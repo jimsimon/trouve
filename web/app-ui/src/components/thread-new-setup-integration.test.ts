@@ -7,6 +7,10 @@ describe("thread screen provisional setup integration", () => {
     new URL("./thread-screen.ts", import.meta.url),
     "utf8",
   );
+  const setup = readFileSync(
+    new URL("./new-thread-setup.ts", import.meta.url),
+    "utf8",
+  );
 
   it("opens a provisional tab without eagerly creating a thread", () => {
     expect(screen).toContain("openNewThreadSetup");
@@ -46,5 +50,15 @@ describe("thread screen provisional setup integration", () => {
       "this.#threadSettingsPending || this.#models.length === 0 || connectivityBlocked",
     );
     expect(screen).toContain('class=${`model-health-pill ${subscriptionLoading ? "loading" : "unavailable"}`}');
+  });
+
+  it("keeps async new-thread defaults synchronized with native select options", () => {
+    expect(setup).toContain(".selected=${mode.id === this.#draft.modeId}");
+    expect(setup).toContain(".selected=${value === this.#draft.thinking}");
+    expect(setup).toContain('.selected=${this.#draft.permissionMode === "ask"}');
+    expect(setup).toContain(
+      '.selected=${this.#draft.permissionMode === "allow_list"}',
+    );
+    expect(setup).toContain('.selected=${this.#draft.permissionMode === "yolo"}');
   });
 });

@@ -393,7 +393,10 @@ export class TrouveNewThreadSetup extends LitElement {
               ${this.#catalog.modes.length === 0
                 ? html`<option value="code">Code</option>`
                 : this.#catalog.modes.map(
-                    (mode) => html`<option value=${mode.id}>${mode.display_name || mode.id}</option>`,
+                    (mode) => html`<option
+                      value=${mode.id}
+                      .selected=${mode.id === this.#draft.modeId}
+                    >${mode.display_name || mode.id}</option>`,
                   )}
             </select>
           </label>
@@ -422,7 +425,10 @@ export class TrouveNewThreadSetup extends LitElement {
               ${thinking === undefined
                 ? html`<option value="">Not supported</option>`
                 : thinking.values.map(
-                    (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
+                    (value) => html`<option
+                      value=${value}
+                      .selected=${value === this.#draft.thinking}
+                    >${modelOptionLabel(value)}</option>`,
                   )}
             </select>
           </label>
@@ -437,9 +443,9 @@ export class TrouveNewThreadSetup extends LitElement {
               ?disabled=${controls.optionControlsDisabled}
               @change=${this.#permissionChanged}
             >
-              <option value="ask">Ask</option>
-              <option value="allow_list">Allow list</option>
-              <option value="yolo">Yolo</option>
+              <option value="ask" .selected=${this.#draft.permissionMode === "ask"}>Ask</option>
+              <option value="allow_list" .selected=${this.#draft.permissionMode === "allow_list"}>Allow list</option>
+              <option value="yolo" .selected=${this.#draft.permissionMode === "yolo"}>Yolo</option>
             </select>
           </label>
         </div>

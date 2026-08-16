@@ -63,4 +63,18 @@ describe("root shell parity wiring", () => {
       'this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current)',
     );
   });
+
+  it("keeps async new-session defaults synchronized with native select options", () => {
+    expect(source).toContain(".selected=${mode.id === this.#newSessionModeId}");
+    expect(source).toContain(".selected=${value === this.#newSessionThinking}");
+    expect(source).toContain(
+      '.selected=${this.#newSessionPermissionMode === "ask"}',
+    );
+    expect(source).toContain(
+      '.selected=${this.#newSessionPermissionMode === "allow_list"}',
+    );
+    expect(source).toContain(
+      '.selected=${this.#newSessionPermissionMode === "yolo"}',
+    );
+  });
 });
