@@ -7056,7 +7056,7 @@ impl Engine {
         }
         let preferred = match access {
             BackendCollaboratorAccess::ReadOnly => ["plan", "review", "question"].as_slice(),
-            BackendCollaboratorAccess::Interactive => ["code", "architect"].as_slice(),
+            BackendCollaboratorAccess::Interactive => ["code"].as_slice(),
             BackendCollaboratorAccess::Inherit => unreachable!(),
         };
         preferred

@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use trouve_protocol::{AgentPersona, PersonaGroup, PersonaInfo};
 
 pub const REVIEW_PERSONA_ID: &str = "review";
+const RETIRED_ARCHITECT_PERSONA_ID: &str = "architect";
 
 pub fn is_valid_persona_id(id: &str) -> bool {
     !id.is_empty()
@@ -58,8 +59,9 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             group: PersonaGroup::General,
             system_prompt:
                 "You are the Planner persona: explore the workspace and produce a concrete \
-                            implementation plan. Do not modify any files; your deliverable is \
-                            the plan itself."
+                            implementation plan. Consider system structure, boundaries, sources \
+                            of truth, maintainability, and design trade-offs. Do not modify any \
+                            files; your deliverable is the plan itself."
                     .into(),
             allowed_tools: vec![
                 "read_file".into(),
@@ -107,22 +109,6 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             // adjudication reliable while explicit persona settings can
             // still move narrower work up or down.
             default_thinking_level: Some("medium".into()),
-        },
-        AgentPersona {
-            id: "architect".into(),
-            display_name: "Architect".into(),
-            group: PersonaGroup::General,
-            system_prompt:
-                "You are the Architect persona: reason about structure, boundaries, and \
-                            trade-offs. Review designs and changes for maintainability, duplicated \
-                            sources of truth, and violated boundaries. Propose designs and ADR-style \
-                            records rather than direct code changes; only touch documentation files."
-                    .into(),
-            allowed_tools: vec![],
-            read_only: false,
-            default_permission_mode: None,
-            default_model: None,
-            default_thinking_level: None,
         },
         AgentPersona {
             id: "question".into(),
@@ -221,7 +207,14 @@ pub fn resolve_personas(
 }
 
 pub fn find_persona<'a>(personas: &'a [AgentPersona], id: &str) -> Option<&'a AgentPersona> {
-    personas.iter().find(|m| m.id == id)
+    personas
+        .iter()
+        .find(|persona| persona.id == id)
+        .or_else(|| {
+            (id == RETIRED_ARCHITECT_PERSONA_ID)
+                .then(|| personas.iter().find(|persona| persona.id == "plan"))
+                .flatten()
+        })
 }
 
 /// Personas with provenance for the settings UI. Same layering as
@@ -342,7 +335,6 @@ mod tests {
             ("code", "Engineer"),
             ("plan", "Planner"),
             ("review", "Reviewer"),
-            ("architect", "Architect"),
             ("question", "Researcher"),
         ] {
             assert_eq!(
@@ -355,7 +347,7 @@ mod tests {
     #[test]
     fn builtin_personas_are_grouped_by_intended_use() {
         let personas = builtin_personas();
-        for id in ["code", "plan", "architect", "question"] {
+        for id in ["code", "plan", "question"] {
             assert_eq!(
                 find_persona(&personas, id).unwrap().group,
                 PersonaGroup::General
@@ -364,6 +356,21 @@ mod tests {
         assert_eq!(
             find_persona(&personas, "review").unwrap().group,
             PersonaGroup::Reviewer
+        );
+    }
+
+    #[test]
+    fn retired_architect_id_resolves_to_planner_unless_customized() {
+        let mut personas = builtin_personas();
+        assert_eq!(find_persona(&personas, "architect").unwrap().id, "plan");
+
+        let mut custom = find_persona(&personas, "plan").unwrap().clone();
+        custom.id = "architect".into();
+        custom.display_name = "Custom Architect".into();
+        personas.push(custom);
+        assert_eq!(
+            find_persona(&personas, "architect").unwrap().display_name,
+            "Custom Architect"
         );
     }
 
