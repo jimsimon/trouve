@@ -814,6 +814,8 @@ struct ReviewFinding {
     side: String,
     #[serde(default)]
     severity: String,
+    #[serde(default = "default_review_confidence")]
+    confidence: String,
     body: String,
     /// Stable candidate ids retained by the coordinator. Reviewer outputs may
     /// omit this; final coordinator output must provide at least one.
@@ -1134,6 +1136,10 @@ impl ReviewOutputBuffer {
 
 fn default_review_side() -> String {
     "RIGHT".into()
+}
+
+fn default_review_confidence() -> String {
+    "medium".into()
 }
 
 struct GithubApi {
@@ -3892,21 +3898,21 @@ impl Engine {
                 }
             };
             let (turn, validated) = turn;
-            if let Some(task) = self.store.finish_code_review_task(
-                &task.id,
-                "succeeded",
-                &turn.output,
-                validated.findings.len() as u64,
-                "",
-            )? {
-                self.emit_code_review_task(&job.id, task)?;
-            }
             let old_ids = previous_findings
                 .iter()
                 .map(|finding| finding.id.as_str())
                 .collect::<HashSet<_>>();
             let findings =
                 coordinator_validated_findings(validated.findings, &candidates, &diff_files);
+            if let Some(task) = self.store.finish_code_review_task(
+                &task.id,
+                "succeeded",
+                &turn.output,
+                findings.len() as u64,
+                "",
+            )? {
+                self.emit_code_review_task(&job.id, task)?;
+            }
             let resolved_finding_ids = validated
                 .resolved_finding_ids
                 .into_iter()
@@ -3982,6 +3988,7 @@ impl Engine {
                     line: finding.line,
                     side: finding.side.clone(),
                     severity: finding.severity.clone(),
+                    confidence: finding.confidence.clone(),
                     body: finding.body.clone(),
                     prompt_for_agents: finding_prompt_for_agents(&job, finding, &parsed.themes),
                     sources,
@@ -4739,9 +4746,15 @@ impl Engine {
         let mut comments = Vec::new();
         let mut eligible_findings = Vec::new();
         let mut ineligible_ids = Vec::new();
+        let mut suppressed_ids = Vec::new();
         for finding in findings {
             if finding.line == 0 || finding.path.trim().is_empty() {
                 ineligible_ids.push(finding.id.as_str());
+            } else if !finding_levels_meet_publication_threshold(
+                &finding.severity,
+                &finding.confidence,
+            ) {
+                suppressed_ids.push(finding.id.as_str());
             } else {
                 comments.push(serde_json::json!({
                     "path": finding.path,
@@ -4756,6 +4769,11 @@ impl Engine {
             &job.id,
             &ineligible_ids,
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
+        );
+        self.persist_publication_status_best_effort(
+            &job.id,
+            &suppressed_ids,
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy,
         );
         if comments.is_empty() {
             if let Err(error) = self.store.release_code_review_publication_claim(&job.id) {
@@ -4966,9 +4984,33 @@ impl Engine {
             return Ok(());
         }
         let findings = self.store.code_review_findings(&job.id)?;
+        let suppressed_ids = findings
+            .iter()
+            .filter(|finding| {
+                finding.line > 0
+                    && !finding.path.trim().is_empty()
+                    && !finding_levels_meet_publication_threshold(
+                        &finding.severity,
+                        &finding.confidence,
+                    )
+            })
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
+        self.persist_publication_status_best_effort(
+            &job.id,
+            &suppressed_ids,
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy,
+        );
         let eligible = findings
             .iter()
-            .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
+            .filter(|finding| {
+                finding.line > 0
+                    && !finding.path.trim().is_empty()
+                    && finding_levels_meet_publication_threshold(
+                        &finding.severity,
+                        &finding.confidence,
+                    )
+            })
             .collect::<Vec<_>>();
         if eligible.is_empty() {
             return Ok(());
@@ -5782,7 +5824,14 @@ impl Engine {
         }
         let target_count = findings
             .iter()
-            .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
+            .filter(|finding| {
+                finding.line > 0
+                    && !finding.path.trim().is_empty()
+                    && finding_levels_meet_publication_threshold(
+                        &finding.severity,
+                        &finding.confidence,
+                    )
+            })
             .count();
         if target_count == 0 {
             return true;
@@ -5813,6 +5862,10 @@ impl Engine {
             for finding in findings {
                 if finding.line == 0
                     || finding.path.trim().is_empty()
+                    || !finding_levels_meet_publication_threshold(
+                        &finding.severity,
+                        &finding.confidence,
+                    )
                     || matched.contains(&finding.id)
                 {
                     continue;
@@ -6100,6 +6153,9 @@ fn lifecycle_finding_entry(
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible => {
                 " _(not eligible for an inline comment)_"
             }
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy => {
+                " _(retained in Trouve; not posted by confidence policy)_"
+            }
             trouve_protocol::CodeReviewFindingPublicationStatus::Pending => {
                 " _(inline publication pending)_"
             }
@@ -6114,8 +6170,9 @@ fn lifecycle_finding_entry(
         "… _(finding text truncated)_",
     );
     format!(
-        "- **{}** — {location}: {finding_body}{note}\n",
-        finding.severity.to_ascii_uppercase()
+        "- **Severity: {} · Confidence: {}** — {location}: {finding_body}{note}\n",
+        finding.severity.to_ascii_uppercase(),
+        finding.confidence.to_ascii_uppercase()
     )
 }
 
@@ -6226,7 +6283,21 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         }
         body.push('\n');
     }
-    if !detail.summary.is_empty() {
+    let suppressed_count = detail
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.github_publication_status
+                == trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
+        })
+        .count();
+    if suppressed_count > 0 {
+        body.push_str(&format!(
+            "Review confirmed {} actionable issue(s); {} met the confidence policy for GitHub publication.\n\n",
+            detail.findings.len(),
+            detail.findings.len().saturating_sub(suppressed_count)
+        ));
+    } else if !detail.summary.is_empty() {
         body.push_str(&bounded_utf8(
             &detail.summary,
             LIFECYCLE_SUMMARY_MAX_BYTES,
@@ -6243,8 +6314,13 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
             ));
         }
     }
-    let (failed_findings, confirmed_findings): (Vec<_>, Vec<_>) =
+    let (suppressed_findings, publishable_findings): (Vec<_>, Vec<_>) =
         detail.findings.iter().partition(|finding| {
+            finding.github_publication_status
+                == trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
+        });
+    let (failed_findings, confirmed_findings): (Vec<_>, Vec<_>) =
+        publishable_findings.into_iter().partition(|finding| {
             finding.github_publication_status
                 == trouve_protocol::CodeReviewFindingPublicationStatus::Failed
         });
@@ -6267,7 +6343,16 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         LIFECYCLE_FINDINGS_MAX_BYTES.saturating_sub(used),
         false,
     );
-    if !detail.findings.is_empty() && !detail.prompt_for_agents.is_empty() {
+    if !suppressed_findings.is_empty() {
+        body.push_str(&format!(
+            "_{} additional confirmed finding(s) were retained in Trouve but not posted by the confidence policy._\n\n",
+            suppressed_findings.len()
+        ));
+    }
+    if suppressed_findings.is_empty()
+        && !detail.findings.is_empty()
+        && !detail.prompt_for_agents.is_empty()
+    {
         let prompt = bounded_utf8(
             &safe_prompt_fence(&detail.prompt_for_agents),
             LIFECYCLE_PROMPT_MAX_BYTES,
@@ -6362,12 +6447,14 @@ fn finding_prompt_for_agents(
          feasible within this pull request, and otherwise make the smallest complete fix"
     };
     format!(
-        "Fix the confirmed {severity} code-review issue in `{path}` near line {line} on \
+        "Fix the confirmed {severity}-severity, {confidence}-confidence code-review issue in \
+         `{path}` near line {line} on \
          pull request #{pull_number} at commit {head_sha}. Problem: {body}{theme_context}\n\
          Inspect the surrounding implementation and tests, {fix_guidance}, \
          add or update regression coverage when appropriate, and verify the affected checks. \
          Do not dismiss the issue without concrete code evidence.",
         severity = finding.severity,
+        confidence = finding.confidence,
         path = finding.path,
         line = finding.line,
         pull_number = job.pull_number,
@@ -6393,9 +6480,10 @@ fn review_prompt_for_agents(
     prompt.push_str("\nConfirmed issues:\n");
     for (index, finding) in findings.iter().enumerate() {
         prompt.push_str(&format!(
-            "{}. [{}] `{}` line {}: {}\n",
+            "{}. [Severity: {} · Confidence: {}] `{}` line {}: {}\n",
             index + 1,
             finding.severity.to_ascii_uppercase(),
+            finding.confidence.to_ascii_uppercase(),
             finding.path,
             finding.line,
             finding.body
@@ -6450,10 +6538,11 @@ fn render_inline_finding(finding: &trouve_protocol::CodeReviewFinding) -> String
         format!("\n\n_Identified by: {source_names}._")
     };
     format!(
-        "### {severity} issue\n\n{body}{source_line}\n\n\
+        "**Severity:** {severity}  \n**Confidence:** {confidence}\n\n{body}{source_line}\n\n\
          <details><summary>Prompt for agents</summary>\n\n```text\n{prompt}\n```\n\n</details>\n\n\
          <!-- trouve-code-review finding:{id} -->",
         severity = finding.severity.to_ascii_uppercase(),
+        confidence = finding.confidence.to_ascii_uppercase(),
         body = finding.body,
         prompt = safe_prompt_fence(&finding.prompt_for_agents),
         id = finding.id,
@@ -7033,7 +7122,7 @@ fn reviewer_prompt(
          ambiguity. Report only actionable problems introduced by the change. Do not ask \
          questions and do not modify files.\n\n{execution_guidance}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
-         {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"body\":\"specific problem and fix\"}}]}}\n\
+         {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"confidence\":\"high|medium|low\",\"body\":\"specific problem and fix\"}}]}}\n\
          Use RIGHT for added/context lines in the new version and LEFT only \
          for removed lines. Return an empty findings array when there are no \
          actionable issues.",
@@ -7090,8 +7179,12 @@ fn validation_prompt(
          immutable revision {base}..{head}. Independently verify every candidate against \
          the diff and repository. Remove false positives, issues not introduced by this \
          revision, non-actionable style preferences, and duplicates. Merge overlapping \
-         findings, correct path/side/line metadata, normalize severity to high/medium/low, \
-         and retain only findings a maintainer should act on. Exact relevant diff context is \
+         findings, correct path/side/line metadata, normalize both severity and confidence to \
+         high/medium/low, and retain every verified finding a maintainer should act on, regardless \
+         of whether its severity/confidence combination will be posted to GitHub. Confidence \
+         measures how strongly the available code and diff prove the issue, independently of \
+         impact. Do not reject an otherwise real, actionable issue solely because its confidence \
+         is low; publication policy is applied after consolidation. Exact relevant diff context is \
          supplied below; use tools only when surrounding unchanged code is necessary to settle \
          a concrete ambiguity. Do not add a finding merely because a \
          reviewer suggested it. Each retained finding must include every contributing \
@@ -7119,7 +7212,8 @@ fn validation_prompt(
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
          {{\"summary\":\"concise final assessment that mentions validated coverage\",\
          \"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\
-         \"severity\":\"high|medium|low\",\"body\":\"specific verified problem and fix\",\
+         \"severity\":\"high|medium|low\",\"confidence\":\"high|medium|low\",\
+         \"body\":\"specific verified problem and fix\",\
          \"source_candidate_ids\":[\"candidate id\"]}}],\
          \"rejected_candidates\":[{{\"candidate_id\":\"candidate id\",\
          \"reason\":\"specific reason this candidate was not retained\"}}],\
@@ -7284,6 +7378,7 @@ fn candidate_rejections(
             line: candidate.finding.line,
             side: candidate.finding.side.clone(),
             severity: candidate.finding.severity.clone(),
+            confidence: candidate.finding.confidence.clone(),
             body: candidate.finding.body.clone(),
             reason: reasons
                 .get(candidate.candidate_id.as_str())
@@ -7372,7 +7467,23 @@ fn normalize_finding(
         _ => "medium",
     }
     .into();
+    finding.confidence = match finding.confidence.trim().to_ascii_lowercase().as_str() {
+        "high" => "high",
+        "low" => "low",
+        _ => "medium",
+    }
+    .into();
     Some(())
+}
+
+/// Publish only findings with enough evidence to justify interrupting the PR:
+/// high and medium severity need at least medium confidence, while low
+/// severity needs high confidence.
+fn finding_levels_meet_publication_threshold(severity: &str, confidence: &str) -> bool {
+    matches!(
+        (severity, confidence),
+        ("high" | "medium", "high" | "medium") | ("low", "high")
+    )
 }
 
 /// (path, line, left-side). Context lines are commentable on either side;
@@ -8179,6 +8290,7 @@ mod tests {
                     line: 42,
                     side: "RIGHT".into(),
                     severity: "high".into(),
+                    confidence: "high".into(),
                     body: "Handle the error before returning.".into(),
                     prompt_for_agents: "Add error handling and a regression test.".into(),
                     sources: Vec::new(),
@@ -8202,7 +8314,12 @@ mod tests {
         assert!(body.contains("| Application Reliability Engineer | Not Applicable |"));
         assert!(body.contains("**Result:** 1 confirmed issue(s)"));
         assert!(body.contains("### Confirmed issues"));
-        assert!(body.contains("- **HIGH** — `src/lib.rs` line 42: Handle the error"));
+        assert!(body.contains(
+            "- **Severity: HIGH · Confidence: HIGH** — `src/lib.rs` line 42: Handle the error"
+        ));
+        let inline = render_inline_finding(&detail.findings[0]);
+        assert!(inline.contains("**Severity:** HIGH"));
+        assert!(inline.contains("**Confidence:** HIGH"));
         assert!(body.contains("_(inline publication pending)_"));
         assert!(!body.contains("### Inline comments that failed to post"));
         assert!(body.contains("<summary>Prompt for agents</summary>"));
@@ -8217,15 +8334,16 @@ mod tests {
         let findings = store
             .save_code_review_result(
                 &queued.id,
-                "Two confirmed issues.",
-                "Fix both issues.",
-                2,
+                "Three confirmed issues, including uncertain issue details.",
+                "Fix all issues, including the uncertain issue.",
+                3,
                 &[
                     NewCodeReviewFinding {
                         path: "src/failed.rs".into(),
                         line: 10,
                         side: "RIGHT".into(),
                         severity: "high".into(),
+                        confidence: "high".into(),
                         body: "Failed inline body".into(),
                         prompt_for_agents: "Fix failed inline issue.".into(),
                         sources: Vec::new(),
@@ -8235,8 +8353,19 @@ mod tests {
                         line: 20,
                         side: "RIGHT".into(),
                         severity: "medium".into(),
+                        confidence: "high".into(),
                         body: "Published inline body".into(),
                         prompt_for_agents: "Fix published inline issue.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/suppressed.rs".into(),
+                        line: 30,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "low".into(),
+                        body: "Uncertain issue details".into(),
+                        prompt_for_agents: "Investigate uncertain issue.".into(),
                         sources: Vec::new(),
                     },
                 ],
@@ -8251,6 +8380,10 @@ mod tests {
             .iter()
             .find(|finding| finding.path == "src/published.rs")
             .unwrap();
+        let suppressed = findings
+            .iter()
+            .find(|finding| finding.path == "src/suppressed.rs")
+            .unwrap();
         store
             .set_code_review_finding_publication_status(
                 &failed.id,
@@ -8261,6 +8394,12 @@ mod tests {
             .set_code_review_finding_publication_status(
                 &published.id,
                 trouve_protocol::CodeReviewFindingPublicationStatus::Published,
+            )
+            .unwrap();
+        store
+            .set_code_review_finding_publication_status(
+                &suppressed.id,
+                trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy,
             )
             .unwrap();
         store
@@ -8277,6 +8416,11 @@ mod tests {
         assert_eq!(body.matches("Published inline body").count(), 1);
         assert_eq!(body.matches("Failed inline body").count(), 1);
         assert!(body.contains("_(inline comment posted; link unavailable)_"));
+        assert!(body.contains(
+            "1 additional confirmed finding(s) were retained in Trouve but not posted by the confidence policy"
+        ));
+        assert!(!body.contains("Uncertain issue details"));
+        assert!(!body.contains("Fix all issues, including the uncertain issue"));
     }
 
     #[test]
@@ -8291,6 +8435,7 @@ mod tests {
                 line: index as u64 + 1,
                 side: "RIGHT".into(),
                 severity: "medium".into(),
+                confidence: "high".into(),
                 body: if index + 1 == MAX_CANDIDATE_FINDINGS {
                     "Failed publication remains visible".into()
                 } else {
@@ -8385,24 +8530,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn published_review_comment_capture_skips_ineligible_findings() {
+    async fn published_review_comment_capture_skips_ineligible_and_suppressed_findings() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let job = enqueue_test_review_job(&store, "acme/widgets#42:ineligible-capture");
         let findings = store
             .save_code_review_result(
                 &job.id,
-                "One issue.",
-                "Fix it.",
-                1,
-                &[NewCodeReviewFinding {
-                    path: String::new(),
-                    line: 0,
-                    side: "RIGHT".into(),
-                    severity: "low".into(),
-                    body: "General issue.".into(),
-                    prompt_for_agents: "Fix it.".into(),
-                    sources: Vec::new(),
-                }],
+                "Two retained issues.",
+                "Fix both.",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: String::new(),
+                        line: 0,
+                        side: "RIGHT".into(),
+                        severity: "low".into(),
+                        confidence: "high".into(),
+                        body: "General issue.".into(),
+                        prompt_for_agents: "Fix it.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/uncertain.rs".into(),
+                        line: 7,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "low".into(),
+                        body: "Uncertain issue.".into(),
+                        prompt_for_agents: "Investigate it.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
                 &[],
             )
             .unwrap();
@@ -8426,7 +8584,7 @@ mod tests {
             engine.capture_published_review_comments(&api, &job, 77, &findings),
         )
         .await
-        .expect("ineligible findings must not make a GitHub request");
+        .expect("ineligible and suppressed findings must not make a GitHub request");
         assert!(matches!(
             listener.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
@@ -8450,6 +8608,7 @@ mod tests {
                     line: 42,
                     side: "RIGHT".into(),
                     severity: "high".into(),
+                    confidence: "high".into(),
                     body: "Handle the error.".into(),
                     prompt_for_agents: "Handle the error and test it.".into(),
                     sources: Vec::new(),
@@ -8546,6 +8705,7 @@ mod tests {
                         line: 10,
                         side: "RIGHT".into(),
                         severity: "high".into(),
+                        confidence: "high".into(),
                         body: "First issue.".into(),
                         prompt_for_agents: "Fix the first issue.".into(),
                         sources: Vec::new(),
@@ -8555,6 +8715,7 @@ mod tests {
                         line: 20,
                         side: "RIGHT".into(),
                         severity: "medium".into(),
+                        confidence: "high".into(),
                         body: "Second issue.".into(),
                         prompt_for_agents: "Fix the second issue.".into(),
                         sources: Vec::new(),
@@ -8652,15 +8813,16 @@ mod tests {
         let findings = store
             .save_code_review_result(
                 &job.id,
-                "Two issues.",
-                "Fix both.",
-                2,
+                "Three issues.",
+                "Fix all three.",
+                3,
                 &[
                     NewCodeReviewFinding {
                         path: "src/lib.rs".into(),
                         line: 42,
                         side: "RIGHT".into(),
                         severity: "high".into(),
+                        confidence: "high".into(),
                         body: "Eligible issue.".into(),
                         prompt_for_agents: "Fix it.".into(),
                         sources: Vec::new(),
@@ -8670,8 +8832,19 @@ mod tests {
                         line: 0,
                         side: "RIGHT".into(),
                         severity: "low".into(),
+                        confidence: "high".into(),
                         body: "General issue.".into(),
                         prompt_for_agents: "Fix it too.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/uncertain.rs".into(),
+                        line: 9,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "low".into(),
+                        body: "Suppressed issue.".into(),
+                        prompt_for_agents: "Investigate it.".into(),
                         sources: Vec::new(),
                     },
                 ],
@@ -8729,6 +8902,14 @@ mod tests {
                 .github_publication_status,
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
         );
+        assert_eq!(
+            stored
+                .iter()
+                .find(|finding| finding.path == "src/uncertain.rs")
+                .unwrap()
+                .github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
+        );
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert!(record.publication_claimed);
         assert!(!record.publication_accepted);
@@ -8751,6 +8932,7 @@ mod tests {
                     line: 42,
                     side: "RIGHT".into(),
                     severity: "high".into(),
+                    confidence: "high".into(),
                     body: "Eligible issue.".into(),
                     prompt_for_agents: "Fix it.".into(),
                     sources: Vec::new(),
@@ -8876,6 +9058,7 @@ mod tests {
                     line: 7,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
                     body: "Another issue.".into(),
                     prompt_for_agents: "Fix it.".into(),
                     sources: Vec::new(),
@@ -8990,6 +9173,7 @@ mod tests {
                     line: 42,
                     side: "RIGHT".into(),
                     severity: "high".into(),
+                    confidence: "high".into(),
                     body: "Eligible issue.".into(),
                     prompt_for_agents: "Fix it.".into(),
                     sources: Vec::new(),
@@ -9139,6 +9323,7 @@ mod tests {
                     line: 0,
                     side: "RIGHT".into(),
                     severity: "low".into(),
+                    confidence: "high".into(),
                     body: "General issue.".into(),
                     prompt_for_agents: "Fix it.".into(),
                     sources: Vec::new(),
@@ -9217,6 +9402,7 @@ mod tests {
                         line: 42,
                         side: "RIGHT".into(),
                         severity: "high".into(),
+                        confidence: "high".into(),
                         body: "Eligible issue.".into(),
                         prompt_for_agents: "Fix it.".into(),
                         sources: Vec::new(),
@@ -9226,6 +9412,7 @@ mod tests {
                         line: 0,
                         side: "RIGHT".into(),
                         severity: "low".into(),
+                        confidence: "high".into(),
                         body: "General issue.".into(),
                         prompt_for_agents: "Fix it too.".into(),
                         sources: Vec::new(),
@@ -9996,6 +10183,15 @@ mod tests {
     }
 
     #[test]
+    fn review_confidence_defaults_for_legacy_output() {
+        let review = parse_review_output(
+            r#"{"summary":"legacy","findings":[{"path":"src/lib.rs","line":3,"severity":"high","body":"issue"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(review.findings[0].confidence, "medium");
+    }
+
+    #[test]
     fn parses_review_themes_and_defaults_them_when_absent() {
         let without = parse_review_output(r#"{"summary":"ok","findings":[]}"#).unwrap();
         assert!(without.themes.is_empty());
@@ -10021,6 +10217,7 @@ mod tests {
             line: 3,
             side: "RIGHT".into(),
             severity: "medium".into(),
+            confidence: "high".into(),
             body: format!("finding {id}"),
             source_candidate_ids: vec![id.into()],
         };
@@ -10079,6 +10276,7 @@ mod tests {
                     line: 3,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
                     body: "first symptom".into(),
                     source_candidate_ids: vec!["c-shared".into()],
                 },
@@ -10087,6 +10285,7 @@ mod tests {
                     line: 7,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
                     body: "second symptom".into(),
                     source_candidate_ids: vec!["c-shared".into()],
                 },
@@ -10107,6 +10306,7 @@ mod tests {
             line: 3,
             side: "RIGHT".into(),
             severity: "medium".into(),
+            confidence: "high".into(),
             body: "finding c-1".into(),
             source_candidate_ids: vec!["c-1".into()],
         }];
@@ -10134,6 +10334,7 @@ mod tests {
             line: 3,
             side: "RIGHT".into(),
             severity: "medium".into(),
+            confidence: "high".into(),
             body: format!("finding {id}"),
             source_candidate_ids: vec![id.into()],
         };
@@ -10224,6 +10425,7 @@ mod tests {
                     line: 3,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
                     body: "stale route".into(),
                     prompt_for_agents: "fix it".into(),
                     sources: Vec::new(),
@@ -10357,6 +10559,7 @@ mod tests {
                         line: 3,
                         side: "RIGHT".into(),
                         severity: "medium".into(),
+                        confidence: "high".into(),
                         body: "first".into(),
                         prompt_for_agents: "fix it".into(),
                         sources: Vec::new(),
@@ -10366,6 +10569,7 @@ mod tests {
                         line: 3,
                         side: "RIGHT".into(),
                         severity: "medium".into(),
+                        confidence: "high".into(),
                         body: "second".into(),
                         prompt_for_agents: "fix it".into(),
                         sources: Vec::new(),
@@ -10484,6 +10688,7 @@ mod tests {
                     line: 3,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
                     body: "deep finding".into(),
                     prompt_for_agents: "fix it".into(),
                     sources: Vec::new(),
@@ -10710,6 +10915,7 @@ mod tests {
                 line: 3,
                 side: side.into(),
                 severity: "critical".into(),
+                confidence: "high".into(),
                 body: body.into(),
                 source_candidate_ids: vec![format!("candidate-{body}")],
             },
@@ -10729,6 +10935,82 @@ mod tests {
     }
 
     #[test]
+    fn publication_threshold_combines_severity_and_confidence() {
+        let finding = |severity: &str, confidence: &str| ReviewFinding {
+            path: "src/lib.rs".into(),
+            line: 3,
+            side: "RIGHT".into(),
+            severity: severity.into(),
+            confidence: confidence.into(),
+            body: "issue".into(),
+            source_candidate_ids: vec!["candidate".into()],
+        };
+
+        for (severity, confidence) in [
+            ("high", "high"),
+            ("high", "medium"),
+            ("medium", "high"),
+            ("medium", "medium"),
+            ("low", "high"),
+        ] {
+            let finding = finding(severity, confidence);
+            assert!(finding_levels_meet_publication_threshold(
+                &finding.severity,
+                &finding.confidence
+            ));
+        }
+        for (severity, confidence) in [
+            ("high", "low"),
+            ("medium", "low"),
+            ("low", "medium"),
+            ("low", "low"),
+        ] {
+            let finding = finding(severity, confidence);
+            assert!(!finding_levels_meet_publication_threshold(
+                &finding.severity,
+                &finding.confidence
+            ));
+        }
+    }
+
+    #[test]
+    fn consolidation_retains_actionable_findings_below_the_publication_threshold() {
+        let files = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -2 +2 @@\n-old\n+new\n".into(),
+        }];
+        let candidate = CandidateFinding {
+            candidate_id: "candidate-low-confidence".into(),
+            task_id: "rt_test".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            finding: ReviewFinding {
+                path: "src/lib.rs".into(),
+                line: 2,
+                side: "RIGHT".into(),
+                severity: "high".into(),
+                confidence: "low".into(),
+                body: "Actionable but uncertain issue".into(),
+                source_candidate_ids: Vec::new(),
+            },
+        };
+        let findings = coordinator_validated_findings(
+            vec![ReviewFinding {
+                source_candidate_ids: vec![candidate.candidate_id.clone()],
+                ..candidate.finding.clone()
+            }],
+            &[candidate],
+            &files,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert!(!finding_levels_meet_publication_threshold(
+            &findings[0].severity,
+            &findings[0].confidence
+        ));
+    }
+
+    #[test]
     fn candidate_rejection_details_cover_every_unselected_candidate() {
         let candidate = |id: &str| CandidateFinding {
             candidate_id: id.into(),
@@ -10740,6 +11022,7 @@ mod tests {
                 line: 3,
                 side: "RIGHT".into(),
                 severity: "medium".into(),
+                confidence: "high".into(),
                 body: format!("candidate {id}"),
                 source_candidate_ids: Vec::new(),
             },
@@ -10756,6 +11039,7 @@ mod tests {
                 line: 3,
                 side: "RIGHT".into(),
                 severity: "medium".into(),
+                confidence: "high".into(),
                 body: "accepted".into(),
                 source_candidate_ids: vec!["accepted".into()],
             }],

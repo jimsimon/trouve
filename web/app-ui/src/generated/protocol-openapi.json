@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "6.0"
+    "version": "6.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -5326,6 +5326,10 @@
           "candidate_id": {
             "type": "string"
           },
+          "confidence": {
+            "type": "string",
+            "description": "Strength of the evidence for the candidate, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."
+          },
           "line": {
             "type": "integer",
             "format": "int64",
@@ -5440,6 +5444,10 @@
           "body": {
             "type": "string"
           },
+          "confidence": {
+            "type": "string",
+            "description": "Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."
+          },
           "github_comment_id": {
             "type": [
               "integer",
@@ -5509,12 +5517,13 @@
           "pending",
           "published",
           "not_eligible",
+          "suppressed_by_policy",
           "failed"
         ]
       },
       "CodeReviewFindingSource": {
         "type": "object",
-        "description": "A persona/candidate that contributed to a confirmed published finding.",
+        "description": "A persona/candidate that contributed to a confirmed finding.",
         "required": [
           "reviewer_id",
           "reviewer_name",

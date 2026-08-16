@@ -2006,7 +2006,7 @@ pub struct CodeReviewPersonaResult {
     pub elapsed_ms: u64,
 }
 
-/// A persona/candidate that contributed to a confirmed published finding.
+/// A persona/candidate that contributed to a confirmed finding.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewFindingSource {
     pub reviewer_id: String,
@@ -2027,6 +2027,10 @@ pub struct CodeReviewCandidateRejection {
     pub line: u64,
     pub side: String,
     pub severity: String,
+    /// Strength of the evidence for the candidate, independently of impact.
+    /// `high`, `medium`, or `low`; legacy records default to `medium`.
+    #[serde(default = "default_code_review_confidence")]
+    pub confidence: String,
     pub body: String,
     pub reason: String,
 }
@@ -2042,6 +2046,9 @@ pub enum CodeReviewFindingPublicationStatus {
     Published,
     /// The finding had no valid path/line pair for an inline comment.
     NotEligible,
+    /// The finding was retained internally but did not meet the automatic
+    /// publication threshold for its severity and confidence.
+    SuppressedByPolicy,
     /// GitHub did not publish the inline comment.
     Failed,
 }
@@ -2056,6 +2063,10 @@ pub struct CodeReviewFinding {
     pub line: u64,
     pub side: String,
     pub severity: String,
+    /// Strength of the evidence for the issue, independently of impact.
+    /// `high`, `medium`, or `low`; legacy records default to `medium`.
+    #[serde(default = "default_code_review_confidence")]
+    pub confidence: String,
     pub body: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt_for_agents: String,
@@ -2073,6 +2084,10 @@ pub struct CodeReviewFinding {
     pub github_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn default_code_review_confidence() -> String {
+    "medium".into()
 }
 
 /// A durable execution of one model review against one immutable PR head.

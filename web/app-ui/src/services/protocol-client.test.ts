@@ -990,11 +990,11 @@ describe("ProtocolClient", () => {
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("6.0")).not.toThrow();
+    expect(() => assertProtocolCompatibility("6.1")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["3.36", "4.0", "5.2", "5.3", "6.1", "unknown", ""]) {
+    for (const version of ["3.36", "4.0", "5.2", "6.0", "6.2", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

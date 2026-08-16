@@ -1894,8 +1894,8 @@ return errors === 0;
 validate112.evaluated = {"props":{"reviewer":true,"state":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema49 = {"type":"object","description":"A review produced by trouve's first-party review service. The marker is\njoined from durable job/finding records rather than inferred from an\nuntrusted comment author or body.","required":["job_id","bot_login","status","summary","prompt_for_agents","review_url"],"properties":{"bot_login":{"type":"string"},"findings":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFinding"}},"job_id":{"type":"string"},"prompt_for_agents":{"type":"string"},"review_url":{"type":"string"},"status":{"type":"string"},"summary":{"type":"string"}}};
-const schema50 = {"type":"object","description":"A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.","required":["id","job_id","path","line","side","severity","body","status"],"properties":{"body":{"type":"string"},"github_comment_id":{"type":["integer","null"],"format":"int64","minimum":0},"github_comment_url":{"type":"string"},"github_publication_status":{"$ref":"#/components/schemas/CodeReviewFindingPublicationStatus"},"github_thread_id":{"type":["string","null"]},"id":{"type":"string"},"job_id":{"type":"string"},"line":{"type":"integer","format":"int64","minimum":0},"path":{"type":"string"},"prompt_for_agents":{"type":"string"},"resolved_at":{"type":["string","null"],"format":"date-time"},"severity":{"type":"string"},"side":{"type":"string"},"sources":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFindingSource"}},"status":{"type":"string","description":"`open`, `fixed`, or `dismissed`."}}};
-const schema51 = {"type":"string","description":"The outcome of attempting to publish a finding as an inline GitHub comment.","enum":["pending","published","not_eligible","failed"]};
+const schema50 = {"type":"object","description":"A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.","required":["id","job_id","path","line","side","severity","body","status"],"properties":{"body":{"type":"string"},"confidence":{"type":"string","description":"Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."},"github_comment_id":{"type":["integer","null"],"format":"int64","minimum":0},"github_comment_url":{"type":"string"},"github_publication_status":{"$ref":"#/components/schemas/CodeReviewFindingPublicationStatus"},"github_thread_id":{"type":["string","null"]},"id":{"type":"string"},"job_id":{"type":"string"},"line":{"type":"integer","format":"int64","minimum":0},"path":{"type":"string"},"prompt_for_agents":{"type":"string"},"resolved_at":{"type":["string","null"],"format":"date-time"},"severity":{"type":"string"},"side":{"type":"string"},"sources":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFindingSource"}},"status":{"type":"string","description":"`open`, `fixed`, or `dismissed`."}}};
+const schema51 = {"type":"string","description":"The outcome of attempting to publish a finding as an inline GitHub comment.","enum":["pending","published","not_eligible","suppressed_by_policy","failed"]};
 
 function validate116(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -1911,7 +1911,7 @@ if(typeof data !== "string"){
 validate116.errors = [{instancePath,schemaPath:"#/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-if(!((((data === "pending") || (data === "published")) || (data === "not_eligible")) || (data === "failed"))){
+if(!(((((data === "pending") || (data === "published")) || (data === "not_eligible")) || (data === "suppressed_by_policy")) || (data === "failed"))){
 validate116.errors = [{instancePath,schemaPath:"#/enum",keyword:"enum",params:{allowedValues: schema51.enum},message:"must be equal to one of the allowed values"}];
 return false;
 }
@@ -1920,7 +1920,7 @@ return errors === 0;
 }
 validate116.evaluated = {"dynamicProps":false,"dynamicItems":false};
 
-const schema52 = {"type":"object","description":"A persona/candidate that contributed to a confirmed published finding.","required":["reviewer_id","reviewer_name","candidate_id"],"properties":{"candidate_id":{"type":"string"},"reviewer_id":{"type":"string"},"reviewer_name":{"type":"string"},"task_id":{"type":"string"}}};
+const schema52 = {"type":"object","description":"A persona/candidate that contributed to a confirmed finding.","required":["reviewer_id","reviewer_name","candidate_id"],"properties":{"candidate_id":{"type":"string"},"reviewer_id":{"type":"string"},"reviewer_name":{"type":"string"},"task_id":{"type":"string"}}};
 
 function validate118(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -2033,20 +2033,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.github_comment_id !== undefined){
-let data1 = data.github_comment_id;
+if(data.confidence !== undefined){
 const _errs3 = errors;
-if((!((typeof data1 == "number") && (!(data1 % 1) && !isNaN(data1)))) && (data1 !== null)){
-validate115.errors = [{instancePath:instancePath+"/github_comment_id",schemaPath:"#/properties/github_comment_id/type",keyword:"type",params:{type: schema50.properties.github_comment_id.type},message:"must be integer,null"}];
+if(typeof data.confidence !== "string"){
+validate115.errors = [{instancePath:instancePath+"/confidence",schemaPath:"#/properties/confidence/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
-}
-if(errors === _errs3){
-if(typeof data1 == "number"){
-if(data1 < 0 || isNaN(data1)){
-validate115.errors = [{instancePath:instancePath+"/github_comment_id",schemaPath:"#/properties/github_comment_id/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
-return false;
-}
-}
 }
 var valid0 = _errs3 === errors;
 }
@@ -2054,11 +2045,20 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.github_comment_url !== undefined){
+if(data.github_comment_id !== undefined){
+let data2 = data.github_comment_id;
 const _errs5 = errors;
-if(typeof data.github_comment_url !== "string"){
-validate115.errors = [{instancePath:instancePath+"/github_comment_url",schemaPath:"#/properties/github_comment_url/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((!((typeof data2 == "number") && (!(data2 % 1) && !isNaN(data2)))) && (data2 !== null)){
+validate115.errors = [{instancePath:instancePath+"/github_comment_id",schemaPath:"#/properties/github_comment_id/type",keyword:"type",params:{type: schema50.properties.github_comment_id.type},message:"must be integer,null"}];
 return false;
+}
+if(errors === _errs5){
+if(typeof data2 == "number"){
+if(data2 < 0 || isNaN(data2)){
+validate115.errors = [{instancePath:instancePath+"/github_comment_id",schemaPath:"#/properties/github_comment_id/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
+return false;
+}
+}
 }
 var valid0 = _errs5 === errors;
 }
@@ -2066,11 +2066,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.github_publication_status !== undefined){
+if(data.github_comment_url !== undefined){
 const _errs7 = errors;
-if(!(validate116(data.github_publication_status, {instancePath:instancePath+"/github_publication_status",parentData:data,parentDataProperty:"github_publication_status",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate116.errors : vErrors.concat(validate116.errors);
-errors = vErrors.length;
+if(typeof data.github_comment_url !== "string"){
+validate115.errors = [{instancePath:instancePath+"/github_comment_url",schemaPath:"#/properties/github_comment_url/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
 }
 var valid0 = _errs7 === errors;
 }
@@ -2078,23 +2078,23 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.github_thread_id !== undefined){
-let data4 = data.github_thread_id;
-const _errs8 = errors;
-if((typeof data4 !== "string") && (data4 !== null)){
-validate115.errors = [{instancePath:instancePath+"/github_thread_id",schemaPath:"#/properties/github_thread_id/type",keyword:"type",params:{type: schema50.properties.github_thread_id.type},message:"must be string,null"}];
-return false;
+if(data.github_publication_status !== undefined){
+const _errs9 = errors;
+if(!(validate116(data.github_publication_status, {instancePath:instancePath+"/github_publication_status",parentData:data,parentDataProperty:"github_publication_status",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate116.errors : vErrors.concat(validate116.errors);
+errors = vErrors.length;
 }
-var valid0 = _errs8 === errors;
+var valid0 = _errs9 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
-if(data.id !== undefined){
+if(data.github_thread_id !== undefined){
+let data5 = data.github_thread_id;
 const _errs10 = errors;
-if(typeof data.id !== "string"){
-validate115.errors = [{instancePath:instancePath+"/id",schemaPath:"#/properties/id/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data5 !== "string") && (data5 !== null)){
+validate115.errors = [{instancePath:instancePath+"/github_thread_id",schemaPath:"#/properties/github_thread_id/type",keyword:"type",params:{type: schema50.properties.github_thread_id.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs10 === errors;
@@ -2103,10 +2103,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.job_id !== undefined){
+if(data.id !== undefined){
 const _errs12 = errors;
-if(typeof data.job_id !== "string"){
-validate115.errors = [{instancePath:instancePath+"/job_id",schemaPath:"#/properties/job_id/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.id !== "string"){
+validate115.errors = [{instancePath:instancePath+"/id",schemaPath:"#/properties/id/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs12 === errors;
@@ -2115,20 +2115,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.line !== undefined){
-let data7 = data.line;
+if(data.job_id !== undefined){
 const _errs14 = errors;
-if(!((typeof data7 == "number") && (!(data7 % 1) && !isNaN(data7)))){
-validate115.errors = [{instancePath:instancePath+"/line",schemaPath:"#/properties/line/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+if(typeof data.job_id !== "string"){
+validate115.errors = [{instancePath:instancePath+"/job_id",schemaPath:"#/properties/job_id/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
-}
-if(errors === _errs14){
-if(typeof data7 == "number"){
-if(data7 < 0 || isNaN(data7)){
-validate115.errors = [{instancePath:instancePath+"/line",schemaPath:"#/properties/line/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
-return false;
-}
-}
 }
 var valid0 = _errs14 === errors;
 }
@@ -2136,11 +2127,20 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.path !== undefined){
+if(data.line !== undefined){
+let data8 = data.line;
 const _errs16 = errors;
-if(typeof data.path !== "string"){
-validate115.errors = [{instancePath:instancePath+"/path",schemaPath:"#/properties/path/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(!((typeof data8 == "number") && (!(data8 % 1) && !isNaN(data8)))){
+validate115.errors = [{instancePath:instancePath+"/line",schemaPath:"#/properties/line/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
 return false;
+}
+if(errors === _errs16){
+if(typeof data8 == "number"){
+if(data8 < 0 || isNaN(data8)){
+validate115.errors = [{instancePath:instancePath+"/line",schemaPath:"#/properties/line/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
+return false;
+}
+}
 }
 var valid0 = _errs16 === errors;
 }
@@ -2148,10 +2148,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.prompt_for_agents !== undefined){
+if(data.path !== undefined){
 const _errs18 = errors;
-if(typeof data.prompt_for_agents !== "string"){
-validate115.errors = [{instancePath:instancePath+"/prompt_for_agents",schemaPath:"#/properties/prompt_for_agents/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.path !== "string"){
+validate115.errors = [{instancePath:instancePath+"/path",schemaPath:"#/properties/path/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs18 === errors;
@@ -2160,11 +2160,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.resolved_at !== undefined){
-let data10 = data.resolved_at;
+if(data.prompt_for_agents !== undefined){
 const _errs20 = errors;
-if((typeof data10 !== "string") && (data10 !== null)){
-validate115.errors = [{instancePath:instancePath+"/resolved_at",schemaPath:"#/properties/resolved_at/type",keyword:"type",params:{type: schema50.properties.resolved_at.type},message:"must be string,null"}];
+if(typeof data.prompt_for_agents !== "string"){
+validate115.errors = [{instancePath:instancePath+"/prompt_for_agents",schemaPath:"#/properties/prompt_for_agents/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs20 === errors;
@@ -2173,10 +2172,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.severity !== undefined){
+if(data.resolved_at !== undefined){
+let data11 = data.resolved_at;
 const _errs22 = errors;
-if(typeof data.severity !== "string"){
-validate115.errors = [{instancePath:instancePath+"/severity",schemaPath:"#/properties/severity/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data11 !== "string") && (data11 !== null)){
+validate115.errors = [{instancePath:instancePath+"/resolved_at",schemaPath:"#/properties/resolved_at/type",keyword:"type",params:{type: schema50.properties.resolved_at.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs22 === errors;
@@ -2185,10 +2185,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.side !== undefined){
+if(data.severity !== undefined){
 const _errs24 = errors;
-if(typeof data.side !== "string"){
-validate115.errors = [{instancePath:instancePath+"/side",schemaPath:"#/properties/side/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.severity !== "string"){
+validate115.errors = [{instancePath:instancePath+"/severity",schemaPath:"#/properties/severity/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs24 === errors;
@@ -2197,20 +2197,32 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.sources !== undefined){
-let data13 = data.sources;
+if(data.side !== undefined){
 const _errs26 = errors;
-if(errors === _errs26){
-if(Array.isArray(data13)){
-var valid1 = true;
-const len0 = data13.length;
-for(let i0=0; i0<len0; i0++){
+if(typeof data.side !== "string"){
+validate115.errors = [{instancePath:instancePath+"/side",schemaPath:"#/properties/side/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs26 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.sources !== undefined){
+let data14 = data.sources;
 const _errs28 = errors;
-if(!(validate118(data13[i0], {instancePath:instancePath+"/sources/" + i0,parentData:data13,parentDataProperty:i0,rootData,dynamicAnchors}))){
+if(errors === _errs28){
+if(Array.isArray(data14)){
+var valid1 = true;
+const len0 = data14.length;
+for(let i0=0; i0<len0; i0++){
+const _errs30 = errors;
+if(!(validate118(data14[i0], {instancePath:instancePath+"/sources/" + i0,parentData:data14,parentDataProperty:i0,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate118.errors : vErrors.concat(validate118.errors);
 errors = vErrors.length;
 }
-var valid1 = _errs28 === errors;
+var valid1 = _errs30 === errors;
 if(!valid1){
 break;
 }
@@ -2221,22 +2233,23 @@ validate115.errors = [{instancePath:instancePath+"/sources",schemaPath:"#/proper
 return false;
 }
 }
-var valid0 = _errs26 === errors;
+var valid0 = _errs28 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.status !== undefined){
-const _errs29 = errors;
+const _errs31 = errors;
 if(typeof data.status !== "string"){
 validate115.errors = [{instancePath:instancePath+"/status",schemaPath:"#/properties/status/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid0 = _errs29 === errors;
+var valid0 = _errs31 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -2262,7 +2275,7 @@ return false;
 validate115.errors = vErrors;
 return errors === 0;
 }
-validate115.evaluated = {"props":{"body":true,"github_comment_id":true,"github_comment_url":true,"github_publication_status":true,"github_thread_id":true,"id":true,"job_id":true,"line":true,"path":true,"prompt_for_agents":true,"resolved_at":true,"severity":true,"side":true,"sources":true,"status":true},"dynamicProps":false,"dynamicItems":false};
+validate115.evaluated = {"props":{"body":true,"confidence":true,"github_comment_id":true,"github_comment_url":true,"github_publication_status":true,"github_thread_id":true,"id":true,"job_id":true,"line":true,"path":true,"prompt_for_agents":true,"resolved_at":true,"severity":true,"side":true,"sources":true,"status":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate114(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

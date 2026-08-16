@@ -1895,6 +1895,11 @@ export interface components {
         CodeReviewCandidateRejection: {
             body: string;
             candidate_id: string;
+            /**
+             * @description Strength of the evidence for the candidate, independently of impact.
+             *     `high`, `medium`, or `low`; legacy records default to `medium`.
+             */
+            confidence?: string;
             /** Format: int64 */
             line: number;
             path: string;
@@ -1929,6 +1934,11 @@ export interface components {
          */
         CodeReviewFinding: {
             body: string;
+            /**
+             * @description Strength of the evidence for the issue, independently of impact.
+             *     `high`, `medium`, or `low`; legacy records default to `medium`.
+             */
+            confidence?: string;
             /** Format: int64 */
             github_comment_id?: number | null;
             github_comment_url?: string;
@@ -1952,8 +1962,8 @@ export interface components {
          * @description The outcome of attempting to publish a finding as an inline GitHub comment.
          * @enum {string}
          */
-        CodeReviewFindingPublicationStatus: "pending" | "published" | "not_eligible" | "failed";
-        /** @description A persona/candidate that contributed to a confirmed published finding. */
+        CodeReviewFindingPublicationStatus: "pending" | "published" | "not_eligible" | "suppressed_by_policy" | "failed";
+        /** @description A persona/candidate that contributed to a confirmed finding. */
         CodeReviewFindingSource: {
             candidate_id: string;
             reviewer_id: string;

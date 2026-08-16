@@ -24,9 +24,11 @@ export interface PullRequestPill {
 export interface PullRequestReviewFinding {
   readonly location: string;
   readonly severity: string;
+  readonly confidence: string;
   readonly body: string;
   readonly prompt: string;
   readonly status: string;
+  readonly publicationStatus: string;
 }
 
 export interface PullRequestRow {
@@ -342,9 +344,11 @@ const rowFromPullRequest = (
     .map((finding) => Object.freeze({
       location: `${finding.path}:${finding.line}`,
       severity: finding.severity,
+      confidence: finding.confidence ?? "medium",
       body: finding.body,
       prompt: finding.prompt_for_agents ?? "",
       status: finding.status,
+      publicationStatus: finding.github_publication_status ?? "pending",
     }));
   const comments = pr.comments ?? 0;
   const lastComment = pr.last_comment_at === null || pr.last_comment_at === undefined

@@ -1487,11 +1487,14 @@ function JobDetailPane({
           <article class={`finding ${finding.severity}`} key={finding.id}>
             <header>
               <strong>
-                {finding.severity.toUpperCase()} · {finding.path}:{finding.line}
+                Severity: {finding.severity.toUpperCase()} · Confidence: {finding.confidence.toUpperCase()} · {finding.path}:{finding.line}
               </strong>
               <StatusPill status={finding.status} />
             </header>
             <p>{finding.body}</p>
+            {finding.github_publication_status === "suppressed_by_policy" && (
+              <small>Retained in Trouve · Not posted to GitHub by confidence policy</small>
+            )}
             <small>
               Found by {finding.sources.map((source) => source.reviewer_name).join(", ") || "legacy review"}
             </small>
@@ -1512,7 +1515,7 @@ function JobDetailPane({
                 <article class="candidate-rejection" key={rejection.candidate_id}>
                   <header>
                     <strong>
-                      {rejection.severity.toUpperCase()} · {rejection.path}:{rejection.line}
+                      Severity: {rejection.severity.toUpperCase()} · Confidence: {rejection.confidence.toUpperCase()} · {rejection.path}:{rejection.line}
                     </strong>
                     <span>{rejection.reviewer_name}</span>
                   </header>

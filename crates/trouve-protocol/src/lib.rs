@@ -267,7 +267,10 @@ pub use requests::*;
 // requests so session navigators can render their terminal PR state.
 // 6.0: interactive and code-review personas become one Persona catalog;
 // AgentPersona/PersonaInfo and /v1/personas replace the former split names.
-pub const PROTOCOL_VERSION: &str = "6.0";
+// 6.1: code-review findings and candidate rejections expose confidence
+// alongside severity, plus an explicit publication-policy suppression outcome
+// for confirmed findings retained internally but not posted (additive).
+pub const PROTOCOL_VERSION: &str = "6.1";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

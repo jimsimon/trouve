@@ -162,9 +162,11 @@ describe("pull request dashboard model", () => {
                 line: 17,
                 side: "RIGHT",
                 severity: "high",
+                confidence: "high",
                 body: "Handle the failure.",
                 status: "open",
                 prompt_for_agents: "Fix the failure path.",
+                github_publication_status: "published",
               },
               {
                 id: "finding-fixed",
@@ -222,7 +224,9 @@ describe("pull request dashboard model", () => {
       reviewFindings: [{
         location: "src/main.ts:17",
         severity: "high",
+        confidence: "high",
         prompt: "Fix the failure path.",
+        publicationStatus: "published",
       }],
     });
   });

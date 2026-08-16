@@ -383,6 +383,7 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   line INTEGER NOT NULL,
   side TEXT NOT NULL,
   severity TEXT NOT NULL,
+  confidence TEXT NOT NULL DEFAULT 'medium',
   body TEXT NOT NULL,
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'open',
@@ -421,6 +422,7 @@ CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
   line INTEGER NOT NULL,
   side TEXT NOT NULL,
   severity TEXT NOT NULL,
+  confidence TEXT NOT NULL DEFAULT 'medium',
   body TEXT NOT NULL,
   reason TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -546,6 +548,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_tasks ADD COLUMN model_started_at TEXT",
     "ALTER TABLE code_review_tasks ADD COLUMN last_progress_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN github_publication_status TEXT NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE code_review_findings ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
+    "ALTER TABLE code_review_candidate_rejections ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -1655,6 +1659,9 @@ fn code_review_publication_status(
     match value {
         "published" => trouve_protocol::CodeReviewFindingPublicationStatus::Published,
         "not_eligible" => trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
+        "suppressed_by_policy" => {
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
+        }
         "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
         _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
     }
@@ -2142,6 +2149,7 @@ pub struct NewCodeReviewFinding {
     pub line: u64,
     pub side: String,
     pub severity: String,
+    pub confidence: String,
     pub body: String,
     pub prompt_for_agents: String,
     pub sources: Vec<trouve_protocol::CodeReviewFindingSource>,
@@ -6988,9 +6996,9 @@ impl Store {
             let finding_id = crate::new_id("rvf");
             tx.execute(
                 "INSERT INTO code_review_findings
-                        (id, job_id, path, line, side, severity, body,
+                        (id, job_id, path, line, side, severity, confidence, body,
                          prompt_for_agents, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10)",
                 params![
                     finding_id,
                     job_id,
@@ -6998,6 +7006,7 @@ impl Store {
                     finding.line as i64,
                     finding.side,
                     finding.severity,
+                    finding.confidence,
                     finding.body,
                     finding.prompt_for_agents,
                     now,
@@ -7030,8 +7039,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO code_review_candidate_rejections
                         (candidate_id, job_id, task_id, reviewer_id, reviewer_name,
-                         path, line, side, severity, body, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         path, line, side, severity, confidence, body, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     rejection.candidate_id,
                     job_id,
@@ -7042,6 +7051,7 @@ impl Store {
                     rejection.line as i64,
                     rejection.side,
                     rejection.severity,
+                    rejection.confidence,
                     rejection.body,
                     rejection.reason,
                     now,
@@ -7073,7 +7083,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT candidate_id, task_id, reviewer_id, reviewer_name,
-                    path, line, side, severity, body, reason
+                    path, line, side, severity, confidence, body, reason
              FROM code_review_candidate_rejections
              WHERE job_id = ?1
              ORDER BY reviewer_name, path, line, candidate_id",
@@ -7089,8 +7099,9 @@ impl Store {
                     line: row.get::<_, i64>(5)? as u64,
                     side: row.get(6)?,
                     severity: row.get(7)?,
-                    body: row.get(8)?,
-                    reason: row.get(9)?,
+                    confidence: row.get(8)?,
+                    body: row.get(9)?,
+                    reason: row.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -7160,6 +7171,9 @@ impl Store {
             trouve_protocol::CodeReviewFindingPublicationStatus::Pending => "pending",
             trouve_protocol::CodeReviewFindingPublicationStatus::Published => "published",
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible => "not_eligible",
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy => {
+                "suppressed_by_policy"
+            }
             trouve_protocol::CodeReviewFindingPublicationStatus::Failed => "failed",
         };
         let mut conn = self.conn.lock().unwrap();
@@ -7304,7 +7318,7 @@ impl Store {
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT j.installation_id, j.repository, j.pull_number,
-                    f.id, f.job_id, f.path, f.line, f.side, f.severity, f.body,
+                    f.id, f.job_id, f.path, f.line, f.side, f.severity, f.confidence, f.body,
                     f.prompt_for_agents, f.status, f.github_comment_id,
                     f.github_comment_url, f.github_publication_status,
                     f.github_thread_id, f.resolved_at
@@ -7338,17 +7352,18 @@ impl Store {
                         line: row.get::<_, i64>(6)? as u64,
                         side: row.get(7)?,
                         severity: row.get(8)?,
-                        body: row.get(9)?,
-                        prompt_for_agents: row.get(10)?,
-                        status: row.get(11)?,
+                        confidence: row.get(9)?,
+                        body: row.get(10)?,
+                        prompt_for_agents: row.get(11)?,
+                        status: row.get(12)?,
                         sources: Vec::new(),
-                        github_comment_id: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
-                        github_comment_url: row.get(13)?,
+                        github_comment_id: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
+                        github_comment_url: row.get(14)?,
                         github_publication_status: code_review_publication_status(
-                            &row.get::<_, String>(14)?,
+                            &row.get::<_, String>(15)?,
                         ),
-                        github_thread_id: row.get(15)?,
-                        resolved_at: parse_optional_datetime(row.get(16)?),
+                        github_thread_id: row.get(16)?,
+                        resolved_at: parse_optional_datetime(row.get(17)?),
                     },
                 ))
             })?
@@ -7363,7 +7378,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let base_rows: Vec<trouve_protocol::CodeReviewFinding> = {
             let mut stmt = conn.prepare(
-                "SELECT id, job_id, path, line, side, severity, body,
+                "SELECT id, job_id, path, line, side, severity, confidence, body,
                         prompt_for_agents, status, github_comment_id,
                         github_comment_url, github_publication_status,
                         github_thread_id, resolved_at
@@ -7378,17 +7393,18 @@ impl Store {
                     line: row.get::<_, i64>(3)? as u64,
                     side: row.get(4)?,
                     severity: row.get(5)?,
-                    body: row.get(6)?,
-                    prompt_for_agents: row.get(7)?,
-                    status: row.get(8)?,
+                    confidence: row.get(6)?,
+                    body: row.get(7)?,
+                    prompt_for_agents: row.get(8)?,
+                    status: row.get(9)?,
                     sources: Vec::new(),
-                    github_comment_id: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
-                    github_comment_url: row.get(10)?,
+                    github_comment_id: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+                    github_comment_url: row.get(11)?,
                     github_publication_status: code_review_publication_status(
-                        &row.get::<_, String>(11)?,
+                        &row.get::<_, String>(12)?,
                     ),
-                    github_thread_id: row.get(12)?,
-                    resolved_at: parse_optional_datetime(row.get(13)?),
+                    github_thread_id: row.get(13)?,
+                    resolved_at: parse_optional_datetime(row.get(14)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -12263,6 +12279,7 @@ mod tests {
                     line: 3,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
                     body: "finding".into(),
                     prompt_for_agents: "fix".into(),
                     sources: Vec::new(),
@@ -12336,6 +12353,7 @@ mod tests {
                     line: 3,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
                     body: "finding".into(),
                     prompt_for_agents: "fix".into(),
                     sources: Vec::new(),
@@ -12881,6 +12899,7 @@ mod tests {
                     line: 12,
                     side: "RIGHT".into(),
                     severity: "high".into(),
+                    confidence: "high".into(),
                     body: "The error is ignored.".into(),
                     prompt_for_agents: "Handle the error at src/lib.rs:12.".into(),
                     sources: vec![trouve_protocol::CodeReviewFindingSource {
@@ -12899,6 +12918,7 @@ mod tests {
                     line: 18,
                     side: "RIGHT".into(),
                     severity: "low".into(),
+                    confidence: "high".into(),
                     body: "This branch could be simplified.".into(),
                     reason: "This is a non-actionable style preference.".into(),
                 }],
@@ -12911,6 +12931,7 @@ mod tests {
         assert_eq!(detail.tasks[0].output, "candidate output");
         assert_eq!(detail.personas[0].candidate_issue_count, 1);
         assert_eq!(detail.candidate_rejections.len(), 1);
+        assert_eq!(detail.candidate_rejections[0].confidence, "high");
         assert_eq!(
             detail.candidate_rejections[0].reason,
             "This is a non-actionable style preference."
@@ -12918,6 +12939,7 @@ mod tests {
         assert_eq!(detail.personas[0].confirmed_issue_count, 1);
         assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
+        assert_eq!(detail.findings[0].confidence, "high");
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
         assert_eq!(detail.routing_decisions, routing_decisions);
 
