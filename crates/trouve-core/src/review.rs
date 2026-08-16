@@ -2869,13 +2869,13 @@ impl Engine {
         let mut page = 1;
         loop {
             let (pull_page, rate): (Vec<GithubPullRequest>, _) = api
-                .get_cached(
-                    &format!(
-                        "/repos/{}/pulls?state=open&per_page=100&page={page}",
-                        repository.repository
-                    ),
-                    &self.code_review.rest_cache,
-                )
+                // Draft status is an automatic-review eligibility boundary.
+                // Do not let a cached pre-transition response enqueue costly
+                // work after GitHub has converted a pull request to draft.
+                .get(&format!(
+                    "/repos/{}/pulls?state=open&per_page=100&page={page}",
+                    repository.repository
+                ))
                 .await
                 .with_context(|| format!("listing pull requests for {}", repository.repository))?;
             self.record_review_rate(rate);
@@ -2915,6 +2915,12 @@ impl Engine {
             let result = (|| -> Result<()> {
                 validate_sha(&pull.base.sha)?;
                 validate_sha(&pull.head.sha)?;
+                if pull.draft {
+                    self.supersede_automatic_code_reviews_for_draft(
+                        &repository.repository,
+                        pull.number,
+                    )?;
+                }
                 let superseded = self.store.supersede_code_review_jobs(
                     &repository.repository,
                     pull.number,
@@ -3053,6 +3059,24 @@ impl Engine {
         Ok(had_errors)
     }
 
+    fn supersede_automatic_code_reviews_for_draft(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<()> {
+        let superseded = self
+            .store
+            .supersede_automatic_code_review_jobs_for_draft(repository, pull_number)?;
+        if superseded.is_empty() {
+            return Ok(());
+        }
+        self.code_review.cancel_superseded(&superseded);
+        for job_id in superseded {
+            self.emit_code_review_updated(Some(job_id))?;
+        }
+        Ok(())
+    }
+
     async fn poll_manual_review_comments(
         &self,
         api: &GithubApi,
@@ -3183,6 +3207,7 @@ impl Engine {
                     | "reopened"
                     | "synchronize"
                     | "ready_for_review"
+                    | "converted_to_draft"
                     | "review_requested"
                     | "review_request_removed"
             );
@@ -3227,6 +3252,16 @@ impl Engine {
             .claim_github_webhook_delivery(delivery_id, durable_request)?
         {
             return Ok(());
+        }
+        if event == "pull_request" && action == "converted_to_draft" && !repository_name.is_empty()
+        {
+            let pull_number = payload["number"]
+                .as_u64()
+                .or_else(|| payload["pull_request"]["number"].as_u64())
+                .unwrap_or_default();
+            if pull_number > 0 {
+                self.supersede_automatic_code_reviews_for_draft(repository_name, pull_number)?;
+            }
         }
         if let Some(repository) = repository {
             let engine = self.clone();
@@ -12986,6 +13021,41 @@ mod tests {
                 pull_number: 42,
                 trigger_key: "manual:comment:100".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn converted_to_draft_webhook_stops_automatic_review() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:automatic-draft");
+        let mut engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        engine.secrets = Arc::new(trouve_providers::secrets::FileStore::new(
+            data.path().join("secrets.json"),
+        ));
+        let engine = Arc::new(engine);
+        engine.secrets.set(WEBHOOK_SECRET, "shared-secret").unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "converted_to_draft",
+            "number": 42,
+            "installation": {"id": 7},
+            "repository": {"full_name": "acme/widgets"},
+            "pull_request": {"number": 42, "draft": true}
+        }))
+        .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(&body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        engine
+            .accept_github_review_webhook("pull_request", "delivery-draft-1", &signature, &body)
+            .unwrap();
+
+        let stopped = engine.store.code_review_job(&job.id).unwrap().unwrap().job;
+        assert_eq!(stopped.status, "stale");
+        assert_eq!(
+            stopped.error,
+            "pull request is a draft; automatic review stopped"
         );
     }
 
