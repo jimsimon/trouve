@@ -8157,7 +8157,7 @@ mod tests {
                 job_id: queued.id.clone(),
                 role: trouve_protocol::CodeReviewTaskRole::Reviewer,
                 reviewer_id: Some("reliability".into()),
-                reviewer_name: "Reliability Engineer".into(),
+                reviewer_name: "Application Reliability Engineer".into(),
                 batch_index: 0,
                 batch_count: 1,
                 model: Some("provider/reviewer".into()),
@@ -8199,7 +8199,7 @@ mod tests {
         let body = render_lifecycle_comment(&detail);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Succeeded"));
         assert!(body.contains("### Reviewer coverage"));
-        assert!(body.contains("| Reliability Engineer | Not Applicable |"));
+        assert!(body.contains("| Application Reliability Engineer | Not Applicable |"));
         assert!(body.contains("**Result:** 1 confirmed issue(s)"));
         assert!(body.contains("### Confirmed issues"));
         assert!(body.contains("- **HIGH** — `src/lib.rs` line 42: Handle the error"));
@@ -9446,7 +9446,7 @@ mod tests {
                 job_id: queued.id.clone(),
                 role: trouve_protocol::CodeReviewTaskRole::Reviewer,
                 reviewer_id: Some("reliability".into()),
-                reviewer_name: "Reliability Engineer".into(),
+                reviewer_name: "Application Reliability Engineer".into(),
                 batch_index: 0,
                 batch_count: 1,
                 model: Some("provider/reviewer".into()),
@@ -9513,7 +9513,7 @@ mod tests {
         let running = render_check_details(&detail, &latest_tasks);
         assert!(running.contains("Reviewers are examining the current revision."));
         assert!(running.contains("### Reviewer status"));
-        assert!(running.contains("Reliability Engineer"));
+        assert!(running.contains("Application Reliability Engineer"));
         assert!(running.contains("| Running | 0/1 |"));
         assert!(!running.contains("stale router failure"));
 

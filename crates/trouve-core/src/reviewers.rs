@@ -37,7 +37,7 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
         ),
         built_in(
             "reliability",
-            "Reliability Engineer",
+            "Application Reliability Engineer",
             "Review failure paths, retries, timeouts, cancellation, cleanup, partial writes, idempotency, resource lifetime, and recovery after interruption. Identify failures that can corrupt state, leak resources, hang, or hide actionable errors.",
         ),
         built_in(
@@ -64,11 +64,6 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
             "testing",
             "Test Engineer",
             "Identify changed behavior that lacks meaningful coverage, tests that can pass while the implementation is broken, missing negative or boundary cases, nondeterministic tests, and validation that does not exercise the real integration path.",
-        ),
-        built_in(
-            "maintainability",
-            "Software Architect",
-            "Look for unnecessary coupling, duplicated sources of truth, violated module boundaries, misleading abstractions, brittle control flow, unreachable or obsolete code, and complexity that is likely to cause future correctness defects.",
         ),
         built_in(
             "dependencies",
@@ -204,13 +199,12 @@ mod tests {
         for (id, name) in [
             ("correctness", "Correctness Analyst"),
             ("security", "Security Engineer"),
-            ("reliability", "Reliability Engineer"),
+            ("reliability", "Application Reliability Engineer"),
             ("performance", "Performance Engineer"),
             ("concurrency", "Concurrency Specialist"),
             ("api-compatibility", "API Steward"),
             ("data-integrity", "Data Integrity Specialist"),
             ("testing", "Test Engineer"),
-            ("maintainability", "Software Architect"),
             ("dependencies", "Supply Chain Analyst"),
             ("accessibility", "Accessibility Specialist"),
             ("operations", "Site Reliability Engineer"),
