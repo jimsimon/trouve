@@ -565,7 +565,7 @@ test("Personas & Models uses provider-qualified model labels", async ({ page }) 
   await expect(page.getByRole("heading", { name: "Personas & Models", exact: true }))
     .toBeVisible();
   await expect(page.getByRole("option", { name: "codex/gpt-5.6-sol", exact: true }))
-    .toHaveCount(4);
+    .toHaveCount(5);
   await expect(page.getByRole("option", { name: "GPT-5.6 Sol", exact: true }))
     .toHaveCount(0);
 });
