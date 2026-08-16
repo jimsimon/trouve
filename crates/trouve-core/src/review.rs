@@ -70,7 +70,10 @@ const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
 const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 24;
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
-const REVIEW_BATCH_MAX_FILES: usize = 24;
+// The changed-path list is rendered outside `ReviewBatch::diff`, so bound it
+// separately. A byte budget admits many short paths without letting unusual
+// path names make the model request unbounded.
+const REVIEW_BATCH_MAX_PATH_BYTES: usize = 16 * 1024;
 const REVIEW_COORDINATOR_CONTEXT_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_DIFF_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
@@ -839,6 +842,53 @@ struct ReviewFinding {
 struct ReviewBatch {
     paths: Vec<String>,
     diff: String,
+}
+
+#[derive(Debug)]
+struct ReviewBatchAccumulator {
+    batch: ReviewBatch,
+    estimated_tokens: usize,
+    path_bytes: usize,
+}
+
+impl ReviewBatchAccumulator {
+    fn with_section(path: &str, section: String, estimated_tokens: usize) -> Self {
+        Self {
+            batch: ReviewBatch {
+                paths: vec![path.to_owned()],
+                diff: section,
+            },
+            estimated_tokens,
+            path_bytes: path.len(),
+        }
+    }
+
+    fn additional_path_bytes(&self, path: &str) -> usize {
+        if self.batch.paths.iter().any(|candidate| candidate == path) {
+            0
+        } else {
+            path.len() + usize::from(!self.batch.paths.is_empty()) * 2
+        }
+    }
+
+    fn fits(&self, path: &str, section: &str, section_tokens: usize) -> bool {
+        self.batch.diff.len().saturating_add(section.len()) <= REVIEW_BATCH_MAX_BYTES
+            && self.estimated_tokens.saturating_add(section_tokens) <= REVIEW_BATCH_TARGET_TOKENS
+            && self
+                .path_bytes
+                .saturating_add(self.additional_path_bytes(path))
+                <= REVIEW_BATCH_MAX_PATH_BYTES
+    }
+
+    fn push(&mut self, path: &str, section: &str, section_tokens: usize) {
+        let additional_path_bytes = self.additional_path_bytes(path);
+        if additional_path_bytes > 0 {
+            self.batch.paths.push(path.to_owned());
+            self.path_bytes += additional_path_bytes;
+        }
+        self.batch.diff.push_str(section);
+        self.estimated_tokens += section_tokens;
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -6590,12 +6640,13 @@ fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
             diff: "No textual file changes were reported by git.".into(),
         }];
     }
-    let mut batches = Vec::new();
-    let mut current = ReviewBatch {
-        paths: Vec::new(),
-        diff: String::new(),
-    };
+    let mut batches = Vec::<ReviewBatchAccumulator>::new();
     for file in files {
+        if is_generated_review_artifact(file) {
+            let section = generated_review_artifact_summary(file);
+            pack_review_section(&mut batches, &file.path, section);
+            continue;
+        }
         // Reserve enough room for the repeated path/fragment header so even
         // one very large file cannot produce an oversized model request.
         let largest_header = format!("\n=== {} (diff fragment {}) ===\n", file.path, usize::MAX);
@@ -6612,28 +6663,80 @@ fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
                 index + 1,
                 chunk
             );
-            if !current.diff.is_empty()
-                && (current.diff.len() + section.len() > REVIEW_BATCH_MAX_BYTES
-                    || estimated_tokens(&current.diff) + estimated_tokens(&section)
-                        > REVIEW_BATCH_TARGET_TOKENS
-                    || current.paths.len() >= REVIEW_BATCH_MAX_FILES)
-            {
-                batches.push(current);
-                current = ReviewBatch {
-                    paths: Vec::new(),
-                    diff: String::new(),
-                };
-            }
-            if !current.paths.contains(&file.path) {
-                current.paths.push(file.path.clone());
-            }
-            current.diff.push_str(&section);
+            pack_review_section(&mut batches, &file.path, section);
         }
     }
-    if !current.diff.is_empty() {
-        batches.push(current);
+    batches.into_iter().map(|batch| batch.batch).collect()
+}
+
+fn pack_review_section(batches: &mut Vec<ReviewBatchAccumulator>, path: &str, section: String) {
+    let section_tokens = estimated_tokens(&section);
+    // Best-fit backfills an earlier batch when a large intervening file did
+    // not fit there. This preserves section order within every batch while
+    // avoiding a small tail batch from a purely sequential first-fit pass.
+    let best_fit = batches
+        .iter()
+        .enumerate()
+        .filter(|(_, batch)| batch.fits(path, &section, section_tokens))
+        .max_by_key(|(_, batch)| batch.batch.diff.len())
+        .map(|(index, _)| index);
+    if let Some(index) = best_fit {
+        batches[index].push(path, &section, section_tokens);
+    } else {
+        batches.push(ReviewBatchAccumulator::with_section(
+            path,
+            section,
+            section_tokens,
+        ));
     }
-    batches
+}
+
+fn is_generated_review_artifact(file: &ReviewDiffFile) -> bool {
+    let path = file.path.replace('\\', "/");
+    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+    let conventional_path = path.split('/').any(|component| {
+        matches!(
+            component,
+            "generated" | "snapshots" | "__snapshots__" | "__screenshots__"
+        )
+    });
+    let conventional_file = matches!(
+        file_name,
+        "Cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
+    ) || file_name.ends_with(".snap")
+        || file_name.ends_with(".min.js")
+        || file_name.ends_with(".min.css")
+        || file_name.ends_with(".map");
+    if conventional_path || conventional_file {
+        return true;
+    }
+
+    let prefix = file.diff.chars().take(4_096).collect::<String>();
+    let prefix = prefix.to_ascii_lowercase();
+    prefix.contains("@generated")
+        || prefix.contains("auto-generated")
+        || prefix.contains("automatically generated")
+        || (prefix.contains("generated file") && prefix.contains("do not edit"))
+}
+
+fn generated_review_artifact_summary(file: &ReviewDiffFile) -> String {
+    let mut additions = 0_usize;
+    let mut deletions = 0_usize;
+    for line in file.diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            additions += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            deletions += 1;
+        }
+    }
+    format!(
+        "\n=== {} (generated artifact summary) ===\n\
+         Full generated diff omitted from focused review: {additions} added and {deletions} \
+         removed lines ({} bytes). Review the corresponding source or generator changes; \
+         inspect this artifact only when they leave a concrete ambiguity.\n",
+        file.path,
+        file.diff.len()
+    )
 }
 
 fn estimated_tokens(text: &str) -> usize {
@@ -12217,6 +12320,86 @@ mod tests {
             batch.diff.len() <= REVIEW_BATCH_MAX_BYTES
                 && estimated_tokens(&batch.diff) <= REVIEW_BATCH_TARGET_TOKENS + 1
         }));
+    }
+
+    #[test]
+    fn generated_artifacts_are_summarized_instead_of_multiplying_batches() {
+        let files = vec![
+            ReviewDiffFile {
+                path: "src/implementation.rs".into(),
+                diff: "+let reviewed = true;\n".into(),
+            },
+            ReviewDiffFile {
+                path: "web/src/generated/protocol-validators.ts".into(),
+                diff: "+generated_validator_row();\n".repeat(50_000),
+            },
+        ];
+
+        let batches = build_review_batches(&files);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].paths.len(), 2);
+        assert!(batches[0].diff.contains("generated artifact summary"));
+        assert!(batches[0].diff.contains("50000 added"));
+        assert!(!batches[0].diff.contains("generated_validator_row"));
+        assert!(batches[0].diff.len() < 4_096);
+    }
+
+    #[test]
+    fn generated_markers_are_compacted_outside_conventional_paths() {
+        let file = ReviewDiffFile {
+            path: "sdk/client.ts".into(),
+            diff:
+                "// This file was auto-generated. Do not edit.\n+export const generated = true;\n"
+                    .into(),
+        };
+
+        assert!(is_generated_review_artifact(&file));
+        let batches = build_review_batches(&[file]);
+        assert!(batches[0].diff.contains("generated artifact summary"));
+        assert!(!batches[0].diff.contains("export const"));
+    }
+
+    #[test]
+    fn review_batch_packing_backfills_earlier_capacity() {
+        let files = vec![
+            ReviewDiffFile {
+                path: "src/first.rs".into(),
+                diff: "a".repeat(60_000),
+            },
+            ReviewDiffFile {
+                path: "src/second.rs".into(),
+                diff: "b".repeat(75_000),
+            },
+            ReviewDiffFile {
+                path: "src/third.rs".into(),
+                diff: "c".repeat(30_000),
+            },
+        ];
+
+        let batches = build_review_batches(&files);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0].paths,
+            vec!["src/first.rs".to_owned(), "src/third.rs".to_owned()]
+        );
+        assert_eq!(batches[1].paths, vec!["src/second.rs".to_owned()]);
+    }
+
+    #[test]
+    fn many_short_paths_share_a_batch_within_the_path_budget() {
+        let files = (0..100)
+            .map(|index| ReviewDiffFile {
+                path: format!("src/module_{index}.rs"),
+                diff: "+changed();\n".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let batches = build_review_batches(&files);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].paths.len(), files.len());
     }
 
     #[test]
