@@ -3,7 +3,7 @@
 //! Everything shells out to `git`; all functions are synchronous and are
 //! called via `spawn_blocking` from async code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -2301,14 +2301,120 @@ pub fn session_diff_files(worktree: &Path, base_ref: &str) -> Result<Vec<String>
 /// Materialize bounded per-file patches from one immutable private-index
 /// snapshot. This avoids rebuilding and rehashing the complete worktree once
 /// per file in the headless review loader.
-pub fn session_diff_patches_cancellable(
+pub struct SessionReviewDiffFile {
+    pub path: String,
+    pub diff: String,
+    /// Trusted marker-bearing header lines from the snapshot-side file, or
+    /// from the base blob when the patch deletes the file.
+    pub generated_header: Option<String>,
+}
+
+fn review_blob_headers(
+    worktree: &Path,
+    treeish: &str,
+    paths: &[&str],
+    index: &TemporaryCheckpointIndex,
+    operation: &GitOperation<'_>,
+) -> Result<HashMap<String, String>> {
+    const HEADER_LINES: u64 = 20;
+    const PATHS_PER_GREP: usize = 16;
+    const OUTPUT_BYTES_PER_PATH: usize = 64 * 1024;
+    const MARKERS: &[&str] = &[
+        "@generated",
+        "auto-generated",
+        "automatically generated",
+        "generated file",
+        "do not edit",
+    ];
+
+    let mut headers = HashMap::<String, String>::new();
+    for paths in paths.chunks(PATHS_PER_GREP) {
+        let mut args = vec![
+            "--literal-pathspecs".to_owned(),
+            "grep".to_owned(),
+            "-I".to_owned(),
+            "-i".to_owned(),
+            "-n".to_owned(),
+            "-z".to_owned(),
+            "-m".to_owned(),
+            HEADER_LINES.to_string(),
+        ];
+        for marker in MARKERS {
+            args.push("-e".to_owned());
+            args.push((*marker).to_owned());
+        }
+        args.push(treeish.to_owned());
+        args.push("--".to_owned());
+        args.extend(paths.iter().map(|path| (*path).to_owned()));
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = match run_git_bounded(
+            worktree,
+            Some(index),
+            &refs,
+            None,
+            paths.len().saturating_mul(OUTPUT_BYTES_PER_PATH),
+            operation,
+        ) {
+            Ok(output) => output,
+            Err(_) => {
+                // No matches exits 1. Other lookup failures also safely keep
+                // the affected full diffs reviewable.
+                operation.check()?;
+                continue;
+            }
+        };
+        let name_prefix = format!("{treeish}:");
+        let mut rest = output.bytes.as_slice();
+        while let Some(name_end) = rest.iter().position(|byte| *byte == 0) {
+            let name = &rest[..name_end];
+            rest = &rest[name_end + 1..];
+            let Some(line_end) = rest.iter().position(|byte| *byte == 0) else {
+                break;
+            };
+            let line = &rest[..line_end];
+            rest = &rest[line_end + 1..];
+            let Some(content_end) = rest.iter().position(|byte| *byte == b'\n') else {
+                break;
+            };
+            let content = &rest[..content_end];
+            rest = &rest[content_end + 1..];
+            let Ok(name) = std::str::from_utf8(name) else {
+                continue;
+            };
+            let Some(line) = std::str::from_utf8(line)
+                .ok()
+                .and_then(|line| line.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(path) = name.strip_prefix(&name_prefix) else {
+                continue;
+            };
+            if line > HEADER_LINES || !paths.contains(&path) {
+                continue;
+            }
+            let header = headers.entry(path.to_owned()).or_default();
+            if !header.is_empty() {
+                header.push('\n');
+            }
+            header.push_str(&String::from_utf8_lossy(content));
+        }
+    }
+    Ok(headers)
+}
+
+pub fn session_diff_patches_cancellable<F>(
     worktree: &Path,
     base_ref: &str,
     max_files: usize,
     max_changed_lines: u64,
     max_total_bytes: usize,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<Vec<(String, String)>> {
+    capture_header: F,
+) -> Result<Vec<SessionReviewDiffFile>>
+where
+    F: Fn(&str) -> bool,
+{
     ensure_safe_ref(base_ref)?;
     let operation = GitOperation::new(Some(cancel));
     with_session_snapshot_index(worktree, &operation, |index| {
@@ -2341,7 +2447,50 @@ pub fn session_diff_patches_cancellable(
                     "review diff is too large (more than {max_total_bytes} bytes)"
                 )));
             }
-            patches.push((file.path, diff));
+            patches.push(SessionReviewDiffFile {
+                path: file.path,
+                diff,
+                generated_header: None,
+            });
+        }
+        let (deleted, current): (Vec<_>, Vec<_>) = patches
+            .iter()
+            .filter(|file| capture_header(&file.path))
+            .partition(|file| {
+                file.diff
+                    .lines()
+                    .any(|line| line.starts_with("deleted file mode "))
+            });
+        let deleted = deleted
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let current = current
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let mut headers = review_blob_headers(worktree, base_ref, &deleted, index, &operation)?;
+        if !current.is_empty() {
+            let tree = run_git_bounded(
+                worktree,
+                Some(index),
+                &["write-tree"],
+                None,
+                128,
+                &operation,
+            )?;
+            let tree = String::from_utf8(tree.bytes)
+                .context("git write-tree returned a non-UTF-8 object id")?;
+            headers.extend(review_blob_headers(
+                worktree,
+                tree.trim(),
+                &current,
+                index,
+                &operation,
+            )?);
+        }
+        for file in &mut patches {
+            file.generated_header = headers.remove(&file.path);
         }
         Ok(patches)
     })
@@ -2983,6 +3132,68 @@ mod tests {
         assert!(first.contains("+two"));
         assert!(second.contains("+added"));
         assert!(session_diff_path(tmp.path(), &base, "../outside").is_err());
+    }
+
+    #[test]
+    fn review_diff_loads_generated_headers_from_head_and_deleted_base_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        let header = "// This file was auto-generated. Do not edit.\n";
+        let modified_path = generated.join("modified.rs");
+        let deleted_path = generated.join("deleted.rs");
+        std::fs::write(
+            &modified_path,
+            format!("{header}{}old();\n", "// filler\n".repeat(30)),
+        )
+        .unwrap();
+        std::fs::write(&deleted_path, format!("{header}deleted();\n")).unwrap();
+        run(tmp.path(), &["add", "generated"]);
+        run(tmp.path(), &["commit", "-m", "add generated files"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        std::fs::write(
+            &modified_path,
+            format!("{header}{}new();\n", "// filler\n".repeat(30)),
+        )
+        .unwrap();
+        std::fs::remove_file(&deleted_path).unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            10,
+            1_000,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+        let modified = files
+            .iter()
+            .find(|file| file.path == "generated/modified.rs")
+            .unwrap();
+        let deleted = files
+            .iter()
+            .find(|file| file.path == "generated/deleted.rs")
+            .unwrap();
+
+        assert!(!modified.diff.contains("auto-generated"));
+        assert!(
+            modified
+                .generated_header
+                .as_deref()
+                .unwrap()
+                .contains("auto-generated")
+        );
+        assert!(
+            deleted
+                .generated_header
+                .as_deref()
+                .unwrap()
+                .contains("auto-generated")
+        );
     }
 
     #[test]

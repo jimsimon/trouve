@@ -918,6 +918,30 @@ async fn run_review_command_with_timeout(
 pub struct ReviewDiffFile {
     pub path: String,
     pub diff: String,
+    /// Trusted marker-bearing header lines loaded from the current snapshot,
+    /// or the base blob for a deleted file. PR-controlled patch text never
+    /// populates this field.
+    pub generated_header: Option<String>,
+}
+
+pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+    if matches!(
+        file_name,
+        "Cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
+    ) {
+        return false;
+    }
+    path.split('/').any(|component| {
+        matches!(
+            component,
+            "generated" | "snapshots" | "__snapshots__" | "__screenshots__"
+        )
+    }) || file_name.ends_with(".snap")
+        || file_name.ends_with(".min.js")
+        || file_name.ends_with(".min.css")
+        || file_name.ends_with(".map")
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -2273,11 +2297,16 @@ impl ToolExecutor for LocalToolExecutor {
                 MAX_REVIEW_DIFF_CHANGED_LINES,
                 MAX_REVIEW_DIFF_BYTES,
                 &cancel,
+                is_conventional_generated_artifact_path,
             )
             .map(|files| {
                 files
                     .into_iter()
-                    .map(|(path, diff)| ReviewDiffFile { path, diff })
+                    .map(|file| ReviewDiffFile {
+                        path: file.path,
+                        diff: file.diff,
+                        generated_header: file.generated_header,
+                    })
                     .collect()
             })
         })

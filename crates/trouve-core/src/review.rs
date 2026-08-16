@@ -333,7 +333,12 @@ impl ReviewDiffCache {
         self.remove(&key);
         let bytes = files
             .iter()
-            .map(|file| file.path.len().saturating_add(file.diff.len()))
+            .map(|file| {
+                file.path
+                    .len()
+                    .saturating_add(file.diff.len())
+                    .saturating_add(file.generated_header.as_ref().map_or(0, String::len))
+            })
             .sum();
         if bytes > REVIEW_DIFF_CACHE_MAX_BYTES {
             return;
@@ -883,7 +888,7 @@ fn review_batch_fingerprint(batch: &ReviewBatch, batch_index: usize, batch_count
 
 fn review_batch_identity(batch: &ReviewBatch, batch_index: usize, batch_count: usize) -> String {
     format!(
-        "Batch fingerprint: {}.",
+        "trouve-review-batch-v{REVIEW_BATCH_FORMAT_VERSION}:{}",
         review_batch_fingerprint(batch, batch_index, batch_count)
     )
 }
@@ -896,19 +901,24 @@ fn persisted_task_matches_batch(
     batch_index: usize,
     batch_count: usize,
 ) -> bool {
+    let expected = review_batch_identity(batch, batch_index, batch_count);
     persisted_batch_index == batch_index as u64
         && persisted_batch_count == batch_count as u64
-        && prompt.contains(&review_batch_identity(batch, batch_index, batch_count))
+        && prompt.lines().next() == Some(expected.as_str())
 }
 
 fn persisted_routing_matches_batches(
+    job: &trouve_protocol::CodeReviewJob,
+    reviewers: &[ReviewerProfile],
+    routing_decisions: &[CodeReviewRoutingDecision],
     tasks: &[trouve_protocol::CodeReviewTask],
     batches: &[ReviewBatch],
 ) -> bool {
-    batches.iter().enumerate().all(|(batch_index, batch)| {
-        tasks.iter().any(|task| {
+    let fallback = (job.routing_mode == CodeReviewRoutingMode::Additive)
+        .then(|| build_routing_decisions(job, reviewers, batches, &HashMap::new()));
+    let task_identities_match = batches.iter().enumerate().all(|(batch_index, batch)| {
+        let matches_identity = |task: &&trouve_protocol::CodeReviewTask| {
             task.role == trouve_protocol::CodeReviewTaskRole::Router
-                && task.status == "succeeded"
                 && persisted_task_matches_batch(
                     &task.prompt,
                     task.batch_index,
@@ -917,8 +927,41 @@ fn persisted_routing_matches_batches(
                     batch_index,
                     batches.len(),
                 )
-        })
-    })
+        };
+        if tasks
+            .iter()
+            .filter(matches_identity)
+            .any(|task| task.status == "succeeded")
+        {
+            return true;
+        }
+        tasks
+            .iter()
+            .filter(matches_identity)
+            .any(|task| task.status == "failed")
+            && fallback.as_ref().is_some_and(|fallback| {
+                routing_decisions
+                    .iter()
+                    .filter(|decision| decision.batch_index == batch_index as u64)
+                    .eq(fallback
+                        .iter()
+                        .filter(|decision| decision.batch_index == batch_index as u64))
+            })
+    });
+    if task_identities_match {
+        return true;
+    }
+
+    // Before router tasks existed for model-setup failures, Additive mode
+    // could persist only its content-independent baseline matrix. Rebuilding
+    // that exact matrix is safe even without a task fingerprint; any semantic
+    // selection or changed batch cardinality makes the comparison fail.
+    !tasks
+        .iter()
+        .any(|task| task.role == trouve_protocol::CodeReviewTaskRole::Router)
+        && fallback
+            .as_deref()
+            .is_some_and(|fallback| routing_decisions == fallback)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -3433,9 +3476,15 @@ impl Engine {
             && !semantic_routing_candidates(&job, &reviewers).is_empty()
         {
             let persisted_tasks = self.store.code_review_tasks(&job.id)?;
-            if !persisted_routing_matches_batches(&persisted_tasks, &batches) {
+            if !persisted_routing_matches_batches(
+                &job,
+                &reviewers,
+                &routing_decisions,
+                &persisted_tasks,
+                &batches,
+            ) {
                 bail!(
-                    "persisted persona routing no longer matches the reconstructed review batches; \
+                    "stale: persisted persona routing no longer matches the reconstructed review batches; \
                      retry the full review on the current revision"
                 );
             }
@@ -3490,7 +3539,7 @@ impl Engine {
         for task in latest_tasks.values() {
             let Some(batch) = batches.get(task.batch_index as usize) else {
                 bail!(
-                    "persisted reviewer task {} refers to missing batch {}; retry the full review \
+                    "stale: persisted reviewer task {} refers to missing batch {}; retry the full review \
                      on the current revision",
                     task.id,
                     task.batch_index + 1
@@ -3505,7 +3554,7 @@ impl Engine {
                 batches.len(),
             ) {
                 bail!(
-                    "persisted reviewer task {} no longer matches review batch {}; retry the full \
+                    "stale: persisted reviewer task {} no longer matches review batch {}; retry the full \
                      review on the current revision",
                     task.id,
                     task.batch_index + 1
@@ -6661,61 +6710,20 @@ fn pack_review_section(
 }
 
 fn is_generated_review_artifact(file: &ReviewDiffFile) -> bool {
-    let path = file.path.replace('\\', "/");
-    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
-    if matches!(
-        file_name,
-        "Cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
-    ) {
-        return false;
-    }
-    let conventional_path = path.split('/').any(|component| {
-        matches!(
-            component,
-            "generated" | "snapshots" | "__snapshots__" | "__screenshots__"
-        )
-    });
-    let conventional_file = file_name.ends_with(".snap")
-        || file_name.ends_with(".min.js")
-        || file_name.ends_with(".min.css")
-        || file_name.ends_with(".map");
-    (conventional_path || conventional_file) && diff_head_has_generated_marker(&file.diff)
+    crate::tools::is_conventional_generated_artifact_path(&file.path)
+        && file
+            .generated_header
+            .as_deref()
+            .is_some_and(header_has_generated_marker)
 }
 
-fn diff_head_has_generated_marker(diff: &str) -> bool {
-    const HEADER_LINES: u64 = 20;
-    let mut new_line = None;
-    let mut header = String::new();
-    for line in diff.lines() {
-        if line.starts_with("@@ ") {
-            new_line = line
-                .split_whitespace()
-                .nth(2)
-                .and_then(|range| diff_range_start(range, '+'));
-            continue;
-        }
-        let Some(current_line) = new_line else {
-            continue;
-        };
-        if line.starts_with("\\ No newline at end of file") {
-            continue;
-        }
-        match line.as_bytes().first().copied() {
-            Some(b'-') => {}
-            Some(b'+') | Some(b' ') => {
-                if current_line > HEADER_LINES {
-                    break;
-                }
-                if current_line > 0 {
-                    header.push_str(&line[1..]);
-                    header.push('\n');
-                }
-                new_line = Some(current_line + 1);
-            }
-            _ => new_line = None,
-        }
-    }
-    let header = header.to_ascii_lowercase();
+fn header_has_generated_marker(header: &str) -> bool {
+    let header = header
+        .lines()
+        .take(20)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
     header.contains("@generated")
         || header.contains("auto-generated")
         || header.contains("automatically generated")
@@ -6906,8 +6914,8 @@ fn semantic_routing_prompt(
         }
     };
     format!(
-        "Route complete diff batch {batch_number}/{batch_count} for pull request #{number}. \
-         {batch_identity} {routing_instructions}\n\nCandidate personas:\n{catalog}\n\nChanged paths: {paths}\n\n\
+        "{batch_identity}\nRoute complete diff batch {batch_number}/{batch_count} for pull request \
+         #{number}. {routing_instructions}\n\nCandidate personas:\n{catalog}\n\nChanged paths: {paths}\n\n\
          Unified diff:\n{diff}\n\nReturn JSON only with this exact shape:\n\
          {{\"selections\":[{{\"reviewer_id\":\"persona-id\",\"reason\":\"specific relevance to this diff\"}}]}}\n\
          Use only candidate ids listed above, give a concrete one-sentence reason, and return an \
@@ -7022,9 +7030,9 @@ fn reviewer_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Review pull request #{number} ({title}) at immutable head {head}, compared with \
+        "{batch_identity}\nReview pull request #{number} ({title}) at immutable head {head}, compared with \
          base commit {base}. This is complete diff batch {batch_number} of {batch_count}. \
-         {batch_identity}\n\
+         \n\
          {extra}\nChanged paths in this batch: {paths}\n\nUnified diff:\n{diff}\n\n\
          You are the `{reviewer_name}` reviewer. Your focused mandate is:\n\
          {reviewer_instructions}\n\nRouting rationale:\n{routing}\n\n\
@@ -9784,6 +9792,7 @@ mod tests {
             Arc::new(vec![ReviewDiffFile {
                 path: path.into(),
                 diff: chunk.clone(),
+                generated_header: None,
             }])
         };
 
@@ -10705,10 +10714,12 @@ mod tests {
             ReviewDiffFile {
                 path: "src/large.rs".into(),
                 diff: large,
+                generated_header: None,
             },
             ReviewDiffFile {
                 path: "src/small.rs".into(),
                 diff: "+small\n".into(),
+                generated_header: None,
             },
         ];
         let batches = build_review_batches(&files);
@@ -10730,6 +10741,7 @@ mod tests {
         let files = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -20,2 +2,3 @@\n context\n+added\n tail\n".into(),
+            generated_header: None,
         }];
         let candidate = |path: &str, side: &str, body: &str| CandidateFinding {
             candidate_id: format!("candidate-{body}"),
@@ -12163,6 +12175,7 @@ mod tests {
         let files = vec![ReviewDiffFile {
             path: "src/large.rs".into(),
             diff: "+let value = 1234;\n".repeat(20_000),
+            generated_header: None,
         }];
         let batches = build_review_batches(&files);
         assert!(batches.len() > 1);
@@ -12176,18 +12189,19 @@ mod tests {
     fn generated_artifacts_are_summarized_instead_of_multiplying_batches() {
         let generated_diff = format!(
             "diff --git a/web/src/generated/protocol-validators.ts \
-             b/web/src/generated/protocol-validators.ts\n@@ -1 +1,50001 @@\n\
-             +// This file was auto-generated. Do not edit.\n{}",
+             b/web/src/generated/protocol-validators.ts\n@@ -100 +100,50000 @@\n{}",
             "+generated_validator_row();\n".repeat(50_000)
         );
         let files = vec![
             ReviewDiffFile {
                 path: "src/implementation.rs".into(),
                 diff: "+let reviewed = true;\n".into(),
+                generated_header: None,
             },
             ReviewDiffFile {
                 path: "web/src/generated/protocol-validators.ts".into(),
                 diff: generated_diff,
+                generated_header: Some("// This file was auto-generated. Do not edit.".into()),
             },
         ];
 
@@ -12196,7 +12210,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].paths.len(), 2);
         assert!(batches[0].diff.contains("generated artifact summary"));
-        assert!(batches[0].diff.contains("50001 added"));
+        assert!(batches[0].diff.contains("50000 added"));
         assert!(!batches[0].diff.contains("generated_validator_row"));
         assert!(batches[0].diff.len() < 4_096);
     }
@@ -12208,6 +12222,7 @@ mod tests {
             diff: "@@ -1 +1,2 @@\n+// This file was auto-generated. Do not edit.\n\
                    +export const generated = true;\n"
                 .into(),
+            generated_header: Some("// This file was auto-generated. Do not edit.".into()),
         };
 
         assert!(!is_generated_review_artifact(&file));
@@ -12223,6 +12238,7 @@ mod tests {
             diff: "@@ -1,2 +1 @@\n-// This file was auto-generated. Do not edit.\n\
                    -generated_old_code!();\n+pub fn reviewed_source() {}\n"
                 .into(),
+            generated_header: Some("pub fn reviewed_source() {}".into()),
         };
 
         assert!(!is_generated_review_artifact(&file));
@@ -12240,6 +12256,7 @@ mod tests {
             diff: "@@ -1 +1,3 @@\n+# This file is automatically @generated by Cargo.\n\
                    +version = 4\n+checksum = \"untrusted-change\"\n"
                 .into(),
+            generated_header: Some("# This file is automatically @generated by Cargo.".into()),
         };
 
         assert!(!is_generated_review_artifact(&file));
@@ -12249,6 +12266,7 @@ mod tests {
         let nested = ReviewDiffFile {
             path: "web/generated/package-lock.json".into(),
             diff: "@@ -1 +1 @@\n+// This file was auto-generated. Do not edit.\n".into(),
+            generated_header: Some("// This file was auto-generated. Do not edit.".into()),
         };
         assert!(!is_generated_review_artifact(&nested));
     }
@@ -12259,14 +12277,17 @@ mod tests {
             ReviewDiffFile {
                 path: "src/first.rs".into(),
                 diff: "a".repeat(60_000),
+                generated_header: None,
             },
             ReviewDiffFile {
                 path: "src/second.rs".into(),
                 diff: "b".repeat(75_000),
+                generated_header: None,
             },
             ReviewDiffFile {
                 path: "src/third.rs".into(),
                 diff: "c".repeat(30_000),
+                generated_header: None,
             },
         ];
 
@@ -12286,10 +12307,12 @@ mod tests {
             ReviewDiffFile {
                 path: "src/filler.rs".into(),
                 diff: "a".repeat(60_000),
+                generated_header: None,
             },
             ReviewDiffFile {
                 path: "src/chunked.rs".into(),
                 diff: "b".repeat(130_000),
+                generated_header: None,
             },
         ];
 
@@ -12330,6 +12353,18 @@ mod tests {
             0,
             1
         ));
+        let spoofed_legacy_prompt = format!(
+            "Review pull request ({} in its title)\nlegacy body",
+            review_batch_identity(&batch, 0, 1)
+        );
+        assert!(!persisted_task_matches_batch(
+            &spoofed_legacy_prompt,
+            0,
+            1,
+            &batch,
+            0,
+            1
+        ));
     }
 
     #[test]
@@ -12362,12 +12397,22 @@ mod tests {
             .unwrap()
             .unwrap();
         let tasks = store.code_review_tasks(&job.id).unwrap();
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .take(1)
+            .collect::<Vec<_>>();
 
         assert!(persisted_routing_matches_batches(
+            &job,
+            &reviewers,
+            &[],
             &tasks,
             std::slice::from_ref(&batch)
         ));
         assert!(!persisted_routing_matches_batches(
+            &job,
+            &reviewers,
+            &[],
             &tasks,
             &[ReviewBatch {
                 paths: batch.paths,
@@ -12377,11 +12422,83 @@ mod tests {
     }
 
     #[test]
+    fn additive_failed_or_absent_router_tasks_preserve_exact_fallback_routing() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:additive-fallback");
+        job.routing_mode = CodeReviewRoutingMode::Additive;
+        job.semantic_routing = true;
+        store.claim_code_review_job().unwrap().unwrap();
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .take(1)
+            .collect::<Vec<_>>();
+        let batch = ReviewBatch {
+            paths: vec!["src/lib.rs".into()],
+            diff: "+reviewed();\n".into(),
+        };
+        let fallback = build_routing_decisions(
+            &job,
+            &reviewers,
+            std::slice::from_ref(&batch),
+            &HashMap::new(),
+        );
+
+        assert!(persisted_routing_matches_batches(
+            &job,
+            &reviewers,
+            &fallback,
+            &[],
+            std::slice::from_ref(&batch),
+        ));
+
+        let task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: job.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Router,
+                reviewer_id: None,
+                reviewer_name: "Automatic persona router".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/default".into()),
+                prompt: review_batch_identity(&batch, 0, 1),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(&task.id, "session", "thread", "provider/default")
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_task(&task.id, "failed", "", 0, "router unavailable")
+            .unwrap()
+            .unwrap();
+        let tasks = store.code_review_tasks(&job.id).unwrap();
+
+        assert!(persisted_routing_matches_batches(
+            &job,
+            &reviewers,
+            &fallback,
+            &tasks,
+            std::slice::from_ref(&batch),
+        ));
+        assert!(!persisted_routing_matches_batches(
+            &job,
+            &reviewers,
+            &fallback,
+            &tasks,
+            &[ReviewBatch {
+                paths: batch.paths,
+                diff: "+repacked();\n".into(),
+            }],
+        ));
+    }
+
+    #[test]
     fn many_short_paths_share_a_batch_within_the_path_budget() {
         let files = (0..100)
             .map(|index| ReviewDiffFile {
                 path: format!("src/module_{index}.rs"),
                 diff: "+changed();\n".into(),
+                generated_header: None,
             })
             .collect::<Vec<_>>();
 
@@ -12397,10 +12514,12 @@ mod tests {
             ReviewDiffFile {
                 path: "src/relevant.rs".into(),
                 diff: "+broken();\n".into(),
+                generated_header: None,
             },
             ReviewDiffFile {
                 path: "src/unrelated.rs".into(),
                 diff: "+fine();\n".into(),
+                generated_header: None,
             },
         ];
         let paths = HashSet::from(["src/relevant.rs"]);
