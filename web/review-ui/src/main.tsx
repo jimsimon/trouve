@@ -2147,7 +2147,7 @@ function RepositoryEditor({
               ))}
             </select>
             <small>
-              Runs the lightweight, tool-free triage pass that may add relevant personas.
+              Runs the lightweight, read-only triage pass that may add relevant personas.
               {!semanticRouterConfigEnabled && ` ${semanticRouterRequirement}`}
             </small>
           </label>
@@ -2210,7 +2210,7 @@ function RepositoryEditor({
                 {draft.routing_mode === "automatic"
                   ? "Required in Automatic mode and solely decides which personas run for each batch."
                   : draft.routing_mode === "additive"
-                    ? "Run one lightweight, tool-free routing pass per batch. It may add relevant personas but cannot remove baseline or enabled core personas."
+                    ? "Run one lightweight, read-only routing pass per batch. It may add relevant personas but cannot remove baseline or enabled core personas."
                     : "Semantic triage is off in Manual mode; only the checked personas run."}
               </small>
             </span>

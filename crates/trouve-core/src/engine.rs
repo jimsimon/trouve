@@ -10568,13 +10568,18 @@ impl Engine {
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
         let supports_steering = tools_enabled && backend.supports_steering();
+        // Some vendor protocols cannot remove their built-in read/search
+        // tools. Keep those turns restricted (no mounted MCP tools and
+        // read-only permission), but reserve strict tool-use rejection for
+        // backends that can actually guarantee a tool-free surface.
+        let strict_tool_free = !tools_enabled && backend.supports_tool_free_turns();
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
         // thread's past this one hasn't seen — everything for a vendor
         // joining mid-conversation, the interleaved turns other models ran
         // for a resumed one — is handed off as a digest in the prompt.
-        // A vendor session retains the tools it was created with. Tool-free
+        // A vendor session retains the tools it was created with. Restricted
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
         let (resume, handoff) = if tools_enabled {
@@ -10634,7 +10639,7 @@ impl Engine {
             bail!("queued prompt {queued_prompt_id} vanished before turn start");
         }
 
-        let permission = if mode.read_only {
+        let permission = if !tools_enabled || mode.read_only {
             BackendPermission::ReadOnly
         } else {
             match thread.permission_mode {
@@ -10690,7 +10695,7 @@ impl Engine {
             attachments: turn_attachments,
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
-            tool_free: !tools_enabled,
+            tool_free: strict_tool_free,
             mcp_bridge,
             mcp_servers,
         };
@@ -11070,7 +11075,7 @@ impl Engine {
                         }
                         continue;
                     }
-                    if !tools_enabled {
+                    if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
@@ -11391,7 +11396,7 @@ impl Engine {
                     args,
                     responder,
                 } => {
-                    if !tools_enabled {
+                    if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested approval for {tool} during a tool-free turn");
                     }

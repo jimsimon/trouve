@@ -439,6 +439,14 @@ pub trait AgentBackend: Send + Sync {
 
     fn status(&self) -> BackendStatus;
 
+    /// Whether the backend can guarantee that a requested tool-free turn
+    /// exposes no vendor-native tools. Backends that return false still run
+    /// such turns without mounted MCP tools and under read-only permissions,
+    /// but the engine must tolerate vendor-native read/search activity.
+    fn supports_tool_free_turns(&self) -> bool {
+        false
+    }
+
     /// Live subscription usage (plan, metered allowance windows). Codex
     /// answers via its app-server, Claude Code via a stream-json `get_usage`
     /// control request, and Cursor via the dashboard's undocumented usage

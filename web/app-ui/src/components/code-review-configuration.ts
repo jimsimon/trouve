@@ -447,7 +447,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
             </div>
             <label class="check-row">
               <input type="checkbox" .checked=${draft.semanticRouting} ?disabled=${this.#busy !== "" || draft.routingMode === "manual"} @change=${(event: Event) => this.#patchRepositoryDraft(key, { semanticRouting: (event.currentTarget as HTMLInputElement).checked })} />
-              Allow one tool-free semantic routing pass per diff batch
+              Allow one read-only semantic routing pass per diff batch
             </label>
           </fieldset>
 

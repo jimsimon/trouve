@@ -1033,7 +1033,7 @@ cat > /dev/null
 }
 
 #[tokio::test]
-async fn cursor_adapter_routes_all_permissions_through_agent_mode_guard() {
+async fn cursor_adapter_maps_permissions_to_safe_modes() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_acp_stub(tmp.path());
     let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
@@ -1088,9 +1088,13 @@ async fn cursor_adapter_routes_all_permissions_through_agent_mode_guard() {
     let mode = std::fs::read_to_string(format!("{stub}.mode")).unwrap();
     assert!(mode.contains("\"value\":\"agent\""), "{mode}");
 
-    // Read-only and approval-gated turns also run in Cursor's agent mode.
-    // Use fresh backends because the ACP child is pooled per worktree.
-    for permission in [BackendPermission::ReadOnly, BackendPermission::Ask] {
+    // Read-only turns use Cursor Ask mode (search-only); approval-gated turns
+    // retain agent mode. Use fresh backends because the ACP child is pooled
+    // per worktree.
+    for (permission, expected_mode) in [
+        (BackendPermission::ReadOnly, "ask"),
+        (BackendPermission::Ask, "agent"),
+    ] {
         let permission_worktree = tempfile::tempdir().unwrap();
         let permission_stub = cursor_acp_stub(permission_worktree.path());
         let permission_backend = CursorBackend::new("cursor", Some(permission_stub.clone()), None);
@@ -1105,7 +1109,7 @@ async fn cursor_adapter_routes_all_permissions_through_agent_mode_guard() {
         }
         let mode = std::fs::read_to_string(format!("{permission_stub}.mode")).unwrap();
         assert!(
-            mode.contains("\"value\":\"agent\""),
+            mode.contains(&format!("\"value\":\"{expected_mode}\"")),
             "{permission:?}: {mode}"
         );
     }
@@ -2145,6 +2149,17 @@ done
     }
     let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
     assert_eq!(spawns.lines().count(), 2, "{spawns}");
+}
+
+#[test]
+fn backend_tool_free_capabilities_match_vendor_protocols() {
+    let claude = ClaudeBackend::new("claude-code", Some("/nonexistent/claude".into()));
+    let cursor = CursorBackend::new("cursor", Some("/nonexistent/cursor-agent".into()), None);
+    let codex = CodexBackend::new("codex", Some("/nonexistent/codex".into()));
+
+    assert!(claude.supports_tool_free_turns());
+    assert!(!cursor.supports_tool_free_turns());
+    assert!(!codex.supports_tool_free_turns());
 }
 
 #[tokio::test]

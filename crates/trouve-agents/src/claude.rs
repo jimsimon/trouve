@@ -377,6 +377,10 @@ impl AgentBackend for ClaudeBackend {
         }
     }
 
+    fn supports_tool_free_turns(&self) -> bool {
+        true
+    }
+
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
         spawn_claude_login(&self.command).await
     }

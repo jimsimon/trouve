@@ -141,8 +141,9 @@ Each repository has one of three persona-selection strategies:
   a repository needs a small, fixed reviewer set.
 - **Additive** always runs the correctness, security, and testing baseline plus
   explicitly enabled core personas. Optional semantic triage makes one
-  lightweight, tool-free model pass per batch and may add more personas; it
-  can never remove a baseline or enabled core persona. This is the default.
+  lightweight, read-only model pass per batch (fully tool-free when the
+  backend supports it) and may add more personas; it can never remove a
+  baseline or enabled core persona. This is the default.
 - **Automatic** makes semantic triage mandatory and lets it select from the
   complete persona catalog for each batch, with no preselected personas.
 

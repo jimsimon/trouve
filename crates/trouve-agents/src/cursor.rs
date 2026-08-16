@@ -470,13 +470,13 @@ impl AgentBackend for CursorBackend {
                 config = server.config_lock.lock() => config,
             };
 
-            // Keep Cursor in agent mode even for read-only turns. Cursor's
-            // plan mode can stall before producing ACP events; trouve's
-            // approval gate remains the authority that rejects mutations.
+            // Cursor ACP has no true tool-free mode. Its Ask mode keeps
+            // read-only turns useful with search tools while withholding edit
+            // and command execution. Approval-gated and Yolo turns retain the
+            // full agent surface and are governed by trouve's permission gate.
             let mode = match turn.permission {
-                BackendPermission::ReadOnly | BackendPermission::Ask | BackendPermission::Yolo => {
-                    "agent"
-                }
+                BackendPermission::ReadOnly => "ask",
+                BackendPermission::Ask | BackendPermission::Yolo => "agent",
             };
             if let Err(e) = server
                 .set_config_option(&session_id, "mode", mode, &cancel)
