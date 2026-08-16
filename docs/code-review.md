@@ -219,8 +219,8 @@ If semantic triage is disabled or its model response fails validation,
 Additive continues with its baseline and enabled core personas. Automatic
 requires semantic triage and fails the review if routing fails. Semantic output
 is restricted to the offered persona IDs and requires a concrete reason. A
-once-persisted routing snapshot is reused by interrupted-job recovery and
-recovery. User-initiated retries create a new snapshot from the current
+once-persisted routing snapshot is reused by interrupted-job recovery.
+User-initiated retries create a new snapshot from the current
 repository settings.
 
 Candidate findings are first checked against actual commentable diff lines. A

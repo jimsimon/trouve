@@ -1732,6 +1732,17 @@ impl Engine {
             .store
             .code_review_job(id)?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        if let Some(retried_by) = old.job.retried_by.as_deref() {
+            return self
+                .store
+                .code_review_job(retried_by)?
+                .map(|record| record.job)
+                .ok_or_else(|| {
+                    EngineError::Internal(anyhow!(
+                        "review job {id} points to missing replacement {retried_by}"
+                    ))
+                });
+        }
         if old.publication_claimed {
             self.sync_code_review_projection(&old.job).await;
             return self
@@ -1802,7 +1813,7 @@ impl Engine {
         self: &Arc<Self>,
         request: trouve_protocol::RequestCodeReviewRequest,
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
-        let new_job = self
+        let mut new_job = self
             .new_code_review_job_with_current_settings(
                 request.installation_id,
                 &request.repository,
@@ -1812,10 +1823,18 @@ impl Engine {
                 None,
             )
             .await?;
-        let job = self
-            .store
-            .enqueue_code_review_job(&new_job)?
-            .ok_or_else(|| EngineError::Internal(anyhow!("manual review dedupe collision")))?;
+        let job = loop {
+            if let Some(job) = self.store.enqueue_code_review_job(&new_job)? {
+                break job;
+            }
+            // Explicit manual requests are intentionally distinct. A UUID
+            // collision must not turn that request into a misleading dedupe
+            // failure, so regenerate only the unique suffix and try again.
+            new_job.dedupe_key.push(':');
+            new_job
+                .dedupe_key
+                .push_str(&uuid::Uuid::new_v4().simple().to_string());
+        };
         self.emit_code_review_updated(Some(job.id.clone()))?;
         self.sync_code_review_projection(&job).await;
         self.code_review.job_wake.notify_one();
@@ -3846,11 +3865,7 @@ impl Engine {
                 .collect::<HashSet<_>>();
             let findings =
                 coordinator_validated_findings(validated.findings, &candidates, &diff_files);
-            let resolved_finding_ids = validated
-                .resolved_finding_ids
-                .into_iter()
-                .filter(|id| old_ids.contains(id.as_str()))
-                .collect::<Vec<_>>();
+            let resolved_finding_ids = validated.resolved_finding_ids;
             let themes = coordinator_validated_themes(
                 validated.themes,
                 &findings,
@@ -7196,10 +7211,7 @@ fn candidate_rejections(
     let reasons = review
         .rejected_candidates
         .iter()
-        .filter_map(|rejection| {
-            let reason = rejection.reason.trim();
-            (!reason.is_empty()).then_some((rejection.candidate_id.as_str(), reason))
-        })
+        .map(|rejection| (rejection.candidate_id.as_str(), rejection.reason.as_str()))
         .collect::<HashMap<_, _>>();
 
     candidates
@@ -7215,13 +7227,7 @@ fn candidate_rejections(
             side: candidate.finding.side.clone(),
             severity: candidate.finding.severity.clone(),
             body: candidate.finding.body.clone(),
-            reason: reasons
-                .get(candidate.candidate_id.as_str())
-                .copied()
-                .unwrap_or(
-                    "The final review editor did not retain this candidate and did not provide a specific reason.",
-                )
-                .to_owned(),
+            reason: reasons[candidate.candidate_id.as_str()].to_owned(),
         })
         .collect()
 }
@@ -7990,6 +7996,35 @@ mod tests {
             excluded_reviewer_ids: job.excluded_reviewer_ids.clone(),
             config_hash: "retry-config".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_retry_returns_linked_replacement_without_reloading_repository() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let original = enqueue_test_review_job(&store, "acme/widgets#42:retry-original");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .finish_code_review_job(&original.id, "failed", "", "review failed")
+            .unwrap();
+        let replacement = store
+            .retry_code_review_job(
+                &original.id,
+                &test_retry_job_request(&original, "acme/widgets#42:retry-replacement"),
+            )
+            .unwrap()
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // No repository or GitHub App is configured. Repeating the retry can
+        // only succeed if the engine resolves the durable retry lineage first.
+        let engine = Arc::new(Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        ));
+
+        let repeated = engine.retry_review_job(&original.id).await.unwrap();
+
+        assert_eq!(repeated.id, replacement.id);
     }
 
     fn review_app_test_config() -> crate::config::Config {
