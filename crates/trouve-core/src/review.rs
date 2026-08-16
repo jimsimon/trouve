@@ -7476,13 +7476,13 @@ fn normalize_finding(
     Some(())
 }
 
-/// Publish only findings with enough evidence to justify interrupting the PR:
-/// high and medium severity need at least medium confidence, while low
-/// severity needs high confidence.
+/// Always publish high-severity findings because their potential impact
+/// outweighs low confidence. Medium severity needs at least medium confidence,
+/// while low severity needs high confidence.
 fn finding_levels_meet_publication_threshold(severity: &str, confidence: &str) -> bool {
     matches!(
         (severity, confidence),
-        ("high" | "medium", "high" | "medium") | ("low", "high")
+        ("high", "high" | "medium" | "low") | ("medium", "high" | "medium") | ("low", "high")
     )
 }
 
@@ -8362,7 +8362,7 @@ mod tests {
                         path: "src/suppressed.rs".into(),
                         line: 30,
                         side: "RIGHT".into(),
-                        severity: "high".into(),
+                        severity: "medium".into(),
                         confidence: "low".into(),
                         body: "Uncertain issue details".into(),
                         prompt_for_agents: "Investigate uncertain issue.".into(),
@@ -8554,7 +8554,7 @@ mod tests {
                         path: "src/uncertain.rs".into(),
                         line: 7,
                         side: "RIGHT".into(),
-                        severity: "high".into(),
+                        severity: "medium".into(),
                         confidence: "low".into(),
                         body: "Uncertain issue.".into(),
                         prompt_for_agents: "Investigate it.".into(),
@@ -8841,7 +8841,7 @@ mod tests {
                         path: "src/uncertain.rs".into(),
                         line: 9,
                         side: "RIGHT".into(),
-                        severity: "high".into(),
+                        severity: "medium".into(),
                         confidence: "low".into(),
                         body: "Suppressed issue.".into(),
                         prompt_for_agents: "Investigate it.".into(),
@@ -10949,6 +10949,7 @@ mod tests {
         for (severity, confidence) in [
             ("high", "high"),
             ("high", "medium"),
+            ("high", "low"),
             ("medium", "high"),
             ("medium", "medium"),
             ("low", "high"),
@@ -10959,12 +10960,7 @@ mod tests {
                 &finding.confidence
             ));
         }
-        for (severity, confidence) in [
-            ("high", "low"),
-            ("medium", "low"),
-            ("low", "medium"),
-            ("low", "low"),
-        ] {
+        for (severity, confidence) in [("medium", "low"), ("low", "medium"), ("low", "low")] {
             let finding = finding(severity, confidence);
             assert!(!finding_levels_meet_publication_threshold(
                 &finding.severity,
@@ -10988,7 +10984,7 @@ mod tests {
                 path: "src/lib.rs".into(),
                 line: 2,
                 side: "RIGHT".into(),
-                severity: "high".into(),
+                severity: "medium".into(),
                 confidence: "low".into(),
                 body: "Actionable but uncertain issue".into(),
                 source_candidate_ids: Vec::new(),
