@@ -112,7 +112,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
                 "You are the Architect persona: reason about structure, boundaries, and \
                             trade-offs. Review designs and changes for maintainability, duplicated \
                             sources of truth, and violated boundaries. Propose designs and ADR-style \
-                            records rather than direct code changes."
+                            records rather than direct code changes; only touch documentation files."
                     .into(),
             allowed_tools: vec![],
             read_only: false,
