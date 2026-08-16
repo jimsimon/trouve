@@ -10,6 +10,7 @@ use trouve_protocol::{AgentPersona, PersonaGroup, PersonaInfo};
 
 pub const REVIEW_PERSONA_ID: &str = "review";
 const RETIRED_ARCHITECT_PERSONA_ID: &str = "architect";
+const RETIRED_RESEARCHER_PERSONA_ID: &str = "question";
 
 pub fn is_valid_persona_id(id: &str) -> bool {
     !id.is_empty()
@@ -58,10 +59,10 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             display_name: "Planner".into(),
             group: PersonaGroup::General,
             system_prompt:
-                "You are the Planner persona: explore the workspace and produce a concrete \
-                            implementation plan. Consider system structure, boundaries, sources \
-                            of truth, maintainability, and design trade-offs. Do not modify any \
-                            files; your deliverable is the plan itself."
+                "You are the Planner persona: investigate and explain the workspace, and produce \
+                            a concrete implementation plan when asked. Consider system structure, \
+                            boundaries, sources of truth, maintainability, and design trade-offs. \
+                            Do not modify any files; your deliverable is analysis or a plan."
                     .into(),
             allowed_tools: vec![
                 "read_file".into(),
@@ -109,30 +110,6 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             // adjudication reliable while explicit persona settings can
             // still move narrower work up or down.
             default_thinking_level: Some("medium".into()),
-        },
-        AgentPersona {
-            id: "question".into(),
-            display_name: "Researcher".into(),
-            group: PersonaGroup::General,
-            system_prompt: "You are the Researcher persona: answer questions about the workspace. \
-                            Read whatever you need; never modify anything."
-                .into(),
-            allowed_tools: vec![
-                "read_file".into(),
-                "list_dir".into(),
-                "glob".into(),
-                "grep".into(),
-                "search".into(),
-                "find_related".into(),
-                "web_fetch".into(),
-                "todo_write".into(),
-                "spawn_thread".into(),
-                "spawn_output".into(),
-            ],
-            read_only: true,
-            default_permission_mode: None,
-            default_model: None,
-            default_thinking_level: None,
         },
     ]
 }
@@ -211,9 +188,12 @@ pub fn find_persona<'a>(personas: &'a [AgentPersona], id: &str) -> Option<&'a Ag
         .iter()
         .find(|persona| persona.id == id)
         .or_else(|| {
-            (id == RETIRED_ARCHITECT_PERSONA_ID)
-                .then(|| personas.iter().find(|persona| persona.id == "plan"))
-                .flatten()
+            matches!(
+                id,
+                RETIRED_ARCHITECT_PERSONA_ID | RETIRED_RESEARCHER_PERSONA_ID
+            )
+            .then(|| personas.iter().find(|persona| persona.id == "plan"))
+            .flatten()
         })
 }
 
@@ -335,7 +315,6 @@ mod tests {
             ("code", "Engineer"),
             ("plan", "Planner"),
             ("review", "Reviewer"),
-            ("question", "Researcher"),
         ] {
             assert_eq!(
                 find_persona(&personas, id).unwrap().display_name,
@@ -347,7 +326,7 @@ mod tests {
     #[test]
     fn builtin_personas_are_grouped_by_intended_use() {
         let personas = builtin_personas();
-        for id in ["code", "plan", "review", "question"] {
+        for id in ["code", "plan", "review"] {
             assert_eq!(
                 find_persona(&personas, id).unwrap().group,
                 PersonaGroup::General
@@ -356,17 +335,20 @@ mod tests {
     }
 
     #[test]
-    fn retired_architect_id_resolves_to_planner_unless_customized() {
-        let mut personas = builtin_personas();
-        assert_eq!(find_persona(&personas, "architect").unwrap().id, "plan");
+    fn retired_general_ids_resolve_to_planner_unless_customized() {
+        let personas = builtin_personas();
+        for id in ["architect", "question"] {
+            assert_eq!(find_persona(&personas, id).unwrap().id, "plan");
+        }
 
+        let mut personas = personas;
         let mut custom = find_persona(&personas, "plan").unwrap().clone();
-        custom.id = "architect".into();
-        custom.display_name = "Custom Architect".into();
+        custom.id = "question".into();
+        custom.display_name = "Custom Researcher".into();
         personas.push(custom);
         assert_eq!(
-            find_persona(&personas, "architect").unwrap().display_name,
-            "Custom Architect"
+            find_persona(&personas, "question").unwrap().display_name,
+            "Custom Researcher"
         );
     }
 
@@ -391,7 +373,7 @@ mod tests {
     #[test]
     fn read_only_builtin_personas_can_delegate_without_spawning_sessions() {
         let personas = builtin_personas();
-        for id in ["plan", "review", "question"] {
+        for id in ["plan", "review"] {
             let persona = find_persona(&personas, id).unwrap();
             assert!(persona.read_only);
             assert!(persona.allowed_tools.iter().any(|tool| tool == "web_fetch"));

@@ -7055,7 +7055,7 @@ impl Engine {
             return Ok(inherited_thread.mode.clone());
         }
         let preferred = match access {
-            BackendCollaboratorAccess::ReadOnly => ["plan", "review", "question"].as_slice(),
+            BackendCollaboratorAccess::ReadOnly => ["plan", "review"].as_slice(),
             BackendCollaboratorAccess::Interactive => ["code"].as_slice(),
             BackendCollaboratorAccess::Inherit => unreachable!(),
         };
