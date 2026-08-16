@@ -486,6 +486,13 @@ impl Provider for OpenAiCompatProvider {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        let catalog_provider = self.catalog_provider_id()?;
+        self.catalog
+            .model(&catalog_provider, &self.id, model, OptionsDialect::OpenAi)
+            .map(|_| model.to_string())
+    }
+
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
         // Known providers can omit `/models` entirely. Their models.dev roster
         // is the last-known catalog; arbitrary custom endpoints still return

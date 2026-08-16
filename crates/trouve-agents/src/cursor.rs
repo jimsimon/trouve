@@ -315,6 +315,20 @@ impl AgentBackend for CursorBackend {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        [
+            ("anthropic", OptionsDialect::ClaudeCli),
+            ("openai", OptionsDialect::CodexCli),
+            ("google", OptionsDialect::Gemini),
+        ]
+        .into_iter()
+        .find_map(|(provider, dialect)| {
+            self.catalog
+                .model(provider, &self.id, model, dialect)
+                .map(|_| model.to_string())
+        })
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
         // Cursor is a distinct serving surface, like Codex: a trouve-owned
         // static roster inherits public metadata where possible and owns

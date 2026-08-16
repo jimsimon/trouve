@@ -258,6 +258,34 @@ describe("ModelCatalogController", () => {
     await Promise.resolve();
   });
 
+  it("does not let a late static response overwrite a live route catalog", async () => {
+    const secondStatic = deferred<readonly ProtocolModelInfo[]>();
+    const firstLive = deferred<readonly ProtocolModelInfo[]>();
+    let staticCalls = 0;
+    const controller = new ModelCatalogController({
+      models: () => {
+        staticCalls += 1;
+        return staticCalls === 1
+          ? Promise.resolve([model("provider/initial")])
+          : secondStatic.promise;
+      },
+      modelRoutes: () => firstLive.promise,
+    });
+
+    await controller.refresh();
+    const forced = controller.refresh("force");
+    firstLive.resolve([model("auto/shared"), model("provider/shared")]);
+    await firstLive.promise;
+    await Promise.resolve();
+    secondStatic.resolve([model("provider/stale")]);
+    await forced;
+
+    expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
+      "auto/shared",
+      "provider/shared",
+    ]);
+  });
+
   it("forces fresh static and live snapshots after connectivity recovers", async () => {
     const forcedStatic = deferred<readonly ProtocolModelInfo[]>();
     const forcedLive = deferred<readonly ProtocolModelInfo[]>();

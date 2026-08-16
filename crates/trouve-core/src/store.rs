@@ -633,6 +633,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE threads ADD COLUMN title TEXT",
+    "ALTER TABLE threads ADD COLUMN route_provider_id TEXT",
+    "ALTER TABLE threads ADD COLUMN route_provider_model TEXT",
     "ALTER TABLE thread_statuses ADD COLUMN started_at TEXT",
     "ALTER TABLE thread_statuses ADD COLUMN completed_at TEXT",
     "ALTER TABLE thread_view_items ADD COLUMN turn_start INTEGER NOT NULL DEFAULT 0",
@@ -16576,6 +16578,69 @@ mod tests {
             store.backend_session("th_old", "anything").unwrap(),
             Some(("vendor-legacy".into(), 0))
         );
+    }
+
+    #[test]
+    fn thread_route_affinity_migrates_legacy_schema_repeat_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy-affinity.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (
+                   id TEXT PRIMARY KEY,
+                   name TEXT NOT NULL,
+                   path TEXT NOT NULL UNIQUE,
+                   closed INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                   title TEXT NOT NULL,
+                   branch TEXT NOT NULL,
+                   worktree_path TEXT NOT NULL,
+                   base_ref TEXT NOT NULL,
+                   undo_pos INTEGER,
+                   archived INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE threads (
+                   id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL REFERENCES sessions(id),
+                   title TEXT,
+                   mode TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   permission_mode TEXT NOT NULL,
+                   model_options TEXT NOT NULL DEFAULT '{}',
+                   todos TEXT NOT NULL DEFAULT '[]',
+                   last_turn INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 INSERT INTO workspaces (id, name, path, created_at)
+                 VALUES ('ws_old', 'Legacy', '/tmp/legacy-affinity', '2026-01-01T00:00:00Z');
+                 INSERT INTO sessions
+                   (id, workspace_id, title, branch, worktree_path, base_ref, created_at)
+                 VALUES
+                   ('se_old', 'ws_old', 'Legacy', 'legacy', '/tmp/legacy-affinity-wt', 'main', '2026-01-01T00:00:00Z');
+                 INSERT INTO threads
+                   (id, session_id, mode, model, permission_mode, created_at)
+                 VALUES ('th_old', 'se_old', 'code', 'auto/shared', 'ask', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            store
+                .set_thread_route_affinity("th_old", "codex", "shared")
+                .unwrap();
+            assert_eq!(
+                store.thread_route_affinity("th_old").unwrap(),
+                Some(("codex".into(), "shared".into()))
+            );
+            drop(store);
+        }
     }
 
     /// Workspace + session + thread rows so FK-checked inserts succeed.

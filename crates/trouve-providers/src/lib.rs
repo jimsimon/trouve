@@ -142,7 +142,20 @@ fn contains_standalone_token(message: &str, token: &str) -> bool {
     message.match_indices(token).any(|(start, _)| {
         let before = message[..start].chars().next_back();
         let after = message[start + token.len()..].chars().next();
-        before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+        let decimal_prefix = before == Some('.')
+            && message[..start.saturating_sub(1)]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_digit());
+        let suffix = &message[start + token.len()..];
+        let decimal_suffix = after == Some('.')
+            && suffix
+                .get(1..)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|ch| ch.is_ascii_digit());
+        !decimal_prefix
+            && !decimal_suffix
+            && before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
             && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
     })
 }
@@ -236,6 +249,14 @@ pub trait Provider: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("openai/gpt-4.1").
     fn id(&self) -> &str;
 
+    /// Catalog-backed provider-neutral identity for a runnable model. Custom
+    /// endpoints and adapter-owned models return `None`, keeping them out of
+    /// automatic cross-provider routing even when their spelling happens to
+    /// match a hosted catalog model.
+    fn shared_model_identity(&self, _model: &str) -> Option<String> {
+        None
+    }
+
     /// Models available to the configured account or endpoint. For
     /// catalog-covered providers, live discovery contributes identifiers only
     /// and models.dev supplies canonical metadata and option schemas.
@@ -276,7 +297,13 @@ mod tests {
         ] {
             assert!(is_capacity_exhaustion_message(message), "{message}");
         }
-        for message in ["HTTP 14290", "error E429x", "request 4290 failed"] {
+        for message in [
+            "HTTP 14290",
+            "error E429x",
+            "request 4290 failed",
+            "version 1.429",
+            "version 429.0",
+        ] {
             assert!(!is_capacity_exhaustion_message(message), "{message}");
         }
     }

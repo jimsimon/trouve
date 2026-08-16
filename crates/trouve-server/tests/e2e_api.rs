@@ -1139,7 +1139,7 @@ async fn compaction_summarizes_transcript_near_context_window() {
                     calls: AtomicUsize::new(0),
                 }),
             )
-            .with_default_model("tiny-model"),
+            .with_default_model("scripted/tiny-model"),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

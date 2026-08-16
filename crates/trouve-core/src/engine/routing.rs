@@ -52,14 +52,27 @@ impl Engine {
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
 
-        let mut candidates = self
-            .resolve_model_candidates(thread)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
+        let mut candidates = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            candidates = self.resolve_model_candidates(thread) => {
+                candidates.map_err(|error| anyhow!(error.to_string()))?
+            }
+        };
         let total_candidates = candidates.len();
         candidates.truncate(MAX_ROUTE_ATTEMPTS_PER_TURN);
         let first_route = candidates.first().context("model route disappeared")?;
         let capacity_model = format!("{}/{}", first_route.provider_id, first_route.provider_model);
+        let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
+        // Session lifecycle always precedes turn/provider capacity. Concrete
+        // and automatic routes therefore share one lock order and cannot
+        // deadlock while session deletion or restore waits for the write lock.
+        let session_lifecycle = self.session_lock(&session.id);
+        let _session_lifecycle_guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            guard = session_lifecycle.read() => guard,
+        };
         let background = self.store.is_code_review_thread(&thread.id)?;
         let capacity_started = Instant::now();
         let turn_capacity = self
@@ -88,13 +101,6 @@ impl Engine {
             },
         )?;
 
-        let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
-        let session_lifecycle = self.session_lock(&session.id);
-        let _session_lifecycle_guard = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("turn cancelled"),
-            guard = session_lifecycle.read() => guard,
-        };
         let _turn_capacity = turn_capacity;
 
         let has_native = candidates
@@ -112,10 +118,10 @@ impl Engine {
             let mut shell_options = self.store.thread_model_options(&thread.id)?;
             normalize_thinking_option(&mut shell_options, Some(&first_route.info));
             let thinking_level = resolved_thinking_level(&shell_options, Some(&first_route.info));
-            let supports_steering = matches!(
-                &first_route.executor,
-                ModelExecutor::Backend(backend) if tools_enabled && backend.supports_steering()
-            );
+            // A later failover may select an adapter without steering. Until
+            // routed turns share the concrete steering queue, advertise the
+            // capability conservatively for the whole turn.
+            let supports_steering = false;
             self.store
                 .append_events_async(
                     scope.clone(),
@@ -144,7 +150,7 @@ impl Engine {
                 model: thread.model.clone(),
                 provider_id: first_route.provider_id.clone(),
                 provider_model: first_route.provider_model.clone(),
-                reason: "initial".into(),
+                reason: trouve_protocol::ModelRouteReason::Initial,
             },
         )?;
         // Compaction must run before this turn's user message joins the
@@ -437,7 +443,7 @@ impl Engine {
                             model: thread.model.clone(),
                             provider_id: next.provider_id.clone(),
                             provider_model: next.provider_model.clone(),
-                            reason: failure.kind.failover_reason().into(),
+                            reason: failure.kind.failover_reason(),
                         },
                     )?;
                 }
@@ -471,26 +477,29 @@ impl Engine {
         let scope = Scope::Thread(thread.id.clone());
         let mut model_options = stored_model_options.clone();
         normalize_thinking_option(&mut model_options, Some(&route.info));
-        let mut continuation_needed = retrying;
+        // Keep one sanitized transcript in memory for the provider tool loop.
+        // Every assistant/tool message is still persisted immediately, then
+        // appended here for the next iteration without re-reading and
+        // deserializing the entire thread.
+        let mut messages = vec![Message::System(system.to_string())];
+        for payload in self.store.messages(&thread.id)? {
+            messages.push(serde_json::from_value(payload)?);
+        }
+        let mut messages = sanitize_transcript(messages);
+        if retrying {
+            messages.push(Message::User(
+                "Another provider could not continue this turn. Continue the in-progress \
+                 response from the transcript and current worktree without repeating \
+                 completed text, tool calls, or edits."
+                    .into(),
+            ));
+        }
 
         while *iterations_left > 0 {
             if cancel.is_cancelled() {
                 return Ok(RouteAttemptResult::Cancelled);
             }
             *iterations_left -= 1;
-            let mut messages = vec![Message::System(system.to_string())];
-            for payload in self.store.messages(&thread.id)? {
-                messages.push(serde_json::from_value(payload)?);
-            }
-            let mut messages = sanitize_transcript(messages);
-            if continuation_needed {
-                messages.push(Message::User(
-                    "Another provider could not continue this turn. Continue the in-progress \
-                     response from the transcript and current worktree without repeating \
-                     completed text, tool calls, or edits."
-                        .into(),
-                ));
-            }
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
@@ -550,12 +559,14 @@ impl Engine {
                             content: text.clone(),
                         },
                     )?;
+                }
+                if !text.is_empty() || !reasoning.is_empty() {
                     self.store.append_message(
                         &thread.id,
                         &serde_json::to_value(Message::Assistant {
                             content: text,
                             tool_calls: Vec::new(),
-                            reasoning: Vec::new(),
+                            reasoning,
                         })?,
                     )?;
                 }
@@ -583,7 +594,6 @@ impl Engine {
                 return Ok(RouteAttemptResult::Cancelled);
             }
 
-            continuation_needed = false;
             if !text.is_empty() {
                 self.store.append_event(
                     scope.clone(),
@@ -602,14 +612,14 @@ impl Engine {
                 tool_calls.clear();
             }
             if !text.is_empty() || !tool_calls.is_empty() {
-                self.store.append_message(
-                    &thread.id,
-                    &serde_json::to_value(Message::Assistant {
-                        content: text,
-                        tool_calls: tool_calls.clone(),
-                        reasoning,
-                    })?,
-                )?;
+                let assistant = Message::Assistant {
+                    content: text,
+                    tool_calls: tool_calls.clone(),
+                    reasoning,
+                };
+                self.store
+                    .append_message(&thread.id, &serde_json::to_value(&assistant)?)?;
+                messages.push(assistant);
             }
             if tool_calls.is_empty() {
                 return Ok(RouteAttemptResult::Completed);
@@ -624,14 +634,14 @@ impl Engine {
                 .await;
             for (call_id, result) in results {
                 let (result_content, images) = result?;
-                self.store.append_message(
-                    &thread.id,
-                    &serde_json::to_value(Message::ToolResult {
-                        call_id,
-                        content: result_content,
-                        images,
-                    })?,
-                )?;
+                let result = Message::ToolResult {
+                    call_id,
+                    content: result_content,
+                    images,
+                };
+                self.store
+                    .append_message(&thread.id, &serde_json::to_value(&result)?)?;
+                messages.push(result);
             }
         }
 
@@ -731,12 +741,14 @@ impl Engine {
                         content: text.clone(),
                     },
                 )?;
+            }
+            if !text.is_empty() || !reasoning.is_empty() {
                 self.store.append_message(
                     &thread.id,
                     &serde_json::to_value(Message::Assistant {
                         content: text,
                         tool_calls: Vec::new(),
-                        reasoning: Vec::new(),
+                        reasoning,
                     })?,
                 )?;
             }
@@ -768,7 +780,7 @@ impl Engine {
 
     #[allow(clippy::too_many_arguments)]
     async fn run_backend_route(
-        &self,
+        self: &Arc<Self>,
         session: &Session,
         thread: &Thread,
         turn: u64,
@@ -812,6 +824,12 @@ impl Engine {
             render_history_digest(&messages, resume.is_some())
         };
         let vendor_session = resume.map(|(id, _)| id);
+        let mut active_vendor_session = vendor_session.clone();
+        if let Some(vendor_session_id) = active_vendor_session.as_deref() {
+            self.bridged_tool_owners
+                .bind_vendor_thread(&thread.id, vendor_session_id, &thread.id)
+                .map_err(anyhow::Error::msg)?;
+        }
         let attempt_prompt = if retrying {
             let continuation = "Another provider could not continue this turn. Continue the \
                 in-progress task from the transcript and current worktree. Do not repeat \
@@ -837,6 +855,22 @@ impl Engine {
             }
             instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
         }
+        let full_tool_bridge = mcp_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.bridge_tools);
+        if full_tool_bridge {
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
+            }
+            instructions.push_str(crate::tools::VENDOR_TOOL_BRIDGE_GUIDANCE);
+        }
+        // A full bridge exposes user MCP servers through ToolExecutor. Direct
+        // mounting would bypass trouve's permission and mutation lanes.
+        let mcp_servers = if tools_enabled && !full_tool_bridge {
+            self.mcp_servers_for(session)?
+        } else {
+            Vec::new()
+        };
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         normalize_thinking_option(&mut model_options, Some(&route.info));
         let backend_turn = BackendTurn {
@@ -852,14 +886,13 @@ impl Engine {
             permission,
             tool_free: !tools_enabled,
             mcp_bridge,
-            mcp_servers: if tools_enabled {
-                self.mcp_servers_for(session)?
-            } else {
-                Vec::new()
-            },
+            mcp_servers,
         };
         let mut stream = match backend.run_turn(backend_turn).await {
             Ok(stream) => stream,
+            Err(BackendError::Cancelled) if cancel.is_cancelled() => {
+                return Ok(RouteAttemptResult::Cancelled);
+            }
             Err(error) => {
                 return Ok(RouteAttemptResult::Failed(backend_attempt_failure(
                     error, false,
@@ -871,37 +904,128 @@ impl Engine {
         let mut segment = String::new();
         let mut attempt_usage = Usage::default();
         let mut backend_error = None;
+        let mut backend_cancelled = false;
         let mut open_tools = HashSet::new();
         let mut side_effect_started = false;
         let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
         let mut github_creation_output = HashMap::<String, String>::new();
+        let mut vendor_threads = HashMap::<String, String>::new();
+        if let Some(vendor_session_id) = active_vendor_session.as_ref() {
+            vendor_threads.insert(vendor_session_id.clone(), thread.id.clone());
+        }
+        let mut collaborators = HashMap::<String, BackendCollaboratorProjection>::new();
+        let mut collaborator_claims = BackendCollaboratorClaims::new(&self.active_threads);
+        let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
+        let mut backend_approval_cancels =
+            HashMap::<String, tokio_util::sync::CancellationToken>::new();
+        let mut backend_mutation_permits =
+            HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
+        let mut suppressed_bridge_calls = HashSet::new();
         let mut persisted = Vec::new();
         let mut persist_deadline = None;
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let event = tokio::select! {
+            let input = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                     persist_deadline = None;
                     continue;
                 }
-                event = stream.next() => match event {
-                    Some(event) => event,
-                    None => break,
-                },
+                approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                    BackendLoopInput::Approval(
+                        approval.expect("non-empty approval queue must yield an outcome")
+                    )
+                }
+                event = stream.next() => BackendLoopInput::Event(event),
             };
-            let event = match event {
-                Ok(event) => event,
-                Err(error) => {
+            let event = match input {
+                BackendLoopInput::Event(None) => break,
+                BackendLoopInput::Approval(outcome) => {
+                    let BackendApprovalOutcome {
+                        owner_thread_id,
+                        call_id,
+                        responder,
+                        approved,
+                        mutation_permit,
+                    } = outcome;
+                    if let Some(owner_thread_id) = owner_thread_id {
+                        let Some(collaborator) = collaborators
+                            .values_mut()
+                            .find(|collaborator| collaborator.thread.id == owner_thread_id)
+                        else {
+                            let _ = responder.send(false);
+                            continue;
+                        };
+                        collaborator.approval_cancels.remove(&call_id);
+                        if collaborator.terminal {
+                            let _ = responder.send(false);
+                            continue;
+                        }
+                        let approved = match approved {
+                            Ok(approved) => approved,
+                            Err(error) => {
+                                let _ = responder.send(false);
+                                return Err(error);
+                            }
+                        };
+                        if approved {
+                            if let Some(permit) = mutation_permit {
+                                collaborator
+                                    .mutation_permits
+                                    .insert(call_id.clone(), permit);
+                            }
+                            if responder.send(true).is_err() {
+                                collaborator.mutation_permits.remove(&call_id);
+                            }
+                        } else {
+                            let _ = responder.send(false);
+                        }
+                        continue;
+                    }
+                    backend_approval_cancels.remove(&call_id);
+                    let approved = match approved {
+                        Ok(approved) => approved,
+                        Err(error) => {
+                            let _ = responder.send(false);
+                            return Err(error);
+                        }
+                    };
+                    if approved {
+                        if let Some(permit) = mutation_permit {
+                            backend_mutation_permits.insert(call_id.clone(), permit);
+                        }
+                        if responder.send(true).is_err() {
+                            backend_mutation_permits.remove(&call_id);
+                        }
+                    } else {
+                        let _ = responder.send(false);
+                    }
+                    continue;
+                }
+                BackendLoopInput::Event(Some(Ok(event))) => event,
+                BackendLoopInput::Event(Some(Err(BackendError::Cancelled)))
+                    if cancel.is_cancelled() =>
+                {
+                    backend_cancelled = true;
+                    break;
+                }
+                BackendLoopInput::Event(Some(Err(error))) => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                     backend_error = Some(error);
                     break;
                 }
             };
             match event {
                 BackendEvent::SessionStarted { session_id } => {
+                    active_vendor_session = Some(session_id.clone());
+                    vendor_threads.insert(session_id.clone(), thread.id.clone());
+                    self.bridged_tool_owners
+                        .bind_vendor_thread(&thread.id, &session_id, &thread.id)
+                        .map_err(anyhow::Error::msg)?;
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         self.store
@@ -942,6 +1066,21 @@ impl Engine {
                     tool,
                     mut args,
                 } => {
+                    if trouve_bridge_wrapper_call(&tool, &args).is_some() {
+                        if suppressed_bridge_calls.insert(call_id.clone())
+                            && let Some(vendor_thread_id) = active_vendor_session.as_deref()
+                        {
+                            self.announce_trouve_bridge_wrapper(
+                                &thread.id,
+                                vendor_thread_id,
+                                &thread.id,
+                                &call_id,
+                                &tool,
+                                &args,
+                            );
+                        }
+                        continue;
+                    }
                     side_effect_started = true;
                     open_tools.insert(call_id.clone());
                     tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
@@ -964,6 +1103,9 @@ impl Engine {
                     persisted.push(Event::ToolStarted { call_id });
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
+                    if suppressed_bridge_calls.contains(&call_id) {
+                        continue;
+                    }
                     if let Some((_, owner, repo)) = github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
                         && requests_pull_request_creation(tool, args, owner, repo)
@@ -1004,22 +1146,165 @@ impl Engine {
                 BackendEvent::CompactionFailed => {
                     persisted.push(Event::CompactionFailed { turn });
                 }
-                BackendEvent::CollaboratorStarted { session_id, .. } => {
-                    tracing::warn!(
-                        %session_id,
-                        "automatic route does not project vendor collaborators yet"
-                    );
+                BackendEvent::CollaboratorStarted {
+                    session_id,
+                    parent_session_id,
+                    name,
+                    access,
+                    prompt,
+                    model,
+                    thinking_level,
+                } => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    let vendor_session_id = session_id.clone();
+                    let prompt_announced =
+                        prompt.as_deref().is_some_and(|prompt| !prompt.is_empty());
+                    self.start_backend_collaborator_claimed(
+                        session,
+                        thread,
+                        backend_id,
+                        session_id,
+                        &parent_session_id,
+                        name,
+                        access,
+                        prompt,
+                        model,
+                        thinking_level,
+                        &mut collaborator_claims,
+                        &mut vendor_threads,
+                        &mut collaborators,
+                    )
+                    .await?;
+                    if let Some(owner_thread_id) = vendor_threads.get(&vendor_session_id) {
+                        self.bridged_tool_owners
+                            .bind_vendor_thread(&thread.id, &vendor_session_id, owner_thread_id)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    self.publish_backend_collaborator_spawn(
+                        thread,
+                        turn,
+                        &vendor_session_id,
+                        &mut collaborators,
+                    )
+                    .await?;
+                    if prompt_announced
+                        && let Some(collaborator) = collaborators.get_mut(&vendor_session_id)
+                    {
+                        flush_backend_event_batch(
+                            &self.store,
+                            &Scope::Thread(collaborator.thread.id.clone()),
+                            &mut collaborator.persisted,
+                        )
+                        .await?;
+                    }
                 }
                 BackendEvent::CollaboratorEvent {
-                    session_id, event, ..
+                    session_id,
+                    turn_id,
+                    event,
                 } => {
-                    if let BackendCollaboratorEvent::ApprovalNeeded { responder, .. } = event {
-                        let _ = responder.send(false);
-                    } else {
-                        tracing::debug!(
-                            %session_id,
-                            "ignored vendor collaborator event on automatic route"
+                    if !collaborators.contains_key(&session_id) {
+                        let parent_session_id = active_vendor_session
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_string();
+                        self.start_backend_collaborator_claimed(
+                            session,
+                            thread,
+                            backend_id,
+                            session_id.clone(),
+                            &parent_session_id,
+                            None,
+                            BackendCollaboratorAccess::Inherit,
+                            None,
+                            None,
+                            None,
+                            &mut collaborator_claims,
+                            &mut vendor_threads,
+                            &mut collaborators,
+                        )
+                        .await?;
+                    }
+                    if let Some(owner_thread_id) = vendor_threads.get(&session_id) {
+                        self.bridged_tool_owners
+                            .bind_vendor_thread(&thread.id, &session_id, owner_thread_id)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    if let Some(collaborator) = collaborators.get(&session_id)
+                        && !collaborator_claims.claim(&collaborator.thread.id, &session.id)
+                    {
+                        bail!(
+                            "cannot route provider collaborator {} while another turn owns it",
+                            collaborator.thread.id
                         );
+                    }
+                    let completed_successfully =
+                        matches!(&event, BackendCollaboratorEvent::Completed { .. });
+                    let terminal_thread =
+                        if let Some(collaborator) = collaborators.get_mut(&session_id) {
+                            self.prepare_backend_collaborator_turn(
+                                session,
+                                backend_id,
+                                collaborator,
+                                turn_id.as_deref(),
+                            )
+                            .await?;
+                            if !self.suppress_collaborator_bridge_wrapper(
+                                &thread.id,
+                                &session_id,
+                                collaborator,
+                                &event,
+                            ) {
+                                self.persist_backend_collaborator_event(
+                                    session,
+                                    mode,
+                                    backend_id,
+                                    collaborator,
+                                    event,
+                                    cancel,
+                                )
+                                .await?;
+                            }
+                            if let Some(approval) = collaborator.pending_approval.take() {
+                                let owner_thread_id = approval.thread.id.clone();
+                                let approval_call_id = approval.call_id.clone();
+                                let approval_cancel = cancel.child_token();
+                                collaborator
+                                    .approval_cancels
+                                    .insert(approval_call_id, approval_cancel.clone());
+                                pending_backend_approvals.push(self.pending_backend_approval(
+                                    session.clone(),
+                                    approval.thread,
+                                    approval.turn,
+                                    approval.mode,
+                                    approval.call_id,
+                                    approval.tool,
+                                    approval.args,
+                                    approval.responder,
+                                    approval_cancel,
+                                    !full_tool_bridge,
+                                    Some(owner_thread_id),
+                                ));
+                            }
+                            collaborator
+                                .terminal
+                                .then(|| collaborator.thread.id.clone())
+                        } else {
+                            None
+                        };
+                    self.publish_backend_collaborator_spawn(
+                        thread,
+                        turn,
+                        &session_id,
+                        &mut collaborators,
+                    )
+                    .await?;
+                    if let Some(thread_id) = terminal_thread {
+                        collaborator_claims.release(&thread_id);
+                        if completed_successfully {
+                            self.dispatch_queue(&thread_id)
+                                .map_err(|error| anyhow!(error.to_string()))?;
+                        }
                     }
                 }
                 BackendEvent::ToolCompleted {
@@ -1027,6 +1312,10 @@ impl Engine {
                     ok,
                     result,
                 } => {
+                    backend_mutation_permits.remove(&call_id);
+                    if suppressed_bridge_calls.remove(&call_id) {
+                        continue;
+                    }
                     open_tools.remove(&call_id);
                     let status = if ok {
                         ToolStatus::Ok
@@ -1090,12 +1379,22 @@ impl Engine {
                     }
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
-                    let approved = self
-                        .gate_backend_approval(
-                            session, thread, turn, mode, &call_id, &tool, &args, cancel,
-                        )
-                        .await?;
-                    let _ = responder.send(approved);
+                    let approval_cancel = cancel.child_token();
+                    backend_approval_cancels.insert(call_id.clone(), approval_cancel.clone());
+                    pending_backend_approvals.push(self.pending_backend_approval(
+                        session.clone(),
+                        thread.clone(),
+                        turn,
+                        mode.clone(),
+                        call_id,
+                        tool,
+                        args,
+                        responder,
+                        approval_cancel,
+                        !full_tool_bridge,
+                        None,
+                    ));
+                    continue;
                 }
                 BackendEvent::QuestionsNeeded {
                     request_id,
@@ -1126,16 +1425,52 @@ impl Engine {
                     if usage.context_window.is_some() {
                         attempt_usage.context_window = usage.context_window;
                     }
+                    if usage.context_input_tokens.is_some() {
+                        attempt_usage.context_input_tokens = usage.context_input_tokens;
+                    }
                 }
             }
-            if persisted.len() >= STREAM_EVENT_BATCH_MAX {
+            let collaborator_pending = collaborators
+                .values()
+                .any(|collaborator| !collaborator.persisted.is_empty());
+            if persisted.len()
+                + collaborators
+                    .values()
+                    .map(|collaborator| collaborator.persisted.len())
+                    .sum::<usize>()
+                >= STREAM_EVENT_BATCH_MAX
+            {
                 flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                 persist_deadline = None;
-            } else if !persisted.is_empty() && persist_deadline.is_none() {
+            } else if (!persisted.is_empty() || collaborator_pending) && persist_deadline.is_none()
+            {
                 persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
             }
         }
         drop(stream);
+        backend_mutation_permits.clear();
+        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+        for collaborator in collaborators.values_mut() {
+            if !collaborator.terminal {
+                let reason = if cancel.is_cancelled() || backend_cancelled {
+                    "turn cancelled".to_string()
+                } else if let Some(error) = backend_error.as_ref() {
+                    format!("parent backend stream failed: {error}")
+                } else {
+                    "parent turn ended before collaborator completion".to_string()
+                };
+                self.finish_backend_collaborator(session, backend_id, collaborator, Err(reason))
+                    .await?;
+            }
+            collaborator_claims.release(&collaborator.thread.id);
+        }
+        deny_pending_backend_approvals(
+            &mut pending_backend_approvals,
+            &mut backend_approval_cancels,
+            &mut collaborators,
+        )
+        .await;
         accounting.add_backend(&attempt_usage);
 
         if let Some(error) = backend_error {
@@ -1176,7 +1511,7 @@ impl Engine {
             )));
         }
 
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || backend_cancelled {
             if !segment.is_empty() {
                 persisted.push(Event::AssistantMessage {
                     turn,

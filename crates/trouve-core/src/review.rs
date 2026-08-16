@@ -20232,10 +20232,10 @@ mod tests {
         assert_eq!(unchanged.router_thinking_level.as_deref(), Some("low"));
 
         let saved = engine
-            .update_code_review_repository(&request(Some("router"), Some("high")))
+            .update_code_review_repository(&request(Some("provider/router"), Some("high")))
             .await
             .unwrap();
-        assert_eq!(saved.router_model.as_deref(), Some("router"));
+        assert_eq!(saved.router_model.as_deref(), Some("provider/router"));
         assert_eq!(saved.router_thinking_level.as_deref(), Some("high"));
 
         let error = engine

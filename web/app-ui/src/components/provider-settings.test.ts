@@ -3,9 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 import type {
   ProtocolKnownProvider,
   ProtocolLoginStatus,
+  ProtocolProviderInfo,
 } from "../services/protocol-client.js";
 import {
   ProviderLoginPoller,
+  automaticRoutingProviders,
   movedProviderOrder,
   providerSubmission,
   validatedHttpsUrl,
@@ -62,6 +64,22 @@ describe("provider settings security boundaries", () => {
       .toEqual(["codex", "cursor", "openai"]);
     expect(movedProviderOrder(["codex", "openai"], ["openai", "codex"], "codex", -1))
       .toEqual(["codex", "openai"]);
+  });
+
+  it("keeps local and configured loopback providers out of hosted priority", () => {
+    const provider = (id: string, category: string): ProtocolProviderInfo => ({
+      id,
+      kind: "openai-compat",
+      has_credentials: true,
+      auth: "api-key",
+      category,
+    });
+    expect(automaticRoutingProviders([
+      provider("codex", "subscription"),
+      provider("openai", "api"),
+      provider("local", "local"),
+      provider("ollama", "local"),
+    ]).map(({ id }) => id)).toEqual(["codex", "openai"]);
   });
 
   it("accepts only HTTPS authorization URLs", () => {

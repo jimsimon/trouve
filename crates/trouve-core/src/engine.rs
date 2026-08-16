@@ -505,6 +505,10 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(not(test))]
+const MODEL_ROUTE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const MODEL_ROUTE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Bound automatic failover so one turn cannot churn through every configured
 /// credential. Persisted circuit state advances later turns past failed routes.
@@ -520,7 +524,7 @@ struct ModelCandidate {
     provider_model: String,
     info: trouve_protocol::ModelInfo,
     executor: ModelExecutor,
-    provider_qualified: bool,
+    shared_model_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -545,10 +549,12 @@ impl RouteFailureKind {
         }
     }
 
-    fn failover_reason(self) -> &'static str {
+    fn failover_reason(self) -> trouve_protocol::ModelRouteReason {
         match self {
-            Self::Capacity => "capacity_failover",
-            Self::Authentication | Self::Unavailable => "route_failover",
+            Self::Capacity => trouve_protocol::ModelRouteReason::CapacityFailover,
+            Self::Authentication | Self::Unavailable => {
+                trouve_protocol::ModelRouteReason::RouteFailover
+            }
         }
     }
 }
@@ -604,7 +610,10 @@ impl TurnAccounting {
         if usage.context_window.is_some() {
             self.usage.context_window = usage.context_window;
         }
-        self.context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
+        self.context_input_tokens = usage
+            .context_input_tokens
+            .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.cached_input_tokens));
+        self.usage.context_input_tokens = Some(self.context_input_tokens);
     }
 
     fn add_backend(&mut self, usage: &Usage) {
@@ -618,7 +627,10 @@ impl TurnAccounting {
         if usage.context_window.is_some() {
             self.usage.context_window = usage.context_window;
         }
-        self.context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
+        self.context_input_tokens = usage
+            .context_input_tokens
+            .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.cached_input_tokens));
+        self.usage.context_input_tokens = Some(self.context_input_tokens);
     }
 
     fn finalize_cost(&mut self) {
@@ -630,11 +642,10 @@ impl TurnAccounting {
 
 impl ModelCandidate {
     fn automatic_selection_id(&self) -> Option<String> {
-        if self.provider_qualified {
-            None
-        } else {
-            neutral_model_id(&self.provider_model).map(|model| format!("auto/{model}"))
-        }
+        self.shared_model_id
+            .as_deref()
+            .and_then(neutral_model_id)
+            .map(|model| format!("auto/{model}"))
     }
 
     fn concrete_selection_id(&self) -> String {
@@ -791,12 +802,16 @@ fn routed_model_info(
             .all(|candidate| candidate.info.supports_tools),
         input_price_per_mtok: common_price(&candidates, |model| model.input_price_per_mtok),
         output_price_per_mtok: common_price(&candidates, |model| model.output_price_per_mtok),
-        options_schema: routed_options_schema(
-            &candidates
-                .iter()
-                .map(|candidate| &candidate.info)
-                .collect::<Vec<_>>(),
-        ),
+        options_schema: if candidates.len() == 1 {
+            first.options_schema.clone()
+        } else {
+            routed_options_schema(
+                &candidates
+                    .iter()
+                    .map(|candidate| &candidate.info)
+                    .collect::<Vec<_>>(),
+            )
+        },
         routes: candidates
             .iter()
             .map(|candidate| trouve_protocol::ModelRouteInfo {
@@ -857,7 +872,7 @@ fn backend_attempt_failure(
     RouteAttemptFailure {
         kind,
         message: format!("backend error: {error}"),
-        safe_to_retry: capacity || !side_effect_started,
+        safe_to_retry: !side_effect_started,
     }
 }
 
@@ -1567,13 +1582,6 @@ impl TurnScheduler {
                     permit.map_err(|_| anyhow!("background turn scheduler closed"))?
                 }
             });
-            permits.push(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                permit = provider.background.clone().acquire_owned() => {
-                    permit.map_err(|_| anyhow!("provider background scheduler closed"))?
-                }
-            });
         }
         permits.push(tokio::select! {
             biased;
@@ -1582,6 +1590,15 @@ impl TurnScheduler {
                 permit.map_err(|_| anyhow!("turn scheduler closed"))?
             }
         });
+        if background {
+            permits.push(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                permit = provider.background.clone().acquire_owned() => {
+                    permit.map_err(|_| anyhow!("provider background scheduler closed"))?
+                }
+            });
+        }
         permits.push(tokio::select! {
             biased;
             _ = cancel.cancelled() => bail!("turn cancelled"),
@@ -1632,19 +1649,10 @@ impl TurnScheduler {
     ) -> Result<TurnCapacityGuard> {
         let started = Instant::now();
         let provider = self.provider(model);
-        let cooldown = provider
-            .backoff
-            .lock()
-            .unwrap()
-            .until
-            .and_then(|until| until.checked_duration_since(Instant::now()));
-        if let Some(cooldown) = cooldown {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                _ = tokio::time::sleep(cooldown) => {}
-            }
-        }
+        // Routed callers filter provider backoff before taking global or
+        // session capacity. Never sleep here while those broader permits are
+        // held; a concurrent outcome can only make this route less preferred
+        // on the following turn.
         let mut permits = Vec::with_capacity(if background { 2 } else { 1 });
         if background {
             permits.push(tokio::select! {
@@ -1666,6 +1674,15 @@ impl TurnScheduler {
             _permits: permits,
             wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
+    }
+
+    fn cooldown_remaining(&self, model: &str) -> Option<std::time::Duration> {
+        self.provider(model)
+            .backoff
+            .lock()
+            .unwrap()
+            .until
+            .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
     fn record_outcome(&self, model: &str, error: Option<&str>) {
@@ -1823,6 +1840,15 @@ fn validate_model_selection(model: &str) -> Result<(), EngineError> {
         return Err(EngineError::BadRequest(
             "model must not have surrounding whitespace".into(),
         ));
+    }
+    let invalid_automatic = model
+        .strip_prefix("auto/")
+        .is_some_and(|name| neutral_model_id(name).is_none())
+        || (!model.contains('/') && neutral_model_id(model).is_none());
+    if invalid_automatic {
+        return Err(EngineError::BadRequest(format!(
+            "automatic model selection must name a concrete shared model: {model}"
+        )));
     }
     Ok(())
 }
@@ -3261,11 +3287,34 @@ impl Engine {
     /// on. Live account and vendor-CLI availability is resolved separately by
     /// refresh_models so first paint never waits for network or CLI startup.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        let mut models: Vec<_> = self
-            .available_model_candidates()
-            .await
+        // Include the same automatic ids as the live route catalog on first
+        // paint. Their route metadata arrives from `/v1/model-routes`, but
+        // exposing the ids here prevents a configured `auto/<model>` default
+        // from being reconciled away while live discovery is still pending.
+        let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
+        for candidate in self.available_model_candidates().await {
+            grouped
+                .entry(candidate.concrete_selection_id())
+                .or_default()
+                .push(candidate.clone());
+            if let Some(id) = candidate.automatic_selection_id() {
+                grouped.entry(id).or_default().push(candidate);
+            }
+        }
+        let mut models: Vec<_> = grouped
             .into_iter()
-            .map(|candidate| candidate.info)
+            .map(|(id, candidates)| {
+                let routed = routed_model_info(id, candidates);
+                trouve_protocol::ModelInfo {
+                    id: routed.id,
+                    display_name: routed.display_name,
+                    context_window: routed.context_window,
+                    supports_tools: routed.supports_tools,
+                    input_price_per_mtok: routed.input_price_per_mtok,
+                    output_price_per_mtok: routed.output_price_per_mtok,
+                    options_schema: routed.options_schema,
+                }
+            })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
@@ -3308,15 +3357,17 @@ impl Engine {
             .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
             .map(|(id, provider)| (id.clone(), provider.clone()))
             .collect();
-        let provider_qualified = self.offline_capable_provider_ids();
         let mut candidates = Vec::new();
         for (provider_id, provider) in providers {
-            candidates.extend(provider.models().into_iter().map(|info| ModelCandidate {
-                provider_model: model_name_for_provider(&provider_id, &info.id).to_string(),
-                provider_qualified: provider_qualified.contains(&provider_id),
-                provider_id: provider_id.clone(),
-                info,
-                executor: ModelExecutor::Native(provider.clone()),
+            candidates.extend(provider.models().into_iter().map(|info| {
+                let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
+                ModelCandidate {
+                    shared_model_id: provider.shared_model_identity(&provider_model),
+                    provider_model,
+                    provider_id: provider_id.clone(),
+                    info,
+                    executor: ModelExecutor::Native(provider.clone()),
+                }
             }));
         }
         let ready: Vec<_> = if online {
@@ -3334,12 +3385,15 @@ impl Engine {
             Vec::new() // vendor backends all need their cloud
         };
         for (provider_id, backend) in ready {
-            candidates.extend(backend.models().into_iter().map(|info| ModelCandidate {
-                provider_model: model_name_for_provider(&provider_id, &info.id).to_string(),
-                provider_qualified: false,
-                provider_id: provider_id.clone(),
-                info,
-                executor: ModelExecutor::Backend(backend.clone()),
+            candidates.extend(backend.models().into_iter().map(|info| {
+                let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
+                ModelCandidate {
+                    shared_model_id: backend.shared_model_identity(&provider_model),
+                    provider_model,
+                    provider_id: provider_id.clone(),
+                    info,
+                    executor: ModelExecutor::Backend(backend.clone()),
+                }
             }));
         }
         candidates
@@ -3360,13 +3414,29 @@ impl Engine {
     }
 
     async fn refresh_model_candidates(&self) -> Vec<ModelCandidate> {
+        self.refresh_model_candidates_for(None).await
+    }
+
+    /// Refresh only adapters which can satisfy `selection` when resolving one
+    /// turn or validating settings. This prevents an unrelated broken adapter
+    /// from delaying a provider pin or one automatic model.
+    async fn refresh_model_candidates_for(&self, selection: Option<&str>) -> Vec<ModelCandidate> {
         let online = self.is_online();
         if online
             && self.connectivity_probe.is_some()
-            && let Err(error) = self.model_catalog.refresh_if_stale().await
+            && let Ok(Err(error)) = tokio::time::timeout(
+                MODEL_ROUTE_DISCOVERY_TIMEOUT,
+                self.model_catalog.refresh_if_stale(),
+            )
+            .await
         {
             tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
         }
+        let automatic = selection.and_then(automatic_model_name);
+        let concrete_provider = selection
+            .filter(|_| automatic.is_none())
+            .and_then(|selection| selection.split_once('/'))
+            .map(|(provider, _)| provider);
         let offline_capable = if online {
             std::collections::HashSet::new()
         } else {
@@ -3378,24 +3448,44 @@ impl Engine {
             .unwrap()
             .iter()
             .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
+            .filter(|(id, provider)| {
+                automatic.is_none_or(|model| provider.shared_model_identity(model).is_some())
+                    && concrete_provider.is_none_or(|selected| id.as_str() == selected)
+            })
             .map(|(id, provider)| (id.clone(), provider.clone()))
             .collect();
         let provider_lists = futures::future::join_all(providers.into_iter().map(
             |(provider_id, provider)| async move {
-                let models = provider.list_models().await;
+                let models = match tokio::time::timeout(
+                    MODEL_ROUTE_DISCOVERY_TIMEOUT,
+                    provider.list_models(),
+                )
+                .await
+                {
+                    Ok(models) => models,
+                    Err(_) => {
+                        tracing::warn!(
+                            provider = %provider_id,
+                            "model discovery timed out; using the static catalog"
+                        );
+                        provider.models()
+                    }
+                };
                 (provider_id, provider, models)
             },
         ))
         .await;
-        let provider_qualified = self.offline_capable_provider_ids();
         let mut candidates = Vec::new();
         for (provider_id, provider, models) in provider_lists {
-            candidates.extend(models.into_iter().map(|info| ModelCandidate {
-                provider_model: model_name_for_provider(&provider_id, &info.id).to_string(),
-                provider_qualified: provider_qualified.contains(&provider_id),
-                provider_id: provider_id.clone(),
-                info,
-                executor: ModelExecutor::Native(provider.clone()),
+            candidates.extend(models.into_iter().map(|info| {
+                let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
+                ModelCandidate {
+                    shared_model_id: provider.shared_model_identity(&provider_model),
+                    provider_model,
+                    provider_id: provider_id.clone(),
+                    info,
+                    executor: ModelExecutor::Native(provider.clone()),
+                }
             }));
         }
         let ready: Vec<_> = if online {
@@ -3407,6 +3497,10 @@ impl Engine {
                     let status = backend.status();
                     status.installed && status.has_credentials
                 })
+                .filter(|(id, backend)| {
+                    automatic.is_none_or(|model| backend.shared_model_identity(model).is_some())
+                        && concrete_provider.is_none_or(|selected| id.as_str() == selected)
+                })
                 .map(|(id, backend)| (id.clone(), backend.clone()))
                 .collect()
         } else {
@@ -3414,17 +3508,34 @@ impl Engine {
         };
         let listings =
             futures::future::join_all(ready.into_iter().map(|(provider_id, backend)| async move {
-                let models = backend.list_models().await;
+                let models = match tokio::time::timeout(
+                    MODEL_ROUTE_DISCOVERY_TIMEOUT,
+                    backend.list_models(),
+                )
+                .await
+                {
+                    Ok(models) => models,
+                    Err(_) => {
+                        tracing::warn!(
+                            provider = %provider_id,
+                            "backend model discovery timed out; using the static catalog"
+                        );
+                        backend.models()
+                    }
+                };
                 (provider_id, backend, models)
             }))
             .await;
         for (provider_id, backend, models) in listings {
-            candidates.extend(models.into_iter().map(|info| ModelCandidate {
-                provider_model: model_name_for_provider(&provider_id, &info.id).to_string(),
-                provider_qualified: false,
-                provider_id: provider_id.clone(),
-                info,
-                executor: ModelExecutor::Backend(backend.clone()),
+            candidates.extend(models.into_iter().map(|info| {
+                let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
+                ModelCandidate {
+                    shared_model_id: backend.shared_model_identity(&provider_model),
+                    provider_model,
+                    provider_id: provider_id.clone(),
+                    info,
+                    executor: ModelExecutor::Backend(backend.clone()),
+                }
             }));
         }
         candidates
@@ -3439,7 +3550,7 @@ impl Engine {
         thread: &Thread,
     ) -> Result<Vec<ModelCandidate>, EngineError> {
         let model = thread.model.as_str();
-        let all = self.refresh_model_candidates().await;
+        let all = self.refresh_model_candidates_for(Some(model)).await;
         if let Some(automatic_model) = automatic_model_name(model) {
             let candidates: Vec<_> = all
                 .into_iter()
@@ -3475,7 +3586,6 @@ impl Engine {
         // injected/custom providers that can run arbitrary model names and
         // therefore publish no finite catalog.
         if let Some((provider_id, provider_model)) = model.split_once('/') {
-            let provider_qualified = self.offline_capable_provider_ids().contains(provider_id);
             let provider = self.providers.read().unwrap().get(provider_id).cloned();
             if let Some(provider) = provider {
                 return Ok(vec![ModelCandidate {
@@ -3483,7 +3593,7 @@ impl Engine {
                     provider_model: provider_model.to_string(),
                     info: fallback_model_info(model, provider_model),
                     executor: ModelExecutor::Native(provider),
-                    provider_qualified,
+                    shared_model_id: None,
                 }]);
             }
             let backend = self.backends.read().unwrap().get(provider_id).cloned();
@@ -3493,7 +3603,7 @@ impl Engine {
                     provider_model: provider_model.to_string(),
                     info: fallback_model_info(model, provider_model),
                     executor: ModelExecutor::Backend(backend),
-                    provider_qualified: false,
+                    shared_model_id: None,
                 }]);
             }
         }
@@ -3508,6 +3618,27 @@ impl Engine {
         mut candidates: Vec<ModelCandidate>,
         affinity: Option<&(String, String)>,
     ) -> Result<Vec<ModelCandidate>, EngineError> {
+        let scheduler_cooling = |candidate: &ModelCandidate| {
+            self.turn_scheduler
+                .cooldown_remaining(&candidate.provider_id)
+        };
+        if candidates
+            .iter()
+            .all(|candidate| scheduler_cooling(candidate).is_some())
+        {
+            let retry_after = candidates
+                .iter()
+                .filter_map(&scheduler_cooling)
+                .min()
+                .unwrap_or_default()
+                .as_secs()
+                .max(1);
+            return Err(EngineError::Conflict(format!(
+                "no provider for {selection} is currently available; all providers are backing off; retry in {retry_after} seconds"
+            )));
+        }
+        candidates.retain(|candidate| scheduler_cooling(candidate).is_none());
+
         let learned = self.store.route_health().map_err(EngineError::Internal)?;
         let now = chrono::Utc::now().timestamp();
         let cooling = |candidate: &ModelCandidate| {
@@ -3868,10 +3999,9 @@ impl Engine {
             }
             self.persist_config(&config);
         }
-        self.store
-            .clear_route_health(id)
-            .map_err(EngineError::Internal)?;
+        let route_cleanup = self.store.clear_route_health(id);
         self.reload_providers();
+        route_cleanup.map_err(EngineError::Internal)?;
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
         let pc = config.providers.get(id).cloned().unwrap_or_default();
@@ -3918,11 +4048,9 @@ impl Engine {
                 .secrets
                 .delete(&trouve_providers::secrets::provider_secret(id, &name));
         }
-        self.store
-            .clear_route_health(id)
-            .map_err(EngineError::Internal)?;
+        let route_cleanup = self.store.clear_route_health(id);
         self.reload_providers();
-        Ok(())
+        route_cleanup.map_err(EngineError::Internal)
     }
 
     /// Replace the explicit provider preference prefix. Omitted providers
@@ -3944,9 +4072,14 @@ impl Engine {
                 )));
             }
         }
-        let mut config = self.config.lock().unwrap();
-        config.provider_order = provider_ids.to_vec();
-        self.persist_config(&config);
+        let next = {
+            let config = self.config.lock().unwrap();
+            let mut next = config.clone();
+            next.provider_order = provider_ids.to_vec();
+            next
+        };
+        self.persist_config_result(&next)?;
+        self.config.lock().unwrap().provider_order = provider_ids.to_vec();
         Ok(())
     }
 
@@ -5473,11 +5606,16 @@ impl Engine {
     }
 
     pub(crate) fn persist_config(&self, config: &Config) {
-        if let Some(path) = &self.config_file
-            && let Err(e) = config.save_to(path)
-        {
+        if let Err(e) = self.persist_config_result(config) {
             tracing::warn!("failed to persist config: {e}");
         }
+    }
+
+    fn persist_config_result(&self, config: &Config) -> Result<(), EngineError> {
+        if let Some(path) = &self.config_file {
+            config.save_to(path).map_err(EngineError::Internal)?;
+        }
+        Ok(())
     }
 
     /// Rebuild the provider registry from the current config (after provider
@@ -9237,17 +9375,22 @@ impl Engine {
     ) -> Result<trouve_protocol::ModelInfo, EngineError> {
         if let Some(automatic_model) = automatic_model_name(model) {
             let catalog_id = format!("auto/{automatic_model}");
-            let routes =
-                tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, self.list_model_routes())
-                    .await
-                    .map_err(|_| {
-                        EngineError::BadRequest(format!(
-                            "timed out loading model metadata for {model}"
-                        ))
-                    })?;
-            return routes
+            let candidates = tokio::time::timeout(
+                MODEL_CATALOG_VALIDATION_TIMEOUT,
+                self.refresh_model_candidates_for(Some(model)),
+            )
+            .await
+            .map_err(|_| {
+                EngineError::BadRequest(format!("timed out loading model metadata for {model}"))
+            })?;
+            let candidates = candidates
                 .into_iter()
-                .find(|candidate| candidate.id == catalog_id)
+                .filter(|candidate| {
+                    candidate.automatic_selection_id().as_deref() == Some(catalog_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            return (!candidates.is_empty())
+                .then(|| routed_model_info(catalog_id, candidates))
                 .map(|candidate| trouve_protocol::ModelInfo {
                     id: candidate.id,
                     display_name: candidate.display_name,
@@ -18594,6 +18737,10 @@ mod tests {
             "catalog-test"
         }
 
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            matches!(model, "static" | "live").then(|| model.to_string())
+        }
+
         fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
             vec![catalog_test_model(
                 "catalog-test/static",
@@ -18608,6 +18755,41 @@ mod tests {
                 "catalog-test/live",
                 "Live discovered model",
             )]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            unreachable!("model catalog tests never start a provider turn")
+        }
+    }
+
+    struct StallingCatalogProvider {
+        live_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for StallingCatalogProvider {
+        fn id(&self) -> &str {
+            "stall"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "stalled").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model("stall/stalled", "Stalled static model")]
+        }
+
+        async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            self.live_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
         }
 
         async fn stream_chat(
@@ -19737,6 +19919,7 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "catalog-test/static")
         );
+        assert!(static_models.iter().any(|model| model.id == "auto/static"));
         assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let live_models = engine.refresh_models().await;
@@ -19746,6 +19929,63 @@ mod tests {
                 .any(|model| model.id == "catalog-test/live")
         );
         assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn live_route_discovery_times_out_each_adapter_and_uses_static_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .with_provider(
+            "stall",
+            Arc::new(StallingCatalogProvider {
+                live_calls: calls.clone(),
+            }),
+        );
+
+        let routes = tokio::time::timeout(Duration::from_secs(1), engine.list_model_routes())
+            .await
+            .expect("one stalled adapter must not hang route discovery");
+        assert!(routes.iter().any(|model| model.id == "stall/stalled"));
+        assert!(routes.iter().any(|model| model.id == "auto/stalled"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn automatic_metadata_validation_skips_unrelated_adapters() {
+        let data = tempfile::tempdir().unwrap();
+        let stalled_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .with_provider(
+            "catalog-test",
+            Arc::new(CatalogTestProvider {
+                live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        )
+        .with_provider(
+            "stall",
+            Arc::new(StallingCatalogProvider {
+                live_calls: stalled_calls.clone(),
+            }),
+        );
+
+        let model = engine.resolve_model_info("auto/live").await.unwrap();
+        assert_eq!(model.id, "auto/live");
+        assert_eq!(stalled_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -21602,7 +21842,7 @@ default_permission_mode = "ask"
     fn test_model_candidate(
         provider_id: &str,
         provider_model: &str,
-        provider_qualified: bool,
+        shared_model: bool,
     ) -> ModelCandidate {
         let qualified_id = format!("{provider_id}/{provider_model}");
         ModelCandidate {
@@ -21612,17 +21852,105 @@ default_permission_mode = "ask"
             executor: ModelExecutor::Native(Arc::new(CatalogTestProvider {
                 live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })),
-            provider_qualified,
+            shared_model_id: shared_model.then(|| provider_model.to_string()),
         }
     }
 
     #[test]
-    fn picker_keeps_local_and_transport_owned_models_provider_qualified() {
-        let local = test_model_candidate("local", "qwen2.5-coder:7b", true);
+    fn routed_accounting_preserves_authoritative_latest_context_size() {
+        let route = test_model_candidate("hosted", "shared", true);
+        let usage = Usage {
+            input_tokens: 10,
+            cached_input_tokens: 20,
+            context_input_tokens: Some(77),
+            ..Usage::default()
+        };
+        let mut native = TurnAccounting::default();
+        native.add_native(
+            &trouve_providers::models_dev::ModelsDevCatalog::embedded(),
+            &route,
+            &usage,
+        );
+        assert_eq!(native.context_input_tokens, 77);
+        assert_eq!(native.usage.context_input_tokens, Some(77));
+
+        let mut backend = TurnAccounting::default();
+        backend.add_backend(&usage);
+        assert_eq!(backend.context_input_tokens, 77);
+        assert_eq!(backend.usage.context_input_tokens, Some(77));
+    }
+
+    #[test]
+    fn backend_capacity_failure_after_a_side_effect_never_fails_over() {
+        let failure = backend_attempt_failure(
+            BackendError::Protocol("HTTP 429 Too Many Requests".into()),
+            true,
+        );
+        assert_eq!(failure.kind, RouteFailureKind::Capacity);
+        assert!(!failure.safe_to_retry);
+    }
+
+    #[test]
+    fn automatic_selection_requires_a_real_shared_model_name() {
+        for invalid in ["auto", "automatic", "auto/", "auto/default", "auto/latest"] {
+            assert!(validate_model_selection(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_model_selection("auto/gpt-5.6-sol").is_ok());
+        assert!(validate_model_selection("codex/gpt-5.6-sol").is_ok());
+    }
+
+    #[test]
+    fn provider_order_is_not_published_when_config_persistence_fails() {
+        let data = tempfile::tempdir().unwrap();
+        let config = Config {
+            providers: BTreeMap::from([
+                ("first".into(), ProviderConfig::default()),
+                ("second".into(), ProviderConfig::default()),
+            ]),
+            provider_order: vec!["first".into(), "second".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &config,
+        )
+        // Saving TOML to a directory is guaranteed to fail.
+        .with_config_file(Some(data.path().to_path_buf()));
+
+        assert!(
+            engine
+                .set_provider_order(&["second".into(), "first".into()])
+                .is_err()
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().provider_order,
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn one_concrete_route_retains_its_provider_option_schema() {
+        let mut candidate = test_model_candidate("provider", "shared", true);
+        candidate.info.options_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reasoning_effort": {"type": "string", "enum": ["low", "high"]},
+                "provider_only": {"type": "boolean"}
+            }
+        });
+        let routed = routed_model_info("provider/shared".into(), vec![candidate.clone()]);
+        assert_eq!(routed.options_schema, candidate.info.options_schema);
+    }
+
+    #[test]
+    fn picker_automatic_ids_require_explicit_shared_catalog_identity() {
+        let local = test_model_candidate("local", "qwen2.5-coder:7b", false);
         assert_eq!(local.automatic_selection_id(), None);
         assert_eq!(local.concrete_selection_id(), "local/qwen2.5-coder:7b");
 
-        let hosted = test_model_candidate("openrouter", "qwen2.5-coder:7b", false);
+        let hosted = test_model_candidate("openrouter", "qwen2.5-coder:7b", true);
         assert_eq!(
             hosted.automatic_selection_id().as_deref(),
             Some("auto/qwen2.5-coder:7b")
@@ -21635,6 +21963,9 @@ default_permission_mode = "ask"
         let transport_owned = test_model_candidate("cursor", "default", false);
         assert_eq!(transport_owned.automatic_selection_id(), None);
         assert_eq!(transport_owned.concrete_selection_id(), "cursor/default");
+
+        let uncatalogued = test_model_candidate("custom", "gpt-5.6-sol", false);
+        assert_eq!(uncatalogued.automatic_selection_id(), None);
     }
 
     #[test]
@@ -21658,9 +21989,9 @@ default_permission_mode = "ask"
             .unwrap();
 
         let api_candidate =
-            test_model_candidate("openai", model_name_for_provider("openai", &api.id), false);
+            test_model_candidate("openai", model_name_for_provider("openai", &api.id), true);
         let codex_candidate =
-            test_model_candidate("codex", model_name_for_provider("codex", &codex.id), false);
+            test_model_candidate("codex", model_name_for_provider("codex", &codex.id), true);
         assert_eq!(
             api_candidate.automatic_selection_id().as_deref(),
             Some("auto/gpt-5.6-sol")

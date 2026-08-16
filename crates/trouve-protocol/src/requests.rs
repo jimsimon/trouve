@@ -2647,7 +2647,6 @@ pub struct ProvidersResponse {
 /// Omitted configured providers remain eligible after the listed providers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SetProviderOrderRequest {
-    #[serde(default)]
     pub provider_ids: Vec<String>,
 }
 
@@ -3159,6 +3158,14 @@ mod tests {
 
         assert!(request.fetch_latest);
         assert!(request.checkout_ref.is_none());
+    }
+
+    #[test]
+    fn provider_order_requires_an_explicit_array() {
+        assert!(serde_json::from_value::<SetProviderOrderRequest>(serde_json::json!({})).is_err());
+        let reset: SetProviderOrderRequest =
+            serde_json::from_value(serde_json::json!({ "provider_ids": [] })).unwrap();
+        assert!(reset.provider_ids.is_empty());
     }
 
     #[test]

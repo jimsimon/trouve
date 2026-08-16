@@ -78,6 +78,12 @@ export const movedProviderOrder = (
   return normalized;
 };
 
+/** Local and loopback adapters never participate in hosted automatic routes. */
+export const automaticRoutingProviders = (
+  providers: readonly ProtocolProviderInfo[],
+): readonly ProtocolProviderInfo[] =>
+  providers.filter((provider) => provider.category !== "local");
+
 /** Build the write request without ever putting write-only values in element
  * properties or rendered attributes. Callers should discard the result as
  * soon as the request settles. */
@@ -460,6 +466,7 @@ export class TrouveProviderSettings extends LitElement {
     }
 
     const allConfigured = this.#providers?.providers ?? [];
+    const automaticConfigured = automaticRoutingProviders(allConfigured);
     const subscriptionPresets = this.#knownProviders.filter(
       (provider) => category(provider) === "subscription" || provider.auth === "oauth" || provider.auth === "cli",
     );
@@ -495,7 +502,9 @@ export class TrouveProviderSettings extends LitElement {
 
         <p class="provider-description">${description}</p>
 
-        ${allConfigured.length < 2 ? nothing : this.#renderRoutingPriority(allConfigured)}
+        ${automaticConfigured.length < 2
+          ? nothing
+          : this.#renderRoutingPriority(automaticConfigured)}
 
         ${this.#notice === "" ? nothing : html`
           <p class=${`notice${this.#noticeIsError ? " error" : ""}`} role=${this.#noticeIsError ? "alert" : "status"} aria-live="polite">
@@ -658,14 +667,20 @@ export class TrouveProviderSettings extends LitElement {
                   type="button"
                   aria-label=${`Move ${providerId} earlier`}
                   title="Prefer earlier"
-                  ?disabled=${index === 0 || this.#busy !== ""}
+                  data-provider-id=${providerId}
+                  data-direction="-1"
+                  aria-disabled=${this.#busy !== "" ? "true" : "false"}
+                  ?disabled=${index === 0}
                   @click=${() => void this.#moveProvider(providerId, -1)}
                 >${fontAwesomeIcon("arrow-up")}</button>
                 <button
                   type="button"
                   aria-label=${`Move ${providerId} later`}
                   title="Prefer later"
-                  ?disabled=${index + 1 === order.length || this.#busy !== ""}
+                  data-provider-id=${providerId}
+                  data-direction="1"
+                  aria-disabled=${this.#busy !== "" ? "true" : "false"}
+                  ?disabled=${index + 1 === order.length}
                   @click=${() => void this.#moveProvider(providerId, 1)}
                 >${fontAwesomeIcon("arrow-down")}</button>
               </div>
@@ -841,9 +856,9 @@ export class TrouveProviderSettings extends LitElement {
     `;
   }
 
-  async #load(forceHealth = true): Promise<void> {
+  async #load(forceHealth = true): Promise<boolean> {
     const services = this.#services.value;
-    if (services === undefined) return;
+    if (services === undefined) return false;
     this.#clearRetry();
     const generation = ++this.#loadGeneration;
     this.#loading = true;
@@ -853,7 +868,7 @@ export class TrouveProviderSettings extends LitElement {
       services.protocol.knownProviders(),
       services.subscriptionHealth.refresh(forceHealth ? "force" : "if-stale"),
     ]);
-    if (generation !== this.#loadGeneration || !this.isConnected) return;
+    if (generation !== this.#loadGeneration || !this.isConnected) return false;
     this.#loading = false;
     if (providers.status === "fulfilled") this.#providers = providers.value;
     if (knownProviders.status === "fulfilled") this.#knownProviders = knownProviders.value;
@@ -884,6 +899,9 @@ export class TrouveProviderSettings extends LitElement {
       this.#apiPresetId = api[0]?.id ?? CUSTOM_PROVIDER;
     }
     this.requestUpdate();
+    return providers.status === "fulfilled"
+      && knownProviders.status === "fulfilled"
+      && health.status === "fulfilled";
   }
 
   #scheduleRetry(): void {
@@ -996,7 +1014,8 @@ export class TrouveProviderSettings extends LitElement {
     const services = this.#services.value;
     const providers = this.#providers;
     if (services === undefined || providers === undefined || this.#busy !== "") return;
-    const configuredIds = providers.providers.map((provider) => provider.id);
+    const configuredIds = automaticRoutingProviders(providers.providers)
+      .map((provider) => provider.id);
     const providerIds = movedProviderOrder(
       providers.provider_order ?? [],
       configuredIds,
@@ -1008,14 +1027,30 @@ export class TrouveProviderSettings extends LitElement {
     this.requestUpdate();
     try {
       await services.protocol.setProviderOrder({ provider_ids: [...providerIds] });
-      await this.#load();
-      this.#setNotice("Automatic routing priority was updated.", false);
+      this.#providers = { ...providers, provider_order: [...providerIds] };
+      this.requestUpdate();
+      const loaded = await this.#load(false);
+      if (loaded) {
+        this.#setNotice("Automatic routing priority was updated.", false);
+      }
     } catch {
       this.#setNotice("Automatic routing priority could not be saved.", true);
     } finally {
       this.#busy = "";
       this.requestUpdate();
+      await this.updateComplete;
+      this.#restoreRoutingFocus(providerId, direction);
     }
+  }
+
+  #restoreRoutingFocus(providerId: string, direction: -1 | 1): void {
+    const buttons = [...this.renderRoot.querySelectorAll<HTMLButtonElement>(
+      ".routing-priority button[data-provider-id]",
+    )].filter((button) => button.dataset["providerId"] === providerId);
+    const preferred = buttons.find((button) =>
+      button.dataset["direction"] === String(direction) && !button.disabled
+    );
+    (preferred ?? buttons.find((button) => !button.disabled))?.focus();
   }
 
   async #beginLogin(providerId: string, displayName: string): Promise<void> {

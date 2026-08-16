@@ -47,6 +47,7 @@ export class ModelCatalogController {
   #staticFailure: { readonly error: unknown } | undefined;
   #lastLiveCheckedAt: number | undefined;
   #generation = 0;
+  #revision = 0;
 
   constructor(
     protocol: ModelCatalogProtocol,

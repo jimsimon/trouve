@@ -9,6 +9,15 @@ use utoipa::ToSchema;
 
 use crate::{CallId, CheckpointId, SessionId, ThreadId, WorkspaceId};
 
+/// Why an automatic model selected a concrete provider route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouteReason {
+    Initial,
+    CapacityFailover,
+    RouteFailover,
+}
+
 /// Which stream an event belongs to. Cursors are monotonic per scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -247,8 +256,7 @@ pub enum Event {
         model: String,
         provider_id: String,
         provider_model: String,
-        /// "initial", "capacity_failover", or "route_failover".
-        reason: String,
+        reason: ModelRouteReason,
     },
     /// Live usage from the most recently completed model request in a running
     /// turn. Thread snapshots add its billing counters to `active_usage` while
@@ -656,6 +664,20 @@ mod tests {
             routing["routing_decisions"][0]["reviewer_id"],
             "concurrency"
         );
+    }
+
+    #[test]
+    fn model_route_reason_is_a_closed_snake_case_enum() {
+        let event = Event::ModelRouteSelected {
+            turn: 1,
+            model: "auto/shared".into(),
+            provider_id: "provider".into(),
+            provider_model: "shared".into(),
+            reason: ModelRouteReason::CapacityFailover,
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["reason"], "capacity_failover");
+        assert!(serde_json::from_value::<ModelRouteReason>(serde_json::json!("other")).is_err());
     }
 
     #[test]

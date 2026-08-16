@@ -443,6 +443,12 @@ pub trait AgentBackend: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("codex/gpt-5.4").
     fn id(&self) -> &str;
 
+    /// Catalog-backed provider-neutral identity for a runnable model.
+    /// Transport-owned choices return `None` and remain concrete selections.
+    fn shared_model_identity(&self, _model: &str) -> Option<String> {
+        None
+    }
+
     /// Canonical model metadata snapshot: instant and offline-safe, used when
     /// the vendor cannot report current availability.
     fn models(&self) -> Vec<ModelInfo>;
