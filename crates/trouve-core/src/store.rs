@@ -593,6 +593,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
+    backfill_code_review_watermarks(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
     backfill_code_review_collapse_pending(conn)?;
@@ -639,6 +640,43 @@ fn backfill_code_review_titles(conn: &mut Connection) -> Result<()> {
         }
         tx.commit()?;
     }
+    Ok(())
+}
+
+/// Jobs created before `review_watermark_sha` existed must recover the last
+/// published head from pull state rather than the mutable effective diff base.
+fn backfill_code_review_watermarks(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-watermark-backfill-v1";
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE code_review_jobs
+         SET review_watermark_sha = COALESCE((
+             SELECT state.last_reviewed_head_sha
+             FROM code_review_pr_state state
+             WHERE state.repository = code_review_jobs.repository
+               AND state.pull_number = code_review_jobs.pull_number
+               AND state.last_reviewed_head_sha != ''
+         ), review_watermark_sha)
+         WHERE review_watermark_sha = ''",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2204,8 +2242,7 @@ fn latest_code_review_task_attempts(
     let mut latest = BTreeMap::new();
     for attempt in attempts {
         let task = &attempt.task;
-        if task.role != trouve_protocol::CodeReviewTaskRole::Reviewer || task.status == "superseded"
-        {
+        if task.role != trouve_protocol::CodeReviewTaskRole::Reviewer {
             continue;
         }
         let Some(reviewer_id) = task.reviewer_id.as_ref() else {
@@ -2221,7 +2258,10 @@ fn latest_code_review_task_attempts(
             latest.insert(key, attempt);
         }
     }
-    latest.into_values().collect()
+    latest
+        .into_values()
+        .filter(|attempt| attempt.task.status != "superseded")
+        .collect()
 }
 
 fn completed_code_review_persona_count(attempts: &[CodeReviewTaskAttempt]) -> u64 {
@@ -3408,6 +3448,20 @@ fn insert_event_batch<'a>(
     code_review_outbox_ids: impl IntoIterator<Item = i64>,
 ) -> Result<InsertedEventBatch> {
     let tx = conn.unchecked_transaction()?;
+    let code_review_outbox_ids = code_review_outbox_ids.into_iter().collect::<Vec<_>>();
+    if !code_review_outbox_ids.is_empty() {
+        let mut stmt = tx.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM code_review_pending_events WHERE id = ?1)",
+        )?;
+        for id in &code_review_outbox_ids {
+            if !stmt.query_row([id], |row| row.get::<_, bool>(0))? {
+                return Ok(InsertedEventBatch {
+                    source_cursors: Vec::new(),
+                    published: Vec::new(),
+                });
+            }
+        }
+    }
     let mut source_cursors = Vec::with_capacity(event_count);
     let mut published = Vec::with_capacity(event_count.saturating_mul(2));
     let mut thread_events = Vec::new();
@@ -3494,9 +3548,8 @@ fn insert_event_batch<'a>(
     {
         let mut stmt = tx.prepare_cached("DELETE FROM code_review_pending_events WHERE id = ?1")?;
         for id in code_review_outbox_ids {
-            if stmt.execute([id])? != 1 {
-                anyhow::bail!("pending code-review event {id} was already consumed");
-            }
+            let deleted = stmt.execute([id])?;
+            debug_assert_eq!(deleted, 1);
         }
     }
     update_thread_view_caches(&tx, &thread_events)?;
@@ -13076,6 +13129,86 @@ mod tests {
     }
 
     #[test]
+    fn watermark_backfill_uses_last_published_head_not_effective_base() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let published_head = "3333333333333333333333333333333333333333";
+        let fallback_base = "4444444444444444444444444444444444444444";
+        store
+            .mark_code_review_published(
+                "acme/widgets",
+                42,
+                "1111111111111111111111111111111111111111",
+                published_head,
+            )
+            .unwrap();
+        {
+            let mut conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET review_base_sha = ?2, review_watermark_sha = '' WHERE id = ?1",
+                params![job.id, fallback_base],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM store_migrations WHERE id = 'code-review-watermark-backfill-v1'",
+                [],
+            )
+            .unwrap();
+            backfill_code_review_watermarks(&mut conn).unwrap();
+        }
+
+        let migrated = store.code_review_job(&job.id).unwrap().unwrap().job;
+        assert_eq!(migrated.review_base_sha, fallback_base);
+        assert_eq!(migrated.review_watermark_sha, published_head);
+    }
+
+    #[test]
+    fn a_latest_superseded_attempt_does_not_resurrect_an_older_success() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store.claim_code_review_job().unwrap().unwrap();
+        let reviewer = crate::reviewers::built_in_reviewers().remove(0);
+        let create = |prompt: &str| {
+            store
+                .create_code_review_task(&NewCodeReviewTask {
+                    job_id: job.id.clone(),
+                    role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                    reviewer_id: Some(reviewer.id.clone()),
+                    reviewer_name: reviewer.name.clone(),
+                    batch_index: 0,
+                    batch_count: 1,
+                    model: Some("provider/default".into()),
+                    prompt: prompt.into(),
+                })
+                .unwrap()
+        };
+        let old = create("old prompt");
+        store
+            .start_code_review_task(&old.id, "session", "thread", "provider/default")
+            .unwrap();
+        store
+            .finish_code_review_task(&old.id, "succeeded", "old output", 0, "")
+            .unwrap();
+        let replacement = create("new prompt");
+        store
+            .supersede_code_review_tasks_for_prompt_change(
+                &job.id,
+                std::slice::from_ref(&replacement.id),
+                1,
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .latest_code_review_reviewer_tasks(&job.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.completed_code_review_personas(&job.id).unwrap(), 0);
+    }
+
+    #[test]
     fn legacy_default_reviewers_gain_automatic_routing_only_once() {
         const LEGACY_DEFAULTS: &str = r#"["correctness","security","api-compatibility","testing"]"#;
         let conn = Connection::open_in_memory().unwrap();
@@ -14021,6 +14154,23 @@ mod tests {
                 .len(),
             pending.len()
         );
+        let stale_events = serialize_events(
+            Scope::CodeReviewJob(queued.id.clone()),
+            pending
+                .iter()
+                .map(|pending| pending.event.clone())
+                .collect(),
+        )
+        .unwrap();
+        let stale_ids = pending.iter().map(|pending| pending.id).collect::<Vec<_>>();
+        let stale_insert = insert_event_batch(
+            &store.conn.lock().unwrap(),
+            &stale_events,
+            stale_events.len(),
+            stale_ids,
+        )
+        .unwrap();
+        assert!(stale_insert.published.is_empty());
         assert!(
             store
                 .flush_pending_code_review_events(&queued.id)

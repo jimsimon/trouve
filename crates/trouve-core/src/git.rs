@@ -189,6 +189,24 @@ struct BoundedGitCommandOutput {
     status: ExitStatus,
 }
 
+#[derive(Debug)]
+struct GitStdoutLimitExceeded {
+    label: &'static str,
+    limit: usize,
+}
+
+impl fmt::Display for GitStdoutLimitExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} output exceeded its {}-byte bound",
+            self.label, self.limit
+        )
+    }
+}
+
+impl std::error::Error for GitStdoutLimitExceeded {}
+
 struct GitOperation<'a> {
     deadline: Instant,
     timeout: Duration,
@@ -420,8 +438,12 @@ fn run_git_bounded_with_status(
                     operation.label
                 );
             }
-            let (stdout, _) = io_threads.join_until(operation.deadline)?;
-            return Ok(stdout);
+            let _ = io_threads.join_until(operation.deadline)?;
+            return Err(GitStdoutLimitExceeded {
+                label: operation.label,
+                limit: max_stdout,
+            }
+            .into());
         }
         if let Some(status) = child
             .try_wait_until(operation.deadline)
@@ -515,7 +537,17 @@ fn validate_session_diff_numstat(
         None,
         MAX_SESSION_DIFF_BYTES,
         operation,
-    )?;
+    )
+    .map_err(|error| {
+        if error.downcast_ref::<GitStdoutLimitExceeded>().is_some() {
+            session_diff_too_large(format!(
+                "session diff metadata is too large to render (more than \
+                 {MAX_SESSION_DIFF_BYTES} bytes)"
+            ))
+        } else {
+            error
+        }
+    })?;
     if output.truncated {
         return Err(session_diff_too_large(format!(
             "session diff metadata is too large to render (more than \
@@ -577,7 +609,16 @@ fn bounded_session_diff(
         None,
         MAX_SESSION_DIFF_BYTES,
         operation,
-    )?;
+    )
+    .map_err(|error| {
+        if error.downcast_ref::<GitStdoutLimitExceeded>().is_some() {
+            session_diff_too_large(format!(
+                "session diff is too large to render (more than {MAX_SESSION_DIFF_BYTES} bytes)"
+            ))
+        } else {
+            error
+        }
+    })?;
     if output.truncated {
         return Err(session_diff_too_large(format!(
             "session diff is too large to render (more than {MAX_SESSION_DIFF_BYTES} bytes)"
@@ -612,7 +653,17 @@ fn bounded_session_diff_path(
         None,
         MAX_SESSION_FILE_DIFF_BYTES,
         operation,
-    )?;
+    )
+    .map_err(|error| {
+        if error.downcast_ref::<GitStdoutLimitExceeded>().is_some() {
+            session_diff_too_large(format!(
+                "selected file diff is too large to render (more than \
+                 {MAX_SESSION_FILE_DIFF_BYTES} bytes)"
+            ))
+        } else {
+            error
+        }
+    })?;
     if output.truncated {
         return Err(session_diff_too_large(format!(
             "selected file diff is too large to render (more than \
@@ -2994,7 +3045,41 @@ pub fn diff_path_between(
     if output.truncated {
         bail!("review file diff exceeds the {max_bytes}-byte limit");
     }
-    String::from_utf8(output.bytes).context("review file diff is not UTF-8")
+    Ok(String::from_utf8_lossy(&output.bytes).into_owned())
+}
+
+/// Complete unified diff between two immutable commits. The byte limit is
+/// enforced while Git is still running so callers can split the result
+/// in-process without launching one child per changed path.
+pub fn diff_between(
+    repo: &Path,
+    base_ref: &str,
+    head_ref: &str,
+    max_bytes: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<String> {
+    ensure_safe_ref(base_ref)?;
+    ensure_safe_ref(head_ref)?;
+    let operation = GitOperation::with_timeout(Some(cancel), REVIEW_GIT_TIMEOUT, "review diff");
+    let output = run_git_bounded(
+        repo,
+        None,
+        &[
+            "diff",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--end-of-options",
+            base_ref,
+            head_ref,
+            "--",
+        ],
+        None,
+        max_bytes,
+        &operation,
+    )?;
+    Ok(String::from_utf8_lossy(&output.bytes).into_owned())
 }
 
 /// URL of the named remote (usually "origin"), if configured.
@@ -4175,6 +4260,30 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_review_diff_is_bounded_and_decodes_non_utf8_lossily() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join("a.txt"), b"before\n").unwrap();
+        run(tmp.path(), &["add", "a.txt"]);
+        run(tmp.path(), &["commit", "-m", "base"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("a.txt"), b"after \xff\n").unwrap();
+        run(tmp.path(), &["add", "a.txt"]);
+        run(tmp.path(), &["commit", "-m", "non utf8"]);
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let diff = diff_between(tmp.path(), &base, &head, 64 * 1024, &cancel).unwrap();
+        assert!(diff.contains("after \u{fffd}"));
+        let error = diff_between(tmp.path(), &base, &head, 1, &cancel).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("output exceeded its 1-byte bound")
+        );
+    }
+
+    #[test]
     fn selected_file_diff_has_an_independent_bound() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
@@ -4235,7 +4344,11 @@ mod tests {
         assert!(!diff.contains("+other"));
         let byte_error =
             diff_path_between(tmp.path(), &base, &head, ":(glob)**", 8, &cancel).unwrap_err();
-        assert!(byte_error.to_string().contains("8-byte limit"));
+        assert!(
+            byte_error
+                .to_string()
+                .contains("output exceeded its 8-byte bound")
+        );
     }
 
     #[test]

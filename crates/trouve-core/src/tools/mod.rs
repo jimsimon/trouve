@@ -55,6 +55,17 @@ const REVIEW_GIT_TRACE_ENV_VARS: &[&str] = &[
 ];
 
 fn harden_authenticated_review_git_command(command: &mut tokio::process::Command) {
+    for (name, _) in std::env::vars_os() {
+        let normalized = name.to_string_lossy().to_ascii_uppercase();
+        if normalized.starts_with("GIT_")
+            || matches!(
+                normalized.as_str(),
+                "SSH_ASKPASS" | "SSH_ASKPASS_REQUIRE" | "GCM_INTERACTIVE"
+            )
+        {
+            command.env_remove(name);
+        }
+    }
     for variable in REVIEW_GIT_TRACE_ENV_VARS {
         command.env_remove(variable);
     }
@@ -91,6 +102,16 @@ fn review_history_ref_name(
 
 fn review_repository_identity(repository_path: &Path) -> std::result::Result<PathBuf, String> {
     if repository_path.exists() {
+        if std::fs::symlink_metadata(repository_path)
+            .map_err(|error| format!("reading review repository path: {error}"))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(format!(
+                "review repository path must not be a symlink: {}",
+                repository_path.display()
+            ));
+        }
         return repository_path.canonicalize().map_err(|error| {
             format!(
                 "resolving review repository {}: {error}",
@@ -209,22 +230,37 @@ async fn finish_review_fetch_stderr(
     guard: &mut ReviewGitChildGuard,
     stderr_task: &mut tokio::task::JoinHandle<String>,
     wait_timeout: Duration,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> std::result::Result<String, String> {
-    match tokio::time::timeout(wait_timeout, &mut *stderr_task).await {
-        Ok(Ok(stderr)) => return Ok(stderr),
-        Ok(Err(_)) => return Ok(String::new()),
-        Err(_) => {}
+    let first_wait = match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            result = tokio::time::timeout(wait_timeout, &mut *stderr_task) => Some(result),
+        },
+        None => Some(tokio::time::timeout(wait_timeout, &mut *stderr_task).await),
+    };
+    let cancelled = first_wait.is_none();
+    match first_wait {
+        Some(Ok(Ok(stderr))) => return Ok(stderr),
+        Some(Ok(Err(_))) => return Ok(String::new()),
+        Some(Err(_)) | None => {}
     }
     terminate_review_git_process(guard)
         .await
         .map_err(|error| format!("terminating fetch descendants holding stderr: {error}"))?;
-    match tokio::time::timeout(wait_timeout, &mut *stderr_task).await {
-        Ok(Ok(stderr)) => Ok(stderr),
-        Ok(Err(_)) => Ok(String::new()),
+    let stderr = match tokio::time::timeout(wait_timeout, &mut *stderr_task).await {
+        Ok(Ok(stderr)) => stderr,
+        Ok(Err(_)) => String::new(),
         Err(_) => {
             stderr_task.abort();
-            Err("optional git fetch stderr remained open after process termination".into())
+            return Err("optional git fetch stderr remained open after process termination".into());
         }
+    };
+    if cancelled {
+        Err("review repository sync cancelled".into())
+    } else {
+        Ok(stderr)
     }
 }
 
@@ -237,25 +273,55 @@ struct ReviewHistoryFetch {
 fn authenticated_review_git_base_command(
     repository_path: &Path,
     auth: &str,
+    remote_url: &str,
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
+    harden_authenticated_review_git_command(&mut command);
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut config = vec![
+        (
+            "http.https://github.com/.extraheader".to_owned(),
+            format!("AUTHORIZATION: basic {auth}"),
+        ),
+        ("credential.helper".to_owned(), String::new()),
+        ("core.hooksPath".to_owned(), null_device.to_owned()),
+        ("core.fsmonitor".to_owned(), "false".to_owned()),
+        ("http.proxy".to_owned(), String::new()),
+        ("remote.origin.proxy".to_owned(), String::new()),
+        ("protocol.allow".to_owned(), "never".to_owned()),
+        ("protocol.https.allow".to_owned(), "always".to_owned()),
+        (format!("url.{remote_url}.insteadOf"), remote_url.to_owned()),
+    ];
+    if !remote_url.starts_with("https://") {
+        config.push(("protocol.file.allow".to_owned(), "always".to_owned()));
+    }
     command
         .current_dir(repository_path)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-        .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_device)
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_ASKPASS", null_device)
+        .env("SSH_ASKPASS", null_device)
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_CONFIG_COUNT", config.len().to_string())
         .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true);
-    harden_authenticated_review_git_command(&mut command);
+    for (index, (key, value)) in config.into_iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
     command
 }
 
 fn optional_review_fetch_command(
     repository_path: &Path,
     auth: &str,
+    remote_url: &str,
     refspec: &str,
 ) -> tokio::process::Command {
-    let mut command = authenticated_review_git_base_command(repository_path, auth);
+    let mut command = authenticated_review_git_base_command(repository_path, auth, remote_url);
     command
         .args([
             "fetch",
@@ -263,7 +329,7 @@ fn optional_review_fetch_command(
             "--no-tags",
             "--no-write-fetch-head",
             "--no-auto-maintenance",
-            "origin",
+            remote_url,
             refspec,
         ])
         .stdin(Stdio::null())
@@ -275,9 +341,10 @@ fn optional_review_fetch_command(
 fn authenticated_review_git_command(
     repository_path: &Path,
     auth: &str,
+    remote_url: &str,
     args: &[String],
 ) -> tokio::process::Command {
-    let mut command = authenticated_review_git_base_command(repository_path, auth);
+    let mut command = authenticated_review_git_base_command(repository_path, auth, remote_url);
     command.args(args);
     command
 }
@@ -286,6 +353,7 @@ async fn run_managed_authenticated_review_git_command(
     mut command: tokio::process::Command,
     auth: &str,
     timeout: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
     repository_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, String> {
     command
@@ -300,26 +368,47 @@ async fn run_managed_authenticated_review_git_command(
         .take_stderr()
         .ok_or_else(|| "git did not capture stderr".to_owned())?;
     let mut stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
-    let result = match tokio::time::timeout(timeout, guard.child_mut().wait_and_cleanup()).await {
-        Ok(Ok(status)) => Ok(status),
-        Ok(Err(error)) => match terminate_review_git_process(&mut guard).await {
-            Ok(()) => Err(format!("running git: {error}")),
-            Err(terminate_error) => Err(format!(
-                "running git: {error}; terminating it: {terminate_error}"
+    let wait_result = {
+        let wait = tokio::time::timeout(timeout, guard.child_mut().wait_and_cleanup());
+        tokio::pin!(wait);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            result = &mut wait => Some(result),
+        }
+    };
+    let result = match wait_result {
+        None => match terminate_review_git_process(&mut guard).await {
+            Ok(()) => Err("review repository sync cancelled".to_owned()),
+            Err(error) => Err(format!(
+                "review repository sync cancelled; process-tree cleanup failed: {error}"
             )),
         },
-        Err(_) => match terminate_review_git_process(&mut guard).await {
-            Ok(()) => Err(format!(
-                "git fetch timed out after {:.1}s",
-                timeout.as_secs_f64()
-            )),
-            Err(error) => Err(format!("terminating timed-out git fetch: {error}")),
+        Some(result) => match result {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(error)) => match terminate_review_git_process(&mut guard).await {
+                Ok(()) => Err(format!("running git: {error}")),
+                Err(terminate_error) => Err(format!(
+                    "running git: {error}; terminating it: {terminate_error}"
+                )),
+            },
+            Err(_) => match terminate_review_git_process(&mut guard).await {
+                Ok(()) => Err(format!(
+                    "git fetch timed out after {:.1}s",
+                    timeout.as_secs_f64()
+                )),
+                Err(error) => Err(format!("terminating timed-out git fetch: {error}")),
+            },
         },
     };
-    let stderr =
-        finish_review_fetch_stderr(&mut guard, &mut stderr_task, REVIEW_FETCH_TERMINATION_GRACE)
-            .await
-            .map(|stderr| sanitize_review_fetch_stderr(&stderr, auth))?;
+    let stderr = finish_review_fetch_stderr(
+        &mut guard,
+        &mut stderr_task,
+        REVIEW_FETCH_TERMINATION_GRACE,
+        Some(cancel),
+    )
+    .await
+    .map(|stderr| sanitize_review_fetch_stderr(&stderr, auth))?;
     let result = match result {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => {
@@ -349,9 +438,11 @@ async fn run_managed_authenticated_review_git_command(
 async fn run_optional_review_fetches(
     repository_path: &Path,
     auth: &str,
+    remote_url: &str,
     fetches: &[ReviewHistoryFetch],
+    cancel: &tokio_util::sync::CancellationToken,
     repository_guard: tokio::sync::OwnedMutexGuard<()>,
-) -> Vec<(String, String)> {
+) -> std::result::Result<Vec<(String, String)>, String> {
     let deadline = tokio::time::Instant::now() + REVIEW_OPTIONAL_FETCH_TIMEOUT;
     let mut repository_guard = Some(repository_guard);
     let mut failures = Vec::new();
@@ -366,7 +457,11 @@ async fn run_optional_review_fetches(
         }
         let attempts_left = u32::try_from(fetches.len() - index).unwrap_or(1);
         let attempt_timeout = remaining / attempts_left;
-        let mut command = optional_review_fetch_command(repository_path, auth, &fetch.refspec);
+        if cancel.is_cancelled() {
+            return Err("review repository sync cancelled".into());
+        }
+        let mut command =
+            optional_review_fetch_command(repository_path, auth, remote_url, &fetch.refspec);
         let child = match spawn_process_tree(&mut command) {
             Ok(child) => child,
             Err(error) => {
@@ -390,59 +485,79 @@ async fn run_optional_review_fetches(
                     fetch.sha.clone(),
                     "optional git fetch stderr was not captured".into(),
                 ));
-                return failures;
+                return Ok(failures);
             }
         };
         let mut stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
-        let result = match tokio::time::timeout(
-            attempt_timeout,
-            guard.child_mut().wait_and_cleanup(),
-        )
-        .await
-        {
-            Ok(Ok(status)) if status.success() => Ok(()),
-            Ok(Ok(status)) => Err(format!("optional git fetch exited with {status}")),
-            Ok(Err(error)) => match terminate_review_git_process(&mut guard).await {
-                Ok(()) => Err(format!("waiting for optional git fetch: {error}")),
-                Err(terminate_error) => {
-                    failures.push((
+        let wait_result = {
+            let wait = tokio::time::timeout(attempt_timeout, guard.child_mut().wait_and_cleanup());
+            tokio::pin!(wait);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                result = &mut wait => Some(result),
+            }
+        };
+        let result = match wait_result {
+            None => {
+                terminate_review_git_process(&mut guard)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "review repository sync cancelled; process-tree cleanup failed: {error}"
+                        )
+                    })?;
+                return Err("review repository sync cancelled".into());
+            }
+            Some(result) => match result {
+                Ok(Ok(status)) if status.success() => Ok(()),
+                Ok(Ok(status)) => Err(format!("optional git fetch exited with {status}")),
+                Ok(Err(error)) => match terminate_review_git_process(&mut guard).await {
+                    Ok(()) => Err(format!("waiting for optional git fetch: {error}")),
+                    Err(terminate_error) => {
+                        failures.push((
                         fetch.sha.clone(),
                         format!(
                             "waiting for optional git fetch: {error}; terminating it: {terminate_error}"
                         ),
                     ));
-                    return failures;
-                }
-            },
-            Err(_) => match terminate_review_git_process(&mut guard).await {
-                Ok(()) => {
-                    cleanup_review_fetch_locks(
-                        repository_path,
-                        std::slice::from_ref(&fetch.history_ref),
-                    );
-                    Err(format!(
-                        "optional git fetch timed out after {:.1}s",
-                        attempt_timeout.as_secs_f64()
-                    ))
-                }
-                Err(error) => {
-                    failures.push((
-                        fetch.sha.clone(),
-                        format!("terminating timed-out optional git fetch: {error}"),
-                    ));
-                    return failures;
-                }
+                        return Ok(failures);
+                    }
+                },
+                Err(_) => match terminate_review_git_process(&mut guard).await {
+                    Ok(()) => {
+                        cleanup_review_fetch_locks(
+                            repository_path,
+                            std::slice::from_ref(&fetch.history_ref),
+                        );
+                        Err(format!(
+                            "optional git fetch timed out after {:.1}s",
+                            attempt_timeout.as_secs_f64()
+                        ))
+                    }
+                    Err(error) => {
+                        failures.push((
+                            fetch.sha.clone(),
+                            format!("terminating timed-out optional git fetch: {error}"),
+                        ));
+                        return Ok(failures);
+                    }
+                },
             },
         };
         let stderr = match finish_review_fetch_stderr(
             &mut guard,
             &mut stderr_task,
             REVIEW_FETCH_TERMINATION_GRACE,
+            Some(cancel),
         )
         .await
         {
             Ok(stderr) => sanitize_review_fetch_stderr(&stderr, auth),
             Err(stderr_error) => {
+                if cancel.is_cancelled() {
+                    return Err(stderr_error);
+                }
                 cleanup_review_fetch_locks(
                     repository_path,
                     std::slice::from_ref(&fetch.history_ref),
@@ -452,7 +567,7 @@ async fn run_optional_review_fetches(
                     Err(error) => format!("{error}; {stderr_error}"),
                 };
                 failures.push((fetch.sha.clone(), error));
-                return failures;
+                return Ok(failures);
             }
         };
         guard.disarm();
@@ -465,7 +580,7 @@ async fn run_optional_review_fetches(
             failures.push((fetch.sha.clone(), error));
         }
     }
-    failures
+    Ok(failures)
 }
 
 /// One session mutation lane that a tool may transfer to a background task.
@@ -1472,6 +1587,43 @@ pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
         ]
         .iter()
         .any(|suffix| file_name.ends_with(suffix))
+}
+
+fn split_review_diff_files(
+    paths: Vec<String>,
+    diff: String,
+) -> std::result::Result<Vec<ReviewDiffFile>, String> {
+    if paths.is_empty() {
+        return if diff.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err("review diff returned content without changed paths".into())
+        };
+    }
+    if !diff.starts_with("diff --git ") {
+        return Err("review diff did not begin with a file boundary".into());
+    }
+    let mut starts = vec![0];
+    starts.extend(
+        diff.match_indices("\ndiff --git ")
+            .map(|(offset, _)| offset + 1),
+    );
+    if starts.len() != paths.len() {
+        return Err(format!(
+            "review diff returned {} file segments for {} changed paths",
+            starts.len(),
+            paths.len()
+        ));
+    }
+    starts.push(diff.len());
+    Ok(paths
+        .into_iter()
+        .zip(starts.windows(2))
+        .map(|(path, range)| ReviewDiffFile {
+            path,
+            diff: diff[range[0]..range[1]].to_owned(),
+        })
+        .collect())
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -2704,10 +2856,16 @@ impl ToolExecutor for LocalToolExecutor {
             .root
             .canonicalize()
             .map_err(|error| format!("resolving review root: {error}"))?;
-        let repository_path =
-            review_repository_identity(&managed_root.join(owner).join(repository))?;
+        let requested_repository_path = managed_root.join(owner).join(repository);
+        let repository_path = review_repository_identity(&requested_repository_path)?;
         let repository_lock = self.review_repository_lock(&repository_path);
-        let mut repository_guard = repository_lock.lock_owned().await;
+        let mut repository_guard = tokio::select! {
+            biased;
+            _ = request.cancel.cancelled() => {
+                return Err("review repository sync cancelled".into());
+            }
+            guard = repository_lock.lock_owned() => guard,
+        };
         let parent = repository_path
             .parent()
             .ok_or_else(|| "invalid review repository path".to_string())?;
@@ -2825,11 +2983,13 @@ impl ToolExecutor for LocalToolExecutor {
                 format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
                 format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
             ];
-            let command = authenticated_review_git_command(&repository_path, &auth, &fetch_args);
+            let command =
+                authenticated_review_git_command(&repository_path, &auth, &remote_url, &fetch_args);
             repository_guard = run_managed_authenticated_review_git_command(
                 command,
                 &auth,
                 REVIEW_PRIMARY_FETCH_TIMEOUT,
+                &request.cancel,
                 repository_guard,
             )
             .await?;
@@ -2884,9 +3044,15 @@ impl ToolExecutor for LocalToolExecutor {
         if fetches.is_empty() {
             drop(repository_guard);
         } else {
-            for (sha, error) in
-                run_optional_review_fetches(&repository_path, &auth, &fetches, repository_guard)
-                    .await
+            for (sha, error) in run_optional_review_fetches(
+                &repository_path,
+                &auth,
+                &remote_url,
+                &fetches,
+                &request.cancel,
+                repository_guard,
+            )
+            .await?
             {
                 tracing::warn!(
                     repository = %request.repository,
@@ -2913,10 +3079,10 @@ impl ToolExecutor for LocalToolExecutor {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let repository_lock = self.review_repository_lock(&repository_path);
-        let repository_guard =
-            tokio::time::timeout(REVIEW_HISTORY_CLEANUP_TIMEOUT, repository_lock.lock_owned())
-                .await
-                .map_err(|_| "timed out waiting to clean temporary review refs".to_owned())?;
+        // Cleanup is performed after the job is terminal, so wait for the
+        // repository owner instead of abandoning refs during normal fetch
+        // contention. The child process itself remains strictly bounded.
+        let repository_guard = repository_lock.lock_owned().await;
 
         let mut command = tokio::process::Command::new("git");
         command
@@ -2979,6 +3145,7 @@ impl ToolExecutor for LocalToolExecutor {
             &mut guard,
             &mut stderr_task,
             REVIEW_FETCH_TERMINATION_GRACE,
+            None,
         )
         .await
         {
@@ -3032,28 +3199,21 @@ impl ToolExecutor for LocalToolExecutor {
                 &cancel,
             )
             .map_err(|error| error.to_string())?;
-            let mut total_bytes = 0_usize;
-            let mut files = Vec::with_capacity(paths.len());
-            for path in paths {
-                if cancel.is_cancelled() {
-                    return Err("review repository diff cancelled".into());
-                }
-                total_bytes = total_bytes
+            let path_bytes = paths.iter().try_fold(0_usize, |total, path| {
+                total
                     .checked_add(path.len())
-                    .ok_or_else(|| "review diff byte count overflow".to_owned())?;
-                let remaining = max_bytes
-                    .checked_sub(total_bytes)
-                    .ok_or_else(|| format!("review diff exceeds the {max_bytes}-byte limit"))?;
-                let diff = crate::git::diff_path_between(
-                    &worktree, &base_sha, &head_sha, &path, remaining, &cancel,
-                )
-                .map_err(|error| error.to_string())?;
-                total_bytes = total_bytes
-                    .checked_add(diff.len())
-                    .ok_or_else(|| "review diff byte count overflow".to_owned())?;
-                files.push(ReviewDiffFile { path, diff });
+                    .ok_or_else(|| "review diff byte count overflow".to_owned())
+            })?;
+            let remaining = max_bytes
+                .checked_sub(path_bytes)
+                .ok_or_else(|| format!("review diff exceeds the {max_bytes}-byte limit"))?;
+            let diff =
+                crate::git::diff_between(&worktree, &base_sha, &head_sha, remaining, &cancel)
+                    .map_err(|error| error.to_string())?;
+            if path_bytes.saturating_add(diff.len()) > max_bytes {
+                return Err(format!("review diff exceeds the {max_bytes}-byte limit"));
             }
-            Ok(files)
+            split_review_diff_files(paths, diff)
         })
         .await
         .map_err(|error| format!("review diff manifest task failed: {error}"))?
@@ -3941,6 +4101,7 @@ mod tests {
         let command = optional_review_fetch_command(
             Path::new("."),
             "secret-auth",
+            "https://github.com/acme/widgets.git",
             "+abc:refs/remotes/origin/trouve-history-42-rv_test-0",
         );
         let command = command.as_std();
@@ -3954,6 +4115,24 @@ mod tests {
         for variable in REVIEW_GIT_TRACE_ENV_VARS {
             assert_eq!(env.get(std::ffi::OsStr::new(variable)), Some(&None));
         }
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("GIT_CONFIG_GLOBAL")),
+            Some(&Some(std::ffi::OsStr::new(if cfg!(windows) {
+                "NUL"
+            } else {
+                "/dev/null"
+            })))
+        );
+        assert!(
+            env.values()
+                .flatten()
+                .any(|value| *value == "credential.helper")
+        );
+        assert!(
+            env.values()
+                .flatten()
+                .any(|value| *value == "protocol.allow")
+        );
     }
 
     #[test]
@@ -3975,6 +4154,71 @@ mod tests {
             review_repository_identity(&direct).unwrap(),
             review_repository_identity(&lexical).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_repository_identity_rejects_repository_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("owner")).unwrap();
+        let repository = root.path().join("owner/repository");
+        symlink(target.path(), &repository).unwrap();
+
+        let error = review_repository_identity(&repository).unwrap_err();
+        assert!(error.contains("must not be a symlink"));
+    }
+
+    #[test]
+    fn aggregate_review_diff_splits_only_real_file_boundaries() {
+        let files = split_review_diff_files(
+            vec!["a.txt".into(), "b.txt".into()],
+            concat!(
+                "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n",
+                "-diff --git old\n+diff --git new\n",
+                "diff --git a/b.txt b/b.txt\n@@ -0,0 +1 @@\n+new\n"
+            )
+            .into(),
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "a.txt");
+        assert!(files[0].diff.contains("+diff --git new"));
+        assert_eq!(files[1].path, "b.txt");
+    }
+
+    #[tokio::test]
+    async fn cancelled_review_sync_does_not_wait_for_repository_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let repository_path =
+            review_repository_identity(&root.path().join("acme/widgets")).unwrap();
+        let executor = LocalToolExecutor::default();
+        let repository_lock = executor.review_repository_lock(&repository_path);
+        let _guard = repository_lock.lock_owned().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            executor.sync_review_repository(&ReviewRepositorySync {
+                root: root.path().to_path_buf(),
+                repository: "acme/widgets".into(),
+                job_id: "rv_cancelled".into(),
+                pull_number: 42,
+                base_sha: "1111111111111111111111111111111111111111".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                optional_shas: Vec::new(),
+                token: "unused".into(),
+                cancel,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.contains("cancelled"));
     }
 
     #[tokio::test]
@@ -4038,10 +4282,13 @@ mod tests {
         let failures = run_optional_review_fetches(
             repository.path(),
             "test-auth",
+            origin.path().to_str().unwrap(),
             &fetches,
+            &tokio_util::sync::CancellationToken::new(),
             repository_lock.lock_owned().await,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].0, missing_sha);
@@ -4191,12 +4438,41 @@ mod tests {
             command,
             "test-auth",
             Duration::from_millis(50),
+            &tokio_util::sync::CancellationToken::new(),
             repository_lock.clone().lock_owned().await,
         )
         .await
         .unwrap_err();
 
         assert!(error.contains("git fetch timed out"));
+        tokio::time::timeout(
+            REVIEW_FETCH_TERMINATION_GRACE * 2,
+            repository_lock.lock_owned(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_authenticated_git_command_reaps_on_cancellation() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("sleep 60 & wait");
+        let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let error = run_managed_authenticated_review_git_command(
+            command,
+            "test-auth",
+            Duration::from_secs(60),
+            &cancel,
+            repository_lock.clone().lock_owned().await,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("cancelled"));
         tokio::time::timeout(
             REVIEW_FETCH_TERMINATION_GRACE * 2,
             repository_lock.lock_owned(),
@@ -4216,6 +4492,7 @@ mod tests {
             command,
             "test-auth",
             Duration::from_secs(1),
+            &tokio_util::sync::CancellationToken::new(),
             repository_lock.lock_owned().await,
         )
         .await
@@ -4260,9 +4537,14 @@ mod tests {
                 .success()
         );
 
-        finish_review_fetch_stderr(&mut guard, &mut stderr_task, Duration::from_millis(50))
-            .await
-            .unwrap();
+        finish_review_fetch_stderr(
+            &mut guard,
+            &mut stderr_task,
+            Duration::from_millis(50),
+            None,
+        )
+        .await
+        .unwrap();
         guard.disarm();
     }
 

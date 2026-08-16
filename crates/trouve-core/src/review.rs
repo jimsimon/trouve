@@ -43,6 +43,7 @@ const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
 const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
+const REVIEW_OUTBOX_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REVIEWER_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_REVIEWER_TIMEOUT_SECONDS";
@@ -262,10 +263,23 @@ pub struct CodeReviewRuntime {
     projection_queue: Mutex<HashMap<String, ProjectionQueueState>>,
     projection_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     diff_cache: Mutex<ReviewDiffCache>,
+    outbox_retries: Mutex<HashMap<String, ReviewOutboxRetryState>>,
     /// Finding ids whose thread collapse is currently being attempted, so the
     /// detached post-publication cleanup and the retry task never issue
     /// duplicate mutations for the same finding.
     collapse_in_flight: Mutex<HashSet<String>>,
+}
+
+struct ReviewOutboxRetryState {
+    failures: u32,
+    retry_at: Instant,
+}
+
+fn review_outbox_retry_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(6);
+    JOB_IDLE_INTERVAL
+        .saturating_mul(1_u32 << exponent)
+        .min(REVIEW_OUTBOX_RETRY_MAX_DELAY)
 }
 
 #[derive(Clone)]
@@ -1083,6 +1097,17 @@ struct ReviewTurnResult {
     metrics: CodeReviewTaskMetrics,
 }
 
+#[derive(Debug)]
+struct SupersededReviewTask;
+
+impl std::fmt::Display for SupersededReviewTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("review task was superseded while finishing")
+    }
+}
+
+impl std::error::Error for SupersededReviewTask {}
+
 struct ReviewTurnRequest {
     prompt: String,
     tools_enabled: bool,
@@ -1558,14 +1583,54 @@ impl Engine {
                 return;
             }
         };
+        let pending_jobs = job_ids.iter().cloned().collect::<HashSet<_>>();
+        self.code_review
+            .outbox_retries
+            .lock()
+            .unwrap()
+            .retain(|job_id, _| pending_jobs.contains(job_id));
+        let mut failures = Vec::new();
         for job_id in job_ids {
+            let now = Instant::now();
+            if self
+                .code_review
+                .outbox_retries
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .is_some_and(|state| state.retry_at > now)
+            {
+                continue;
+            }
             if let Err(error) = self.flush_pending_code_review_events(&job_id).await {
                 tracing::warn!(
                     job_id = %job_id,
                     %error,
                     "could not replay pending code-review transition events"
                 );
+                let mut retries = self.code_review.outbox_retries.lock().unwrap();
+                let state = retries
+                    .entry(job_id.clone())
+                    .or_insert(ReviewOutboxRetryState {
+                        failures: 0,
+                        retry_at: now,
+                    });
+                state.failures = state.failures.saturating_add(1);
+                state.retry_at = now + review_outbox_retry_delay(state.failures);
+                failures.push((job_id, error.to_string()));
+            } else {
+                self.code_review
+                    .outbox_retries
+                    .lock()
+                    .unwrap()
+                    .remove(&job_id);
             }
+        }
+        if let Some((job_id, error)) = failures.first() {
+            self.record_review_error(format!(
+                "{} code-review transition outbox job(s) remain pending; first failure for {job_id}: {error}",
+                failures.len()
+            ));
         }
     }
 
@@ -3323,27 +3388,6 @@ impl Engine {
                 }
             }
         }
-        if record.job.scope == trouve_protocol::CodeReviewJobScope::Incremental
-            && let Err(cleanup_error) = self
-                .executor
-                .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
-                    worktree: self
-                        .data_dir
-                        .join("review-repositories")
-                        .join(&record.job.repository),
-                    job_id: job_id.clone(),
-                    pull_number: record.job.pull_number,
-                })
-                .await
-        {
-            tracing::warn!(
-                job_id = %job_id,
-                repository = %record.job.repository,
-                pull_number = record.job.pull_number,
-                error = %cleanup_error,
-                "could not delete temporary review-history refs during job cleanup"
-            );
-        }
         self.code_review.running.lock().unwrap().remove(&job_id);
         let cancellation_requested = self
             .store
@@ -3399,7 +3443,28 @@ impl Engine {
         }
         let _ = self.store.cancel_active_code_review_tasks(&job_id, &error);
         let _ = self.emit_code_review_job_updated(&job_id);
-        let _ = self.emit_code_review_updated(Some(job_id));
+        let _ = self.emit_code_review_updated(Some(job_id.clone()));
+        if record.job.scope == trouve_protocol::CodeReviewJobScope::Incremental
+            && let Err(cleanup_error) = self
+                .executor
+                .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
+                    worktree: self
+                        .data_dir
+                        .join("review-repositories")
+                        .join(&record.job.repository),
+                    job_id: job_id.clone(),
+                    pull_number: record.job.pull_number,
+                })
+                .await
+        {
+            tracing::warn!(
+                job_id = %job_id,
+                repository = %record.job.repository,
+                pull_number = record.job.pull_number,
+                error = %cleanup_error,
+                "could not delete temporary review-history refs during job cleanup"
+            );
+        }
     }
 
     async fn retry_code_review_cleanup(&self) {
@@ -3988,7 +4053,7 @@ impl Engine {
                             "",
                         )?
                         else {
-                            bail!("stale: review task was superseded while finishing");
+                            return Err(anyhow!(SupersededReviewTask));
                         };
                         engine.emit_code_review_task(&job.id, task)?;
                         Ok::<_, anyhow::Error>(candidates)
@@ -3996,7 +4061,7 @@ impl Engine {
                     .await;
                     if result
                         .as_ref()
-                        .is_err_and(|error| error.to_string().starts_with("stale:"))
+                        .is_err_and(|error| error.downcast_ref::<SupersededReviewTask>().is_some())
                     {
                         engine.refresh_code_review_progress(&job.id).await?;
                         return result;
@@ -8231,6 +8296,17 @@ fn merge_review_task_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_outbox_retry_delay_is_bounded_and_exponential() {
+        assert_eq!(review_outbox_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(review_outbox_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(review_outbox_retry_delay(4), Duration::from_secs(40));
+        assert_eq!(
+            review_outbox_retry_delay(u32::MAX),
+            REVIEW_OUTBOX_RETRY_MAX_DELAY
+        );
+    }
 
     #[test]
     fn review_progress_preserves_capacity_and_coalesced_tool_stages() {
