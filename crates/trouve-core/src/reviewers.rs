@@ -1,4 +1,4 @@
-use trouve_protocol::{AgentPersona, ReviewerProfile};
+use trouve_protocol::{AgentPersona, PersonaGroup, ReviewerProfile};
 
 pub const DEFAULT_REVIEWER_IDS: &[&str] = &[
     "correctness",
@@ -25,6 +25,11 @@ fn built_in(id: &str, name: &str, prompt: &str) -> ReviewerProfile {
 /// and queued jobs persist them.
 pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
     vec![
+        built_in(
+            "maintainability",
+            "Software Architect",
+            "Look for unnecessary coupling, duplicated sources of truth, violated module boundaries, misleading abstractions, brittle control flow, unreachable or obsolete code, and complexity that is likely to cause future correctness defects.",
+        ),
         built_in(
             "correctness",
             "Correctness Analyst",
@@ -90,6 +95,7 @@ pub fn reviewer_as_persona(reviewer: &ReviewerProfile) -> AgentPersona {
     AgentPersona {
         id: reviewer.id.clone(),
         display_name: reviewer.name.clone(),
+        group: PersonaGroup::Reviewer,
         system_prompt: reviewer.prompt.clone(),
         allowed_tools: crate::personas::review_inspection_tools(),
         read_only: true,
@@ -176,6 +182,7 @@ mod tests {
             ("api-compatibility", "API Steward"),
             ("data-integrity", "Data Integrity Specialist"),
             ("testing", "Test Engineer"),
+            ("maintainability", "Software Architect"),
             ("dependencies", "Supply Chain Analyst"),
             ("accessibility", "Accessibility Specialist"),
             ("operations", "Site Reliability Engineer"),
@@ -207,6 +214,7 @@ mod tests {
             review.default_permission_mode
         );
         assert_eq!(persona.system_prompt, reviewer.prompt);
+        assert_eq!(persona.group, PersonaGroup::Reviewer);
     }
 
     #[test]
@@ -214,6 +222,7 @@ mod tests {
         let persona = AgentPersona {
             id: "correctness".into(),
             display_name: "Correctness".into(),
+            group: PersonaGroup::Reviewer,
             system_prompt: "Canonical prompt".into(),
             allowed_tools: Vec::new(),
             read_only: true,

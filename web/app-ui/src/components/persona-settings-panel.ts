@@ -183,6 +183,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const id = String(data.get("id") ?? existing?.persona.id ?? "").trim();
     const displayName = String(data.get("display_name") ?? "").trim();
     const systemPrompt = String(data.get("system_prompt") ?? "").trim();
+    const group = String(data.get("group") ?? "general") as "general" | "reviewer";
     const permission = String(data.get("default_permission_mode") ?? "");
     if ((existing === undefined && !/^[a-z0-9][a-z0-9_-]*$/u.test(id)) || displayName === "") {
       this.#message = "Persona IDs use lowercase letters, digits, underscore, or dash; a display name is required.";
@@ -201,6 +202,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     }
     const request: ProtocolUpsertPersonaRequest = {
       display_name: displayName,
+      group,
       system_prompt: systemPrompt,
       allowed_tools: splitTools(String(data.get("allowed_tools") ?? "")),
       read_only: data.get("read_only") === "on",
@@ -267,6 +269,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
           ${mode === undefined ? html`<label class="mode-id-field"><span class="visually-hidden">Persona ID</span><input name="id" required placeholder="id (e.g. docs)" /></label>` : html`<input type="hidden" name="id" .value=${mode.id} />`}
           <label><span class="visually-hidden">Display name</span><input name="display_name" required placeholder="display name" .value=${mode?.display_name ?? ""} ?disabled=${readOnly} /></label>
         </div>
+        <label><span>Persona group</span><select name="group" .value=${mode?.group ?? "general"} ?disabled=${readOnly}><option value="general">General persona</option><option value="reviewer">Reviewer persona</option></select></label>
         <label><span>System prompt (appended to the base prompt):</span><textarea name="system_prompt" .value=${mode?.system_prompt ?? ""} ?disabled=${readOnly}></textarea></label>
         <label><span class="visually-hidden">Allowed tools</span><input name="allowed_tools" placeholder="allowed tools, comma-separated (empty = all tools)" .value=${(mode?.allowed_tools ?? []).join(", ")} ?disabled=${readOnly} /></label>
         <label class="row"><input style="width:auto" type="checkbox" name="read_only" .checked=${mode?.read_only ?? false} ?disabled=${readOnly} /><span>Read-only (never mutates the worktree)</span></label>
@@ -307,6 +310,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     try {
       await protocol.upsertPersona(mode.id, {
         display_name: mode.display_name,
+        group: mode.group ?? "general",
         system_prompt: mode.system_prompt,
         allowed_tools: [...(mode.allowed_tools ?? [])],
         ...(mode.read_only === undefined ? {} : { read_only: mode.read_only }),
@@ -397,9 +401,12 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
           <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
           <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Set defaults</button></div>
         </form>
-        <h3 class="section-subtitle">Personas</h3>
-        <p class="modes-copy">A persona combines a prompt, tool policy, permissions, model, and thinking defaults. Built-in personas cannot be deleted. Custom personas are also available for code review. Workspace personas are file-managed and read-only here.</p>
-        <section class="mode-list" aria-label="Personas">${this.#modes.map((info) => this.#modeRow(info))}</section>
+        <h3 class="section-subtitle">General personas</h3>
+        <p class="modes-copy">General personas are available to sessions and threads.</p>
+        <section class="mode-list" aria-label="General personas">${this.#modes.filter((info) => (info.persona.group ?? "general") === "general").map((info) => this.#modeRow(info))}</section>
+        <h3 class="section-subtitle">Reviewer personas</h3>
+        <p class="modes-copy">Reviewer personas are available to sessions and threads and may also be selected by code review.</p>
+        <section class="mode-list" aria-label="Reviewer personas">${this.#modes.filter((info) => info.persona.group === "reviewer").map((info) => this.#modeRow(info))}</section>
         ${this.#editingModeId === ""
           ? html`<div class="row"><button type="button" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add persona</button></div>`
           : this.#editingModeId === "__new__"

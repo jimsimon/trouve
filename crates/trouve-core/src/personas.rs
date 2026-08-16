@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use trouve_protocol::{AgentPersona, PersonaInfo};
+use trouve_protocol::{AgentPersona, PersonaGroup, PersonaInfo};
 
 pub const REVIEW_PERSONA_ID: &str = "review";
 
@@ -41,6 +41,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         AgentPersona {
             id: "code".into(),
             display_name: "Engineer".into(),
+            group: PersonaGroup::General,
             system_prompt: "You are the Engineer persona: implement the user's request by editing \
                             files in the workspace. Prefer small verifiable steps; run tests \
                             or builds when they exist. Report what you changed when done."
@@ -54,6 +55,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         AgentPersona {
             id: "plan".into(),
             display_name: "Planner".into(),
+            group: PersonaGroup::General,
             system_prompt:
                 "You are the Planner persona: explore the workspace and produce a concrete \
                             implementation plan. Do not modify any files; your deliverable is \
@@ -87,6 +89,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         AgentPersona {
             id: REVIEW_PERSONA_ID.into(),
             display_name: "Reviewer".into(),
+            group: PersonaGroup::Reviewer,
             system_prompt:
                 "You are the Reviewer persona: examine the changes in this workspace and \
                             report problems — bugs, missed edge cases, style violations — with \
@@ -108,6 +111,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         AgentPersona {
             id: "architect".into(),
             display_name: "Architect".into(),
+            group: PersonaGroup::General,
             system_prompt:
                 "You are the Architect persona: reason about structure, boundaries, and \
                             trade-offs. Review designs and changes for maintainability, duplicated \
@@ -123,6 +127,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         AgentPersona {
             id: "question".into(),
             display_name: "Researcher".into(),
+            group: PersonaGroup::General,
             system_prompt: "You are the Researcher persona: answer questions about the workspace. \
                             Read whatever you need; never modify anything."
                 .into(),
@@ -154,6 +159,7 @@ pub fn fallback_persona() -> AgentPersona {
     AgentPersona {
         id: "restricted".into(),
         display_name: "Restricted".into(),
+        group: PersonaGroup::General,
         system_prompt: "The configured persona is unavailable. Operating in a restricted, \
                         read-only persona: inspect the workspace and report, but do not modify \
                         anything."
@@ -347,6 +353,21 @@ mod tests {
     }
 
     #[test]
+    fn builtin_personas_are_grouped_by_intended_use() {
+        let personas = builtin_personas();
+        for id in ["code", "plan", "architect", "question"] {
+            assert_eq!(
+                find_persona(&personas, id).unwrap().group,
+                PersonaGroup::General
+            );
+        }
+        assert_eq!(
+            find_persona(&personas, "review").unwrap().group,
+            PersonaGroup::Reviewer
+        );
+    }
+
+    #[test]
     fn review_persona_defaults_to_medium_thinking_without_changing_plan_persona() {
         let personas = builtin_personas();
         assert_eq!(
@@ -438,6 +459,7 @@ default_permission_mode = "ask"
         let custom = AgentPersona {
             id: "docs".into(),
             display_name: "Docs".into(),
+            group: PersonaGroup::General,
             system_prompt: "write docs".into(),
             allowed_tools: vec![],
             read_only: false,

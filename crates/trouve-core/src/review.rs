@@ -2194,7 +2194,10 @@ impl Engine {
             reviewers.push(reviewer);
         }
         // Code review consumes the canonical persona catalog directly.
-        for persona in crate::personas::resolve_personas(self.config_dir.as_deref(), None) {
+        for persona in crate::personas::resolve_personas(self.config_dir.as_deref(), None)
+            .into_iter()
+            .filter(|persona| persona.group == trouve_protocol::PersonaGroup::Reviewer)
+        {
             let existing = reviewers
                 .iter()
                 .find(|candidate| candidate.id == persona.id)

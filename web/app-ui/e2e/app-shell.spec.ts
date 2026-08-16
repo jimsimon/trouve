@@ -133,6 +133,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
           persona: {
             id: "code",
             display_name: "Engineer",
+            group: "general",
             system_prompt: "Implement the user's request by editing files.",
           },
         },
@@ -141,6 +142,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
           persona: {
             id: "plan",
             display_name: "Planner",
+            group: "general",
             system_prompt: "Explore the workspace and produce a concrete plan.",
             read_only: true,
           },
@@ -150,6 +152,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
           persona: {
             id: "review",
             display_name: "Reviewer",
+            group: "reviewer",
             system_prompt: "Review the current changes for correctness.",
             read_only: true,
           },

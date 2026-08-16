@@ -4678,6 +4678,7 @@ impl Engine {
         let persona = AgentPersona {
             id: id.to_string(),
             display_name: req.display_name,
+            group: req.group,
             system_prompt: req.system_prompt,
             allowed_tools: req.allowed_tools,
             read_only: req.read_only,
@@ -14595,6 +14596,7 @@ mod tests {
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
             display_name: display_name.into(),
+            group: trouve_protocol::PersonaGroup::General,
             system_prompt: format!("Act as {display_name}."),
             allowed_tools: vec!["read_file".into()],
             read_only: true,
@@ -14728,6 +14730,7 @@ mod tests {
         let workspace_persona = AgentPersona {
             id: "workspace-only".into(),
             display_name: "Workspace only".into(),
+            group: trouve_protocol::PersonaGroup::General,
             system_prompt: "Inspect the workspace.".into(),
             allowed_tools: vec!["read_file".into()],
             read_only: true,
@@ -14883,6 +14886,7 @@ mod tests {
         let persona = AgentPersona {
             id: "custom".into(),
             display_name: "Custom".into(),
+            group: trouve_protocol::PersonaGroup::General,
             system_prompt: "Review carefully.".into(),
             allowed_tools: Vec::new(),
             read_only: true,

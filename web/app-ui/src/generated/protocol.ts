@@ -1717,10 +1717,6 @@ export interface components {
             /** @description HuggingFace repo id, e.g. "unsloth/Qwen3.6-27B-GGUF". */
             repo: string;
         };
-        /**
-         * @description A data-driven agent persona: prompt + tool policy + model/permission defaults.
-         *     Adding a persona is configuration, not code (AGENTS.md invariant 6).
-         */
         AgentPersona: {
             /** @description Tool names this persona may use; empty means all registered tools. */
             allowed_tools?: string[];
@@ -1738,6 +1734,7 @@ export interface components {
              */
             default_thinking_level?: string | null;
             display_name: string;
+            group?: components["schemas"]["PersonaGroup"];
             /** @description Stable identifier, e.g. "code", "plan", "review". */
             id: string;
             /**
@@ -3294,6 +3291,12 @@ export interface components {
          * @enum {string}
          */
         PermissionMode: "ask" | "allow_list" | "yolo";
+        /**
+         * @description A data-driven agent persona: prompt + tool policy + model/permission defaults.
+         *     Adding a persona is configuration, not code (AGENTS.md invariant 6).
+         * @enum {string}
+         */
+        PersonaGroup: "general" | "reviewer";
         /** @description A persona plus where it came from, for the settings UI. */
         PersonaInfo: {
             /**
@@ -4680,6 +4683,7 @@ export interface components {
             /** @description None uses the global default thinking level. */
             default_thinking_level?: string | null;
             display_name: string;
+            group?: components["schemas"]["PersonaGroup"];
             read_only?: boolean;
             system_prompt: string;
         };

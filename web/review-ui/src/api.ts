@@ -161,6 +161,7 @@ export const saveReviewer = async (
     method: "PUT",
     body: JSON.stringify({
       display_name: reviewer.name,
+      group: "reviewer",
       system_prompt: reviewer.prompt,
       allowed_tools: existing?.allowed_tools ?? [],
       read_only: existing?.read_only ?? false,
@@ -186,6 +187,7 @@ export const savePersona = (persona: PersonaInfo["persona"]): Promise<void> =>
     method: "PUT",
     body: JSON.stringify({
       display_name: persona.display_name,
+      group: persona.group ?? "general",
       system_prompt: persona.system_prompt,
       allowed_tools: persona.allowed_tools,
       read_only: persona.read_only,

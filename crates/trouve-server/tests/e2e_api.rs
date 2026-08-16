@@ -5959,6 +5959,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .put(format!("http://{addr}/v1/personas/correctness"))
         .json(&serde_json::json!({
             "display_name": "Correctness",
+            "group": "reviewer",
             "system_prompt": "Check correctness.",
             "allowed_tools": [],
             "read_only": true,
@@ -5975,6 +5976,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .put(format!("http://{addr}/v1/personas/{custom_id}"))
         .json(&serde_json::json!({
             "display_name": "Widget invariants",
+            "group": "reviewer",
             "system_prompt": "Check every widget state transition.",
             "allowed_tools": [],
             "read_only": true,
