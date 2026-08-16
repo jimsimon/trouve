@@ -27,62 +27,62 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
     vec![
         built_in(
             "correctness",
-            "Correctness & Edge Cases",
+            "Correctness Analyst",
             "Find behavior that is incorrect for reachable inputs or states. Trace changed control flow, invariants, boundary conditions, null/empty/error cases, and interactions with unchanged callers. Prefer concrete failures over speculative concerns.",
         ),
         built_in(
             "security",
-            "Security & Privacy",
+            "Security Engineer",
             "Look for authorization or authentication bypasses, injection, unsafe deserialization, secret or personal-data exposure, path and command traversal, cryptographic misuse, insecure defaults, and trust-boundary violations introduced by the change.",
         ),
         built_in(
             "reliability",
-            "Reliability & Error Handling",
+            "Reliability Engineer",
             "Review failure paths, retries, timeouts, cancellation, cleanup, partial writes, idempotency, resource lifetime, and recovery after interruption. Identify failures that can corrupt state, leak resources, hang, or hide actionable errors.",
         ),
         built_in(
             "performance",
-            "Performance & Scalability",
+            "Performance Engineer",
             "Find algorithmic regressions, unbounded work or memory, avoidable network or database round trips, blocking work on async paths, missing batching or pagination, cache invalidation problems, and hot-path allocations with material impact.",
         ),
         built_in(
             "concurrency",
-            "Concurrency & Async",
+            "Concurrency Specialist",
             "Analyze races, deadlocks, lock ordering and scope, cancellation races, task and process lifetime, atomicity, lost wakeups, duplicate work, and unsafe assumptions about serialization across threads, workers, or replicas. Trace synchronization guards through their full lifetime, especially across awaits, I/O, durable writes, callbacks, and state publication or removal.",
         ),
         built_in(
             "api-compatibility",
-            "API & Compatibility",
+            "API Steward",
             "Check public APIs, wire formats, schemas, migrations, configuration, persisted data, CLI behavior, and downstream callers for breaking or ambiguous changes. Verify backward/forward compatibility and safe rollout behavior.",
         ),
         built_in(
             "data-integrity",
-            "Data Integrity & Migrations",
+            "Data Integrity Specialist",
             "Review database and state transitions for transactional safety, constraints, migration compatibility, precision or encoding loss, ordering assumptions, duplicate handling, rollback safety, and consistency between durable and in-memory state.",
         ),
         built_in(
             "testing",
-            "Tests & Verification",
+            "Test Engineer",
             "Identify changed behavior that lacks meaningful coverage, tests that can pass while the implementation is broken, missing negative or boundary cases, nondeterministic tests, and validation that does not exercise the real integration path.",
         ),
         built_in(
             "maintainability",
-            "Maintainability & Architecture",
+            "Software Architect",
             "Look for unnecessary coupling, duplicated sources of truth, violated module boundaries, misleading abstractions, brittle control flow, unreachable or obsolete code, and complexity that is likely to cause future correctness defects.",
         ),
         built_in(
             "dependencies",
-            "Dependencies & Supply Chain",
+            "Supply Chain Analyst",
             "Inspect dependency, lockfile, build, packaging, and CI changes for unsafe sources, accidental upgrades or downgrades, feature mismatches, license or provenance concerns, non-reproducible builds, and deployment incompatibilities.",
         ),
         built_in(
             "accessibility",
-            "Frontend UX & Accessibility",
+            "Accessibility Specialist",
             "Review user-facing changes for keyboard and screen-reader access, focus and state management, semantic structure, contrast and motion concerns, responsive behavior, localization, destructive-action safety, and confusing failure states.",
         ),
         built_in(
             "operations",
-            "Observability & Operations",
+            "Site Reliability Engineer",
             "Check logging, metrics, tracing, health behavior, configuration, deployment, rate limiting, backpressure, alertability, and operational failure modes. Flag changes that make incidents harder to detect, diagnose, contain, or recover from.",
         ),
     ]
@@ -196,6 +196,34 @@ mod tests {
             );
         }
         assert!(DEFAULT_REVIEWER_IDS.contains(&"concurrency"));
+    }
+
+    #[test]
+    fn built_in_reviewer_names_describe_person_roles() {
+        let reviewers = built_in_reviewers();
+        for (id, name) in [
+            ("correctness", "Correctness Analyst"),
+            ("security", "Security Engineer"),
+            ("reliability", "Reliability Engineer"),
+            ("performance", "Performance Engineer"),
+            ("concurrency", "Concurrency Specialist"),
+            ("api-compatibility", "API Steward"),
+            ("data-integrity", "Data Integrity Specialist"),
+            ("testing", "Test Engineer"),
+            ("maintainability", "Software Architect"),
+            ("dependencies", "Supply Chain Analyst"),
+            ("accessibility", "Accessibility Specialist"),
+            ("operations", "Site Reliability Engineer"),
+        ] {
+            assert_eq!(
+                reviewers
+                    .iter()
+                    .find(|reviewer| reviewer.id == id)
+                    .unwrap()
+                    .name,
+                name
+            );
+        }
     }
 
     #[test]
