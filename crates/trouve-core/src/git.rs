@@ -2368,11 +2368,11 @@ fn parse_review_marker_output(
         if line > header_lines {
             continue;
         }
-        let marker = markers.entry(name.to_owned()).or_default();
-        if !marker.is_empty() {
-            marker.push('\n');
-        }
-        marker.push_str(&String::from_utf8_lossy(content));
+        append_distinct_review_marker(
+            markers.entry(name.to_owned()).or_default(),
+            &String::from_utf8_lossy(content),
+            usize::MAX,
+        );
     }
     if tail_paths.is_empty()
         && let Some(path) = last_complete_path
@@ -2380,6 +2380,29 @@ fn parse_review_marker_output(
         tail_paths.push(path);
     }
     (markers, tail_paths)
+}
+
+fn append_distinct_review_marker(
+    header: &mut String,
+    marker: &str,
+    remaining_bytes: usize,
+) -> usize {
+    if marker.is_empty()
+        || header
+            .lines()
+            .any(|existing| existing.eq_ignore_ascii_case(marker))
+    {
+        return 0;
+    }
+    let added_bytes = marker.len() + usize::from(!header.is_empty());
+    if added_bytes > remaining_bytes {
+        return 0;
+    }
+    if !header.is_empty() {
+        header.push('\n');
+    }
+    header.push_str(marker);
+    added_bytes
 }
 
 fn review_marker_retry_paths<'a>(
@@ -2400,17 +2423,15 @@ fn review_marker_retry_paths<'a>(
 fn merge_review_marker_headers(
     headers: &mut HashMap<String, String>,
     additional: HashMap<String, String>,
+    retained_bytes: &mut usize,
+    max_retained_bytes: usize,
 ) {
     for (path, markers) in additional {
-        headers
-            .entry(path)
-            .and_modify(|header| {
-                if !header.is_empty() && !markers.is_empty() {
-                    header.push('\n');
-                }
-                header.push_str(&markers);
-            })
-            .or_insert(markers);
+        let header = headers.entry(path).or_default();
+        for marker in markers.lines() {
+            let remaining_bytes = max_retained_bytes.saturating_sub(*retained_bytes);
+            *retained_bytes += append_distinct_review_marker(header, marker, remaining_bytes);
+        }
     }
 }
 
@@ -2418,8 +2439,8 @@ fn run_review_marker_grep(
     worktree: &Path,
     paths: &[&str],
     markers: &[&str],
-    header_lines: u64,
     max_stdout: usize,
+    one_match_per_line: bool,
     index: &TemporaryCheckpointIndex,
     operation: &GitOperation<'_>,
 ) -> Result<Option<BoundedGitOutput>> {
@@ -2435,11 +2456,21 @@ fn run_review_marker_grep(
         "-o".to_owned(),
         "-z".to_owned(),
         "-m".to_owned(),
-        header_lines.to_string(),
+        REVIEW_MARKER_HEADER_LINES.to_string(),
     ];
+    if one_match_per_line {
+        // Anchoring each single-marker retry and resetting the match start with
+        // \K makes `-o` emit that token once per matching line. This prevents
+        // repeated tokens on one minified line from producing unbounded output.
+        args.push("-P".to_owned());
+    }
     for marker in markers {
         args.push("-e".to_owned());
-        args.push((*marker).to_owned());
+        args.push(if one_match_per_line {
+            format!(r"^.*?\K\Q{marker}\E")
+        } else {
+            (*marker).to_owned()
+        });
     }
     args.push("--".to_owned());
     args.extend(paths.iter().map(|path| (*path).to_owned()));
@@ -2457,15 +2488,19 @@ fn run_review_marker_grep(
     }
 }
 
+const REVIEW_MARKER_HEADER_LINES: u64 = 20;
+
 fn review_blob_headers(
     worktree: &Path,
     paths: &[&str],
     index: &TemporaryCheckpointIndex,
     operation: &GitOperation<'_>,
 ) -> Result<HashMap<String, String>> {
-    const HEADER_LINES: u64 = 20;
     const PATHS_PER_GREP: usize = 16;
     const OUTPUT_BYTES_PER_PATH: usize = 64 * 1024;
+    const MAX_RETAINED_HEADER_BYTES: usize = 64 * 1024;
+    const MAX_RETRY_PATHS: usize = 256;
+    const MAX_RETRY_OUTPUT_BYTES: usize = 1024 * 1024;
     const MARKERS: &[&str] = &[
         "@generated",
         "auto-generated",
@@ -2474,13 +2509,15 @@ fn review_blob_headers(
         "do not edit",
     ];
     let mut headers = HashMap::<String, String>::new();
+    let mut retained_header_bytes = 0;
+    let mut retry_paths = Vec::new();
     for paths in paths.chunks(PATHS_PER_GREP) {
         let Some(output) = run_review_marker_grep(
             worktree,
             paths,
             MARKERS,
-            HEADER_LINES,
             paths.len().saturating_mul(OUTPUT_BYTES_PER_PATH),
+            false,
             index,
             operation,
         )?
@@ -2488,36 +2525,52 @@ fn review_blob_headers(
             continue;
         };
         let (group_headers, tail_paths) =
-            parse_review_marker_output(&output.bytes, paths, HEADER_LINES);
+            parse_review_marker_output(&output.bytes, paths, REVIEW_MARKER_HEADER_LINES);
         if output.truncated {
-            // One pathological line must not consume the shared chunk budget
-            // and hide marker matches for the remaining paths or later marker
-            // tokens for the tail path. Retain complete records, then isolate
-            // each retry and marker behind the larger aggregate diff bound.
-            let retry_paths = review_marker_retry_paths(paths, &group_headers, &tail_paths);
-            merge_review_marker_headers(&mut headers, group_headers);
-            for path in retry_paths {
-                for marker in MARKERS {
-                    let Some(output) = run_review_marker_grep(
-                        worktree,
-                        &[path],
-                        &[*marker],
-                        HEADER_LINES,
-                        MAX_SESSION_DIFF_BYTES,
-                        index,
-                        operation,
-                    )?
-                    else {
-                        continue;
-                    };
-                    let (marker_headers, _) =
-                        parse_review_marker_output(&output.bytes, &[path], HEADER_LINES);
-                    merge_review_marker_headers(&mut headers, marker_headers);
+            // Retain complete records, then collect incomplete paths for a
+            // fixed number of batched, one-match-per-line retries. Paths over
+            // the global retry budget safely retain their full review diff.
+            for path in review_marker_retry_paths(paths, &group_headers, &tail_paths) {
+                if retry_paths.len() == MAX_RETRY_PATHS {
+                    break;
+                }
+                if !retry_paths.contains(&path) {
+                    retry_paths.push(path);
                 }
             }
-        } else {
-            merge_review_marker_headers(&mut headers, group_headers);
         }
+        merge_review_marker_headers(
+            &mut headers,
+            group_headers,
+            &mut retained_header_bytes,
+            MAX_RETAINED_HEADER_BYTES,
+        );
+    }
+    for marker in MARKERS {
+        if retry_paths.is_empty() {
+            break;
+        }
+        operation.check_cancelled()?;
+        let Some(output) = run_review_marker_grep(
+            worktree,
+            &retry_paths,
+            &[*marker],
+            MAX_RETRY_OUTPUT_BYTES,
+            true,
+            index,
+            operation,
+        )?
+        else {
+            continue;
+        };
+        let (marker_headers, _) =
+            parse_review_marker_output(&output.bytes, &retry_paths, REVIEW_MARKER_HEADER_LINES);
+        merge_review_marker_headers(
+            &mut headers,
+            marker_headers,
+            &mut retained_header_bytes,
+            MAX_RETAINED_HEADER_BYTES,
+        );
     }
     Ok(headers)
 }
@@ -3318,6 +3371,35 @@ mod tests {
     }
 
     #[test]
+    fn review_marker_parser_deduplicates_repeated_matches() {
+        let output = b"generated/a.rs\x001\x00generated file\n\
+                       generated/a.rs\x001\x00Generated File\n\
+                       generated/a.rs\x001\x00do not edit\n";
+
+        let (markers, _) = parse_review_marker_output(output, &["generated/a.rs"], 20);
+
+        assert_eq!(
+            markers.get("generated/a.rs").map(String::as_str),
+            Some("generated file\ndo not edit")
+        );
+    }
+
+    #[test]
+    fn review_marker_merge_enforces_the_aggregate_header_bound() {
+        let mut headers = HashMap::new();
+        let mut retained_bytes = 0;
+        let additional = HashMap::from([(
+            "generated/a.rs".to_owned(),
+            "generated file\ndo not edit".to_owned(),
+        )]);
+
+        merge_review_marker_headers(&mut headers, additional, &mut retained_bytes, 14);
+
+        assert_eq!(retained_bytes, 14);
+        assert_eq!(headers["generated/a.rs"], "generated file");
+    }
+
+    #[test]
     fn review_diff_recognizes_generated_markers_on_very_long_lines() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
@@ -3375,8 +3457,7 @@ mod tests {
         .unwrap();
 
         let header = files[0].generated_header.as_deref().unwrap();
-        assert!(header.contains("generated file"));
-        assert!(header.contains("do not edit"));
+        assert_eq!(header, "generated file\ndo not edit");
     }
 
     #[cfg(unix)]
