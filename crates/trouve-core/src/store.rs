@@ -384,6 +384,7 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   side TEXT NOT NULL,
   severity TEXT NOT NULL,
   confidence TEXT NOT NULL DEFAULT 'medium',
+  title TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL,
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'open',
@@ -423,6 +424,7 @@ CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
   side TEXT NOT NULL,
   severity TEXT NOT NULL,
   confidence TEXT NOT NULL DEFAULT 'medium',
+  title TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL,
   reason TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -550,6 +552,14 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN github_publication_status TEXT NOT NULL DEFAULT 'pending'",
     "ALTER TABLE code_review_findings ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
+    "ALTER TABLE code_review_findings ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_candidate_rejections ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+    "UPDATE code_review_findings
+       SET title = substr(replace(replace(trim(body), char(10), ' '), char(13), ' '), 1, 200)
+       WHERE title = ''",
+    "UPDATE code_review_candidate_rejections
+       SET title = substr(replace(replace(trim(body), char(10), ' '), char(13), ' '), 1, 200)
+       WHERE title = ''",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -2150,6 +2160,7 @@ pub struct NewCodeReviewFinding {
     pub side: String,
     pub severity: String,
     pub confidence: String,
+    pub title: String,
     pub body: String,
     pub prompt_for_agents: String,
     pub sources: Vec<trouve_protocol::CodeReviewFindingSource>,
@@ -6996,9 +7007,9 @@ impl Store {
             let finding_id = crate::new_id("rvf");
             tx.execute(
                 "INSERT INTO code_review_findings
-                        (id, job_id, path, line, side, severity, confidence, body,
+                        (id, job_id, path, line, side, severity, confidence, title, body,
                          prompt_for_agents, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'open', ?11)",
                 params![
                     finding_id,
                     job_id,
@@ -7007,6 +7018,7 @@ impl Store {
                     finding.side,
                     finding.severity,
                     finding.confidence,
+                    finding.title,
                     finding.body,
                     finding.prompt_for_agents,
                     now,
@@ -7039,8 +7051,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO code_review_candidate_rejections
                         (candidate_id, job_id, task_id, reviewer_id, reviewer_name,
-                         path, line, side, severity, confidence, body, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                         path, line, side, severity, confidence, title, body, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     rejection.candidate_id,
                     job_id,
@@ -7052,6 +7064,7 @@ impl Store {
                     rejection.side,
                     rejection.severity,
                     rejection.confidence,
+                    rejection.title,
                     rejection.body,
                     rejection.reason,
                     now,
@@ -7083,7 +7096,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT candidate_id, task_id, reviewer_id, reviewer_name,
-                    path, line, side, severity, confidence, body, reason
+                    path, line, side, severity, confidence, title, body, reason
              FROM code_review_candidate_rejections
              WHERE job_id = ?1
              ORDER BY reviewer_name, path, line, candidate_id",
@@ -7100,8 +7113,9 @@ impl Store {
                     side: row.get(6)?,
                     severity: row.get(7)?,
                     confidence: row.get(8)?,
-                    body: row.get(9)?,
-                    reason: row.get(10)?,
+                    title: row.get(9)?,
+                    body: row.get(10)?,
+                    reason: row.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -7318,7 +7332,7 @@ impl Store {
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT j.installation_id, j.repository, j.pull_number,
-                    f.id, f.job_id, f.path, f.line, f.side, f.severity, f.confidence, f.body,
+                    f.id, f.job_id, f.path, f.line, f.side, f.severity, f.confidence, f.title, f.body,
                     f.prompt_for_agents, f.status, f.github_comment_id,
                     f.github_comment_url, f.github_publication_status,
                     f.github_thread_id, f.resolved_at
@@ -7353,17 +7367,18 @@ impl Store {
                         side: row.get(7)?,
                         severity: row.get(8)?,
                         confidence: row.get(9)?,
-                        body: row.get(10)?,
-                        prompt_for_agents: row.get(11)?,
-                        status: row.get(12)?,
+                        title: row.get(10)?,
+                        body: row.get(11)?,
+                        prompt_for_agents: row.get(12)?,
+                        status: row.get(13)?,
                         sources: Vec::new(),
-                        github_comment_id: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
-                        github_comment_url: row.get(14)?,
+                        github_comment_id: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
+                        github_comment_url: row.get(15)?,
                         github_publication_status: code_review_publication_status(
-                            &row.get::<_, String>(15)?,
+                            &row.get::<_, String>(16)?,
                         ),
-                        github_thread_id: row.get(16)?,
-                        resolved_at: parse_optional_datetime(row.get(17)?),
+                        github_thread_id: row.get(17)?,
+                        resolved_at: parse_optional_datetime(row.get(18)?),
                     },
                 ))
             })?
@@ -7378,7 +7393,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let base_rows: Vec<trouve_protocol::CodeReviewFinding> = {
             let mut stmt = conn.prepare(
-                "SELECT id, job_id, path, line, side, severity, confidence, body,
+                "SELECT id, job_id, path, line, side, severity, confidence, title, body,
                         prompt_for_agents, status, github_comment_id,
                         github_comment_url, github_publication_status,
                         github_thread_id, resolved_at
@@ -7394,17 +7409,18 @@ impl Store {
                     side: row.get(4)?,
                     severity: row.get(5)?,
                     confidence: row.get(6)?,
-                    body: row.get(7)?,
-                    prompt_for_agents: row.get(8)?,
-                    status: row.get(9)?,
+                    title: row.get(7)?,
+                    body: row.get(8)?,
+                    prompt_for_agents: row.get(9)?,
+                    status: row.get(10)?,
                     sources: Vec::new(),
-                    github_comment_id: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
-                    github_comment_url: row.get(11)?,
+                    github_comment_id: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+                    github_comment_url: row.get(12)?,
                     github_publication_status: code_review_publication_status(
-                        &row.get::<_, String>(12)?,
+                        &row.get::<_, String>(13)?,
                     ),
-                    github_thread_id: row.get(13)?,
-                    resolved_at: parse_optional_datetime(row.get(14)?),
+                    github_thread_id: row.get(14)?,
+                    resolved_at: parse_optional_datetime(row.get(15)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -12280,6 +12296,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "medium".into(),
                     confidence: "high".into(),
+                    title: "Test finding".into(),
                     body: "finding".into(),
                     prompt_for_agents: "fix".into(),
                     sources: Vec::new(),
@@ -12354,6 +12371,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "medium".into(),
                     confidence: "high".into(),
+                    title: "Test finding".into(),
                     body: "finding".into(),
                     prompt_for_agents: "fix".into(),
                     sources: Vec::new(),
@@ -12900,6 +12918,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "high".into(),
                     confidence: "high".into(),
+                    title: "Ignored error".into(),
                     body: "The error is ignored.".into(),
                     prompt_for_agents: "Handle the error at src/lib.rs:12.".into(),
                     sources: vec![trouve_protocol::CodeReviewFindingSource {
@@ -12919,6 +12938,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "low".into(),
                     confidence: "high".into(),
+                    title: "Simplify branch".into(),
                     body: "This branch could be simplified.".into(),
                     reason: "This is a non-actionable style preference.".into(),
                 }],

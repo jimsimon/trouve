@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "6.1"
+    "version": "7.0"
   },
   "paths": {
     "/v1/approvals": {
@@ -5316,6 +5316,7 @@
           "line",
           "side",
           "severity",
+          "title",
           "body",
           "reason"
         ],
@@ -5355,6 +5356,10 @@
           },
           "task_id": {
             "type": "string"
+          },
+          "title": {
+            "type": "string",
+            "description": "Concise, generated one-line summary of the candidate issue."
           }
         }
       },
@@ -5437,6 +5442,7 @@
           "line",
           "side",
           "severity",
+          "title",
           "body",
           "status"
         ],
@@ -5507,6 +5513,10 @@
           "status": {
             "type": "string",
             "description": "`open`, `fixed`, or `dismissed`."
+          },
+          "title": {
+            "type": "string",
+            "description": "Concise, generated one-line summary of the issue."
           }
         }
       },

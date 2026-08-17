@@ -1486,11 +1486,12 @@ function JobDetailPane({
         {detail.findings.map((finding) => (
           <article class={`finding ${finding.severity}`} key={finding.id}>
             <header>
-              <strong>
-                Severity: {finding.severity.toUpperCase()} · Confidence: {finding.confidence.toUpperCase()} · {finding.path}:{finding.line}
-              </strong>
+              <strong>{finding.title}</strong>
               <StatusPill status={finding.status} />
             </header>
+            <small>
+              {finding.path}:{finding.line} · Severity: {finding.severity.toUpperCase()} · Confidence: {finding.confidence.toUpperCase()}
+            </small>
             <p>{finding.body}</p>
             {finding.github_publication_status === "suppressed_by_policy" && (
               <small>Retained in Trouve · Not posted to GitHub by confidence policy</small>
@@ -1514,11 +1515,12 @@ function JobDetailPane({
               {candidateRejections.map((rejection) => (
                 <article class="candidate-rejection" key={rejection.candidate_id}>
                   <header>
-                    <strong>
-                      Severity: {rejection.severity.toUpperCase()} · Confidence: {rejection.confidence.toUpperCase()} · {rejection.path}:{rejection.line}
-                    </strong>
+                    <strong>{rejection.title}</strong>
                     <span>{rejection.reviewer_name}</span>
                   </header>
+                  <small>
+                    {rejection.path}:{rejection.line} · Severity: {rejection.severity.toUpperCase()} · Confidence: {rejection.confidence.toUpperCase()}
+                  </small>
                   <p>{rejection.body}</p>
                   <div>
                     <b>Not selected:</b> {rejection.reason}

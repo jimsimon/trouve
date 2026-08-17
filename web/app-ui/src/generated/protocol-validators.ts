@@ -1894,7 +1894,7 @@ return errors === 0;
 validate112.evaluated = {"props":{"reviewer":true,"state":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema49 = {"type":"object","description":"A review produced by trouve's first-party review service. The marker is\njoined from durable job/finding records rather than inferred from an\nuntrusted comment author or body.","required":["job_id","bot_login","status","summary","prompt_for_agents","review_url"],"properties":{"bot_login":{"type":"string"},"findings":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFinding"}},"job_id":{"type":"string"},"prompt_for_agents":{"type":"string"},"review_url":{"type":"string"},"status":{"type":"string"},"summary":{"type":"string"}}};
-const schema50 = {"type":"object","description":"A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.","required":["id","job_id","path","line","side","severity","body","status"],"properties":{"body":{"type":"string"},"confidence":{"type":"string","description":"Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."},"github_comment_id":{"type":["integer","null"],"format":"int64","minimum":0},"github_comment_url":{"type":"string"},"github_publication_status":{"$ref":"#/components/schemas/CodeReviewFindingPublicationStatus"},"github_thread_id":{"type":["string","null"]},"id":{"type":"string"},"job_id":{"type":"string"},"line":{"type":"integer","format":"int64","minimum":0},"path":{"type":"string"},"prompt_for_agents":{"type":"string"},"resolved_at":{"type":["string","null"],"format":"date-time"},"severity":{"type":"string"},"side":{"type":"string"},"sources":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFindingSource"}},"status":{"type":"string","description":"`open`, `fixed`, or `dismissed`."}}};
+const schema50 = {"type":"object","description":"A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.","required":["id","job_id","path","line","side","severity","title","body","status"],"properties":{"body":{"type":"string"},"confidence":{"type":"string","description":"Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."},"github_comment_id":{"type":["integer","null"],"format":"int64","minimum":0},"github_comment_url":{"type":"string"},"github_publication_status":{"$ref":"#/components/schemas/CodeReviewFindingPublicationStatus"},"github_thread_id":{"type":["string","null"]},"id":{"type":"string"},"job_id":{"type":"string"},"line":{"type":"integer","format":"int64","minimum":0},"path":{"type":"string"},"prompt_for_agents":{"type":"string"},"resolved_at":{"type":["string","null"],"format":"date-time"},"severity":{"type":"string"},"side":{"type":"string"},"sources":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFindingSource"}},"status":{"type":"string","description":"`open`, `fixed`, or `dismissed`."},"title":{"type":"string","description":"Concise, generated one-line summary of the issue."}}};
 const schema51 = {"type":"string","description":"The outcome of attempting to publish a finding as an inline GitHub comment.","enum":["pending","published","not_eligible","suppressed_by_policy","failed"]};
 
 function validate116(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -2016,7 +2016,7 @@ evaluated0.items = undefined;
 if(errors === 0){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing0;
-if(((((((((data.id === undefined) && (missing0 = "id")) || ((data.job_id === undefined) && (missing0 = "job_id"))) || ((data.path === undefined) && (missing0 = "path"))) || ((data.line === undefined) && (missing0 = "line"))) || ((data.side === undefined) && (missing0 = "side"))) || ((data.severity === undefined) && (missing0 = "severity"))) || ((data.body === undefined) && (missing0 = "body"))) || ((data.status === undefined) && (missing0 = "status"))){
+if((((((((((data.id === undefined) && (missing0 = "id")) || ((data.job_id === undefined) && (missing0 = "job_id"))) || ((data.path === undefined) && (missing0 = "path"))) || ((data.line === undefined) && (missing0 = "line"))) || ((data.side === undefined) && (missing0 = "side"))) || ((data.severity === undefined) && (missing0 = "severity"))) || ((data.title === undefined) && (missing0 = "title"))) || ((data.body === undefined) && (missing0 = "body"))) || ((data.status === undefined) && (missing0 = "status"))){
 validate115.errors = [{instancePath,schemaPath:"#/required",keyword:"required",params:{missingProperty: missing0},message:"must have required property '"+missing0+"'"}];
 return false;
 }
@@ -2250,6 +2250,19 @@ var valid0 = _errs31 === errors;
 else {
 var valid0 = true;
 }
+if(valid0){
+if(data.title !== undefined){
+const _errs33 = errors;
+if(typeof data.title !== "string"){
+validate115.errors = [{instancePath:instancePath+"/title",schemaPath:"#/properties/title/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs33 === errors;
+}
+else {
+var valid0 = true;
+}
+}
 }
 }
 }
@@ -2275,7 +2288,7 @@ return false;
 validate115.errors = vErrors;
 return errors === 0;
 }
-validate115.evaluated = {"props":{"body":true,"confidence":true,"github_comment_id":true,"github_comment_url":true,"github_publication_status":true,"github_thread_id":true,"id":true,"job_id":true,"line":true,"path":true,"prompt_for_agents":true,"resolved_at":true,"severity":true,"side":true,"sources":true,"status":true},"dynamicProps":false,"dynamicItems":false};
+validate115.evaluated = {"props":{"body":true,"confidence":true,"github_comment_id":true,"github_comment_url":true,"github_publication_status":true,"github_thread_id":true,"id":true,"job_id":true,"line":true,"path":true,"prompt_for_agents":true,"resolved_at":true,"severity":true,"side":true,"sources":true,"status":true,"title":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate114(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

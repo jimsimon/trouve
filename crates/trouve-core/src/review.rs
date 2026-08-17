@@ -816,6 +816,7 @@ struct ReviewFinding {
     severity: String,
     #[serde(default = "default_review_confidence")]
     confidence: String,
+    title: String,
     body: String,
     /// Stable candidate ids retained by the coordinator. Reviewer outputs may
     /// omit this; final coordinator output must provide at least one.
@@ -3989,6 +3990,7 @@ impl Engine {
                     side: finding.side.clone(),
                     severity: finding.severity.clone(),
                     confidence: finding.confidence.clone(),
+                    title: finding.title.clone(),
                     body: finding.body.clone(),
                     prompt_for_agents: finding_prompt_for_agents(&job, finding, &parsed.themes),
                     sources,
@@ -6164,13 +6166,14 @@ fn lifecycle_finding_entry(
     } else {
         ""
     };
+    let finding_title = bounded_utf8(&finding.title, 512, "…");
     let finding_body = bounded_utf8(
         &finding.body,
         LIFECYCLE_FINDING_BODY_MAX_BYTES,
         "… _(finding text truncated)_",
     );
     format!(
-        "- **Severity: {} · Confidence: {}** — {location}: {finding_body}{note}\n",
+        "- **Severity: {} · Confidence: {}** — {location}: **{finding_title}** — {finding_body}{note}\n",
         finding.severity.to_ascii_uppercase(),
         finding.confidence.to_ascii_uppercase()
     )
@@ -6449,12 +6452,14 @@ fn finding_prompt_for_agents(
     format!(
         "Fix the confirmed {severity}-severity, {confidence}-confidence code-review issue in \
          `{path}` near line {line} on \
-         pull request #{pull_number} at commit {head_sha}. Problem: {body}{theme_context}\n\
+         pull request #{pull_number} at commit {head_sha}. Issue: {title}. Details: \
+         {body}{theme_context}\n\
          Inspect the surrounding implementation and tests, {fix_guidance}, \
          add or update regression coverage when appropriate, and verify the affected checks. \
          Do not dismiss the issue without concrete code evidence.",
         severity = finding.severity,
         confidence = finding.confidence,
+        title = finding.title,
         path = finding.path,
         line = finding.line,
         pull_number = job.pull_number,
@@ -6480,12 +6485,13 @@ fn review_prompt_for_agents(
     prompt.push_str("\nConfirmed issues:\n");
     for (index, finding) in findings.iter().enumerate() {
         prompt.push_str(&format!(
-            "{}. [Severity: {} · Confidence: {}] `{}` line {}: {}\n",
+            "{}. [Severity: {} · Confidence: {}] `{}` line {}: {} — {}\n",
             index + 1,
             finding.severity.to_ascii_uppercase(),
             finding.confidence.to_ascii_uppercase(),
             finding.path,
             finding.line,
+            finding.title,
             finding.body
         ));
     }
@@ -6532,15 +6538,18 @@ fn render_inline_finding(finding: &trouve_protocol::CodeReviewFinding) -> String
         .into_iter()
         .collect::<Vec<_>>()
         .join(", ");
-    let source_line = if source_names.is_empty() {
-        String::new()
+    let source_names = if source_names.is_empty() {
+        "Trouve".to_string()
     } else {
-        format!("\n\n_Identified by: {source_names}._")
+        source_names
     };
     format!(
-        "**Severity:** {severity}  \n**Confidence:** {confidence}\n\n{body}{source_line}\n\n\
+        "**{title}**\n_Identified by: {source_names} | Severity: {severity} | Confidence: {confidence}_\n\n\
+         {body}\n\n\
          <details><summary>Prompt for agents</summary>\n\n```text\n{prompt}\n```\n\n</details>\n\n\
          <!-- trouve-code-review finding:{id} -->",
+        title = finding.title,
+        source_names = source_names,
         severity = finding.severity.to_ascii_uppercase(),
         confidence = finding.confidence.to_ascii_uppercase(),
         body = finding.body,
@@ -7122,7 +7131,7 @@ fn reviewer_prompt(
          ambiguity. Report only actionable problems introduced by the change. Do not ask \
          questions and do not modify files.\n\n{execution_guidance}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
-         {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"confidence\":\"high|medium|low\",\"body\":\"specific problem and fix\"}}]}}\n\
+         {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"confidence\":\"high|medium|low\",\"title\":\"concise one-line issue summary\",\"body\":\"specific problem and fix\"}}]}}\n\
          Use RIGHT for added/context lines in the new version and LEFT only \
          for removed lines. Return an empty findings array when there are no \
          actionable issues.",
@@ -7213,6 +7222,7 @@ fn validation_prompt(
          {{\"summary\":\"concise final assessment that mentions validated coverage\",\
          \"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\
          \"severity\":\"high|medium|low\",\"confidence\":\"high|medium|low\",\
+         \"title\":\"concise one-line issue summary\",\
          \"body\":\"specific verified problem and fix\",\
          \"source_candidate_ids\":[\"candidate id\"]}}],\
          \"rejected_candidates\":[{{\"candidate_id\":\"candidate id\",\
@@ -7379,6 +7389,7 @@ fn candidate_rejections(
             side: candidate.finding.side.clone(),
             severity: candidate.finding.severity.clone(),
             confidence: candidate.finding.confidence.clone(),
+            title: candidate.finding.title.clone(),
             body: candidate.finding.body.clone(),
             reason: reasons
                 .get(candidate.candidate_id.as_str())
@@ -7449,7 +7460,19 @@ fn normalize_finding(
         .unwrap_or(finding.path.trim())
         .to_string();
     finding.body = finding.body.trim().chars().take(4_000).collect();
-    if finding.path.is_empty() || finding.line == 0 || finding.body.is_empty() {
+    finding.title = finding
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect();
+    if finding.path.is_empty()
+        || finding.line == 0
+        || finding.title.is_empty()
+        || finding.body.is_empty()
+    {
         return None;
     }
     let mut left = finding.side.eq_ignore_ascii_case("LEFT");
@@ -7560,6 +7583,7 @@ fn review_output_repair_prompt(error: &anyhow::Error, malformed_output: &str) ->
          exactly this shape:\n\
          {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\
          \"line\":123,\"side\":\"RIGHT|LEFT\",\"severity\":\"high|medium|low\",\
+         \"confidence\":\"high|medium|low\",\"title\":\"concise one-line issue summary\",\
          \"body\":\"specific problem and fix\",\"source_candidate_ids\":[]}}],\
          \"rejected_candidates\":[{{\"candidate_id\":\"candidate id\",\
          \"reason\":\"specific reason this candidate was not retained\"}}],\
@@ -8291,9 +8315,23 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "high".into(),
                     confidence: "high".into(),
-                    body: "Handle the error before returning.".into(),
+                    title: "Error bypasses handling".into(),
+                    body: "Return a typed error and add a regression test.".into(),
                     prompt_for_agents: "Add error handling and a regression test.".into(),
-                    sources: Vec::new(),
+                    sources: vec![
+                        trouve_protocol::CodeReviewFindingSource {
+                            reviewer_id: "correctness".into(),
+                            reviewer_name: "Correctness".into(),
+                            candidate_id: "candidate-correctness".into(),
+                            task_id: String::new(),
+                        },
+                        trouve_protocol::CodeReviewFindingSource {
+                            reviewer_id: "security".into(),
+                            reviewer_name: "Security".into(),
+                            candidate_id: "candidate-security".into(),
+                            task_id: String::new(),
+                        },
+                    ],
                 }],
                 &[],
             )
@@ -8315,11 +8353,15 @@ mod tests {
         assert!(body.contains("**Result:** 1 confirmed issue(s)"));
         assert!(body.contains("### Confirmed issues"));
         assert!(body.contains(
-            "- **Severity: HIGH · Confidence: HIGH** — `src/lib.rs` line 42: Handle the error"
+            "- **Severity: HIGH · Confidence: HIGH** — `src/lib.rs` line 42: **Error bypasses handling** — Return a typed error"
         ));
         let inline = render_inline_finding(&detail.findings[0]);
-        assert!(inline.contains("**Severity:** HIGH"));
-        assert!(inline.contains("**Confidence:** HIGH"));
+        assert!(inline.starts_with(
+            "**Error bypasses handling**\n_Identified by: Correctness, Security | Severity: HIGH | Confidence: HIGH_\n\nReturn a typed error and add a regression test."
+        ));
+        assert!(inline.contains(
+            "<details><summary>Prompt for agents</summary>\n\n```text\nAdd error handling and a regression test.\n```\n\n</details>"
+        ));
         assert!(body.contains("_(inline publication pending)_"));
         assert!(!body.contains("### Inline comments that failed to post"));
         assert!(body.contains("<summary>Prompt for agents</summary>"));
@@ -8344,6 +8386,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "high".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "Failed inline body".into(),
                         prompt_for_agents: "Fix failed inline issue.".into(),
                         sources: Vec::new(),
@@ -8354,6 +8397,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "medium".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "Published inline body".into(),
                         prompt_for_agents: "Fix published inline issue.".into(),
                         sources: Vec::new(),
@@ -8364,6 +8408,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "medium".into(),
                         confidence: "low".into(),
+                        title: "Test issue".into(),
                         body: "Uncertain issue details".into(),
                         prompt_for_agents: "Investigate uncertain issue.".into(),
                         sources: Vec::new(),
@@ -8436,6 +8481,7 @@ mod tests {
                 side: "RIGHT".into(),
                 severity: "medium".into(),
                 confidence: "high".into(),
+                title: "Test issue".into(),
                 body: if index + 1 == MAX_CANDIDATE_FINDINGS {
                     "Failed publication remains visible".into()
                 } else {
@@ -8546,6 +8592,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "low".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "General issue.".into(),
                         prompt_for_agents: "Fix it.".into(),
                         sources: Vec::new(),
@@ -8556,6 +8603,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "medium".into(),
                         confidence: "low".into(),
+                        title: "Test issue".into(),
                         body: "Uncertain issue.".into(),
                         prompt_for_agents: "Investigate it.".into(),
                         sources: Vec::new(),
@@ -8609,6 +8657,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "high".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "Handle the error.".into(),
                     prompt_for_agents: "Handle the error and test it.".into(),
                     sources: Vec::new(),
@@ -8706,6 +8755,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "high".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "First issue.".into(),
                         prompt_for_agents: "Fix the first issue.".into(),
                         sources: Vec::new(),
@@ -8716,6 +8766,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "medium".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "Second issue.".into(),
                         prompt_for_agents: "Fix the second issue.".into(),
                         sources: Vec::new(),
@@ -8823,6 +8874,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "high".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "Eligible issue.".into(),
                         prompt_for_agents: "Fix it.".into(),
                         sources: Vec::new(),
@@ -8833,6 +8885,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "low".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "General issue.".into(),
                         prompt_for_agents: "Fix it too.".into(),
                         sources: Vec::new(),
@@ -8843,6 +8896,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "medium".into(),
                         confidence: "low".into(),
+                        title: "Test issue".into(),
                         body: "Suppressed issue.".into(),
                         prompt_for_agents: "Investigate it.".into(),
                         sources: Vec::new(),
@@ -8933,6 +8987,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "high".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "Eligible issue.".into(),
                     prompt_for_agents: "Fix it.".into(),
                     sources: Vec::new(),
@@ -9059,6 +9114,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "medium".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "Another issue.".into(),
                     prompt_for_agents: "Fix it.".into(),
                     sources: Vec::new(),
@@ -9174,6 +9230,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "high".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "Eligible issue.".into(),
                     prompt_for_agents: "Fix it.".into(),
                     sources: Vec::new(),
@@ -9324,6 +9381,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "low".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "General issue.".into(),
                     prompt_for_agents: "Fix it.".into(),
                     sources: Vec::new(),
@@ -9403,6 +9461,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "high".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "Eligible issue.".into(),
                         prompt_for_agents: "Fix it.".into(),
                         sources: Vec::new(),
@@ -9413,6 +9472,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "low".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "General issue.".into(),
                         prompt_for_agents: "Fix it too.".into(),
                         sources: Vec::new(),
@@ -10185,10 +10245,19 @@ mod tests {
     #[test]
     fn review_confidence_defaults_for_legacy_output() {
         let review = parse_review_output(
-            r#"{"summary":"legacy","findings":[{"path":"src/lib.rs","line":3,"severity":"high","body":"issue"}]}"#,
+            r#"{"summary":"legacy","findings":[{"path":"src/lib.rs","line":3,"severity":"high","title":"Legacy issue","body":"issue"}]}"#,
         )
         .unwrap();
         assert_eq!(review.findings[0].confidence, "medium");
+    }
+
+    #[test]
+    fn review_output_requires_a_generated_finding_title() {
+        let error = parse_review_output(
+            r#"{"summary":"untitled","findings":[{"path":"src/lib.rs","line":3,"severity":"high","body":"issue"}]}"#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("missing field `title`"));
     }
 
     #[test]
@@ -10218,6 +10287,7 @@ mod tests {
             side: "RIGHT".into(),
             severity: "medium".into(),
             confidence: "high".into(),
+            title: "Test issue".into(),
             body: format!("finding {id}"),
             source_candidate_ids: vec![id.into()],
         };
@@ -10277,6 +10347,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "medium".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "first symptom".into(),
                     source_candidate_ids: vec!["c-shared".into()],
                 },
@@ -10286,6 +10357,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "medium".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "second symptom".into(),
                     source_candidate_ids: vec!["c-shared".into()],
                 },
@@ -10307,6 +10379,7 @@ mod tests {
             side: "RIGHT".into(),
             severity: "medium".into(),
             confidence: "high".into(),
+            title: "Test issue".into(),
             body: "finding c-1".into(),
             source_candidate_ids: vec!["c-1".into()],
         }];
@@ -10335,6 +10408,7 @@ mod tests {
             side: "RIGHT".into(),
             severity: "medium".into(),
             confidence: "high".into(),
+            title: "Test issue".into(),
             body: format!("finding {id}"),
             source_candidate_ids: vec![id.into()],
         };
@@ -10426,6 +10500,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "medium".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "stale route".into(),
                     prompt_for_agents: "fix it".into(),
                     sources: Vec::new(),
@@ -10560,6 +10635,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "medium".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "first".into(),
                         prompt_for_agents: "fix it".into(),
                         sources: Vec::new(),
@@ -10570,6 +10646,7 @@ mod tests {
                         side: "RIGHT".into(),
                         severity: "medium".into(),
                         confidence: "high".into(),
+                        title: "Test issue".into(),
                         body: "second".into(),
                         prompt_for_agents: "fix it".into(),
                         sources: Vec::new(),
@@ -10689,6 +10766,7 @@ mod tests {
                     side: "RIGHT".into(),
                     severity: "medium".into(),
                     confidence: "high".into(),
+                    title: "Test issue".into(),
                     body: "deep finding".into(),
                     prompt_for_agents: "fix it".into(),
                     sources: Vec::new(),
@@ -10916,6 +10994,7 @@ mod tests {
                 side: side.into(),
                 severity: "critical".into(),
                 confidence: "high".into(),
+                title: "Test issue".into(),
                 body: body.into(),
                 source_candidate_ids: vec![format!("candidate-{body}")],
             },
@@ -10942,6 +11021,7 @@ mod tests {
             side: "RIGHT".into(),
             severity: severity.into(),
             confidence: confidence.into(),
+            title: "Test issue".into(),
             body: "issue".into(),
             source_candidate_ids: vec!["candidate".into()],
         };
@@ -10986,6 +11066,7 @@ mod tests {
                 side: "RIGHT".into(),
                 severity: "medium".into(),
                 confidence: "low".into(),
+                title: "Test issue".into(),
                 body: "Actionable but uncertain issue".into(),
                 source_candidate_ids: Vec::new(),
             },
@@ -11019,6 +11100,7 @@ mod tests {
                 side: "RIGHT".into(),
                 severity: "medium".into(),
                 confidence: "high".into(),
+                title: "Test issue".into(),
                 body: format!("candidate {id}"),
                 source_candidate_ids: Vec::new(),
             },
@@ -11036,6 +11118,7 @@ mod tests {
                 side: "RIGHT".into(),
                 severity: "medium".into(),
                 confidence: "high".into(),
+                title: "Test issue".into(),
                 body: "accepted".into(),
                 source_candidate_ids: vec!["accepted".into()],
             }],

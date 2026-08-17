@@ -2031,6 +2031,8 @@ pub struct CodeReviewCandidateRejection {
     /// `high`, `medium`, or `low`; legacy records default to `medium`.
     #[serde(default = "default_code_review_confidence")]
     pub confidence: String,
+    /// Concise, generated one-line summary of the candidate issue.
+    pub title: String,
     pub body: String,
     pub reason: String,
 }
@@ -2067,6 +2069,8 @@ pub struct CodeReviewFinding {
     /// `high`, `medium`, or `low`; legacy records default to `medium`.
     #[serde(default = "default_code_review_confidence")]
     pub confidence: String,
+    /// Concise, generated one-line summary of the issue.
+    pub title: String,
     pub body: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt_for_agents: String,

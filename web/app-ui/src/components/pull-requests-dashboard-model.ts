@@ -23,6 +23,7 @@ export interface PullRequestPill {
 
 export interface PullRequestReviewFinding {
   readonly location: string;
+  readonly title: string;
   readonly severity: string;
   readonly confidence: string;
   readonly body: string;
@@ -343,6 +344,7 @@ const rowFromPullRequest = (
     .filter((finding) => finding.status === "open")
     .map((finding) => Object.freeze({
       location: `${finding.path}:${finding.line}`,
+      title: finding.title,
       severity: finding.severity,
       confidence: finding.confidence ?? "medium",
       body: finding.body,

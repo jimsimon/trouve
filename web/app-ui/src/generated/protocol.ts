@@ -1909,6 +1909,8 @@ export interface components {
             severity: string;
             side: string;
             task_id: string;
+            /** @description Concise, generated one-line summary of the candidate issue. */
+            title: string;
         };
         CodeReviewDashboard: {
             app: components["schemas"]["GithubAppStatus"];
@@ -1957,6 +1959,8 @@ export interface components {
             sources?: components["schemas"]["CodeReviewFindingSource"][];
             /** @description `open`, `fixed`, or `dismissed`. */
             status: string;
+            /** @description Concise, generated one-line summary of the issue. */
+            title: string;
         };
         /**
          * @description The outcome of attempting to publish a finding as an inline GitHub comment.

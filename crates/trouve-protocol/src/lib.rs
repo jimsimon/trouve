@@ -270,7 +270,10 @@ pub use requests::*;
 // 6.1: code-review findings and candidate rejections expose confidence
 // alongside severity, plus an explicit publication-policy suppression outcome
 // for confirmed findings retained internally but not posted (additive).
-pub const PROTOCOL_VERSION: &str = "6.1";
+// 7.0: code-review findings and rejected candidates require a separately
+// generated one-line title instead of deriving presentation from body text
+// (breaking).
+pub const PROTOCOL_VERSION: &str = "7.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

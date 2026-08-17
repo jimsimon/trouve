@@ -161,6 +161,7 @@ describe("pull request dashboard model", () => {
                 path: "src/main.ts",
                 line: 17,
                 side: "RIGHT",
+                title: "Failure path is ignored",
                 severity: "high",
                 confidence: "high",
                 body: "Handle the failure.",
@@ -174,6 +175,7 @@ describe("pull request dashboard model", () => {
                 path: "src/old.ts",
                 line: 2,
                 side: "RIGHT",
+                title: "Handled legacy issue",
                 severity: "low",
                 body: "Already handled.",
                 status: "fixed",
@@ -223,6 +225,7 @@ describe("pull request dashboard model", () => {
       reviewPrompt: "Fix every confirmed issue.",
       reviewFindings: [{
         location: "src/main.ts:17",
+        title: "Failure path is ignored",
         severity: "high",
         confidence: "high",
         prompt: "Fix the failure path.",
