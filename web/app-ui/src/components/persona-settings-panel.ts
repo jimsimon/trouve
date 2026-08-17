@@ -158,13 +158,11 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     this.#error = false;
     this.requestUpdate();
     try {
-      await Promise.all([
-        protocol.setDefaultModel({
-          model,
-          ...(thinking === "" ? {} : { default_thinking_level: thinking }),
-        }),
-        protocol.setDefaultPermissionMode({ permission_mode: permission }),
-      ]);
+      await protocol.setGlobalDefaults({
+        model,
+        default_thinking_level: thinking || null,
+        permission_mode: permission,
+      });
       await this.#load();
       this.#message = "Defaults saved for new threads.";
       this.requestUpdate();
@@ -188,6 +186,15 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const permission = String(data.get("default_permission_mode") ?? "");
     if ((existing === undefined && !/^[a-z0-9][a-z0-9_-]*$/u.test(id)) || displayName === "") {
       this.#message = "Persona IDs use lowercase letters, digits, underscore, or dash; a display name is required.";
+      this.#error = true;
+      this.requestUpdate();
+      return;
+    }
+    if (
+      existing === undefined
+      && this.#modes.some(({ persona }) => persona.id === id)
+    ) {
+      this.#message = `A persona with the ID ${id} already exists.`;
       this.#error = true;
       this.requestUpdate();
       return;
@@ -381,7 +388,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
             }}><option value="" disabled>Choose model</option>${models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
           </div>
           ${thinking.length === 0
-            ? html`<input name="thinking" type="hidden" .value=${this.#providers?.default_thinking_level ?? ""} />`
+            ? html`<input name="thinking" type="hidden" .value=${this.#defaultThinkingDraft ?? ""} />`
             : html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
           <p class="meta">Global default permissions — used by new threads whose persona has no default of its own.</p>
           <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>

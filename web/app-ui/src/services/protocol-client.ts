@@ -47,6 +47,8 @@ export type ProtocolAgentPersona = ProtocolComponents["schemas"]["AgentPersona"]
 export type ProtocolPersonaInfo = ProtocolComponents["schemas"]["PersonaInfo"];
 export type ProtocolUpsertPersonaRequest =
   ProtocolComponents["schemas"]["UpsertPersonaRequest"];
+export type ProtocolSetGlobalDefaultsRequest =
+  ProtocolComponents["schemas"]["SetGlobalDefaultsRequest"];
 export type ProtocolSetDefaultModelRequest =
   ProtocolComponents["schemas"]["SetDefaultModelRequest"];
 export type ProtocolSetDefaultPermissionModeRequest =
@@ -420,7 +422,7 @@ export class ProtocolClientError extends Error {
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.0";
+export const SUPPORTED_PROTOCOL_VERSION = "7.1";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -963,6 +965,15 @@ export class ProtocolClient {
       `/v1/personas/${encodeURIComponent(personaId)}`,
       "reset persona",
       "DELETE",
+    );
+  }
+
+  async setGlobalDefaults(request: ProtocolSetGlobalDefaultsRequest): Promise<void> {
+    await this.#mutation(
+      "/v1/config/defaults",
+      "set global defaults",
+      "PUT",
+      request,
     );
   }
 

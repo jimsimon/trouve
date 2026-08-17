@@ -511,13 +511,14 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .unwrap();
     assert_eq!(info["protocol_version"], trouve_protocol::PROTOCOL_VERSION);
 
-    // Global model + thinking defaults round-trip through the protocol and
+    // Global defaults round-trip through one atomic protocol operation and
     // are inherited by newly created threads.
     let resp = client
-        .put(format!("{base}/config/default-model"))
+        .put(format!("{base}/config/defaults"))
         .json(&serde_json::json!({
             "model": "scripted/test-model",
-            "default_thinking_level": "high"
+            "default_thinking_level": "high",
+            "permission_mode": "ask"
         }))
         .send()
         .await
@@ -531,7 +532,33 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .json()
         .await
         .unwrap();
+    assert_eq!(providers["default_model"], "scripted/test-model");
     assert_eq!(providers["default_thinking_level"], "high");
+    assert_eq!(providers["default_permission_mode"], "ask");
+
+    // Validation happens before any of the replacement defaults are applied.
+    let resp = client
+        .put(format!("{base}/config/defaults"))
+        .json(&serde_json::json!({
+            "model": "not-provider-qualified",
+            "default_thinking_level": "low",
+            "permission_mode": "yolo"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let providers: serde_json::Value = client
+        .get(format!("{base}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(providers["default_model"], "scripted/test-model");
+    assert_eq!(providers["default_thinking_level"], "high");
+    assert_eq!(providers["default_permission_mode"], "ask");
 
     // Workspace -> session -> thread.
     let ws: serde_json::Value = client
@@ -1461,10 +1488,14 @@ async fn session_and_thread_updates_and_provider_config() {
             .any(|p| p["id"] == "openrouter")
     );
 
-    // Default model change persists.
+    // Global defaults persist together in one config-file update.
     let resp = client
-        .put(format!("{base}/config/default-model"))
-        .json(&serde_json::json!({"model": "scripted/test-model"}))
+        .put(format!("{base}/config/defaults"))
+        .json(&serde_json::json!({
+            "model": "scripted/test-model",
+            "default_thinking_level": "medium",
+            "permission_mode": "yolo"
+        }))
         .send()
         .await
         .unwrap();
@@ -1478,6 +1509,32 @@ async fn session_and_thread_updates_and_provider_config() {
         .await
         .unwrap();
     assert_eq!(providers["default_model"], "scripted/test-model");
+    assert_eq!(providers["default_thinking_level"], "medium");
+    assert_eq!(providers["default_permission_mode"], "yolo");
+    let saved = Config::load_from(&config_file);
+    assert_eq!(saved.default_model.as_deref(), Some("scripted/test-model"));
+    assert_eq!(saved.default_thinking_level.as_deref(), Some("medium"));
+    assert_eq!(
+        saved.default_permission_mode,
+        Some(trouve_protocol::PermissionMode::Yolo)
+    );
+    let resp = client
+        .put(format!("{base}/config/defaults"))
+        .json(&serde_json::json!({
+            "model": "scripted/test-model",
+            "default_thinking_level": null,
+            "permission_mode": "ask"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let saved = Config::load_from(&config_file);
+    assert_eq!(saved.default_thinking_level, None);
+    assert_eq!(
+        saved.default_permission_mode,
+        Some(trouve_protocol::PermissionMode::Ask)
+    );
 
     let resp = client
         .delete(format!("{base}/providers/openrouter"))

@@ -2514,6 +2514,19 @@ pub struct SetDefaultModelRequest {
     pub default_thinking_level: Option<String>,
 }
 
+/// Atomically replace the global defaults used by new threads
+/// (`PUT /v1/config/defaults`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetGlobalDefaultsRequest {
+    /// Provider-qualified id, e.g. "openai/gpt-4.1-mini".
+    pub model: String,
+    /// Global thinking level for the selected model. None clears the default
+    /// so the model chooses its own setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
+    pub permission_mode: PermissionMode,
+}
+
 /// Set the global default permission mode
 /// (`PUT /v1/config/default-permission-mode`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -447,6 +447,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/config/defaults": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_global_defaults"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/config/git-worktrees": {
         parameters: {
             query?: never;
@@ -4118,6 +4134,20 @@ export interface components {
             title_model_resource_policy?: components["schemas"]["TitleModelResourcePolicy"];
         };
         /**
+         * @description Atomically replace the global defaults used by new threads
+         *     (`PUT /v1/config/defaults`).
+         */
+        SetGlobalDefaultsRequest: {
+            /**
+             * @description Global thinking level for the selected model. None clears the default
+             *     so the model chooses its own setting.
+             */
+            default_thinking_level?: string | null;
+            /** @description Provider-qualified id, e.g. "openai/gpt-4.1-mini". */
+            model: string;
+            permission_mode: components["schemas"]["PermissionMode"];
+        };
+        /**
          * @description Turn local models on or off (`PUT /v1/local/enabled`). Disabling stops
          *     the llama-server sidecar and unregisters the "local" provider.
          */
@@ -5708,6 +5738,35 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["SetDefaultPermissionModeRequest"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_global_defaults: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetGlobalDefaultsRequest"];
             };
         };
         responses: {

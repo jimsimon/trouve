@@ -986,15 +986,44 @@ describe("ProtocolClient", () => {
       request.headers.get("x-trouve-host-csrf") === "ephemeral-token"
     )).toBe(true);
   });
+
+  it("sends global defaults in one replacement request", async () => {
+    const requests: Request[] = [];
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      requests.push(input instanceof Request ? input : new Request(input, init));
+      return new Response(null, { status: 204 });
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: fakeFetch,
+      mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
+    });
+
+    await client.setGlobalDefaults({
+      model: "openai/gpt-5.6",
+      default_thinking_level: null,
+      permission_mode: "allow_list",
+    });
+
+    expect(requests).toHaveLength(1);
+    const request = requests[0];
+    if (request === undefined) throw new Error("global defaults request was not sent");
+    expect(request.url).toBe("http://127.0.0.1:43127/v1/config/defaults");
+    expect(request.method).toBe("PUT");
+    await expect(request.clone().json()).resolves.toEqual({
+      model: "openai/gpt-5.6",
+      default_thinking_level: null,
+      permission_mode: "allow_list",
+    });
+  });
 });
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.0")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.1")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.2", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

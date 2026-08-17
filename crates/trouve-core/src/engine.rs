@@ -1731,6 +1731,13 @@ impl Drop for DeletingSessionMarker<'_> {
     }
 }
 
+#[derive(Clone)]
+struct GlobalDefaults {
+    model: String,
+    thinking_level: Option<String>,
+    permission_mode: trouve_protocol::PermissionMode,
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -1819,14 +1826,10 @@ pub struct Engine {
     config_file: Option<PathBuf>,
     /// Serializes persistence and runtime application of title-model behavior.
     title_model_behavior_transition: tokio::sync::Mutex<()>,
-    default_model: RwLock<String>,
-    /// Canonical thinking-level token inherited by modes without an
-    /// override. It is translated through the selected model's schema when
-    /// the turn starts.
-    default_thinking_level: RwLock<Option<String>>,
-    /// Global default permission mode for new threads, used by modes that
-    /// don't set one of their own.
-    default_permission_mode: RwLock<trouve_protocol::PermissionMode>,
+    /// One coherent snapshot of the defaults inherited by personas. Keeping
+    /// these values under one lock prevents new threads from observing a
+    /// partially applied global-defaults update.
+    global_defaults: RwLock<GlobalDefaults>,
     pub(crate) secrets: Arc<dyn trouve_providers::secrets::SecretStore>,
     pub(crate) code_review: crate::review::CodeReviewRuntime,
     /// In-flight OAuth logins, keyed by provider id.
@@ -2195,16 +2198,14 @@ impl Engine {
             // clobber the user's config.toml on any provider change.
             config_file: None,
             title_model_behavior_transition: tokio::sync::Mutex::new(()),
-            default_model: RwLock::new(
-                config
+            global_defaults: RwLock::new(GlobalDefaults {
+                model: config
                     .default_model
                     .clone()
                     .unwrap_or_else(|| "openai/gpt-4.1-mini".into()),
-            ),
-            default_thinking_level: RwLock::new(config.default_thinking_level.clone()),
-            default_permission_mode: RwLock::new(
-                config.default_permission_mode.unwrap_or_default(),
-            ),
+                thinking_level: config.default_thinking_level.clone(),
+                permission_mode: config.default_permission_mode.unwrap_or_default(),
+            }),
             secrets,
             code_review: crate::review::CodeReviewRuntime::default(),
             logins: Mutex::new(HashMap::new()),
@@ -2595,13 +2596,13 @@ impl Engine {
 
     /// Override the default model for new threads.
     pub fn with_default_model(self, model: &str) -> Self {
-        *self.default_model.write().unwrap() = model.to_string();
+        self.global_defaults.write().unwrap().model = model.to_string();
         self
     }
 
     /// Override the global default thinking level for new threads.
     pub fn with_default_thinking_level(self, level: Option<&str>) -> Self {
-        *self.default_thinking_level.write().unwrap() = level.map(String::from);
+        self.global_defaults.write().unwrap().thinking_level = level.map(String::from);
         self
     }
 
@@ -2799,11 +2800,12 @@ impl Engine {
             }
         }
         infos.sort_by(|a, b| a.id.cmp(&b.id));
+        let defaults = self.global_defaults.read().unwrap().clone();
         ProvidersResponse {
             providers: infos,
-            default_model: self.default_model.read().unwrap().clone(),
-            default_thinking_level: self.default_thinking_level.read().unwrap().clone(),
-            default_permission_mode: *self.default_permission_mode.read().unwrap(),
+            default_model: defaults.model,
+            default_thinking_level: defaults.thinking_level,
+            default_permission_mode: defaults.permission_mode,
         }
     }
 
@@ -4296,10 +4298,46 @@ impl Engine {
             }
             self.persist_config(&config);
         }
-        *self.default_model.write().unwrap() = model.to_string();
+        let mut defaults = self.global_defaults.write().unwrap();
+        defaults.model = model.to_string();
         if let Some(level) = thinking_level {
-            *self.default_thinking_level.write().unwrap() = Some(level.into());
+            defaults.thinking_level = Some(level.into());
         }
+        Ok(())
+    }
+
+    /// Validate, persist, and apply all global defaults as one replacement.
+    pub fn set_global_defaults(
+        &self,
+        model: &str,
+        thinking_level: Option<&str>,
+        permission_mode: trouve_protocol::PermissionMode,
+    ) -> Result<(), EngineError> {
+        if !model.contains('/') {
+            return Err(EngineError::BadRequest(format!(
+                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
+            )));
+        }
+        validate_thinking_level(thinking_level)?;
+
+        let next_defaults = GlobalDefaults {
+            model: model.to_string(),
+            thinking_level: thinking_level.map(String::from),
+            permission_mode,
+        };
+        let mut config = self.config.lock().unwrap();
+        let mut next_config = config.clone();
+        next_config.default_model = Some(next_defaults.model.clone());
+        next_config.default_thinking_level = next_defaults.thinking_level.clone();
+        next_config.default_permission_mode = Some(next_defaults.permission_mode);
+        if let Some(path) = &self.config_file {
+            next_config
+                .save_to(path)
+                .with_context(|| format!("persisting global defaults to {}", path.display()))?;
+        }
+        let mut defaults = self.global_defaults.write().unwrap();
+        *config = next_config;
+        *defaults = next_defaults;
         Ok(())
     }
 
@@ -4314,7 +4352,7 @@ impl Engine {
             config.default_permission_mode = Some(mode);
             self.persist_config(&config);
         }
-        *self.default_permission_mode.write().unwrap() = mode;
+        self.global_defaults.write().unwrap().permission_mode = mode;
         Ok(())
     }
 
@@ -6892,12 +6930,12 @@ impl Engine {
         // here: a thread must be creatable before any provider is configured.
         // Model precedence: explicit request > the mode's default model >
         // the global default.
+        let global_defaults = self.global_defaults.read().unwrap().clone();
         let model = req
             .model
             .or_else(|| mode.default_model.clone())
-            .unwrap_or_else(|| self.default_model.read().unwrap().clone());
+            .unwrap_or_else(|| global_defaults.model.clone());
         let mut model_options = req.model_options;
-        let global_thinking_level = self.default_thinking_level.read().unwrap().clone();
         // `thinking_level` is the canonical inherited key. Before a turn it
         // is resolved to the selected model's advertised key
         // (reasoning_effort, effort, ...), or removed for models that do not
@@ -6905,7 +6943,7 @@ impl Engine {
         inherit_thinking_option(
             &mut model_options,
             mode.default_thinking_level.as_deref(),
-            global_thinking_level.as_deref(),
+            global_defaults.thinking_level.as_deref(),
         );
         let thread = Thread {
             id: new_id("th"),
@@ -6924,7 +6962,7 @@ impl Engine {
             permission_mode: req
                 .permission_mode
                 .or(mode.default_permission_mode)
-                .unwrap_or_else(|| *self.default_permission_mode.read().unwrap()),
+                .unwrap_or(global_defaults.permission_mode),
             created_at: chrono::Utc::now(),
             spawned: spawn.is_some(),
             todos: Vec::new(),

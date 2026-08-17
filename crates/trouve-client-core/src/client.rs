@@ -659,6 +659,24 @@ impl ProtocolClient {
         .await
     }
 
+    /// Atomically replace the global defaults inherited by new threads.
+    pub async fn set_global_defaults(
+        &self,
+        model: &str,
+        default_thinking_level: Option<&str>,
+        permission_mode: PermissionMode,
+    ) -> Result<()> {
+        self.put_empty(
+            "/config/defaults",
+            &SetGlobalDefaultsRequest {
+                model: model.into(),
+                default_thinking_level: default_thinking_level.map(String::from),
+                permission_mode,
+            },
+        )
+        .await
+    }
+
     /// Set the global default permission mode for new threads (used by
     /// modes without a default of their own).
     pub async fn set_default_permission_mode(&self, permission_mode: PermissionMode) -> Result<()> {

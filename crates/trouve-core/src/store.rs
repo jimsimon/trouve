@@ -6168,7 +6168,8 @@ impl Store {
                 .is_some(),
             None => tx
                 .query_row(
-                    "SELECT 1 FROM persona_cleanup_intents WHERE persona_id = ?1",
+                    "SELECT 1 FROM persona_cleanup_intents
+                     WHERE persona_id = ?1 AND claim_token IS NULL",
                     [id],
                     |_| Ok(()),
                 )
@@ -6206,7 +6207,8 @@ impl Store {
                 params![id, token],
             )?,
             None => tx.execute(
-                "DELETE FROM persona_cleanup_intents WHERE persona_id = ?1",
+                "DELETE FROM persona_cleanup_intents
+                 WHERE persona_id = ?1 AND claim_token IS NULL",
                 [id],
             )?,
         };
@@ -12015,6 +12017,8 @@ mod tests {
         assert_eq!(first.id, "custom");
         assert_eq!(first.attempts, 0);
         assert!(store.claim_next_persona_deletion().unwrap().is_none());
+        assert!(store.complete_persona_deletion("custom").is_err());
+        assert!(store.persona_deletion_pending("custom").unwrap());
 
         store.fail_claimed_persona_deletion(&first).unwrap();
         assert!(store.claim_next_persona_deletion().unwrap().is_none());

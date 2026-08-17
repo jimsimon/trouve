@@ -211,8 +211,7 @@ const SURFACES: readonly CallbackSurface[] = [
       {
         path: "../components/persona-settings-panel.ts",
         markers: [
-          "setDefaultModel",
-          "setDefaultPermissionMode",
+          "setGlobalDefaults",
           "upsertPersona",
           "deletePersona",
         ],

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.0"
+    "version": "7.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -1222,6 +1222,37 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/SetDefaultPermissionModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/defaults": {
+      "put": {
+        "tags": [],
+        "operationId": "set_global_defaults",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGlobalDefaultsRequest"
               }
             }
           },
@@ -11717,6 +11748,30 @@
           },
           "title_model_resource_policy": {
             "$ref": "#/components/schemas/TitleModelResourcePolicy"
+          }
+        }
+      },
+      "SetGlobalDefaultsRequest": {
+        "type": "object",
+        "description": "Atomically replace the global defaults used by new threads\n(`PUT /v1/config/defaults`).",
+        "required": [
+          "model",
+          "permission_mode"
+        ],
+        "properties": {
+          "default_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Global thinking level for the selected model. None clears the default\nso the model chooses its own setting."
+          },
+          "model": {
+            "type": "string",
+            "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
           }
         }
       },

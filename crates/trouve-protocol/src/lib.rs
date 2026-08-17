@@ -273,7 +273,9 @@ pub use requests::*;
 // 7.0: code-review findings and rejected candidates require a separately
 // generated one-line title instead of deriving presentation from body text
 // (breaking).
-pub const PROTOCOL_VERSION: &str = "7.0";
+// 7.1: PUT /v1/config/defaults atomically replaces the global model,
+// thinking level, and permission mode used by new threads (additive).
+pub const PROTOCOL_VERSION: &str = "7.1";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

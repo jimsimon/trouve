@@ -44,12 +44,13 @@ use trouve_protocol::{
     ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
     SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SetMcpServerEnabledRequest,
-    SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
-    TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails,
-    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
-    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
-    UpsertMcpServerRequest, UpsertPersonaRequest, UpsertProviderRequest, UsageSummary, Workspace,
+    SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest, SetLocalEnabledRequest,
+    SetMcpServerEnabledRequest, SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus,
+    ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
+    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertPersonaRequest,
+    UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -168,6 +169,7 @@ impl IntoResponse for ApiError {
         cancel_local_model_download,
         stop_local_server,
         restart_local_server,
+        set_global_defaults,
         set_default_model,
         set_default_permission_mode,
         get_code_review_settings,
@@ -283,6 +285,7 @@ impl IntoResponse for ApiError {
         AddLocalModelRequest,
         SetLocalEnabledRequest,
         UpsertProviderRequest,
+        SetGlobalDefaultsRequest,
         SetDefaultModelRequest,
         SetDefaultPermissionModeRequest,
         CodeReviewSettings,
@@ -691,6 +694,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/local/server/stop", post(stop_local_server))
         .route("/v1/local/server/restart", post(restart_local_server))
+        .route(
+            "/v1/config/defaults",
+            axum::routing::put(set_global_defaults),
+        )
         .route(
             "/v1/config/default-model",
             axum::routing::put(set_default_model),
@@ -2000,6 +2007,21 @@ async fn delete_provider(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     engine.delete_provider(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(put, path = "/v1/config/defaults",
+    request_body = SetGlobalDefaultsRequest,
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn set_global_defaults(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetGlobalDefaultsRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.set_global_defaults(
+        &req.model,
+        req.default_thinking_level.as_deref(),
+        req.permission_mode,
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
