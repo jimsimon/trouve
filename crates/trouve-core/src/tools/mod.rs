@@ -932,6 +932,7 @@ pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
         "Cargo.lock"
             | "Gemfile.lock"
             | "Pipfile.lock"
+            | "bun.lock"
             | "bun.lockb"
             | "composer.lock"
             | "go.sum"
@@ -2575,6 +2576,7 @@ mod tests {
             "Cargo.lock",
             "Gemfile.lock",
             "Pipfile.lock",
+            "bun.lock",
             "bun.lockb",
             "composer.lock",
             "go.sum",
