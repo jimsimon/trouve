@@ -117,6 +117,21 @@ const COORDINATOR_EXECUTION_GUIDANCE: &str = "\
 Time and exploration budget: finish validation in about one minute. Use no more than 4 tool calls \
 total, only to resolve a concrete ambiguity that the supplied candidate and diff context cannot \
 settle. Do not inventory the repository, recreate the diff, make a todo list, or run builds/tests.";
+const FINDING_LEVEL_GUIDANCE: &str = "\
+Finding level rubric (apply these same thresholds in every review domain):
+- Severity measures the realistic consequence and blast radius if a reachable issue manifests, \
+not how certain you are that the issue exists.
+- high: a security-boundary violation, unauthorized access, secret or personal-data exposure, \
+data loss or corruption, sustained outage, or a broadly affecting or irreversible failure of \
+core behavior.
+- medium: a material but scoped or recoverable functional failure, reliability or performance \
+degradation, or compatibility break affecting a subset of users or workflows.
+- low: a narrow edge case or limited-consequence defect that is still actionable; exclude style \
+preferences and non-actionable nits.
+- Confidence measures only how strongly the available code and diff prove the issue exists, \
+independently of severity. Do not lower severity merely because confidence is low.
+Use your reviewer mandate to recognize domain-specific consequences, but do not redefine these \
+shared thresholds.";
 
 fn parse_code_review_poll_interval(value: &str) -> Option<Duration> {
     value
@@ -7129,7 +7144,7 @@ fn reviewer_prompt(
          Review every supplied file or fragment. Inspect relevant \
          unchanged code with read/search tools only when the supplied diff leaves a concrete \
          ambiguity. Report only actionable problems introduced by the change. Do not ask \
-         questions and do not modify files.\n\n{execution_guidance}\n\n\
+         questions and do not modify files.\n\n{level_guidance}\n\n{execution_guidance}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
          {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"confidence\":\"high|medium|low\",\"title\":\"concise one-line issue summary\",\"body\":\"specific problem and fix\"}}]}}\n\
          Use RIGHT for added/context lines in the new version and LEFT only \
@@ -7138,6 +7153,7 @@ fn reviewer_prompt(
         reviewer_name = reviewer.name,
         reviewer_instructions = reviewer.prompt,
         routing = routing,
+        level_guidance = FINDING_LEVEL_GUIDANCE,
         execution_guidance = REVIEWER_EXECUTION_GUIDANCE,
         number = job.pull_number,
         title = job.pull_title,
@@ -7190,9 +7206,9 @@ fn validation_prompt(
          revision, non-actionable style preferences, and duplicates. Merge overlapping \
          findings, correct path/side/line metadata, normalize both severity and confidence to \
          high/medium/low, and retain every verified finding a maintainer should act on, regardless \
-         of whether its severity/confidence combination will be posted to GitHub. Confidence \
-         measures how strongly the available code and diff prove the issue, independently of \
-         impact. Do not reject an otherwise real, actionable issue solely because its confidence \
+         of whether its severity/confidence combination will be posted to GitHub. Reassess each \
+         candidate against the shared finding level rubric instead of copying its submitted \
+         levels. Do not reject an otherwise real, actionable issue solely because its confidence \
          is low; publication policy is applied after consolidation. Exact relevant diff context is \
          supplied below; use tools only when surrounding unchanged code is necessary to settle \
          a concrete ambiguity. Do not add a finding merely because a \
@@ -7214,7 +7230,7 @@ fn validation_prompt(
          and a previous finding you resolve in this response cannot support a theme. Only \
          report a root cause you can state concretely from the \
          code; leave `themes` empty when the findings are unrelated.\
-         \n\n{execution_guidance}\n\n{extra}Changed paths: {paths}\n\n\
+         \n\n{level_guidance}\n\n{execution_guidance}\n\n{extra}Changed paths: {paths}\n\n\
          Candidate findings:\n{candidates}\n\n\
          Previously published open findings:\n{previous_findings}\n\n\
          Relevant diff context:\n{diff_context}\n\n\
@@ -7236,6 +7252,7 @@ fn validation_prompt(
         title = job.pull_title,
         base = job.review_base_sha,
         head = job.head_sha,
+        level_guidance = FINDING_LEVEL_GUIDANCE,
         execution_guidance = COORDINATOR_EXECUTION_GUIDANCE,
     ))
 }
@@ -11298,6 +11315,44 @@ mod tests {
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("about one minute"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("no more than 4 tool calls"));
         assert_eq!(DEFAULT_REVIEW_TASK_CONCURRENCY, 24);
+    }
+
+    #[test]
+    fn reviewer_and_coordinator_share_the_impact_based_severity_rubric() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:level-rubric");
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        let reviewer = &record.reviewers[0];
+        let batch = ReviewBatch {
+            paths: vec!["src/lib.rs".into()],
+            diff: "+fn changed() {}\n".into(),
+        };
+        let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[]);
+        let coordinator_prompt = validation_prompt(&record, &[], &[], &[]).unwrap();
+
+        for (name, prompt) in [
+            ("reviewer", reviewer_prompt.as_str()),
+            ("coordinator", coordinator_prompt.as_str()),
+        ] {
+            assert!(
+                prompt.contains(
+                    "Severity measures the realistic consequence and blast radius if a reachable issue manifests"
+                ),
+                "{name} prompt is missing the severity definition"
+            );
+            assert!(
+                prompt.contains("Confidence measures only how strongly the available code and diff prove the issue exists"),
+                "{name} prompt is missing the confidence definition"
+            );
+            assert!(
+                prompt.contains("do not redefine these shared thresholds"),
+                "{name} prompt permits reviewer-specific severity semantics"
+            );
+        }
+        assert!(
+            coordinator_prompt
+                .contains("Reassess each candidate against the shared finding level rubric")
+        );
     }
 
     #[test]
