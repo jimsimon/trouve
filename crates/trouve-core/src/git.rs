@@ -180,6 +180,12 @@ struct BoundedGitOutput {
     truncated: bool,
 }
 
+struct BoundedGitCommandOutput {
+    stdout: BoundedGitOutput,
+    stderr: BoundedGitOutput,
+    status: ExitStatus,
+}
+
 struct GitOperation<'a> {
     deadline: Instant,
     timeout: Duration,
@@ -295,14 +301,14 @@ fn clear_inherited_git_process_controls(command: &mut Command) {
     }
 }
 
-fn run_git_bounded(
+fn run_git_bounded_with_status(
     dir: &Path,
     index: Option<&TemporaryCheckpointIndex>,
     args: &[&str],
     input: Option<GitCommandInput>,
     max_stdout: usize,
     operation: &GitOperation<'_>,
-) -> Result<BoundedGitOutput> {
+) -> Result<BoundedGitCommandOutput> {
     operation.check()?;
     let execution_deadline = operation.deadline - PROCESS_TREE_CLEANUP_RESERVE;
     if Instant::now() >= execution_deadline {
@@ -416,6 +422,27 @@ fn run_git_bounded(
         thread::sleep(COMMAND_POLL_INTERVAL.min(execution_deadline - now));
     };
     let (stdout, stderr) = io_threads.join_until(operation.deadline)?;
+    Ok(BoundedGitCommandOutput {
+        stdout,
+        stderr,
+        status,
+    })
+}
+
+fn run_git_bounded(
+    dir: &Path,
+    index: Option<&TemporaryCheckpointIndex>,
+    args: &[&str],
+    input: Option<GitCommandInput>,
+    max_stdout: usize,
+    operation: &GitOperation<'_>,
+) -> Result<BoundedGitOutput> {
+    let output = run_git_bounded_with_status(dir, index, args, input, max_stdout, operation)?;
+    let BoundedGitCommandOutput {
+        stdout,
+        stderr,
+        status,
+    } = output;
     if !status.success() {
         let suffix = if stderr.truncated {
             "\n… stderr truncated"
@@ -2435,6 +2462,12 @@ fn merge_review_marker_headers(
     }
 }
 
+enum ReviewMarkerGrepResult {
+    Output(BoundedGitOutput),
+    NoMatch,
+    Failed,
+}
+
 fn run_review_marker_grep(
     worktree: &Path,
     paths: &[&str],
@@ -2443,7 +2476,7 @@ fn run_review_marker_grep(
     one_match_per_line: bool,
     index: &TemporaryCheckpointIndex,
     operation: &GitOperation<'_>,
-) -> Result<Option<BoundedGitOutput>> {
+) -> Result<ReviewMarkerGrepResult> {
     let mut args = vec![
         "--literal-pathspecs".to_owned(),
         "grep".to_owned(),
@@ -2475,20 +2508,27 @@ fn run_review_marker_grep(
     args.push("--".to_owned());
     args.extend(paths.iter().map(|path| (*path).to_owned()));
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    match run_git_bounded(worktree, Some(index), &refs, None, max_stdout, operation) {
-        Ok(output) => Ok(Some(output)),
-        Err(_) => {
-            // No matches exits 1. Other lookup failures also safely keep the
-            // affected full diffs reviewable. The header pass is optional
-            // after patches are loaded, so only explicit caller cancellation
-            // aborts the completed diff operation.
+    match run_git_bounded_with_status(worktree, Some(index), &refs, None, max_stdout, operation) {
+        Ok(output) if output.status.success() => Ok(ReviewMarkerGrepResult::Output(output.stdout)),
+        Ok(output) if output.status.code() == Some(1) => Ok(ReviewMarkerGrepResult::NoMatch),
+        Ok(_) | Err(_) => {
+            // Lookup failures safely keep the affected full diffs reviewable.
+            // The header pass is optional after patches are loaded, so only
+            // explicit caller cancellation aborts the completed operation.
             operation.check_cancelled()?;
-            Ok(None)
+            Ok(ReviewMarkerGrepResult::Failed)
         }
     }
 }
 
 const REVIEW_MARKER_HEADER_LINES: u64 = 20;
+const MAX_PORTABLE_REVIEW_MARKER_COMMANDS: usize = 64;
+
+fn portable_review_marker_command_budget(marker_count: usize) -> usize {
+    MAX_PORTABLE_REVIEW_MARKER_COMMANDS
+        .checked_div(marker_count)
+        .unwrap_or(0)
+}
 
 fn review_marker_output_bound(paths: &[&str], marker: &str) -> usize {
     // `git grep -n -z -o` emits path<NUL>line<NUL>match<LF>. Reserve the
@@ -2521,7 +2561,7 @@ fn run_portable_review_marker_retry(
         }
         *remaining_commands -= 1;
         operation.check_cancelled()?;
-        let Some(output) = run_review_marker_grep(
+        let ReviewMarkerGrepResult::Output(output) = run_review_marker_grep(
             worktree,
             &group,
             &[marker],
@@ -2558,7 +2598,6 @@ fn review_blob_headers(
     const OUTPUT_BYTES_PER_PATH: usize = 64 * 1024;
     const MAX_RETAINED_HEADER_BYTES: usize = 64 * 1024;
     const MAX_RETRY_PATHS: usize = 256;
-    const MAX_PORTABLE_RETRY_COMMANDS: usize = 64;
     const MARKERS: &[&str] = &[
         "@generated",
         "auto-generated",
@@ -2570,7 +2609,7 @@ fn review_blob_headers(
     let mut retained_header_bytes = 0;
     let mut retry_paths = Vec::new();
     for paths in paths.chunks(PATHS_PER_GREP) {
-        let Some(output) = run_review_marker_grep(
+        let ReviewMarkerGrepResult::Output(output) = run_review_marker_grep(
             worktree,
             paths,
             MARKERS,
@@ -2604,7 +2643,6 @@ fn review_blob_headers(
             MAX_RETAINED_HEADER_BYTES,
         );
     }
-    let mut portable_retry_commands = MAX_PORTABLE_RETRY_COMMANDS;
     for marker in MARKERS {
         if retry_paths.is_empty() {
             break;
@@ -2619,42 +2657,45 @@ fn review_blob_headers(
             index,
             operation,
         )?;
-        let marker_headers = if let Some(output) = output {
-            let (marker_headers, _) =
-                parse_review_marker_output(&output.bytes, &retry_paths, REVIEW_MARKER_HEADER_LINES);
-            if output.truncated {
-                let fallback_headers = run_portable_review_marker_retry(
-                    worktree,
+        let mut portable_retry_commands = portable_review_marker_command_budget(MARKERS.len());
+        let marker_headers = match output {
+            ReviewMarkerGrepResult::Output(output) => {
+                let (marker_headers, _) = parse_review_marker_output(
+                    &output.bytes,
                     &retry_paths,
-                    marker,
-                    &mut portable_retry_commands,
-                    index,
-                    operation,
-                )?;
-                let mut merged_bytes = marker_headers.values().map(String::len).sum();
-                let mut marker_headers = marker_headers;
-                merge_review_marker_headers(
-                    &mut marker_headers,
-                    fallback_headers,
-                    &mut merged_bytes,
-                    usize::MAX,
+                    REVIEW_MARKER_HEADER_LINES,
                 );
-                marker_headers
-            } else {
-                marker_headers
+                if output.truncated {
+                    let fallback_headers = run_portable_review_marker_retry(
+                        worktree,
+                        &retry_paths,
+                        marker,
+                        &mut portable_retry_commands,
+                        index,
+                        operation,
+                    )?;
+                    let mut merged_bytes = marker_headers.values().map(String::len).sum();
+                    let mut marker_headers = marker_headers;
+                    merge_review_marker_headers(
+                        &mut marker_headers,
+                        fallback_headers,
+                        &mut merged_bytes,
+                        usize::MAX,
+                    );
+                    marker_headers
+                } else {
+                    marker_headers
+                }
             }
-        } else {
-            // Exit 1 (no match) and optional-PCRE invocation failures share the
-            // bounded runner's error surface. A portable query is cheap for the
-            // former and preserves classification on Git builds without PCRE.
-            run_portable_review_marker_retry(
+            ReviewMarkerGrepResult::NoMatch => HashMap::new(),
+            ReviewMarkerGrepResult::Failed => run_portable_review_marker_retry(
                 worktree,
                 &retry_paths,
                 marker,
                 &mut portable_retry_commands,
                 index,
                 operation,
-            )?
+            )?,
         };
         merge_review_marker_headers(
             &mut headers,
@@ -3496,6 +3537,36 @@ mod tests {
         let paths = vec![path.as_str(); 250];
 
         assert!(review_marker_output_bound(&paths, "generated file") > 1024 * 1024);
+    }
+
+    #[test]
+    fn portable_review_marker_budget_reserves_work_for_every_marker() {
+        let per_marker = portable_review_marker_command_budget(5);
+
+        assert_eq!(per_marker, 12);
+        assert!(per_marker * 5 <= MAX_PORTABLE_REVIEW_MARKER_COMMANDS);
+    }
+
+    #[test]
+    fn review_marker_grep_distinguishes_no_match_from_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let operation = GitOperation::new(None);
+
+        let result = with_session_snapshot_index(tmp.path(), &operation, |index| {
+            run_review_marker_grep(
+                tmp.path(),
+                &["a.txt"],
+                &["@generated"],
+                review_marker_output_bound(&["a.txt"], "@generated"),
+                false,
+                index,
+                &operation,
+            )
+        })
+        .unwrap();
+
+        assert!(matches!(result, ReviewMarkerGrepResult::NoMatch));
     }
 
     #[test]
