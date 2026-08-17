@@ -2490,6 +2490,64 @@ fn run_review_marker_grep(
 
 const REVIEW_MARKER_HEADER_LINES: u64 = 20;
 
+fn review_marker_output_bound(paths: &[&str], marker: &str) -> usize {
+    // `git grep -n -z -o` emits path<NUL>line<NUL>match<LF>. Reserve the
+    // maximum u64 line-number width even though only the first 20 matches are
+    // retained, so a successful one-match-per-line query cannot truncate.
+    const RECORD_OVERHEAD: usize = 1 + 20 + 1 + 1;
+    paths.iter().fold(0_usize, |total, path| {
+        let record_bytes = path
+            .len()
+            .saturating_add(marker.len())
+            .saturating_add(RECORD_OVERHEAD);
+        total.saturating_add(record_bytes.saturating_mul(REVIEW_MARKER_HEADER_LINES as usize))
+    })
+}
+
+fn run_portable_review_marker_retry(
+    worktree: &Path,
+    paths: &[&str],
+    marker: &str,
+    remaining_commands: &mut usize,
+    index: &TemporaryCheckpointIndex,
+    operation: &GitOperation<'_>,
+) -> Result<HashMap<String, String>> {
+    let mut headers = HashMap::new();
+    let mut retained_bytes = 0;
+    let mut pending = vec![paths.to_vec()];
+    while let Some(group) = pending.pop() {
+        if group.is_empty() || *remaining_commands == 0 {
+            break;
+        }
+        *remaining_commands -= 1;
+        operation.check_cancelled()?;
+        let Some(output) = run_review_marker_grep(
+            worktree,
+            &group,
+            &[marker],
+            review_marker_output_bound(&group, marker),
+            false,
+            index,
+            operation,
+        )?
+        else {
+            continue;
+        };
+        let (group_headers, _) =
+            parse_review_marker_output(&output.bytes, &group, REVIEW_MARKER_HEADER_LINES);
+        merge_review_marker_headers(&mut headers, group_headers, &mut retained_bytes, usize::MAX);
+        if output.truncated && group.len() > 1 {
+            // Portable `git grep -o` can repeat one marker many times on a
+            // single line. Split only overflowing groups and stop at the
+            // shared command budget; omitted headers keep those diffs visible.
+            let middle = group.len() / 2;
+            pending.push(group[middle..].to_vec());
+            pending.push(group[..middle].to_vec());
+        }
+    }
+    Ok(headers)
+}
+
 fn review_blob_headers(
     worktree: &Path,
     paths: &[&str],
@@ -2500,7 +2558,7 @@ fn review_blob_headers(
     const OUTPUT_BYTES_PER_PATH: usize = 64 * 1024;
     const MAX_RETAINED_HEADER_BYTES: usize = 64 * 1024;
     const MAX_RETRY_PATHS: usize = 256;
-    const MAX_RETRY_OUTPUT_BYTES: usize = 1024 * 1024;
+    const MAX_PORTABLE_RETRY_COMMANDS: usize = 64;
     const MARKERS: &[&str] = &[
         "@generated",
         "auto-generated",
@@ -2546,25 +2604,58 @@ fn review_blob_headers(
             MAX_RETAINED_HEADER_BYTES,
         );
     }
+    let mut portable_retry_commands = MAX_PORTABLE_RETRY_COMMANDS;
     for marker in MARKERS {
         if retry_paths.is_empty() {
             break;
         }
         operation.check_cancelled()?;
-        let Some(output) = run_review_marker_grep(
+        let output = run_review_marker_grep(
             worktree,
             &retry_paths,
             &[*marker],
-            MAX_RETRY_OUTPUT_BYTES,
+            review_marker_output_bound(&retry_paths, marker),
             true,
             index,
             operation,
-        )?
-        else {
-            continue;
+        )?;
+        let marker_headers = if let Some(output) = output {
+            let (marker_headers, _) =
+                parse_review_marker_output(&output.bytes, &retry_paths, REVIEW_MARKER_HEADER_LINES);
+            if output.truncated {
+                let fallback_headers = run_portable_review_marker_retry(
+                    worktree,
+                    &retry_paths,
+                    marker,
+                    &mut portable_retry_commands,
+                    index,
+                    operation,
+                )?;
+                let mut merged_bytes = marker_headers.values().map(String::len).sum();
+                let mut marker_headers = marker_headers;
+                merge_review_marker_headers(
+                    &mut marker_headers,
+                    fallback_headers,
+                    &mut merged_bytes,
+                    usize::MAX,
+                );
+                marker_headers
+            } else {
+                marker_headers
+            }
+        } else {
+            // Exit 1 (no match) and optional-PCRE invocation failures share the
+            // bounded runner's error surface. A portable query is cheap for the
+            // former and preserves classification on Git builds without PCRE.
+            run_portable_review_marker_retry(
+                worktree,
+                &retry_paths,
+                marker,
+                &mut portable_retry_commands,
+                index,
+                operation,
+            )?
         };
-        let (marker_headers, _) =
-            parse_review_marker_output(&output.bytes, &retry_paths, REVIEW_MARKER_HEADER_LINES);
         merge_review_marker_headers(
             &mut headers,
             marker_headers,
@@ -3397,6 +3488,44 @@ mod tests {
 
         assert_eq!(retained_bytes, 14);
         assert_eq!(headers["generated/a.rs"], "generated file");
+    }
+
+    #[test]
+    fn review_marker_retry_bound_scales_with_paths_and_records() {
+        let path = "p".repeat(300);
+        let paths = vec![path.as_str(); 250];
+
+        assert!(review_marker_output_bound(&paths, "generated file") > 1024 * 1024);
+    }
+
+    #[test]
+    fn portable_review_marker_retry_deduplicates_a_pathological_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(
+            generated.join("compound.rs"),
+            format!("// {}\n", "generated file ".repeat(3_000)),
+        )
+        .unwrap();
+        let operation = GitOperation::new(None);
+        let mut remaining_commands = 4;
+
+        let headers = with_session_snapshot_index(tmp.path(), &operation, |index| {
+            run_portable_review_marker_retry(
+                tmp.path(),
+                &["generated/compound.rs"],
+                "generated file",
+                &mut remaining_commands,
+                index,
+                &operation,
+            )
+        })
+        .unwrap();
+
+        assert_eq!(headers["generated/compound.rs"], "generated file");
+        assert_eq!(remaining_commands, 3);
     }
 
     #[test]
