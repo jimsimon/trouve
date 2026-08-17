@@ -346,6 +346,23 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         Err("review repository diff is unavailable in this executor".into())
     }
+    /// Read review diffs with optional trusted snapshot metadata. Existing
+    /// executors remain compatible by supplying ordinary diff files.
+    async fn review_repository_diff_with_metadata(
+        &self,
+        request: &ReviewRepositoryDiff,
+    ) -> Result<Vec<ReviewDiffFileWithMetadata>, String> {
+        self.review_repository_diff(request).await.map(|files| {
+            files
+                .into_iter()
+                .map(|file| ReviewDiffFileWithMetadata {
+                    path: file.path,
+                    diff: file.diff,
+                    generated_header: None,
+                })
+                .collect()
+        })
+    }
     /// Read a bounded current-worktree diff through the trusted Git boundary.
     async fn session_diff(&self, _request: &SessionRepositoryDiff) -> Result<String, String> {
         Err("session diff is unavailable in this executor".into())
@@ -916,6 +933,12 @@ async fn run_review_command_with_timeout(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewDiffFile {
+    pub path: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDiffFileWithMetadata {
     pub path: String,
     pub diff: String,
     /// Newline-separated generated-marker tokens matched in the current
@@ -2306,6 +2329,23 @@ impl ToolExecutor for LocalToolExecutor {
         &self,
         request: &ReviewRepositoryDiff,
     ) -> Result<Vec<ReviewDiffFile>, String> {
+        self.review_repository_diff_with_metadata(request)
+            .await
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| ReviewDiffFile {
+                        path: file.path,
+                        diff: file.diff,
+                    })
+                    .collect()
+            })
+    }
+
+    async fn review_repository_diff_with_metadata(
+        &self,
+        request: &ReviewRepositoryDiff,
+    ) -> Result<Vec<ReviewDiffFileWithMetadata>, String> {
         validate_review_commit(&request.base_sha)?;
         let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
         let base_sha = request.base_sha.clone();
@@ -2323,7 +2363,7 @@ impl ToolExecutor for LocalToolExecutor {
             .map(|files| {
                 files
                     .into_iter()
-                    .map(|file| ReviewDiffFile {
+                    .map(|file| ReviewDiffFileWithMetadata {
                         path: file.path,
                         diff: file.diff,
                         generated_header: file.generated_header,
@@ -2569,6 +2609,17 @@ impl ToolExecutor for LocalToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_diff_file_preserves_two_field_construction() {
+        let file = ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "+pub fn added() {}\n".into(),
+        };
+
+        assert_eq!(file.path, "src/lib.rs");
+        assert_eq!(file.diff, "+pub fn added() {}\n");
+    }
 
     #[test]
     fn generated_artifact_paths_exclude_lockfiles_and_unrelated_map_files() {

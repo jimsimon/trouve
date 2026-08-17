@@ -33,7 +33,9 @@ use crate::store::{
     CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewManualRequest, CodeReviewModelTiming,
     CodeReviewTaskMetrics, NewCodeReviewFinding, NewCodeReviewJob, NewCodeReviewTask,
 };
-use crate::tools::{ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositorySync};
+use crate::tools::{
+    ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositorySync,
+};
 
 const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
 const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
@@ -3500,7 +3502,7 @@ impl Engine {
         } else {
             let loaded = Arc::new(
                 self.executor
-                    .review_repository_diff(&ReviewRepositoryDiff {
+                    .review_repository_diff_with_metadata(&ReviewRepositoryDiff {
                         managed_root: self.data_dir.join("worktrees"),
                         worktree: session.worktree_path.clone().into(),
                         base_sha: job.review_base_sha.clone(),
