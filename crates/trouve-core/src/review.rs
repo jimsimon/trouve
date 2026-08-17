@@ -6785,18 +6785,20 @@ fn generated_review_artifact_summary(file: &ReviewDiffFile) -> String {
     let mut additions = 0_usize;
     let mut deletions = 0_usize;
     for line in file.diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++") {
+        if line.starts_with('+') && !line.starts_with("+++ ") {
             additions += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
+        } else if line.starts_with('-') && !line.starts_with("--- ") {
             deletions += 1;
         }
     }
+    let content_digest = hex::encode(Sha256::digest(file.diff.as_bytes()));
     format!(
         "\n=== {} (generated artifact summary) ===\n\
          Full generated diff omitted from focused review: {additions} added and {deletions} \
-         removed lines ({} bytes). This artifact remains review scope and its full head file is \
-         available in the checkout. Inspect it when no changed source or generator accounts for \
-         the output, or when the source changes leave a concrete ambiguity.\n",
+         removed lines ({} bytes; SHA-256 {content_digest}). This artifact remains review scope \
+         and its full head file is available in the checkout. Inspect it when no changed source \
+         or generator accounts for the output, or when the source changes leave a concrete \
+         ambiguity.\n",
         file.path,
         file.diff.len()
     )
@@ -12264,6 +12266,54 @@ mod tests {
         assert!(batches[0].diff.contains("50000 added"));
         assert!(!batches[0].diff.contains("generated_validator_row"));
         assert!(batches[0].diff.len() < 4_096);
+    }
+
+    #[test]
+    fn generated_artifact_summary_counts_content_that_resembles_file_headers() {
+        let file = ReviewDiffFile {
+            path: "src/generated/client.rs".into(),
+            diff: "--- a/src/generated/client.rs\n\
+                   +++ b/src/generated/client.rs\n\
+                   @@ -1 +1 @@\n\
+                   ---removed_content\n\
+                   +++added_content\n"
+                .into(),
+            generated_header: Some("// This file was auto-generated. Do not edit.".into()),
+        };
+
+        let summary = generated_review_artifact_summary(&file);
+
+        assert!(summary.contains("1 added and 1 removed lines"));
+    }
+
+    #[test]
+    fn generated_artifact_content_changes_batch_identity() {
+        let file = |removed: &str, added: &str| ReviewDiffFile {
+            path: "src/generated/client.rs".into(),
+            diff: format!(
+                "--- a/src/generated/client.rs\n+++ b/src/generated/client.rs\n@@ -1 +1 @@\n-{removed}\n+{added}\n"
+            ),
+            generated_header: Some("// This file was auto-generated. Do not edit.".into()),
+        };
+        let first_file = file("old_a", "new_a");
+        let second_file = file("old_b", "new_b");
+        assert_eq!(first_file.diff.len(), second_file.diff.len());
+
+        let first = build_review_batches(&[first_file]);
+        let second = build_review_batches(&[second_file]);
+        let persisted_prompt = review_batch_identity(&first[0], 0, 1);
+
+        assert!(first[0].diff.contains("1 added and 1 removed lines"));
+        assert!(second[0].diff.contains("1 added and 1 removed lines"));
+        assert_eq!(first[0].diff.len(), second[0].diff.len());
+        assert!(!persisted_task_matches_batch(
+            &persisted_prompt,
+            0,
+            1,
+            &second[0],
+            0,
+            1
+        ));
     }
 
     #[test]
