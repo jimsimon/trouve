@@ -955,9 +955,9 @@ fn persisted_routing_matches_batches(
     }
 
     // Before router tasks existed for model-setup failures, Additive mode
-    // could persist only its content-independent baseline matrix. Rebuilding
-    // that exact matrix is safe even without a task fingerprint; any semantic
-    // selection or changed batch cardinality makes the comparison fail.
+    // persisted its complete content-independent baseline matrix. This legacy
+    // comparison is valid only when no Router task exists; mixed task presence
+    // must be validated batch-by-batch through the identity path above.
     !tasks
         .iter()
         .any(|task| task.role == trouve_protocol::CodeReviewTaskRole::Router)
@@ -980,10 +980,37 @@ fn routing_decisions_equal_by_key<'a, 'b>(
     left.sort_unstable_by(sort);
     right.sort_unstable_by(sort);
     left.len() == right.len()
-        && left
-            .into_iter()
-            .zip(right)
-            .all(|(left, right)| left == right)
+        && left.into_iter().zip(right).all(|(left, right)| {
+            left.batch_index == right.batch_index
+                && left.reviewer_id == right.reviewer_id
+                && left.reviewer_name == right.reviewer_name
+                && left.selected == right.selected
+                && routing_reasons_equal(&left.reasons, &right.reasons)
+        })
+}
+
+fn routing_reasons_equal(
+    left: &[CodeReviewRoutingReason],
+    right: &[CodeReviewRoutingReason],
+) -> bool {
+    let source_rank = |source: CodeReviewRoutingSource| match source {
+        CodeReviewRoutingSource::Core => 0,
+        CodeReviewRoutingSource::Baseline => 1,
+        CodeReviewRoutingSource::Deterministic => 2,
+        CodeReviewRoutingSource::Semantic => 3,
+        CodeReviewRoutingSource::Included => 4,
+        CodeReviewRoutingSource::Thorough => 5,
+    };
+    let mut left = left.iter().collect::<Vec<_>>();
+    let mut right = right.iter().collect::<Vec<_>>();
+    let sort = |a: &&CodeReviewRoutingReason, b: &&CodeReviewRoutingReason| {
+        source_rank(a.source)
+            .cmp(&source_rank(b.source))
+            .then_with(|| a.detail.cmp(&b.detail))
+    };
+    left.sort_unstable_by(sort);
+    right.sort_unstable_by(sort);
+    left == right
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -12449,12 +12476,20 @@ mod tests {
         let mut job = enqueue_test_review_job(&store, "acme/widgets#42:additive-fallback");
         job.routing_mode = CodeReviewRoutingMode::Additive;
         job.semantic_routing = true;
+        job.included_reviewer_ids = vec!["correctness".into()];
         store.claim_code_review_job().unwrap().unwrap();
-        let mut reviewers = crate::reviewers::built_in_reviewers()
+        let catalog = crate::reviewers::built_in_reviewers();
+        let reviewer_ids = ["correctness", "security", "concurrency"];
+        let reviewers = reviewer_ids
             .into_iter()
-            .take(3)
+            .map(|id| {
+                catalog
+                    .iter()
+                    .find(|reviewer| reviewer.id == id)
+                    .unwrap()
+                    .clone()
+            })
             .collect::<Vec<_>>();
-        reviewers.sort_by(|left, right| right.id.cmp(&left.id));
         let batch = ReviewBatch {
             paths: vec!["src/lib.rs".into()],
             diff: "+reviewed();\n".into(),
@@ -12471,6 +12506,10 @@ mod tests {
                 .cmp(&right.batch_index)
                 .then_with(|| left.reviewer_id.cmp(&right.reviewer_id))
         });
+        for decision in &mut persisted_fallback {
+            decision.reasons.reverse();
+        }
+        assert!(fallback.iter().any(|decision| decision.reasons.len() > 1));
         assert_ne!(persisted_fallback, fallback);
 
         assert!(persisted_routing_matches_batches(

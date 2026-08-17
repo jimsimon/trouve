@@ -929,7 +929,17 @@ pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
     let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
     if matches!(
         file_name,
-        "Cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
+        "Cargo.lock"
+            | "Gemfile.lock"
+            | "Pipfile.lock"
+            | "bun.lockb"
+            | "composer.lock"
+            | "go.sum"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "poetry.lock"
+            | "uv.lock"
+            | "yarn.lock"
     ) {
         return false;
     }
@@ -941,7 +951,9 @@ pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
     }) || file_name.ends_with(".snap")
         || file_name.ends_with(".min.js")
         || file_name.ends_with(".min.css")
-        || file_name.ends_with(".map")
+        || [".js.map", ".mjs.map", ".cjs.map", ".css.map"]
+            .iter()
+            .any(|suffix| file_name.ends_with(suffix))
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -2548,6 +2560,41 @@ impl ToolExecutor for LocalToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_artifact_paths_exclude_lockfiles_and_unrelated_map_files() {
+        for lockfile in [
+            "Cargo.lock",
+            "Gemfile.lock",
+            "Pipfile.lock",
+            "bun.lockb",
+            "composer.lock",
+            "go.sum",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "poetry.lock",
+            "uv.lock",
+            "yarn.lock",
+        ] {
+            assert!(!is_conventional_generated_artifact_path(&format!(
+                "generated/{lockfile}"
+            )));
+        }
+        for source_map in [
+            "assets/app.js.map",
+            "assets/app.mjs.map",
+            "assets/app.cjs.map",
+            "assets/app.css.map",
+        ] {
+            assert!(is_conventional_generated_artifact_path(source_map));
+        }
+        assert!(!is_conventional_generated_artifact_path(
+            "assets/regions.map"
+        ));
+        assert!(is_conventional_generated_artifact_path(
+            "generated/client.rs"
+        ));
+    }
 
     #[test]
     fn session_creation_receipt_rolls_back_exactly_once_before_durability() {

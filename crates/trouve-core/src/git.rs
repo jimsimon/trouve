@@ -2358,6 +2358,17 @@ fn parse_review_marker_output(
     markers
 }
 
+fn review_marker_retry_paths<'a>(
+    paths: &[&'a str],
+    complete_headers: &HashMap<String, String>,
+) -> Vec<&'a str> {
+    paths
+        .iter()
+        .copied()
+        .filter(|path| !complete_headers.contains_key(*path))
+        .collect()
+}
+
 fn review_blob_headers(
     worktree: &Path,
     paths: &[&str],
@@ -2422,9 +2433,11 @@ fn review_blob_headers(
         let group_headers = parse_review_marker_output(&output.bytes, &paths, HEADER_LINES);
         if output.truncated && paths.len() > 1 {
             // One pathological line must not consume the shared chunk budget
-            // and hide marker matches for the remaining paths. Discard every
-            // provisional result so singleton retries cannot duplicate it.
-            path_groups.extend(paths.into_iter().map(|path| vec![path]));
+            // and hide marker matches for the remaining paths. Retain complete
+            // records and retry only paths whose result may have been omitted.
+            let retry_paths = review_marker_retry_paths(&paths, &group_headers);
+            headers.extend(group_headers);
+            path_groups.extend(retry_paths.into_iter().map(|path| vec![path]));
         } else {
             headers.extend(group_headers);
         }
@@ -3203,6 +3216,10 @@ mod tests {
             Some("@generated")
         );
         assert!(!markers.contains_key("generated/b.rs"));
+        assert_eq!(
+            review_marker_retry_paths(&["generated/a.rs", "generated/b.rs"], &markers),
+            ["generated/b.rs"]
+        );
     }
 
     #[test]
