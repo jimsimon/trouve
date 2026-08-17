@@ -940,12 +940,14 @@ fn persisted_routing_matches_batches(
             .filter(matches_identity)
             .any(|task| task.status == "failed")
             && fallback.as_ref().is_some_and(|fallback| {
-                routing_decisions
-                    .iter()
-                    .filter(|decision| decision.batch_index == batch_index as u64)
-                    .eq(fallback
+                routing_decisions_equal_by_key(
+                    routing_decisions
                         .iter()
-                        .filter(|decision| decision.batch_index == batch_index as u64))
+                        .filter(|decision| decision.batch_index == batch_index as u64),
+                    fallback
+                        .iter()
+                        .filter(|decision| decision.batch_index == batch_index as u64),
+                )
             })
     });
     if task_identities_match {
@@ -959,9 +961,29 @@ fn persisted_routing_matches_batches(
     !tasks
         .iter()
         .any(|task| task.role == trouve_protocol::CodeReviewTaskRole::Router)
-        && fallback
-            .as_deref()
-            .is_some_and(|fallback| routing_decisions == fallback)
+        && fallback.as_deref().is_some_and(|fallback| {
+            routing_decisions_equal_by_key(routing_decisions.iter(), fallback.iter())
+        })
+}
+
+fn routing_decisions_equal_by_key<'a, 'b>(
+    left: impl Iterator<Item = &'a CodeReviewRoutingDecision>,
+    right: impl Iterator<Item = &'b CodeReviewRoutingDecision>,
+) -> bool {
+    let mut left = left.collect::<Vec<_>>();
+    let mut right = right.collect::<Vec<_>>();
+    let sort = |a: &&CodeReviewRoutingDecision, b: &&CodeReviewRoutingDecision| {
+        a.batch_index
+            .cmp(&b.batch_index)
+            .then_with(|| a.reviewer_id.cmp(&b.reviewer_id))
+    };
+    left.sort_unstable_by(sort);
+    right.sort_unstable_by(sort);
+    left.len() == right.len()
+        && left
+            .into_iter()
+            .zip(right)
+            .all(|(left, right)| left == right)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -12428,10 +12450,11 @@ mod tests {
         job.routing_mode = CodeReviewRoutingMode::Additive;
         job.semantic_routing = true;
         store.claim_code_review_job().unwrap().unwrap();
-        let reviewers = crate::reviewers::built_in_reviewers()
+        let mut reviewers = crate::reviewers::built_in_reviewers()
             .into_iter()
-            .take(1)
+            .take(3)
             .collect::<Vec<_>>();
+        reviewers.sort_by(|left, right| right.id.cmp(&left.id));
         let batch = ReviewBatch {
             paths: vec!["src/lib.rs".into()],
             diff: "+reviewed();\n".into(),
@@ -12442,11 +12465,18 @@ mod tests {
             std::slice::from_ref(&batch),
             &HashMap::new(),
         );
+        let mut persisted_fallback = fallback.clone();
+        persisted_fallback.sort_by(|left, right| {
+            left.batch_index
+                .cmp(&right.batch_index)
+                .then_with(|| left.reviewer_id.cmp(&right.reviewer_id))
+        });
+        assert_ne!(persisted_fallback, fallback);
 
         assert!(persisted_routing_matches_batches(
             &job,
             &reviewers,
-            &fallback,
+            &persisted_fallback,
             &[],
             std::slice::from_ref(&batch),
         ));
@@ -12476,14 +12506,14 @@ mod tests {
         assert!(persisted_routing_matches_batches(
             &job,
             &reviewers,
-            &fallback,
+            &persisted_fallback,
             &tasks,
             std::slice::from_ref(&batch),
         ));
         assert!(!persisted_routing_matches_batches(
             &job,
             &reviewers,
-            &fallback,
+            &persisted_fallback,
             &tasks,
             &[ReviewBatch {
                 paths: batch.paths,

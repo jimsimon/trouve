@@ -918,9 +918,9 @@ async fn run_review_command_with_timeout(
 pub struct ReviewDiffFile {
     pub path: String,
     pub diff: String,
-    /// Trusted marker-bearing header lines loaded from the current snapshot,
-    /// or the base blob for a deleted file. PR-controlled patch text never
-    /// populates this field.
+    /// Trusted marker-bearing header lines loaded from the current snapshot.
+    /// PR-controlled patch text never populates this field, and deletions keep
+    /// their full diff by leaving it absent.
     pub generated_header: Option<String>,
 }
 

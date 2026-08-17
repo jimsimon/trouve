@@ -210,10 +210,15 @@ impl<'a> GitOperation<'a> {
         }
     }
 
-    fn check(&self) -> Result<()> {
+    fn check_cancelled(&self) -> Result<()> {
         if self.cancel.is_some_and(|cancel| cancel.is_cancelled()) {
             bail!("{} cancelled", self.label);
         }
+        Ok(())
+    }
+
+    fn check(&self) -> Result<()> {
+        self.check_cancelled()?;
         if Instant::now() >= self.deadline {
             bail!(
                 "{} timed out after {}s",
@@ -2304,14 +2309,13 @@ pub fn session_diff_files(worktree: &Path, base_ref: &str) -> Result<Vec<String>
 pub struct SessionReviewDiffFile {
     pub path: String,
     pub diff: String,
-    /// Trusted marker-bearing header lines from the snapshot-side file, or
-    /// from the base blob when the patch deletes the file.
+    /// Trusted marker-bearing header lines from the snapshot-side file.
+    /// Deleted files intentionally have no header so their diffs stay visible.
     pub generated_header: Option<String>,
 }
 
 fn review_blob_headers(
     worktree: &Path,
-    treeish: &str,
     paths: &[&str],
     index: &TemporaryCheckpointIndex,
     operation: &GitOperation<'_>,
@@ -2326,15 +2330,22 @@ fn review_blob_headers(
         "generated file",
         "do not edit",
     ];
-
     let mut headers = HashMap::<String, String>::new();
-    for paths in paths.chunks(PATHS_PER_GREP) {
+    let mut path_groups = paths
+        .chunks(PATHS_PER_GREP)
+        .map(<[_]>::to_vec)
+        .collect::<Vec<_>>();
+    while let Some(paths) = path_groups.pop() {
         let mut args = vec![
             "--literal-pathspecs".to_owned(),
             "grep".to_owned(),
+            "--cached".to_owned(),
             "-I".to_owned(),
             "-i".to_owned(),
             "-n".to_owned(),
+            // Emit only the bounded marker, not a potentially enormous
+            // minified source line containing it.
+            "-o".to_owned(),
             "-z".to_owned(),
             "-m".to_owned(),
             HEADER_LINES.to_string(),
@@ -2343,7 +2354,6 @@ fn review_blob_headers(
             args.push("-e".to_owned());
             args.push((*marker).to_owned());
         }
-        args.push(treeish.to_owned());
         args.push("--".to_owned());
         args.extend(paths.iter().map(|path| (*path).to_owned()));
         let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2358,12 +2368,13 @@ fn review_blob_headers(
             Ok(output) => output,
             Err(_) => {
                 // No matches exits 1. Other lookup failures also safely keep
-                // the affected full diffs reviewable.
-                operation.check()?;
+                // the affected full diffs reviewable. The header pass is
+                // optional after patches are loaded, so only explicit caller
+                // cancellation aborts the completed diff operation.
+                operation.check_cancelled()?;
                 continue;
             }
         };
-        let name_prefix = format!("{treeish}:");
         let mut rest = output.bytes.as_slice();
         while let Some(name_end) = rest.iter().position(|byte| *byte == 0) {
             let name = &rest[..name_end];
@@ -2373,11 +2384,19 @@ fn review_blob_headers(
             };
             let line = &rest[..line_end];
             rest = &rest[line_end + 1..];
-            let Some(content_end) = rest.iter().position(|byte| *byte == b'\n') else {
-                break;
+            let content = match rest.iter().position(|byte| *byte == b'\n') {
+                Some(content_end) => {
+                    let content = &rest[..content_end];
+                    rest = &rest[content_end + 1..];
+                    content
+                }
+                None if output.truncated => {
+                    let content = rest;
+                    rest = &[];
+                    content
+                }
+                None => break,
             };
-            let content = &rest[..content_end];
-            rest = &rest[content_end + 1..];
             let Ok(name) = std::str::from_utf8(name) else {
                 continue;
             };
@@ -2387,9 +2406,7 @@ fn review_blob_headers(
             else {
                 continue;
             };
-            let Some(path) = name.strip_prefix(&name_prefix) else {
-                continue;
-            };
+            let path = name;
             if line > HEADER_LINES || !paths.contains(&path) {
                 continue;
             }
@@ -2398,6 +2415,11 @@ fn review_blob_headers(
                 header.push('\n');
             }
             header.push_str(&String::from_utf8_lossy(content));
+        }
+        if output.truncated && paths.len() > 1 {
+            // One pathological line must not consume the shared chunk budget
+            // and hide marker matches for the remaining paths.
+            path_groups.extend(paths.into_iter().map(|path| vec![path]));
         }
     }
     Ok(headers)
@@ -2453,42 +2475,12 @@ where
                 generated_header: None,
             });
         }
-        let (deleted, current): (Vec<_>, Vec<_>) = patches
+        let current = patches
             .iter()
             .filter(|file| capture_header(&file.path))
-            .partition(|file| {
-                file.diff
-                    .lines()
-                    .any(|line| line.starts_with("deleted file mode "))
-            });
-        let deleted = deleted
-            .iter()
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>();
-        let current = current
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>();
-        let mut headers = review_blob_headers(worktree, base_ref, &deleted, index, &operation)?;
-        if !current.is_empty() {
-            let tree = run_git_bounded(
-                worktree,
-                Some(index),
-                &["write-tree"],
-                None,
-                128,
-                &operation,
-            )?;
-            let tree = String::from_utf8(tree.bytes)
-                .context("git write-tree returned a non-UTF-8 object id")?;
-            headers.extend(review_blob_headers(
-                worktree,
-                tree.trim(),
-                &current,
-                index,
-                &operation,
-            )?);
-        }
+        let mut headers = review_blob_headers(worktree, &current, index, &operation)?;
         for file in &mut patches {
             file.generated_header = headers.remove(&file.path);
         }
@@ -3135,7 +3127,7 @@ mod tests {
     }
 
     #[test]
-    fn review_diff_loads_generated_headers_from_head_and_deleted_base_blobs() {
+    fn review_diff_loads_generated_headers_from_snapshot_and_preserves_deletions() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
         let generated = tmp.path().join("generated");
@@ -3187,13 +3179,73 @@ mod tests {
                 .unwrap()
                 .contains("auto-generated")
         );
+        assert!(deleted.generated_header.is_none());
+        assert!(deleted.diff.contains("auto-generated"));
+    }
+
+    #[test]
+    fn review_diff_recognizes_generated_markers_on_very_long_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(
+            generated.join("large.min.js"),
+            format!("// @generated {}\n", "x".repeat(70 * 1024)),
+        )
+        .unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            10,
+            1_000,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
         assert!(
-            deleted
+            files[0]
                 .generated_header
                 .as_deref()
-                .unwrap()
-                .contains("auto-generated")
+                .is_some_and(|header| header.contains("@generated"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_diff_uses_replacement_content_instead_of_deleted_base_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        let path = generated.join("replaced.js");
+        std::fs::write(&path, "// @generated\nold();\n").unwrap();
+        run(tmp.path(), &["add", "generated/replaced.js"]);
+        run(tmp.path(), &["commit", "-m", "add generated file"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("ordinary-target.js", &path).unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            10,
+            1_000,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].diff.contains("new file mode 120000"));
+        assert!(files[0].generated_header.is_none());
     }
 
     #[test]
