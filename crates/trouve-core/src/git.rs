@@ -2309,9 +2309,53 @@ pub fn session_diff_files(worktree: &Path, base_ref: &str) -> Result<Vec<String>
 pub struct SessionReviewDiffFile {
     pub path: String,
     pub diff: String,
-    /// Trusted marker-bearing header lines from the snapshot-side file.
-    /// Deleted files intentionally have no header so their diffs stay visible.
+    /// Newline-separated generated-marker tokens matched in the snapshot-side
+    /// file. Deleted files intentionally leave this absent so their diffs stay
+    /// visible.
     pub generated_header: Option<String>,
+}
+
+fn parse_review_marker_output(
+    bytes: &[u8],
+    paths: &[&str],
+    header_lines: u64,
+) -> HashMap<String, String> {
+    let mut markers = HashMap::<String, String>::new();
+    let mut rest = bytes;
+    while let Some(name_end) = rest.iter().position(|byte| *byte == 0) {
+        let name = &rest[..name_end];
+        rest = &rest[name_end + 1..];
+        let Some(line_end) = rest.iter().position(|byte| *byte == 0) else {
+            break;
+        };
+        let line = &rest[..line_end];
+        rest = &rest[line_end + 1..];
+        let Some(content_end) = rest.iter().position(|byte| *byte == b'\n') else {
+            // A bounded read may end partway through the final marker token.
+            // Only complete grep records are trusted and retained.
+            break;
+        };
+        let content = &rest[..content_end];
+        rest = &rest[content_end + 1..];
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        let Some(line) = std::str::from_utf8(line)
+            .ok()
+            .and_then(|line| line.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if line > header_lines || !paths.contains(&name) {
+            continue;
+        }
+        let marker = markers.entry(name.to_owned()).or_default();
+        if !marker.is_empty() {
+            marker.push('\n');
+        }
+        marker.push_str(&String::from_utf8_lossy(content));
+    }
+    markers
 }
 
 fn review_blob_headers(
@@ -2375,51 +2419,14 @@ fn review_blob_headers(
                 continue;
             }
         };
-        let mut rest = output.bytes.as_slice();
-        while let Some(name_end) = rest.iter().position(|byte| *byte == 0) {
-            let name = &rest[..name_end];
-            rest = &rest[name_end + 1..];
-            let Some(line_end) = rest.iter().position(|byte| *byte == 0) else {
-                break;
-            };
-            let line = &rest[..line_end];
-            rest = &rest[line_end + 1..];
-            let content = match rest.iter().position(|byte| *byte == b'\n') {
-                Some(content_end) => {
-                    let content = &rest[..content_end];
-                    rest = &rest[content_end + 1..];
-                    content
-                }
-                None if output.truncated => {
-                    let content = rest;
-                    rest = &[];
-                    content
-                }
-                None => break,
-            };
-            let Ok(name) = std::str::from_utf8(name) else {
-                continue;
-            };
-            let Some(line) = std::str::from_utf8(line)
-                .ok()
-                .and_then(|line| line.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            let path = name;
-            if line > HEADER_LINES || !paths.contains(&path) {
-                continue;
-            }
-            let header = headers.entry(path.to_owned()).or_default();
-            if !header.is_empty() {
-                header.push('\n');
-            }
-            header.push_str(&String::from_utf8_lossy(content));
-        }
+        let group_headers = parse_review_marker_output(&output.bytes, &paths, HEADER_LINES);
         if output.truncated && paths.len() > 1 {
             // One pathological line must not consume the shared chunk budget
-            // and hide marker matches for the remaining paths.
+            // and hide marker matches for the remaining paths. Discard every
+            // provisional result so singleton retries cannot duplicate it.
             path_groups.extend(paths.into_iter().map(|path| vec![path]));
+        } else {
+            headers.extend(group_headers);
         }
     }
     Ok(headers)
@@ -3181,6 +3188,21 @@ mod tests {
         );
         assert!(deleted.generated_header.is_none());
         assert!(deleted.diff.contains("auto-generated"));
+    }
+
+    #[test]
+    fn review_marker_parser_discards_an_incomplete_tail_record() {
+        let output = b"generated/a.rs\x001\x00@generated\n\
+                       generated/b.rs\x002\x00auto-generated";
+
+        let markers = parse_review_marker_output(output, &["generated/a.rs", "generated/b.rs"], 20);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers.get("generated/a.rs").map(String::as_str),
+            Some("@generated")
+        );
+        assert!(!markers.contains_key("generated/b.rs"));
     }
 
     #[test]
