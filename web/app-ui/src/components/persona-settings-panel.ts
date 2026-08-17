@@ -383,9 +383,9 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
           ${thinking.length === 0
             ? html`<input name="thinking" type="hidden" .value=${this.#providers?.default_thinking_level ?? ""} />`
             : html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
-          <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Set defaults</button></div>
           <p class="meta">Global default permissions — used by new threads whose persona has no default of its own.</p>
           <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
+          <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Set defaults</button></div>
         </form>
         <h3 class="section-subtitle">Personas</h3>
         <p class="modes-copy">A persona combines a prompt, tool policy, permissions, model, and thinking defaults. Built-in personas cannot be deleted. Custom personas are also available for code review. Workspace personas are file-managed and read-only here.</p>

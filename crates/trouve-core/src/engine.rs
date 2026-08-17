@@ -1322,11 +1322,7 @@ fn validate_thinking_level(level: Option<&str>) -> Result<(), EngineError> {
 }
 
 fn validate_persona_id(id: &str) -> Result<(), EngineError> {
-    if id.is_empty()
-        || !id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
+    if !personas::is_valid_persona_id(id) {
         return Err(EngineError::BadRequest(
             "persona id must be non-empty and [a-zA-Z0-9_-] only".into(),
         ));
@@ -2311,36 +2307,38 @@ impl Engine {
     /// The intent keeps repository references untouched until the executor
     /// confirms the file is gone; a missing file is success only on replay.
     pub async fn retry_persona_deletions(&self) {
-        let ids = match self.store.pending_persona_deletions() {
-            Ok(ids) => ids,
-            Err(error) => {
-                tracing::warn!(%error, "failed to list durable persona deletion intents");
-                return;
-            }
-        };
         let Some(config_dir) = self.config_dir.as_deref() else {
             return;
         };
-        for id in ids {
-            let _mutation = self.persona_mutations.lock().await;
-            match self.store.persona_deletion_pending(&id) {
-                Ok(true) => {}
-                Ok(false) => continue,
+        loop {
+            let claim = match self.store.claim_next_persona_deletion() {
+                Ok(Some(claim)) => claim,
+                Ok(None) => break,
                 Err(error) => {
-                    tracing::warn!(persona_id = %id, %error, "failed to recheck persona deletion intent");
-                    continue;
+                    tracing::warn!(%error, "failed to claim durable persona deletion intent");
+                    break;
                 }
-            }
-            if let Err(error) = self
+            };
+            let _mutation = self.persona_mutations.lock().await;
+            let result = self
                 .executor
-                .delete_persona_file(config_dir, &id, true)
+                .delete_persona_file(config_dir, &claim.id, true)
                 .await
-            {
-                tracing::warn!(persona_id = %id, %error, "persona deletion retry failed");
-                continue;
-            }
-            if let Err(error) = self.store.complete_persona_deletion(&id) {
-                tracing::warn!(persona_id = %id, %error, "finalizing persona deletion retry failed");
+                .map_err(anyhow::Error::msg)
+                .and_then(|()| self.store.complete_claimed_persona_deletion(&claim));
+            if let Err(error) = result {
+                if let Err(store_error) = self.store.fail_claimed_persona_deletion(&claim) {
+                    tracing::error!(
+                        persona_id = %claim.id,
+                        %error,
+                        %store_error,
+                        "persona deletion failed and its durable retry could not be updated"
+                    );
+                } else if claim.attempts == 0 {
+                    tracing::warn!(persona_id = %claim.id, %error, "persona deletion retry failed");
+                } else {
+                    tracing::debug!(persona_id = %claim.id, %error, "persona deletion retry failed");
+                }
             }
         }
     }
@@ -4533,7 +4531,7 @@ impl Engine {
         self.resolve_personas(root.as_deref())
     }
 
-    /// Modes with provenance (builtin / customized / custom / workspace)
+    /// Personas with provenance (builtin / customized / custom / workspace)
     /// for the settings screen.
     pub fn list_persona_infos(
         &self,
@@ -4552,16 +4550,26 @@ impl Engine {
         let mut infos =
             personas::resolve_persona_infos(self.config_dir.as_deref(), root.as_deref());
         let reviewer_catalog = self.code_review_reviewer_catalog()?;
-        let mut builtin_ids: std::collections::HashSet<_> = personas::builtin_personas()
+        let mut builtin_order = HashMap::new();
+        for id in personas::builtin_personas()
             .into_iter()
             .map(|persona| persona.id)
-            .collect();
-        builtin_ids.extend(
-            reviewer_catalog
-                .iter()
-                .filter(|reviewer| reviewer.built_in)
-                .map(|reviewer| reviewer.id.clone()),
-        );
+            .chain(
+                crate::reviewers::built_in_reviewers()
+                    .into_iter()
+                    .map(|reviewer| reviewer.id),
+            )
+            .chain(
+                reviewer_catalog
+                    .iter()
+                    .filter(|reviewer| reviewer.built_in)
+                    .map(|reviewer| reviewer.id.clone()),
+            )
+        {
+            let position = builtin_order.len();
+            builtin_order.entry(id).or_insert(position);
+        }
+        let builtin_ids: HashSet<_> = builtin_order.keys().cloned().collect();
         for info in &mut infos {
             if builtin_ids.contains(&info.persona.id) && info.origin == "custom" {
                 info.origin = "customized".into();
@@ -4583,7 +4591,10 @@ impl Engine {
         }
         infos.sort_by_key(|info| {
             (
-                !builtin_ids.contains(&info.persona.id),
+                builtin_order
+                    .get(&info.persona.id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
                 info.persona.id.clone(),
             )
         });
@@ -4595,8 +4606,7 @@ impl Engine {
         workspace_root: Option<&Path>,
     ) -> Result<Vec<AgentPersona>, EngineError> {
         let mut personas: Vec<_> = self
-            .code_review_reviewer_catalog()
-            .unwrap_or_default()
+            .code_review_reviewer_catalog()?
             .iter()
             .map(crate::reviewers::reviewer_as_persona)
             .collect();
@@ -4638,13 +4648,14 @@ impl Engine {
             default_thinking_level: req.default_thinking_level,
         };
         let _mutation = self.persona_mutations.lock().await;
-        if self.store.persona_deletion_pending(id)? {
-            self.store.complete_persona_deletion(id)?;
-        }
         self.executor
             .upsert_persona_file(config_dir, &persona)
             .await
-            .map_err(EngineError::BadRequest)
+            .map_err(EngineError::BadRequest)?;
+        if self.store.persona_deletion_pending(id)? {
+            self.store.complete_persona_deletion(id)?;
+        }
+        Ok(())
     }
 
     /// Remove a user-level persona file: deletes a custom persona, or resets a
@@ -4657,14 +4668,18 @@ impl Engine {
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
         let _mutation = self.persona_mutations.lock().await;
         let deletion_pending = self.store.persona_deletion_pending(id)?;
+        let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        let custom_reviewer = reviewer_catalog
+            .iter()
+            .any(|reviewer| reviewer.id == id && !reviewer.built_in);
         let system_persona = personas::builtin_personas()
             .iter()
             .any(|persona| persona.id == id)
-            || self
-                .code_review_reviewer_catalog()?
+            || reviewer_catalog
                 .iter()
                 .any(|reviewer| reviewer.id == id && reviewer.built_in);
         let is_custom = deletion_pending
+            || custom_reviewer
             || (!system_persona
                 && personas::resolve_persona_infos(Some(config_dir), None)
                     .iter()
@@ -4672,7 +4687,7 @@ impl Engine {
         if is_custom {
             self.store.begin_persona_deletion(id)?;
             self.executor
-                .delete_persona_file(config_dir, id, deletion_pending)
+                .delete_persona_file(config_dir, id, deletion_pending || custom_reviewer)
                 .await
                 .map_err(EngineError::BadRequest)?;
             return self
@@ -14574,6 +14589,16 @@ mod tests {
             ToolResult::error(format!("unknown tool: {name}"))
         }
 
+        async fn upsert_persona_file(
+            &self,
+            _config_dir: &Path,
+            _persona: &AgentPersona,
+        ) -> Result<(), String> {
+            self.attempted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("injected persona upsert failure".into())
+        }
+
         async fn delete_persona_file(
             &self,
             _config_dir: &Path,
@@ -14584,6 +14609,31 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Err("injected persona deletion failure".into())
         }
+    }
+
+    #[tokio::test]
+    async fn failed_persona_upsert_does_not_consume_pending_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store.begin_persona_deletion("custom").unwrap();
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(Some(tmp.path().join("config")))
+            .with_executor(Arc::new(RejectingPersonaDeletionExecutor {
+                attempted: attempted.clone(),
+            }));
+
+        let error = engine
+            .upsert_persona("custom", persona_request("Custom"))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected persona upsert failure")
+        );
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.persona_deletion_pending("custom").unwrap());
     }
 
     #[tokio::test]
@@ -14704,9 +14754,65 @@ mod tests {
         assert_eq!(repository.prompt, "preserve this");
         assert_eq!(repository.model.as_deref(), Some("openai/reviewer"));
 
+        let legacy_reviewer = trouve_protocol::ReviewerProfile {
+            id: "legacy-reviewer".into(),
+            name: "Legacy reviewer".into(),
+            prompt: "Inspect legacy behavior.".into(),
+            model: None,
+            default_thinking_level: None,
+            built_in: false,
+        };
+        engine
+            .store
+            .upsert_reviewer_profile(&legacy_reviewer)
+            .unwrap();
+        assert!(
+            engine
+                .code_review_reviewer_catalog()
+                .unwrap()
+                .iter()
+                .any(|reviewer| reviewer.id == legacy_reviewer.id && !reviewer.built_in)
+        );
+        engine.delete_persona(&legacy_reviewer.id).await.unwrap();
+        assert!(
+            engine
+                .store
+                .list_custom_reviewer_profiles()
+                .unwrap()
+                .iter()
+                .all(|reviewer| reviewer.id != legacy_reviewer.id)
+        );
+
         engine.delete_persona("code").await.unwrap();
         engine.delete_persona("correctness").await.unwrap();
         let infos = engine.list_persona_infos(None).unwrap();
+        let mut expected_builtin_ids = personas::builtin_personas()
+            .into_iter()
+            .map(|persona| persona.id)
+            .chain(
+                crate::reviewers::built_in_reviewers()
+                    .into_iter()
+                    .map(|reviewer| reviewer.id),
+            )
+            .collect::<Vec<_>>();
+        for reviewer in engine
+            .code_review_reviewer_catalog()
+            .unwrap()
+            .into_iter()
+            .filter(|reviewer| reviewer.built_in)
+        {
+            if !expected_builtin_ids.contains(&reviewer.id) {
+                expected_builtin_ids.push(reviewer.id);
+            }
+        }
+        assert_eq!(
+            infos
+                .iter()
+                .take(expected_builtin_ids.len())
+                .map(|info| info.persona.id.clone())
+                .collect::<Vec<_>>(),
+            expected_builtin_ids
+        );
         for (id, customized_name) in [
             ("code", "Customized Code"),
             ("correctness", "Customized Correctness"),

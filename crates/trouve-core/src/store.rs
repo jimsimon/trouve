@@ -153,6 +153,10 @@ CREATE TABLE IF NOT EXISTS artifact_cleanup_jobs (
 -- makes a completed file mutation recoverable after a crash.
 CREATE TABLE IF NOT EXISTS persona_cleanup_intents (
   persona_id TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  claim_until TEXT,
+  claim_token TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -480,6 +484,10 @@ const MIGRATIONS: &[&str] = &[
        persona_id TEXT PRIMARY KEY,
        created_at TEXT NOT NULL
      )",
+    "ALTER TABLE persona_cleanup_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE persona_cleanup_intents ADD COLUMN next_attempt_at TEXT",
+    "ALTER TABLE persona_cleanup_intents ADD COLUMN claim_until TEXT",
+    "ALTER TABLE persona_cleanup_intents ADD COLUMN claim_token TEXT",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
@@ -554,12 +562,6 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
     "ALTER TABLE code_review_findings ADD COLUMN title TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN title TEXT NOT NULL DEFAULT ''",
-    "UPDATE code_review_findings
-       SET title = substr(replace(replace(trim(body), char(10), ' '), char(13), ' '), 1, 200)
-       WHERE title = ''",
-    "UPDATE code_review_candidate_rejections
-       SET title = substr(replace(replace(trim(body), char(10), ' '), char(13), ' '), 1, 200)
-       WHERE title = ''",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -582,11 +584,49 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
     backfill_code_review_collapse_pending(conn)?;
+    backfill_code_review_titles(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+fn backfill_code_review_titles(conn: &mut Connection) -> Result<()> {
+    for (migration_id, table) in [
+        (
+            "code-review-finding-title-backfill-v1",
+            "code_review_findings",
+        ),
+        (
+            "code-review-candidate-rejection-title-backfill-v1",
+            "code_review_candidate_rejections",
+        ),
+    ] {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let applied = tx
+            .query_row(
+                "SELECT 1 FROM store_migrations WHERE id = ?1",
+                [migration_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            tx.execute(
+                &format!(
+                    "UPDATE {table}\n                     SET title = substr(replace(replace(trim(body), char(10), ' '), char(13), ' '), 1, 200)\n                     WHERE title = ''"
+                ),
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+                params![migration_id, chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -2519,6 +2559,15 @@ pub(crate) struct ArtifactCleanupClaim {
     pub id: String,
     pub token: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersonaDeletionClaim {
+    pub id: String,
+    pub token: String,
+    pub attempts: i64,
+}
+
+const PERSONA_DELETION_CLAIM_MINUTES: i64 = 5;
 
 pub(crate) struct PromptAcceptance {
     pub prompt: trouve_protocol::QueuedPrompt,
@@ -6018,12 +6067,115 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub(crate) fn claim_next_persona_deletion(&self) -> Result<Option<PersonaDeletionClaim>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_at = chrono::Utc::now();
+        let now = now_at.to_rfc3339();
+        let candidate = tx
+            .query_row(
+                "SELECT persona_id, attempts
+                 FROM persona_cleanup_intents
+                 WHERE (claim_until IS NULL OR julianday(claim_until) <= julianday(?1))
+                   AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?1))
+                 ORDER BY created_at, persona_id
+                 LIMIT 1",
+                [&now],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((id, attempts)) = candidate else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let claim_until =
+            (now_at + chrono::Duration::minutes(PERSONA_DELETION_CLAIM_MINUTES)).to_rfc3339();
+        let claimed = tx.execute(
+            "UPDATE persona_cleanup_intents
+             SET claim_until = ?2, claim_token = ?3
+             WHERE persona_id = ?1
+               AND (claim_until IS NULL OR julianday(claim_until) <= julianday(?4))
+               AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?4))",
+            params![id, claim_until, token, now],
+        )?;
+        tx.commit()?;
+        if claimed != 1 {
+            return Ok(None);
+        }
+        Ok(Some(PersonaDeletionClaim {
+            id,
+            token,
+            attempts,
+        }))
+    }
+
+    pub(crate) fn fail_claimed_persona_deletion(&self, claim: &PersonaDeletionClaim) -> Result<()> {
+        let delay_seconds = match claim.attempts {
+            0 => 1,
+            1 => 5,
+            2 => 30,
+            3 => 120,
+            _ => 600,
+        };
+        let next_attempt_at =
+            (chrono::Utc::now() + chrono::Duration::seconds(delay_seconds)).to_rfc3339();
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE persona_cleanup_intents
+             SET attempts = attempts + 1, next_attempt_at = ?3,
+                 claim_until = NULL, claim_token = NULL
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![claim.id, claim.token, next_attempt_at],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "persona deletion claim {} is no longer owned",
+            claim.id
+        );
+        Ok(())
+    }
+
     /// Remove a deleted custom persona from every repository and consume its
     /// durable intent atomically. Filesystem work has already completed and no
     /// executor call occurs while the SQLite connection is locked.
     pub fn complete_persona_deletion(&self, id: &str) -> Result<()> {
+        self.complete_persona_deletion_with_claim(id, None)
+    }
+
+    pub(crate) fn complete_claimed_persona_deletion(
+        &self,
+        claim: &PersonaDeletionClaim,
+    ) -> Result<()> {
+        self.complete_persona_deletion_with_claim(&claim.id, Some(&claim.token))
+    }
+
+    fn complete_persona_deletion_with_claim(
+        &self,
+        id: &str,
+        claim_token: Option<&str>,
+    ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let intent_exists = match claim_token {
+            Some(token) => tx
+                .query_row(
+                    "SELECT 1 FROM persona_cleanup_intents
+                     WHERE persona_id = ?1 AND claim_token = ?2",
+                    params![id, token],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some(),
+            None => tx
+                .query_row(
+                    "SELECT 1 FROM persona_cleanup_intents WHERE persona_id = ?1",
+                    [id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some(),
+        };
+        anyhow::ensure!(intent_exists, "persona deletion intent for {id} is missing");
         let defaults = serde_json::to_string(&crate::reviewers::default_reviewer_ids())?;
         tx.execute(
             "UPDATE code_review_repositories SET
@@ -6046,10 +6198,18 @@ impl Store {
                 OR EXISTS (SELECT 1 FROM json_each(reviewer_overrides) WHERE json_extract(value, '$.reviewer_id') = ?1)",
             params![id, defaults, chrono::Utc::now().to_rfc3339()],
         )?;
-        let deleted = tx.execute(
-            "DELETE FROM persona_cleanup_intents WHERE persona_id = ?1",
-            [id],
-        )?;
+        tx.execute("DELETE FROM code_review_identities WHERE id = ?1", [id])?;
+        let deleted = match claim_token {
+            Some(token) => tx.execute(
+                "DELETE FROM persona_cleanup_intents
+                 WHERE persona_id = ?1 AND claim_token = ?2",
+                params![id, token],
+            )?,
+            None => tx.execute(
+                "DELETE FROM persona_cleanup_intents WHERE persona_id = ?1",
+                [id],
+            )?,
+        };
         anyhow::ensure!(deleted == 1, "persona deletion intent for {id} is missing");
         tx.commit()?;
         Ok(())
@@ -11807,6 +11967,77 @@ mod tests {
         let reopened = store.list_workspaces().unwrap();
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened[0].id, workspace.id);
+    }
+
+    #[test]
+    fn code_review_title_backfills_are_applied_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+             CREATE TABLE code_review_findings (title TEXT NOT NULL, body TEXT NOT NULL);
+             CREATE TABLE code_review_candidate_rejections (title TEXT NOT NULL, body TEXT NOT NULL);
+             INSERT INTO code_review_findings VALUES ('', 'Finding body');
+             INSERT INTO code_review_candidate_rejections VALUES ('', 'Rejection body');",
+        )
+        .unwrap();
+
+        backfill_code_review_titles(&mut conn).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM code_review_findings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let marker_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM store_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "Finding body");
+        assert_eq!(marker_count, 2);
+
+        conn.execute("UPDATE code_review_findings SET title = ''", [])
+            .unwrap();
+        backfill_code_review_titles(&mut conn).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM code_review_findings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "");
+    }
+
+    #[test]
+    fn persona_deletion_claims_are_fenced_and_back_off_durably() {
+        let store = Store::open_in_memory().unwrap();
+        store.begin_persona_deletion("custom").unwrap();
+
+        let first = store.claim_next_persona_deletion().unwrap().unwrap();
+        assert_eq!(first.id, "custom");
+        assert_eq!(first.attempts, 0);
+        assert!(store.claim_next_persona_deletion().unwrap().is_none());
+
+        store.fail_claimed_persona_deletion(&first).unwrap();
+        assert!(store.claim_next_persona_deletion().unwrap().is_none());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE persona_cleanup_intents SET next_attempt_at = ?2
+                 WHERE persona_id = ?1",
+                params![
+                    "custom",
+                    (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+
+        let second = store.claim_next_persona_deletion().unwrap().unwrap();
+        assert_eq!(second.attempts, 1);
+        assert_ne!(second.token, first.token);
+        assert!(store.complete_claimed_persona_deletion(&first).is_err());
+        store.complete_claimed_persona_deletion(&second).unwrap();
+        assert!(!store.persona_deletion_pending("custom").unwrap());
     }
 
     #[test]

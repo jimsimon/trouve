@@ -180,6 +180,17 @@ describe("pull request dashboard model", () => {
                 body: "Already handled.",
                 status: "fixed",
               },
+              {
+                id: "finding-legacy",
+                job_id: "job-1",
+                path: "src/legacy.ts",
+                line: 9,
+                side: "RIGHT",
+                title: "Legacy finding",
+                severity: "medium",
+                body: "Loaded from an older server response.",
+                status: "open",
+              },
             ],
           },
         }),
@@ -223,14 +234,24 @@ describe("pull request dashboard model", () => {
       lastComment: "last comment 45 mins ago",
       reviewSummary: "One issue found.",
       reviewPrompt: "Fix every confirmed issue.",
-      reviewFindings: [{
-        location: "src/main.ts:17",
-        title: "Failure path is ignored",
-        severity: "high",
-        confidence: "high",
-        prompt: "Fix the failure path.",
-        publicationStatus: "published",
-      }],
+      reviewFindings: [
+        {
+          location: "src/main.ts:17",
+          title: "Failure path is ignored",
+          severity: "high",
+          confidence: "high",
+          prompt: "Fix the failure path.",
+          publicationStatus: "published",
+        },
+        {
+          location: "src/legacy.ts:9",
+          title: "Legacy finding",
+          severity: "medium",
+          confidence: "medium",
+          prompt: "",
+          publicationStatus: "pending",
+        },
+      ],
     });
   });
 

@@ -218,7 +218,7 @@ export interface Finding {
   line: number;
   side: string;
   severity: string;
-  confidence: string;
+  confidence?: string;
   title: string;
   body: string;
   prompt_for_agents: string;
@@ -245,7 +245,7 @@ export interface CandidateRejection {
   line: number;
   side: string;
   severity: string;
-  confidence: string;
+  confidence?: string;
   title: string;
   body: string;
   reason: string;

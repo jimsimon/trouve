@@ -10,6 +10,32 @@ use trouve_protocol::{AgentPersona, PersonaInfo};
 
 pub const REVIEW_PERSONA_ID: &str = "review";
 
+pub fn is_valid_persona_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+pub fn review_inspection_tools() -> Vec<String> {
+    [
+        "read_file",
+        "list_dir",
+        "glob",
+        "grep",
+        "search",
+        "find_related",
+        "git_diff",
+        "web_fetch",
+        "todo_write",
+        "spawn_thread",
+        "spawn_output",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 pub fn builtin_personas() -> Vec<AgentPersona> {
     vec![
         AgentPersona {
@@ -69,19 +95,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             // No shell here: review is read_only, and the gate denies every
             // mutating tool (shell included) in read-only personas, so listing
             // them would only tempt the model into a guaranteed-deny loop.
-            allowed_tools: vec![
-                "read_file".into(),
-                "list_dir".into(),
-                "glob".into(),
-                "grep".into(),
-                "search".into(),
-                "find_related".into(),
-                "git_diff".into(),
-                "web_fetch".into(),
-                "todo_write".into(),
-                "spawn_thread".into(),
-                "spawn_output".into(),
-            ],
+            allowed_tools: review_inspection_tools(),
             read_only: true,
             default_permission_mode: None,
             default_model: None,
@@ -98,7 +112,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
                 "You are the Architect persona: reason about structure, boundaries, and \
                             trade-offs. Review designs and changes for maintainability, duplicated \
                             sources of truth, and violated boundaries. Propose designs and ADR-style \
-                            records rather than direct code changes; only touch documentation files."
+                            records rather than direct code changes."
                     .into(),
             allowed_tools: vec![],
             read_only: false,
@@ -281,12 +295,7 @@ pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Option<PathBuf> 
 /// Write (create or replace) the user-level TOML file for a persona. Saving
 /// under a built-in id customizes that built-in.
 pub fn upsert_user_persona(config_dir: &Path, persona: &AgentPersona) -> Result<()> {
-    if persona.id.is_empty()
-        || !persona
-            .id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !is_valid_persona_id(&persona.id) {
         bail!("persona id must be non-empty and [a-zA-Z0-9_-] only");
     }
     let path = user_persona_file(config_dir, &persona.id).unwrap_or_else(|| {
@@ -473,5 +482,8 @@ default_permission_mode = "ask"
         assert!(upsert_user_persona(tmp.path(), &persona).is_err());
         persona.id = "".into();
         assert!(upsert_user_persona(tmp.path(), &persona).is_err());
+        assert!(is_valid_persona_id("review_2-alpha"));
+        assert!(!is_valid_persona_id("../evil"));
+        assert!(!is_valid_persona_id(""));
     }
 }

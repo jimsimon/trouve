@@ -2069,13 +2069,13 @@ impl Engine {
         let mut reviewers = crate::reviewers::built_in_reviewers();
         // Pre-unification reviewer records are retained as system personas. They
         // can be customized through the persona catalog, but never deleted.
-        for mut reviewer in self
-            .store
-            .list_built_in_reviewer_defaults()?
-            .into_iter()
-            .chain(self.store.list_custom_reviewer_profiles()?)
-        {
+        for mut reviewer in self.store.list_built_in_reviewer_defaults()? {
             reviewer.built_in = true;
+            reviewers.retain(|candidate| candidate.id != reviewer.id);
+            reviewers.push(reviewer);
+        }
+        for mut reviewer in self.store.list_custom_reviewer_profiles()? {
+            reviewer.built_in = false;
             reviewers.retain(|candidate| candidate.id != reviewer.id);
             reviewers.push(reviewer);
         }
@@ -4765,12 +4765,9 @@ impl Engine {
         let mut ineligible_ids = Vec::new();
         let mut suppressed_ids = Vec::new();
         for finding in findings {
-            if finding.line == 0 || finding.path.trim().is_empty() {
+            if !finding.has_inline_location() {
                 ineligible_ids.push(finding.id.as_str());
-            } else if !finding_levels_meet_publication_threshold(
-                &finding.severity,
-                &finding.confidence,
-            ) {
+            } else if !finding.is_publishable() {
                 suppressed_ids.push(finding.id.as_str());
             } else {
                 comments.push(serde_json::json!({
@@ -5003,14 +5000,7 @@ impl Engine {
         let findings = self.store.code_review_findings(&job.id)?;
         let suppressed_ids = findings
             .iter()
-            .filter(|finding| {
-                finding.line > 0
-                    && !finding.path.trim().is_empty()
-                    && !finding_levels_meet_publication_threshold(
-                        &finding.severity,
-                        &finding.confidence,
-                    )
-            })
+            .filter(|finding| finding.has_inline_location() && !finding.is_publishable())
             .map(|finding| finding.id.as_str())
             .collect::<Vec<_>>();
         self.persist_publication_status_best_effort(
@@ -5020,14 +5010,7 @@ impl Engine {
         );
         let eligible = findings
             .iter()
-            .filter(|finding| {
-                finding.line > 0
-                    && !finding.path.trim().is_empty()
-                    && finding_levels_meet_publication_threshold(
-                        &finding.severity,
-                        &finding.confidence,
-                    )
-            })
+            .filter(|finding| finding.is_publishable())
             .collect::<Vec<_>>();
         if eligible.is_empty() {
             return Ok(());
@@ -5841,14 +5824,7 @@ impl Engine {
         }
         let target_count = findings
             .iter()
-            .filter(|finding| {
-                finding.line > 0
-                    && !finding.path.trim().is_empty()
-                    && finding_levels_meet_publication_threshold(
-                        &finding.severity,
-                        &finding.confidence,
-                    )
-            })
+            .filter(|finding| finding.is_publishable())
             .count();
         if target_count == 0 {
             return true;
@@ -5877,14 +5853,7 @@ impl Engine {
             self.record_review_rate(rate);
             let count = page_comments.len();
             for finding in findings {
-                if finding.line == 0
-                    || finding.path.trim().is_empty()
-                    || !finding_levels_meet_publication_threshold(
-                        &finding.severity,
-                        &finding.confidence,
-                    )
-                    || matched.contains(&finding.id)
-                {
+                if !finding.is_publishable() || matched.contains(&finding.id) {
                     continue;
                 }
                 let marker = format!("trouve-code-review finding:{}", finding.id);
@@ -6309,13 +6278,7 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
                 == trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
         })
         .count();
-    if suppressed_count > 0 {
-        body.push_str(&format!(
-            "Review confirmed {} actionable issue(s); {} met the confidence policy for GitHub publication.\n\n",
-            detail.findings.len(),
-            detail.findings.len().saturating_sub(suppressed_count)
-        ));
-    } else if !detail.summary.is_empty() {
+    if !detail.summary.is_empty() {
         body.push_str(&bounded_utf8(
             &detail.summary,
             LIFECYCLE_SUMMARY_MAX_BYTES,
@@ -6332,11 +6295,19 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
             ));
         }
     }
-    let (suppressed_findings, publishable_findings): (Vec<_>, Vec<_>) =
-        detail.findings.iter().partition(|finding| {
-            finding.github_publication_status
-                == trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
-        });
+    if suppressed_count > 0 {
+        body.push_str(&format!(
+            "_{} of {} confirmed finding(s) were retained in Trouve but not posted by the confidence policy._\n\n",
+            suppressed_count,
+            detail.findings.len()
+        ));
+    }
+    let publishable_findings = detail
+        .findings
+        .iter()
+        .filter(|finding| finding.is_publishable())
+        .collect::<Vec<_>>();
+    let lifecycle_prompt = lifecycle_prompt_for_agents(job, &detail.summary, &publishable_findings);
     let (failed_findings, confirmed_findings): (Vec<_>, Vec<_>) =
         publishable_findings.into_iter().partition(|finding| {
             finding.github_publication_status
@@ -6361,18 +6332,9 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         LIFECYCLE_FINDINGS_MAX_BYTES.saturating_sub(used),
         false,
     );
-    if !suppressed_findings.is_empty() {
-        body.push_str(&format!(
-            "_{} additional confirmed finding(s) were retained in Trouve but not posted by the confidence policy._\n\n",
-            suppressed_findings.len()
-        ));
-    }
-    if suppressed_findings.is_empty()
-        && !detail.findings.is_empty()
-        && !detail.prompt_for_agents.is_empty()
-    {
+    if !lifecycle_prompt.is_empty() {
         let prompt = bounded_utf8(
-            &safe_prompt_fence(&detail.prompt_for_agents),
+            &safe_prompt_fence(&lifecycle_prompt),
             LIFECYCLE_PROMPT_MAX_BYTES,
             "\n[Prompt truncated; open the trouve dashboard for the complete prompt.]",
         );
@@ -6399,6 +6361,36 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
 
 fn safe_prompt_fence(text: &str) -> String {
     text.replace("```", "` ` `")
+}
+
+fn lifecycle_prompt_for_agents(
+    job: &trouve_protocol::CodeReviewJob,
+    summary: &str,
+    findings: &[&trouve_protocol::CodeReviewFinding],
+) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut prompt = format!(
+        "Address every publishable trouve code-review issue on {} pull request #{} at commit {}.\n\nReview summary: {}\n\nPublishable issues:\n",
+        job.repository, job.pull_number, job.head_sha, summary
+    );
+    for (index, finding) in findings.iter().enumerate() {
+        prompt.push_str(&format!(
+            "{}. [Severity: {} · Confidence: {}] `{}` line {}: {} — {}\n",
+            index + 1,
+            canonical_finding_level(&finding.severity).to_ascii_uppercase(),
+            canonical_finding_level(&finding.confidence).to_ascii_uppercase(),
+            finding.path,
+            finding.line,
+            finding.title,
+            finding.body
+        ));
+    }
+    prompt.push_str(
+        "\nInspect each location and its surrounding code, implement the smallest complete fixes, add or update regression tests where appropriate, and run the relevant checks. Preserve unrelated behavior and report anything that cannot be fixed with evidence.",
+    );
+    prompt
 }
 
 fn render_theme(theme: &ReviewTheme) -> String {
@@ -7520,10 +7512,36 @@ fn normalize_finding(
 /// outweighs low confidence. Medium severity needs at least medium confidence,
 /// while low severity needs high confidence.
 fn finding_levels_meet_publication_threshold(severity: &str, confidence: &str) -> bool {
+    let severity = canonical_finding_level(severity);
+    let confidence = canonical_finding_level(confidence);
     matches!(
         (severity, confidence),
         ("high", "high" | "medium" | "low") | ("medium", "high" | "medium") | ("low", "high")
     )
+}
+
+fn canonical_finding_level(level: &str) -> &str {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "high" => "high",
+        "low" => "low",
+        _ => "medium",
+    }
+}
+
+trait CodeReviewFindingPublicationExt {
+    fn has_inline_location(&self) -> bool;
+    fn is_publishable(&self) -> bool;
+}
+
+impl CodeReviewFindingPublicationExt for trouve_protocol::CodeReviewFinding {
+    fn has_inline_location(&self) -> bool {
+        self.line > 0 && !self.path.trim().is_empty()
+    }
+
+    fn is_publishable(&self) -> bool {
+        self.has_inline_location()
+            && finding_levels_meet_publication_threshold(&self.severity, &self.confidence)
+    }
 }
 
 /// (path, line, left-side). Context lines are commentable on either side;
@@ -8475,14 +8493,17 @@ mod tests {
             .find("### Inline comments that failed to post")
             .unwrap();
         assert!(confirmed < failed_section);
-        assert_eq!(body.matches("Published inline body").count(), 1);
-        assert_eq!(body.matches("Failed inline body").count(), 1);
+        assert!(body.matches("Published inline body").count() >= 1);
+        assert!(body.matches("Failed inline body").count() >= 1);
         assert!(body.contains("_(inline comment posted; link unavailable)_"));
+        assert!(body.contains("Three confirmed issues, including uncertain issue details."));
         assert!(body.contains(
-            "1 additional confirmed finding(s) were retained in Trouve but not posted by the confidence policy"
+            "1 of 3 confirmed finding(s) were retained in Trouve but not posted by the confidence policy"
         ));
         assert!(!body.contains("Uncertain issue details"));
         assert!(!body.contains("Fix all issues, including the uncertain issue"));
+        assert!(body.contains("<summary>Prompt for agents</summary>"));
+        assert!(!body.contains("Investigate uncertain issue"));
     }
 
     #[test]
@@ -11064,6 +11085,12 @@ mod tests {
                 &finding.confidence
             ));
         }
+        assert!(finding_levels_meet_publication_threshold(" HIGH ", "LOW"));
+        assert!(finding_levels_meet_publication_threshold(
+            "unsupported",
+            "UNKNOWN"
+        ));
+        assert!(!finding_levels_meet_publication_threshold("low", "unknown"));
     }
 
     #[test]

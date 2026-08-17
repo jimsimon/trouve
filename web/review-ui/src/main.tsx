@@ -1490,7 +1490,7 @@ function JobDetailPane({
               <StatusPill status={finding.status} />
             </header>
             <small>
-              {finding.path}:{finding.line} · Severity: {finding.severity.toUpperCase()} · Confidence: {finding.confidence.toUpperCase()}
+              {finding.path}:{finding.line} · Severity: {finding.severity.toUpperCase()} · Confidence: {(finding.confidence ?? "medium").toUpperCase()}
             </small>
             <p>{finding.body}</p>
             {finding.github_publication_status === "suppressed_by_policy" && (
@@ -1519,7 +1519,7 @@ function JobDetailPane({
                     <span>{rejection.reviewer_name}</span>
                   </header>
                   <small>
-                    {rejection.path}:{rejection.line} · Severity: {rejection.severity.toUpperCase()} · Confidence: {rejection.confidence.toUpperCase()}
+                    {rejection.path}:{rejection.line} · Severity: {rejection.severity.toUpperCase()} · Confidence: {(rejection.confidence ?? "medium").toUpperCase()}
                   </small>
                   <p>{rejection.body}</p>
                   <div>

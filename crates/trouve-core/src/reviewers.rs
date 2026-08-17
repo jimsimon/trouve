@@ -87,42 +87,13 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
 /// personas are deliberately read-only and receive the same inspection tools
 /// as the built-in Review persona when selected for an interactive thread.
 pub fn reviewer_as_persona(reviewer: &ReviewerProfile) -> AgentPersona {
-    let review_policy = crate::personas::builtin_personas()
-        .into_iter()
-        .find(|persona| persona.id == crate::personas::REVIEW_PERSONA_ID);
-    let (allowed_tools, read_only, default_permission_mode) = review_policy
-        .map(|policy| {
-            (
-                policy.allowed_tools,
-                policy.read_only,
-                policy.default_permission_mode,
-            )
-        })
-        .unwrap_or_else(|| {
-            (
-                [
-                    "read_file",
-                    "list_dir",
-                    "glob",
-                    "grep",
-                    "search",
-                    "find_related",
-                    "git_diff",
-                ]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-                true,
-                None,
-            )
-        });
     AgentPersona {
         id: reviewer.id.clone(),
         display_name: reviewer.name.clone(),
         system_prompt: reviewer.prompt.clone(),
-        allowed_tools,
-        read_only,
-        default_permission_mode,
+        allowed_tools: crate::personas::review_inspection_tools(),
+        read_only: true,
+        default_permission_mode: None,
         default_model: reviewer.model.clone(),
         default_thinking_level: reviewer.default_thinking_level.clone(),
     }

@@ -151,11 +151,12 @@ export const saveReviewer = async (
   if (!id) {
     throw new Error("Persona name must include at least one ASCII letter or digit.");
   }
-  const existing = reviewer.id === ""
-    ? undefined
-    : (await api<PersonaInfo[]>("/persona-infos"))
-      .find((info) => info.persona.id === id)
-      ?.persona;
+  const existing = (await api<PersonaInfo[]>("/persona-infos"))
+    .find((info) => info.persona.id === id)
+    ?.persona;
+  if (reviewer.id === "" && existing !== undefined) {
+    throw new Error(`A persona with id "${id}" already exists.`);
+  }
   await api(`/personas/${encodeURIComponent(id)}`, {
     method: "PUT",
     body: JSON.stringify({

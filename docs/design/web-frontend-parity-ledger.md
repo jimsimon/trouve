@@ -393,19 +393,20 @@ desktop-device, mobile-PWA, or performance evidence is recorded.
 - Existing threads can be selected. The tab-strip **+** action and command
   palette open the same provisional new-thread setup surface; cancelling it
   performs no server mutation.
-- New-thread setup loads available modes, models, and providers and accepts
-  mode, model, thinking, permission, an optional initial prompt, and bounded
+- New-thread setup loads available personas, models, and providers and accepts
+  persona selection, model, thinking, permission, an optional initial prompt, and bounded
   file/paste attachments. It warns for full-access/YOLO permission, prevents
   duplicate submission, and keeps create failures in the form for retry.
 - Submitting creates the thread through the protocol and selects it. If an
   optional initial prompt fails after creation, the created thread remains
   available and the UI reports that the prompt was not queued.
 - The new-session preview accepts an initial prompt, fetch-latest and branch
-  choices, mode/model/permission/thinking overrides, and bounded attachments.
+  choices, persona/model/permission/thinking overrides, and bounded attachments.
   It requests a generated title and uses a sanitized, length-bounded
   prompt-derived fallback when title generation is unavailable.
-- Mode, model, permission, and thinking controls are wired into the creation
-  flow, while existing-thread controls remain part of the thread workflow.
+- Persona selection plus inherited persona model, permission, and thinking
+  defaults are wired into the creation flow, while existing-thread controls
+  remain part of the thread workflow.
 - Thread tabs use route-backed automatic activation with one roving tab stop
   and Arrow Left/Right, Home, and End navigation.
 - The active thread's permission mode is repeated in the desktop status bar;
@@ -1425,7 +1426,7 @@ reviewable artifact and reviewer/date.
 | 12 | General/appearance | functionally-ported | Not captured | Not run | Not run | Not run | Not measured | Unassigned |
 | 13 | Notifications | functionally-ported | Not captured | Not run | Not run | Not run | Not measured | Unassigned |
 | 14 | Providers/onboarding | functionally-ported | Not captured | Not run | Not run | Not run | Not measured | Unassigned |
-| 15 | Modes/models | functionally-ported | Not captured | Not run | Not run | Not run | Not measured | Unassigned |
+| 15 | Personas/models | functionally-ported | Not captured | Not run | Not run | Not run | Not measured | Unassigned |
 | 16 | Local models | functionally-ported | Not captured | Not run | Not run | Not run | Not measured | Unassigned |
 | 17 | Git/worktrees | functionally-ported | Not captured | Not run | Not run | Not run | Not measured | Unassigned |
 | 18 | MCP | functionally-ported | Not captured | Not run | Not run | Not run | Not measured | Unassigned |
