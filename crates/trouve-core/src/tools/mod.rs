@@ -951,9 +951,17 @@ pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
     }) || file_name.ends_with(".snap")
         || file_name.ends_with(".min.js")
         || file_name.ends_with(".min.css")
-        || [".js.map", ".mjs.map", ".cjs.map", ".css.map"]
-            .iter()
-            .any(|suffix| file_name.ends_with(suffix))
+        || [
+            ".js.map",
+            ".mjs.map",
+            ".cjs.map",
+            ".css.map",
+            ".d.ts.map",
+            ".d.mts.map",
+            ".d.cts.map",
+        ]
+        .iter()
+        .any(|suffix| file_name.ends_with(suffix))
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -2585,6 +2593,9 @@ mod tests {
             "assets/app.mjs.map",
             "assets/app.cjs.map",
             "assets/app.css.map",
+            "assets/app.d.ts.map",
+            "assets/app.d.mts.map",
+            "assets/app.d.cts.map",
         ] {
             assert!(is_conventional_generated_artifact_path(source_map));
         }

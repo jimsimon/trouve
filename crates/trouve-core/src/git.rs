@@ -2319,13 +2319,30 @@ fn parse_review_marker_output(
     bytes: &[u8],
     paths: &[&str],
     header_lines: u64,
-) -> HashMap<String, String> {
+) -> (HashMap<String, String>, Vec<String>) {
     let mut markers = HashMap::<String, String>::new();
+    let mut tail_paths = Vec::new();
+    let mut last_complete_path = None;
     let mut rest = bytes;
-    while let Some(name_end) = rest.iter().position(|byte| *byte == 0) {
+    loop {
+        let Some(name_end) = rest.iter().position(|byte| *byte == 0) else {
+            if !rest.is_empty() {
+                tail_paths.extend(
+                    paths
+                        .iter()
+                        .filter(|path| path.as_bytes().starts_with(rest))
+                        .map(|path| (*path).to_owned()),
+                );
+            }
+            break;
+        };
         let name = &rest[..name_end];
         rest = &rest[name_end + 1..];
+        let decoded_name = std::str::from_utf8(name)
+            .ok()
+            .filter(|name| paths.contains(name));
         let Some(line_end) = rest.iter().position(|byte| *byte == 0) else {
+            tail_paths.extend(decoded_name.map(str::to_owned));
             break;
         };
         let line = &rest[..line_end];
@@ -2333,20 +2350,22 @@ fn parse_review_marker_output(
         let Some(content_end) = rest.iter().position(|byte| *byte == b'\n') else {
             // A bounded read may end partway through the final marker token.
             // Only complete grep records are trusted and retained.
+            tail_paths.extend(decoded_name.map(str::to_owned));
             break;
         };
         let content = &rest[..content_end];
         rest = &rest[content_end + 1..];
-        let Ok(name) = std::str::from_utf8(name) else {
+        let Some(name) = decoded_name else {
             continue;
         };
+        last_complete_path = Some(name.to_owned());
         let Some(line) = std::str::from_utf8(line)
             .ok()
             .and_then(|line| line.parse::<u64>().ok())
         else {
             continue;
         };
-        if line > header_lines || !paths.contains(&name) {
+        if line > header_lines {
             continue;
         }
         let marker = markers.entry(name.to_owned()).or_default();
@@ -2355,18 +2374,87 @@ fn parse_review_marker_output(
         }
         marker.push_str(&String::from_utf8_lossy(content));
     }
-    markers
+    if tail_paths.is_empty()
+        && let Some(path) = last_complete_path
+    {
+        tail_paths.push(path);
+    }
+    (markers, tail_paths)
 }
 
 fn review_marker_retry_paths<'a>(
     paths: &[&'a str],
     complete_headers: &HashMap<String, String>,
+    tail_paths: &[String],
 ) -> Vec<&'a str> {
     paths
         .iter()
         .copied()
-        .filter(|path| !complete_headers.contains_key(*path))
+        .filter(|path| {
+            !complete_headers.contains_key(*path)
+                || tail_paths.iter().any(|tail_path| tail_path == path)
+        })
         .collect()
+}
+
+fn merge_review_marker_headers(
+    headers: &mut HashMap<String, String>,
+    additional: HashMap<String, String>,
+) {
+    for (path, markers) in additional {
+        headers
+            .entry(path)
+            .and_modify(|header| {
+                if !header.is_empty() && !markers.is_empty() {
+                    header.push('\n');
+                }
+                header.push_str(&markers);
+            })
+            .or_insert(markers);
+    }
+}
+
+fn run_review_marker_grep(
+    worktree: &Path,
+    paths: &[&str],
+    markers: &[&str],
+    header_lines: u64,
+    max_stdout: usize,
+    index: &TemporaryCheckpointIndex,
+    operation: &GitOperation<'_>,
+) -> Result<Option<BoundedGitOutput>> {
+    let mut args = vec![
+        "--literal-pathspecs".to_owned(),
+        "grep".to_owned(),
+        "--cached".to_owned(),
+        "-I".to_owned(),
+        "-i".to_owned(),
+        "-n".to_owned(),
+        // Emit only the bounded marker, not a potentially enormous minified
+        // source line containing it.
+        "-o".to_owned(),
+        "-z".to_owned(),
+        "-m".to_owned(),
+        header_lines.to_string(),
+    ];
+    for marker in markers {
+        args.push("-e".to_owned());
+        args.push((*marker).to_owned());
+    }
+    args.push("--".to_owned());
+    args.extend(paths.iter().map(|path| (*path).to_owned()));
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    match run_git_bounded(worktree, Some(index), &refs, None, max_stdout, operation) {
+        Ok(output) => Ok(Some(output)),
+        Err(_) => {
+            // No matches exits 1. Other lookup failures also safely keep the
+            // affected full diffs reviewable. The header pass is optional
+            // after patches are loaded, so only explicit caller cancellation
+            // aborts the completed diff operation.
+            operation.check_cancelled()?;
+            Ok(None)
+        }
+    }
 }
 
 fn review_blob_headers(
@@ -2386,60 +2474,49 @@ fn review_blob_headers(
         "do not edit",
     ];
     let mut headers = HashMap::<String, String>::new();
-    let mut path_groups = paths
-        .chunks(PATHS_PER_GREP)
-        .map(<[_]>::to_vec)
-        .collect::<Vec<_>>();
-    while let Some(paths) = path_groups.pop() {
-        let mut args = vec![
-            "--literal-pathspecs".to_owned(),
-            "grep".to_owned(),
-            "--cached".to_owned(),
-            "-I".to_owned(),
-            "-i".to_owned(),
-            "-n".to_owned(),
-            // Emit only the bounded marker, not a potentially enormous
-            // minified source line containing it.
-            "-o".to_owned(),
-            "-z".to_owned(),
-            "-m".to_owned(),
-            HEADER_LINES.to_string(),
-        ];
-        for marker in MARKERS {
-            args.push("-e".to_owned());
-            args.push((*marker).to_owned());
-        }
-        args.push("--".to_owned());
-        args.extend(paths.iter().map(|path| (*path).to_owned()));
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = match run_git_bounded(
+    for paths in paths.chunks(PATHS_PER_GREP) {
+        let Some(output) = run_review_marker_grep(
             worktree,
-            Some(index),
-            &refs,
-            None,
+            paths,
+            MARKERS,
+            HEADER_LINES,
             paths.len().saturating_mul(OUTPUT_BYTES_PER_PATH),
+            index,
             operation,
-        ) {
-            Ok(output) => output,
-            Err(_) => {
-                // No matches exits 1. Other lookup failures also safely keep
-                // the affected full diffs reviewable. The header pass is
-                // optional after patches are loaded, so only explicit caller
-                // cancellation aborts the completed diff operation.
-                operation.check_cancelled()?;
-                continue;
-            }
+        )?
+        else {
+            continue;
         };
-        let group_headers = parse_review_marker_output(&output.bytes, &paths, HEADER_LINES);
-        if output.truncated && paths.len() > 1 {
+        let (group_headers, tail_paths) =
+            parse_review_marker_output(&output.bytes, paths, HEADER_LINES);
+        if output.truncated {
             // One pathological line must not consume the shared chunk budget
-            // and hide marker matches for the remaining paths. Retain complete
-            // records and retry only paths whose result may have been omitted.
-            let retry_paths = review_marker_retry_paths(&paths, &group_headers);
-            headers.extend(group_headers);
-            path_groups.extend(retry_paths.into_iter().map(|path| vec![path]));
+            // and hide marker matches for the remaining paths or later marker
+            // tokens for the tail path. Retain complete records, then isolate
+            // each retry and marker behind the larger aggregate diff bound.
+            let retry_paths = review_marker_retry_paths(paths, &group_headers, &tail_paths);
+            merge_review_marker_headers(&mut headers, group_headers);
+            for path in retry_paths {
+                for marker in MARKERS {
+                    let Some(output) = run_review_marker_grep(
+                        worktree,
+                        &[path],
+                        &[*marker],
+                        HEADER_LINES,
+                        MAX_SESSION_DIFF_BYTES,
+                        index,
+                        operation,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let (marker_headers, _) =
+                        parse_review_marker_output(&output.bytes, &[path], HEADER_LINES);
+                    merge_review_marker_headers(&mut headers, marker_headers);
+                }
+            }
         } else {
-            headers.extend(group_headers);
+            merge_review_marker_headers(&mut headers, group_headers);
         }
     }
     Ok(headers)
@@ -3208,7 +3285,8 @@ mod tests {
         let output = b"generated/a.rs\x001\x00@generated\n\
                        generated/b.rs\x002\x00auto-generated";
 
-        let markers = parse_review_marker_output(output, &["generated/a.rs", "generated/b.rs"], 20);
+        let (markers, tail_paths) =
+            parse_review_marker_output(output, &["generated/a.rs", "generated/b.rs"], 20);
 
         assert_eq!(markers.len(), 1);
         assert_eq!(
@@ -3217,8 +3295,25 @@ mod tests {
         );
         assert!(!markers.contains_key("generated/b.rs"));
         assert_eq!(
-            review_marker_retry_paths(&["generated/a.rs", "generated/b.rs"], &markers),
+            review_marker_retry_paths(&["generated/a.rs", "generated/b.rs"], &markers, &tail_paths,),
             ["generated/b.rs"]
+        );
+    }
+
+    #[test]
+    fn review_marker_retry_includes_a_complete_tail_path() {
+        let output = b"generated/a.rs\x001\x00generated file\n\
+                       generated/a.rs\x001\x00do not edit";
+
+        let (markers, tail_paths) = parse_review_marker_output(output, &["generated/a.rs"], 20);
+
+        assert_eq!(
+            markers.get("generated/a.rs").map(String::as_str),
+            Some("generated file")
+        );
+        assert_eq!(
+            review_marker_retry_paths(&["generated/a.rs"], &markers, &tail_paths),
+            ["generated/a.rs"]
         );
     }
 
@@ -3253,6 +3348,35 @@ mod tests {
                 .as_deref()
                 .is_some_and(|header| header.contains("@generated"))
         );
+    }
+
+    #[test]
+    fn review_diff_recovers_compound_markers_after_single_path_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(
+            generated.join("compound.rs"),
+            format!("// {} do not edit\n", "generated file ".repeat(3_000)),
+        )
+        .unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            10,
+            1_000,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+
+        let header = files[0].generated_header.as_deref().unwrap();
+        assert!(header.contains("generated file"));
+        assert!(header.contains("do not edit"));
     }
 
     #[cfg(unix)]
