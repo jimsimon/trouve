@@ -3114,6 +3114,7 @@ impl Engine {
             bail!("stale: pull request revision changed before the review was published");
         }
         if job.trigger == "automatic" && current.draft {
+            self.supersede_automatic_code_reviews_for_draft(&job.repository, job.pull_number)?;
             bail!("stale: pull request is a draft; automatic review stopped");
         }
         Ok(())
@@ -11547,6 +11548,10 @@ mod tests {
     async fn publication_revalidation_rejects_draft_only_for_automatic_reviews() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let automatic = enqueue_test_review_job(&store, "acme/widgets#42:publish-draft");
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            automatic.id
+        );
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
         let body = serde_json::json!({
@@ -11580,6 +11585,18 @@ mod tests {
             error.to_string(),
             "stale: pull request is a draft; automatic review stopped"
         );
+        assert_eq!(
+            engine
+                .store
+                .code_review_job(&automatic.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "stale"
+        );
+        let replacement = enqueue_test_review_job(&engine.store, "acme/widgets#42:publish-draft");
+        assert_ne!(replacement.id, automatic.id);
 
         let mut manual = automatic;
         manual.trigger = "manual".into();

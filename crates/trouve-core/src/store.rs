@@ -598,6 +598,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_code_review_finding_publication_status(conn)?;
     backfill_code_review_collapse_pending(conn)?;
     backfill_code_review_titles(conn)?;
+    backfill_draft_stale_code_review_dedupe_keys(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
     migrate_session_summary_projection(conn)?;
@@ -670,6 +671,43 @@ fn backfill_code_review_watermarks(conn: &mut Connection) -> Result<()> {
                AND state.last_reviewed_head_sha != ''
          ), review_watermark_sha)
          WHERE review_watermark_sha = ''",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Releases canonical automatic-review keys held by draft-stale jobs written
+/// before draft superseding rekeyed them transactionally.
+fn backfill_draft_stale_code_review_dedupe_keys(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-draft-stale-dedupe-backfill-v1";
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE code_review_jobs
+         SET dedupe_key = 'draft-stale:' || id || ':' || dedupe_key
+         WHERE status = 'stale'
+           AND trigger = 'automatic'
+           AND error IN (
+               'stale: pull request is a draft; automatic review stopped',
+               'pull request is a draft; automatic review stopped'
+           )
+           AND dedupe_key NOT LIKE 'draft-stale:%'",
         [],
     )?;
     tx.execute(
@@ -13213,6 +13251,40 @@ mod tests {
         let migrated = store.code_review_job(&job.id).unwrap().unwrap().job;
         assert_eq!(migrated.review_base_sha, fallback_base);
         assert_eq!(migrated.review_watermark_sha, published_head);
+    }
+
+    #[test]
+    fn draft_stale_dedupe_backfill_releases_legacy_automatic_key() {
+        let store = Store::open_in_memory().unwrap();
+        let legacy = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            legacy.id
+        );
+        assert!(
+            store
+                .finish_code_review_job(
+                    &legacy.id,
+                    "stale",
+                    "",
+                    "stale: pull request is a draft; automatic review stopped",
+                )
+                .unwrap()
+        );
+        {
+            let mut conn = store.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM store_migrations
+                 WHERE id = 'code-review-draft-stale-dedupe-backfill-v1'",
+                [],
+            )
+            .unwrap();
+            backfill_draft_stale_code_review_dedupe_keys(&mut conn).unwrap();
+            backfill_draft_stale_code_review_dedupe_keys(&mut conn).unwrap();
+        }
+
+        let replacement = enqueue_backoff_test_job(&store);
+        assert_ne!(replacement.id, legacy.id);
     }
 
     #[test]
