@@ -10,6 +10,7 @@ import {
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
   NEW_THREAD_TITLE_FALLBACK,
+  newThreadInheritanceForWorkspace,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
@@ -184,6 +185,35 @@ describe("new session model", () => {
     expect(resolveNewThreadDefaults([mode()], models, globalProviders)).toMatchObject({
       thinking: "high",
       permissionMode: "yolo",
+      inheritedThinking: "high",
+      inheritedPermissionMode: "yolo",
+    });
+  });
+
+  it("authorizes inherited defaults only for the workspace that supplied the catalog", () => {
+    const defaults = resolveNewThreadDefaults(
+      [mode()],
+      [model({
+        properties: {
+          thinking_level: { type: "string", enum: ["low", "high"] },
+        },
+      }, "provider/global")],
+      {
+        ...providers("provider/global"),
+        default_permission_mode: "yolo",
+        default_thinking_level: "high",
+      },
+    );
+
+    expect(newThreadInheritanceForWorkspace(defaults, "ws-old", "ws-new")).toEqual({
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    });
+    expect(newThreadInheritanceForWorkspace(defaults, "", "ws-new")).toEqual({
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    });
+    expect(newThreadInheritanceForWorkspace(defaults, "ws-new", "ws-new")).toEqual({
       inheritedThinking: "high",
       inheritedPermissionMode: "yolo",
     });

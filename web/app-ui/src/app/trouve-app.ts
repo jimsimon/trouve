@@ -113,6 +113,7 @@ import { createSignal, readSignal, withSignalTracking } from "../state/reactivit
 import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
   createNewSessionThreadRequest,
+  newThreadInheritanceForWorkspace,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
@@ -392,6 +393,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionThinking = "";
   #newSessionInheritedPermissionMode: string | undefined;
   #newSessionInheritedThinking: string | undefined;
+  #newSessionOptionsWorkspaceId = "";
   #newSessionOptionsPending = false;
   #newSessionOptionsError = "";
   #newSessionOptionsGeneration = 0;
@@ -1362,8 +1364,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionModelId = defaults.modelId;
     this.#newSessionPermissionMode = defaults.permissionMode;
     this.#newSessionThinking = defaults.thinking;
-    this.#newSessionInheritedPermissionMode = defaults.inheritedPermissionMode;
-    this.#newSessionInheritedThinking = defaults.inheritedThinking;
+    const inheritance = newThreadInheritanceForWorkspace(
+      defaults,
+      this.#newSessionOptionsWorkspaceId,
+      workspace.id,
+    );
+    this.#newSessionInheritedPermissionMode = inheritance.inheritedPermissionMode;
+    this.#newSessionInheritedThinking = inheritance.inheritedThinking;
     this.#newSessionWorkspaceId = workspace.id;
     this.#newSessionPreferredBaseRef = preferredBaseRef;
     this.#newSessionOpen = true;
@@ -1663,6 +1670,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const generation = ++this.#newSessionOptionsGeneration;
     this.#newSessionOptionsPending = true;
     this.#newSessionOptionsError = "";
+    this.#newSessionOptionsWorkspaceId = "";
     // Until this workspace's metadata arrives, preserve the values shown as explicit choices.
     this.#newSessionInheritedPermissionMode = undefined;
     this.#newSessionInheritedThinking = undefined;
@@ -1690,6 +1698,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionModes = modes;
       this.#newSessionModels = models;
       this.#newSessionProviders = providers;
+      this.#newSessionOptionsWorkspaceId = workspaceId;
       const defaults = resolveNewThreadDefaults(modes, models, providers);
       this.#newSessionModeId = defaults.modeId;
       this.#newSessionModelId = defaults.modelId;
@@ -2876,12 +2885,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     this.#newSessionModelId = defaults.modelId;
                     this.#newSessionThinking = defaults.thinking;
                     this.#newSessionPermissionMode = defaults.permissionMode;
-                    this.#newSessionInheritedThinking = this.#newSessionOptionsPending
-                      ? undefined
-                      : defaults.inheritedThinking;
-                    this.#newSessionInheritedPermissionMode = this.#newSessionOptionsPending
-                      ? undefined
-                      : defaults.inheritedPermissionMode;
+                    const inheritance = newThreadInheritanceForWorkspace(
+                      defaults,
+                      this.#newSessionOptionsWorkspaceId,
+                      this.#newSessionWorkspaceId,
+                    );
+                    this.#newSessionInheritedThinking = inheritance.inheritedThinking;
+                    this.#newSessionInheritedPermissionMode =
+                      inheritance.inheritedPermissionMode;
                     this.requestUpdate();
                   }}
                 >
@@ -2920,9 +2931,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     );
                     this.#newSessionModelId = defaults.modelId;
                     this.#newSessionThinking = defaults.thinking;
-                    this.#newSessionInheritedThinking = this.#newSessionOptionsPending
-                      ? undefined
-                      : defaults.inheritedThinking;
+                    this.#newSessionInheritedThinking = newThreadInheritanceForWorkspace(
+                      defaults,
+                      this.#newSessionOptionsWorkspaceId,
+                      this.#newSessionWorkspaceId,
+                    ).inheritedThinking;
                     this.requestUpdate();
                   }}
                 ></trouve-model-picker>

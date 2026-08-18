@@ -40,6 +40,13 @@ export interface NewThreadSetupDraft {
   readonly attachments: readonly PendingAttachment[];
 }
 
+export interface NewThreadSetupEdits {
+  readonly mode: boolean;
+  readonly model: boolean;
+  readonly thinking: boolean;
+  readonly permission: boolean;
+}
+
 export interface NewThreadSetupSubmitDetail {
   readonly workspaceId: string;
   readonly sessionId: string;
@@ -152,6 +159,52 @@ export const selectNewThreadModel = (
     modelId: defaults.modelId,
     thinking: defaults.thinking,
     inheritedThinking: defaults.inheritedThinking,
+  };
+};
+
+export const createNewThreadSetupEdits = (): NewThreadSetupEdits => ({
+  mode: false,
+  model: false,
+  thinking: false,
+  permission: false,
+});
+
+/**
+ * Reconcile a draft with a refreshed catalog. Explicit, still-valid fields
+ * remain request overrides; untouched fields adopt refreshed defaults and
+ * their authoritative inheritance markers together.
+ */
+export const reconcileNewThreadDraft = (
+  draft: NewThreadSetupDraft,
+  catalog: NewThreadSetupCatalog,
+  edits: NewThreadSetupEdits,
+): NewThreadSetupDraft => {
+  const initial = createInitialNewThreadDraft(catalog);
+  const modeId = edits.mode && knownMode(catalog.modes, draft.modeId) !== undefined
+    ? draft.modeId
+    : initial.modeId;
+  const modeDefaults = selectNewThreadMode(initial, modeId, catalog);
+  const modelId = edits.model && knownModel(catalog.models, draft.modelId) !== undefined
+    ? draft.modelId
+    : modeDefaults.modelId;
+  const refreshed = selectNewThreadModel(modeDefaults, modelId, catalog);
+  const keepThinking = edits.thinking
+    && newThreadThinkingOption(refreshed, catalog)?.values.includes(draft.thinking) === true;
+  const keepPermission = edits.permission
+    && (draft.permissionMode === "ask"
+      || draft.permissionMode === "allow_list"
+      || draft.permissionMode === "yolo");
+
+  return {
+    ...draft,
+    modeId: refreshed.modeId,
+    modelId: refreshed.modelId,
+    thinking: keepThinking ? draft.thinking : refreshed.thinking,
+    inheritedThinking: keepThinking ? undefined : refreshed.inheritedThinking,
+    permissionMode: keepPermission ? draft.permissionMode : refreshed.permissionMode,
+    inheritedPermissionMode: keepPermission
+      ? undefined
+      : refreshed.inheritedPermissionMode,
   };
 };
 

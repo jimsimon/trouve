@@ -33,6 +33,11 @@ export interface ResolvedNewThreadDefaults {
   readonly inheritedPermissionMode: ResolvedPermissionMode | undefined;
 }
 
+export interface NewThreadInheritance {
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: ResolvedPermissionMode | undefined;
+}
+
 export interface NewSessionThreadRequestInput {
   readonly sessionId: string;
   readonly title?: string | null;
@@ -186,6 +191,22 @@ export const resolveNewThreadDefaults = (
     inheritedPermissionMode,
   };
 };
+
+/** Only metadata loaded successfully for the selected workspace is authoritative. */
+export const newThreadInheritanceForWorkspace = (
+  defaults: ResolvedNewThreadDefaults,
+  catalogWorkspaceId: string,
+  selectedWorkspaceId: string,
+): NewThreadInheritance =>
+  catalogWorkspaceId !== "" && catalogWorkspaceId === selectedWorkspaceId
+    ? {
+        inheritedThinking: defaults.inheritedThinking,
+        inheritedPermissionMode: defaults.inheritedPermissionMode,
+      }
+    : {
+        inheritedThinking: undefined,
+        inheritedPermissionMode: undefined,
+      };
 
 /** Prefer an explicit base, then the repository HEAD/default, then conventional trunks. */
 export const resolveNewSessionBaseRef = (

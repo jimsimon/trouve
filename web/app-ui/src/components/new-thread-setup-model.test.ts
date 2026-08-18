@@ -14,11 +14,13 @@ import type {
 import {
   appendNewThreadAttachment,
   createInitialNewThreadDraft,
+  createNewThreadSetupEdits,
   createNewThreadSetupSubmission,
   effectiveNewThreadModel,
   newThreadAttachmentLimitMessage,
   newThreadSetupControls,
   newThreadThinkingOption,
+  reconcileNewThreadDraft,
   selectNewThreadMode,
   selectNewThreadModel,
   type NewThreadSetupCatalog,
@@ -139,6 +141,70 @@ describe("new thread setup model", () => {
       permissionMode: "ask",
     });
     expect(effectiveNewThreadModel(plan, catalog)?.id).toBe("provider/global");
+  });
+
+  it("restores refreshed inheritance after an untouched catalog retry", () => {
+    const staleCatalog: NewThreadSetupCatalog = {
+      ...catalog,
+      providers: {
+        ...providers,
+        default_permission_mode: "ask",
+        default_thinking_level: "low",
+      },
+    };
+    const refreshedCatalog: NewThreadSetupCatalog = {
+      ...catalog,
+      providers: {
+        ...providers,
+        default_permission_mode: "yolo",
+        default_thinking_level: "high",
+      },
+    };
+    const loadingDraft = {
+      ...createInitialNewThreadDraft(staleCatalog),
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    };
+
+    expect(reconcileNewThreadDraft(
+      loadingDraft,
+      refreshedCatalog,
+      createNewThreadSetupEdits(),
+    )).toMatchObject({
+      thinking: "high",
+      inheritedThinking: "high",
+      permissionMode: "yolo",
+      inheritedPermissionMode: "yolo",
+    });
+  });
+
+  it("preserves per-field edits across a workspace catalog switch without inheritance markers", () => {
+    const refreshedCatalog: NewThreadSetupCatalog = {
+      ...catalog,
+      providers: {
+        ...providers,
+        default_permission_mode: "yolo",
+        default_thinking_level: "high",
+      },
+    };
+    const draft = {
+      ...createInitialNewThreadDraft(catalog),
+      thinking: "low",
+      permissionMode: "allow_list" as const,
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    };
+
+    expect(reconcileNewThreadDraft(draft, refreshedCatalog, {
+      ...createNewThreadSetupEdits(),
+      thinking: true,
+      permission: true,
+    })).toMatchObject({
+      thinking: "low",
+      inheritedThinking: undefined,
+      permissionMode: "allow_list",
+      inheritedPermissionMode: undefined,
+    });
   });
 
   it("builds only existing protocol requests and an optional initial message", () => {
