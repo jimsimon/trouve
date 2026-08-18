@@ -7516,6 +7516,10 @@ fn no_candidate_review_summary(
     changed_file_count: usize,
     reused_hunk_count: usize,
 ) -> String {
+    if reused_hunk_count > 0 && reviewer_count == 0 {
+        return "All relevant hunks were reused from the prior review; no persona review was run."
+            .into();
+    }
     if reviewer_count == 0 {
         return format!(
             "No reviewer persona was selected for {changed_file_count} changed file(s); no persona review was run."
@@ -13058,6 +13062,18 @@ mod tests {
         assert_eq!(
             no_candidate_review_summary(3, 1, 0),
             "3 reviewer(s) examined 1 changed file(s); no actionable issues were confirmed."
+        );
+        assert_eq!(
+            no_candidate_review_summary(0, 0, 2),
+            "All relevant hunks were reused from the prior review; no persona review was run."
+        );
+        assert_eq!(
+            no_candidate_review_summary(0, 1, 0),
+            "No reviewer persona was selected for 1 changed file(s); no persona review was run."
+        );
+        assert_eq!(
+            no_candidate_review_summary(3, 1, 2),
+            "3 reviewer(s) examined 1 changed file(s) after reusing 2 unchanged hunk(s) from the prior review; no actionable issues were confirmed."
         );
     }
 
