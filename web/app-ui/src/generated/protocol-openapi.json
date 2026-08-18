@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "5.3"
+    "version": "7.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -1060,86 +1060,6 @@
         }
       }
     },
-    "/v1/code-review/reviewer": {
-      "put": {
-        "tags": [],
-        "operationId": "upsert_reviewer_profile",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpsertReviewerProfileRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReviewerProfile"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/code-review/reviewer/{id}": {
-      "delete": {
-        "tags": [],
-        "operationId": "delete_reviewer_profile",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Custom reviewer profile id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": ""
-          },
-          "400": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/code-review/stats": {
       "get": {
         "tags": [],
@@ -1302,6 +1222,37 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/SetDefaultPermissionModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/defaults": {
+      "put": {
+        "tags": [],
+        "operationId": "set_global_defaults",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGlobalDefaultsRequest"
               }
             }
           },
@@ -2080,38 +2031,6 @@
         }
       }
     },
-    "/v1/mode-infos": {
-      "get": {
-        "tags": [],
-        "operationId": "list_mode_infos",
-        "parameters": [
-          {
-            "name": "workspace_id",
-            "in": "query",
-            "description": "Include the workspace's .agents modes",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ModeInfo"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/models": {
       "get": {
         "tags": [],
@@ -2154,15 +2073,15 @@
         }
       }
     },
-    "/v1/modes": {
+    "/v1/persona-infos": {
       "get": {
         "tags": [],
-        "operationId": "list_modes",
+        "operationId": "list_persona_infos",
         "parameters": [
           {
             "name": "workspace_id",
             "in": "query",
-            "description": "Include the workspace's .agents modes",
+            "description": "Include personas from the workspace's .agents/personas configuration",
             "required": false,
             "schema": {
               "type": "string"
@@ -2177,7 +2096,7 @@
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/AgentMode"
+                    "$ref": "#/components/schemas/PersonaInfo"
                   }
                 }
               }
@@ -2186,10 +2105,42 @@
         }
       }
     },
-    "/v1/modes/{id}": {
+    "/v1/personas": {
+      "get": {
+        "tags": [],
+        "operationId": "list_personas",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Include personas from the workspace's .agents/personas configuration",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AgentPersona"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/personas/{id}": {
       "put": {
         "tags": [],
-        "operationId": "upsert_mode",
+        "operationId": "upsert_persona",
         "parameters": [
           {
             "name": "id",
@@ -2204,7 +2155,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/UpsertModeRequest"
+                "$ref": "#/components/schemas/UpsertPersonaRequest"
               }
             }
           },
@@ -2228,7 +2179,7 @@
       },
       "delete": {
         "tags": [],
-        "operationId": "delete_mode",
+        "operationId": "delete_persona",
         "parameters": [
           {
             "name": "id",
@@ -4949,9 +4900,9 @@
           }
         }
       },
-      "AgentMode": {
+      "AgentPersona": {
         "type": "object",
-        "description": "A data-driven agent mode: prompt + tool policy + model/permission defaults.\nAdding a mode is configuration, not code (AGENTS.md invariant 6).",
+        "description": "A data-driven agent persona: prompt + tool policy + model/permission defaults.\nAdding a persona is configuration, not code (AGENTS.md invariant 6).",
         "required": [
           "id",
           "display_name",
@@ -4963,14 +4914,14 @@
             "items": {
               "type": "string"
             },
-            "description": "Tool names this mode may use; empty means all registered tools."
+            "description": "Tool names this persona may use; empty means all registered tools."
           },
           "default_model": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Preferred model for threads started in this mode (\"provider/model\").\nNone falls back to the global default model."
+            "description": "Preferred model for threads started with this persona (\"provider/model\").\nNone falls back to the global default model."
           },
           "default_permission_mode": {
             "oneOf": [
@@ -4979,7 +4930,7 @@
               },
               {
                 "$ref": "#/components/schemas/PermissionMode",
-                "description": "Permission mode for threads started in this mode. None falls back to\nthe global default permission mode."
+                "description": "Permission policy for threads started with this persona. None falls back to\nthe global default permission mode."
               }
             ]
           },
@@ -4988,7 +4939,7 @@
               "string",
               "null"
             ],
-            "description": "Preferred thinking setting for threads started in this mode. The value\nis a model-advertised enum token (for example \"medium\" or \"high\") or\na decimal token budget for fixed-thinking models.\nNone falls back to the global default thinking level."
+            "description": "Preferred thinking setting for threads started with this persona. The value\nis a model-advertised enum token (for example \"medium\" or \"high\") or\na decimal token budget for fixed-thinking models.\nNone falls back to the global default thinking level."
           },
           "display_name": {
             "type": "string"
@@ -4999,7 +4950,7 @@
           },
           "read_only": {
             "type": "boolean",
-            "description": "When true the mode can never mutate the worktree regardless of the\nthread's permission mode (e.g. plan/question modes)."
+            "description": "When true the persona can never mutate the worktree regardless of the\nthread's permission policy (e.g. plan/question personas)."
           },
           "system_prompt": {
             "type": "string",
@@ -5067,7 +5018,7 @@
       },
       "Automation": {
         "type": "object",
-        "description": "A scheduled prompt. Each run creates a fresh session (worktree) in the\nworkspace, a thread with the configured mode/model, and sends the\nprompt — exactly as if the user had typed it.",
+        "description": "A scheduled prompt. Each run creates a fresh session (worktree) in the\nworkspace, a thread with the configured persona/model, and sends the\nprompt — exactly as if the user had typed it.",
         "required": [
           "id",
           "name",
@@ -5110,14 +5061,14 @@
               "string",
               "null"
             ],
-            "description": "Agent mode for the runs (None = the default mode)."
+            "description": "Agent persona for the runs (None = the default persona)."
           },
           "model": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Model for the runs (None = the mode's default)."
+            "description": "Model for the runs (None = the persona's default)."
           },
           "name": {
             "type": "string"
@@ -5144,7 +5095,7 @@
               "string",
               "null"
             ],
-            "description": "Thinking level for the runs (None = the selected model/mode/global\ndefault). The engine maps this canonical value to the model's\nadvertised option key when the turn starts."
+            "description": "Thinking level for the runs (None = the selected model/persona/global\ndefault). The engine maps this canonical value to the model's\nadvertised option key when the turn starts."
           },
           "workspace_id": {
             "$ref": "#/components/schemas/String"
@@ -5396,6 +5347,7 @@
           "line",
           "side",
           "severity",
+          "title",
           "body",
           "reason"
         ],
@@ -5405,6 +5357,10 @@
           },
           "candidate_id": {
             "type": "string"
+          },
+          "confidence": {
+            "type": "string",
+            "description": "Strength of the evidence for the candidate, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."
           },
           "line": {
             "type": "integer",
@@ -5431,6 +5387,10 @@
           },
           "task_id": {
             "type": "string"
+          },
+          "title": {
+            "type": "string",
+            "description": "Concise, generated one-line summary of the candidate issue."
           }
         }
       },
@@ -5513,12 +5473,17 @@
           "line",
           "side",
           "severity",
+          "title",
           "body",
           "status"
         ],
         "properties": {
           "body": {
             "type": "string"
+          },
+          "confidence": {
+            "type": "string",
+            "description": "Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."
           },
           "github_comment_id": {
             "type": [
@@ -5579,6 +5544,10 @@
           "status": {
             "type": "string",
             "description": "`open`, `fixed`, or `dismissed`."
+          },
+          "title": {
+            "type": "string",
+            "description": "Concise, generated one-line summary of the issue."
           }
         }
       },
@@ -5589,12 +5558,13 @@
           "pending",
           "published",
           "not_eligible",
+          "suppressed_by_policy",
           "failed"
         ]
       },
       "CodeReviewFindingSource": {
         "type": "object",
-        "description": "A persona/candidate that contributed to a confirmed published finding.",
+        "description": "A persona/candidate that contributed to a confirmed finding.",
         "required": [
           "reviewer_id",
           "reviewer_name",
@@ -6910,7 +6880,7 @@
               "string",
               "null"
             ],
-            "description": "Agent mode id (default: \"code\")."
+            "description": "Agent persona id (default: \"code\")."
           },
           "model": {
             "type": [
@@ -9219,23 +9189,6 @@
           }
         }
       },
-      "ModeInfo": {
-        "type": "object",
-        "description": "A mode plus where it came from, for the settings UI.",
-        "required": [
-          "mode",
-          "origin"
-        ],
-        "properties": {
-          "mode": {
-            "$ref": "#/components/schemas/AgentMode"
-          },
-          "origin": {
-            "type": "string",
-            "description": "\"builtin\" (untouched), \"customized\" (builtin with a user override\nfile), \"custom\" (user-added), or \"workspace\" (defined in the\nworkspace's .agents/modes — file-managed, read-only in settings)."
-          }
-        }
-      },
       "ModelInfo": {
         "type": "object",
         "description": "A model a configured provider can run, with enough metadata for clients\nto render selection and options UIs generically.",
@@ -9310,6 +9263,23 @@
           "allow_list",
           "yolo"
         ]
+      },
+      "PersonaInfo": {
+        "type": "object",
+        "description": "A persona plus where it came from, for the settings UI.",
+        "required": [
+          "persona",
+          "origin"
+        ],
+        "properties": {
+          "origin": {
+            "type": "string",
+            "description": "\"builtin\" (untouched), \"customized\" (builtin with a user override\nfile), \"custom\" (user-added), or \"workspace\" (defined in the\nworkspace's .agents/personas — file-managed, read-only in settings)."
+          },
+          "persona": {
+            "$ref": "#/components/schemas/AgentPersona"
+          }
+        }
       },
       "PrActionRequest": {
         "oneOf": [
@@ -11781,6 +11751,30 @@
           }
         }
       },
+      "SetGlobalDefaultsRequest": {
+        "type": "object",
+        "description": "Atomically replace the global defaults used by new threads\n(`PUT /v1/config/defaults`).",
+        "required": [
+          "model",
+          "permission_mode"
+        ],
+        "properties": {
+          "default_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Global thinking level for the selected model. None clears the default\nso the model chooses its own setting."
+          },
+          "model": {
+            "type": "string",
+            "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
+          }
+        }
+      },
       "SetLocalEnabledRequest": {
         "type": "object",
         "description": "Turn local models on or off (`PUT /v1/local/enabled`). Disabling stops\nthe llama-server sidecar and unregisters the \"local\" provider.",
@@ -13239,9 +13233,9 @@
           }
         }
       },
-      "UpsertModeRequest": {
+      "UpsertPersonaRequest": {
         "type": "object",
-        "description": "Create or update a user-level mode (`<config>/modes/<id>.toml`). Saving\nunder a built-in id customizes that built-in.",
+        "description": "Create or update a user-level persona (`<config>/personas/<id>.toml`). Saving\nunder a built-in id customizes that built-in.",
         "required": [
           "display_name",
           "system_prompt"
@@ -13350,40 +13344,6 @@
             "propertyNames": {
               "type": "string"
             }
-          }
-        }
-      },
-      "UpsertReviewerProfileRequest": {
-        "type": "object",
-        "description": "Create or update a reviewer profile. Omit `id` to create a custom profile;\nbuilt-in ids update only that persona's model and thinking defaults.\n\nThis request uses full-replace PUT semantics: omitted optional `model` or\n`default_thinking_level` values are cleared rather than merged with the\nexisting profile. Callers updating either field must resend both fields.",
-        "required": [
-          "name",
-          "prompt"
-        ],
-        "properties": {
-          "default_thinking_level": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "model": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "prompt": {
-            "type": "string"
           }
         }
       },

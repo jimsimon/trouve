@@ -218,13 +218,20 @@ export interface Finding {
   line: number;
   side: string;
   severity: string;
+  confidence?: string;
+  title: string;
   body: string;
   prompt_for_agents: string;
   status: string;
   sources: FindingSource[];
   github_comment_id?: number;
   github_comment_url: string;
-  github_publication_status: "pending" | "published" | "not_eligible" | "failed";
+  github_publication_status:
+    | "pending"
+    | "published"
+    | "not_eligible"
+    | "suppressed_by_policy"
+    | "failed";
   github_thread_id?: string;
   resolved_at?: string;
 }
@@ -238,6 +245,8 @@ export interface CandidateRejection {
   line: number;
   side: string;
   severity: string;
+  confidence?: string;
+  title: string;
   body: string;
   reason: string;
 }
@@ -384,7 +393,7 @@ export interface Model {
   options_schema?: unknown;
 }
 
-export interface AgentMode {
+export interface AgentPersona {
   id: string;
   display_name: string;
   system_prompt: string;
@@ -395,8 +404,8 @@ export interface AgentMode {
   default_thinking_level?: string;
 }
 
-export interface ModeInfo {
-  mode: AgentMode;
+export interface PersonaInfo {
+  persona: AgentPersona;
   origin: "builtin" | "customized" | "custom" | "workspace";
 }
 

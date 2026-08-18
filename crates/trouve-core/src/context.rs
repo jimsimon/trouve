@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use trouve_protocol::AgentMode;
+use trouve_protocol::AgentPersona;
 
 const BASE_PROMPT: &str = "You are trouve, an AI coding agent operating inside a dedicated git \
 worktree for this session. You interact with the workspace exclusively through the provided \
@@ -27,7 +27,11 @@ fn read_if_exists(path: &Path) -> Option<String> {
 }
 
 /// Assemble the full system prompt for a thread.
-pub fn system_prompt(mode: &AgentMode, config_dir: Option<&Path>, workspace_root: &Path) -> String {
+pub fn system_prompt(
+    mode: &AgentPersona,
+    config_dir: Option<&Path>,
+    workspace_root: &Path,
+) -> String {
     let mut sections = vec![BASE_PROMPT.to_string(), mode.system_prompt.clone()];
 
     if let Some(dir) = config_dir
@@ -59,7 +63,7 @@ pub fn system_prompt(mode: &AgentMode, config_dir: Option<&Path>, workspace_root
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modes::builtin_modes;
+    use crate::personas::builtin_personas;
 
     #[test]
     fn layers_are_ordered_and_optional() {
@@ -72,7 +76,7 @@ mod tests {
         std::fs::write(repo.join("AGENTS.md"), "REPO RULES").unwrap();
         std::fs::write(repo.join(".agents/AGENTS.md"), "DOTAGENTS RULES").unwrap();
 
-        let modes = builtin_modes();
+        let modes = builtin_personas();
         let prompt = system_prompt(&modes[0], Some(&cfg), &repo);
         let g = prompt.find("GLOBAL RULES").unwrap();
         let r = prompt.find("REPO RULES").unwrap();

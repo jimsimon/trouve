@@ -383,38 +383,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/code-review/reviewer": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put: operations["upsert_reviewer_profile"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/code-review/reviewer/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        delete: operations["delete_reviewer_profile"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/code-review/stats": {
         parameters: {
             query?: never;
@@ -472,6 +440,22 @@ export interface paths {
         };
         get?: never;
         put: operations["set_default_permission_mode"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/config/defaults": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_global_defaults"];
         post?: never;
         delete?: never;
         options?: never;
@@ -798,22 +782,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/mode-infos": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_mode_infos"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/models": {
         parameters: {
             query?: never;
@@ -846,14 +814,14 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/modes": {
+    "/v1/persona-infos": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["list_modes"];
+        get: operations["list_persona_infos"];
         put?: never;
         post?: never;
         delete?: never;
@@ -862,7 +830,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/modes/{id}": {
+    "/v1/personas": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_personas"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/personas/{id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -870,9 +854,9 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put: operations["upsert_mode"];
+        put: operations["upsert_persona"];
         post?: never;
-        delete: operations["delete_mode"];
+        delete: operations["delete_persona"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1734,20 +1718,20 @@ export interface components {
             repo: string;
         };
         /**
-         * @description A data-driven agent mode: prompt + tool policy + model/permission defaults.
-         *     Adding a mode is configuration, not code (AGENTS.md invariant 6).
+         * @description A data-driven agent persona: prompt + tool policy + model/permission defaults.
+         *     Adding a persona is configuration, not code (AGENTS.md invariant 6).
          */
-        AgentMode: {
-            /** @description Tool names this mode may use; empty means all registered tools. */
+        AgentPersona: {
+            /** @description Tool names this persona may use; empty means all registered tools. */
             allowed_tools?: string[];
             /**
-             * @description Preferred model for threads started in this mode ("provider/model").
+             * @description Preferred model for threads started with this persona ("provider/model").
              *     None falls back to the global default model.
              */
             default_model?: string | null;
             default_permission_mode?: null | components["schemas"]["PermissionMode"];
             /**
-             * @description Preferred thinking setting for threads started in this mode. The value
+             * @description Preferred thinking setting for threads started with this persona. The value
              *     is a model-advertised enum token (for example "medium" or "high") or
              *     a decimal token budget for fixed-thinking models.
              *     None falls back to the global default thinking level.
@@ -1757,8 +1741,8 @@ export interface components {
             /** @description Stable identifier, e.g. "code", "plan", "review". */
             id: string;
             /**
-             * @description When true the mode can never mutate the worktree regardless of the
-             *     thread's permission mode (e.g. plan/question modes).
+             * @description When true the persona can never mutate the worktree regardless of the
+             *     thread's permission policy (e.g. plan/question personas).
              */
             read_only?: boolean;
             /** @description Appended to the base system prompt. */
@@ -1797,7 +1781,7 @@ export interface components {
         };
         /**
          * @description A scheduled prompt. Each run creates a fresh session (worktree) in the
-         *     workspace, a thread with the configured mode/model, and sends the
+         *     workspace, a thread with the configured persona/model, and sends the
          *     prompt — exactly as if the user had typed it.
          */
         Automation: {
@@ -1810,9 +1794,9 @@ export interface components {
             last_run_at?: string | null;
             /** @description Session created by the last run. */
             last_session_id?: string | null;
-            /** @description Agent mode for the runs (None = the default mode). */
+            /** @description Agent persona for the runs (None = the default persona). */
             mode?: string | null;
-            /** @description Model for the runs (None = the mode's default). */
+            /** @description Model for the runs (None = the persona's default). */
             model?: string | null;
             name: string;
             /** @description Next fire time (RFC3339), when enabled. */
@@ -1825,7 +1809,7 @@ export interface components {
             prompt: string;
             schedule: components["schemas"]["AutomationSchedule"];
             /**
-             * @description Thinking level for the runs (None = the selected model/mode/global
+             * @description Thinking level for the runs (None = the selected model/persona/global
              *     default). The engine maps this canonical value to the model's
              *     advertised option key when the turn starts.
              */
@@ -1927,6 +1911,11 @@ export interface components {
         CodeReviewCandidateRejection: {
             body: string;
             candidate_id: string;
+            /**
+             * @description Strength of the evidence for the candidate, independently of impact.
+             *     `high`, `medium`, or `low`; legacy records default to `medium`.
+             */
+            confidence?: string;
             /** Format: int64 */
             line: number;
             path: string;
@@ -1936,6 +1925,8 @@ export interface components {
             severity: string;
             side: string;
             task_id: string;
+            /** @description Concise, generated one-line summary of the candidate issue. */
+            title: string;
         };
         CodeReviewDashboard: {
             app: components["schemas"]["GithubAppStatus"];
@@ -1961,6 +1952,11 @@ export interface components {
          */
         CodeReviewFinding: {
             body: string;
+            /**
+             * @description Strength of the evidence for the issue, independently of impact.
+             *     `high`, `medium`, or `low`; legacy records default to `medium`.
+             */
+            confidence?: string;
             /** Format: int64 */
             github_comment_id?: number | null;
             github_comment_url?: string;
@@ -1979,13 +1975,15 @@ export interface components {
             sources?: components["schemas"]["CodeReviewFindingSource"][];
             /** @description `open`, `fixed`, or `dismissed`. */
             status: string;
+            /** @description Concise, generated one-line summary of the issue. */
+            title: string;
         };
         /**
          * @description The outcome of attempting to publish a finding as an inline GitHub comment.
          * @enum {string}
          */
-        CodeReviewFindingPublicationStatus: "pending" | "published" | "not_eligible" | "failed";
-        /** @description A persona/candidate that contributed to a confirmed published finding. */
+        CodeReviewFindingPublicationStatus: "pending" | "published" | "not_eligible" | "suppressed_by_policy" | "failed";
+        /** @description A persona/candidate that contributed to a confirmed finding. */
         CodeReviewFindingSource: {
             candidate_id: string;
             reviewer_id: string;
@@ -2501,7 +2499,7 @@ export interface components {
             workspace_id: components["schemas"]["String"];
         };
         CreateThreadRequest: {
-            /** @description Agent mode id (default: "code"). */
+            /** @description Agent persona id (default: "code"). */
             mode?: string | null;
             /** @description Provider/model identifier, e.g. "openai/gpt-4.1". */
             model?: string | null;
@@ -3250,16 +3248,6 @@ export interface components {
             /** @description merge / squash / rebase (default: merge) */
             method?: string | null;
         };
-        /** @description A mode plus where it came from, for the settings UI. */
-        ModeInfo: {
-            mode: components["schemas"]["AgentMode"];
-            /**
-             * @description "builtin" (untouched), "customized" (builtin with a user override
-             *     file), "custom" (user-added), or "workspace" (defined in the
-             *     workspace's .agents/modes — file-managed, read-only in settings).
-             */
-            origin: string;
-        };
         /**
          * @description A model a configured provider can run, with enough metadata for clients
          *     to render selection and options UIs generically.
@@ -3300,6 +3288,16 @@ export interface components {
          * @enum {string}
          */
         PermissionMode: "ask" | "allow_list" | "yolo";
+        /** @description A persona plus where it came from, for the settings UI. */
+        PersonaInfo: {
+            /**
+             * @description "builtin" (untouched), "customized" (builtin with a user override
+             *     file), "custom" (user-added), or "workspace" (defined in the
+             *     workspace's .agents/personas — file-managed, read-only in settings).
+             */
+            origin: string;
+            persona: components["schemas"]["AgentPersona"];
+        };
         /**
          * @description Typed PR-page actions. The server resolves every opaque target against the
          *     selected session PR before contacting GitHub; OAuth tokens and arbitrary
@@ -4136,6 +4134,20 @@ export interface components {
             title_model_resource_policy?: components["schemas"]["TitleModelResourcePolicy"];
         };
         /**
+         * @description Atomically replace the global defaults used by new threads
+         *     (`PUT /v1/config/defaults`).
+         */
+        SetGlobalDefaultsRequest: {
+            /**
+             * @description Global thinking level for the selected model. None clears the default
+             *     so the model chooses its own setting.
+             */
+            default_thinking_level?: string | null;
+            /** @description Provider-qualified id, e.g. "openai/gpt-4.1-mini". */
+            model: string;
+            permission_mode: components["schemas"]["PermissionMode"];
+        };
+        /**
          * @description Turn local models on or off (`PUT /v1/local/enabled`). Disabling stops
          *     the llama-server sidecar and unregisters the "local" provider.
          */
@@ -4652,10 +4664,10 @@ export interface components {
             workspace_id?: string | null;
         };
         /**
-         * @description Create or update a user-level mode (`<config>/modes/<id>.toml`). Saving
+         * @description Create or update a user-level persona (`<config>/personas/<id>.toml`). Saving
          *     under a built-in id customizes that built-in.
          */
-        UpsertModeRequest: {
+        UpsertPersonaRequest: {
             allowed_tools?: string[];
             default_model?: string | null;
             default_permission_mode?: null | components["schemas"]["PermissionMode"];
@@ -4704,21 +4716,6 @@ export interface components {
             settings?: {
                 [key: string]: string;
             };
-        };
-        /**
-         * @description Create or update a reviewer profile. Omit `id` to create a custom profile;
-         *     built-in ids update only that persona's model and thinking defaults.
-         *
-         *     This request uses full-replace PUT semantics: omitted optional `model` or
-         *     `default_thinking_level` values are cleared rather than merged with the
-         *     existing profile. Callers updating either field must resend both fields.
-         */
-        UpsertReviewerProfileRequest: {
-            default_thinking_level?: string | null;
-            id?: string | null;
-            model?: string | null;
-            name: string;
-            prompt: string;
         };
         /** @description Token/cost usage for a turn. */
         Usage: {
@@ -5616,73 +5613,6 @@ export interface operations {
             };
         };
     };
-    upsert_reviewer_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpsertReviewerProfileRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ReviewerProfile"];
-                };
-            };
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    delete_reviewer_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Custom reviewer profile id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     code_review_stats: {
         parameters: {
             query?: {
@@ -5808,6 +5738,35 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["SetDefaultPermissionModeRequest"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_global_defaults: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetGlobalDefaultsRequest"];
             };
         };
         responses: {
@@ -6465,28 +6424,6 @@ export interface operations {
             };
         };
     };
-    list_mode_infos: {
-        parameters: {
-            query?: {
-                /** @description Include the workspace's .agents modes */
-                workspace_id?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ModeInfo"][];
-                };
-            };
-        };
-    };
     list_models: {
         parameters: {
             query?: never;
@@ -6525,10 +6462,10 @@ export interface operations {
             };
         };
     };
-    list_modes: {
+    list_persona_infos: {
         parameters: {
             query?: {
-                /** @description Include the workspace's .agents modes */
+                /** @description Include personas from the workspace's .agents/personas configuration */
                 workspace_id?: string;
             };
             header?: never;
@@ -6542,12 +6479,34 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AgentMode"][];
+                    "application/json": components["schemas"]["PersonaInfo"][];
                 };
             };
         };
     };
-    upsert_mode: {
+    list_personas: {
+        parameters: {
+            query?: {
+                /** @description Include personas from the workspace's .agents/personas configuration */
+                workspace_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentPersona"][];
+                };
+            };
+        };
+    };
+    upsert_persona: {
         parameters: {
             query?: never;
             header?: never;
@@ -6558,7 +6517,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["UpsertModeRequest"];
+                "application/json": components["schemas"]["UpsertPersonaRequest"];
             };
         };
         responses: {
@@ -6578,7 +6537,7 @@ export interface operations {
             };
         };
     };
-    delete_mode: {
+    delete_persona: {
         parameters: {
             query?: never;
             header?: never;

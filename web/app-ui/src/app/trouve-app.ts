@@ -92,7 +92,7 @@ import {
 } from "../services/session-notifications.js";
 import {
   ProtocolClient,
-  type ProtocolAgentMode,
+  type ProtocolAgentPersona,
   type ProtocolEventEnvelope,
   type ProtocolGeneratedSessionTitle,
   type ProtocolModelInfo,
@@ -382,7 +382,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionBranchesPending = false;
   #newSessionBranchError = "";
   #newSessionBranchGeneration = 0;
-  #newSessionModes: readonly ProtocolAgentMode[] = [];
+  #newSessionModes: readonly ProtocolAgentPersona[] = [];
   #newSessionModels: readonly ProtocolModelInfo[] = [];
   #newSessionProviders: ProtocolProvidersResponse | undefined;
   #newSessionSubscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
@@ -1674,7 +1674,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     );
     try {
       const [modes, models, providers] = await Promise.all([
-        this.#protocolClient.modes(workspaceId),
+        this.#protocolClient.personas(workspaceId),
         this.#modelCatalog.refresh("if-stale"),
         this.#protocolClient.providers(),
       ]);
@@ -1690,7 +1690,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     } catch {
       if (generation !== this.#newSessionOptionsGeneration) return;
       this.#newSessionOptionsError =
-        "Mode and model choices could not be loaded. Server defaults will be used.";
+        "Persona and model choices could not be loaded. Server defaults will be used.";
     } finally {
       if (generation === this.#newSessionOptionsGeneration) {
         this.#newSessionOptionsPending = false;
@@ -2844,7 +2844,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             </label>
             <div class="dialog-option-grid">
               <label class="new-session-mode">
-                <span>Agent mode</span>
+                <span>Agent persona</span>
                 <select
                   name="mode"
                   .value=${this.#newSessionModeId}

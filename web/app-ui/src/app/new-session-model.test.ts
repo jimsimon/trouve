@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
@@ -29,9 +29,9 @@ const model = (
   options_schema: optionsSchema,
 });
 
-const mode = (defaultModel?: string | null): ProtocolAgentMode => ({
+const mode = (defaultModel?: string | null): ProtocolAgentPersona => ({
   id: "code",
-  display_name: "Code",
+  display_name: "Engineer",
   system_prompt: "Write code.",
   ...(defaultModel === undefined ? {} : { default_model: defaultModel }),
 });
@@ -136,7 +136,7 @@ describe("new session model", () => {
   });
 
   it("resolves concrete mode, model, thinking, and permission defaults", () => {
-    const codeMode: ProtocolAgentMode = {
+    const codeMode: ProtocolAgentPersona = {
       ...mode(),
       default_permission_mode: "allow_list",
       default_thinking_level: "high",

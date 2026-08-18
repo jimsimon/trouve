@@ -127,29 +127,29 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
         providers: [],
       },
       "GET /v1/models": [],
-      "GET /v1/mode-infos": [
+      "GET /v1/persona-infos": [
         {
           origin: "builtin",
-          mode: {
+          persona: {
             id: "code",
-            display_name: "Code",
+            display_name: "Engineer",
             system_prompt: "Implement the user's request by editing files.",
           },
         },
         {
           origin: "builtin",
-          mode: {
+          persona: {
             id: "plan",
-            display_name: "Plan",
+            display_name: "Planner",
             system_prompt: "Explore the workspace and produce a concrete plan.",
             read_only: true,
           },
         },
         {
           origin: "builtin",
-          mode: {
+          persona: {
             id: "review",
-            display_name: "Review",
+            display_name: "Reviewer",
             system_prompt: "Review the current changes for correctness.",
             read_only: true,
           },
@@ -535,122 +535,25 @@ test("Settings reopens the last screen until the app restarts", async ({ page })
   await expect(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
 });
 
-test("Modes & Models saves global defaults on change and keeps mode editing focused", async ({ page }) => {
-  let providers = {
-    default_model: "codex/gpt-5.6-sol",
-    default_permission_mode: "ask",
-    default_thinking_level: "medium" as string | null,
-    providers: [],
-  };
-  const modelDefaults: Array<Record<string, unknown>> = [];
-  const permissionDefaults: Array<Record<string, unknown>> = [];
-  let failProviderRefresh = false;
-  await page.route("**/v1/providers", async (route) => {
-    if (failProviderRefresh) {
-      await route.fulfill({
-        status: 503,
-        json: { code: "unavailable", message: "Provider refresh failed" },
-      });
-      return;
-    }
-    await route.fulfill({ json: providers });
-  });
+test("Personas & Models uses provider-qualified model labels", async ({ page }) => {
   await page.route("**/v1/models", async (route) => {
     await route.fulfill({
-      json: [
-        {
-          id: "codex/gpt-5.6-sol",
-          display_name: "GPT-5.6 Sol",
-          context_window: 500_000,
-          supports_tools: true,
-          options_schema: {
-            type: "object",
-            properties: {
-              reasoning_effort: {
-                type: "string",
-                enum: ["low", "medium", "high"],
-                default: "medium",
-              },
-            },
-          },
-        },
-        {
-          id: "codex/gpt-5.6-terra",
-          display_name: "GPT-5.6 Terra",
-          context_window: 250_000,
-          supports_tools: true,
-          options_schema: {},
-        },
-      ],
+      json: [{
+        id: "codex/gpt-5.6-sol",
+        display_name: "GPT-5.6 Sol",
+        context_window: 500_000,
+        supports_tools: true,
+        options_schema: {},
+      }],
     });
   });
-  await page.route("**/v1/config/default-model", async (route) => {
-    const request = route.request().postDataJSON() as Record<string, unknown>;
-    modelDefaults.push(request);
-    providers = { ...providers, default_model: String(request["model"]) };
-    if ("default_thinking_level" in request) {
-      providers = {
-        ...providers,
-        default_thinking_level: typeof request["default_thinking_level"] === "string"
-          ? request["default_thinking_level"]
-          : null,
-      };
-    }
-    await route.fulfill({ status: 204 });
-  });
-  await page.route("**/v1/config/default-permission-mode", async (route) => {
-    const request = route.request().postDataJSON() as Record<string, unknown>;
-    permissionDefaults.push(request);
-    providers = {
-      ...providers,
-      default_permission_mode: String(request["permission_mode"]),
-    };
-    await route.fulfill({ status: 204 });
-  });
-  await page.goto("/settings/modes");
+  await page.goto("/settings/personas");
 
-  await expect(page.getByRole("heading", { name: "Modes & Models", exact: true }))
+  await expect(page.getByRole("heading", { name: "Personas & Models", exact: true }))
     .toBeVisible();
   await expect(page.getByRole("option", { name: "codex/gpt-5.6-sol", exact: true }))
     .toHaveCount(4);
   await expect(page.getByRole("option", { name: "GPT-5.6 Sol", exact: true }))
-    .toHaveCount(0);
-  await expect(page.getByLabel("Global Default Thinking"))
-    .toHaveValue("medium");
-  await expect(page.getByText("Implement the user's request by editing files.", { exact: true }))
-    .toHaveCount(0);
-
-  await page.getByLabel("Global Default Thinking").selectOption("high");
-  await expect.poll(() => modelDefaults).toEqual([{
-    model: "codex/gpt-5.6-sol",
-    default_thinking_level: "high",
-  }]);
-  await page.getByLabel("Global Default Model").selectOption("codex/gpt-5.6-terra");
-  await expect.poll(() => modelDefaults).toEqual([{
-    model: "codex/gpt-5.6-sol",
-    default_thinking_level: "high",
-  }, {
-    model: "codex/gpt-5.6-terra",
-  }]);
-  await expect(page.getByLabel("Global Default Thinking")).toBeDisabled();
-  await page.getByLabel("Global Default Permissions").selectOption("yolo");
-  await expect.poll(() => permissionDefaults).toEqual([{ permission_mode: "yolo" }]);
-
-  await page.getByRole("button", { name: "Edit Code", exact: true }).click();
-  const editor = page.locator("form.mode-editor");
-  await expect(editor.getByText("Default model", { exact: true })).toHaveCount(0);
-  await expect(editor.getByText("Default permissions", { exact: true })).toHaveCount(0);
-
-  failProviderRefresh = true;
-  await page.getByLabel("Global Default Model").selectOption("codex/gpt-5.6-sol");
-  await expect(page.getByText("Modes and model defaults could not be loaded.", { exact: true }))
-    .toBeVisible();
-  await expect(page.getByText("Model defaults saved for new threads.", { exact: true }))
-    .toHaveCount(0);
-  await page.getByLabel("Global Default Permissions").selectOption("ask");
-  await expect(page.getByText("Modes and model defaults could not be loaded.", { exact: true }))
-    .toBeVisible();
-  await expect(page.getByText("Permission default saved for new threads.", { exact: true }))
     .toHaveCount(0);
 });
 
@@ -750,7 +653,7 @@ test("management screens retain their reviewed desktop geometry", async ({ page 
 
   for (const screen of [
     { path: "/settings/general", heading: "General", snapshot: "settings-general.png" },
-    { path: "/settings/modes", heading: "Modes & Models", snapshot: "settings-modes-models.png" },
+    { path: "/settings/personas", heading: "Personas & Models", snapshot: "settings-personas-models.png" },
     { path: "/automations", heading: "Automations", snapshot: "automations-empty.png" },
   ]) {
     await page.goto(screen.path);

@@ -349,7 +349,7 @@ describe("ProtocolClient", () => {
   it("loads workspace modes/models and validates a confirmed thread update", async () => {
     const mode = {
       id: "code",
-      display_name: "Code",
+      display_name: "Engineer",
       system_prompt: "Implement the requested change.",
     };
     const model = {
@@ -371,7 +371,7 @@ describe("ProtocolClient", () => {
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
       requests.push(request);
-      if (request.url.includes("/v1/modes")) return Response.json([mode]);
+      if (request.url.includes("/v1/personas")) return Response.json([mode]);
       if (request.url.endsWith("/v1/models/refresh")) return Response.json([model]);
       if (request.url.endsWith("/v1/models")) return Response.json([model]);
       return Response.json(thread);
@@ -381,7 +381,7 @@ describe("ProtocolClient", () => {
       mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
     });
 
-    await expect(client.modes("ws_1")).resolves.toEqual([mode]);
+    await expect(client.personas("ws_1")).resolves.toEqual([mode]);
     await expect(client.models()).resolves.toEqual([model]);
     await expect(client.refreshModels()).resolves.toEqual([model]);
     await expect(
@@ -975,32 +975,55 @@ describe("ProtocolClient", () => {
       private_key_pem: "write-only-private-key",
       webhook_secret: "write-only-webhook-secret",
     })).resolves.toEqual({ configured: true, app_id: 1234 });
-    await expect(client.upsertCodeReviewReviewer({
-      name: reviewer.name,
-      prompt: reviewer.prompt,
-    })).resolves.toEqual(reviewer);
     await expect(client.updateCodeReviewRepository({
       repository: repository.repository,
       installation_id: repository.installation_id,
       mode: "automatic",
       reviewer_ids: [reviewer.id],
     })).resolves.toEqual(repository);
-    await expect(client.deleteCodeReviewReviewer(reviewer.id)).resolves.toBeUndefined();
 
     expect(requests.every((request) =>
       request.headers.get("x-trouve-host-csrf") === "ephemeral-token"
     )).toBe(true);
-    expect(requests[3]?.url).toContain("security%2Freviewer");
+  });
+
+  it("sends global defaults in one replacement request", async () => {
+    const requests: Request[] = [];
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      requests.push(input instanceof Request ? input : new Request(input, init));
+      return new Response(null, { status: 204 });
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: fakeFetch,
+      mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
+    });
+
+    await client.setGlobalDefaults({
+      model: "openai/gpt-5.6",
+      default_thinking_level: null,
+      permission_mode: "allow_list",
+    });
+
+    expect(requests).toHaveLength(1);
+    const request = requests[0];
+    if (request === undefined) throw new Error("global defaults request was not sent");
+    expect(request.url).toBe("http://127.0.0.1:43127/v1/config/defaults");
+    expect(request.method).toBe("PUT");
+    await expect(request.clone().json()).resolves.toEqual({
+      model: "openai/gpt-5.6",
+      default_thinking_level: null,
+      permission_mode: "allow_list",
+    });
   });
 });
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("5.3")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.1")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["3.36", "4.0", "5.1", "5.2", "5.4", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.2", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

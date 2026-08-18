@@ -3,7 +3,6 @@ import type {
   ProtocolGithubAppStatus,
   ProtocolReviewerProfile,
   ProtocolUpdateCodeReviewRepositoryRequest,
-  ProtocolUpsertReviewerProfileRequest,
 } from "../services/protocol-client.js";
 
 export type CodeReviewMode = "off" | "manual" | "automatic";
@@ -130,28 +129,6 @@ export const reviewerDraft = (profile?: ProtocolReviewerProfile): ReviewerDraft 
   model: profile?.model ?? "",
   thinkingLevel: profile?.default_thinking_level ?? "",
 });
-
-/** Reviewer writes also use replacement semantics. Built-in identity and
- * persona text are immutable in this UI, while their model defaults remain
- * editable. Both optional defaults are sent explicitly, including null when
- * the user chooses inheritance. */
-export const reviewerUpsertRequest = (
-  existing: ProtocolReviewerProfile | undefined,
-  draft: ReviewerDraft,
-): ProtocolUpsertReviewerProfileRequest => {
-  const name = existing?.built_in === true ? existing.name : draft.name.trim();
-  const prompt = existing?.built_in === true ? existing.prompt : draft.prompt;
-  if (name === "") throw new Error("reviewer name required");
-  if (prompt.trim() === "") throw new Error("reviewer prompt required");
-
-  return {
-    ...(existing === undefined ? {} : { id: existing.id }),
-    name,
-    prompt,
-    model: optionalValue(draft.model),
-    default_thinking_level: optionalValue(draft.thinkingLevel),
-  };
-};
 
 export const repositoryKey = (
   repository: Pick<ProtocolCodeReviewRepository, "installation_id" | "repository">,

@@ -18,31 +18,31 @@ pub enum PermissionMode {
     Yolo,
 }
 
-/// A data-driven agent mode: prompt + tool policy + model/permission defaults.
-/// Adding a mode is configuration, not code (AGENTS.md invariant 6).
+/// A data-driven agent persona: prompt + tool policy + model/permission defaults.
+/// Adding a persona is configuration, not code (AGENTS.md invariant 6).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AgentMode {
+pub struct AgentPersona {
     /// Stable identifier, e.g. "code", "plan", "review".
     pub id: String,
     pub display_name: String,
     /// Appended to the base system prompt.
     pub system_prompt: String,
-    /// Tool names this mode may use; empty means all registered tools.
+    /// Tool names this persona may use; empty means all registered tools.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
-    /// When true the mode can never mutate the worktree regardless of the
-    /// thread's permission mode (e.g. plan/question modes).
+    /// When true the persona can never mutate the worktree regardless of the
+    /// thread's permission policy (e.g. plan/question personas).
     #[serde(default)]
     pub read_only: bool,
-    /// Permission mode for threads started in this mode. None falls back to
+    /// Permission policy for threads started with this persona. None falls back to
     /// the global default permission mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_permission_mode: Option<PermissionMode>,
-    /// Preferred model for threads started in this mode ("provider/model").
+    /// Preferred model for threads started with this persona ("provider/model").
     /// None falls back to the global default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
-    /// Preferred thinking setting for threads started in this mode. The value
+    /// Preferred thinking setting for threads started with this persona. The value
     /// is a model-advertised enum token (for example "medium" or "high") or
     /// a decimal token budget for fixed-thinking models.
     /// None falls back to the global default thinking level.
@@ -50,20 +50,20 @@ pub struct AgentMode {
     pub default_thinking_level: Option<String>,
 }
 
-/// A mode plus where it came from, for the settings UI.
+/// A persona plus where it came from, for the settings UI.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ModeInfo {
-    pub mode: AgentMode,
+pub struct PersonaInfo {
+    pub persona: AgentPersona,
     /// "builtin" (untouched), "customized" (builtin with a user override
     /// file), "custom" (user-added), or "workspace" (defined in the
-    /// workspace's .agents/modes — file-managed, read-only in settings).
+    /// workspace's .agents/personas — file-managed, read-only in settings).
     pub origin: String,
 }
 
-/// Create or update a user-level mode (`<config>/modes/<id>.toml`). Saving
+/// Create or update a user-level persona (`<config>/personas/<id>.toml`). Saving
 /// under a built-in id customizes that built-in.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpsertModeRequest {
+pub struct UpsertPersonaRequest {
     pub display_name: String,
     pub system_prompt: String,
     #[serde(default)]
@@ -273,7 +273,7 @@ pub struct CreateThreadRequest {
     /// Concise user-visible title for navigation surfaces.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Agent mode id (default: "code").
+    /// Agent persona id (default: "code").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Provider/model identifier, e.g. "openai/gpt-4.1".
@@ -1671,24 +1671,6 @@ pub struct ReviewerProfile {
     pub built_in: bool,
 }
 
-/// Create or update a reviewer profile. Omit `id` to create a custom profile;
-/// built-in ids update only that persona's model and thinking defaults.
-///
-/// This request uses full-replace PUT semantics: omitted optional `model` or
-/// `default_thinking_level` values are cleared rather than merged with the
-/// existing profile. Callers updating either field must resend both fields.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpsertReviewerProfileRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    pub name: String,
-    pub prompt: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_thinking_level: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewerPromptMode {
@@ -2024,7 +2006,7 @@ pub struct CodeReviewPersonaResult {
     pub elapsed_ms: u64,
 }
 
-/// A persona/candidate that contributed to a confirmed published finding.
+/// A persona/candidate that contributed to a confirmed finding.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewFindingSource {
     pub reviewer_id: String,
@@ -2045,6 +2027,12 @@ pub struct CodeReviewCandidateRejection {
     pub line: u64,
     pub side: String,
     pub severity: String,
+    /// Strength of the evidence for the candidate, independently of impact.
+    /// `high`, `medium`, or `low`; legacy records default to `medium`.
+    #[serde(default = "default_code_review_confidence")]
+    pub confidence: String,
+    /// Concise, generated one-line summary of the candidate issue.
+    pub title: String,
     pub body: String,
     pub reason: String,
 }
@@ -2060,6 +2048,9 @@ pub enum CodeReviewFindingPublicationStatus {
     Published,
     /// The finding had no valid path/line pair for an inline comment.
     NotEligible,
+    /// The finding was retained internally but did not meet the automatic
+    /// publication threshold for its severity and confidence.
+    SuppressedByPolicy,
     /// GitHub did not publish the inline comment.
     Failed,
 }
@@ -2074,6 +2065,12 @@ pub struct CodeReviewFinding {
     pub line: u64,
     pub side: String,
     pub severity: String,
+    /// Strength of the evidence for the issue, independently of impact.
+    /// `high`, `medium`, or `low`; legacy records default to `medium`.
+    #[serde(default = "default_code_review_confidence")]
+    pub confidence: String,
+    /// Concise, generated one-line summary of the issue.
+    pub title: String,
     pub body: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt_for_agents: String,
@@ -2091,6 +2088,10 @@ pub struct CodeReviewFinding {
     pub github_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn default_code_review_confidence() -> String {
+    "medium".into()
 }
 
 /// A durable execution of one model review against one immutable PR head.
@@ -2513,6 +2514,19 @@ pub struct SetDefaultModelRequest {
     pub default_thinking_level: Option<String>,
 }
 
+/// Atomically replace the global defaults used by new threads
+/// (`PUT /v1/config/defaults`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetGlobalDefaultsRequest {
+    /// Provider-qualified id, e.g. "openai/gpt-4.1-mini".
+    pub model: String,
+    /// Global thinking level for the selected model. None clears the default
+    /// so the model chooses its own setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
+    pub permission_mode: PermissionMode,
+}
+
 /// Set the global default permission mode
 /// (`PUT /v1/config/default-permission-mode`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2787,7 +2801,7 @@ pub struct AutomationSchedule {
 }
 
 /// A scheduled prompt. Each run creates a fresh session (worktree) in the
-/// workspace, a thread with the configured mode/model, and sends the
+/// workspace, a thread with the configured persona/model, and sends the
 /// prompt — exactly as if the user had typed it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Automation {
@@ -2795,13 +2809,13 @@ pub struct Automation {
     pub name: String,
     pub prompt: String,
     pub workspace_id: WorkspaceId,
-    /// Agent mode for the runs (None = the default mode).
+    /// Agent persona for the runs (None = the default persona).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// Model for the runs (None = the mode's default).
+    /// Model for the runs (None = the persona's default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Thinking level for the runs (None = the selected model/mode/global
+    /// Thinking level for the runs (None = the selected model/persona/global
     /// default). The engine maps this canonical value to the model's
     /// advertised option key when the turn starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -11,7 +11,7 @@ describe("new thread setup component contract", () => {
   it("is a standalone context consumer with no protocol mutations", () => {
     expect(component).toContain("new ContextConsumer");
     expect(component).toContain("context: appServicesContext");
-    expect(component).toContain("services.protocol.modes(workspaceId)");
+    expect(component).toContain("services.protocol.personas(workspaceId)");
     expect(component).toContain('services.modelCatalog.refresh("if-stale")');
     expect(component).toContain("services.protocol.providers()");
     expect(component).not.toContain("services.protocol.createThread(");

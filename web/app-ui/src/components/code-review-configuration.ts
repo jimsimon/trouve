@@ -16,13 +16,10 @@ import {
   repositoryDraft,
   repositoryKey,
   repositoryUpdateRequest,
-  reviewerDraft,
-  reviewerUpsertRequest,
   sanitizeGithubAppStatus,
   type CodeReviewMode,
   type CodeReviewRoutingMode,
   type RepositoryDraft,
-  type ReviewerDraft,
   type ReviewerOverrideDraft,
   type ReviewerPromptMode,
 } from "./code-review-configuration-model.js";
@@ -203,20 +200,6 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
       border-radius: var(--trouve-radius-sm);
       background: var(--trouve-inset-bg);
     }
-    .persona-copy { display: grid; gap: 5px; }
-    .persona-copy p { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .confirm {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 7px;
-      padding: 9px;
-      border: 1px solid var(--trouve-err);
-      border-radius: var(--trouve-radius-sm);
-      background: var(--trouve-panel-bg);
-    }
-    .confirm span { flex: 1 1 220px; color: var(--trouve-text-hi); }
     .empty { padding: 9px 0; color: var(--trouve-text-dim); }
     .visually-hidden {
       position: absolute;
@@ -249,14 +232,11 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
   #reviewers: readonly ProtocolReviewerProfile[] = [];
   #models: readonly ProtocolModelInfo[] = [];
   #repositoryDrafts = new Map<string, RepositoryDraft>();
-  #reviewerDrafts = new Map<string, ReviewerDraft>();
-  #newReviewerDraft: ReviewerDraft = reviewerDraft();
   #loading = true;
   #modelsUnavailable = false;
   #busy = "";
   #notice = "";
   #noticeIsError = false;
-  #confirmDeleteReviewer = "";
   #loadGeneration = 0;
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -304,7 +284,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
         <header class="section-heading">
           <div>
             <h2 id="code-review-configuration-title">Code review</h2>
-            <p>Configure the GitHub App, repository policies, and focused reviewer personas.</p>
+            <p>Configure the GitHub App, repository policies, and focused personas.</p>
           </div>
         </header>
         <p class=${`notice${this.#noticeIsError ? " error" : ""}`} role=${this.#noticeIsError ? "alert" : "status"} aria-live="polite">
@@ -315,7 +295,6 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
           : nothing}
         ${this.#renderGithubApp(this.#app)}
         ${this.#renderRepositories()}
-        ${this.#renderReviewers()}
       </section>
     `;
   }
@@ -426,14 +405,14 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
           </label>
 
           <fieldset>
-            <legend>Reviewer routing</legend>
+            <legend>Persona routing</legend>
             <div class="form-grid three">
               <label>
                 Selection mode
                 <select .value=${draft.routingMode} ?disabled=${this.#busy !== ""} @change=${(event: Event) => this.#setRoutingMode(key, (event.currentTarget as HTMLSelectElement).value as CodeReviewRoutingMode)}>
-                  <option value="manual">Selected reviewers only</option>
+                  <option value="manual">Selected personas only</option>
                   <option value="additive">Always include + route</option>
-                  <option value="automatic">Route all reviewers</option>
+                  <option value="automatic">Route all personas</option>
                 </select>
               </label>
               <label>
@@ -452,13 +431,13 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
           </fieldset>
 
           ${draft.routingMode === "manual"
-            ? this.#renderReviewerSelection(key, "reviewerIds", "Reviewers run for every requested review", "Select at least one reviewer while reviews are enabled.", draft.reviewerIds)
+            ? this.#renderReviewerSelection(key, "reviewerIds", "Personas run for every requested review", "Select at least one persona while reviews are enabled.", draft.reviewerIds)
             : draft.routingMode === "additive"
               ? html`
-                  ${this.#renderReviewerSelection(key, "includedReviewerIds", "Always included reviewers", "Routing may add other relevant reviewers.", draft.includedReviewerIds)}
-                  ${this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "Keep these reviewers out of routed review batches.", draft.excludedReviewerIds)}
+                  ${this.#renderReviewerSelection(key, "includedReviewerIds", "Always included personas", "Routing may add other relevant personas.", draft.includedReviewerIds)}
+                  ${this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "Keep these personas out of routed review batches.", draft.excludedReviewerIds, false)}
                 `
-              : this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "All other reviewers are eligible for routing.", draft.excludedReviewerIds)}
+              : this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "All other personas are eligible for routing.", draft.excludedReviewerIds)}
 
           ${this.#renderReviewerOverrides(key, draft)}
           <div class="actions">
@@ -475,13 +454,19 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
     legend: string,
     description: string,
     selected: readonly string[],
+    showEmptyAction = true,
   ) {
     return html`
       <fieldset>
         <legend>${legend}</legend>
         <p>${description}</p>
         ${this.#reviewers.length === 0
-          ? html`<div class="empty">Create a reviewer profile before enabling reviews.</div>`
+          ? html`<div class="empty">
+              <span>No personas are available before enabling reviews.</span>
+              ${showEmptyAction
+                ? html`<button type="button" ?disabled=${this.#busy !== ""} @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "personas" })}>Open Personas &amp; Models</button>`
+                : nothing}
+            </div>`
           : html`
               <div class="check-grid">
                 ${this.#reviewers.map((reviewer) => html`
@@ -499,11 +484,11 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
   #renderReviewerOverrides(key: string, draft: RepositoryDraft) {
     return html`
       <details class="subdetails">
-        <summary>Reviewer-specific overrides</summary>
-        <p>Override a profile only for this repository. Resetting an override restores profile and repository inheritance.</p>
+        <summary>Persona-specific overrides</summary>
+        <p>Override a persona only for this repository. Resetting an override restores persona and repository inheritance.</p>
         <div class="override-list">
           ${this.#reviewers.length === 0
-            ? html`<div class="empty">No reviewer profiles are available.</div>`
+            ? html`<div class="empty">No personas are available.</div>`
             : this.#reviewers.map((reviewer) => {
                 const stored = draft.reviewerOverrides.find((override) => override.reviewerId === reviewer.id);
                 const override = stored ?? emptyOverride(reviewer.id);
@@ -527,15 +512,15 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
                       <label>
                         Prompt behavior
                         <select .value=${override.promptMode} ?disabled=${this.#busy !== ""} @change=${(event: Event) => this.#patchReviewerOverride(key, reviewer.id, { promptMode: (event.currentTarget as HTMLSelectElement).value as ReviewerPromptMode })}>
-                          <option value="inherit">Inherit profile prompt</option>
+                          <option value="inherit">Inherit persona prompt</option>
                           <option value="append">Append instructions</option>
-                          <option value="replace">Replace profile prompt</option>
+                          <option value="replace">Replace persona prompt</option>
                         </select>
                       </label>
                     </div>
                     <label>
                       Prompt override
-                      <textarea .value=${override.prompt} ?disabled=${this.#busy !== "" || override.promptMode === "inherit"} @input=${(event: Event) => this.#patchReviewerOverride(key, reviewer.id, { prompt: (event.currentTarget as HTMLTextAreaElement).value })} placeholder=${override.promptMode === "append" ? "Additional instructions" : "Repository-specific reviewer prompt"}></textarea>
+                      <textarea .value=${override.prompt} ?disabled=${this.#busy !== "" || override.promptMode === "inherit"} @input=${(event: Event) => this.#patchReviewerOverride(key, reviewer.id, { prompt: (event.currentTarget as HTMLTextAreaElement).value })} placeholder=${override.promptMode === "append" ? "Additional instructions" : "Repository-specific persona prompt"}></textarea>
                     </label>
                   </article>
                 `;
@@ -545,111 +530,6 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
     `;
   }
 
-  #renderReviewers() {
-    return html`
-      <section class="settings-card" aria-labelledby="reviewer-profiles-title">
-        <h3 id="reviewer-profiles-title">Reviewer profiles</h3>
-        <p>Built-in persona text stays consistent; its model and thinking defaults are editable. Custom profiles are fully editable.</p>
-        <div class="card-list">
-          ${this.#reviewers.length === 0
-            ? html`<div class="empty">No reviewer profiles are configured.</div>`
-            : this.#reviewers.map((profile) => this.#renderReviewer(profile))}
-          ${this.#renderNewReviewer()}
-        </div>
-      </section>
-    `;
-  }
-
-  #renderReviewer(profile: ProtocolReviewerProfile) {
-    const draft = this.#reviewerDrafts.get(profile.id) ?? reviewerDraft(profile);
-    const deleting = this.#confirmDeleteReviewer === profile.id;
-    const saving = this.#busy === `reviewer:${profile.id}`;
-    return html`
-      <details class="item">
-        <summary>
-          <span>${profile.name}</span>
-          <span class="status-pill">${profile.built_in ? "Built in" : "Custom"}</span>
-        </summary>
-        <form @submit=${(event: SubmitEvent) => void this.#saveReviewer(event, profile)}>
-          ${profile.built_in
-            ? html`
-                <div class="persona-copy" role="note">
-                  <strong>${profile.name}</strong>
-                  <p>${profile.prompt}</p>
-                  <small>Built-in name and prompt are maintained by trouve.</small>
-                </div>
-              `
-            : html`
-                <label>
-                  Name
-                  <input required autocomplete="off" .value=${draft.name} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchReviewerDraft(profile.id, { name: (event.currentTarget as HTMLInputElement).value })} />
-                </label>
-                <label>
-                  Reviewer prompt
-                  <textarea required .value=${draft.prompt} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchReviewerDraft(profile.id, { prompt: (event.currentTarget as HTMLTextAreaElement).value })}></textarea>
-                </label>
-              `}
-          <div class="form-grid">
-            <label>
-              Default model
-              <input list="code-review-models" autocomplete="off" spellcheck="false" placeholder="Inherit repository model" .value=${draft.model} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchReviewerDraft(profile.id, { model: (event.currentTarget as HTMLInputElement).value })} />
-            </label>
-            <label>
-              Default thinking
-              <input autocomplete="off" spellcheck="false" placeholder="Inherit, level, or token budget" .value=${draft.thinkingLevel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchReviewerDraft(profile.id, { thinkingLevel: (event.currentTarget as HTMLInputElement).value })} />
-            </label>
-          </div>
-          ${deleting
-            ? html`
-                <div class="confirm" role="alert">
-                  <span>Delete the custom reviewer “${profile.name}”? This cannot be undone.</span>
-                  <button class="danger" type="button" ?disabled=${this.#busy !== ""} @click=${() => void this.#deleteReviewer(profile)}>Confirm delete</button>
-                  <button type="button" ?disabled=${this.#busy !== ""} @click=${() => { this.#confirmDeleteReviewer = ""; this.requestUpdate(); }}>Cancel</button>
-                </div>
-              `
-            : nothing}
-          <div class="actions">
-            ${profile.built_in
-              ? nothing
-              : html`<button class="danger" type="button" ?disabled=${this.#busy !== "" || deleting} @click=${() => { this.#confirmDeleteReviewer = profile.id; this.requestUpdate(); }}>Delete reviewer</button>`}
-            <button class="primary" type="submit" ?disabled=${this.#busy !== ""}>${saving ? "Saving…" : "Save reviewer"}</button>
-          </div>
-        </form>
-      </details>
-    `;
-  }
-
-  #renderNewReviewer() {
-    const draft = this.#newReviewerDraft;
-    return html`
-      <details class="item">
-        <summary><span>Create custom reviewer</span><span class="status-pill">New</span></summary>
-        <form @submit=${(event: SubmitEvent) => void this.#saveReviewer(event)}>
-          <label>
-            Name
-            <input required autocomplete="off" placeholder="API compatibility" .value=${draft.name} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchNewReviewerDraft({ name: (event.currentTarget as HTMLInputElement).value })} />
-          </label>
-          <label>
-            Reviewer prompt
-            <textarea required placeholder="Describe the defects this reviewer should find" .value=${draft.prompt} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchNewReviewerDraft({ prompt: (event.currentTarget as HTMLTextAreaElement).value })}></textarea>
-          </label>
-          <div class="form-grid">
-            <label>
-              Default model
-              <input list="code-review-models" autocomplete="off" spellcheck="false" placeholder="Inherit repository model" .value=${draft.model} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchNewReviewerDraft({ model: (event.currentTarget as HTMLInputElement).value })} />
-            </label>
-            <label>
-              Default thinking
-              <input autocomplete="off" spellcheck="false" placeholder="Inherit, level, or token budget" .value=${draft.thinkingLevel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchNewReviewerDraft({ thinkingLevel: (event.currentTarget as HTMLInputElement).value })} />
-            </label>
-          </div>
-          <div class="actions">
-            <button class="primary" type="submit" ?disabled=${this.#busy !== ""}>${this.#busy === "reviewer:new" ? "Creating…" : "Create reviewer"}</button>
-          </div>
-        </form>
-      </details>
-    `;
-  }
 
   async #load(): Promise<void> {
     const services = this.#services.value;
@@ -683,11 +563,6 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
         repositoryKey(repository),
         repositoryDraft(repository),
       ]));
-      this.#reviewerDrafts = new Map(dashboard.reviewers.map((profile) => [
-        profile.id,
-        reviewerDraft(profile),
-      ]));
-      this.#confirmDeleteReviewer = "";
       this.#loading = false;
     } catch {
       if (generation !== this.#loadGeneration || !this.isConnected) return;
@@ -845,11 +720,11 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
       return;
     }
     if (draft.mode !== "off" && this.#reviewers.length === 0) {
-      this.#setNotice("Create at least one reviewer before enabling repository reviews.", true);
+      this.#setNotice("No personas are available. Create one under Settings → Personas & Models before enabling repository reviews.", true);
       return;
     }
     if (draft.mode !== "off" && draft.routingMode === "manual" && draft.reviewerIds.length === 0) {
-      this.#setNotice(`Select at least one reviewer for ${repository.repository}.`, true);
+      this.#setNotice(`Select at least one persona for ${repository.repository}.`, true);
       return;
     }
 
@@ -870,84 +745,6 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
     }
   }
 
-  #patchReviewerDraft(id: string, patch: Partial<ReviewerDraft>): void {
-    const draft = this.#reviewerDrafts.get(id);
-    if (draft === undefined) return;
-    this.#reviewerDrafts.set(id, { ...draft, ...patch });
-    this.requestUpdate();
-  }
-
-  #patchNewReviewerDraft(patch: Partial<ReviewerDraft>): void {
-    this.#newReviewerDraft = { ...this.#newReviewerDraft, ...patch };
-    this.requestUpdate();
-  }
-
-  async #saveReviewer(event: SubmitEvent, existing?: ProtocolReviewerProfile): Promise<void> {
-    event.preventDefault();
-    const services = this.#services.value;
-    const draft = existing === undefined
-      ? this.#newReviewerDraft
-      : this.#reviewerDrafts.get(existing.id);
-    if (services === undefined || draft === undefined || this.#busy !== "") return;
-    if (existing?.built_in !== true && draft.name.trim() === "") {
-      this.#setNotice("Enter a reviewer name.", true);
-      return;
-    }
-    if (existing?.built_in !== true && draft.prompt.trim() === "") {
-      this.#setNotice("Enter instructions for the reviewer.", true);
-      return;
-    }
-
-    const request = reviewerUpsertRequest(existing, draft);
-    const busyId = existing?.id ?? "new";
-    this.#busy = `reviewer:${busyId}`;
-    this.requestUpdate();
-    try {
-      const updated = await services.protocol.upsertCodeReviewReviewer(request);
-      const index = this.#reviewers.findIndex((reviewer) => reviewer.id === updated.id);
-      this.#reviewers = index < 0
-        ? [...this.#reviewers, updated]
-        : this.#reviewers.map((reviewer) => reviewer.id === updated.id ? updated : reviewer);
-      this.#reviewerDrafts.set(updated.id, reviewerDraft(updated));
-      if (existing === undefined) this.#newReviewerDraft = reviewerDraft();
-      this.#setNotice(`${updated.name} reviewer was saved.`, false);
-      this.#dispatchChange("reviewer", updated.id);
-    } catch {
-      this.#setNotice("Reviewer configuration could not be saved. Try again.", true);
-    } finally {
-      this.#busy = "";
-      this.requestUpdate();
-    }
-  }
-
-  async #deleteReviewer(profile: ProtocolReviewerProfile): Promise<void> {
-    const services = this.#services.value;
-    if (services === undefined || profile.built_in === true || this.#busy !== "") return;
-    this.#busy = `delete-reviewer:${profile.id}`;
-    this.requestUpdate();
-    try {
-      await services.protocol.deleteCodeReviewReviewer(profile.id);
-      this.#reviewers = this.#reviewers.filter((reviewer) => reviewer.id !== profile.id);
-      this.#reviewerDrafts.delete(profile.id);
-      for (const [key, draft] of this.#repositoryDrafts) {
-        this.#repositoryDrafts.set(key, {
-          ...draft,
-          reviewerIds: draft.reviewerIds.filter((id) => id !== profile.id),
-          includedReviewerIds: draft.includedReviewerIds.filter((id) => id !== profile.id),
-          excludedReviewerIds: draft.excludedReviewerIds.filter((id) => id !== profile.id),
-          reviewerOverrides: draft.reviewerOverrides.filter((override) => override.reviewerId !== profile.id),
-        });
-      }
-      this.#confirmDeleteReviewer = "";
-      this.#setNotice(`${profile.name} reviewer was deleted.`, false);
-      this.#dispatchChange("reviewer-delete", profile.id);
-    } catch {
-      this.#setNotice("The reviewer could not be deleted. It may still be in use; update repository selections and try again.", true);
-    } finally {
-      this.#busy = "";
-      this.requestUpdate();
-    }
-  }
 
   #dispatchChange(kind: CodeReviewConfigurationChangeDetail["kind"], id?: string): void {
     this.dispatchEvent(new CustomEvent<CodeReviewConfigurationChangeDetail>(

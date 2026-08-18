@@ -17,7 +17,7 @@ use trouve_agents::{
     BackendPermission, BackendSteer, BackendTurn,
 };
 use trouve_protocol::{
-    AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
+    AgentPersona, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
     UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
@@ -37,7 +37,7 @@ use crate::tools::{
     McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
     SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
 };
-use crate::{context, git, modes, new_id};
+use crate::{context, git, new_id, personas};
 
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
@@ -536,7 +536,7 @@ async fn flush_backend_event_batch(
 
 struct BackendCollaboratorProjection {
     thread: Thread,
-    mode: AgentMode,
+    mode: AgentPersona,
     turn: u64,
     /// Whether the durable parent-rail link for this collaborator has been
     /// published. Child activity can arrive before the provider's formal
@@ -568,7 +568,7 @@ struct BackendCollaboratorProjection {
 struct PendingCollaboratorApproval {
     thread: Thread,
     turn: u64,
-    mode: AgentMode,
+    mode: AgentPersona,
     call_id: String,
     tool: String,
     args: serde_json::Value,
@@ -1321,6 +1321,15 @@ fn validate_thinking_level(level: Option<&str>) -> Result<(), EngineError> {
     Ok(())
 }
 
+fn validate_persona_id(id: &str) -> Result<(), EngineError> {
+    if !personas::is_valid_persona_id(id) {
+        return Err(EngineError::BadRequest(
+            "persona id must be non-empty and [a-zA-Z0-9_-] only".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> bool {
     THINKING_OPTION_KEYS
         .iter()
@@ -1722,10 +1731,17 @@ impl Drop for DeletingSessionMarker<'_> {
     }
 }
 
+#[derive(Clone)]
+struct GlobalDefaults {
+    model: String,
+    thinking_level: Option<String>,
+    permission_mode: trouve_protocol::PermissionMode,
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
-    config_dir: Option<PathBuf>,
+    pub(crate) config_dir: Option<PathBuf>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute models the catalog cannot represent (notably Cursor).
@@ -1801,20 +1817,19 @@ pub struct Engine {
     /// Serializes provider upserts and deletions across config, secret-store,
     /// and registry mutations without blocking unrelated provider ids.
     provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Serializes persona-file mutations with durable deletion replay so a
+    /// recreate cannot race a pending cleanup of the same user-level file.
+    persona_mutations: tokio::sync::Mutex<()>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
     config_file: Option<PathBuf>,
     /// Serializes persistence and runtime application of title-model behavior.
     title_model_behavior_transition: tokio::sync::Mutex<()>,
-    default_model: RwLock<String>,
-    /// Canonical thinking-level token inherited by modes without an
-    /// override. It is translated through the selected model's schema when
-    /// the turn starts.
-    default_thinking_level: RwLock<Option<String>>,
-    /// Global default permission mode for new threads, used by modes that
-    /// don't set one of their own.
-    default_permission_mode: RwLock<trouve_protocol::PermissionMode>,
+    /// One coherent snapshot of the defaults inherited by personas. Keeping
+    /// these values under one lock prevents new threads from observing a
+    /// partially applied global-defaults update.
+    global_defaults: RwLock<GlobalDefaults>,
     pub(crate) secrets: Arc<dyn trouve_providers::secrets::SecretStore>,
     pub(crate) code_review: crate::review::CodeReviewRuntime,
     /// In-flight OAuth logins, keyed by provider id.
@@ -2174,6 +2189,7 @@ impl Engine {
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
+            persona_mutations: tokio::sync::Mutex::new(()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -2182,16 +2198,14 @@ impl Engine {
             // clobber the user's config.toml on any provider change.
             config_file: None,
             title_model_behavior_transition: tokio::sync::Mutex::new(()),
-            default_model: RwLock::new(
-                config
+            global_defaults: RwLock::new(GlobalDefaults {
+                model: config
                     .default_model
                     .clone()
                     .unwrap_or_else(|| "openai/gpt-4.1-mini".into()),
-            ),
-            default_thinking_level: RwLock::new(config.default_thinking_level.clone()),
-            default_permission_mode: RwLock::new(
-                config.default_permission_mode.unwrap_or_default(),
-            ),
+                thinking_level: config.default_thinking_level.clone(),
+                permission_mode: config.default_permission_mode.unwrap_or_default(),
+            }),
             secrets,
             code_review: crate::review::CodeReviewRuntime::default(),
             logins: Mutex::new(HashMap::new()),
@@ -2290,6 +2304,46 @@ impl Engine {
         }
     }
 
+    /// Finish durable persona-file deletions left by an interrupted request.
+    /// The intent keeps repository references untouched until the executor
+    /// confirms the file is gone; a missing file is success only on replay.
+    pub async fn retry_persona_deletions(&self) {
+        let Some(config_dir) = self.config_dir.as_deref() else {
+            return;
+        };
+        loop {
+            let _mutation = self.persona_mutations.lock().await;
+            let claim = match self.store.claim_next_persona_deletion() {
+                Ok(Some(claim)) => claim,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to claim durable persona deletion intent");
+                    break;
+                }
+            };
+            let result = self
+                .executor
+                .delete_persona_file(config_dir, &claim.id, true)
+                .await
+                .map_err(anyhow::Error::msg)
+                .and_then(|()| self.store.complete_claimed_persona_deletion(&claim));
+            if let Err(error) = result {
+                if let Err(store_error) = self.store.fail_claimed_persona_deletion(&claim) {
+                    tracing::error!(
+                        persona_id = %claim.id,
+                        %error,
+                        %store_error,
+                        "persona deletion failed and its durable retry could not be updated"
+                    );
+                } else if claim.attempts == 0 {
+                    tracing::warn!(persona_id = %claim.id, %error, "persona deletion retry failed");
+                } else {
+                    tracing::debug!(persona_id = %claim.id, %error, "persona deletion retry failed");
+                }
+            }
+        }
+    }
+
     /// Keep retrying failed cleanup intents while the process remains alive.
     /// Atomic store claims prevent this worker from overlapping immediate
     /// cleanup or another server instance sharing the database.
@@ -2301,6 +2355,7 @@ impl Engine {
             loop {
                 interval.tick().await;
                 engine.retry_artifact_cleanup_jobs().await;
+                engine.retry_persona_deletions().await;
             }
         });
     }
@@ -2541,13 +2596,13 @@ impl Engine {
 
     /// Override the default model for new threads.
     pub fn with_default_model(self, model: &str) -> Self {
-        *self.default_model.write().unwrap() = model.to_string();
+        self.global_defaults.write().unwrap().model = model.to_string();
         self
     }
 
     /// Override the global default thinking level for new threads.
     pub fn with_default_thinking_level(self, level: Option<&str>) -> Self {
-        *self.default_thinking_level.write().unwrap() = level.map(String::from);
+        self.global_defaults.write().unwrap().thinking_level = level.map(String::from);
         self
     }
 
@@ -2745,11 +2800,12 @@ impl Engine {
             }
         }
         infos.sort_by(|a, b| a.id.cmp(&b.id));
+        let defaults = self.global_defaults.read().unwrap().clone();
         ProvidersResponse {
             providers: infos,
-            default_model: self.default_model.read().unwrap().clone(),
-            default_thinking_level: self.default_thinking_level.read().unwrap().clone(),
-            default_permission_mode: *self.default_permission_mode.read().unwrap(),
+            default_model: defaults.model,
+            default_thinking_level: defaults.thinking_level,
+            default_permission_mode: defaults.permission_mode,
         }
     }
 
@@ -4241,11 +4297,47 @@ impl Engine {
                 config.default_thinking_level = Some(level.into());
             }
             self.persist_config(&config);
+            let mut defaults = self.global_defaults.write().unwrap();
+            defaults.model = model.to_string();
+            if let Some(level) = thinking_level {
+                defaults.thinking_level = Some(level.into());
+            }
         }
-        *self.default_model.write().unwrap() = model.to_string();
-        if let Some(level) = thinking_level {
-            *self.default_thinking_level.write().unwrap() = Some(level.into());
+        Ok(())
+    }
+
+    /// Validate, persist, and apply all global defaults as one replacement.
+    pub fn set_global_defaults(
+        &self,
+        model: &str,
+        thinking_level: Option<&str>,
+        permission_mode: trouve_protocol::PermissionMode,
+    ) -> Result<(), EngineError> {
+        if !model.contains('/') {
+            return Err(EngineError::BadRequest(format!(
+                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
+            )));
         }
+        validate_thinking_level(thinking_level)?;
+
+        let next_defaults = GlobalDefaults {
+            model: model.to_string(),
+            thinking_level: thinking_level.map(String::from),
+            permission_mode,
+        };
+        let mut config = self.config.lock().unwrap();
+        let mut next_config = config.clone();
+        next_config.default_model = Some(next_defaults.model.clone());
+        next_config.default_thinking_level = next_defaults.thinking_level.clone();
+        next_config.default_permission_mode = Some(next_defaults.permission_mode);
+        if let Some(path) = &self.config_file {
+            next_config
+                .save_to(path)
+                .with_context(|| format!("persisting global defaults to {}", path.display()))?;
+        }
+        let mut defaults = self.global_defaults.write().unwrap();
+        *config = next_config;
+        *defaults = next_defaults;
         Ok(())
     }
 
@@ -4259,8 +4351,8 @@ impl Engine {
             let mut config = self.config.lock().unwrap();
             config.default_permission_mode = Some(mode);
             self.persist_config(&config);
+            self.global_defaults.write().unwrap().permission_mode = mode;
         }
-        *self.default_permission_mode.write().unwrap() = mode;
         Ok(())
     }
 
@@ -4458,30 +4550,12 @@ impl Engine {
             .usage_summary(crate::store::UsageScope::Session(session_id))?)
     }
 
-    /// Agent modes visible for a workspace (built-ins + config + `.agents`).
-    pub fn list_modes(&self, workspace_id: Option<&str>) -> Result<Vec<AgentMode>, EngineError> {
-        let root = match workspace_id {
-            Some(id) => {
-                let ws = self
-                    .store
-                    .workspace(id)?
-                    .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
-                Some(PathBuf::from(ws.path))
-            }
-            None => None,
-        };
-        Ok(modes::resolve_modes(
-            self.config_dir.as_deref(),
-            root.as_deref(),
-        ))
-    }
-
-    /// Modes with provenance (builtin / customized / custom / workspace)
-    /// for the settings screen.
-    pub fn list_mode_infos(
+    /// Agent personas visible for a workspace. This is the unified catalog:
+    /// interactive personas plus the focused code-review personas.
+    pub fn list_personas(
         &self,
         workspace_id: Option<&str>,
-    ) -> Result<Vec<trouve_protocol::ModeInfo>, EngineError> {
+    ) -> Result<Vec<AgentPersona>, EngineError> {
         let root = match workspace_id {
             Some(id) => {
                 let ws = self
@@ -4492,19 +4566,103 @@ impl Engine {
             }
             None => None,
         };
-        Ok(modes::resolve_mode_infos(
-            self.config_dir.as_deref(),
-            root.as_deref(),
-        ))
+        self.resolve_personas(root.as_deref())
     }
 
-    /// Create or update a user-level mode. Saving under a built-in id
-    /// customizes that built-in; the file lands in `<config>/modes/`.
-    pub fn upsert_mode(
+    /// Personas with provenance (builtin / customized / custom / workspace)
+    /// for the settings screen.
+    pub fn list_persona_infos(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<trouve_protocol::PersonaInfo>, EngineError> {
+        let root = match workspace_id {
+            Some(id) => {
+                let ws = self
+                    .store
+                    .workspace(id)?
+                    .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+                Some(PathBuf::from(ws.path))
+            }
+            None => None,
+        };
+        let mut infos =
+            personas::resolve_persona_infos(self.config_dir.as_deref(), root.as_deref());
+        let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        let mut builtin_order = HashMap::new();
+        for id in personas::builtin_personas()
+            .into_iter()
+            .map(|persona| persona.id)
+            .chain(
+                crate::reviewers::built_in_reviewers()
+                    .into_iter()
+                    .map(|reviewer| reviewer.id),
+            )
+            .chain(
+                reviewer_catalog
+                    .iter()
+                    .filter(|reviewer| reviewer.built_in)
+                    .map(|reviewer| reviewer.id.clone()),
+            )
+        {
+            let position = builtin_order.len();
+            builtin_order.entry(id).or_insert(position);
+        }
+        let builtin_ids: HashSet<_> = builtin_order.keys().cloned().collect();
+        for info in &mut infos {
+            if builtin_ids.contains(&info.persona.id) && info.origin == "custom" {
+                info.origin = "customized".into();
+            }
+        }
+        for reviewer in reviewer_catalog {
+            if infos.iter().any(|info| info.persona.id == reviewer.id) {
+                continue;
+            }
+            infos.push(trouve_protocol::PersonaInfo {
+                persona: crate::reviewers::reviewer_as_persona(&reviewer),
+                origin: if reviewer.built_in {
+                    "builtin"
+                } else {
+                    "custom"
+                }
+                .into(),
+            });
+        }
+        infos.sort_by_key(|info| {
+            (
+                builtin_order
+                    .get(&info.persona.id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                info.persona.id.clone(),
+            )
+        });
+        Ok(infos)
+    }
+
+    fn resolve_personas(
+        &self,
+        workspace_root: Option<&Path>,
+    ) -> Result<Vec<AgentPersona>, EngineError> {
+        let mut personas: Vec<_> = self
+            .code_review_reviewer_catalog()?
+            .iter()
+            .map(crate::reviewers::reviewer_as_persona)
+            .collect();
+        for persona in personas::resolve_personas(self.config_dir.as_deref(), workspace_root) {
+            personas.retain(|candidate| candidate.id != persona.id);
+            personas.push(persona);
+        }
+        Ok(personas)
+    }
+
+    /// Create or update a user-level persona. Saving under a built-in id
+    /// customizes that built-in; the file lands in `<config>/personas/`.
+    pub async fn upsert_persona(
         &self,
         id: &str,
-        req: trouve_protocol::UpsertModeRequest,
+        req: trouve_protocol::UpsertPersonaRequest,
     ) -> Result<(), EngineError> {
+        validate_persona_id(id)?;
         let config_dir = self
             .config_dir
             .as_deref()
@@ -4517,7 +4675,7 @@ impl Engine {
             )));
         }
         validate_thinking_level(req.default_thinking_level.as_deref())?;
-        let mode = AgentMode {
+        let persona = AgentPersona {
             id: id.to_string(),
             display_name: req.display_name,
             system_prompt: req.system_prompt,
@@ -4527,19 +4685,58 @@ impl Engine {
             default_model: req.default_model,
             default_thinking_level: req.default_thinking_level,
         };
-        modes::upsert_user_mode(config_dir, &mode)
-            .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
+        let _mutation = self.persona_mutations.lock().await;
+        self.executor
+            .upsert_persona_file(config_dir, &persona)
+            .await
+            .map_err(EngineError::BadRequest)?;
+        if self.store.persona_deletion_pending(id)? {
+            self.store.complete_persona_deletion(id)?;
+        }
+        Ok(())
     }
 
-    /// Remove a user-level mode file: deletes a custom mode, or resets a
+    /// Remove a user-level persona file: deletes a custom persona, or resets a
     /// customized built-in to its defaults.
-    pub fn delete_mode(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn delete_persona(&self, id: &str) -> Result<(), EngineError> {
+        validate_persona_id(id)?;
         let config_dir = self
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
-        modes::delete_user_mode(config_dir, id)
-            .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
+        let _mutation = self.persona_mutations.lock().await;
+        let deletion_pending = self.store.persona_deletion_pending(id)?;
+        let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        let custom_reviewer = reviewer_catalog
+            .iter()
+            .any(|reviewer| reviewer.id == id && !reviewer.built_in);
+        let system_persona = personas::builtin_personas()
+            .iter()
+            .any(|persona| persona.id == id)
+            || reviewer_catalog
+                .iter()
+                .any(|reviewer| reviewer.id == id && reviewer.built_in);
+        let is_custom = deletion_pending
+            || custom_reviewer
+            || (!system_persona
+                && personas::resolve_persona_infos(Some(config_dir), None)
+                    .iter()
+                    .any(|info| info.persona.id == id && info.origin == "custom"));
+        if is_custom {
+            self.store.begin_persona_deletion(id)?;
+            self.executor
+                .delete_persona_file(config_dir, id, deletion_pending || custom_reviewer)
+                .await
+                .map_err(EngineError::BadRequest)?;
+            return self
+                .store
+                .complete_persona_deletion(id)
+                .map_err(EngineError::Internal);
+        }
+        self.executor
+            .delete_persona_file(config_dir, id, false)
+            .await
+            .map_err(EngineError::BadRequest)
     }
 
     /// GitHub repository named by the session's origin remote. Routes to
@@ -4769,12 +4966,12 @@ impl Engine {
         let mut prs = github
             .prs_for_branch(&session.branch)
             .await
-            .map_err(EngineError::Internal)?;
+            .map_err(github_engine_error)?;
         let mut seen: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
         for pr in github
             .open_prs_referenced_by(&evidence.successful_tool_args, &evidence.commit_ids)
             .await
-            .map_err(EngineError::Internal)?
+            .map_err(github_engine_error)?
         {
             self.record_session_pr_numbers(
                 session_id,
@@ -4952,11 +5149,11 @@ impl Engine {
             (Some(base), Some(head)) if !base.is_empty() && !head.is_empty() => github
                 .pr_file_diff_known(file, base, head)
                 .await
-                .map_err(EngineError::Internal),
+                .map_err(github_engine_error),
             _ => github
                 .pr_file_diff(number, path)
                 .await
-                .map_err(EngineError::Internal),
+                .map_err(github_engine_error),
         }
     }
 
@@ -4998,7 +5195,7 @@ impl Engine {
         self.github_for_session(&session)?
             .act_on_pr(&detail, action)
             .await
-            .map_err(EngineError::Internal)?;
+            .map_err(github_engine_error)?;
 
         let mut stale = HashSet::from([Section::Overview]);
         match action {
@@ -5628,7 +5825,7 @@ impl Engine {
         let mut pr = github
             .create_pr(&session.branch, &base, &req.title, &req.body, req.draft)
             .await
-            .map_err(EngineError::Internal)?;
+            .map_err(github_engine_error)?;
         pr.workspace_id = session.workspace_id.clone();
         self.store.append_event(
             Scope::Session(session.id.clone()),
@@ -5656,7 +5853,7 @@ impl Engine {
         github
             .merge_pr(pr.number, method.unwrap_or("merge"))
             .await
-            .map_err(EngineError::Internal)
+            .map_err(github_engine_error)
     }
 
     /// Unified diff of the session worktree against its base ref.
@@ -6725,20 +6922,20 @@ impl Engine {
     ) -> Result<Thread, EngineError> {
         debug_assert_eq!(session.id, req.session_id);
         let ws = self.store.workspace(&session.workspace_id)?.unwrap();
-        let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
+        let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
         let mode_id = req.mode.unwrap_or_else(|| "code".into());
-        let mode = modes::find_mode(&all_modes, &mode_id)
-            .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
+        let mode = personas::find_persona(&all_modes, &mode_id)
+            .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
         // Provider availability is validated when a message is sent, not
         // here: a thread must be creatable before any provider is configured.
         // Model precedence: explicit request > the mode's default model >
         // the global default.
+        let global_defaults = self.global_defaults.read().unwrap().clone();
         let model = req
             .model
             .or_else(|| mode.default_model.clone())
-            .unwrap_or_else(|| self.default_model.read().unwrap().clone());
+            .unwrap_or_else(|| global_defaults.model.clone());
         let mut model_options = req.model_options;
-        let global_thinking_level = self.default_thinking_level.read().unwrap().clone();
         // `thinking_level` is the canonical inherited key. Before a turn it
         // is resolved to the selected model's advertised key
         // (reasoning_effort, effort, ...), or removed for models that do not
@@ -6746,7 +6943,7 @@ impl Engine {
         inherit_thinking_option(
             &mut model_options,
             mode.default_thinking_level.as_deref(),
-            global_thinking_level.as_deref(),
+            global_defaults.thinking_level.as_deref(),
         );
         let thread = Thread {
             id: new_id("th"),
@@ -6765,7 +6962,7 @@ impl Engine {
             permission_mode: req
                 .permission_mode
                 .or(mode.default_permission_mode)
-                .unwrap_or_else(|| *self.default_permission_mode.read().unwrap()),
+                .unwrap_or(global_defaults.permission_mode),
             created_at: chrono::Utc::now(),
             spawned: spawn.is_some(),
             todos: Vec::new(),
@@ -6815,9 +7012,8 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
-        let modes =
-            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
-        Ok(modes::find_mode(&modes, &thread.mode)
+        let modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        Ok(personas::find_persona(&modes, &thread.mode)
             .map(|mode| mode.read_only)
             .unwrap_or(true))
     }
@@ -6832,9 +7028,8 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
-        let modes =
-            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
-        let inherited = modes::find_mode(&modes, &inherited_thread.mode);
+        let modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        let inherited = personas::find_persona(&modes, &inherited_thread.mode);
         // Provider metadata may reduce a collaborator's authority, but it is
         // never an authorization source that can widen the parent's mode.
         // Unknown parent modes fail closed just like turn execution does.
@@ -6865,7 +7060,9 @@ impl Engine {
         };
         preferred
             .iter()
-            .find_map(|id| modes::find_mode(&modes, id).filter(|mode| mode.read_only == read_only))
+            .find_map(|id| {
+                personas::find_persona(&modes, id).filter(|mode| mode.read_only == read_only)
+            })
             .or_else(|| modes.iter().find(|mode| mode.read_only == read_only))
             .map(|mode| mode.id.clone())
             .ok_or_else(|| {
@@ -7020,10 +7217,9 @@ impl Engine {
 
         if let Some(mode_id) = req.mode.as_deref() {
             let ws = self.store.workspace(&session.workspace_id)?.unwrap();
-            let all_modes =
-                modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-            modes::find_mode(&all_modes, mode_id)
-                .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
+            let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
+            personas::find_persona(&all_modes, mode_id)
+                .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
         }
         if let Some(model) = req.model.as_deref()
             && !model.contains('/')
@@ -8589,10 +8785,10 @@ impl Engine {
             background_mutation_lease: None,
         };
 
-        let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-        let mode = modes::find_mode(&all_modes, &thread.mode)
+        let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
+        let mode = personas::find_persona(&all_modes, &thread.mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
         // A turn owns only a shared session lifecycle lease. Sibling turns in
         // the same worktree may reason and invoke tools concurrently; the
         // narrower tool-execution lane is the authority that serializes
@@ -8713,7 +8909,7 @@ impl Engine {
             specs.push(search_transcript_spec());
         }
         // Recursive spawn tools remain bounded by the durable tree depth and
-        // also respect the mode policy, so restrictive/read-only modes that
+        // also respect the mode policy, so restrictive/read-only personas that
         // do not list them cannot create child agents.
         let spawn_allowed = |name: &str| {
             mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
@@ -9708,7 +9904,7 @@ impl Engine {
     fn bridged_context(
         &self,
         thread_id: &str,
-    ) -> Result<(Session, Thread, AgentMode, ToolCtx), EngineError> {
+    ) -> Result<(Session, Thread, AgentPersona, ToolCtx), EngineError> {
         let cancel = self.active_bridge_cancel(thread_id)?;
         self.bridged_context_with_cancel(thread_id, cancel)
     }
@@ -9740,7 +9936,7 @@ impl Engine {
         &self,
         thread_id: &str,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<(Session, Thread, AgentMode, ToolCtx), EngineError> {
+    ) -> Result<(Session, Thread, AgentPersona, ToolCtx), EngineError> {
         let thread = self.get_thread(thread_id)?;
         let session = self.get_session(&thread.session_id)?;
         let ws = self
@@ -9748,10 +9944,10 @@ impl Engine {
             .workspace(&session.workspace_id)
             .map_err(EngineError::Internal)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
-        let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-        let mode = modes::find_mode(&all_modes, &thread.mode)
+        let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
+        let mode = personas::find_persona(&all_modes, &thread.mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
         let worktree = PathBuf::from(&session.worktree_path);
         let canonical_worktree = worktree
             .canonicalize()
@@ -9962,11 +10158,10 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .ok_or_else(|| anyhow!("workspace {} not found", session.workspace_id))?;
-        let all_modes =
-            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
-        let inherited_mode = modes::find_mode(&all_modes, &inherited_thread.mode)
+        let all_modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        let inherited_mode = personas::find_persona(&all_modes, &inherited_thread.mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
         if !inherited_mode.allowed_tools.is_empty()
             && !inherited_mode
                 .allowed_tools
@@ -10036,9 +10231,9 @@ impl Engine {
             .generate_subagent_title(name.as_deref(), prompt.as_deref())
             .await;
         let child_mode = self.backend_collaborator_mode(session, &inherited_thread, access)?;
-        let collaborator_mode = modes::find_mode(&all_modes, &child_mode)
+        let collaborator_mode = personas::find_persona(&all_modes, &child_mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
         let child = collaborator_claims
             .create_claimed_thread(&session.id, || {
                 self.create_spawned_thread_for_session(
@@ -10304,7 +10499,7 @@ impl Engine {
     async fn persist_backend_collaborator_event(
         &self,
         session: &Session,
-        _root_mode: &AgentMode,
+        _root_mode: &AgentPersona,
         backend_id: &str,
         collaborator: &mut BackendCollaboratorProjection,
         event: BackendCollaboratorEvent,
@@ -10548,7 +10743,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
@@ -11668,7 +11863,7 @@ impl Engine {
     }
 
     /// Gate one backend approval request through trouve's permission layer:
-    /// allow-list hits auto-approve, read-only modes deny, otherwise ask the
+    /// allow-list hits auto-approve, read-only personas deny, otherwise ask the
     /// user through the ApprovalHub (same endpoints as native tool calls).
     #[allow(clippy::too_many_arguments)]
     async fn gate_backend_approval(
@@ -11937,7 +12132,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         ctx: &ToolCtx,
         calls: Vec<trouve_providers::ToolCallRequest>,
         cancel: &tokio_util::sync::CancellationToken,
@@ -11993,7 +12188,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         ctx: &ToolCtx,
         calls: Vec<(usize, trouve_providers::ToolCallRequest)>,
         cancel: &tokio_util::sync::CancellationToken,
@@ -12026,7 +12221,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         ctx: &ToolCtx,
         call: &trouve_providers::ToolCallRequest,
         cancel: &tokio_util::sync::CancellationToken,
@@ -12040,7 +12235,7 @@ impl Engine {
 
         // ask_question is engine-served (it blocks on the QuestionHub, which
         // tools can't reach) and never gated — asking is how the agent defers
-        // to the user, so it works even in read-only modes. No tool card is
+        // to the user, so it works even in read-only personas. No tool card is
         // emitted: the question wizard is its representation in the UI.
         if call.name == "ask_question" {
             let result = match parse_question_args(&call.arguments) {
@@ -12445,7 +12640,7 @@ impl Engine {
         self: &Arc<Self>,
         session: &Session,
         thread: &Thread,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         name: &str,
         args: &serde_json::Value,
         cancel: &tokio_util::sync::CancellationToken,
@@ -12489,7 +12684,7 @@ impl Engine {
         let tree_lock = self.subagent_tree_lock(&root_thread_id);
         let _tree_spawn = tree_lock.lock().await;
 
-        // Respect the mode's tool policy: a restrictive/read-only mode that
+        // Respect the mode's tool policy: a restrictive/read-only persona that
         // doesn't list the spawn tool can't create branches or child agents
         // (the specs are already filtered, but a model may still emit the
         // call — deny it here too).
@@ -12530,7 +12725,7 @@ impl Engine {
         // A read-only parent must not launch an agent that can do what it
         // itself cannot.
         if mode.read_only && child_mode != thread.mode {
-            bail!("read-only modes can only spawn children in the same mode");
+            bail!("read-only personas can only spawn children in the same mode");
         }
         let child_model = args
             .get("model")
@@ -13850,7 +14045,7 @@ pub fn spawn_thread_spec() -> ToolSpec {
                 },
                 "mode": {
                     "type": "string",
-                    "description": "Agent mode id for the child (default: your mode). Use a read-only mode like \"plan\" for concurrent research."
+                    "description": "Agent persona id for the child (default: your persona). Use a read-only persona like \"plan\" for concurrent research."
                 },
                 "model": {
                     "type": "string",
@@ -13892,7 +14087,7 @@ pub fn spawn_session_spec() -> ToolSpec {
                 },
                 "mode": {
                     "type": "string",
-                    "description": "Agent mode id for the child (default: your mode)."
+                    "description": "Agent persona id for the child (default: your persona)."
                 },
                 "model": {
                     "type": "string",
@@ -14396,6 +14591,350 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
+        trouve_protocol::UpsertPersonaRequest {
+            display_name: display_name.into(),
+            system_prompt: format!("Act as {display_name}."),
+            allowed_tools: vec!["read_file".into()],
+            read_only: true,
+            default_permission_mode: None,
+            default_model: None,
+            default_thinking_level: None,
+        }
+    }
+
+    struct RejectingPersonaDeletionExecutor {
+        attempted: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for RejectingPersonaDeletionExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error(format!("unknown tool: {name}"))
+        }
+
+        async fn upsert_persona_file(
+            &self,
+            _config_dir: &Path,
+            _persona: &AgentPersona,
+        ) -> Result<(), String> {
+            self.attempted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("injected persona upsert failure".into())
+        }
+
+        async fn delete_persona_file(
+            &self,
+            _config_dir: &Path,
+            _id: &str,
+            _allow_missing: bool,
+        ) -> Result<(), String> {
+            self.attempted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("injected persona deletion failure".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_persona_upsert_does_not_consume_pending_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store.begin_persona_deletion("custom").unwrap();
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(Some(tmp.path().join("config")))
+            .with_executor(Arc::new(RejectingPersonaDeletionExecutor {
+                attempted: attempted.clone(),
+            }));
+
+        let error = engine
+            .upsert_persona("custom", persona_request("Custom"))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected persona upsert failure")
+        );
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.persona_deletion_pending("custom").unwrap());
+    }
+
+    #[tokio::test]
+    async fn persona_mutations_reject_unsafe_ids_before_file_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let outside = config_dir.join("escape.toml");
+        std::fs::write(&outside, "sentinel").unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            tmp.path().join("data"),
+            &Config::default(),
+        )
+        .with_config_dir(Some(config_dir));
+
+        for id in ["", "../escape", "has/slash", "has space", "question?"] {
+            assert!(matches!(
+                engine.upsert_persona(id, persona_request("Unsafe")).await,
+                Err(EngineError::BadRequest(_))
+            ));
+            assert!(matches!(
+                engine.delete_persona(id).await,
+                Err(EngineError::BadRequest(_))
+            ));
+        }
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "sentinel");
+    }
+
+    #[tokio::test]
+    async fn delete_persona_cleans_custom_references_and_resets_system_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let workspace = tmp.path().join("workspace");
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            tmp.path().join("data"),
+            &Config::default(),
+        )
+        .with_config_dir(Some(config_dir.clone()));
+
+        engine
+            .upsert_persona("custom", persona_request("Custom persona"))
+            .await
+            .unwrap();
+        engine
+            .upsert_persona("code", persona_request("Customized Code"))
+            .await
+            .unwrap();
+        engine
+            .upsert_persona("correctness", persona_request("Customized Correctness"))
+            .await
+            .unwrap();
+        let workspace_persona = AgentPersona {
+            id: "workspace-only".into(),
+            display_name: "Workspace only".into(),
+            system_prompt: "Inspect the workspace.".into(),
+            allowed_tools: vec!["read_file".into()],
+            read_only: true,
+            default_permission_mode: None,
+            default_model: None,
+            default_thinking_level: None,
+        };
+        personas::upsert_user_persona(&workspace.join(".agents"), &workspace_persona).unwrap();
+        assert!(
+            personas::resolve_persona_infos(None, Some(&workspace))
+                .iter()
+                .any(|info| info.persona.id == "workspace-only" && info.origin == "workspace")
+        );
+
+        engine
+            .store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: trouve_protocol::CodeReviewMode::Manual,
+                model: Some("openai/reviewer".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: "preserve this".into(),
+                reviewer_ids: Some(vec!["custom".into()]),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
+                semantic_routing: Some(false),
+                included_reviewer_ids: Some(vec![
+                    "custom".into(),
+                    "code".into(),
+                    "correctness".into(),
+                    "workspace-only".into(),
+                ]),
+                excluded_reviewer_ids: Some(vec!["custom".into()]),
+                reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
+                    reviewer_id: "custom".into(),
+                    model: None,
+                    thinking_level: None,
+                    prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
+                    prompt: "custom prompt".into(),
+                }]),
+            })
+            .unwrap();
+
+        engine.delete_persona("custom").await.unwrap();
+        let repository = engine
+            .store
+            .list_code_review_repositories()
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            repository.reviewer_ids,
+            crate::reviewers::default_reviewer_ids()
+        );
+        assert_eq!(
+            repository.included_reviewer_ids,
+            ["code", "correctness", "workspace-only"]
+        );
+        assert!(repository.excluded_reviewer_ids.is_empty());
+        assert!(repository.reviewer_overrides.is_empty());
+        assert_eq!(repository.prompt, "preserve this");
+        assert_eq!(repository.model.as_deref(), Some("openai/reviewer"));
+
+        let legacy_reviewer = trouve_protocol::ReviewerProfile {
+            id: "legacy-reviewer".into(),
+            name: "Legacy reviewer".into(),
+            prompt: "Inspect legacy behavior.".into(),
+            model: None,
+            default_thinking_level: None,
+            built_in: false,
+        };
+        engine
+            .store
+            .upsert_reviewer_profile(&legacy_reviewer)
+            .unwrap();
+        assert!(
+            engine
+                .code_review_reviewer_catalog()
+                .unwrap()
+                .iter()
+                .any(|reviewer| reviewer.id == legacy_reviewer.id && !reviewer.built_in)
+        );
+        engine.delete_persona(&legacy_reviewer.id).await.unwrap();
+        assert!(
+            engine
+                .store
+                .list_custom_reviewer_profiles()
+                .unwrap()
+                .iter()
+                .all(|reviewer| reviewer.id != legacy_reviewer.id)
+        );
+
+        engine.delete_persona("code").await.unwrap();
+        engine.delete_persona("correctness").await.unwrap();
+        let infos = engine.list_persona_infos(None).unwrap();
+        let mut expected_builtin_ids = personas::builtin_personas()
+            .into_iter()
+            .map(|persona| persona.id)
+            .chain(
+                crate::reviewers::built_in_reviewers()
+                    .into_iter()
+                    .map(|reviewer| reviewer.id),
+            )
+            .collect::<Vec<_>>();
+        for reviewer in engine
+            .code_review_reviewer_catalog()
+            .unwrap()
+            .into_iter()
+            .filter(|reviewer| reviewer.built_in)
+        {
+            if !expected_builtin_ids.contains(&reviewer.id) {
+                expected_builtin_ids.push(reviewer.id);
+            }
+        }
+        assert_eq!(
+            infos
+                .iter()
+                .take(expected_builtin_ids.len())
+                .map(|info| info.persona.id.clone())
+                .collect::<Vec<_>>(),
+            expected_builtin_ids
+        );
+        for (id, customized_name) in [
+            ("code", "Customized Code"),
+            ("correctness", "Customized Correctness"),
+        ] {
+            let info = infos.iter().find(|info| info.persona.id == id).unwrap();
+            assert_eq!(info.origin, "builtin");
+            assert_ne!(info.persona.display_name, customized_name);
+        }
+
+        assert!(matches!(
+            engine.delete_persona("workspace-only").await,
+            Err(EngineError::BadRequest(_))
+        ));
+        let repository = engine
+            .store
+            .list_code_review_repositories()
+            .unwrap()
+            .remove(0);
+        assert!(
+            repository
+                .included_reviewer_ids
+                .contains(&"workspace-only".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_executor_persona_deletion_keeps_repository_references_retryable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let persona = AgentPersona {
+            id: "custom".into(),
+            display_name: "Custom".into(),
+            system_prompt: "Review carefully.".into(),
+            allowed_tools: Vec::new(),
+            read_only: true,
+            default_permission_mode: None,
+            default_model: None,
+            default_thinking_level: None,
+        };
+        personas::upsert_user_persona(&config_dir, &persona).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: trouve_protocol::CodeReviewMode::Manual,
+                model: None,
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: String::new(),
+                reviewer_ids: Some(vec!["custom".into()]),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
+                semantic_routing: Some(false),
+                included_reviewer_ids: None,
+                excluded_reviewer_ids: None,
+                reviewer_overrides: None,
+            })
+            .unwrap();
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(Some(config_dir.clone()))
+            .with_executor(Arc::new(RejectingPersonaDeletionExecutor {
+                attempted: attempted.clone(),
+            }));
+
+        let error = engine.delete_persona("custom").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected persona deletion failure")
+        );
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.persona_deletion_pending("custom").unwrap());
+        assert_eq!(
+            store
+                .list_code_review_repositories()
+                .unwrap()
+                .remove(0)
+                .reviewer_ids,
+            ["custom"]
+        );
+        assert!(personas::user_persona_file(&config_dir, "custom").is_some());
+    }
 
     #[test]
     fn github_permission_failures_require_reauthentication() {
@@ -15767,7 +16306,7 @@ mod tests {
             engine.handle_spawn_tool(
                 &session,
                 &parent,
-                &modes::fallback_mode(),
+                &personas::fallback_persona(),
                 "spawn_output",
                 &serde_json::json!({"thread_id": child.id, "wait_ms": 180_000}),
                 &cancel,
@@ -16370,10 +16909,10 @@ mod tests {
         assert!(accepted.queued);
         assert_eq!(store.queued_prompts(&child.id).unwrap().len(), 1);
 
-        let workspace_modes = data.path().join(".agents/modes");
-        std::fs::create_dir_all(&workspace_modes).unwrap();
+        let workspace_personas = data.path().join(".agents/personas");
+        std::fs::create_dir_all(&workspace_personas).unwrap();
         std::fs::write(
-            workspace_modes.join("plan.toml"),
+            workspace_personas.join("plan.toml"),
             r#"
 id = "plan"
 display_name = "Interactive Plan Override"
@@ -16445,7 +16984,7 @@ default_permission_mode = "ask"
         ));
         assert!(store.queued_prompts(&audit_child.id).unwrap().is_empty());
 
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         std::fs::write(data.path().join("bridge-owner.txt"), "owned by the child").unwrap();
@@ -17951,7 +18490,7 @@ default_permission_mode = "ask"
                 &session,
                 &thread,
                 1,
-                &modes::fallback_mode(),
+                &personas::fallback_persona(),
                 &ctx,
                 &call,
                 &tokio_util::sync::CancellationToken::new(),
@@ -18023,7 +18562,7 @@ default_permission_mode = "ask"
             thread_id: thread.id.clone(),
             ..Default::default()
         };
-        let mode = modes::fallback_mode();
+        let mode = personas::fallback_persona();
         for (turn, call) in [
             (
                 2,
@@ -18616,7 +19155,7 @@ default_permission_mode = "ask"
             spawned: false,
             todos: Vec::new(),
         };
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         let tools_enabled = false;
@@ -18762,7 +19301,7 @@ default_permission_mode = "ask"
                 },
             )),
         );
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -18839,7 +19378,7 @@ default_permission_mode = "ask"
             name: "write_test".into(),
             arguments: serde_json::json!({}),
         };
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         let execution = tokio::spawn({
@@ -18935,7 +19474,7 @@ default_permission_mode = "ask"
                 },
             )),
         );
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         let ctx = ToolCtx {

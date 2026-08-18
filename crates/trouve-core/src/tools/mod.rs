@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use trouve_protocol::ToolStatus;
+use trouve_protocol::{AgentPersona, ToolStatus};
 use trouve_providers::ToolSpec;
 
 pub use edit_strategy::EditStrategy;
@@ -239,6 +239,25 @@ pub trait ToolExecutor: Send + Sync {
     /// request is stopped/reaped; the engine retains the session execution
     /// lane until this future acknowledges that cleanup.
     async fn execute(&self, ctx: &ToolCtx, name: &str, args: &Value) -> ToolResult;
+    /// Persist a user-level persona through the trusted filesystem boundary.
+    async fn upsert_persona_file(
+        &self,
+        _config_dir: &Path,
+        _persona: &AgentPersona,
+    ) -> Result<(), String> {
+        Err("persona persistence is unavailable in this executor".into())
+    }
+    /// Remove a user-level persona through the trusted filesystem boundary.
+    /// `allow_missing` is reserved for replaying a durable deletion intent
+    /// after the file mutation may already have completed.
+    async fn delete_persona_file(
+        &self,
+        _config_dir: &Path,
+        _id: &str,
+        _allow_missing: bool,
+    ) -> Result<(), String> {
+        Err("persona deletion is unavailable in this executor".into())
+    }
     /// Create an engine-owned worktree checkpoint through the same trusted
     /// execution boundary as other Git mutations.
     async fn checkpoint_worktree(
@@ -1877,6 +1896,40 @@ impl ToolExecutor for LocalToolExecutor {
             }
             None => ToolResult::error(format!("unknown tool: {name}")),
         }
+    }
+
+    async fn upsert_persona_file(
+        &self,
+        config_dir: &Path,
+        persona: &AgentPersona,
+    ) -> Result<(), String> {
+        let config_dir = config_dir.to_path_buf();
+        let persona = persona.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::personas::upsert_user_persona(&config_dir, &persona)
+        })
+        .await
+        .map_err(|error| format!("persona persistence worker failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    async fn delete_persona_file(
+        &self,
+        config_dir: &Path,
+        id: &str,
+        allow_missing: bool,
+    ) -> Result<(), String> {
+        let config_dir = config_dir.to_path_buf();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if allow_missing && crate::personas::user_persona_file(&config_dir, &id).is_none() {
+                return Ok(());
+            }
+            crate::personas::delete_user_persona(&config_dir, &id)
+        })
+        .await
+        .map_err(|error| format!("persona deletion worker failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
     }
 
     async fn checkpoint_worktree(

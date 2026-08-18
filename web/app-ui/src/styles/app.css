@@ -875,7 +875,7 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .settings-content > trouve-provider-settings,
 .settings-content > trouve-cli-settings,
 .settings-content > trouve-local-model-settings,
-.settings-content > trouve-mode-settings,
+.settings-content > trouve-persona-settings,
 .settings-content > trouve-mcp-settings,
 .settings-content > trouve-integrations-settings { display: block; width: 100%; }
 .settings-section { display: grid; align-content: start; gap: 12px; }

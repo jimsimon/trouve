@@ -467,30 +467,31 @@ impl ProtocolClient {
         self.get_json("/models").await
     }
 
-    pub async fn list_modes(&self, workspace_id: Option<&str>) -> Result<Vec<AgentMode>> {
+    pub async fn list_personas(&self, workspace_id: Option<&str>) -> Result<Vec<AgentPersona>> {
         match workspace_id {
-            Some(id) => self.get_json(&format!("/modes?workspace_id={id}")).await,
-            None => self.get_json("/modes").await,
+            Some(id) => self.get_json(&format!("/personas?workspace_id={id}")).await,
+            None => self.get_json("/personas").await,
         }
     }
 
-    /// Modes with provenance (builtin / customized / custom / workspace).
-    pub async fn list_mode_infos(&self, workspace_id: Option<&str>) -> Result<Vec<ModeInfo>> {
+    /// Personas with provenance (builtin / customized / custom / workspace).
+    pub async fn list_persona_infos(&self, workspace_id: Option<&str>) -> Result<Vec<PersonaInfo>> {
         match workspace_id {
             Some(id) => {
-                self.get_json(&format!("/mode-infos?workspace_id={id}"))
+                self.get_json(&format!("/persona-infos?workspace_id={id}"))
                     .await
             }
-            None => self.get_json("/mode-infos").await,
+            None => self.get_json("/persona-infos").await,
         }
     }
 
-    /// Create or update a user-level mode; a built-in id customizes that
+    /// Create or update a user-level persona; a built-in id customizes that
     /// built-in.
-    pub async fn upsert_mode(&self, id: &str, req: &UpsertModeRequest) -> Result<()> {
+    pub async fn upsert_persona(&self, id: &str, req: &UpsertPersonaRequest) -> Result<()> {
+        let id = urlencode_path_segment(id);
         let resp = self
             .http
-            .put(format!("{}/modes/{id}", self.base))
+            .put(format!("{}/personas/{id}", self.base))
             .json(req)
             .send()
             .await?;
@@ -501,14 +502,15 @@ impl ProtocolClient {
                 .await
                 .map(|e| e.message)
                 .unwrap_or_else(|_| status.to_string());
-            bail!("saving mode failed: {message}");
+            bail!("saving persona failed: {message}");
         }
         Ok(())
     }
 
-    /// Delete a custom mode / reset a customized built-in.
-    pub async fn delete_mode(&self, id: &str) -> Result<()> {
-        self.delete(&format!("/modes/{id}")).await
+    /// Delete a custom persona / reset a customized built-in.
+    pub async fn delete_persona(&self, id: &str) -> Result<()> {
+        let id = urlencode_path_segment(id);
+        self.delete(&format!("/personas/{id}")).await
     }
 
     pub async fn list_providers(&self) -> Result<ProvidersResponse> {
@@ -652,6 +654,24 @@ impl ProtocolClient {
             &SetDefaultModelRequest {
                 model: model.into(),
                 default_thinking_level: default_thinking_level.map(String::from),
+            },
+        )
+        .await
+    }
+
+    /// Atomically replace the global defaults inherited by new threads.
+    pub async fn set_global_defaults(
+        &self,
+        model: &str,
+        default_thinking_level: Option<&str>,
+        permission_mode: PermissionMode,
+    ) -> Result<()> {
+        self.put_empty(
+            "/config/defaults",
+            &SetGlobalDefaultsRequest {
+                model: model.into(),
+                default_thinking_level: default_thinking_level.map(String::from),
+                permission_mode,
             },
         )
         .await

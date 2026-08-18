@@ -18,20 +18,21 @@ pub fn ensure_compatible_protocol(server: &str, required: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trouve_protocol::PROTOCOL_VERSION;
 
     #[test]
     fn accepts_the_exact_required_protocol() {
-        ensure_compatible_protocol("5.3", "5.3").unwrap();
+        ensure_compatible_protocol(PROTOCOL_VERSION, PROTOCOL_VERSION).unwrap();
     }
 
     #[test]
     fn rejects_older_newer_other_major_and_malformed_protocols() {
-        for server in ["3.36", "4.0", "5.1", "5.2", "5.4", "unknown", "5.3.1"] {
-            let error = ensure_compatible_protocol(server, "5.3")
+        for server in ["4.0", "5.2", "6.1", "7.0", "7.2", "unknown", "7.1.1"] {
+            let error = ensure_compatible_protocol(server, PROTOCOL_VERSION)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(server));
-            assert!(error.contains("expected exactly 5.3"));
+            assert!(error.contains(&format!("expected exactly {PROTOCOL_VERSION}")));
         }
     }
 }

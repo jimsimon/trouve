@@ -148,6 +148,17 @@ CREATE TABLE IF NOT EXISTS artifact_cleanup_jobs (
   claim_token TEXT,
   created_at TEXT NOT NULL
 );
+-- Persona deletion is a cross-boundary mutation: repository references stay
+-- intact until the executor confirms the file removal, while this intent
+-- makes a completed file mutation recoverable after a crash.
+CREATE TABLE IF NOT EXISTS persona_cleanup_intents (
+  persona_id TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  claim_until TEXT,
+  claim_token TEXT,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
   cursor INTEGER PRIMARY KEY AUTOINCREMENT,
   scope_kind TEXT NOT NULL,
@@ -376,6 +387,8 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   line INTEGER NOT NULL,
   side TEXT NOT NULL,
   severity TEXT NOT NULL,
+  confidence TEXT NOT NULL DEFAULT 'medium',
+  title TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL,
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'open',
@@ -414,6 +427,8 @@ CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
   line INTEGER NOT NULL,
   side TEXT NOT NULL,
   severity TEXT NOT NULL,
+  confidence TEXT NOT NULL DEFAULT 'medium',
+  title TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL,
   reason TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -465,6 +480,14 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN next_attempt_at TEXT",
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_until TEXT",
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_token TEXT",
+    "CREATE TABLE IF NOT EXISTS persona_cleanup_intents (
+       persona_id TEXT PRIMARY KEY,
+       created_at TEXT NOT NULL
+     )",
+    "ALTER TABLE persona_cleanup_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE persona_cleanup_intents ADD COLUMN next_attempt_at TEXT",
+    "ALTER TABLE persona_cleanup_intents ADD COLUMN claim_until TEXT",
+    "ALTER TABLE persona_cleanup_intents ADD COLUMN claim_token TEXT",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
@@ -535,6 +558,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_tasks ADD COLUMN model_started_at TEXT",
     "ALTER TABLE code_review_tasks ADD COLUMN last_progress_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN github_publication_status TEXT NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE code_review_findings ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
+    "ALTER TABLE code_review_candidate_rejections ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
+    "ALTER TABLE code_review_findings ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_candidate_rejections ADD COLUMN title TEXT NOT NULL DEFAULT ''",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -557,11 +584,49 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
     backfill_code_review_collapse_pending(conn)?;
+    backfill_code_review_titles(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+fn backfill_code_review_titles(conn: &mut Connection) -> Result<()> {
+    for (migration_id, table) in [
+        (
+            "code-review-finding-title-backfill-v1",
+            "code_review_findings",
+        ),
+        (
+            "code-review-candidate-rejection-title-backfill-v1",
+            "code_review_candidate_rejections",
+        ),
+    ] {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let applied = tx
+            .query_row(
+                "SELECT 1 FROM store_migrations WHERE id = ?1",
+                [migration_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            tx.execute(
+                &format!(
+                    "UPDATE {table}\n                     SET title = substr(replace(replace(trim(body), char(10), ' '), char(13), ' '), 1, 200)\n                     WHERE title = ''"
+                ),
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+                params![migration_id, chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -1644,6 +1709,9 @@ fn code_review_publication_status(
     match value {
         "published" => trouve_protocol::CodeReviewFindingPublicationStatus::Published,
         "not_eligible" => trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
+        "suppressed_by_policy" => {
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
+        }
         "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
         _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
     }
@@ -2131,6 +2199,8 @@ pub struct NewCodeReviewFinding {
     pub line: u64,
     pub side: String,
     pub severity: String,
+    pub confidence: String,
+    pub title: String,
     pub body: String,
     pub prompt_for_agents: String,
     pub sources: Vec<trouve_protocol::CodeReviewFindingSource>,
@@ -2489,6 +2559,15 @@ pub(crate) struct ArtifactCleanupClaim {
     pub id: String,
     pub token: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersonaDeletionClaim {
+    pub id: String,
+    pub token: String,
+    pub attempts: i64,
+}
+
+const PERSONA_DELETION_CLAIM_MINUTES: i64 = 5;
 
 pub(crate) struct PromptAcceptance {
     pub prompt: trouve_protocol::QueuedPrompt,
@@ -5952,6 +6031,192 @@ impl Store {
         Ok(())
     }
 
+    /// Record a durable custom-persona deletion before filesystem work begins.
+    /// Repository references deliberately remain unchanged until the executor
+    /// confirms that the persona file was removed.
+    pub fn begin_persona_deletion(&self, id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO persona_cleanup_intents (persona_id, created_at)
+             VALUES (?1, ?2)",
+            params![id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn persona_deletion_pending(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM persona_cleanup_intents WHERE persona_id = ?1",
+                [id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn pending_persona_deletions(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT persona_id FROM persona_cleanup_intents ORDER BY created_at, persona_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn claim_next_persona_deletion(&self) -> Result<Option<PersonaDeletionClaim>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_at = chrono::Utc::now();
+        let now = now_at.to_rfc3339();
+        let candidate = tx
+            .query_row(
+                "SELECT persona_id, attempts
+                 FROM persona_cleanup_intents
+                 WHERE (claim_until IS NULL OR julianday(claim_until) <= julianday(?1))
+                   AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?1))
+                 ORDER BY created_at, persona_id
+                 LIMIT 1",
+                [&now],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((id, attempts)) = candidate else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let claim_until =
+            (now_at + chrono::Duration::minutes(PERSONA_DELETION_CLAIM_MINUTES)).to_rfc3339();
+        let claimed = tx.execute(
+            "UPDATE persona_cleanup_intents
+             SET claim_until = ?2, claim_token = ?3
+             WHERE persona_id = ?1
+               AND (claim_until IS NULL OR julianday(claim_until) <= julianday(?4))
+               AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?4))",
+            params![id, claim_until, token, now],
+        )?;
+        tx.commit()?;
+        if claimed != 1 {
+            return Ok(None);
+        }
+        Ok(Some(PersonaDeletionClaim {
+            id,
+            token,
+            attempts,
+        }))
+    }
+
+    pub(crate) fn fail_claimed_persona_deletion(&self, claim: &PersonaDeletionClaim) -> Result<()> {
+        let delay_seconds = match claim.attempts {
+            0 => 1,
+            1 => 5,
+            2 => 30,
+            3 => 120,
+            _ => 600,
+        };
+        let next_attempt_at =
+            (chrono::Utc::now() + chrono::Duration::seconds(delay_seconds)).to_rfc3339();
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE persona_cleanup_intents
+             SET attempts = attempts + 1, next_attempt_at = ?3,
+                 claim_until = NULL, claim_token = NULL
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![claim.id, claim.token, next_attempt_at],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "persona deletion claim {} is no longer owned",
+            claim.id
+        );
+        Ok(())
+    }
+
+    /// Remove a deleted custom persona from every repository and consume its
+    /// durable intent atomically. Filesystem work has already completed and no
+    /// executor call occurs while the SQLite connection is locked.
+    pub fn complete_persona_deletion(&self, id: &str) -> Result<()> {
+        self.complete_persona_deletion_with_claim(id, None)
+    }
+
+    pub(crate) fn complete_claimed_persona_deletion(
+        &self,
+        claim: &PersonaDeletionClaim,
+    ) -> Result<()> {
+        self.complete_persona_deletion_with_claim(&claim.id, Some(&claim.token))
+    }
+
+    fn complete_persona_deletion_with_claim(
+        &self,
+        id: &str,
+        claim_token: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let intent_exists = match claim_token {
+            Some(token) => tx
+                .query_row(
+                    "SELECT 1 FROM persona_cleanup_intents
+                     WHERE persona_id = ?1 AND claim_token = ?2",
+                    params![id, token],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some(),
+            None => tx
+                .query_row(
+                    "SELECT 1 FROM persona_cleanup_intents
+                     WHERE persona_id = ?1 AND claim_token IS NULL",
+                    [id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some(),
+        };
+        anyhow::ensure!(intent_exists, "persona deletion intent for {id} is missing");
+        let defaults = serde_json::to_string(&crate::reviewers::default_reviewer_ids())?;
+        tx.execute(
+            "UPDATE code_review_repositories SET
+               identity_ids = CASE
+                 WHEN EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value = ?1)
+                 THEN CASE
+                   WHEN EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value != ?1)
+                   THEN (SELECT json_group_array(value) FROM json_each(identity_ids) WHERE value != ?1)
+                   ELSE ?2
+                 END
+                 ELSE identity_ids
+               END,
+               included_reviewer_ids = (SELECT json_group_array(value) FROM json_each(included_reviewer_ids) WHERE value != ?1),
+               excluded_reviewer_ids = (SELECT json_group_array(value) FROM json_each(excluded_reviewer_ids) WHERE value != ?1),
+               reviewer_overrides = (SELECT json_group_array(value) FROM json_each(reviewer_overrides) WHERE json_extract(value, '$.reviewer_id') != ?1),
+               updated_at = ?3
+             WHERE EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value = ?1)
+                OR EXISTS (SELECT 1 FROM json_each(included_reviewer_ids) WHERE value = ?1)
+                OR EXISTS (SELECT 1 FROM json_each(excluded_reviewer_ids) WHERE value = ?1)
+                OR EXISTS (SELECT 1 FROM json_each(reviewer_overrides) WHERE json_extract(value, '$.reviewer_id') = ?1)",
+            params![id, defaults, chrono::Utc::now().to_rfc3339()],
+        )?;
+        tx.execute("DELETE FROM code_review_identities WHERE id = ?1", [id])?;
+        let deleted = match claim_token {
+            Some(token) => tx.execute(
+                "DELETE FROM persona_cleanup_intents
+                 WHERE persona_id = ?1 AND claim_token = ?2",
+                params![id, token],
+            )?,
+            None => tx.execute(
+                "DELETE FROM persona_cleanup_intents
+                 WHERE persona_id = ?1 AND claim_token IS NULL",
+                [id],
+            )?,
+        };
+        anyhow::ensure!(deleted == 1, "persona deletion intent for {id} is missing");
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn enqueue_code_review_job(
         &self,
         new_job: &NewCodeReviewJob,
@@ -6904,9 +7169,9 @@ impl Store {
             let finding_id = crate::new_id("rvf");
             tx.execute(
                 "INSERT INTO code_review_findings
-                        (id, job_id, path, line, side, severity, body,
+                        (id, job_id, path, line, side, severity, confidence, title, body,
                          prompt_for_agents, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'open', ?11)",
                 params![
                     finding_id,
                     job_id,
@@ -6914,6 +7179,8 @@ impl Store {
                     finding.line as i64,
                     finding.side,
                     finding.severity,
+                    finding.confidence,
+                    finding.title,
                     finding.body,
                     finding.prompt_for_agents,
                     now,
@@ -6946,8 +7213,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO code_review_candidate_rejections
                         (candidate_id, job_id, task_id, reviewer_id, reviewer_name,
-                         path, line, side, severity, body, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         path, line, side, severity, confidence, title, body, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     rejection.candidate_id,
                     job_id,
@@ -6958,6 +7225,8 @@ impl Store {
                     rejection.line as i64,
                     rejection.side,
                     rejection.severity,
+                    rejection.confidence,
+                    rejection.title,
                     rejection.body,
                     rejection.reason,
                     now,
@@ -6989,7 +7258,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT candidate_id, task_id, reviewer_id, reviewer_name,
-                    path, line, side, severity, body, reason
+                    path, line, side, severity, confidence, title, body, reason
              FROM code_review_candidate_rejections
              WHERE job_id = ?1
              ORDER BY reviewer_name, path, line, candidate_id",
@@ -7005,8 +7274,10 @@ impl Store {
                     line: row.get::<_, i64>(5)? as u64,
                     side: row.get(6)?,
                     severity: row.get(7)?,
-                    body: row.get(8)?,
-                    reason: row.get(9)?,
+                    confidence: row.get(8)?,
+                    title: row.get(9)?,
+                    body: row.get(10)?,
+                    reason: row.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -7076,6 +7347,9 @@ impl Store {
             trouve_protocol::CodeReviewFindingPublicationStatus::Pending => "pending",
             trouve_protocol::CodeReviewFindingPublicationStatus::Published => "published",
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible => "not_eligible",
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy => {
+                "suppressed_by_policy"
+            }
             trouve_protocol::CodeReviewFindingPublicationStatus::Failed => "failed",
         };
         let mut conn = self.conn.lock().unwrap();
@@ -7220,7 +7494,7 @@ impl Store {
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT j.installation_id, j.repository, j.pull_number,
-                    f.id, f.job_id, f.path, f.line, f.side, f.severity, f.body,
+                    f.id, f.job_id, f.path, f.line, f.side, f.severity, f.confidence, f.title, f.body,
                     f.prompt_for_agents, f.status, f.github_comment_id,
                     f.github_comment_url, f.github_publication_status,
                     f.github_thread_id, f.resolved_at
@@ -7254,17 +7528,19 @@ impl Store {
                         line: row.get::<_, i64>(6)? as u64,
                         side: row.get(7)?,
                         severity: row.get(8)?,
-                        body: row.get(9)?,
-                        prompt_for_agents: row.get(10)?,
-                        status: row.get(11)?,
+                        confidence: row.get(9)?,
+                        title: row.get(10)?,
+                        body: row.get(11)?,
+                        prompt_for_agents: row.get(12)?,
+                        status: row.get(13)?,
                         sources: Vec::new(),
-                        github_comment_id: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
-                        github_comment_url: row.get(13)?,
+                        github_comment_id: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
+                        github_comment_url: row.get(15)?,
                         github_publication_status: code_review_publication_status(
-                            &row.get::<_, String>(14)?,
+                            &row.get::<_, String>(16)?,
                         ),
-                        github_thread_id: row.get(15)?,
-                        resolved_at: parse_optional_datetime(row.get(16)?),
+                        github_thread_id: row.get(17)?,
+                        resolved_at: parse_optional_datetime(row.get(18)?),
                     },
                 ))
             })?
@@ -7279,7 +7555,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let base_rows: Vec<trouve_protocol::CodeReviewFinding> = {
             let mut stmt = conn.prepare(
-                "SELECT id, job_id, path, line, side, severity, body,
+                "SELECT id, job_id, path, line, side, severity, confidence, title, body,
                         prompt_for_agents, status, github_comment_id,
                         github_comment_url, github_publication_status,
                         github_thread_id, resolved_at
@@ -7294,17 +7570,19 @@ impl Store {
                     line: row.get::<_, i64>(3)? as u64,
                     side: row.get(4)?,
                     severity: row.get(5)?,
-                    body: row.get(6)?,
-                    prompt_for_agents: row.get(7)?,
-                    status: row.get(8)?,
+                    confidence: row.get(6)?,
+                    title: row.get(7)?,
+                    body: row.get(8)?,
+                    prompt_for_agents: row.get(9)?,
+                    status: row.get(10)?,
                     sources: Vec::new(),
-                    github_comment_id: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
-                    github_comment_url: row.get(10)?,
+                    github_comment_id: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+                    github_comment_url: row.get(12)?,
                     github_publication_status: code_review_publication_status(
-                        &row.get::<_, String>(11)?,
+                        &row.get::<_, String>(13)?,
                     ),
-                    github_thread_id: row.get(12)?,
-                    resolved_at: parse_optional_datetime(row.get(13)?),
+                    github_thread_id: row.get(14)?,
+                    resolved_at: parse_optional_datetime(row.get(15)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -11694,6 +11972,191 @@ mod tests {
     }
 
     #[test]
+    fn code_review_title_backfills_are_applied_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+             CREATE TABLE code_review_findings (title TEXT NOT NULL, body TEXT NOT NULL);
+             CREATE TABLE code_review_candidate_rejections (title TEXT NOT NULL, body TEXT NOT NULL);
+             INSERT INTO code_review_findings VALUES ('', 'Finding body');
+             INSERT INTO code_review_candidate_rejections VALUES ('', 'Rejection body');",
+        )
+        .unwrap();
+
+        backfill_code_review_titles(&mut conn).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM code_review_findings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let marker_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM store_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "Finding body");
+        assert_eq!(marker_count, 2);
+
+        conn.execute("UPDATE code_review_findings SET title = ''", [])
+            .unwrap();
+        backfill_code_review_titles(&mut conn).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM code_review_findings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "");
+    }
+
+    #[test]
+    fn persona_deletion_claims_are_fenced_and_back_off_durably() {
+        let store = Store::open_in_memory().unwrap();
+        store.begin_persona_deletion("custom").unwrap();
+
+        let first = store.claim_next_persona_deletion().unwrap().unwrap();
+        assert_eq!(first.id, "custom");
+        assert_eq!(first.attempts, 0);
+        assert!(store.claim_next_persona_deletion().unwrap().is_none());
+        assert!(store.complete_persona_deletion("custom").is_err());
+        assert!(store.persona_deletion_pending("custom").unwrap());
+
+        store.fail_claimed_persona_deletion(&first).unwrap();
+        assert!(store.claim_next_persona_deletion().unwrap().is_none());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE persona_cleanup_intents SET next_attempt_at = ?2
+                 WHERE persona_id = ?1",
+                params![
+                    "custom",
+                    (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+
+        let second = store.claim_next_persona_deletion().unwrap().unwrap();
+        assert_eq!(second.attempts, 1);
+        assert_ne!(second.token, first.token);
+        assert!(store.complete_claimed_persona_deletion(&first).is_err());
+        store.complete_claimed_persona_deletion(&second).unwrap();
+        assert!(!store.persona_deletion_pending("custom").unwrap());
+    }
+
+    #[test]
+    fn persona_reference_cleanup_is_durable_and_preserves_unrelated_selection() {
+        let store = Store::open_in_memory().unwrap();
+        let request = trouve_protocol::UpdateCodeReviewRepositoryRequest {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            mode: trouve_protocol::CodeReviewMode::Manual,
+            model: Some("openai/reviewer".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: "keep this".into(),
+            reviewer_ids: Some(vec!["custom".into()]),
+            routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
+            semantic_routing: Some(false),
+            included_reviewer_ids: Some(vec!["custom".into(), "reliability".into()]),
+            excluded_reviewer_ids: Some(vec!["custom".into()]),
+            reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
+                reviewer_id: "custom".into(),
+                model: None,
+                thinking_level: None,
+                prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
+                prompt: "custom prompt".into(),
+            }]),
+        };
+        store.update_code_review_repository(&request).unwrap();
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/empty".into(),
+                mode: trouve_protocol::CodeReviewMode::Manual,
+                model: None,
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: "preserve empty selection".into(),
+                reviewer_ids: Some(Vec::new()),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
+                semantic_routing: Some(false),
+                included_reviewer_ids: Some(vec!["custom".into()]),
+                excluded_reviewer_ids: Some(vec!["security".into()]),
+                reviewer_overrides: None,
+            })
+            .unwrap();
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/unrelated".into(),
+                mode: trouve_protocol::CodeReviewMode::Manual,
+                model: None,
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: String::new(),
+                reviewer_ids: Some(vec!["reliability".into()]),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
+                semantic_routing: Some(false),
+                included_reviewer_ids: Some(vec!["custom".into()]),
+                excluded_reviewer_ids: None,
+                reviewer_overrides: None,
+            })
+            .unwrap();
+
+        store.begin_persona_deletion("custom").unwrap();
+        assert!(store.persona_deletion_pending("custom").unwrap());
+        assert_eq!(store.pending_persona_deletions().unwrap(), ["custom"]);
+        let unchanged = store
+            .list_code_review_repositories()
+            .unwrap()
+            .into_iter()
+            .find(|repository| repository.repository == "acme/widgets")
+            .unwrap();
+        assert_eq!(unchanged.reviewer_ids, vec!["custom"]);
+        assert_eq!(
+            unchanged.included_reviewer_ids,
+            vec!["custom", "reliability"]
+        );
+        assert_eq!(unchanged.reviewer_overrides.len(), 1);
+
+        store.complete_persona_deletion("custom").unwrap();
+        assert!(!store.persona_deletion_pending("custom").unwrap());
+        let repositories = store.list_code_review_repositories().unwrap();
+        let cleaned = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/widgets")
+            .unwrap();
+        assert_eq!(
+            cleaned.reviewer_ids,
+            crate::reviewers::default_reviewer_ids()
+        );
+        assert_eq!(cleaned.included_reviewer_ids, vec!["reliability"]);
+        assert!(cleaned.excluded_reviewer_ids.is_empty());
+        assert!(cleaned.reviewer_overrides.is_empty());
+        assert_eq!(cleaned.prompt, "keep this");
+        assert_eq!(cleaned.model.as_deref(), Some("openai/reviewer"));
+
+        let empty = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/empty")
+            .unwrap();
+        assert!(empty.reviewer_ids.is_empty());
+        assert!(empty.included_reviewer_ids.is_empty());
+        assert_eq!(empty.excluded_reviewer_ids, ["security"]);
+        assert_eq!(empty.prompt, "preserve empty selection");
+        let unrelated = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/unrelated")
+            .unwrap();
+        assert_eq!(unrelated.reviewer_ids, ["reliability"]);
+        assert!(unrelated.included_reviewer_ids.is_empty());
+    }
+
+    #[test]
     fn code_review_policy_queue_and_manual_generations_are_durable() {
         let store = Store::open_in_memory().unwrap();
         store
@@ -12067,6 +12530,8 @@ mod tests {
                     line: 3,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Test finding".into(),
                     body: "finding".into(),
                     prompt_for_agents: "fix".into(),
                     sources: Vec::new(),
@@ -12140,6 +12605,8 @@ mod tests {
                     line: 3,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Test finding".into(),
                     body: "finding".into(),
                     prompt_for_agents: "fix".into(),
                     sources: Vec::new(),
@@ -12685,6 +13152,8 @@ mod tests {
                     line: 12,
                     side: "RIGHT".into(),
                     severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Ignored error".into(),
                     body: "The error is ignored.".into(),
                     prompt_for_agents: "Handle the error at src/lib.rs:12.".into(),
                     sources: vec![trouve_protocol::CodeReviewFindingSource {
@@ -12703,6 +13172,8 @@ mod tests {
                     line: 18,
                     side: "RIGHT".into(),
                     severity: "low".into(),
+                    confidence: "high".into(),
+                    title: "Simplify branch".into(),
                     body: "This branch could be simplified.".into(),
                     reason: "This is a non-actionable style preference.".into(),
                 }],
@@ -12715,6 +13186,7 @@ mod tests {
         assert_eq!(detail.tasks[0].output, "candidate output");
         assert_eq!(detail.personas[0].candidate_issue_count, 1);
         assert_eq!(detail.candidate_rejections.len(), 1);
+        assert_eq!(detail.candidate_rejections[0].confidence, "high");
         assert_eq!(
             detail.candidate_rejections[0].reason,
             "This is a non-actionable style preference."
@@ -12722,6 +13194,7 @@ mod tests {
         assert_eq!(detail.personas[0].confirmed_issue_count, 1);
         assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
+        assert_eq!(detail.findings[0].confidence, "high");
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
         assert_eq!(detail.routing_decisions, routing_decisions);
 

@@ -1089,8 +1089,10 @@ mod tests {
     async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Ok(pid) = std::fs::read_to_string(path) {
-                    break pid.trim().parse::<u32>().unwrap();
+                if let Ok(pid) = std::fs::read_to_string(path)
+                    && let Ok(pid) = pid.trim().parse::<u32>()
+                {
+                    break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

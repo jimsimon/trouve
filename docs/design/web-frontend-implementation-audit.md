@@ -139,7 +139,7 @@ forced colors/large text, and the PR dashboard; checks keyboard focus and
 selectable text; and fails on serious/critical axe findings. Its first run
 found keyboard-inaccessible CodeMirror scroll regions and forced-color token
 leakage. Expanding the route baselines also found a 2.26:1 primary-action
-contrast failure in Modes & Models. All three product defects were fixed
+contrast failure in Personas & Models. All three product defects were fixed
 rather than excluded from axe.
 
 ### Shared pull-request state
@@ -220,7 +220,7 @@ Cargo workspace on 2026-08-04:
   3,000,000-byte budget in each artifact; the artifact-boundary
   verifier also confirms that neither production distribution contains source
   maps and that desktop contains no PWA service worker or release metadata;
-- 20 Chromium visual baselines exist, including General, Modes & Models, and
+- 20 Chromium visual baselines exist, including General, Personas & Models, and
   Automations full-screen references; the combined desktop/mobile Chromium
   run passed all 20 applicable browser tests with four project-inapplicable
   cases skipped. The desktop and mobile terminal gallery references were

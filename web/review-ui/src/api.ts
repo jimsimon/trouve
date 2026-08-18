@@ -7,7 +7,7 @@ import type {
   LoginStarted,
   LoginStatus,
   Model,
-  ModeInfo,
+  PersonaInfo,
   Provider,
   ProvidersResponse,
   Repository,
@@ -142,21 +142,36 @@ export const saveRepository = (repository: Repository): Promise<Repository> =>
       reviewer_overrides: repository.reviewer_overrides ?? [],
     }),
   });
-export const saveReviewer = (
+const personaId = (reviewer: Pick<ReviewerProfile, "id" | "name">): string =>
+  reviewer.id || reviewer.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+export const saveReviewer = async (
   reviewer: Omit<ReviewerProfile, "built_in"> & { built_in?: boolean },
-): Promise<ReviewerProfile> =>
-  api("/code-review/reviewer", {
+): Promise<void> => {
+  const id = personaId(reviewer);
+  if (!id) {
+    throw new Error("Persona name must include at least one ASCII letter or digit.");
+  }
+  const existing = (await api<PersonaInfo[]>("/persona-infos"))
+    .find((info) => info.persona.id === id)
+    ?.persona;
+  if (reviewer.id === "" && existing !== undefined) {
+    throw new Error(`A persona with id "${id}" already exists.`);
+  }
+  await api(`/personas/${encodeURIComponent(id)}`, {
     method: "PUT",
     body: JSON.stringify({
-      id: reviewer.id || null,
-      name: reviewer.name,
-      prompt: reviewer.prompt,
-      model: reviewer.model || null,
+      display_name: reviewer.name,
+      system_prompt: reviewer.prompt,
+      allowed_tools: existing?.allowed_tools ?? [],
+      read_only: existing?.read_only ?? false,
+      default_permission_mode: existing?.default_permission_mode ?? null,
+      default_model: reviewer.model || null,
       default_thinking_level: reviewer.default_thinking_level || null,
     }),
   });
+};
 export const deleteReviewer = (id: string): Promise<void> =>
-  api(`/code-review/reviewer/${encodeURIComponent(id)}`, { method: "DELETE" });
+  api(`/personas/${encodeURIComponent(id)}`, { method: "DELETE" });
 export const configureApp = (body: {
   app_id: number;
   private_key_pem: string;
@@ -165,22 +180,22 @@ export const configureApp = (body: {
   api("/code-review/github-app", { method: "PUT", body: JSON.stringify(body) });
 export const getProviders = (): Promise<ProvidersResponse> => api("/providers");
 export const getModels = (): Promise<Model[]> => api("/models");
-export const getModeInfos = (): Promise<ModeInfo[]> => api("/mode-infos");
-export const saveMode = (mode: ModeInfo["mode"]): Promise<void> =>
-  api(`/modes/${encodeURIComponent(mode.id)}`, {
+export const getPersonaInfos = (): Promise<PersonaInfo[]> => api("/persona-infos");
+export const savePersona = (persona: PersonaInfo["persona"]): Promise<void> =>
+  api(`/personas/${encodeURIComponent(persona.id)}`, {
     method: "PUT",
     body: JSON.stringify({
-      display_name: mode.display_name,
-      system_prompt: mode.system_prompt,
-      allowed_tools: mode.allowed_tools,
-      read_only: mode.read_only,
-      default_permission_mode: mode.default_permission_mode ?? null,
-      default_model: mode.default_model ?? null,
-      default_thinking_level: mode.default_thinking_level ?? null,
+      display_name: persona.display_name,
+      system_prompt: persona.system_prompt,
+      allowed_tools: persona.allowed_tools,
+      read_only: persona.read_only,
+      default_permission_mode: persona.default_permission_mode ?? null,
+      default_model: persona.default_model ?? null,
+      default_thinking_level: persona.default_thinking_level ?? null,
     }),
   });
-export const resetMode = (id: string): Promise<void> =>
-  api(`/modes/${encodeURIComponent(id)}`, { method: "DELETE" });
+export const resetPersona = (id: string): Promise<void> =>
+  api(`/personas/${encodeURIComponent(id)}`, { method: "DELETE" });
 export const saveDefaultModel = (
   model: string,
   defaultThinkingLevel?: string,

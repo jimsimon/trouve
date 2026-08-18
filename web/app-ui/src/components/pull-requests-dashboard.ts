@@ -690,7 +690,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                 ${row.reviewSummary === "" ? nothing : html`<p>${row.reviewSummary}</p>`}
                 ${row.reviewFindings.map((finding) => html`<article class="finding">
                   <div class="finding-heading">
-                    <strong class=${finding.severity === "critical" || finding.severity === "high" ? "severe" : ""}>${finding.severity} · ${finding.location}</strong>
+                    <strong class=${finding.severity === "critical" || finding.severity === "high" ? "severe" : ""}>${finding.title}</strong>
                     <button
                       class="control"
                       type="button"
@@ -698,7 +698,11 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                       @click=${() => this.#fix(row, finding.prompt)}
                     >Fix</button>
                   </div>
+                  <small>Identified at ${finding.location} · Severity: ${finding.severity} · Confidence: ${finding.confidence}</small>
                   <p>${finding.body}</p>
+                  ${finding.publicationStatus === "suppressed_by_policy"
+                    ? html`<small>Retained in Trouve · Not posted to GitHub by confidence policy</small>`
+                    : nothing}
                 </article>`)}
               </section>`}
         </div>

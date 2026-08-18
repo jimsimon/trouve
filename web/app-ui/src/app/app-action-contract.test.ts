@@ -197,7 +197,7 @@ const SURFACES: readonly CallbackSurface[] = [
     ],
   },
   {
-    description: "global defaults, agent modes, and settings routing",
+    description: "global defaults, agent personas, and settings routing",
     callbacks: [
       "default-model-picked",
       "default-permission-picked",
@@ -209,12 +209,11 @@ const SURFACES: readonly CallbackSurface[] = [
     ],
     evidence: [
       {
-        path: "../components/mode-settings-panel.ts",
+        path: "../components/persona-settings-panel.ts",
         markers: [
-          "setDefaultModel",
-          "setDefaultPermissionMode",
-          "upsertMode",
-          "deleteMode",
+          "setGlobalDefaults",
+          "upsertPersona",
+          "deletePersona",
         ],
       },
       {

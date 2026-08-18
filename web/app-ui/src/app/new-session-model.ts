@@ -1,5 +1,5 @@
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolCreateThreadRequest,
   ProtocolModelInfo,
   ProtocolProvidersResponse,
@@ -131,7 +131,7 @@ export const thinkingOption = (
 /** Resolves the model shown for a new session in protocol precedence order. */
 export const resolveNewSessionModel = (
   explicitModel: string | null | undefined,
-  selectedMode: ProtocolAgentMode | null | undefined,
+  selectedMode: ProtocolAgentPersona | null | undefined,
   providers: ProtocolProvidersResponse | null | undefined,
 ): string | undefined =>
   nonEmpty(explicitModel)
@@ -143,7 +143,7 @@ const validPermissionMode = (value: unknown): ResolvedPermissionMode | undefined
 
 /** Resolve every inherited new-thread option to the concrete value the server uses. */
 export const resolveNewThreadDefaults = (
-  modes: readonly ProtocolAgentMode[],
+  modes: readonly ProtocolAgentPersona[],
   models: readonly ProtocolModelInfo[],
   providers: ProtocolProvidersResponse | null | undefined,
   overrides: { readonly modeId?: string; readonly modelId?: string } = {},

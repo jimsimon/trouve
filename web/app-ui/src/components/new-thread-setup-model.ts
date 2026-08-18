@@ -13,7 +13,7 @@ import {
   type PendingAttachment,
 } from "../services/attachments.js";
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolCreateThreadRequest,
   ProtocolModelInfo,
   ProtocolProvidersResponse,
@@ -23,7 +23,7 @@ import type {
 export type NewThreadPermissionSelection = "" | "ask" | "allow_list" | "yolo";
 
 export interface NewThreadSetupCatalog {
-  readonly modes: readonly ProtocolAgentMode[];
+  readonly modes: readonly ProtocolAgentPersona[];
   readonly models: readonly ProtocolModelInfo[];
   readonly providers: ProtocolProvidersResponse | undefined;
 }
@@ -75,9 +75,9 @@ const nonEmpty = (value: string): string | undefined => {
 };
 
 const knownMode = (
-  modes: readonly ProtocolAgentMode[],
+  modes: readonly ProtocolAgentPersona[],
   modeId: string,
-): ProtocolAgentMode | undefined => modes.find((mode) => mode.id === modeId);
+): ProtocolAgentPersona | undefined => modes.find((mode) => mode.id === modeId);
 
 const knownModel = (
   models: readonly ProtocolModelInfo[],

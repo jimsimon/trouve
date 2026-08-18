@@ -383,7 +383,7 @@ export class TrouveNewThreadSetup extends LitElement {
 
         <div class="option-grid">
           <label>
-            <span>Agent mode</span>
+            <span>Agent persona</span>
             <select
               name="mode"
               .value=${this.#draft.modeId}
@@ -577,7 +577,7 @@ export class TrouveNewThreadSetup extends LitElement {
     );
     try {
       const [modes, models, providers] = await Promise.all([
-        services.protocol.modes(workspaceId),
+        services.protocol.personas(workspaceId),
         services.modelCatalog.refresh("if-stale"),
         services.protocol.providers(),
       ]);
@@ -586,7 +586,7 @@ export class TrouveNewThreadSetup extends LitElement {
     } catch {
       if (generation !== this.#loadGeneration || workspaceId !== this.#effectiveWorkspaceId) return;
       this.#optionsError =
-        "Mode and model choices could not be loaded. Server defaults remain available while trouve retries automatically.";
+        "Persona and model choices could not be loaded. Server defaults remain available while trouve retries automatically.";
       this.#scheduleOptionsRetry();
     } finally {
       if (generation === this.#loadGeneration && workspaceId === this.#effectiveWorkspaceId) {
