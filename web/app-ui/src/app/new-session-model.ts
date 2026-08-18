@@ -38,6 +38,20 @@ export interface NewThreadInheritance {
   readonly inheritedPermissionMode: ResolvedPermissionMode | undefined;
 }
 
+export interface NewThreadOptionEdits {
+  readonly mode: boolean;
+  readonly model: boolean;
+  readonly thinking: boolean;
+  readonly permission: boolean;
+}
+
+export interface NewThreadOptionSelections {
+  readonly modeId: string;
+  readonly modelId: string;
+  readonly thinking: string;
+  readonly permissionMode: string;
+}
+
 export interface NewSessionThreadRequestInput {
   readonly sessionId: string;
   readonly title?: string | null;
@@ -189,6 +203,47 @@ export const resolveNewThreadDefaults = (
     permissionMode,
     inheritedThinking,
     inheritedPermissionMode,
+  };
+};
+
+export const createNewThreadOptionEdits = (): NewThreadOptionEdits => ({
+  mode: false,
+  model: false,
+  thinking: false,
+  permission: false,
+});
+
+/** Merge a refreshed catalog into fields the user has not edited. */
+export const reconcileNewThreadDefaults = (
+  selections: NewThreadOptionSelections,
+  modes: readonly ProtocolAgentPersona[],
+  models: readonly ProtocolModelInfo[],
+  providers: ProtocolProvidersResponse | null | undefined,
+  edits: NewThreadOptionEdits,
+): ResolvedNewThreadDefaults => {
+  const initial = resolveNewThreadDefaults(modes, models, providers);
+  const modeId = edits.mode && modes.some((mode) => mode.id === selections.modeId)
+    ? selections.modeId
+    : initial.modeId;
+  const modeDefaults = resolveNewThreadDefaults(modes, models, providers, { modeId });
+  const modelId = edits.model && models.some((model) => model.id === selections.modelId)
+    ? selections.modelId
+    : modeDefaults.modelId;
+  const refreshed = resolveNewThreadDefaults(modes, models, providers, { modeId, modelId });
+  const option = thinkingOption(models.find((model) => model.id === refreshed.modelId));
+  const keepThinking = edits.thinking
+    && option?.values.includes(selections.thinking) === true;
+  const permissionMode = validPermissionMode(selections.permissionMode);
+  const keepPermission = edits.permission && permissionMode !== undefined;
+
+  return {
+    ...refreshed,
+    thinking: keepThinking ? selections.thinking : refreshed.thinking,
+    inheritedThinking: keepThinking ? undefined : refreshed.inheritedThinking,
+    permissionMode: keepPermission ? permissionMode : refreshed.permissionMode,
+    inheritedPermissionMode: keepPermission
+      ? undefined
+      : refreshed.inheritedPermissionMode,
   };
 };
 

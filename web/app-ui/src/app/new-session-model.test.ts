@@ -7,10 +7,12 @@ import type {
 } from "../services/protocol-client.js";
 import {
   createNewSessionThreadRequest,
+  createNewThreadOptionEdits,
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
   NEW_THREAD_TITLE_FALLBACK,
   newThreadInheritanceForWorkspace,
+  reconcileNewThreadDefaults,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
@@ -216,6 +218,40 @@ describe("new session model", () => {
     expect(newThreadInheritanceForWorkspace(defaults, "ws-new", "ws-new")).toEqual({
       inheritedThinking: "high",
       inheritedPermissionMode: "yolo",
+    });
+  });
+
+  it("preserves pending edits while adopting refreshed defaults for untouched fields", () => {
+    const models = [model({
+      properties: {
+        thinking_level: { type: "string", enum: ["low", "high"] },
+      },
+    }, "provider/global")];
+    const refreshed = reconcileNewThreadDefaults(
+      {
+        modeId: "code",
+        modelId: "provider/global",
+        thinking: "low",
+        permissionMode: "ask",
+      },
+      [mode()],
+      models,
+      {
+        ...providers("provider/global"),
+        default_permission_mode: "yolo",
+        default_thinking_level: "high",
+      },
+      {
+        ...createNewThreadOptionEdits(),
+        permission: true,
+      },
+    );
+
+    expect(refreshed).toMatchObject({
+      thinking: "high",
+      inheritedThinking: "high",
+      permissionMode: "ask",
+      inheritedPermissionMode: undefined,
     });
   });
 

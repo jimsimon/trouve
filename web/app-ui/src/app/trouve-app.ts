@@ -113,12 +113,15 @@ import { createSignal, readSignal, withSignalTracking } from "../state/reactivit
 import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
   createNewSessionThreadRequest,
+  createNewThreadOptionEdits,
   newThreadInheritanceForWorkspace,
+  reconcileNewThreadDefaults,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   sessionTitleFallback,
   thinkingOption,
+  type NewThreadOptionEdits,
 } from "./new-session-model.js";
 import {
   composerTextareaLayout,
@@ -394,6 +397,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionInheritedPermissionMode: string | undefined;
   #newSessionInheritedThinking: string | undefined;
   #newSessionOptionsWorkspaceId = "";
+  #newSessionOptionEdits: NewThreadOptionEdits = createNewThreadOptionEdits();
   #newSessionOptionsPending = false;
   #newSessionOptionsError = "";
   #newSessionOptionsGeneration = 0;
@@ -1355,6 +1359,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPromptComposing = false;
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;
+    this.#newSessionOptionEdits = createNewThreadOptionEdits();
     const defaults = resolveNewThreadDefaults(
       this.#newSessionModes,
       this.#availableNewSessionModels(),
@@ -1671,6 +1676,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionOptionsPending = true;
     this.#newSessionOptionsError = "";
     this.#newSessionOptionsWorkspaceId = "";
+    this.#newSessionOptionEdits = createNewThreadOptionEdits();
     // Until this workspace's metadata arrives, preserve the values shown as explicit choices.
     this.#newSessionInheritedPermissionMode = undefined;
     this.#newSessionInheritedThinking = undefined;
@@ -1699,7 +1705,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionModels = models;
       this.#newSessionProviders = providers;
       this.#newSessionOptionsWorkspaceId = workspaceId;
-      const defaults = resolveNewThreadDefaults(modes, models, providers);
+      const defaults = reconcileNewThreadDefaults(
+        {
+          modeId: this.#newSessionModeId,
+          modelId: this.#newSessionModelId,
+          thinking: this.#newSessionThinking,
+          permissionMode: this.#newSessionPermissionMode,
+        },
+        modes,
+        models,
+        providers,
+        this.#newSessionOptionEdits,
+      );
       this.#newSessionModeId = defaults.modeId;
       this.#newSessionModelId = defaults.modelId;
       this.#newSessionThinking = defaults.thinking;
@@ -2875,6 +2892,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   .value=${this.#newSessionModeId}
                   ?disabled=${this.#newSessionPending}
                   @change=${(event: Event) => {
+                    this.#newSessionOptionEdits = {
+                      mode: true,
+                      model: false,
+                      thinking: false,
+                      permission: false,
+                    };
                     const defaults = resolveNewThreadDefaults(
                       this.#newSessionModes,
                       newSessionModels,
@@ -2920,6 +2943,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   .health=${newSessionModelHealth}
                   .disabled=${this.#newSessionPending}
                   @trouve-model-picked=${(event: CustomEvent<{ readonly modelId: string }>) => {
+                    this.#newSessionOptionEdits = {
+                      ...this.#newSessionOptionEdits,
+                      model: true,
+                      thinking: false,
+                    };
                     const defaults = resolveNewThreadDefaults(
                       this.#newSessionModes,
                       newSessionModels,
@@ -2948,6 +2976,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   .value=${this.#newSessionPermissionMode}
                   ?disabled=${this.#newSessionPending}
                   @change=${(event: Event) => {
+                    this.#newSessionOptionEdits = {
+                      ...this.#newSessionOptionEdits,
+                      permission: true,
+                    };
                     const value = (event.currentTarget as HTMLSelectElement).value;
                     this.#newSessionPermissionMode = value === "ask"
                         || value === "allow_list"
@@ -2975,6 +3007,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   .value=${newSessionThinkingOption === undefined ? "" : this.#newSessionThinking}
                   ?disabled=${this.#newSessionPending}
                   @change=${(event: Event) => {
+                    this.#newSessionOptionEdits = {
+                      ...this.#newSessionOptionEdits,
+                      thinking: true,
+                    };
                     const value = (event.currentTarget as HTMLSelectElement).value;
                     this.#newSessionThinking = value || resolveNewThreadDefaults(
                       this.#newSessionModes,
