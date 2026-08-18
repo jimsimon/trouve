@@ -751,17 +751,17 @@ for sequence in $(seq 1 1024); do
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$sequence"
 done
 echo '{"jsonrpc":"2.0","id":101,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c2","title":"overflow","kind":"execute"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}'
-while IFS= read -r dropped; do
-    if [[ "$dropped" == *'"id":101'* ]]; then
-        printf '%s\n' "$dropped" > "$0.dropped.tmp"
+received_dropped=false
+received_cancel=false
+while [[ "$received_dropped" != true || "$received_cancel" != true ]] && IFS= read -r message; do
+    if [[ "$message" == *'"id":101'* ]]; then
+        printf '%s\n' "$message" > "$0.dropped.tmp"
         mv "$0.dropped.tmp" "$0.dropped"
-        break
+        received_dropped=true
     fi
-done
-while IFS= read -r cancel; do
-    if [[ "$cancel" == *'"method":"session/cancel"'* ]]; then
+    if [[ "$message" == *'"method":"session/cancel"'* ]]; then
         echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"cancelled"}}'
-        break
+        received_cancel=true
     fi
 done
 cat > /dev/null
