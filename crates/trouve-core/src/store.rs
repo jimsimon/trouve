@@ -6542,6 +6542,7 @@ impl Store {
                  WHERE repository = ?1 AND pull_number = ?2
                    AND trigger = 'automatic'
                    AND status IN ('queued', 'running')
+                   AND publication_claimed = 0
                  ORDER BY created_at",
             )?;
             let rows = stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?;
@@ -6552,10 +6553,12 @@ impl Store {
                 "UPDATE code_review_jobs
                  SET status = 'stale', review_url = '',
                      error = 'pull request is a draft; automatic review stopped',
-                     completed_at = ?3
+                     completed_at = ?3,
+                     dedupe_key = 'draft-stale:' || id || ':' || dedupe_key
                  WHERE repository = ?1 AND pull_number = ?2
                    AND trigger = 'automatic'
-                   AND status IN ('queued', 'running')",
+                   AND status IN ('queued', 'running')
+                   AND publication_claimed = 0",
                 params![
                     repository,
                     pull_number as i64,
@@ -14762,6 +14765,16 @@ mod tests {
             store.claim_code_review_job().unwrap().unwrap().job.id,
             running_automatic.id
         );
+        let publishing_automatic = enqueue("automatic-publishing", "automatic");
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            publishing_automatic.id
+        );
+        assert!(
+            store
+                .claim_code_review_publication(&publishing_automatic.id)
+                .unwrap()
+        );
         let queued_automatic = enqueue("automatic-queued", "automatic");
         let queued_manual = enqueue("manual-queued", "manual");
 
@@ -14782,7 +14795,37 @@ mod tests {
         }
         assert_eq!(
             store
+                .code_review_job(&publishing_automatic.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "running"
+        );
+        assert_eq!(
+            store
                 .code_review_job(&queued_manual.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "queued"
+        );
+
+        let requeued_automatic = enqueue("automatic-queued", "automatic");
+        assert_ne!(requeued_automatic.id, queued_automatic.id);
+        let retry = store
+            .retry_code_review_job(&running_automatic.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.trigger, "retry");
+        let superseded = store
+            .supersede_automatic_code_review_jobs_for_draft("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(superseded, vec![requeued_automatic.id]);
+        assert_eq!(
+            store
+                .code_review_job(&retry.id)
                 .unwrap()
                 .unwrap()
                 .job
