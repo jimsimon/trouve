@@ -2915,6 +2915,12 @@ impl Engine {
             let result = (|| -> Result<()> {
                 validate_sha(&pull.base.sha)?;
                 validate_sha(&pull.head.sha)?;
+                if pull.draft {
+                    self.supersede_automatic_code_reviews_for_draft(
+                        &repository.repository,
+                        pull.number,
+                    )?;
+                }
                 let superseded = self.store.supersede_code_review_jobs(
                     &repository.repository,
                     pull.number,
@@ -3053,6 +3059,67 @@ impl Engine {
         Ok(had_errors)
     }
 
+    fn supersede_automatic_code_reviews_for_draft(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<()> {
+        let superseded = self
+            .store
+            .supersede_automatic_code_review_jobs_for_draft(repository, pull_number)?;
+        if superseded.is_empty() {
+            return Ok(());
+        }
+        self.code_review.cancel_superseded(&superseded);
+        for job_id in superseded {
+            self.emit_code_review_updated(Some(job_id))?;
+        }
+        Ok(())
+    }
+
+    async fn supersede_automatic_code_reviews_if_currently_draft(
+        &self,
+        api: &GithubApi,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<()> {
+        let (current, rate): (GithubPullRequest, _) = api
+            .get(&format!("/repos/{repository}/pulls/{pull_number}"))
+            .await
+            .context("revalidating converted-to-draft webhook")?;
+        self.record_review_rate(rate);
+        if current.draft {
+            self.supersede_automatic_code_reviews_for_draft(repository, pull_number)?;
+        }
+        Ok(())
+    }
+
+    async fn revalidate_code_review_publication(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+    ) -> Result<()> {
+        let (current, rate): (GithubPullRequest, _) = api
+            .get(&format!(
+                "/repos/{}/pulls/{}",
+                job.repository, job.pull_number
+            ))
+            .await
+            .context("revalidating pull request before publication")?;
+        self.record_review_rate(rate);
+        if current.state != "open"
+            || current.base.sha != job.base_ref
+            || current.head.sha != job.head_sha
+        {
+            bail!("stale: pull request revision changed before the review was published");
+        }
+        if job.trigger == "automatic" && current.draft {
+            self.supersede_automatic_code_reviews_for_draft(&job.repository, job.pull_number)?;
+            bail!("stale: pull request is a draft; automatic review stopped");
+        }
+        Ok(())
+    }
+
     async fn poll_manual_review_comments(
         &self,
         api: &GithubApi,
@@ -3183,6 +3250,7 @@ impl Engine {
                     | "reopened"
                     | "synchronize"
                     | "ready_for_review"
+                    | "converted_to_draft"
                     | "review_requested"
                     | "review_request_removed"
             );
@@ -3222,6 +3290,15 @@ impl Engine {
                 )
             })
         });
+        let converted_to_draft_pull =
+            (event == "pull_request" && action == "converted_to_draft" && repository.is_some())
+                .then(|| {
+                    payload["number"]
+                        .as_u64()
+                        .or_else(|| payload["pull_request"]["number"].as_u64())
+                        .unwrap_or_default()
+                })
+                .filter(|pull_number| *pull_number > 0);
         if !self
             .store
             .claim_github_webhook_delivery(delivery_id, durable_request)?
@@ -3232,6 +3309,27 @@ impl Engine {
             let engine = self.clone();
             tokio::spawn(async move {
                 let _guard = engine.code_review.reconcile_lock.lock().await;
+                if let Some(pull_number) = converted_to_draft_pull {
+                    match engine.installation_api(repository.installation_id).await {
+                        Ok(api) => {
+                            if let Err(error) = engine
+                                .supersede_automatic_code_reviews_if_currently_draft(
+                                    &api,
+                                    &repository.repository,
+                                    pull_number,
+                                )
+                                .await
+                            {
+                                engine.record_review_error(format!(
+                                    "handling converted-to-draft webhook failed: {error:#}"
+                                ));
+                            }
+                        }
+                        Err(error) => engine.record_review_error(format!(
+                            "authenticating converted-to-draft webhook failed: {error:#}"
+                        )),
+                    }
+                }
                 if let Err(error) = engine.poll_code_review_repository(&repository).await {
                     engine.record_review_error(format!("webhook reconciliation failed: {error:#}"));
                 }
@@ -4254,20 +4352,7 @@ impl Engine {
             .installation_api(job.installation_id)
             .await
             .context("refreshing GitHub App credentials before publication")?;
-        let (current, rate): (GithubPullRequest, _) = api
-            .get_cached(
-                &format!("/repos/{}/pulls/{}", job.repository, job.pull_number),
-                &self.code_review.rest_cache,
-            )
-            .await
-            .context("revalidating pull request before publication")?;
-        self.record_review_rate(rate);
-        if current.state != "open"
-            || current.base.sha != job.base_ref
-            || current.head.sha != job.head_sha
-        {
-            bail!("stale: pull request revision changed before the review was published");
-        }
+        self.revalidate_code_review_publication(&api, &job).await?;
         if !self.store.claim_code_review_publication(&job.id)? {
             bail!("stale: review was cancelled before publication");
         }
@@ -11393,6 +11478,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn draft_revalidation_cancels_only_when_github_is_currently_draft() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let first = enqueue_test_review_job(&store, "acme/widgets#42:draft-current");
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        let pull = |draft| {
+            serde_json::json!({
+                "number": 42,
+                "title": "Ship widgets",
+                "html_url": "https://github.com/acme/widgets/pull/42",
+                "draft": draft,
+                "state": "open",
+                "base": {"ref": "main", "sha": "main"},
+                "head": {
+                    "ref": "ship",
+                    "sha": "2222222222222222222222222222222222222222"
+                }
+            })
+            .to_string()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(listener, vec![pull(true), pull(false)]);
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        engine
+            .supersede_automatic_code_reviews_if_currently_draft(&api, "acme/widgets", 42)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .store
+                .code_review_job(&first.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "stale"
+        );
+
+        let second = enqueue_test_review_job(
+            &engine.store,
+            "acme/widgets#42:stale-converted-to-draft-webhook",
+        );
+        engine
+            .supersede_automatic_code_reviews_if_currently_draft(&api, "acme/widgets", 42)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            engine
+                .store
+                .code_review_job(&second.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_revalidation_rejects_draft_only_for_automatic_reviews() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let automatic = enqueue_test_review_job(&store, "acme/widgets#42:publish-draft");
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            automatic.id
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        let body = serde_json::json!({
+            "number": 42,
+            "title": "Ship widgets",
+            "html_url": "https://github.com/acme/widgets/pull/42",
+            "draft": true,
+            "state": "open",
+            "base": {"ref": "main", "sha": "main"},
+            "head": {
+                "ref": "ship",
+                "sha": "2222222222222222222222222222222222222222"
+            }
+        })
+        .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(listener, vec![body.clone(), body]);
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let error = engine
+            .revalidate_code_review_publication(&api, &automatic)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "stale: pull request is a draft; automatic review stopped"
+        );
+        assert_eq!(
+            engine
+                .store
+                .code_review_job(&automatic.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "stale"
+        );
+        let replacement = enqueue_test_review_job(&engine.store, "acme/widgets#42:publish-draft");
+        assert_ne!(replacement.id, automatic.id);
+
+        let mut manual = automatic;
+        manual.trigger = "manual".into();
+        engine
+            .revalidate_code_review_publication(&api, &manual)
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fixed_findings_close_and_pending_collapses_survive_remote_failures() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let previous_job = enqueue_test_review_job(&store, "acme/widgets#42:previous-round");
@@ -12987,6 +13202,37 @@ mod tests {
                 trigger_key: "manual:comment:100".into(),
             }]
         );
+    }
+
+    #[test]
+    fn converted_to_draft_webhook_ignores_unconfigured_repository() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:automatic-draft");
+        let mut engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        engine.secrets = Arc::new(trouve_providers::secrets::FileStore::new(
+            data.path().join("secrets.json"),
+        ));
+        let engine = Arc::new(engine);
+        engine.secrets.set(WEBHOOK_SECRET, "shared-secret").unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "converted_to_draft",
+            "number": 42,
+            "installation": {"id": 99},
+            "repository": {"full_name": "acme/widgets"},
+            "pull_request": {"number": 42, "draft": true}
+        }))
+        .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(&body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        engine
+            .accept_github_review_webhook("pull_request", "delivery-draft-1", &signature, &body)
+            .unwrap();
+
+        let unchanged = engine.store.code_review_job(&job.id).unwrap().unwrap().job;
+        assert_eq!(unchanged.status, "queued");
     }
 
     #[test]

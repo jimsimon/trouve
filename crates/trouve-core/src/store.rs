@@ -598,6 +598,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_code_review_finding_publication_status(conn)?;
     backfill_code_review_collapse_pending(conn)?;
     backfill_code_review_titles(conn)?;
+    normalize_draft_stale_code_review_dedupe_keys(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
     migrate_session_summary_projection(conn)?;
@@ -677,6 +678,25 @@ fn backfill_code_review_watermarks(conn: &mut Connection) -> Result<()> {
         params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Releases canonical automatic-review keys held by draft-stale jobs written
+/// by an older binary. This intentionally runs on every startup so restoring a
+/// current binary after a rollback also repairs rows created during rollback.
+fn normalize_draft_stale_code_review_dedupe_keys(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE code_review_jobs
+         SET dedupe_key = 'draft-stale:' || id || ':' || dedupe_key
+         WHERE status = 'stale'
+           AND trigger = 'automatic'
+           AND error IN (
+               'stale: pull request is a draft; automatic review stopped',
+               'pull request is a draft; automatic review stopped'
+           )
+           AND dedupe_key NOT LIKE 'draft-stale:%'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -6522,6 +6542,47 @@ impl Store {
                     ),
                     chrono::Utc::now().to_rfc3339(),
                     config_hash,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    pub fn supersede_automatic_code_review_jobs_for_draft(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2
+                   AND trigger = 'automatic'
+                   AND status IN ('queued', 'running')
+                   AND publication_claimed = 0
+                 ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !ids.is_empty() {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET status = 'stale', review_url = '',
+                     error = 'pull request is a draft; automatic review stopped',
+                     completed_at = ?3,
+                     dedupe_key = 'draft-stale:' || id || ':' || dedupe_key
+                 WHERE repository = ?1 AND pull_number = ?2
+                   AND trigger = 'automatic'
+                   AND status IN ('queued', 'running')
+                   AND publication_claimed = 0",
+                params![
+                    repository,
+                    pull_number as i64,
+                    chrono::Utc::now().to_rfc3339(),
                 ],
             )?;
         }
@@ -13175,6 +13236,61 @@ mod tests {
     }
 
     #[test]
+    fn draft_stale_dedupe_normalization_runs_on_reopen_and_is_idempotent() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("draft-stale.sqlite3");
+        let legacy = {
+            let store = Store::open(&database).unwrap();
+            let legacy = enqueue_backoff_test_job(&store);
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                legacy.id
+            );
+            assert!(
+                store
+                    .finish_code_review_job(
+                        &legacy.id,
+                        "stale",
+                        "",
+                        "stale: pull request is a draft; automatic review stopped",
+                    )
+                    .unwrap()
+            );
+            legacy
+        };
+
+        let normalized_key = {
+            let store = Store::open(&database).unwrap();
+            let normalized_key = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT dedupe_key FROM code_review_jobs WHERE id = ?1",
+                    params![legacy.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            let replacement = enqueue_backoff_test_job(&store);
+            assert_ne!(replacement.id, legacy.id);
+            normalized_key
+        };
+
+        let store = Store::open(&database).unwrap();
+        let reopened_key = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT dedupe_key FROM code_review_jobs WHERE id = ?1",
+                params![legacy.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(reopened_key, normalized_key);
+    }
+
+    #[test]
     fn a_latest_superseded_attempt_does_not_resurrect_an_older_success() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
@@ -14681,6 +14797,115 @@ mod tests {
         assert_eq!(
             store.pending_code_review_job_cleanups().unwrap(),
             vec![(old_head.id, "se_old".into())]
+        );
+    }
+
+    #[test]
+    fn draft_pull_supersedes_only_automatic_active_jobs() {
+        let store = Store::open_in_memory().unwrap();
+        let enqueue = |suffix: &str, trigger: &str| {
+            store
+                .enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key: format!("acme/widgets#42:{suffix}"),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number: 42,
+                    pull_title: "Ship widgets".into(),
+                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                    head_sha: "head".into(),
+                    review_base_sha: "base".into(),
+                    base_ref: "base".into(),
+                    head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                    trigger: trigger.into(),
+                    retry_of: None,
+                    model: None,
+                    coordinator_thinking_level: None,
+                    router_model: None,
+                    router_thinking_level: None,
+                    prompt: String::new(),
+                    reviewers: Vec::new(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                    semantic_routing: false,
+                    included_reviewer_ids: Vec::new(),
+                    excluded_reviewer_ids: Vec::new(),
+                    config_hash: "config".into(),
+                })
+                .unwrap()
+                .unwrap()
+        };
+
+        let running_automatic = enqueue("automatic-running", "automatic");
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            running_automatic.id
+        );
+        let publishing_automatic = enqueue("automatic-publishing", "automatic");
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            publishing_automatic.id
+        );
+        assert!(
+            store
+                .claim_code_review_publication(&publishing_automatic.id)
+                .unwrap()
+        );
+        let queued_automatic = enqueue("automatic-queued", "automatic");
+        let queued_manual = enqueue("manual-queued", "manual");
+
+        let mut superseded = store
+            .supersede_automatic_code_review_jobs_for_draft("acme/widgets", 42)
+            .unwrap();
+        superseded.sort();
+        let mut expected = vec![running_automatic.id.clone(), queued_automatic.id.clone()];
+        expected.sort();
+        assert_eq!(superseded, expected);
+        for id in [&running_automatic.id, &queued_automatic.id] {
+            let job = store.code_review_job(id).unwrap().unwrap().job;
+            assert_eq!(job.status, "stale");
+            assert_eq!(
+                job.error,
+                "pull request is a draft; automatic review stopped"
+            );
+        }
+        assert_eq!(
+            store
+                .code_review_job(&publishing_automatic.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "running"
+        );
+        assert_eq!(
+            store
+                .code_review_job(&queued_manual.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "queued"
+        );
+
+        let requeued_automatic = enqueue("automatic-queued", "automatic");
+        assert_ne!(requeued_automatic.id, queued_automatic.id);
+        let retry = store
+            .retry_code_review_job(&running_automatic.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.trigger, "retry");
+        let superseded = store
+            .supersede_automatic_code_review_jobs_for_draft("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(superseded, vec![requeued_automatic.id]);
+        assert_eq!(
+            store
+                .code_review_job(&retry.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "queued"
         );
     }
 
