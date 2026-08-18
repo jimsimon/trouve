@@ -346,6 +346,23 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         Err("review repository diff is unavailable in this executor".into())
     }
+    /// Read review diffs with optional trusted snapshot metadata. Existing
+    /// executors remain compatible by supplying ordinary diff files.
+    async fn review_repository_diff_with_metadata(
+        &self,
+        request: &ReviewRepositoryDiff,
+    ) -> Result<Vec<ReviewDiffFileWithMetadata>, String> {
+        self.review_repository_diff(request).await.map(|files| {
+            files
+                .into_iter()
+                .map(|file| ReviewDiffFileWithMetadata {
+                    path: file.path,
+                    diff: file.diff,
+                    generated_header: None,
+                })
+                .collect()
+        })
+    }
     /// Read a bounded current-worktree diff through the trusted Git boundary.
     async fn session_diff(&self, _request: &SessionRepositoryDiff) -> Result<String, String> {
         Err("session diff is unavailable in this executor".into())
@@ -918,6 +935,57 @@ async fn run_review_command_with_timeout(
 pub struct ReviewDiffFile {
     pub path: String,
     pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDiffFileWithMetadata {
+    pub path: String,
+    pub diff: String,
+    /// Newline-separated generated-marker tokens matched in the current
+    /// snapshot. Raw patch text never populates this field, and deletions keep
+    /// their full diff by leaving it absent.
+    pub generated_header: Option<String>,
+}
+
+pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+    if matches!(
+        file_name,
+        "Cargo.lock"
+            | "Gemfile.lock"
+            | "Pipfile.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "composer.lock"
+            | "go.sum"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "poetry.lock"
+            | "uv.lock"
+            | "yarn.lock"
+    ) {
+        return false;
+    }
+    path.split('/').any(|component| {
+        matches!(
+            component,
+            "generated" | "snapshots" | "__snapshots__" | "__screenshots__"
+        )
+    }) || file_name.ends_with(".snap")
+        || file_name.ends_with(".min.js")
+        || file_name.ends_with(".min.css")
+        || [
+            ".js.map",
+            ".mjs.map",
+            ".cjs.map",
+            ".css.map",
+            ".d.ts.map",
+            ".d.mts.map",
+            ".d.cts.map",
+        ]
+        .iter()
+        .any(|suffix| file_name.ends_with(suffix))
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -2261,6 +2329,23 @@ impl ToolExecutor for LocalToolExecutor {
         &self,
         request: &ReviewRepositoryDiff,
     ) -> Result<Vec<ReviewDiffFile>, String> {
+        self.review_repository_diff_with_metadata(request)
+            .await
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| ReviewDiffFile {
+                        path: file.path,
+                        diff: file.diff,
+                    })
+                    .collect()
+            })
+    }
+
+    async fn review_repository_diff_with_metadata(
+        &self,
+        request: &ReviewRepositoryDiff,
+    ) -> Result<Vec<ReviewDiffFileWithMetadata>, String> {
         validate_review_commit(&request.base_sha)?;
         let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
         let base_sha = request.base_sha.clone();
@@ -2273,11 +2358,16 @@ impl ToolExecutor for LocalToolExecutor {
                 MAX_REVIEW_DIFF_CHANGED_LINES,
                 MAX_REVIEW_DIFF_BYTES,
                 &cancel,
+                is_conventional_generated_artifact_path,
             )
             .map(|files| {
                 files
                     .into_iter()
-                    .map(|(path, diff)| ReviewDiffFile { path, diff })
+                    .map(|file| ReviewDiffFileWithMetadata {
+                        path: file.path,
+                        diff: file.diff,
+                        generated_header: file.generated_header,
+                    })
                     .collect()
             })
         })
@@ -2519,6 +2609,56 @@ impl ToolExecutor for LocalToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_diff_file_preserves_two_field_construction() {
+        let file = ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "+pub fn added() {}\n".into(),
+        };
+
+        assert_eq!(file.path, "src/lib.rs");
+        assert_eq!(file.diff, "+pub fn added() {}\n");
+    }
+
+    #[test]
+    fn generated_artifact_paths_exclude_lockfiles_and_unrelated_map_files() {
+        for lockfile in [
+            "Cargo.lock",
+            "Gemfile.lock",
+            "Pipfile.lock",
+            "bun.lock",
+            "bun.lockb",
+            "composer.lock",
+            "go.sum",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "poetry.lock",
+            "uv.lock",
+            "yarn.lock",
+        ] {
+            assert!(!is_conventional_generated_artifact_path(&format!(
+                "generated/{lockfile}"
+            )));
+        }
+        for source_map in [
+            "assets/app.js.map",
+            "assets/app.mjs.map",
+            "assets/app.cjs.map",
+            "assets/app.css.map",
+            "assets/app.d.ts.map",
+            "assets/app.d.mts.map",
+            "assets/app.d.cts.map",
+        ] {
+            assert!(is_conventional_generated_artifact_path(source_map));
+        }
+        assert!(!is_conventional_generated_artifact_path(
+            "assets/regions.map"
+        ));
+        assert!(is_conventional_generated_artifact_path(
+            "generated/client.rs"
+        ));
+    }
 
     #[test]
     fn session_creation_receipt_rolls_back_exactly_once_before_durability() {

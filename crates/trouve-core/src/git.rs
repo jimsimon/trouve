@@ -3,7 +3,7 @@
 //! Everything shells out to `git`; all functions are synchronous and are
 //! called via `spawn_blocking` from async code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -180,6 +180,12 @@ struct BoundedGitOutput {
     truncated: bool,
 }
 
+struct BoundedGitCommandOutput {
+    stdout: BoundedGitOutput,
+    stderr: BoundedGitOutput,
+    status: ExitStatus,
+}
+
 struct GitOperation<'a> {
     deadline: Instant,
     timeout: Duration,
@@ -210,10 +216,15 @@ impl<'a> GitOperation<'a> {
         }
     }
 
-    fn check(&self) -> Result<()> {
+    fn check_cancelled(&self) -> Result<()> {
         if self.cancel.is_some_and(|cancel| cancel.is_cancelled()) {
             bail!("{} cancelled", self.label);
         }
+        Ok(())
+    }
+
+    fn check(&self) -> Result<()> {
+        self.check_cancelled()?;
         if Instant::now() >= self.deadline {
             bail!(
                 "{} timed out after {}s",
@@ -290,14 +301,14 @@ fn clear_inherited_git_process_controls(command: &mut Command) {
     }
 }
 
-fn run_git_bounded(
+fn run_git_bounded_with_status(
     dir: &Path,
     index: Option<&TemporaryCheckpointIndex>,
     args: &[&str],
     input: Option<GitCommandInput>,
     max_stdout: usize,
     operation: &GitOperation<'_>,
-) -> Result<BoundedGitOutput> {
+) -> Result<BoundedGitCommandOutput> {
     operation.check()?;
     let execution_deadline = operation.deadline - PROCESS_TREE_CLEANUP_RESERVE;
     if Instant::now() >= execution_deadline {
@@ -411,6 +422,27 @@ fn run_git_bounded(
         thread::sleep(COMMAND_POLL_INTERVAL.min(execution_deadline - now));
     };
     let (stdout, stderr) = io_threads.join_until(operation.deadline)?;
+    Ok(BoundedGitCommandOutput {
+        stdout,
+        stderr,
+        status,
+    })
+}
+
+fn run_git_bounded(
+    dir: &Path,
+    index: Option<&TemporaryCheckpointIndex>,
+    args: &[&str],
+    input: Option<GitCommandInput>,
+    max_stdout: usize,
+    operation: &GitOperation<'_>,
+) -> Result<BoundedGitOutput> {
+    let output = run_git_bounded_with_status(dir, index, args, input, max_stdout, operation)?;
+    let BoundedGitCommandOutput {
+        stdout,
+        stderr,
+        status,
+    } = output;
     if !status.success() {
         let suffix = if stderr.truncated {
             "\n… stderr truncated"
@@ -2301,14 +2333,392 @@ pub fn session_diff_files(worktree: &Path, base_ref: &str) -> Result<Vec<String>
 /// Materialize bounded per-file patches from one immutable private-index
 /// snapshot. This avoids rebuilding and rehashing the complete worktree once
 /// per file in the headless review loader.
-pub fn session_diff_patches_cancellable(
+pub struct SessionReviewDiffFile {
+    pub path: String,
+    pub diff: String,
+    /// Newline-separated generated-marker tokens matched in the snapshot-side
+    /// file. Deleted files intentionally leave this absent so their diffs stay
+    /// visible.
+    pub generated_header: Option<String>,
+}
+
+fn parse_review_marker_output(
+    bytes: &[u8],
+    paths: &[&str],
+    header_lines: u64,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut markers = HashMap::<String, String>::new();
+    let mut tail_paths = Vec::new();
+    let mut last_complete_path = None;
+    let mut rest = bytes;
+    loop {
+        let Some(name_end) = rest.iter().position(|byte| *byte == 0) else {
+            if !rest.is_empty() {
+                tail_paths.extend(
+                    paths
+                        .iter()
+                        .filter(|path| path.as_bytes().starts_with(rest))
+                        .map(|path| (*path).to_owned()),
+                );
+            }
+            break;
+        };
+        let name = &rest[..name_end];
+        rest = &rest[name_end + 1..];
+        let decoded_name = std::str::from_utf8(name)
+            .ok()
+            .filter(|name| paths.contains(name));
+        let Some(line_end) = rest.iter().position(|byte| *byte == 0) else {
+            tail_paths.extend(decoded_name.map(str::to_owned));
+            break;
+        };
+        let line = &rest[..line_end];
+        rest = &rest[line_end + 1..];
+        let Some(content_end) = rest.iter().position(|byte| *byte == b'\n') else {
+            // A bounded read may end partway through the final marker token.
+            // Only complete grep records are trusted and retained.
+            tail_paths.extend(decoded_name.map(str::to_owned));
+            break;
+        };
+        let content = &rest[..content_end];
+        rest = &rest[content_end + 1..];
+        let Some(name) = decoded_name else {
+            continue;
+        };
+        last_complete_path = Some(name.to_owned());
+        let Some(line) = std::str::from_utf8(line)
+            .ok()
+            .and_then(|line| line.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if line > header_lines {
+            continue;
+        }
+        append_distinct_review_marker(
+            markers.entry(name.to_owned()).or_default(),
+            &String::from_utf8_lossy(content),
+            usize::MAX,
+        );
+    }
+    if tail_paths.is_empty()
+        && let Some(path) = last_complete_path
+    {
+        tail_paths.push(path);
+    }
+    (markers, tail_paths)
+}
+
+fn append_distinct_review_marker(
+    header: &mut String,
+    marker: &str,
+    remaining_bytes: usize,
+) -> usize {
+    if marker.is_empty()
+        || header
+            .lines()
+            .any(|existing| existing.eq_ignore_ascii_case(marker))
+    {
+        return 0;
+    }
+    let added_bytes = marker.len() + usize::from(!header.is_empty());
+    if added_bytes > remaining_bytes {
+        return 0;
+    }
+    if !header.is_empty() {
+        header.push('\n');
+    }
+    header.push_str(marker);
+    added_bytes
+}
+
+fn review_marker_retry_paths<'a>(
+    paths: &[&'a str],
+    complete_headers: &HashMap<String, String>,
+    tail_paths: &[String],
+) -> Vec<&'a str> {
+    paths
+        .iter()
+        .copied()
+        .filter(|path| {
+            !complete_headers.contains_key(*path)
+                || tail_paths.iter().any(|tail_path| tail_path == path)
+        })
+        .collect()
+}
+
+fn merge_review_marker_headers(
+    headers: &mut HashMap<String, String>,
+    additional: HashMap<String, String>,
+    retained_bytes: &mut usize,
+    max_retained_bytes: usize,
+) {
+    for (path, markers) in additional {
+        let header = headers.entry(path).or_default();
+        for marker in markers.lines() {
+            let remaining_bytes = max_retained_bytes.saturating_sub(*retained_bytes);
+            *retained_bytes += append_distinct_review_marker(header, marker, remaining_bytes);
+        }
+    }
+}
+
+enum ReviewMarkerGrepResult {
+    Output(BoundedGitOutput),
+    NoMatch,
+    Failed,
+}
+
+fn run_review_marker_grep(
+    worktree: &Path,
+    paths: &[&str],
+    markers: &[&str],
+    max_stdout: usize,
+    one_match_per_line: bool,
+    index: &TemporaryCheckpointIndex,
+    operation: &GitOperation<'_>,
+) -> Result<ReviewMarkerGrepResult> {
+    let mut args = vec![
+        "--literal-pathspecs".to_owned(),
+        "grep".to_owned(),
+        "--cached".to_owned(),
+        "-I".to_owned(),
+        "-i".to_owned(),
+        "-n".to_owned(),
+        // Emit only the bounded marker, not a potentially enormous minified
+        // source line containing it.
+        "-o".to_owned(),
+        "-z".to_owned(),
+        "-m".to_owned(),
+        REVIEW_MARKER_HEADER_LINES.to_string(),
+    ];
+    if one_match_per_line {
+        // Anchoring each single-marker retry and resetting the match start with
+        // \K makes `-o` emit that token once per matching line. This prevents
+        // repeated tokens on one minified line from producing unbounded output.
+        args.push("-P".to_owned());
+    }
+    for marker in markers {
+        args.push("-e".to_owned());
+        args.push(if one_match_per_line {
+            format!(r"^.*?\K\Q{marker}\E")
+        } else {
+            (*marker).to_owned()
+        });
+    }
+    args.push("--".to_owned());
+    args.extend(paths.iter().map(|path| (*path).to_owned()));
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    match run_git_bounded_with_status(worktree, Some(index), &refs, None, max_stdout, operation) {
+        Ok(output) if output.status.success() => Ok(ReviewMarkerGrepResult::Output(output.stdout)),
+        Ok(output) if output.status.code() == Some(1) => Ok(ReviewMarkerGrepResult::NoMatch),
+        Ok(_) | Err(_) => {
+            // Lookup failures safely keep the affected full diffs reviewable.
+            // The header pass is optional after patches are loaded, so only
+            // explicit caller cancellation aborts the completed operation.
+            operation.check_cancelled()?;
+            Ok(ReviewMarkerGrepResult::Failed)
+        }
+    }
+}
+
+const REVIEW_MARKER_HEADER_LINES: u64 = 20;
+const MAX_PORTABLE_REVIEW_MARKER_COMMANDS: usize = 64;
+
+fn portable_review_marker_command_budget(marker_count: usize) -> usize {
+    MAX_PORTABLE_REVIEW_MARKER_COMMANDS
+        .checked_div(marker_count)
+        .unwrap_or(0)
+}
+
+fn review_marker_output_bound(paths: &[&str], marker: &str) -> usize {
+    // `git grep -n -z -o` emits path<NUL>line<NUL>match<LF>. Reserve the
+    // maximum u64 line-number width even though only the first 20 matches are
+    // retained, so a successful one-match-per-line query cannot truncate.
+    const RECORD_OVERHEAD: usize = 1 + 20 + 1 + 1;
+    paths.iter().fold(0_usize, |total, path| {
+        let record_bytes = path
+            .len()
+            .saturating_add(marker.len())
+            .saturating_add(RECORD_OVERHEAD);
+        total.saturating_add(record_bytes.saturating_mul(REVIEW_MARKER_HEADER_LINES as usize))
+    })
+}
+
+fn run_portable_review_marker_retry(
+    worktree: &Path,
+    paths: &[&str],
+    marker: &str,
+    remaining_commands: &mut usize,
+    index: &TemporaryCheckpointIndex,
+    operation: &GitOperation<'_>,
+) -> Result<HashMap<String, String>> {
+    let mut headers = HashMap::new();
+    let mut retained_bytes = 0;
+    let mut pending = vec![paths.to_vec()];
+    while let Some(group) = pending.pop() {
+        if group.is_empty() || *remaining_commands == 0 {
+            break;
+        }
+        *remaining_commands -= 1;
+        operation.check_cancelled()?;
+        let ReviewMarkerGrepResult::Output(output) = run_review_marker_grep(
+            worktree,
+            &group,
+            &[marker],
+            review_marker_output_bound(&group, marker),
+            false,
+            index,
+            operation,
+        )?
+        else {
+            continue;
+        };
+        let (group_headers, _) =
+            parse_review_marker_output(&output.bytes, &group, REVIEW_MARKER_HEADER_LINES);
+        merge_review_marker_headers(&mut headers, group_headers, &mut retained_bytes, usize::MAX);
+        if output.truncated && group.len() > 1 {
+            // Portable `git grep -o` can repeat one marker many times on a
+            // single line. Split only overflowing groups and stop at the
+            // shared command budget; omitted headers keep those diffs visible.
+            let middle = group.len() / 2;
+            pending.push(group[middle..].to_vec());
+            pending.push(group[..middle].to_vec());
+        }
+    }
+    Ok(headers)
+}
+
+fn review_blob_headers(
+    worktree: &Path,
+    paths: &[&str],
+    index: &TemporaryCheckpointIndex,
+    operation: &GitOperation<'_>,
+) -> Result<HashMap<String, String>> {
+    const PATHS_PER_GREP: usize = 16;
+    const OUTPUT_BYTES_PER_PATH: usize = 64 * 1024;
+    const MAX_RETAINED_HEADER_BYTES: usize = 64 * 1024;
+    const MAX_RETRY_PATHS: usize = 256;
+    const MARKERS: &[&str] = &[
+        "@generated",
+        "auto-generated",
+        "automatically generated",
+        "generated file",
+        "do not edit",
+    ];
+    let mut headers = HashMap::<String, String>::new();
+    let mut retained_header_bytes = 0;
+    let mut retry_paths = Vec::new();
+    for paths in paths.chunks(PATHS_PER_GREP) {
+        let ReviewMarkerGrepResult::Output(output) = run_review_marker_grep(
+            worktree,
+            paths,
+            MARKERS,
+            paths.len().saturating_mul(OUTPUT_BYTES_PER_PATH),
+            false,
+            index,
+            operation,
+        )?
+        else {
+            continue;
+        };
+        let (group_headers, tail_paths) =
+            parse_review_marker_output(&output.bytes, paths, REVIEW_MARKER_HEADER_LINES);
+        if output.truncated {
+            // Retain complete records, then collect incomplete paths for a
+            // fixed number of batched, one-match-per-line retries. Paths over
+            // the global retry budget safely retain their full review diff.
+            for path in review_marker_retry_paths(paths, &group_headers, &tail_paths) {
+                if retry_paths.len() == MAX_RETRY_PATHS {
+                    break;
+                }
+                if !retry_paths.contains(&path) {
+                    retry_paths.push(path);
+                }
+            }
+        }
+        merge_review_marker_headers(
+            &mut headers,
+            group_headers,
+            &mut retained_header_bytes,
+            MAX_RETAINED_HEADER_BYTES,
+        );
+    }
+    for marker in MARKERS {
+        if retry_paths.is_empty() {
+            break;
+        }
+        operation.check_cancelled()?;
+        let output = run_review_marker_grep(
+            worktree,
+            &retry_paths,
+            &[*marker],
+            review_marker_output_bound(&retry_paths, marker),
+            true,
+            index,
+            operation,
+        )?;
+        let mut portable_retry_commands = portable_review_marker_command_budget(MARKERS.len());
+        let marker_headers = match output {
+            ReviewMarkerGrepResult::Output(output) => {
+                let (marker_headers, _) = parse_review_marker_output(
+                    &output.bytes,
+                    &retry_paths,
+                    REVIEW_MARKER_HEADER_LINES,
+                );
+                if output.truncated {
+                    let fallback_headers = run_portable_review_marker_retry(
+                        worktree,
+                        &retry_paths,
+                        marker,
+                        &mut portable_retry_commands,
+                        index,
+                        operation,
+                    )?;
+                    let mut merged_bytes = marker_headers.values().map(String::len).sum();
+                    let mut marker_headers = marker_headers;
+                    merge_review_marker_headers(
+                        &mut marker_headers,
+                        fallback_headers,
+                        &mut merged_bytes,
+                        usize::MAX,
+                    );
+                    marker_headers
+                } else {
+                    marker_headers
+                }
+            }
+            ReviewMarkerGrepResult::NoMatch => HashMap::new(),
+            ReviewMarkerGrepResult::Failed => run_portable_review_marker_retry(
+                worktree,
+                &retry_paths,
+                marker,
+                &mut portable_retry_commands,
+                index,
+                operation,
+            )?,
+        };
+        merge_review_marker_headers(
+            &mut headers,
+            marker_headers,
+            &mut retained_header_bytes,
+            MAX_RETAINED_HEADER_BYTES,
+        );
+    }
+    Ok(headers)
+}
+
+pub fn session_diff_patches_cancellable<F>(
     worktree: &Path,
     base_ref: &str,
     max_files: usize,
     max_changed_lines: u64,
     max_total_bytes: usize,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<Vec<(String, String)>> {
+    capture_header: F,
+) -> Result<Vec<SessionReviewDiffFile>>
+where
+    F: Fn(&str) -> bool,
+{
     ensure_safe_ref(base_ref)?;
     let operation = GitOperation::new(Some(cancel));
     with_session_snapshot_index(worktree, &operation, |index| {
@@ -2341,7 +2751,20 @@ pub fn session_diff_patches_cancellable(
                     "review diff is too large (more than {max_total_bytes} bytes)"
                 )));
             }
-            patches.push((file.path, diff));
+            patches.push(SessionReviewDiffFile {
+                path: file.path,
+                diff,
+                generated_header: None,
+            });
+        }
+        let current = patches
+            .iter()
+            .filter(|file| capture_header(&file.path))
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let mut headers = review_blob_headers(worktree, &current, index, &operation)?;
+        for file in &mut patches {
+            file.generated_header = headers.remove(&file.path);
         }
         Ok(patches)
     })
@@ -2983,6 +3406,290 @@ mod tests {
         assert!(first.contains("+two"));
         assert!(second.contains("+added"));
         assert!(session_diff_path(tmp.path(), &base, "../outside").is_err());
+    }
+
+    #[test]
+    fn review_diff_loads_generated_headers_from_snapshot_and_preserves_deletions() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        let header = "// This file was auto-generated. Do not edit.\n";
+        let modified_path = generated.join("modified.rs");
+        let deleted_path = generated.join("deleted.rs");
+        std::fs::write(
+            &modified_path,
+            format!("{header}{}old();\n", "// filler\n".repeat(30)),
+        )
+        .unwrap();
+        std::fs::write(&deleted_path, format!("{header}deleted();\n")).unwrap();
+        run(tmp.path(), &["add", "generated"]);
+        run(tmp.path(), &["commit", "-m", "add generated files"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        std::fs::write(
+            &modified_path,
+            format!("{header}{}new();\n", "// filler\n".repeat(30)),
+        )
+        .unwrap();
+        std::fs::remove_file(&deleted_path).unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            10,
+            1_000,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+        let modified = files
+            .iter()
+            .find(|file| file.path == "generated/modified.rs")
+            .unwrap();
+        let deleted = files
+            .iter()
+            .find(|file| file.path == "generated/deleted.rs")
+            .unwrap();
+
+        assert!(!modified.diff.contains("auto-generated"));
+        assert!(
+            modified
+                .generated_header
+                .as_deref()
+                .unwrap()
+                .contains("auto-generated")
+        );
+        assert!(deleted.generated_header.is_none());
+        assert!(deleted.diff.contains("auto-generated"));
+    }
+
+    #[test]
+    fn review_marker_parser_discards_an_incomplete_tail_record() {
+        let output = b"generated/a.rs\x001\x00@generated\n\
+                       generated/b.rs\x002\x00auto-generated";
+
+        let (markers, tail_paths) =
+            parse_review_marker_output(output, &["generated/a.rs", "generated/b.rs"], 20);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers.get("generated/a.rs").map(String::as_str),
+            Some("@generated")
+        );
+        assert!(!markers.contains_key("generated/b.rs"));
+        assert_eq!(
+            review_marker_retry_paths(&["generated/a.rs", "generated/b.rs"], &markers, &tail_paths,),
+            ["generated/b.rs"]
+        );
+    }
+
+    #[test]
+    fn review_marker_retry_includes_a_complete_tail_path() {
+        let output = b"generated/a.rs\x001\x00generated file\n\
+                       generated/a.rs\x001\x00do not edit";
+
+        let (markers, tail_paths) = parse_review_marker_output(output, &["generated/a.rs"], 20);
+
+        assert_eq!(
+            markers.get("generated/a.rs").map(String::as_str),
+            Some("generated file")
+        );
+        assert_eq!(
+            review_marker_retry_paths(&["generated/a.rs"], &markers, &tail_paths),
+            ["generated/a.rs"]
+        );
+    }
+
+    #[test]
+    fn review_marker_parser_deduplicates_repeated_matches() {
+        let output = b"generated/a.rs\x001\x00generated file\n\
+                       generated/a.rs\x001\x00Generated File\n\
+                       generated/a.rs\x001\x00do not edit\n";
+
+        let (markers, _) = parse_review_marker_output(output, &["generated/a.rs"], 20);
+
+        assert_eq!(
+            markers.get("generated/a.rs").map(String::as_str),
+            Some("generated file\ndo not edit")
+        );
+    }
+
+    #[test]
+    fn review_marker_merge_enforces_the_aggregate_header_bound() {
+        let mut headers = HashMap::new();
+        let mut retained_bytes = 0;
+        let additional = HashMap::from([(
+            "generated/a.rs".to_owned(),
+            "generated file\ndo not edit".to_owned(),
+        )]);
+
+        merge_review_marker_headers(&mut headers, additional, &mut retained_bytes, 14);
+
+        assert_eq!(retained_bytes, 14);
+        assert_eq!(headers["generated/a.rs"], "generated file");
+    }
+
+    #[test]
+    fn review_marker_retry_bound_scales_with_paths_and_records() {
+        let path = "p".repeat(300);
+        let paths = vec![path.as_str(); 250];
+
+        assert!(review_marker_output_bound(&paths, "generated file") > 1024 * 1024);
+    }
+
+    #[test]
+    fn portable_review_marker_budget_reserves_work_for_every_marker() {
+        let per_marker = portable_review_marker_command_budget(5);
+
+        assert_eq!(per_marker, 12);
+        assert!(per_marker * 5 <= MAX_PORTABLE_REVIEW_MARKER_COMMANDS);
+    }
+
+    #[test]
+    fn review_marker_grep_distinguishes_no_match_from_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let operation = GitOperation::new(None);
+
+        let result = with_session_snapshot_index(tmp.path(), &operation, |index| {
+            run_review_marker_grep(
+                tmp.path(),
+                &["a.txt"],
+                &["@generated"],
+                review_marker_output_bound(&["a.txt"], "@generated"),
+                false,
+                index,
+                &operation,
+            )
+        })
+        .unwrap();
+
+        assert!(matches!(result, ReviewMarkerGrepResult::NoMatch));
+    }
+
+    #[test]
+    fn portable_review_marker_retry_deduplicates_a_pathological_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(
+            generated.join("compound.rs"),
+            format!("// {}\n", "generated file ".repeat(3_000)),
+        )
+        .unwrap();
+        let operation = GitOperation::new(None);
+        let mut remaining_commands = 4;
+
+        let headers = with_session_snapshot_index(tmp.path(), &operation, |index| {
+            run_portable_review_marker_retry(
+                tmp.path(),
+                &["generated/compound.rs"],
+                "generated file",
+                &mut remaining_commands,
+                index,
+                &operation,
+            )
+        })
+        .unwrap();
+
+        assert_eq!(headers["generated/compound.rs"], "generated file");
+        assert_eq!(remaining_commands, 3);
+    }
+
+    #[test]
+    fn review_diff_recognizes_generated_markers_on_very_long_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(
+            generated.join("large.min.js"),
+            format!("// @generated {}\n", "x".repeat(70 * 1024)),
+        )
+        .unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            10,
+            1_000,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0]
+                .generated_header
+                .as_deref()
+                .is_some_and(|header| header.contains("@generated"))
+        );
+    }
+
+    #[test]
+    fn review_diff_recovers_compound_markers_after_single_path_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(
+            generated.join("compound.rs"),
+            format!("// {} do not edit\n", "generated file ".repeat(3_000)),
+        )
+        .unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            10,
+            1_000,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+
+        let header = files[0].generated_header.as_deref().unwrap();
+        assert_eq!(header, "generated file\ndo not edit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_diff_uses_replacement_content_instead_of_deleted_base_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir(&generated).unwrap();
+        let path = generated.join("replaced.js");
+        std::fs::write(&path, "// @generated\nold();\n").unwrap();
+        run(tmp.path(), &["add", "generated/replaced.js"]);
+        run(tmp.path(), &["commit", "-m", "add generated file"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("ordinary-target.js", &path).unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            10,
+            1_000,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].diff.contains("new file mode 120000"));
+        assert!(files[0].generated_header.is_none());
     }
 
     #[test]
