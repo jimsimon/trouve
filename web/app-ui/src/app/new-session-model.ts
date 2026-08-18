@@ -38,6 +38,9 @@ export interface NewSessionThreadRequestInput {
   /** Raw form value; only protocol-advertised permission modes are emitted. */
   readonly permissionMode?: string | null;
   readonly thinking?: string | null;
+  /** Effective inherited values shown by the form. Matching selections stay server-inherited. */
+  readonly inheritedPermissionMode?: string | null;
+  readonly inheritedThinking?: string | null;
   /** Metadata for the effective model whose thinking option is being overridden. */
   readonly modelInfo?: ProtocolModelInfo | null;
 }
@@ -177,13 +180,16 @@ export const resolveNewThreadDefaults = (
   };
 };
 
-/** Prefer conventional trunk branches, then the repository's literal HEAD ref. */
+/** Prefer an explicit base, then the repository HEAD/default, then conventional trunks. */
 export const resolveNewSessionBaseRef = (
   branches: readonly string[],
   preferredBaseRef = "",
+  repositoryHead = "",
 ): string => {
   const preferred = nonEmpty(preferredBaseRef);
   if (preferred !== undefined && branches.includes(preferred)) return preferred;
+  const head = nonEmpty(repositoryHead);
+  if (head !== undefined && branches.includes(head)) return head;
   if (branches.includes("main")) return "main";
   if (branches.includes("master")) return "master";
   return "HEAD";
@@ -191,8 +197,8 @@ export const resolveNewSessionBaseRef = (
 
 /**
  * Builds the initial thread request while preserving server-side inheritance.
- * A thinking override is sent only when the effective model advertises both its
- * option key and the selected enum value.
+ * Matching permission/thinking selections remain omitted so a concurrent
+ * global-default update wins; changed thinking is emitted only when advertised.
  */
 export const createNewSessionThreadRequest = (
   input: NewSessionThreadRequestInput,
@@ -209,12 +215,16 @@ export const createNewSessionThreadRequest = (
   const validPermission = permissionMode === "ask"
     || permissionMode === "allow_list"
     || permissionMode === "yolo";
+  const inheritedPermission = validPermissionMode(input.inheritedPermissionMode);
+  const permissionOverride = validPermission && permissionMode !== inheritedPermission;
 
   const advertisedThinking = model === undefined || input.modelInfo?.id === model
     ? thinkingOption(input.modelInfo)
     : undefined;
   const thinking = nonEmpty(input.thinking);
+  const inheritedThinking = nonEmpty(input.inheritedThinking);
   const modelOptions = thinking !== undefined
+    && thinking !== inheritedThinking
     && advertisedThinking?.values.includes(thinking) === true
     ? { [advertisedThinking.key]: thinking }
     : undefined;
@@ -224,7 +234,7 @@ export const createNewSessionThreadRequest = (
     ...(title === undefined ? {} : { title }),
     ...(mode === undefined ? {} : { mode }),
     ...(model === undefined ? {} : { model }),
-    ...(validPermission ? { permission_mode: permissionMode } : {}),
+    ...(permissionOverride ? { permission_mode: permissionMode } : {}),
     ...(modelOptions === undefined ? {} : { model_options: modelOptions }),
   };
 };

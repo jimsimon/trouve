@@ -1639,6 +1639,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionBaseRef = resolveNewSessionBaseRef(
         result.branches,
         this.#newSessionPreferredBaseRef,
+        result.head,
       );
     } catch {
       if (generation !== this.#newSessionBranchGeneration) return;
@@ -1972,8 +1973,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         selectedMode,
         this.#newSessionProviders,
       );
-      const modelInfo = this.#availableNewSessionModels().find(
-        (model) => model.id === effectiveModel,
+      const availableModels = this.#availableNewSessionModels();
+      const modelInfo = availableModels.find((model) => model.id === effectiveModel);
+      const inheritedDefaults = resolveNewThreadDefaults(
+        this.#newSessionModes,
+        availableModels,
+        this.#newSessionProviders,
+        {
+          modeId: this.#newSessionModeId,
+          ...(effectiveModel === undefined ? {} : { modelId: effectiveModel }),
+        },
       );
       const permissionMode = String(data.get("permission_mode") ?? "");
       const thread = await this.#protocolClient.createThread(
@@ -1990,6 +1999,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               : {}
           ),
           thinking: this.#newSessionThinking,
+          inheritedPermissionMode: inheritedDefaults.permissionMode,
+          inheritedThinking: inheritedDefaults.thinking,
           ...(modelInfo === undefined ? {} : { modelInfo }),
         }),
       );

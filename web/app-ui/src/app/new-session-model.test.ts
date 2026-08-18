@@ -163,6 +163,28 @@ describe("new session model", () => {
     });
   });
 
+  it("uses global thinking and permission values when the persona inherits them", () => {
+    const globalProviders: ProtocolProvidersResponse = {
+      ...providers("provider/global"),
+      default_permission_mode: "yolo",
+      default_thinking_level: "high",
+    };
+    const models = [model({
+      properties: {
+        thinking_level: {
+          type: "string",
+          enum: ["low", "medium", "high"],
+          default: "low",
+        },
+      },
+    }, "provider/global")];
+
+    expect(resolveNewThreadDefaults([mode()], models, globalProviders)).toMatchObject({
+      thinking: "high",
+      permissionMode: "yolo",
+    });
+  });
+
   it("falls back to an advertised model when inherited defaults are stale", () => {
     const available = model({}, "provider/available");
     expect(resolveNewThreadDefaults(
@@ -179,12 +201,13 @@ describe("new session model", () => {
       .toBe("");
   });
 
-  it("chooses main, master, then literal HEAD for a new session base", () => {
-    expect(resolveNewSessionBaseRef(["feature", "master", "main"])).toBe("main");
+  it("chooses an explicit base, repository HEAD, conventional trunks, then literal HEAD", () => {
+    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "feature")).toBe("feature");
+    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "master", "feature")).toBe("master");
+    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "missing")).toBe("main");
     expect(resolveNewSessionBaseRef(["feature", "master"])).toBe("master");
     expect(resolveNewSessionBaseRef(["feature"])).toBe("HEAD");
-    expect(resolveNewSessionBaseRef(["main", "release"], "release")).toBe("release");
-    expect(resolveNewSessionBaseRef(["main"], "missing")).toBe("main");
+    expect(resolveNewSessionBaseRef(["main"], "missing", "main")).toBe("main");
   });
 
   it("composes a complete request with an advertised thinking override", () => {
@@ -208,6 +231,26 @@ describe("new session model", () => {
       model: "provider/model",
       permission_mode: "allow_list",
       model_options: { effort: "high" },
+    });
+  });
+
+  it("keeps matching thinking and permission selections server-inherited", () => {
+    const modelInfo = model({
+      properties: {
+        thinking_level: { type: "string", enum: ["low", "high"], default: "low" },
+      },
+    });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      mode: "code",
+      permissionMode: "yolo",
+      inheritedPermissionMode: "yolo",
+      thinking: "high",
+      inheritedThinking: "high",
+      modelInfo,
+    })).toEqual({
+      session_id: "session-1",
+      mode: "code",
     });
   });
 

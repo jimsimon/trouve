@@ -247,6 +247,15 @@ export const createNewThreadSetupSubmission = (input: {
     },
     input.catalog,
   );
+  const inheritedDefaults = resolveNewThreadDefaults(
+    input.catalog.modes,
+    input.catalog.models,
+    input.catalog.providers,
+    {
+      ...(mode === undefined ? {} : { modeId: mode.id }),
+      ...(effectiveModel === undefined ? {} : { modelId: effectiveModel.id }),
+    },
+  );
   const prompt = input.draft.prompt.trim();
   const request = createNewSessionThreadRequest({
     sessionId: input.sessionId,
@@ -255,6 +264,8 @@ export const createNewThreadSetupSubmission = (input: {
     ...(model === undefined ? {} : { model: model.id }),
     permissionMode: input.draft.permissionMode,
     thinking: input.draft.thinking,
+    inheritedPermissionMode: inheritedDefaults.permissionMode,
+    inheritedThinking: inheritedDefaults.thinking,
     ...(effectiveModel === undefined ? {} : { modelInfo: effectiveModel }),
   });
   const initialMessage = prompt === "" && input.draft.attachments.length === 0

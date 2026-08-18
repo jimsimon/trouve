@@ -100,6 +100,21 @@ describe("new thread setup model", () => {
     });
   });
 
+  it("leaves untouched thinking and permission defaults for the server to inherit", () => {
+    const detail = createNewThreadSetupSubmission({
+      workspaceId: "ws-main",
+      sessionId: "se-main",
+      draft: createInitialNewThreadDraft(catalog),
+      catalog,
+    });
+    expect(detail.request).toEqual({
+      session_id: "se-main",
+      title: "New thread",
+      mode: "code",
+      model: "provider/global",
+    });
+  });
+
   it("applies mode model defaults and resets thinking when the effective model changes", () => {
     const initial = createInitialNewThreadDraft(catalog);
     const reviewed = selectNewThreadMode(initial, "review", catalog);
