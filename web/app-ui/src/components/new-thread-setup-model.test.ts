@@ -14,11 +14,13 @@ import type {
 import {
   appendNewThreadAttachment,
   createInitialNewThreadDraft,
+  createNewThreadSetupEdits,
   createNewThreadSetupSubmission,
   effectiveNewThreadModel,
   newThreadAttachmentLimitMessage,
   newThreadSetupControls,
   newThreadThinkingOption,
+  reconcileNewThreadDraft,
   selectNewThreadMode,
   selectNewThreadModel,
   type NewThreadSetupCatalog,
@@ -90,6 +92,8 @@ describe("new thread setup model", () => {
       modelId: "provider/global",
       thinking: "medium",
       permissionMode: "ask",
+      inheritedThinking: "medium",
+      inheritedPermissionMode: "ask",
       prompt: "",
       attachments: [],
     });
@@ -97,6 +101,21 @@ describe("new thread setup model", () => {
     expect(newThreadThinkingOption(draft, catalog)).toMatchObject({
       key: "thinking_level",
       values: ["low", "medium", "high"],
+    });
+  });
+
+  it("leaves untouched thinking and permission defaults for the server to inherit", () => {
+    const detail = createNewThreadSetupSubmission({
+      workspaceId: "ws-main",
+      sessionId: "se-main",
+      draft: createInitialNewThreadDraft(catalog),
+      catalog,
+    });
+    expect(detail.request).toEqual({
+      session_id: "se-main",
+      title: "New thread",
+      mode: "code",
+      model: "provider/global",
     });
   });
 
@@ -122,6 +141,70 @@ describe("new thread setup model", () => {
       permissionMode: "ask",
     });
     expect(effectiveNewThreadModel(plan, catalog)?.id).toBe("provider/global");
+  });
+
+  it("restores refreshed inheritance after an untouched catalog retry", () => {
+    const staleCatalog: NewThreadSetupCatalog = {
+      ...catalog,
+      providers: {
+        ...providers,
+        default_permission_mode: "ask",
+        default_thinking_level: "low",
+      },
+    };
+    const refreshedCatalog: NewThreadSetupCatalog = {
+      ...catalog,
+      providers: {
+        ...providers,
+        default_permission_mode: "yolo",
+        default_thinking_level: "high",
+      },
+    };
+    const loadingDraft = {
+      ...createInitialNewThreadDraft(staleCatalog),
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    };
+
+    expect(reconcileNewThreadDraft(
+      loadingDraft,
+      refreshedCatalog,
+      createNewThreadSetupEdits(),
+    )).toMatchObject({
+      thinking: "high",
+      inheritedThinking: "high",
+      permissionMode: "yolo",
+      inheritedPermissionMode: "yolo",
+    });
+  });
+
+  it("preserves per-field edits across a workspace catalog switch without inheritance markers", () => {
+    const refreshedCatalog: NewThreadSetupCatalog = {
+      ...catalog,
+      providers: {
+        ...providers,
+        default_permission_mode: "yolo",
+        default_thinking_level: "high",
+      },
+    };
+    const draft = {
+      ...createInitialNewThreadDraft(catalog),
+      thinking: "low",
+      permissionMode: "allow_list" as const,
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    };
+
+    expect(reconcileNewThreadDraft(draft, refreshedCatalog, {
+      ...createNewThreadSetupEdits(),
+      thinking: true,
+      permission: true,
+    })).toMatchObject({
+      thinking: "low",
+      inheritedThinking: undefined,
+      permissionMode: "allow_list",
+      inheritedPermissionMode: undefined,
+    });
   });
 
   it("builds only existing protocol requests and an optional initial message", () => {

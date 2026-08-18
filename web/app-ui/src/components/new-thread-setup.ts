@@ -25,17 +25,20 @@ import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   appendNewThreadAttachment,
   createInitialNewThreadDraft,
+  createNewThreadSetupEdits,
   createNewThreadSetupSubmission,
   formatNewThreadAttachmentBytes,
   newThreadAttachmentLimitMessage,
   newThreadSetupControls,
   newThreadThinkingOption,
+  reconcileNewThreadDraft,
   selectNewThreadMode,
   selectNewThreadModel,
   type NewThreadPermissionSelection,
   type NewThreadSetupCancelDetail,
   type NewThreadSetupCatalog,
   type NewThreadSetupDraft,
+  type NewThreadSetupEdits,
   type NewThreadSetupSubmitDetail,
 } from "./new-thread-setup-model.js";
 import "./image-preview.js";
@@ -260,12 +263,14 @@ export class TrouveNewThreadSetup extends LitElement {
   #attachmentError = "";
   #internalError = "";
   #loadedWorkspaceId = "";
+  #catalogWorkspaceId = "";
+  #observedWorkspaceId = "";
   #observedSessionId = "";
   #loadGeneration = 0;
   #attachmentGeneration = 0;
   #subscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
   #optionsRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  #optionsTouched = false;
+  #optionEdits: NewThreadSetupEdits = createNewThreadSetupEdits();
   #promptComposing = false;
 
   readonly #services = new ContextConsumer(this, {
@@ -307,16 +312,32 @@ export class TrouveNewThreadSetup extends LitElement {
   }
 
   protected override willUpdate(changed: PropertyValues<this>): void {
+    const workspaceId = this.#effectiveWorkspaceId;
     const sessionId = this.#effectiveSessionId;
-    if (changed.has("sessionId") || sessionId !== this.#observedSessionId) {
+    const sessionChanged = changed.has("sessionId") || sessionId !== this.#observedSessionId;
+    const workspaceChanged = workspaceId !== this.#observedWorkspaceId;
+    if (sessionChanged) {
       this.#attachmentGeneration += 1;
       this.#observedSessionId = sessionId;
       this.#draft = createInitialNewThreadDraft(this.#catalog);
-      this.#optionsTouched = false;
+      this.#optionEdits = createNewThreadSetupEdits();
       this.#promptComposing = false;
       this.#attachmentLoading = false;
       this.#attachmentError = "";
       this.#internalError = "";
+    }
+    if (workspaceChanged) {
+      const draft = this.#draft;
+      this.#observedWorkspaceId = workspaceId;
+      this.#catalogWorkspaceId = "";
+      this.#optionEdits = createNewThreadSetupEdits();
+      this.#draft = {
+        ...createInitialNewThreadDraft(this.#catalog),
+        prompt: draft.prompt,
+        attachments: draft.attachments,
+        inheritedThinking: undefined,
+        inheritedPermissionMode: undefined,
+      };
     }
     if (changed.has("catalogModes") || changed.has("catalogModels")) {
       this.#adoptCatalog({
@@ -552,8 +573,14 @@ export class TrouveNewThreadSetup extends LitElement {
     }
     const generation = ++this.#loadGeneration;
     this.#loadedWorkspaceId = workspaceId;
+    this.#catalogWorkspaceId = "";
     this.#optionsLoading = true;
     this.#optionsError = "";
+    this.#draft = {
+      ...this.#draft,
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    };
     this.#subscriptionHealth = readSignal(services.subscriptionHealth.current);
     this.requestUpdate();
 
@@ -582,11 +609,11 @@ export class TrouveNewThreadSetup extends LitElement {
         services.protocol.providers(),
       ]);
       if (generation !== this.#loadGeneration || workspaceId !== this.#effectiveWorkspaceId) return;
-      this.#adoptCatalog({ modes, models, providers });
+      this.#adoptCatalog({ modes, models, providers }, workspaceId);
     } catch {
       if (generation !== this.#loadGeneration || workspaceId !== this.#effectiveWorkspaceId) return;
       this.#optionsError =
-        "Persona and model choices could not be loaded. Server defaults remain available while trouve retries automatically.";
+        "Persona and model choices could not be loaded. Current displayed choices remain available while trouve retries automatically.";
       this.#scheduleOptionsRetry();
     } finally {
       if (generation === this.#loadGeneration && workspaceId === this.#effectiveWorkspaceId) {
@@ -596,31 +623,22 @@ export class TrouveNewThreadSetup extends LitElement {
     }
   }
 
-  #adoptCatalog(catalog: NewThreadSetupCatalog): void {
-    const draft = this.#draft;
+  #adoptCatalog(catalog: NewThreadSetupCatalog, workspaceId = this.#catalogWorkspaceId): void {
     this.#catalog = catalog;
-    const refreshedInitial = createInitialNewThreadDraft(catalog);
-    if (!this.#optionsTouched) {
-      this.#draft = {
-        ...refreshedInitial,
-        prompt: draft.prompt,
-        attachments: draft.attachments,
-      };
-      return;
-    }
-    const modeDefaults = selectNewThreadMode(draft, draft.modeId, catalog);
-    const repaired = catalog.models.some((model) => model.id === draft.modelId)
-      ? selectNewThreadModel(modeDefaults, draft.modelId, catalog)
-      : modeDefaults;
-    this.#draft = {
-      ...draft,
-      modeId: repaired.modeId,
-      modelId: repaired.modelId,
-      thinking: newThreadThinkingOption(repaired, catalog)?.values.includes(draft.thinking)
-        ? draft.thinking
-        : repaired.thinking,
-      permissionMode: draft.permissionMode || repaired.permissionMode,
-    };
+    this.#catalogWorkspaceId = workspaceId === this.#effectiveWorkspaceId ? workspaceId : "";
+    this.#draft = reconcileNewThreadDraft(this.#draft, catalog, this.#optionEdits);
+    this.#draft = this.#withVerifiedInheritance(this.#draft);
+  }
+
+  #withVerifiedInheritance(draft: NewThreadSetupDraft): NewThreadSetupDraft {
+    return this.#catalogWorkspaceId !== ""
+        && this.#catalogWorkspaceId === this.#effectiveWorkspaceId
+      ? draft
+      : {
+          ...draft,
+          inheritedThinking: undefined,
+          inheritedPermissionMode: undefined,
+        };
   }
 
   #scheduleOptionsRetry(): void {
@@ -637,29 +655,38 @@ export class TrouveNewThreadSetup extends LitElement {
   }
 
   readonly #modeChanged = (event: Event): void => {
-    this.#optionsTouched = true;
-    this.#draft = selectNewThreadMode(
+    this.#optionEdits = {
+      mode: true,
+      model: false,
+      thinking: false,
+      permission: false,
+    };
+    this.#draft = this.#withVerifiedInheritance(selectNewThreadMode(
       this.#draft,
       (event.currentTarget as HTMLSelectElement).value,
       this.#catalog,
-    );
+    ));
     this.#internalError = "";
     this.requestUpdate();
   };
 
   readonly #modelPicked = (event: CustomEvent<{ readonly modelId: string }>): void => {
-    this.#optionsTouched = true;
-    this.#draft = selectNewThreadModel(
+    this.#optionEdits = {
+      ...this.#optionEdits,
+      model: true,
+      thinking: false,
+    };
+    this.#draft = this.#withVerifiedInheritance(selectNewThreadModel(
       this.#draft,
       event.detail.modelId,
       this.#catalog,
-    );
+    ));
     this.#internalError = "";
     this.requestUpdate();
   };
 
   readonly #thinkingChanged = (event: Event): void => {
-    this.#optionsTouched = true;
+    this.#optionEdits = { ...this.#optionEdits, thinking: true };
     const value = (event.currentTarget as HTMLSelectElement).value;
     this.#draft = {
       ...this.#draft,
@@ -668,12 +695,13 @@ export class TrouveNewThreadSetup extends LitElement {
         this.#draft.modelId,
         this.#catalog,
       ).thinking,
+      inheritedThinking: undefined,
     };
     this.requestUpdate();
   };
 
   readonly #permissionChanged = (event: Event): void => {
-    this.#optionsTouched = true;
+    this.#optionEdits = { ...this.#optionEdits, permission: true };
     const value = (event.currentTarget as HTMLSelectElement).value;
     const permissionMode: NewThreadPermissionSelection =
       value === "ask" || value === "allow_list" || value === "yolo"
@@ -683,7 +711,11 @@ export class TrouveNewThreadSetup extends LitElement {
             this.#draft.modeId,
             this.#catalog,
           ).permissionMode;
-    this.#draft = { ...this.#draft, permissionMode };
+    this.#draft = {
+      ...this.#draft,
+      permissionMode,
+      inheritedPermissionMode: undefined,
+    };
     this.requestUpdate();
   };
 

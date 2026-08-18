@@ -28,6 +28,28 @@ export interface ResolvedNewThreadDefaults {
   readonly modelId: string;
   readonly thinking: string;
   readonly permissionMode: ResolvedPermissionMode;
+  /** Authoritative persona/global values that may remain server-inherited. */
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: ResolvedPermissionMode | undefined;
+}
+
+export interface NewThreadInheritance {
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: ResolvedPermissionMode | undefined;
+}
+
+export interface NewThreadOptionEdits {
+  readonly mode: boolean;
+  readonly model: boolean;
+  readonly thinking: boolean;
+  readonly permission: boolean;
+}
+
+export interface NewThreadOptionSelections {
+  readonly modeId: string;
+  readonly modelId: string;
+  readonly thinking: string;
+  readonly permissionMode: string;
 }
 
 export interface NewSessionThreadRequestInput {
@@ -38,6 +60,9 @@ export interface NewSessionThreadRequestInput {
   /** Raw form value; only protocol-advertised permission modes are emitted. */
   readonly permissionMode?: string | null;
   readonly thinking?: string | null;
+  /** Effective inherited values shown by the form. Matching selections stay server-inherited. */
+  readonly inheritedPermissionMode?: string | null;
+  readonly inheritedThinking?: string | null;
   /** Metadata for the effective model whose thinking option is being overridden. */
   readonly modelInfo?: ProtocolModelInfo | null;
 }
@@ -141,7 +166,7 @@ export const resolveNewSessionModel = (
 const validPermissionMode = (value: unknown): ResolvedPermissionMode | undefined =>
   value === "ask" || value === "allow_list" || value === "yolo" ? value : undefined;
 
-/** Resolve every inherited new-thread option to the concrete value the server uses. */
+/** Resolve displayed defaults and identify values backed by persona/global metadata. */
 export const resolveNewThreadDefaults = (
   modes: readonly ProtocolAgentPersona[],
   models: readonly ProtocolModelInfo[],
@@ -159,40 +184,104 @@ export const resolveNewThreadDefaults = (
     : models[0]?.id ?? "";
   const model = models.find((candidate) => candidate.id === modelId);
   const option = thinkingOption(model);
-  const thinking = [
+  const inheritedThinking = [
     nonEmpty(mode?.default_thinking_level),
     nonEmpty(providers?.default_thinking_level),
-    option?.defaultValue,
-    option?.values[0],
   ].find((candidate): candidate is string =>
-    candidate !== undefined && option?.values.includes(candidate) === true) ?? "";
-  const permissionMode = validPermissionMode(mode?.default_permission_mode)
-    ?? validPermissionMode(providers?.default_permission_mode)
-    ?? "ask";
+    candidate !== undefined && option?.values.includes(candidate) === true);
+  const thinking = inheritedThinking
+    ?? option?.defaultValue
+    ?? option?.values[0]
+    ?? "";
+  const inheritedPermissionMode = validPermissionMode(mode?.default_permission_mode)
+    ?? validPermissionMode(providers?.default_permission_mode);
+  const permissionMode = inheritedPermissionMode ?? "ask";
   return {
     modeId: mode?.id ?? "code",
     modelId,
     thinking,
     permissionMode,
+    inheritedThinking,
+    inheritedPermissionMode,
   };
 };
 
-/** Prefer conventional trunk branches, then the repository's literal HEAD ref. */
+export const createNewThreadOptionEdits = (): NewThreadOptionEdits => ({
+  mode: false,
+  model: false,
+  thinking: false,
+  permission: false,
+});
+
+/** Merge a refreshed catalog into fields the user has not edited. */
+export const reconcileNewThreadDefaults = (
+  selections: NewThreadOptionSelections,
+  modes: readonly ProtocolAgentPersona[],
+  models: readonly ProtocolModelInfo[],
+  providers: ProtocolProvidersResponse | null | undefined,
+  edits: NewThreadOptionEdits,
+): ResolvedNewThreadDefaults => {
+  const initial = resolveNewThreadDefaults(modes, models, providers);
+  const modeId = edits.mode && modes.some((mode) => mode.id === selections.modeId)
+    ? selections.modeId
+    : initial.modeId;
+  const modeDefaults = resolveNewThreadDefaults(modes, models, providers, { modeId });
+  const modelId = edits.model && models.some((model) => model.id === selections.modelId)
+    ? selections.modelId
+    : modeDefaults.modelId;
+  const refreshed = resolveNewThreadDefaults(modes, models, providers, { modeId, modelId });
+  const option = thinkingOption(models.find((model) => model.id === refreshed.modelId));
+  const keepThinking = edits.thinking
+    && option?.values.includes(selections.thinking) === true;
+  const permissionMode = validPermissionMode(selections.permissionMode);
+  const keepPermission = edits.permission && permissionMode !== undefined;
+
+  return {
+    ...refreshed,
+    thinking: keepThinking ? selections.thinking : refreshed.thinking,
+    inheritedThinking: keepThinking ? undefined : refreshed.inheritedThinking,
+    permissionMode: keepPermission ? permissionMode : refreshed.permissionMode,
+    inheritedPermissionMode: keepPermission
+      ? undefined
+      : refreshed.inheritedPermissionMode,
+  };
+};
+
+/** Only metadata loaded successfully for the selected workspace is authoritative. */
+export const newThreadInheritanceForWorkspace = (
+  defaults: ResolvedNewThreadDefaults,
+  catalogWorkspaceId: string,
+  selectedWorkspaceId: string,
+): NewThreadInheritance =>
+  catalogWorkspaceId !== "" && catalogWorkspaceId === selectedWorkspaceId
+    ? {
+        inheritedThinking: defaults.inheritedThinking,
+        inheritedPermissionMode: defaults.inheritedPermissionMode,
+      }
+    : {
+        inheritedThinking: undefined,
+        inheritedPermissionMode: undefined,
+      };
+
+/** Prefer an explicit base, then the repository HEAD/default, then conventional trunks. */
 export const resolveNewSessionBaseRef = (
   branches: readonly string[],
   preferredBaseRef = "",
+  repositoryHead = "",
 ): string => {
   const preferred = nonEmpty(preferredBaseRef);
   if (preferred !== undefined && branches.includes(preferred)) return preferred;
+  const head = nonEmpty(repositoryHead);
+  if (head !== undefined) return branches.includes(head) ? head : "HEAD";
   if (branches.includes("main")) return "main";
   if (branches.includes("master")) return "master";
   return "HEAD";
 };
 
 /**
- * Builds the initial thread request while preserving server-side inheritance.
- * A thinking override is sent only when the effective model advertises both its
- * option key and the selected enum value.
+ * Builds the initial thread request while preserving authoritative inheritance.
+ * Values without a captured persona/global source are emitted so the request
+ * always matches what the form displayed.
  */
 export const createNewSessionThreadRequest = (
   input: NewSessionThreadRequestInput,
@@ -209,12 +298,16 @@ export const createNewSessionThreadRequest = (
   const validPermission = permissionMode === "ask"
     || permissionMode === "allow_list"
     || permissionMode === "yolo";
+  const inheritedPermission = validPermissionMode(input.inheritedPermissionMode);
+  const permissionOverride = validPermission && permissionMode !== inheritedPermission;
 
   const advertisedThinking = model === undefined || input.modelInfo?.id === model
     ? thinkingOption(input.modelInfo)
     : undefined;
   const thinking = nonEmpty(input.thinking);
+  const inheritedThinking = nonEmpty(input.inheritedThinking);
   const modelOptions = thinking !== undefined
+    && thinking !== inheritedThinking
     && advertisedThinking?.values.includes(thinking) === true
     ? { [advertisedThinking.key]: thinking }
     : undefined;
@@ -224,7 +317,7 @@ export const createNewSessionThreadRequest = (
     ...(title === undefined ? {} : { title }),
     ...(mode === undefined ? {} : { mode }),
     ...(model === undefined ? {} : { model }),
-    ...(validPermission ? { permission_mode: permissionMode } : {}),
+    ...(permissionOverride ? { permission_mode: permissionMode } : {}),
     ...(modelOptions === undefined ? {} : { model_options: modelOptions }),
   };
 };

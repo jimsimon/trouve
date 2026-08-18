@@ -68,10 +68,20 @@ describe("new thread setup component contract", () => {
     expect(component).toContain(".form?.requestSubmit()");
     expect(component).toContain("@compositionstart=${this.#promptCompositionStarted}");
     expect(component).toContain(
-      'this.#optionsTouched = false;\n      this.#promptComposing = false;',
+      'this.#optionEdits = createNewThreadSetupEdits();\n      this.#promptComposing = false;',
     );
+    expect(component).toContain('this.#catalogWorkspaceId = "";');
     expect(component).toContain(
       'this.#attachmentGeneration += 1;\n    this.#promptComposing = false;\n    this.#loadedWorkspaceId = "";',
+    );
+  });
+
+  it("changes workspace lifecycle only when the effective workspace changes", () => {
+    expect(component).toContain(
+      "const workspaceChanged = workspaceId !== this.#observedWorkspaceId;",
+    );
+    expect(component).not.toContain(
+      'const workspaceChanged = changed.has("workspaceId")',
     );
   });
 

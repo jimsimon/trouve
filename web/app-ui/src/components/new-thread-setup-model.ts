@@ -33,8 +33,18 @@ export interface NewThreadSetupDraft {
   readonly modelId: string;
   readonly thinking: string;
   readonly permissionMode: NewThreadPermissionSelection;
+  /** Captured authoritative sources for the values currently displayed. */
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: Exclude<NewThreadPermissionSelection, ""> | undefined;
   readonly prompt: string;
   readonly attachments: readonly PendingAttachment[];
+}
+
+export interface NewThreadSetupEdits {
+  readonly mode: boolean;
+  readonly model: boolean;
+  readonly thinking: boolean;
+  readonly permission: boolean;
 }
 
 export interface NewThreadSetupSubmitDetail {
@@ -148,6 +158,53 @@ export const selectNewThreadModel = (
     ...draft,
     modelId: defaults.modelId,
     thinking: defaults.thinking,
+    inheritedThinking: defaults.inheritedThinking,
+  };
+};
+
+export const createNewThreadSetupEdits = (): NewThreadSetupEdits => ({
+  mode: false,
+  model: false,
+  thinking: false,
+  permission: false,
+});
+
+/**
+ * Reconcile a draft with a refreshed catalog. Explicit, still-valid fields
+ * remain request overrides; untouched fields adopt refreshed defaults and
+ * their authoritative inheritance markers together.
+ */
+export const reconcileNewThreadDraft = (
+  draft: NewThreadSetupDraft,
+  catalog: NewThreadSetupCatalog,
+  edits: NewThreadSetupEdits,
+): NewThreadSetupDraft => {
+  const initial = createInitialNewThreadDraft(catalog);
+  const modeId = edits.mode && knownMode(catalog.modes, draft.modeId) !== undefined
+    ? draft.modeId
+    : initial.modeId;
+  const modeDefaults = selectNewThreadMode(initial, modeId, catalog);
+  const modelId = edits.model && knownModel(catalog.models, draft.modelId) !== undefined
+    ? draft.modelId
+    : modeDefaults.modelId;
+  const refreshed = selectNewThreadModel(modeDefaults, modelId, catalog);
+  const keepThinking = edits.thinking
+    && newThreadThinkingOption(refreshed, catalog)?.values.includes(draft.thinking) === true;
+  const keepPermission = edits.permission
+    && (draft.permissionMode === "ask"
+      || draft.permissionMode === "allow_list"
+      || draft.permissionMode === "yolo");
+
+  return {
+    ...draft,
+    modeId: refreshed.modeId,
+    modelId: refreshed.modelId,
+    thinking: keepThinking ? draft.thinking : refreshed.thinking,
+    inheritedThinking: keepThinking ? undefined : refreshed.inheritedThinking,
+    permissionMode: keepPermission ? draft.permissionMode : refreshed.permissionMode,
+    inheritedPermissionMode: keepPermission
+      ? undefined
+      : refreshed.inheritedPermissionMode,
   };
 };
 
@@ -255,6 +312,12 @@ export const createNewThreadSetupSubmission = (input: {
     ...(model === undefined ? {} : { model: model.id }),
     permissionMode: input.draft.permissionMode,
     thinking: input.draft.thinking,
+    ...(input.draft.inheritedPermissionMode === undefined
+      ? {}
+      : { inheritedPermissionMode: input.draft.inheritedPermissionMode }),
+    ...(input.draft.inheritedThinking === undefined
+      ? {}
+      : { inheritedThinking: input.draft.inheritedThinking }),
     ...(effectiveModel === undefined ? {} : { modelInfo: effectiveModel }),
   });
   const initialMessage = prompt === "" && input.draft.attachments.length === 0
