@@ -390,6 +390,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionModelId = "";
   #newSessionPermissionMode = "";
   #newSessionThinking = "";
+  #newSessionInheritedPermissionMode: string | undefined;
+  #newSessionInheritedThinking: string | undefined;
   #newSessionOptionsPending = false;
   #newSessionOptionsError = "";
   #newSessionOptionsGeneration = 0;
@@ -1360,6 +1362,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionModelId = defaults.modelId;
     this.#newSessionPermissionMode = defaults.permissionMode;
     this.#newSessionThinking = defaults.thinking;
+    this.#newSessionInheritedPermissionMode = defaults.inheritedPermissionMode;
+    this.#newSessionInheritedThinking = defaults.inheritedThinking;
     this.#newSessionWorkspaceId = workspace.id;
     this.#newSessionPreferredBaseRef = preferredBaseRef;
     this.#newSessionOpen = true;
@@ -1659,6 +1663,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const generation = ++this.#newSessionOptionsGeneration;
     this.#newSessionOptionsPending = true;
     this.#newSessionOptionsError = "";
+    // Until this workspace's metadata arrives, preserve the values shown as explicit choices.
+    this.#newSessionInheritedPermissionMode = undefined;
+    this.#newSessionInheritedThinking = undefined;
     this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current);
     this.requestUpdate();
 
@@ -1688,10 +1695,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionModelId = defaults.modelId;
       this.#newSessionThinking = defaults.thinking;
       this.#newSessionPermissionMode = defaults.permissionMode;
+      this.#newSessionInheritedThinking = defaults.inheritedThinking;
+      this.#newSessionInheritedPermissionMode = defaults.inheritedPermissionMode;
     } catch {
       if (generation !== this.#newSessionOptionsGeneration) return;
       this.#newSessionOptionsError =
-        "Persona and model choices could not be loaded. Server defaults will be used.";
+        "Persona and model choices could not be loaded. Current displayed choices will be preserved.";
     } finally {
       if (generation === this.#newSessionOptionsGeneration) {
         this.#newSessionOptionsPending = false;
@@ -1973,16 +1982,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         selectedMode,
         this.#newSessionProviders,
       );
-      const availableModels = this.#availableNewSessionModels();
-      const modelInfo = availableModels.find((model) => model.id === effectiveModel);
-      const inheritedDefaults = resolveNewThreadDefaults(
-        this.#newSessionModes,
-        availableModels,
-        this.#newSessionProviders,
-        {
-          modeId: this.#newSessionModeId,
-          ...(effectiveModel === undefined ? {} : { modelId: effectiveModel }),
-        },
+      const modelInfo = this.#availableNewSessionModels().find(
+        (model) => model.id === effectiveModel,
       );
       const permissionMode = String(data.get("permission_mode") ?? "");
       const thread = await this.#protocolClient.createThread(
@@ -1999,8 +2000,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               : {}
           ),
           thinking: this.#newSessionThinking,
-          inheritedPermissionMode: inheritedDefaults.permissionMode,
-          inheritedThinking: inheritedDefaults.thinking,
+          ...(this.#newSessionInheritedPermissionMode === undefined
+            ? {}
+            : { inheritedPermissionMode: this.#newSessionInheritedPermissionMode }),
+          ...(this.#newSessionInheritedThinking === undefined
+            ? {}
+            : { inheritedThinking: this.#newSessionInheritedThinking }),
           ...(modelInfo === undefined ? {} : { modelInfo }),
         }),
       );
@@ -2871,6 +2876,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     this.#newSessionModelId = defaults.modelId;
                     this.#newSessionThinking = defaults.thinking;
                     this.#newSessionPermissionMode = defaults.permissionMode;
+                    this.#newSessionInheritedThinking = this.#newSessionOptionsPending
+                      ? undefined
+                      : defaults.inheritedThinking;
+                    this.#newSessionInheritedPermissionMode = this.#newSessionOptionsPending
+                      ? undefined
+                      : defaults.inheritedPermissionMode;
                     this.requestUpdate();
                   }}
                 >
@@ -2909,6 +2920,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     );
                     this.#newSessionModelId = defaults.modelId;
                     this.#newSessionThinking = defaults.thinking;
+                    this.#newSessionInheritedThinking = this.#newSessionOptionsPending
+                      ? undefined
+                      : defaults.inheritedThinking;
                     this.requestUpdate();
                   }}
                 ></trouve-model-picker>
@@ -2932,6 +2946,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                           this.#newSessionProviders,
                           { modeId: this.#newSessionModeId, modelId: this.#newSessionModelId },
                         ).permissionMode;
+                    this.#newSessionInheritedPermissionMode = undefined;
                     this.requestUpdate();
                   }}
                 >
@@ -2954,6 +2969,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       this.#newSessionProviders,
                       { modeId: this.#newSessionModeId, modelId: this.#newSessionModelId },
                     ).thinking;
+                    this.#newSessionInheritedThinking = undefined;
                     this.requestUpdate();
                   }}
                 >

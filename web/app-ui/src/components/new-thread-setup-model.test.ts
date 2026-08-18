@@ -90,6 +90,8 @@ describe("new thread setup model", () => {
       modelId: "provider/global",
       thinking: "medium",
       permissionMode: "ask",
+      inheritedThinking: "medium",
+      inheritedPermissionMode: "ask",
       prompt: "",
       attachments: [],
     });

@@ -160,6 +160,8 @@ describe("new session model", () => {
       modelId: "provider/global",
       thinking: "high",
       permissionMode: "allow_list",
+      inheritedThinking: "high",
+      inheritedPermissionMode: "allow_list",
     });
   });
 
@@ -182,6 +184,37 @@ describe("new session model", () => {
     expect(resolveNewThreadDefaults([mode()], models, globalProviders)).toMatchObject({
       thinking: "high",
       permissionMode: "yolo",
+      inheritedThinking: "high",
+      inheritedPermissionMode: "yolo",
+    });
+  });
+
+  it("emits displayed schema and safety fallbacks when metadata is unavailable", () => {
+    const modelInfo = model({
+      properties: {
+        thinking_level: { type: "string", enum: ["low", "high"], default: "low" },
+      },
+    });
+    const defaults = resolveNewThreadDefaults([], [modelInfo], undefined);
+    expect(defaults).toMatchObject({
+      thinking: "low",
+      permissionMode: "ask",
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      mode: defaults.modeId,
+      model: defaults.modelId,
+      permissionMode: defaults.permissionMode,
+      thinking: defaults.thinking,
+      modelInfo,
+    })).toEqual({
+      session_id: "session-1",
+      mode: "code",
+      model: "provider/model",
+      permission_mode: "ask",
+      model_options: { thinking_level: "low" },
     });
   });
 
@@ -201,10 +234,10 @@ describe("new session model", () => {
       .toBe("");
   });
 
-  it("chooses an explicit base, repository HEAD, conventional trunks, then literal HEAD", () => {
+  it("chooses an explicit base, repository branch, detached HEAD, then conventional trunks", () => {
     expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "feature")).toBe("feature");
     expect(resolveNewSessionBaseRef(["feature", "master", "main"], "master", "feature")).toBe("master");
-    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "missing")).toBe("main");
+    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "deadbeef")).toBe("HEAD");
     expect(resolveNewSessionBaseRef(["feature", "master"])).toBe("master");
     expect(resolveNewSessionBaseRef(["feature"])).toBe("HEAD");
     expect(resolveNewSessionBaseRef(["main"], "missing", "main")).toBe("main");

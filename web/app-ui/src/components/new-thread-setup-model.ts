@@ -33,6 +33,9 @@ export interface NewThreadSetupDraft {
   readonly modelId: string;
   readonly thinking: string;
   readonly permissionMode: NewThreadPermissionSelection;
+  /** Captured authoritative sources for the values currently displayed. */
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: Exclude<NewThreadPermissionSelection, ""> | undefined;
   readonly prompt: string;
   readonly attachments: readonly PendingAttachment[];
 }
@@ -148,6 +151,7 @@ export const selectNewThreadModel = (
     ...draft,
     modelId: defaults.modelId,
     thinking: defaults.thinking,
+    inheritedThinking: defaults.inheritedThinking,
   };
 };
 
@@ -247,15 +251,6 @@ export const createNewThreadSetupSubmission = (input: {
     },
     input.catalog,
   );
-  const inheritedDefaults = resolveNewThreadDefaults(
-    input.catalog.modes,
-    input.catalog.models,
-    input.catalog.providers,
-    {
-      ...(mode === undefined ? {} : { modeId: mode.id }),
-      ...(effectiveModel === undefined ? {} : { modelId: effectiveModel.id }),
-    },
-  );
   const prompt = input.draft.prompt.trim();
   const request = createNewSessionThreadRequest({
     sessionId: input.sessionId,
@@ -264,8 +259,12 @@ export const createNewThreadSetupSubmission = (input: {
     ...(model === undefined ? {} : { model: model.id }),
     permissionMode: input.draft.permissionMode,
     thinking: input.draft.thinking,
-    inheritedPermissionMode: inheritedDefaults.permissionMode,
-    inheritedThinking: inheritedDefaults.thinking,
+    ...(input.draft.inheritedPermissionMode === undefined
+      ? {}
+      : { inheritedPermissionMode: input.draft.inheritedPermissionMode }),
+    ...(input.draft.inheritedThinking === undefined
+      ? {}
+      : { inheritedThinking: input.draft.inheritedThinking }),
     ...(effectiveModel === undefined ? {} : { modelInfo: effectiveModel }),
   });
   const initialMessage = prompt === "" && input.draft.attachments.length === 0

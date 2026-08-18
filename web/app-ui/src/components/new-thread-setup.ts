@@ -554,6 +554,11 @@ export class TrouveNewThreadSetup extends LitElement {
     this.#loadedWorkspaceId = workspaceId;
     this.#optionsLoading = true;
     this.#optionsError = "";
+    this.#draft = {
+      ...this.#draft,
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    };
     this.#subscriptionHealth = readSignal(services.subscriptionHealth.current);
     this.requestUpdate();
 
@@ -586,7 +591,7 @@ export class TrouveNewThreadSetup extends LitElement {
     } catch {
       if (generation !== this.#loadGeneration || workspaceId !== this.#effectiveWorkspaceId) return;
       this.#optionsError =
-        "Persona and model choices could not be loaded. Server defaults remain available while trouve retries automatically.";
+        "Persona and model choices could not be loaded. Current displayed choices remain available while trouve retries automatically.";
       this.#scheduleOptionsRetry();
     } finally {
       if (generation === this.#loadGeneration && workspaceId === this.#effectiveWorkspaceId) {
@@ -612,14 +617,20 @@ export class TrouveNewThreadSetup extends LitElement {
     const repaired = catalog.models.some((model) => model.id === draft.modelId)
       ? selectNewThreadModel(modeDefaults, draft.modelId, catalog)
       : modeDefaults;
+    const keepThinking =
+      newThreadThinkingOption(repaired, catalog)?.values.includes(draft.thinking) === true;
     this.#draft = {
       ...draft,
       modeId: repaired.modeId,
       modelId: repaired.modelId,
-      thinking: newThreadThinkingOption(repaired, catalog)?.values.includes(draft.thinking)
-        ? draft.thinking
-        : repaired.thinking,
+      thinking: keepThinking ? draft.thinking : repaired.thinking,
+      inheritedThinking: keepThinking
+        ? draft.inheritedThinking
+        : repaired.inheritedThinking,
       permissionMode: draft.permissionMode || repaired.permissionMode,
+      inheritedPermissionMode: draft.permissionMode
+        ? draft.inheritedPermissionMode
+        : repaired.inheritedPermissionMode,
     };
   }
 
@@ -668,6 +679,7 @@ export class TrouveNewThreadSetup extends LitElement {
         this.#draft.modelId,
         this.#catalog,
       ).thinking,
+      inheritedThinking: undefined,
     };
     this.requestUpdate();
   };
@@ -683,7 +695,11 @@ export class TrouveNewThreadSetup extends LitElement {
             this.#draft.modeId,
             this.#catalog,
           ).permissionMode;
-    this.#draft = { ...this.#draft, permissionMode };
+    this.#draft = {
+      ...this.#draft,
+      permissionMode,
+      inheritedPermissionMode: undefined,
+    };
     this.requestUpdate();
   };
 

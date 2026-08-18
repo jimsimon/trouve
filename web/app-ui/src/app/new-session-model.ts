@@ -28,6 +28,9 @@ export interface ResolvedNewThreadDefaults {
   readonly modelId: string;
   readonly thinking: string;
   readonly permissionMode: ResolvedPermissionMode;
+  /** Authoritative persona/global values that may remain server-inherited. */
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: ResolvedPermissionMode | undefined;
 }
 
 export interface NewSessionThreadRequestInput {
@@ -144,7 +147,7 @@ export const resolveNewSessionModel = (
 const validPermissionMode = (value: unknown): ResolvedPermissionMode | undefined =>
   value === "ask" || value === "allow_list" || value === "yolo" ? value : undefined;
 
-/** Resolve every inherited new-thread option to the concrete value the server uses. */
+/** Resolve displayed defaults and identify values backed by persona/global metadata. */
 export const resolveNewThreadDefaults = (
   modes: readonly ProtocolAgentPersona[],
   models: readonly ProtocolModelInfo[],
@@ -162,21 +165,25 @@ export const resolveNewThreadDefaults = (
     : models[0]?.id ?? "";
   const model = models.find((candidate) => candidate.id === modelId);
   const option = thinkingOption(model);
-  const thinking = [
+  const inheritedThinking = [
     nonEmpty(mode?.default_thinking_level),
     nonEmpty(providers?.default_thinking_level),
-    option?.defaultValue,
-    option?.values[0],
   ].find((candidate): candidate is string =>
-    candidate !== undefined && option?.values.includes(candidate) === true) ?? "";
-  const permissionMode = validPermissionMode(mode?.default_permission_mode)
-    ?? validPermissionMode(providers?.default_permission_mode)
-    ?? "ask";
+    candidate !== undefined && option?.values.includes(candidate) === true);
+  const thinking = inheritedThinking
+    ?? option?.defaultValue
+    ?? option?.values[0]
+    ?? "";
+  const inheritedPermissionMode = validPermissionMode(mode?.default_permission_mode)
+    ?? validPermissionMode(providers?.default_permission_mode);
+  const permissionMode = inheritedPermissionMode ?? "ask";
   return {
     modeId: mode?.id ?? "code",
     modelId,
     thinking,
     permissionMode,
+    inheritedThinking,
+    inheritedPermissionMode,
   };
 };
 
@@ -189,16 +196,16 @@ export const resolveNewSessionBaseRef = (
   const preferred = nonEmpty(preferredBaseRef);
   if (preferred !== undefined && branches.includes(preferred)) return preferred;
   const head = nonEmpty(repositoryHead);
-  if (head !== undefined && branches.includes(head)) return head;
+  if (head !== undefined) return branches.includes(head) ? head : "HEAD";
   if (branches.includes("main")) return "main";
   if (branches.includes("master")) return "master";
   return "HEAD";
 };
 
 /**
- * Builds the initial thread request while preserving server-side inheritance.
- * Matching permission/thinking selections remain omitted so a concurrent
- * global-default update wins; changed thinking is emitted only when advertised.
+ * Builds the initial thread request while preserving authoritative inheritance.
+ * Values without a captured persona/global source are emitted so the request
+ * always matches what the form displayed.
  */
 export const createNewSessionThreadRequest = (
   input: NewSessionThreadRequestInput,
