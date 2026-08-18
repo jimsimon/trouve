@@ -13236,7 +13236,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_stale_dedupe_normalization_repairs_rows_written_after_first_pass() {
+    fn draft_stale_dedupe_normalization_runs_on_reopen_and_is_idempotent() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("draft-stale.sqlite3");
         let legacy = {
@@ -13259,9 +13259,35 @@ mod tests {
             legacy
         };
 
+        let normalized_key = {
+            let store = Store::open(&database).unwrap();
+            let normalized_key = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT dedupe_key FROM code_review_jobs WHERE id = ?1",
+                    params![legacy.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            let replacement = enqueue_backoff_test_job(&store);
+            assert_ne!(replacement.id, legacy.id);
+            normalized_key
+        };
+
         let store = Store::open(&database).unwrap();
-        let replacement = enqueue_backoff_test_job(&store);
-        assert_ne!(replacement.id, legacy.id);
+        let reopened_key = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT dedupe_key FROM code_review_jobs WHERE id = ?1",
+                params![legacy.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(reopened_key, normalized_key);
     }
 
     #[test]
