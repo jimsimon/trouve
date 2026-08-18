@@ -11098,6 +11098,7 @@ mod tests {
         let files = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -2 +2 @@\n-old\n+new\n".into(),
+            generated_header: None,
         }];
         let candidate = CandidateFinding {
             candidate_id: "candidate-low-confidence".into(),
