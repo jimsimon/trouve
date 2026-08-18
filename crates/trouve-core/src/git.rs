@@ -2960,6 +2960,8 @@ pub fn diff_files_between(
         None,
         &[
             "diff",
+            "--no-ext-diff",
+            "--no-textconv",
             "--no-renames",
             "--numstat",
             "-z",
@@ -4052,6 +4054,59 @@ mod tests {
             "review plumbing executed a repository filter"
         );
         assert_eq!(run(tmp.path(), &["count-objects", "-v"]), objects_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_review_manifest_never_executes_external_diff_or_textconv_filters() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let filter_dir = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join(".gitattributes"), "*.txt diff=evil\n").unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "changed\n").unwrap();
+        run(tmp.path(), &["add", "."]);
+        run(tmp.path(), &["commit", "-m", "change text"]);
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        let sentinel = filter_dir.path().join("filter-ran");
+        let filter = filter_dir.path().join("hostile-diff");
+        std::fs::write(
+            &filter,
+            format!(
+                "#!/bin/sh\nprintf invoked >> {}\nexit 1\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run(
+            tmp.path(),
+            &["config", "diff.external", filter.to_str().unwrap()],
+        );
+        run(
+            tmp.path(),
+            &["config", "diff.evil.textconv", filter.to_str().unwrap()],
+        );
+
+        let files = diff_files_between(
+            tmp.path(),
+            &base,
+            &head,
+            10,
+            100,
+            64 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(files, [".gitattributes", "a.txt"]);
+        assert!(
+            !sentinel.exists(),
+            "immutable review manifest executed a repository diff filter"
+        );
     }
 
     #[test]

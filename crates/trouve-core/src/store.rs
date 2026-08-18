@@ -3556,7 +3556,10 @@ fn insert_event_batch<'a>(
         let mut stmt = tx.prepare_cached("DELETE FROM code_review_pending_events WHERE id = ?1")?;
         for id in code_review_outbox_ids {
             let deleted = stmt.execute([id])?;
-            debug_assert_eq!(deleted, 1);
+            anyhow::ensure!(
+                deleted == 1,
+                "code review pending event {id} was concurrently consumed"
+            );
         }
     }
     update_thread_view_caches(&tx, &thread_events)?;

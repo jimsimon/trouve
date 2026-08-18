@@ -3015,17 +3015,11 @@ function ReviewPersonaSettings({
                 onChange={(event) => {
                   const next = event.currentTarget.value;
                   setModel(next);
-                  const nextOptions = thinkingOptions(
-                    models.find((candidate) => candidate.id === (next || globalModel)),
-                  );
                   const nextModel = models.find(
                     (candidate) => candidate.id === (next || globalModel),
                   );
                   if (thinking && !thinkingSelectionIsValid(nextModel, thinking)) {
-                    setThinking(
-                      nextOptions.defaultValue ??
-                        (nextOptions.budget ? String(nextOptions.budget.minimum) : ""),
-                    );
+                    setThinking(defaultThinkingSelection(nextModel));
                   }
                 }}
               >

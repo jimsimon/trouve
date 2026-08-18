@@ -3674,6 +3674,7 @@ impl Engine {
             loaded
         };
         let (diff_files, reused_hunk_count) = if rewritten_history
+            && previous_pull_state.last_reviewed_head_sha == job.review_watermark_sha
             && validate_sha(&previous_pull_state.last_reviewed_base_sha).is_ok()
             && validate_sha(&previous_pull_state.last_reviewed_head_sha).is_ok()
         {

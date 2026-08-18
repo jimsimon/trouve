@@ -39,6 +39,22 @@ test("models without an advertised thinking enum have no thinking selector", () 
   assert.equal(defaultThinkingSelection(undefined, "high"), "");
 });
 
+test("enum-backed thinking without a declared default selects its first value", () => {
+  const model = {
+    id: "provider/enum-thinking",
+    options_schema: {
+      properties: {
+        reasoning_effort: {
+          type: "string",
+          enum: ["low", "high"],
+        },
+      },
+    },
+  };
+
+  assert.equal(defaultThinkingSelection(model), "low");
+});
+
 test("fixed thinking budgets follow advertised numeric bounds", () => {
   const model = {
     id: "anthropic/claude-haiku-4-5",
