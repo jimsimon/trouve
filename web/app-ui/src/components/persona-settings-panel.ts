@@ -103,7 +103,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
   #editingModeId = "";
   #defaultModelDraft = "";
   #defaultThinkingDraft = "";
-  #modeFormModelId = "";
+  #modeFormModelId: string | undefined;
   #modeFormThinkingDraft: string | undefined;
 
   #availableModels(): readonly ProtocolModelInfo[] {
@@ -216,7 +216,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       await protocol.upsertPersona(id, request);
       if (existing === undefined) form.reset();
       this.#editingModeId = "";
-      this.#modeFormModelId = "";
+      this.#modeFormModelId = undefined;
       this.#modeFormThinkingDraft = undefined;
       await this.#load();
       this.#message = `Saved persona ${id}.`;
@@ -255,9 +255,10 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
   #modeForm(info?: ProtocolPersonaInfo) {
     const mode = info?.persona;
     const readOnly = info?.origin === "workspace";
-    const selectedModelId = this.#modeFormModelId || mode?.default_model || this.#providers?.default_model || "";
+    const configuredModelId = this.#modeFormModelId ?? mode?.default_model ?? "";
+    const effectiveModelId = configuredModelId || this.#providers?.default_model || "";
     const editorThinking = thinkingOptions(
-      this.#availableModels().find((candidate) => candidate.id === selectedModelId),
+      this.#availableModels().find((candidate) => candidate.id === effectiveModelId),
     );
     return html`
       <form class="mode-editor" @submit=${(event: SubmitEvent) => void this.#saveMode(event, info)}>
@@ -271,9 +272,11 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
         <label class="row"><input style="width:auto" type="checkbox" name="read_only" .checked=${mode?.read_only ?? false} ?disabled=${readOnly} /><span>Read-only (never mutates the worktree)</span></label>
         <div class="grid mode-default-grid">
           <label><span>Default permissions</span><select name="default_permission_mode" .value=${mode?.default_permission_mode ?? ""} ?disabled=${readOnly}><option value="">Global default</option><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
-          <label><span>Default model</span><select name="default_model" .value=${this.#modeFormModelId || mode?.default_model || ""} ?disabled=${readOnly || this.#availableModels().length === 0} @change=${(event: Event) => {
-            this.#modeFormModelId = (event.currentTarget as HTMLSelectElement).value;
-            const options = thinkingOptions(this.#availableModels().find((candidate) => candidate.id === this.#modeFormModelId));
+          <label><span>Default model</span><select name="default_model" .value=${configuredModelId} ?disabled=${readOnly || this.#availableModels().length === 0} @change=${(event: Event) => {
+            const configuredModelId = (event.currentTarget as HTMLSelectElement).value;
+            this.#modeFormModelId = configuredModelId;
+            const effectiveModelId = configuredModelId || this.#providers?.default_model || "";
+            const options = thinkingOptions(this.#availableModels().find((candidate) => candidate.id === effectiveModelId));
             const current = this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? "";
             this.#modeFormThinkingDraft = options.includes(current) ? current : "";
             this.requestUpdate();
@@ -284,7 +287,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
         </div>
         ${readOnly
           ? html`<p class="meta">Workspace personas are managed by the repository’s .agents configuration.</p>`
-          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add persona" : "Save persona"}</button><button type="button" @click=${() => { this.#editingModeId = ""; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = undefined; this.requestUpdate(); }}>Cancel</button></div>`}
+          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add persona" : "Save persona"}</button><button type="button" @click=${() => { this.#editingModeId = ""; this.#modeFormModelId = undefined; this.#modeFormThinkingDraft = undefined; this.requestUpdate(); }}>Cancel</button></div>`}
       </form>
     `;
   }

@@ -4297,11 +4297,11 @@ impl Engine {
                 config.default_thinking_level = Some(level.into());
             }
             self.persist_config(&config);
-        }
-        let mut defaults = self.global_defaults.write().unwrap();
-        defaults.model = model.to_string();
-        if let Some(level) = thinking_level {
-            defaults.thinking_level = Some(level.into());
+            let mut defaults = self.global_defaults.write().unwrap();
+            defaults.model = model.to_string();
+            if let Some(level) = thinking_level {
+                defaults.thinking_level = Some(level.into());
+            }
         }
         Ok(())
     }
@@ -4351,8 +4351,8 @@ impl Engine {
             let mut config = self.config.lock().unwrap();
             config.default_permission_mode = Some(mode);
             self.persist_config(&config);
+            self.global_defaults.write().unwrap().permission_mode = mode;
         }
-        self.global_defaults.write().unwrap().permission_mode = mode;
         Ok(())
     }
 
