@@ -802,9 +802,13 @@ cat > /dev/null
         dropped["error"]["message"],
         "session event route unavailable"
     );
-
     let mut overload_error = None;
-    while let Some(event) = tokio::time::timeout(deadline, stream.next())
+    // Overload cleanup may spend up to five seconds waiting for Cursor's
+    // cancellation acknowledgement before entering its bounded process-reap
+    // fallback. Keep the short setup deadline above, but cover that complete
+    // production shutdown contract here.
+    let shutdown_deadline = std::time::Duration::from_secs(12);
+    while let Some(event) = tokio::time::timeout(shutdown_deadline, stream.next())
         .await
         .expect("overloaded Cursor stream must terminate")
     {
