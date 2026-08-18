@@ -1030,6 +1030,7 @@ pub struct ReviewRepositoryDiff {
 }
 
 pub struct ReviewRepositoryMergeBase {
+    pub managed_root: PathBuf,
     pub worktree: PathBuf,
     pub base_sha: String,
     pub head_sha: String,
@@ -3085,6 +3086,7 @@ impl ToolExecutor for LocalToolExecutor {
         let repository_guard = repository_lock.lock_owned().await;
 
         let mut command = tokio::process::Command::new("git");
+        harden_authenticated_review_git_command(&mut command);
         command
             .args(["update-ref", "--stdin"])
             .current_dir(&repository_path)
@@ -3261,7 +3263,9 @@ impl ToolExecutor for LocalToolExecutor {
         &self,
         request: &ReviewRepositoryMergeBase,
     ) -> Result<String, String> {
-        let worktree = request.worktree.clone();
+        validate_review_commit(&request.base_sha)?;
+        validate_review_commit(&request.head_sha)?;
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
         let base_sha = request.base_sha.clone();
         let head_sha = request.head_sha.clone();
         let cancel = request.cancel.clone();
@@ -3647,6 +3651,42 @@ mod tests {
         assert_eq!(resolved, session.canonicalize().unwrap());
         assert!(canonical_managed_path(&managed, &managed).is_err());
         assert!(canonical_managed_path(&managed, &outside).is_err());
+    }
+
+    #[tokio::test]
+    async fn review_merge_base_rejects_unmanaged_paths_and_invalid_commits() {
+        let container = tempfile::tempdir().unwrap();
+        let managed = container.path().join("worktrees");
+        let worktree = managed.join("se_test");
+        let outside = container.path().join("outside");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let executor = LocalToolExecutor::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let error = executor
+            .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                managed_root: managed.clone(),
+                worktree: outside,
+                base_sha: "0".repeat(40),
+                head_sha: "1".repeat(40),
+                cancel: cancel.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("escapes"), "{error}");
+
+        let error = executor
+            .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                managed_root: managed,
+                worktree,
+                base_sha: "not-a-commit".into(),
+                head_sha: "1".repeat(40),
+                cancel,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid review commit id"), "{error}");
     }
 
     #[tokio::test]

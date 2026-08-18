@@ -2962,6 +2962,11 @@ fn spawn_event_writer(
                     );
                 }
                 match inserted {
+                    Ok(inserted) if inserted.skipped => {
+                        for request in requests {
+                            request.reply.send(Ok(Vec::new()));
+                        }
+                    }
                     Ok(inserted) => {
                         // Publish every committed source and derived event in
                         // exact cursor order before resolving append callers.
@@ -3047,6 +3052,7 @@ pub(crate) fn event_writer_sqlite_error_code(error: &anyhow::Error) -> Option<ru
 /// Insert a batch in queue order under one transaction, returning the
 /// assigned cursors. All-or-nothing: on error the transaction rolls back.
 struct InsertedEventBatch {
+    skipped: bool,
     source_cursors: Vec<u64>,
     published: Vec<EventEnvelope>,
 }
@@ -3456,6 +3462,7 @@ fn insert_event_batch<'a>(
         for id in &code_review_outbox_ids {
             if !stmt.query_row([id], |row| row.get::<_, bool>(0))? {
                 return Ok(InsertedEventBatch {
+                    skipped: true,
                     source_cursors: Vec::new(),
                     published: Vec::new(),
                 });
@@ -3555,6 +3562,7 @@ fn insert_event_batch<'a>(
     update_thread_view_caches(&tx, &thread_events)?;
     tx.commit()?;
     Ok(InsertedEventBatch {
+        skipped: false,
         source_cursors,
         published,
     })
@@ -14167,10 +14175,22 @@ mod tests {
             &store.conn.lock().unwrap(),
             &stale_events,
             stale_events.len(),
-            stale_ids,
+            stale_ids.iter().copied(),
         )
         .unwrap();
+        assert!(stale_insert.skipped);
         assert!(stale_insert.published.is_empty());
+        let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
+        store
+            .append_tx
+            .send(AppendRequest {
+                events: stale_events,
+                code_review_outbox_ids: stale_ids,
+                reply: AppendReply::Sync(reply),
+                queued_at: std::time::Instant::now(),
+            })
+            .unwrap();
+        assert!(reply_rx.recv().unwrap().unwrap().is_empty());
         assert!(
             store
                 .flush_pending_code_review_events(&queued.id)

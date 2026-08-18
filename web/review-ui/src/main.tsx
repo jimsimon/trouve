@@ -2970,6 +2970,12 @@ function ReviewPersonaSettings({
   );
   const effectiveModel = model || globalModel || "";
   const selectedModel = models.find((candidate) => candidate.id === effectiveModel);
+  useEffect(() => {
+    setThinking((current) => {
+      if (!current || thinkingSelectionIsValid(selectedModel, current)) return current;
+      return defaultThinkingSelection(selectedModel);
+    });
+  }, [effectiveModel, selectedModel]);
   const options = thinkingOptions(selectedModel);
   const inheritedThinking = globalThinking
     ? thinkingLevelLabel(globalThinking)

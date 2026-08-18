@@ -3555,6 +3555,7 @@ impl Engine {
             match self
                 .executor
                 .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                    managed_root: self.data_dir.join("review-repositories"),
                     worktree: repository_path.clone(),
                     base_sha: review_watermark_sha.clone(),
                     head_sha: job.head_sha.clone(),
@@ -3588,6 +3589,7 @@ impl Engine {
             job.review_base_sha = self
                 .executor
                 .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                    managed_root: self.data_dir.join("review-repositories"),
                     worktree: repository_path.clone(),
                     base_sha: job.base_ref.clone(),
                     head_sha: job.head_sha.clone(),
@@ -3678,6 +3680,7 @@ impl Engine {
             let previous_merge_base = self
                 .executor
                 .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                    managed_root: self.data_dir.join("worktrees"),
                     worktree: session.worktree_path.clone().into(),
                     base_sha: previous_pull_state.last_reviewed_base_sha.clone(),
                     head_sha: previous_pull_state.last_reviewed_head_sha.clone(),

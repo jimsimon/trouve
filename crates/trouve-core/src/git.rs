@@ -3092,6 +3092,9 @@ pub fn diff_between(
         max_bytes,
         &operation,
     )?;
+    if output.truncated {
+        bail!("review diff exceeds the {max_bytes}-byte limit");
+    }
     Ok(String::from_utf8_lossy(&output.bytes).into_owned())
 }
 
@@ -4289,10 +4292,11 @@ mod tests {
         let diff = diff_between(tmp.path(), &base, &head, 64 * 1024, &cancel).unwrap();
         assert!(diff.contains("after \u{fffd}"));
         let error = diff_between(tmp.path(), &base, &head, 1, &cancel).unwrap_err();
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("output exceeded its 1-byte bound")
+            message.contains("review diff exceeds the 1-byte limit")
+                || message.contains("output exceeded its 1-byte bound"),
+            "{message}"
         );
     }
 
@@ -4357,10 +4361,11 @@ mod tests {
         assert!(!diff.contains("+other"));
         let byte_error =
             diff_path_between(tmp.path(), &base, &head, ":(glob)**", 8, &cancel).unwrap_err();
+        let message = byte_error.to_string();
         assert!(
-            byte_error
-                .to_string()
-                .contains("output exceeded its 8-byte bound")
+            message.contains("review file diff exceeds the 8-byte limit")
+                || message.contains("output exceeded its 8-byte bound"),
+            "{message}"
         );
     }
 
