@@ -1102,7 +1102,7 @@ struct SupersededReviewTask;
 
 impl std::fmt::Display for SupersededReviewTask {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("review task was superseded while finishing")
+        formatter.write_str("stale: review task was superseded while finishing")
     }
 }
 
@@ -3811,14 +3811,12 @@ impl Engine {
             })
             .collect::<HashMap<_, _>>();
         let catalog_reviewer_count = reviewers.len();
-        let selected_reviewer_count = selected_reviewer_count(
-            &routing_decisions,
-            if batches.is_empty() {
-                0
-            } else {
-                catalog_reviewer_count
-            },
-        );
+        let total_reviewers = if batches.is_empty() {
+            0
+        } else {
+            catalog_reviewer_count
+        };
+        let selected_reviewer_count = selected_reviewer_count(&routing_decisions, total_reviewers);
         let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
         let mut latest_tasks = HashMap::new();
         if !batch_snapshot_changed {
@@ -3954,7 +3952,7 @@ impl Engine {
             let completed = self.store.supersede_code_review_tasks_for_prompt_change(
                 &job.id,
                 &prompt_replaced_task_ids,
-                catalog_reviewer_count as u64,
+                total_reviewers as u64,
             )?;
             self.flush_pending_code_review_events(&job.id).await?;
             completed
@@ -3962,7 +3960,7 @@ impl Engine {
         self.store.set_code_review_job_progress(
             &job.id,
             completed_reviewers,
-            catalog_reviewer_count as u64,
+            total_reviewers as u64,
         )?;
         if prompt_replaced_task_ids.is_empty() {
             self.emit_code_review_progress(&job.id)?;
@@ -7516,7 +7514,7 @@ fn no_candidate_review_summary(
     changed_file_count: usize,
     reused_hunk_count: usize,
 ) -> String {
-    if reused_hunk_count > 0 && reviewer_count == 0 {
+    if changed_file_count == 0 && reused_hunk_count > 0 && reviewer_count == 0 {
         return "All relevant hunks were reused from the prior review; no persona review was run."
             .into();
     }
@@ -10869,6 +10867,10 @@ mod tests {
         assert!(should_log_code_review_job_failure("failed", None));
         assert!(!should_log_code_review_job_failure("failed", Some(false)));
         assert!(!should_log_code_review_job_failure("stale", None));
+        assert_eq!(
+            SupersededReviewTask.to_string(),
+            "stale: review task was superseded while finishing"
+        );
     }
 
     #[test]
@@ -13069,6 +13071,10 @@ mod tests {
         );
         assert_eq!(
             no_candidate_review_summary(0, 1, 0),
+            "No reviewer persona was selected for 1 changed file(s); no persona review was run."
+        );
+        assert_eq!(
+            no_candidate_review_summary(0, 1, 2),
             "No reviewer persona was selected for 1 changed file(s); no persona review was run."
         );
         assert_eq!(
