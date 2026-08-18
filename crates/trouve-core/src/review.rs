@@ -831,6 +831,7 @@ struct ReviewFinding {
     severity: String,
     #[serde(default = "default_review_confidence")]
     confidence: String,
+    #[serde(default)]
     title: String,
     body: String,
     /// Stable candidate ids retained by the coordinator. Reviewer outputs may
@@ -6158,8 +6159,8 @@ fn lifecycle_finding_entry(
     );
     format!(
         "- **Severity: {} · Confidence: {}** — {location}: **{finding_title}** — {finding_body}{note}\n",
-        finding.severity.to_ascii_uppercase(),
-        finding.confidence.to_ascii_uppercase()
+        canonical_finding_level(&finding.severity).to_ascii_uppercase(),
+        canonical_finding_level(&finding.confidence).to_ascii_uppercase()
     )
 }
 
@@ -8390,6 +8391,13 @@ mod tests {
         assert!(body.contains(
             "- **Severity: HIGH · Confidence: HIGH** — `src/lib.rs` line 42: **Error bypasses handling** — Return a typed error"
         ));
+        let mut legacy_finding = detail.findings[0].clone();
+        legacy_finding.severity = "critical".into();
+        legacy_finding.confidence = "UNKNOWN".into();
+        assert!(
+            lifecycle_finding_entry(&legacy_finding, false)
+                .starts_with("- **Severity: MEDIUM · Confidence: MEDIUM**")
+        );
         let inline = render_inline_finding(&detail.findings[0]);
         assert!(inline.starts_with(
             "**Error bypasses handling**\n_Identified by: Correctness, Security | Severity: HIGH | Confidence: HIGH_\n\nReturn a typed error and add a regression test."
@@ -10281,21 +10289,23 @@ mod tests {
     }
 
     #[test]
-    fn review_confidence_defaults_for_legacy_output() {
+    fn review_finding_fields_default_for_legacy_output() {
         let review = parse_review_output(
-            r#"{"summary":"legacy","findings":[{"path":"src/lib.rs","line":3,"severity":"high","title":"Legacy issue","body":"issue"}]}"#,
+            r#"{"summary":"legacy","findings":[{"path":"src/lib.rs","line":3,"severity":"high","body":"issue"}]}"#,
         )
         .unwrap();
         assert_eq!(review.findings[0].confidence, "medium");
+        assert!(review.findings[0].title.is_empty());
     }
 
     #[test]
-    fn review_output_requires_a_generated_finding_title() {
-        let error = parse_review_output(
+    fn review_output_discards_findings_without_a_generated_title() {
+        let mut review = parse_review_output(
             r#"{"summary":"untitled","findings":[{"path":"src/lib.rs","line":3,"severity":"high","body":"issue"}]}"#,
         )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("missing field `title`"));
+        .unwrap();
+        let valid = HashSet::from([("src/lib.rs".into(), 3, false)]);
+        assert!(normalize_finding(&mut review.findings[0], &valid).is_none());
     }
 
     #[test]

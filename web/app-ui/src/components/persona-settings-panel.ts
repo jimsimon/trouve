@@ -282,7 +282,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
             this.requestUpdate();
           }}><option value="">Global default</option>${this.#availableModels().map((candidate) => html`<option value=${candidate.id}>${modelSelectorLabel(candidate)}</option>`)}</select></label>
           ${editorThinking.length === 0
-            ? html`<input type="hidden" name="default_thinking_level" value="" />`
+            ? html`<input type="hidden" name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} />`
             : html`<label><span>Default thinking level</span><select name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @change=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Global default</option>${editorThinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
         </div>
         ${readOnly

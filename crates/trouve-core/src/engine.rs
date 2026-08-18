@@ -2312,6 +2312,7 @@ impl Engine {
             return;
         };
         loop {
+            let _mutation = self.persona_mutations.lock().await;
             let claim = match self.store.claim_next_persona_deletion() {
                 Ok(Some(claim)) => claim,
                 Ok(None) => break,
@@ -2320,7 +2321,6 @@ impl Engine {
                     break;
                 }
             };
-            let _mutation = self.persona_mutations.lock().await;
             let result = self
                 .executor
                 .delete_persona_file(config_dir, &claim.id, true)
