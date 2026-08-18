@@ -5,11 +5,12 @@ Fast and accurate code search for agents — a Rust port of
 branch- and worktree-aware index and a fully multithreaded pipeline.
 
 This package is the code-search component of the
-[trouve AI coding harness](../../README.md).
+[trouve AI coding harness](https://github.com/jimsimon/trouve).
 
 Pronounced **"troov"** (rhymes with *groove*; French /tʁuv/). *Trouver* is
 French for "to find" — a nod to upstream's namesake *sembler*, "to seem".
-The full story behind the name is in [NAME.md](../../NAME.md).
+The full story behind the name is in
+[NAME.md](https://github.com/jimsimon/trouve/blob/main/NAME.md).
 
 ## Why a port?
 
@@ -44,7 +45,9 @@ loads embeddings and BM25 postings zero-copy, and an incremental build patches
 the previous snapshot — splicing unchanged rows out of the old mapping — so
 its cost is proportional to the edit, not the repository.
 
-Measured results ([BENCHMARKS.md](../../BENCHMARKS.md)) on kubernetes/kubernetes
+Measured results
+([BENCHMARKS.md](https://github.com/jimsimon/trouve/blob/main/BENCHMARKS.md))
+on kubernetes/kubernetes
 (30k files): cold indexing drops from ~3 minutes to 3.3 s (54x), an
 incremental reindex after touching one file from ~3 minutes to 0.86 s (200x+),
 and a fully warm query from ~7 s to 0.55 s (13x). Retrieval quality is
@@ -54,9 +57,10 @@ annotated benchmark, with identical chunk boundaries and BM25 scores.
 Everything runs on CPU, like upstream: model2vec static embeddings are table
 lookups plus mean pooling, so there is no neural forward pass to accelerate.
 Disk and memory footprints are documented in
-[BENCHMARKS.md](../../BENCHMARKS.md#resource-usage); a complete list of differences
+[BENCHMARKS.md](https://github.com/jimsimon/trouve/blob/main/BENCHMARKS.md#resource-usage);
+a complete list of differences
 from upstream (and the reasoning behind each) is in
-[DIFFERENCES.md](../../DIFFERENCES.md).
+[DIFFERENCES.md](https://github.com/jimsimon/trouve/blob/main/DIFFERENCES.md).
 
 ## Install
 
@@ -96,7 +100,8 @@ case on Windows).
 
 There are three ways to wire trouve into a coding agent, plus the CLI as a
 universal fallback. Pick **one per agent** — they expose the same tools, so
-combining them shows the model duplicates. [INSTALL.md](../../INSTALL.md) has
+combining them shows the model duplicates.
+[INSTALL.md](https://github.com/jimsimon/trouve/blob/main/INSTALL.md) has
 step-by-step instructions for every route and agent.
 
 | Aspect | Plugin: OpenCode / Kilo | Plugin: Claude Code / Codex | Native tool file | MCP entry | CLI only |
@@ -122,7 +127,8 @@ How to choose:
   daemon keeps indexes cached across calls and across sessions with the same
   configuration.
 - **For OpenCode without npm, use the native tool file**: copy
-  [`src/agents/opencode-tool.ts`](src/agents/opencode-tool.ts) to
+  [`src/agents/opencode-tool.ts`](https://github.com/jimsimon/trouve/blob/main/crates/trouve-search/src/agents/opencode-tool.ts)
+  to
   `~/.config/opencode/tools/trouve.ts`. It exposes `trouve_search` /
   `trouve_find_related` with no MCP server process and no JSON config
   edits; it provides the same capabilities as an MCP entry under different
@@ -130,7 +136,8 @@ How to choose:
 - **Add an MCP entry for everything else.** `trouve-search` with no subcommand is
   an MCP stdio server; one `{"command": "npx", "args": ["-y", "@trouve-ai/search-core"]}`
   entry in your agent's MCP config is all it takes.
-  [INSTALL.md](../../INSTALL.md#3-mcp-server-entry) lists the exact file and snippet
+  [INSTALL.md](https://github.com/jimsimon/trouve/blob/main/INSTALL.md#3-mcp-server-entry)
+  lists the exact file and snippet
   for 14 agents, plus optional `trouve-search` sub-agent files you can copy
   alongside.
 - **The CLI needs no setup at all** and is what sub-agents without tool
@@ -150,7 +157,9 @@ Per-harness plugin install commands:
   `codex plugin marketplace add 'https://github.com/jimsimon/trouve.git' --ref main`
   then `codex plugin add trouve-search@trouve`.
 
-See [search-plugin](../../npm/search-plugin/README.md) for details.
+See
+[search-plugin](https://github.com/jimsimon/trouve/blob/main/npm/search-plugin/README.md)
+for details.
 
 ## Ignoring files
 
@@ -241,7 +250,9 @@ Thomas van Dongen and Stephan Tulkens of [MinishLab](https://github.com/MinishLa
 which pioneered the approach: static [Model2Vec](https://github.com/MinishLab/model2vec)
 embeddings fused with BM25 and code-aware reranking, fast enough for agents to
 use as a native tool. trouve's retrieval behaviour is a faithful port of their
-design (see [DIFFERENCES.md](../../DIFFERENCES.md)), and the
+design (see
+[DIFFERENCES.md](https://github.com/jimsimon/trouve/blob/main/DIFFERENCES.md)),
+and the
 [potion-code-16M](https://huggingface.co/minishlab/potion-code-16M) embedding
 model is theirs. If you find trouve useful, star their repo too.
 

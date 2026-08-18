@@ -46,7 +46,7 @@ server but still talks to it over the protocol.
 | Provider and vendor-agent integrations | [`crates/trouve-providers`](crates/trouve-providers), [`crates/trouve-agents`](crates/trouve-agents) |
 | Published semantic code search | [`crates/trouve-search`](crates/trouve-search/README.md) |
 
-The repository invariants and full crate map are in
+The repository invariants and a crate overview are in
 [AGENTS.md](AGENTS.md); architectural decisions are recorded in
 [`docs/adr`](docs/adr/README.md).
 
@@ -71,6 +71,7 @@ TROUVE_APP_UI_DEV_URL=http://127.0.0.1:5173 cargo run -p trouve-app
 To build a release binary with the desktop assets embedded:
 
 ```bash
+npm --prefix web/app-ui ci
 npm --prefix web/app-ui run build
 TROUVE_APP_UI_DIST="$PWD/web/app-ui/dist/desktop" \
   cargo build --release -p trouve-app
@@ -84,6 +85,8 @@ The main workspace checks are:
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
+npm --prefix web/app-ui run format:check
+npm --prefix web/app-ui run lint
 npm --prefix web/app-ui test
 npm --prefix web/app-ui run build
 ```
