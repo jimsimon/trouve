@@ -221,8 +221,8 @@ fn proxy_falls_back_in_process_when_daemon_dies_unrestartably() {
     std::fs::remove_dir_all(&daemon_dir).unwrap();
     std::fs::write(&daemon_dir, b"not a directory").unwrap();
 
-    // The reconnect attempt times out (~10s), then the session finishes
-    // in-process rather than going dark.
+    // The launcher detects that the directory cannot be prepared, then the
+    // session finishes in-process rather than going dark.
     let response = search(&mut session, 3, repo.path(), "database connection");
     assert_eq!(response["result"]["isError"], false, "got {response}");
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
