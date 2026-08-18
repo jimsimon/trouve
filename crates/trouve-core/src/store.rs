@@ -13237,28 +13237,29 @@ mod tests {
 
     #[test]
     fn draft_stale_dedupe_normalization_repairs_rows_written_after_first_pass() {
-        let store = Store::open_in_memory().unwrap();
-        let legacy = enqueue_backoff_test_job(&store);
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            legacy.id
-        );
-        assert!(
-            store
-                .finish_code_review_job(
-                    &legacy.id,
-                    "stale",
-                    "",
-                    "stale: pull request is a draft; automatic review stopped",
-                )
-                .unwrap()
-        );
-        {
-            let conn = store.conn.lock().unwrap();
-            normalize_draft_stale_code_review_dedupe_keys(&conn).unwrap();
-            normalize_draft_stale_code_review_dedupe_keys(&conn).unwrap();
-        }
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("draft-stale.sqlite3");
+        let legacy = {
+            let store = Store::open(&database).unwrap();
+            let legacy = enqueue_backoff_test_job(&store);
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                legacy.id
+            );
+            assert!(
+                store
+                    .finish_code_review_job(
+                        &legacy.id,
+                        "stale",
+                        "",
+                        "stale: pull request is a draft; automatic review stopped",
+                    )
+                    .unwrap()
+            );
+            legacy
+        };
 
+        let store = Store::open(&database).unwrap();
         let replacement = enqueue_backoff_test_job(&store);
         assert_ne!(replacement.id, legacy.id);
     }
