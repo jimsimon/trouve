@@ -55,7 +55,7 @@ pub fn run_daemon(content: &[ContentType]) -> ExitCode {
 mod unix {
     use std::fs;
     use std::io::{BufRead, BufReader, ErrorKind, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -122,7 +122,10 @@ mod unix {
         let dir = sock
             .parent()
             .ok_or_else(|| std::io::Error::other("daemon socket path has no parent"))?;
-        fs::create_dir_all(dir)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
         // Owner-only: the socket accepts tool calls from anyone who can
         // connect, same trust boundary as the cache files next to it.
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
@@ -450,12 +453,33 @@ mod unix {
         #[test]
         fn ensure_daemon_dir_creates_private_parent() {
             let root = tempfile::tempdir().unwrap();
-            let dir = root.path().join("missing").join("daemon");
+            let missing = root.path().join("missing");
+            let dir = missing.join("daemon");
             let sock = dir.join("mcp-test.sock");
 
             ensure_daemon_dir(&sock).unwrap();
 
             assert!(dir.is_dir());
+            assert_eq!(
+                fs::metadata(missing).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+
+        #[test]
+        fn ensure_daemon_dir_hardens_existing_parent() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("daemon");
+            let sock = dir.join("mcp-test.sock");
+
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            ensure_daemon_dir(&sock).unwrap();
+
             assert_eq!(
                 fs::metadata(dir).unwrap().permissions().mode() & 0o777,
                 0o700
