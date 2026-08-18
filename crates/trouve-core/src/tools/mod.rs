@@ -3251,6 +3251,7 @@ impl ToolExecutor for LocalToolExecutor {
                     })
                     .collect()
             })
+            .map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| format!("review diff manifest task failed: {error}"))?

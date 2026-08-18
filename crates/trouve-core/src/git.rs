@@ -178,6 +178,7 @@ impl GitIoThreads {
     }
 }
 
+#[derive(Debug)]
 struct BoundedGitOutput {
     bytes: Vec<u8>,
     truncated: bool,
@@ -193,6 +194,7 @@ struct BoundedGitCommandOutput {
 struct GitStdoutLimitExceeded {
     label: &'static str,
     limit: usize,
+    stdout: BoundedGitOutput,
 }
 
 impl fmt::Display for GitStdoutLimitExceeded {
@@ -438,10 +440,11 @@ fn run_git_bounded_with_status(
                     operation.label
                 );
             }
-            let _ = io_threads.join_until(operation.deadline)?;
+            let (stdout, _) = io_threads.join_until(operation.deadline)?;
             return Err(GitStdoutLimitExceeded {
                 label: operation.label,
                 limit: max_stdout,
+                stdout,
             }
             .into());
         }
@@ -2590,7 +2593,17 @@ fn run_review_marker_grep(
     match run_git_bounded_with_status(worktree, Some(index), &refs, None, max_stdout, operation) {
         Ok(output) if output.status.success() => Ok(ReviewMarkerGrepResult::Output(output.stdout)),
         Ok(output) if output.status.code() == Some(1) => Ok(ReviewMarkerGrepResult::NoMatch),
-        Ok(_) | Err(_) => {
+        Err(error) => {
+            if let Some(limit) = error.downcast_ref::<GitStdoutLimitExceeded>() {
+                return Ok(ReviewMarkerGrepResult::Output(BoundedGitOutput {
+                    bytes: limit.stdout.bytes.clone(),
+                    truncated: true,
+                }));
+            }
+            operation.check_cancelled()?;
+            Ok(ReviewMarkerGrepResult::Failed)
+        }
+        Ok(_) => {
             // Lookup failures safely keep the affected full diffs reviewable.
             // The header pass is optional after patches are loaded, so only
             // explicit caller cancellation aborts the completed operation.

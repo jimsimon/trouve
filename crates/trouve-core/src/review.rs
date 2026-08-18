@@ -3701,6 +3701,14 @@ impl Engine {
                         .await;
                     match previous_diff {
                         Ok(previous_diff) => {
+                            let previous_diff = previous_diff
+                                .into_iter()
+                                .map(|file| ReviewDiffFile {
+                                    path: file.path,
+                                    diff: file.diff,
+                                    generated_header: None,
+                                })
+                                .collect::<Vec<_>>();
                             let (filtered, reused) =
                                 filter_previously_reviewed_hunks(&diff_files, &previous_diff);
                             (Arc::new(filtered), reused)
@@ -3807,6 +3815,7 @@ impl Engine {
                 catalog_reviewer_count
             },
         );
+        let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
         let mut latest_tasks = HashMap::new();
         if !batch_snapshot_changed {
             for task in existing_tasks {
@@ -7147,6 +7156,7 @@ fn filter_previously_reviewed_hunks(
         filtered.push(ReviewDiffFile {
             path: file.path.clone(),
             diff,
+            generated_header: file.generated_header.clone(),
         });
     }
     let every_old_hunk_accounted_for = reviewed_anchors.into_iter().all(|(key, count)| {
@@ -8741,11 +8751,13 @@ mod tests {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
                 .into(),
+            generated_header: None,
         }];
         let current = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..333 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -30 +30 @@\n-old\n+new\n"
                 .into(),
+            generated_header: None,
         }];
 
         let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
@@ -8759,11 +8771,13 @@ mod tests {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
                 .into(),
+            generated_header: None,
         }];
         let current = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 333..444 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
                 .into(),
+            generated_header: None,
         }];
 
         let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
@@ -8777,11 +8791,13 @@ mod tests {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,3 @@ fn value() {\n context\n-old\n+new\n context\n"
                 .into(),
+            generated_header: None,
         }];
         let current = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..444 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +35,3 @@ fn value() {\n context\n-old\n+new\n context\n"
                 .into(),
+            generated_header: None,
         }];
 
         let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
@@ -8795,11 +8811,13 @@ mod tests {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,3 @@ fn value() {\n context\n-old\n+new\n context\n"
                 .into(),
+            generated_header: None,
         }];
         let current = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..555 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +35,3 @@ fn value() {\n context\n-old\n+new\n context\n@@ -50 +55 @@ fn added() {\n-before\n+after\n"
                 .into(),
+            generated_header: None,
         }];
 
         let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
@@ -8817,11 +8835,13 @@ mod tests {
                 path: "src/a.rs".into(),
                 diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@ fn stable() {\n context\n-old\n+reviewed\n context\n"
                     .into(),
+                generated_header: None,
             },
             ReviewDiffFile {
                 path: "src/b.rs".into(),
                 diff: "diff --git a/src/b.rs b/src/b.rs\nindex ccc..ddd 100644\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1,3 +1,3 @@ fn changed() {\n context\n-old\n+first\n context\n"
                     .into(),
+                generated_header: None,
             },
         ];
         let current = vec![
@@ -8830,6 +8850,7 @@ mod tests {
                 path: "src/b.rs".into(),
                 diff: "diff --git a/src/b.rs b/src/b.rs\nindex ccc..eee 100644\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -20,3 +20,3 @@ fn changed() {\n context\n-old\n+second\n context\n"
                     .into(),
+                generated_header: None,
             },
         ];
 
@@ -8846,12 +8867,14 @@ mod tests {
             path: "src/a.rs".into(),
             diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@ fn stable() {\n context\n-old\n+reviewed\n context\n"
                 .into(),
+            generated_header: None,
         }];
         let mut previous = current.clone();
         previous.push(ReviewDiffFile {
             path: "src/removed.rs".into(),
             diff: "diff --git a/src/removed.rs b/src/removed.rs\nindex ccc..ddd 100644\n--- a/src/removed.rs\n+++ b/src/removed.rs\n@@ -1,3 +1,3 @@ fn removed() {\n context\n-old\n+gone\n context\n"
                 .into(),
+            generated_header: None,
         });
 
         let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
@@ -8865,12 +8888,14 @@ mod tests {
             path: "src/a.rs".into(),
             diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+reviewed\n"
                 .into(),
+            generated_header: None,
         }];
         let mut previous = current.clone();
         previous.push(ReviewDiffFile {
             path: "image.png".into(),
             diff: "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
                 .into(),
+            generated_header: None,
         });
 
         let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
@@ -8884,11 +8909,13 @@ mod tests {
             path: "config.yml".into(),
             diff: "diff --git a/config.yml b/config.yml\nindex aaa..bbb 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -1 +1 @@\n-old\n+  value\n"
                 .into(),
+            generated_header: None,
         }];
         let current = vec![ReviewDiffFile {
             path: "config.yml".into(),
             diff: "diff --git a/config.yml b/config.yml\nindex aaa..ccc 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -8 +8 @@\n-old\n+\tvalue\n"
                 .into(),
+            generated_header: None,
         }];
 
         let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
@@ -8899,6 +8926,7 @@ mod tests {
             path: "config.yml".into(),
             diff: "diff --git a/config.yml b/config.yml\nindex aaa..ddd 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -1,2 +1,2 @@\n-old\n+\tvalue\n"
                 .into(),
+            generated_header: None,
         }];
         let (_, reused) = filter_previously_reviewed_hunks(&current, &incomplete);
         assert_eq!(reused, 0);
@@ -12187,8 +12215,8 @@ mod tests {
             paths: vec!["src/lib.rs".into()],
             diff: "+fn changed() {}\n".into(),
         };
-        let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[]);
-        let coordinator_prompt = validation_prompt(&record, &[], &[], &[]).unwrap();
+        let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[], 0);
+        let coordinator_prompt = validation_prompt(&record, &[], &[], &[], 0).unwrap();
 
         for (name, prompt) in [
             ("reviewer", reviewer_prompt.as_str()),
