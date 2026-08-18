@@ -76,6 +76,15 @@ describe("new thread setup component contract", () => {
     );
   });
 
+  it("changes workspace lifecycle only when the effective workspace changes", () => {
+    expect(component).toContain(
+      "const workspaceChanged = workspaceId !== this.#observedWorkspaceId;",
+    );
+    expect(component).not.toContain(
+      'const workspaceChanged = changed.has("workspaceId")',
+    );
+  });
+
   it("keeps static controls immediate while surfacing busy, warning, and error states", () => {
     expect(component).toContain("newThreadSetupControls({");
     expect(component).toContain('aria-busy=${this.busy || this.#attachmentLoading}');

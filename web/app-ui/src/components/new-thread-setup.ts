@@ -315,8 +315,7 @@ export class TrouveNewThreadSetup extends LitElement {
     const workspaceId = this.#effectiveWorkspaceId;
     const sessionId = this.#effectiveSessionId;
     const sessionChanged = changed.has("sessionId") || sessionId !== this.#observedSessionId;
-    const workspaceChanged = changed.has("workspaceId")
-      || workspaceId !== this.#observedWorkspaceId;
+    const workspaceChanged = workspaceId !== this.#observedWorkspaceId;
     if (sessionChanged) {
       this.#attachmentGeneration += 1;
       this.#observedSessionId = sessionId;
