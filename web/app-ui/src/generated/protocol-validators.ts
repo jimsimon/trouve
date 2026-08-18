@@ -10014,7 +10014,7 @@ return errors === 0;
 }
 validate272.evaluated = {"props":{"app_id":true,"bot_login":true,"check_run_webhook_configured":true,"checks_write_configured":true,"configured":true,"installation_count":true,"last_error":true,"last_poll_at":true,"rate_limit_remaining":true,"rate_limit_reset_at":true,"slug":true,"webhook_configured":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema127 = {"type":"object","description":"A durable execution of one model review against one immutable PR head.","required":["id","installation_id","repository","pull_number","pull_title","pull_url","head_sha","base_ref","head_ref","trigger","status","created_at"],"properties":{"base_ref":{"type":"string"},"cancel_requested":{"type":"boolean"},"candidate_issue_count":{"type":"integer","format":"int64","minimum":0},"check_run_id":{"type":["integer","null"],"format":"int64","minimum":0},"check_run_url":{"type":"string"},"check_sync_error":{"type":"string"},"completed_at":{"type":["string","null"],"format":"date-time"},"coordinator_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"coordinator_thinking_level":{"type":["string","null"],"description":"Thinking level snapshotted for the final coordinator/editor."},"created_at":{"type":"string","format":"date-time"},"error":{"type":"string"},"excluded_reviewer_ids":{"type":"array","items":{"type":"string"}},"fixed_issue_count":{"type":"integer","format":"int64","minimum":0},"head_ref":{"type":"string"},"head_sha":{"type":"string"},"id":{"type":"string"},"included_reviewer_ids":{"type":"array","items":{"type":"string"}},"installation_id":{"type":"integer","format":"int64","minimum":0},"issue_count":{"type":"integer","format":"int64","minimum":0},"lifecycle_comment_url":{"type":"string"},"model":{"type":["string","null"]},"pending_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"preparation_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"progress":{"$ref":"#/components/schemas/CodeReviewProgress"},"publication_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"pull_number":{"type":"integer","format":"int64","minimum":0},"pull_title":{"type":"string"},"pull_url":{"type":"string"},"repository":{"type":"string"},"retried_by":{"type":["string","null"]},"retry_of":{"type":["string","null"]},"review_base_sha":{"type":"string","description":"Commit used as the left side of this review's diff. For incremental\njobs this is normally the last successfully published head."},"review_url":{"type":"string"},"reviewer_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"reviewer_ids":{"type":"array","items":{"type":"string"},"description":"Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics. Additive/Automatic jobs\nsnapshot the candidate catalog; routing decisions record which\npersonas ran."},"router_model":{"type":["string","null"],"description":"Model snapshotted for semantic persona triage. Absent inherits\n`model`; legacy jobs may omit both and are rejected before dispatch."},"router_thinking_level":{"type":["string","null"],"description":"Thinking level snapshotted for semantic persona triage."},"routing_mode":{"$ref":"#/components/schemas/CodeReviewRoutingMode"},"running_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"scope":{"$ref":"#/components/schemas/CodeReviewJobScope"},"semantic_routing":{"type":"boolean","description":"Snapshotted Additive semantic-routing choice. Automatic jobs route\nsemantically regardless of a legacy `false` value."},"session_id":{"type":["string","null"]},"started_at":{"type":["string","null"],"format":"date-time"},"status":{"type":"string","description":"`queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`."},"thread_id":{"type":["string","null"]},"trigger":{"type":"string","description":"`automatic`, `manual`, or `retry`."}}};
+const schema127 = {"type":"object","description":"A durable execution of one model review against one immutable PR head.","required":["id","installation_id","repository","pull_number","pull_title","pull_url","head_sha","base_ref","head_ref","trigger","status","created_at"],"properties":{"base_ref":{"type":"string"},"cancel_requested":{"type":"boolean"},"candidate_issue_count":{"type":"integer","format":"int64","minimum":0},"check_run_id":{"type":["integer","null"],"format":"int64","minimum":0},"check_run_url":{"type":"string"},"check_sync_error":{"type":"string"},"completed_at":{"type":["string","null"],"format":"date-time"},"coordinator_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"coordinator_thinking_level":{"type":["string","null"],"description":"Thinking level snapshotted for the final coordinator/editor."},"created_at":{"type":"string","format":"date-time"},"error":{"type":"string"},"excluded_reviewer_ids":{"type":"array","items":{"type":"string"}},"fixed_issue_count":{"type":"integer","format":"int64","minimum":0},"head_ref":{"type":"string"},"head_sha":{"type":"string"},"id":{"type":"string"},"included_reviewer_ids":{"type":"array","items":{"type":"string"}},"installation_id":{"type":"integer","format":"int64","minimum":0},"issue_count":{"type":"integer","format":"int64","minimum":0},"lifecycle_comment_url":{"type":"string"},"model":{"type":["string","null"]},"pending_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"preparation_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"progress":{"$ref":"#/components/schemas/CodeReviewProgress"},"publication_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"pull_number":{"type":"integer","format":"int64","minimum":0},"pull_title":{"type":"string"},"pull_url":{"type":"string"},"repository":{"type":"string"},"retried_by":{"type":["string","null"]},"retry_of":{"type":["string","null"]},"review_base_sha":{"type":"string","description":"Commit used as the left side of this review's diff. For incremental\njobs this is normally the last successfully published head."},"review_url":{"type":"string"},"review_watermark_sha":{"type":"string","description":"Immutable commit from the last successfully published review. This is\nthe incremental watermark even when history rewriting makes the\neffective `review_base_sha` fall back to the pull request merge base."},"reviewer_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"reviewer_ids":{"type":"array","items":{"type":"string"},"description":"Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics. Additive/Automatic jobs\nsnapshot the candidate catalog; routing decisions record which\npersonas ran."},"router_model":{"type":["string","null"],"description":"Model snapshotted for semantic persona triage. Absent inherits\n`model`; legacy jobs may omit both and are rejected before dispatch."},"router_thinking_level":{"type":["string","null"],"description":"Thinking level snapshotted for semantic persona triage."},"routing_mode":{"$ref":"#/components/schemas/CodeReviewRoutingMode"},"running_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"scope":{"$ref":"#/components/schemas/CodeReviewJobScope"},"semantic_routing":{"type":"boolean","description":"Snapshotted Additive semantic-routing choice. Automatic jobs route\nsemantically regardless of a legacy `false` value."},"session_id":{"type":["string","null"]},"started_at":{"type":["string","null"],"format":"date-time"},"status":{"type":"string","description":"`queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`."},"thread_id":{"type":["string","null"]},"trigger":{"type":"string","description":"`automatic`, `manual`, or `retry`."}}};
 const schema128 = {"type":"object","required":["completed_reviewers","total_reviewers","percent"],"properties":{"completed_reviewers":{"type":"integer","format":"int64","minimum":0},"percent":{"type":"integer","format":"int32","description":"Integer percentage in the inclusive range 0..=100.","minimum":0},"total_reviewers":{"type":"integer","format":"int64","minimum":0}}};
 
 function validate275(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -10711,20 +10711,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.reviewer_elapsed_ms !== undefined){
-let data35 = data.reviewer_elapsed_ms;
+if(data.review_watermark_sha !== undefined){
 const _errs70 = errors;
-if(!((typeof data35 == "number") && (!(data35 % 1) && !isNaN(data35)))){
-validate274.errors = [{instancePath:instancePath+"/reviewer_elapsed_ms",schemaPath:"#/properties/reviewer_elapsed_ms/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+if(typeof data.review_watermark_sha !== "string"){
+validate274.errors = [{instancePath:instancePath+"/review_watermark_sha",schemaPath:"#/properties/review_watermark_sha/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
-}
-if(errors === _errs70){
-if(typeof data35 == "number"){
-if(data35 < 0 || isNaN(data35)){
-validate274.errors = [{instancePath:instancePath+"/reviewer_elapsed_ms",schemaPath:"#/properties/reviewer_elapsed_ms/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
-return false;
-}
-}
 }
 var valid0 = _errs70 === errors;
 }
@@ -10732,20 +10723,41 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.reviewer_ids !== undefined){
-let data36 = data.reviewer_ids;
+if(data.reviewer_elapsed_ms !== undefined){
+let data36 = data.reviewer_elapsed_ms;
 const _errs72 = errors;
+if(!((typeof data36 == "number") && (!(data36 % 1) && !isNaN(data36)))){
+validate274.errors = [{instancePath:instancePath+"/reviewer_elapsed_ms",schemaPath:"#/properties/reviewer_elapsed_ms/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+return false;
+}
 if(errors === _errs72){
-if(Array.isArray(data36)){
-var valid3 = true;
-const len2 = data36.length;
-for(let i2=0; i2<len2; i2++){
+if(typeof data36 == "number"){
+if(data36 < 0 || isNaN(data36)){
+validate274.errors = [{instancePath:instancePath+"/reviewer_elapsed_ms",schemaPath:"#/properties/reviewer_elapsed_ms/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
+return false;
+}
+}
+}
+var valid0 = _errs72 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.reviewer_ids !== undefined){
+let data37 = data.reviewer_ids;
 const _errs74 = errors;
-if(typeof data36[i2] !== "string"){
+if(errors === _errs74){
+if(Array.isArray(data37)){
+var valid3 = true;
+const len2 = data37.length;
+for(let i2=0; i2<len2; i2++){
+const _errs76 = errors;
+if(typeof data37[i2] !== "string"){
 validate274.errors = [{instancePath:instancePath+"/reviewer_ids/" + i2,schemaPath:"#/properties/reviewer_ids/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid3 = _errs74 === errors;
+var valid3 = _errs76 === errors;
 if(!valid3){
 break;
 }
@@ -10756,30 +10768,17 @@ validate274.errors = [{instancePath:instancePath+"/reviewer_ids",schemaPath:"#/p
 return false;
 }
 }
-var valid0 = _errs72 === errors;
+var valid0 = _errs74 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.router_model !== undefined){
-let data38 = data.router_model;
-const _errs76 = errors;
-if((typeof data38 !== "string") && (data38 !== null)){
-validate274.errors = [{instancePath:instancePath+"/router_model",schemaPath:"#/properties/router_model/type",keyword:"type",params:{type: schema127.properties.router_model.type},message:"must be string,null"}];
-return false;
-}
-var valid0 = _errs76 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.router_thinking_level !== undefined){
-let data39 = data.router_thinking_level;
+let data39 = data.router_model;
 const _errs78 = errors;
 if((typeof data39 !== "string") && (data39 !== null)){
-validate274.errors = [{instancePath:instancePath+"/router_thinking_level",schemaPath:"#/properties/router_thinking_level/type",keyword:"type",params:{type: schema127.properties.router_thinking_level.type},message:"must be string,null"}];
+validate274.errors = [{instancePath:instancePath+"/router_model",schemaPath:"#/properties/router_model/type",keyword:"type",params:{type: schema127.properties.router_model.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs78 === errors;
@@ -10788,11 +10787,12 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.routing_mode !== undefined){
+if(data.router_thinking_level !== undefined){
+let data40 = data.router_thinking_level;
 const _errs80 = errors;
-if(!(validate277(data.routing_mode, {instancePath:instancePath+"/routing_mode",parentData:data,parentDataProperty:"routing_mode",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate277.errors : vErrors.concat(validate277.errors);
-errors = vErrors.length;
+if((typeof data40 !== "string") && (data40 !== null)){
+validate274.errors = [{instancePath:instancePath+"/router_thinking_level",schemaPath:"#/properties/router_thinking_level/type",keyword:"type",params:{type: schema127.properties.router_thinking_level.type},message:"must be string,null"}];
+return false;
 }
 var valid0 = _errs80 === errors;
 }
@@ -10800,32 +10800,32 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.running_elapsed_ms !== undefined){
-let data41 = data.running_elapsed_ms;
-const _errs81 = errors;
-if(!((typeof data41 == "number") && (!(data41 % 1) && !isNaN(data41)))){
-validate274.errors = [{instancePath:instancePath+"/running_elapsed_ms",schemaPath:"#/properties/running_elapsed_ms/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
-return false;
+if(data.routing_mode !== undefined){
+const _errs82 = errors;
+if(!(validate277(data.routing_mode, {instancePath:instancePath+"/routing_mode",parentData:data,parentDataProperty:"routing_mode",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate277.errors : vErrors.concat(validate277.errors);
+errors = vErrors.length;
 }
-if(errors === _errs81){
-if(typeof data41 == "number"){
-if(data41 < 0 || isNaN(data41)){
-validate274.errors = [{instancePath:instancePath+"/running_elapsed_ms",schemaPath:"#/properties/running_elapsed_ms/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
-return false;
-}
-}
-}
-var valid0 = _errs81 === errors;
+var valid0 = _errs82 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
-if(data.scope !== undefined){
+if(data.running_elapsed_ms !== undefined){
+let data42 = data.running_elapsed_ms;
 const _errs83 = errors;
-if(!(validate279(data.scope, {instancePath:instancePath+"/scope",parentData:data,parentDataProperty:"scope",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate279.errors : vErrors.concat(validate279.errors);
-errors = vErrors.length;
+if(!((typeof data42 == "number") && (!(data42 % 1) && !isNaN(data42)))){
+validate274.errors = [{instancePath:instancePath+"/running_elapsed_ms",schemaPath:"#/properties/running_elapsed_ms/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+return false;
+}
+if(errors === _errs83){
+if(typeof data42 == "number"){
+if(data42 < 0 || isNaN(data42)){
+validate274.errors = [{instancePath:instancePath+"/running_elapsed_ms",schemaPath:"#/properties/running_elapsed_ms/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
+return false;
+}
+}
 }
 var valid0 = _errs83 === errors;
 }
@@ -10833,23 +10833,22 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.semantic_routing !== undefined){
-const _errs84 = errors;
-if(typeof data.semantic_routing !== "boolean"){
-validate274.errors = [{instancePath:instancePath+"/semantic_routing",schemaPath:"#/properties/semantic_routing/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
-return false;
+if(data.scope !== undefined){
+const _errs85 = errors;
+if(!(validate279(data.scope, {instancePath:instancePath+"/scope",parentData:data,parentDataProperty:"scope",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate279.errors : vErrors.concat(validate279.errors);
+errors = vErrors.length;
 }
-var valid0 = _errs84 === errors;
+var valid0 = _errs85 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
-if(data.session_id !== undefined){
-let data44 = data.session_id;
+if(data.semantic_routing !== undefined){
 const _errs86 = errors;
-if((typeof data44 !== "string") && (data44 !== null)){
-validate274.errors = [{instancePath:instancePath+"/session_id",schemaPath:"#/properties/session_id/type",keyword:"type",params:{type: schema127.properties.session_id.type},message:"must be string,null"}];
+if(typeof data.semantic_routing !== "boolean"){
+validate274.errors = [{instancePath:instancePath+"/semantic_routing",schemaPath:"#/properties/semantic_routing/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs86 === errors;
@@ -10858,11 +10857,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.started_at !== undefined){
-let data45 = data.started_at;
+if(data.session_id !== undefined){
+let data45 = data.session_id;
 const _errs88 = errors;
 if((typeof data45 !== "string") && (data45 !== null)){
-validate274.errors = [{instancePath:instancePath+"/started_at",schemaPath:"#/properties/started_at/type",keyword:"type",params:{type: schema127.properties.started_at.type},message:"must be string,null"}];
+validate274.errors = [{instancePath:instancePath+"/session_id",schemaPath:"#/properties/session_id/type",keyword:"type",params:{type: schema127.properties.session_id.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs88 === errors;
@@ -10871,10 +10870,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.status !== undefined){
+if(data.started_at !== undefined){
+let data46 = data.started_at;
 const _errs90 = errors;
-if(typeof data.status !== "string"){
-validate274.errors = [{instancePath:instancePath+"/status",schemaPath:"#/properties/status/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data46 !== "string") && (data46 !== null)){
+validate274.errors = [{instancePath:instancePath+"/started_at",schemaPath:"#/properties/started_at/type",keyword:"type",params:{type: schema127.properties.started_at.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs90 === errors;
@@ -10883,11 +10883,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.thread_id !== undefined){
-let data47 = data.thread_id;
+if(data.status !== undefined){
 const _errs92 = errors;
-if((typeof data47 !== "string") && (data47 !== null)){
-validate274.errors = [{instancePath:instancePath+"/thread_id",schemaPath:"#/properties/thread_id/type",keyword:"type",params:{type: schema127.properties.thread_id.type},message:"must be string,null"}];
+if(typeof data.status !== "string"){
+validate274.errors = [{instancePath:instancePath+"/status",schemaPath:"#/properties/status/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs92 === errors;
@@ -10896,16 +10895,30 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.trigger !== undefined){
+if(data.thread_id !== undefined){
+let data48 = data.thread_id;
 const _errs94 = errors;
-if(typeof data.trigger !== "string"){
-validate274.errors = [{instancePath:instancePath+"/trigger",schemaPath:"#/properties/trigger/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data48 !== "string") && (data48 !== null)){
+validate274.errors = [{instancePath:instancePath+"/thread_id",schemaPath:"#/properties/thread_id/type",keyword:"type",params:{type: schema127.properties.thread_id.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs94 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.trigger !== undefined){
+const _errs96 = errors;
+if(typeof data.trigger !== "string"){
+validate274.errors = [{instancePath:instancePath+"/trigger",schemaPath:"#/properties/trigger/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs96 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -10962,7 +10975,7 @@ return false;
 validate274.errors = vErrors;
 return errors === 0;
 }
-validate274.evaluated = {"props":{"base_ref":true,"cancel_requested":true,"candidate_issue_count":true,"check_run_id":true,"check_run_url":true,"check_sync_error":true,"completed_at":true,"coordinator_elapsed_ms":true,"coordinator_thinking_level":true,"created_at":true,"error":true,"excluded_reviewer_ids":true,"fixed_issue_count":true,"head_ref":true,"head_sha":true,"id":true,"included_reviewer_ids":true,"installation_id":true,"issue_count":true,"lifecycle_comment_url":true,"model":true,"pending_elapsed_ms":true,"preparation_elapsed_ms":true,"progress":true,"publication_elapsed_ms":true,"pull_number":true,"pull_title":true,"pull_url":true,"repository":true,"retried_by":true,"retry_of":true,"review_base_sha":true,"review_url":true,"reviewer_elapsed_ms":true,"reviewer_ids":true,"router_model":true,"router_thinking_level":true,"routing_mode":true,"running_elapsed_ms":true,"scope":true,"semantic_routing":true,"session_id":true,"started_at":true,"status":true,"thread_id":true,"trigger":true},"dynamicProps":false,"dynamicItems":false};
+validate274.evaluated = {"props":{"base_ref":true,"cancel_requested":true,"candidate_issue_count":true,"check_run_id":true,"check_run_url":true,"check_sync_error":true,"completed_at":true,"coordinator_elapsed_ms":true,"coordinator_thinking_level":true,"created_at":true,"error":true,"excluded_reviewer_ids":true,"fixed_issue_count":true,"head_ref":true,"head_sha":true,"id":true,"included_reviewer_ids":true,"installation_id":true,"issue_count":true,"lifecycle_comment_url":true,"model":true,"pending_elapsed_ms":true,"preparation_elapsed_ms":true,"progress":true,"publication_elapsed_ms":true,"pull_number":true,"pull_title":true,"pull_url":true,"repository":true,"retried_by":true,"retry_of":true,"review_base_sha":true,"review_url":true,"review_watermark_sha":true,"reviewer_elapsed_ms":true,"reviewer_ids":true,"router_model":true,"router_thinking_level":true,"routing_mode":true,"running_elapsed_ms":true,"scope":true,"semantic_routing":true,"session_id":true,"started_at":true,"status":true,"thread_id":true,"trigger":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema131 = {"type":"object","description":"One repository visible to a GitHub App installation plus trouve's local\nreview policy for it.","required":["installation_id","repository"],"properties":{"coordinator_thinking_level":{"type":["string","null"],"description":"Preferred thinking level or fixed token budget for the final\ncoordinator/editor. Absent inherits the review mode's default."},"excluded_reviewer_ids":{"type":"array","items":{"type":"string"},"description":"Legacy forced exclusions retained for backward compatibility."},"included_reviewer_ids":{"type":"array","items":{"type":"string"},"description":"Personas that Additive mode always runs."},"installation_id":{"type":"integer","format":"int64","minimum":0},"mode":{"$ref":"#/components/schemas/CodeReviewMode"},"model":{"type":["string","null"],"description":"Provider-qualified model used by the coordinator and inherited by\nreviewers without an override. Required while reviews are enabled."},"private":{"type":"boolean"},"prompt":{"type":"string","description":"Extra repository-specific review instructions."},"repository":{"type":"string"},"reviewer_ids":{"type":"array","items":{"type":"string"},"description":"Ordered reviewer profiles run for each revision."},"reviewer_overrides":{"type":"array","items":{"$ref":"#/components/schemas/ReviewerOverride"},"description":"Per-reviewer repository overrides. Entries may be retained while a\nreviewer is disabled so re-enabling it restores its configuration."},"router_model":{"type":["string","null"],"description":"Provider-qualified model used by semantic persona triage. Absent\ninherits `model`."},"router_thinking_level":{"type":["string","null"],"description":"Preferred thinking level or fixed token budget for semantic persona\ntriage. Absent inherits the review mode's default."},"routing_mode":{"$ref":"#/components/schemas/CodeReviewRoutingMode","description":"Persona-selection policy. Manual uses `reviewer_ids`; Additive and\nAutomatic consider the complete reviewer catalog."},"semantic_routing":{"type":"boolean","description":"Whether Additive mode may run one tool-free semantic router pass per\ndiff batch. Automatic mode always runs it as the sole selector."}}};
 const schema132 = {"type":"string","description":"Whether an installed repository participates in automated code review.","enum":["off","manual","automatic"]};
@@ -12239,20 +12252,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.reviewer_elapsed_ms !== undefined){
-let data35 = data.reviewer_elapsed_ms;
+if(data.review_watermark_sha !== undefined){
 const _errs70 = errors;
-if(!((typeof data35 == "number") && (!(data35 % 1) && !isNaN(data35)))){
-validate295.errors = [{instancePath:instancePath+"/reviewer_elapsed_ms",schemaPath:"#/properties/reviewer_elapsed_ms/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+if(typeof data.review_watermark_sha !== "string"){
+validate295.errors = [{instancePath:instancePath+"/review_watermark_sha",schemaPath:"#/properties/review_watermark_sha/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
-}
-if(errors === _errs70){
-if(typeof data35 == "number"){
-if(data35 < 0 || isNaN(data35)){
-validate295.errors = [{instancePath:instancePath+"/reviewer_elapsed_ms",schemaPath:"#/properties/reviewer_elapsed_ms/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
-return false;
-}
-}
 }
 var valid0 = _errs70 === errors;
 }
@@ -12260,20 +12264,41 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.reviewer_ids !== undefined){
-let data36 = data.reviewer_ids;
+if(data.reviewer_elapsed_ms !== undefined){
+let data36 = data.reviewer_elapsed_ms;
 const _errs72 = errors;
+if(!((typeof data36 == "number") && (!(data36 % 1) && !isNaN(data36)))){
+validate295.errors = [{instancePath:instancePath+"/reviewer_elapsed_ms",schemaPath:"#/properties/reviewer_elapsed_ms/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+return false;
+}
 if(errors === _errs72){
-if(Array.isArray(data36)){
-var valid3 = true;
-const len2 = data36.length;
-for(let i2=0; i2<len2; i2++){
+if(typeof data36 == "number"){
+if(data36 < 0 || isNaN(data36)){
+validate295.errors = [{instancePath:instancePath+"/reviewer_elapsed_ms",schemaPath:"#/properties/reviewer_elapsed_ms/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
+return false;
+}
+}
+}
+var valid0 = _errs72 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.reviewer_ids !== undefined){
+let data37 = data.reviewer_ids;
 const _errs74 = errors;
-if(typeof data36[i2] !== "string"){
+if(errors === _errs74){
+if(Array.isArray(data37)){
+var valid3 = true;
+const len2 = data37.length;
+for(let i2=0; i2<len2; i2++){
+const _errs76 = errors;
+if(typeof data37[i2] !== "string"){
 validate295.errors = [{instancePath:instancePath+"/reviewer_ids/" + i2,schemaPath:"#/properties/reviewer_ids/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid3 = _errs74 === errors;
+var valid3 = _errs76 === errors;
 if(!valid3){
 break;
 }
@@ -12284,30 +12309,17 @@ validate295.errors = [{instancePath:instancePath+"/reviewer_ids",schemaPath:"#/p
 return false;
 }
 }
-var valid0 = _errs72 === errors;
+var valid0 = _errs74 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.router_model !== undefined){
-let data38 = data.router_model;
-const _errs76 = errors;
-if((typeof data38 !== "string") && (data38 !== null)){
-validate295.errors = [{instancePath:instancePath+"/router_model",schemaPath:"#/properties/router_model/type",keyword:"type",params:{type: schema127.properties.router_model.type},message:"must be string,null"}];
-return false;
-}
-var valid0 = _errs76 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.router_thinking_level !== undefined){
-let data39 = data.router_thinking_level;
+let data39 = data.router_model;
 const _errs78 = errors;
 if((typeof data39 !== "string") && (data39 !== null)){
-validate295.errors = [{instancePath:instancePath+"/router_thinking_level",schemaPath:"#/properties/router_thinking_level/type",keyword:"type",params:{type: schema127.properties.router_thinking_level.type},message:"must be string,null"}];
+validate295.errors = [{instancePath:instancePath+"/router_model",schemaPath:"#/properties/router_model/type",keyword:"type",params:{type: schema127.properties.router_model.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs78 === errors;
@@ -12316,11 +12328,12 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.routing_mode !== undefined){
+if(data.router_thinking_level !== undefined){
+let data40 = data.router_thinking_level;
 const _errs80 = errors;
-if(!(validate277(data.routing_mode, {instancePath:instancePath+"/routing_mode",parentData:data,parentDataProperty:"routing_mode",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate277.errors : vErrors.concat(validate277.errors);
-errors = vErrors.length;
+if((typeof data40 !== "string") && (data40 !== null)){
+validate295.errors = [{instancePath:instancePath+"/router_thinking_level",schemaPath:"#/properties/router_thinking_level/type",keyword:"type",params:{type: schema127.properties.router_thinking_level.type},message:"must be string,null"}];
+return false;
 }
 var valid0 = _errs80 === errors;
 }
@@ -12328,32 +12341,32 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.running_elapsed_ms !== undefined){
-let data41 = data.running_elapsed_ms;
-const _errs81 = errors;
-if(!((typeof data41 == "number") && (!(data41 % 1) && !isNaN(data41)))){
-validate295.errors = [{instancePath:instancePath+"/running_elapsed_ms",schemaPath:"#/properties/running_elapsed_ms/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
-return false;
+if(data.routing_mode !== undefined){
+const _errs82 = errors;
+if(!(validate277(data.routing_mode, {instancePath:instancePath+"/routing_mode",parentData:data,parentDataProperty:"routing_mode",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate277.errors : vErrors.concat(validate277.errors);
+errors = vErrors.length;
 }
-if(errors === _errs81){
-if(typeof data41 == "number"){
-if(data41 < 0 || isNaN(data41)){
-validate295.errors = [{instancePath:instancePath+"/running_elapsed_ms",schemaPath:"#/properties/running_elapsed_ms/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
-return false;
-}
-}
-}
-var valid0 = _errs81 === errors;
+var valid0 = _errs82 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
-if(data.scope !== undefined){
+if(data.running_elapsed_ms !== undefined){
+let data42 = data.running_elapsed_ms;
 const _errs83 = errors;
-if(!(validate279(data.scope, {instancePath:instancePath+"/scope",parentData:data,parentDataProperty:"scope",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate279.errors : vErrors.concat(validate279.errors);
-errors = vErrors.length;
+if(!((typeof data42 == "number") && (!(data42 % 1) && !isNaN(data42)))){
+validate295.errors = [{instancePath:instancePath+"/running_elapsed_ms",schemaPath:"#/properties/running_elapsed_ms/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+return false;
+}
+if(errors === _errs83){
+if(typeof data42 == "number"){
+if(data42 < 0 || isNaN(data42)){
+validate295.errors = [{instancePath:instancePath+"/running_elapsed_ms",schemaPath:"#/properties/running_elapsed_ms/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
+return false;
+}
+}
 }
 var valid0 = _errs83 === errors;
 }
@@ -12361,23 +12374,22 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.semantic_routing !== undefined){
-const _errs84 = errors;
-if(typeof data.semantic_routing !== "boolean"){
-validate295.errors = [{instancePath:instancePath+"/semantic_routing",schemaPath:"#/properties/semantic_routing/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
-return false;
+if(data.scope !== undefined){
+const _errs85 = errors;
+if(!(validate279(data.scope, {instancePath:instancePath+"/scope",parentData:data,parentDataProperty:"scope",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate279.errors : vErrors.concat(validate279.errors);
+errors = vErrors.length;
 }
-var valid0 = _errs84 === errors;
+var valid0 = _errs85 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
-if(data.session_id !== undefined){
-let data44 = data.session_id;
+if(data.semantic_routing !== undefined){
 const _errs86 = errors;
-if((typeof data44 !== "string") && (data44 !== null)){
-validate295.errors = [{instancePath:instancePath+"/session_id",schemaPath:"#/properties/session_id/type",keyword:"type",params:{type: schema127.properties.session_id.type},message:"must be string,null"}];
+if(typeof data.semantic_routing !== "boolean"){
+validate295.errors = [{instancePath:instancePath+"/semantic_routing",schemaPath:"#/properties/semantic_routing/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs86 === errors;
@@ -12386,11 +12398,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.started_at !== undefined){
-let data45 = data.started_at;
+if(data.session_id !== undefined){
+let data45 = data.session_id;
 const _errs88 = errors;
 if((typeof data45 !== "string") && (data45 !== null)){
-validate295.errors = [{instancePath:instancePath+"/started_at",schemaPath:"#/properties/started_at/type",keyword:"type",params:{type: schema127.properties.started_at.type},message:"must be string,null"}];
+validate295.errors = [{instancePath:instancePath+"/session_id",schemaPath:"#/properties/session_id/type",keyword:"type",params:{type: schema127.properties.session_id.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs88 === errors;
@@ -12399,10 +12411,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.status !== undefined){
+if(data.started_at !== undefined){
+let data46 = data.started_at;
 const _errs90 = errors;
-if(typeof data.status !== "string"){
-validate295.errors = [{instancePath:instancePath+"/status",schemaPath:"#/properties/status/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data46 !== "string") && (data46 !== null)){
+validate295.errors = [{instancePath:instancePath+"/started_at",schemaPath:"#/properties/started_at/type",keyword:"type",params:{type: schema127.properties.started_at.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs90 === errors;
@@ -12411,11 +12424,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.thread_id !== undefined){
-let data47 = data.thread_id;
+if(data.status !== undefined){
 const _errs92 = errors;
-if((typeof data47 !== "string") && (data47 !== null)){
-validate295.errors = [{instancePath:instancePath+"/thread_id",schemaPath:"#/properties/thread_id/type",keyword:"type",params:{type: schema127.properties.thread_id.type},message:"must be string,null"}];
+if(typeof data.status !== "string"){
+validate295.errors = [{instancePath:instancePath+"/status",schemaPath:"#/properties/status/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs92 === errors;
@@ -12424,16 +12436,30 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.trigger !== undefined){
+if(data.thread_id !== undefined){
+let data48 = data.thread_id;
 const _errs94 = errors;
-if(typeof data.trigger !== "string"){
-validate295.errors = [{instancePath:instancePath+"/trigger",schemaPath:"#/properties/trigger/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data48 !== "string") && (data48 !== null)){
+validate295.errors = [{instancePath:instancePath+"/thread_id",schemaPath:"#/properties/thread_id/type",keyword:"type",params:{type: schema127.properties.thread_id.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs94 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.trigger !== undefined){
+const _errs96 = errors;
+if(typeof data.trigger !== "string"){
+validate295.errors = [{instancePath:instancePath+"/trigger",schemaPath:"#/properties/trigger/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs96 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -12490,7 +12516,7 @@ return false;
 validate295.errors = vErrors;
 return errors === 0;
 }
-validate295.evaluated = {"props":{"base_ref":true,"cancel_requested":true,"candidate_issue_count":true,"check_run_id":true,"check_run_url":true,"check_sync_error":true,"completed_at":true,"coordinator_elapsed_ms":true,"coordinator_thinking_level":true,"created_at":true,"error":true,"excluded_reviewer_ids":true,"fixed_issue_count":true,"head_ref":true,"head_sha":true,"id":true,"included_reviewer_ids":true,"installation_id":true,"issue_count":true,"lifecycle_comment_url":true,"model":true,"pending_elapsed_ms":true,"preparation_elapsed_ms":true,"progress":true,"publication_elapsed_ms":true,"pull_number":true,"pull_title":true,"pull_url":true,"repository":true,"retried_by":true,"retry_of":true,"review_base_sha":true,"review_url":true,"reviewer_elapsed_ms":true,"reviewer_ids":true,"router_model":true,"router_thinking_level":true,"routing_mode":true,"running_elapsed_ms":true,"scope":true,"semantic_routing":true,"session_id":true,"started_at":true,"status":true,"thread_id":true,"trigger":true},"dynamicProps":false,"dynamicItems":false};
+validate295.evaluated = {"props":{"base_ref":true,"cancel_requested":true,"candidate_issue_count":true,"check_run_id":true,"check_run_url":true,"check_sync_error":true,"completed_at":true,"coordinator_elapsed_ms":true,"coordinator_thinking_level":true,"created_at":true,"error":true,"excluded_reviewer_ids":true,"fixed_issue_count":true,"head_ref":true,"head_sha":true,"id":true,"included_reviewer_ids":true,"installation_id":true,"issue_count":true,"lifecycle_comment_url":true,"model":true,"pending_elapsed_ms":true,"preparation_elapsed_ms":true,"progress":true,"publication_elapsed_ms":true,"pull_number":true,"pull_title":true,"pull_url":true,"repository":true,"retried_by":true,"retry_of":true,"review_base_sha":true,"review_url":true,"review_watermark_sha":true,"reviewer_elapsed_ms":true,"reviewer_ids":true,"router_model":true,"router_thinking_level":true,"routing_mode":true,"running_elapsed_ms":true,"scope":true,"semantic_routing":true,"session_id":true,"started_at":true,"status":true,"thread_id":true,"trigger":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate294(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -12511,7 +12537,7 @@ errors = vErrors.length;
 validate294.errors = vErrors;
 return errors === 0;
 }
-validate294.evaluated = {"props":{"base_ref":true,"cancel_requested":true,"candidate_issue_count":true,"check_run_id":true,"check_run_url":true,"check_sync_error":true,"completed_at":true,"coordinator_elapsed_ms":true,"coordinator_thinking_level":true,"created_at":true,"error":true,"excluded_reviewer_ids":true,"fixed_issue_count":true,"head_ref":true,"head_sha":true,"id":true,"included_reviewer_ids":true,"installation_id":true,"issue_count":true,"lifecycle_comment_url":true,"model":true,"pending_elapsed_ms":true,"preparation_elapsed_ms":true,"progress":true,"publication_elapsed_ms":true,"pull_number":true,"pull_title":true,"pull_url":true,"repository":true,"retried_by":true,"retry_of":true,"review_base_sha":true,"review_url":true,"reviewer_elapsed_ms":true,"reviewer_ids":true,"router_model":true,"router_thinking_level":true,"routing_mode":true,"running_elapsed_ms":true,"scope":true,"semantic_routing":true,"session_id":true,"started_at":true,"status":true,"thread_id":true,"trigger":true},"dynamicProps":false,"dynamicItems":false};
+validate294.evaluated = {"props":{"base_ref":true,"cancel_requested":true,"candidate_issue_count":true,"check_run_id":true,"check_run_url":true,"check_sync_error":true,"completed_at":true,"coordinator_elapsed_ms":true,"coordinator_thinking_level":true,"created_at":true,"error":true,"excluded_reviewer_ids":true,"fixed_issue_count":true,"head_ref":true,"head_sha":true,"id":true,"included_reviewer_ids":true,"installation_id":true,"issue_count":true,"lifecycle_comment_url":true,"model":true,"pending_elapsed_ms":true,"preparation_elapsed_ms":true,"progress":true,"publication_elapsed_ms":true,"pull_number":true,"pull_title":true,"pull_url":true,"repository":true,"retried_by":true,"retry_of":true,"review_base_sha":true,"review_url":true,"review_watermark_sha":true,"reviewer_elapsed_ms":true,"reviewer_ids":true,"router_model":true,"router_thinking_level":true,"routing_mode":true,"running_elapsed_ms":true,"scope":true,"semantic_routing":true,"session_id":true,"started_at":true,"status":true,"thread_id":true,"trigger":true},"dynamicProps":false,"dynamicItems":false};
 
 export const codeReviewSettings = validate300;
 const schema138 = {"$id":"urn:trouve:protocol-validator:codeReviewSettings","$ref":"urn:trouve:protocol-openapi#/components/schemas/CodeReviewSettings"};
@@ -14933,7 +14959,7 @@ return errors === 0;
 }
 validate377.evaluated = {"dynamicProps":false,"dynamicItems":false};
 
-const schema171 = {"type":"object","description":"One durable router, reviewer, or coordinator execution. Tasks survive\ncleanup of their implementation sessions and threads.","required":["id","job_id","role","status","created_at"],"properties":{"batch_count":{"type":"integer","format":"int64","minimum":0},"batch_index":{"type":"integer","format":"int64","minimum":0},"cached_input_tokens":{"type":"integer","format":"int64","minimum":0},"candidate_issue_count":{"type":"integer","format":"int64","minimum":0},"completed_at":{"type":["string","null"],"format":"date-time"},"confirmed_issue_count":{"type":"integer","format":"int64","minimum":0},"created_at":{"type":"string","format":"date-time"},"elapsed_ms":{"type":"integer","format":"int64","description":"Current elapsed time for active tasks and final elapsed time for\nterminal tasks, as measured by the server.","minimum":0},"error":{"type":"string"},"id":{"type":"string"},"input_tokens":{"type":"integer","format":"int64","minimum":0},"job_id":{"type":"string"},"last_progress_at":{"type":["string","null"],"format":"date-time"},"lifecycle_stage":{"$ref":"#/components/schemas/CodeReviewTaskLifecycleStage","description":"Current stage while active; last observed stage after failure or\ncancellation."},"model":{"type":["string","null"],"description":"The provider-qualified model actually used by the created thread."},"model_elapsed_ms":{"type":"integer","format":"int64","description":"Wall time from model dispatch through tool iterations and completion.","minimum":0},"model_started_at":{"type":["string","null"],"format":"date-time"},"output":{"type":"string"},"output_tokens":{"type":"integer","format":"int64","minimum":0},"prompt":{"type":"string"},"provider_wait_ms":{"type":"integer","format":"int64","description":"Time spent waiting for shared/provider model capacity.","minimum":0},"reviewer_id":{"type":["string","null"]},"reviewer_name":{"type":"string"},"role":{"$ref":"#/components/schemas/CodeReviewTaskRole"},"session_id":{"type":["string","null"]},"started_at":{"type":["string","null"],"format":"date-time"},"status":{"type":"string","description":"`queued`, `running`, `succeeded`, `failed`, `cancelled`, or\n`not_applicable`."},"thinking":{"type":"string"},"thread_id":{"type":["string","null"]},"tool_call_count":{"type":"integer","format":"int64","minimum":0},"tool_output":{"type":"string"}}};
+const schema171 = {"type":"object","description":"One durable router, reviewer, or coordinator execution. Tasks survive\ncleanup of their implementation sessions and threads.","required":["id","job_id","role","status","created_at"],"properties":{"batch_count":{"type":"integer","format":"int64","minimum":0},"batch_index":{"type":"integer","format":"int64","minimum":0},"cached_input_tokens":{"type":"integer","format":"int64","minimum":0},"candidate_issue_count":{"type":"integer","format":"int64","minimum":0},"completed_at":{"type":["string","null"],"format":"date-time"},"confirmed_issue_count":{"type":"integer","format":"int64","minimum":0},"created_at":{"type":"string","format":"date-time"},"elapsed_ms":{"type":"integer","format":"int64","description":"Current elapsed time for active tasks and final elapsed time for\nterminal tasks, as measured by the server.","minimum":0},"error":{"type":"string"},"id":{"type":"string"},"input_tokens":{"type":"integer","format":"int64","minimum":0},"job_id":{"type":"string"},"last_progress_at":{"type":["string","null"],"format":"date-time"},"lifecycle_stage":{"$ref":"#/components/schemas/CodeReviewTaskLifecycleStage","description":"Current stage while active; last observed stage after failure or\ncancellation."},"model":{"type":["string","null"],"description":"The provider-qualified model actually used by the created thread."},"model_elapsed_ms":{"type":"integer","format":"int64","description":"Wall time from model dispatch through tool iterations and completion.","minimum":0},"model_started_at":{"type":["string","null"],"format":"date-time"},"output":{"type":"string"},"output_tokens":{"type":"integer","format":"int64","minimum":0},"prompt":{"type":"string"},"provider_wait_ms":{"type":"integer","format":"int64","description":"Time spent waiting for shared/provider model capacity.","minimum":0},"reviewer_id":{"type":["string","null"]},"reviewer_name":{"type":"string"},"role":{"$ref":"#/components/schemas/CodeReviewTaskRole"},"session_id":{"type":["string","null"]},"started_at":{"type":["string","null"],"format":"date-time"},"status":{"type":"string","description":"`queued`, `running`, `succeeded`, `failed`, `cancelled`,\n`not_applicable`, or `superseded`."},"thinking":{"type":"string"},"thread_id":{"type":["string","null"]},"tool_call_count":{"type":"integer","format":"int64","minimum":0},"tool_output":{"type":"string"}}};
 const schema172 = {"type":"string","description":"Current lifecycle stage for an active review task, or the last observed\nstage when a task fails or is cancelled.","enum":["queued","waiting_for_capacity","starting_model","running_model","running_tool","repairing_output","completed"]};
 
 function validate380(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

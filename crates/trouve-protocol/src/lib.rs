@@ -275,7 +275,9 @@ pub use requests::*;
 // (breaking).
 // 7.1: PUT /v1/config/defaults atomically replaces the global model,
 // thinking level, and permission mode used by new threads (additive).
-pub const PROTOCOL_VERSION: &str = "7.1";
+// 7.2: code-review jobs expose the immutable incremental watermark separately
+// from the effective diff base selected after ancestry checks (additive).
+pub const PROTOCOL_VERSION: &str = "7.2";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

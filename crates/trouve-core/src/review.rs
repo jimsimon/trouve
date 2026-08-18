@@ -34,7 +34,8 @@ use crate::store::{
     CodeReviewTaskMetrics, NewCodeReviewFinding, NewCodeReviewJob, NewCodeReviewTask,
 };
 use crate::tools::{
-    ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositorySync,
+    ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryDiff,
+    ReviewRepositoryHistoryCleanup, ReviewRepositoryMergeBase, ReviewRepositorySync,
 };
 
 const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
@@ -42,6 +43,7 @@ const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
 const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
+const REVIEW_OUTBOX_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REVIEWER_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_REVIEWER_TIMEOUT_SECONDS";
@@ -81,6 +83,8 @@ const REVIEW_BATCH_FORMAT_VERSION: &str = "2";
 const REVIEW_BATCH_MAX_PATH_BYTES: usize = 16 * 1024;
 const REVIEW_COORDINATOR_CONTEXT_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_DIFF_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const REVIEW_DIFF_MAX_FILES: usize = 250;
+const REVIEW_DIFF_MAX_CHANGED_LINES: u64 = 20_000;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
 const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
 const REVIEW_COMMENT_PAGE_SIZE: usize = 100;
@@ -259,10 +263,23 @@ pub struct CodeReviewRuntime {
     projection_queue: Mutex<HashMap<String, ProjectionQueueState>>,
     projection_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     diff_cache: Mutex<ReviewDiffCache>,
+    outbox_retries: Mutex<HashMap<String, ReviewOutboxRetryState>>,
     /// Finding ids whose thread collapse is currently being attempted, so the
     /// detached post-publication cleanup and the retry task never issue
     /// duplicate mutations for the same finding.
     collapse_in_flight: Mutex<HashSet<String>>,
+}
+
+struct ReviewOutboxRetryState {
+    failures: u32,
+    retry_at: Instant,
+}
+
+fn review_outbox_retry_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(6);
+    JOB_IDLE_INTERVAL
+        .saturating_mul(1_u32 << exponent)
+        .min(REVIEW_OUTBOX_RETRY_MAX_DELAY)
 }
 
 #[derive(Clone)]
@@ -572,9 +589,28 @@ struct GithubPullRequest {
     requested_reviewers: Vec<GithubUser>,
 }
 
-#[derive(Deserialize)]
-struct GithubCompare {
-    status: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalHistory {
+    NotApplicable,
+    Linear,
+    Rewritten,
+    Unknown,
+}
+
+fn classify_incremental_history(
+    incremental_candidate: bool,
+    review_watermark_sha: &str,
+    merge_base: Option<&str>,
+) -> IncrementalHistory {
+    if !incremental_candidate {
+        IncrementalHistory::NotApplicable
+    } else {
+        match merge_base {
+            Some(merge_base) if merge_base == review_watermark_sha => IncrementalHistory::Linear,
+            Some(_) => IncrementalHistory::Rewritten,
+            None => IncrementalHistory::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -1061,6 +1097,17 @@ struct ReviewTurnResult {
     metrics: CodeReviewTaskMetrics,
 }
 
+#[derive(Debug)]
+struct SupersededReviewTask;
+
+impl std::fmt::Display for SupersededReviewTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stale: review task was superseded while finishing")
+    }
+}
+
+impl std::error::Error for SupersededReviewTask {}
+
 struct ReviewTurnRequest {
     prompt: String,
     tools_enabled: bool,
@@ -1519,6 +1566,72 @@ impl Engine {
             },
         )?;
         Ok(())
+    }
+
+    async fn flush_pending_code_review_events(&self, job_id: &str) -> Result<(), EngineError> {
+        self.store.flush_pending_code_review_events(job_id).await?;
+        Ok(())
+    }
+
+    async fn retry_code_review_event_outbox(&self) {
+        let job_ids = match self.store.code_review_jobs_with_pending_events(100) {
+            Ok(job_ids) => job_ids,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "listing pending code-review transition events: {error:#}"
+                ));
+                return;
+            }
+        };
+        let pending_jobs = job_ids.iter().cloned().collect::<HashSet<_>>();
+        self.code_review
+            .outbox_retries
+            .lock()
+            .unwrap()
+            .retain(|job_id, _| pending_jobs.contains(job_id));
+        let mut failures = Vec::new();
+        for job_id in job_ids {
+            let now = Instant::now();
+            if self
+                .code_review
+                .outbox_retries
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .is_some_and(|state| state.retry_at > now)
+            {
+                continue;
+            }
+            if let Err(error) = self.flush_pending_code_review_events(&job_id).await {
+                tracing::warn!(
+                    job_id = %job_id,
+                    %error,
+                    "could not replay pending code-review transition events"
+                );
+                let mut retries = self.code_review.outbox_retries.lock().unwrap();
+                let state = retries
+                    .entry(job_id.clone())
+                    .or_insert(ReviewOutboxRetryState {
+                        failures: 0,
+                        retry_at: now,
+                    });
+                state.failures = state.failures.saturating_add(1);
+                state.retry_at = now + review_outbox_retry_delay(state.failures);
+                failures.push((job_id, error.to_string()));
+            } else {
+                self.code_review
+                    .outbox_retries
+                    .lock()
+                    .unwrap()
+                    .remove(&job_id);
+            }
+        }
+        if let Some((job_id, error)) = failures.first() {
+            self.record_review_error(format!(
+                "{} code-review transition outbox job(s) remain pending; first failure for {job_id}: {error}",
+                failures.len()
+            ));
+        }
     }
 
     fn project_code_review_output(
@@ -3188,6 +3301,7 @@ impl Engine {
             let mut running_jobs = tokio::task::JoinSet::new();
             loop {
                 worker_engine.retry_code_review_cleanup().await;
+                worker_engine.retry_code_review_event_outbox().await;
                 let job_concurrency = worker_engine.effective_code_review_job_concurrency();
                 let mut claim_failed = false;
                 while running_jobs.len() < job_concurrency {
@@ -3329,7 +3443,28 @@ impl Engine {
         }
         let _ = self.store.cancel_active_code_review_tasks(&job_id, &error);
         let _ = self.emit_code_review_job_updated(&job_id);
-        let _ = self.emit_code_review_updated(Some(job_id));
+        let _ = self.emit_code_review_updated(Some(job_id.clone()));
+        if record.job.scope == trouve_protocol::CodeReviewJobScope::Incremental
+            && let Err(cleanup_error) = self
+                .executor
+                .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
+                    worktree: self
+                        .data_dir
+                        .join("review-repositories")
+                        .join(&record.job.repository),
+                    job_id: job_id.clone(),
+                    pull_number: record.job.pull_number,
+                })
+                .await
+        {
+            tracing::warn!(
+                job_id = %job_id,
+                repository = %record.job.repository,
+                pull_number = record.job.pull_number,
+                error = %cleanup_error,
+                "could not delete temporary review-history refs during job cleanup"
+            );
+        }
     }
 
     async fn retry_code_review_cleanup(&self) {
@@ -3377,43 +3512,100 @@ impl Engine {
         validate_repository(&job.repository)?;
         validate_sha(&job.base_ref)?;
         validate_sha(&job.head_sha)?;
-        validate_sha(&job.review_base_sha)?;
-        let api = self.installation_api(job.installation_id).await?;
-        if job.scope == trouve_protocol::CodeReviewJobScope::Incremental
-            && job.review_base_sha != job.base_ref
-        {
-            let compare_path = format!(
-                "/repos/{}/compare/{}...{}",
-                job.repository, job.review_base_sha, job.head_sha
-            );
-            let comparison = api.get::<GithubCompare>(&compare_path).await;
-            let valid_incremental_base = comparison.as_ref().is_ok_and(|(comparison, _)| {
-                matches!(comparison.status.as_str(), "ahead" | "identical")
-            });
-            if let Ok((_, rate)) = comparison {
-                self.record_review_rate(rate);
+        validate_sha(&job.review_watermark_sha)?;
+        let previous_pull_state = self
+            .store
+            .code_review_pull_state(&job.repository, job.pull_number)?;
+        let review_watermark_sha = job.review_watermark_sha.clone();
+        let incremental_candidate = job.scope == trouve_protocol::CodeReviewJobScope::Incremental
+            && review_watermark_sha != job.base_ref;
+        let optional_shas = if incremental_candidate {
+            let mut shas = Vec::new();
+            for sha in [
+                &review_watermark_sha,
+                &previous_pull_state.last_reviewed_base_sha,
+                &previous_pull_state.last_reviewed_head_sha,
+            ] {
+                if validate_sha(sha).is_ok() && !shas.contains(sha) {
+                    shas.push(sha.clone());
+                }
             }
-            if !valid_incremental_base {
-                job.review_base_sha = job.base_ref.clone();
-                self.store
-                    .set_code_review_job_review_base(&job.id, &job.review_base_sha)?;
-            }
-        }
+            shas
+        } else {
+            Vec::new()
+        };
         let token = self.installation_token(job.installation_id).await?;
         let repository_path = self
             .executor
             .sync_review_repository(&ReviewRepositorySync {
                 root: self.data_dir.join("review-repositories"),
                 repository: job.repository.clone(),
+                job_id: job.id.clone(),
                 pull_number: job.pull_number,
-                base_sha: job.review_base_sha.clone(),
+                base_sha: job.base_ref.clone(),
                 head_sha: job.head_sha.clone(),
+                optional_shas,
                 token,
                 cancel: superseded.clone(),
             })
             .await
             .map_err(|error| anyhow!(error))?;
         ensure_review_current(superseded)?;
+        let watermark_merge_base = if incremental_candidate {
+            match self
+                .executor
+                .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                    managed_root: self.data_dir.join("review-repositories"),
+                    worktree: repository_path.clone(),
+                    base_sha: review_watermark_sha.clone(),
+                    head_sha: job.head_sha.clone(),
+                    cancel: superseded.clone(),
+                })
+                .await
+            {
+                Ok(merge_base) => Some(merge_base),
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        watermark = %review_watermark_sha,
+                        %error,
+                        "could not establish incremental review ancestry; reviewing the full pull request diff"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let incremental_history = classify_incremental_history(
+            incremental_candidate,
+            &review_watermark_sha,
+            watermark_merge_base.as_deref(),
+        );
+        let rewritten_history = incremental_history == IncrementalHistory::Rewritten;
+        if incremental_history == IncrementalHistory::Linear {
+            job.review_base_sha = review_watermark_sha;
+        } else {
+            job.review_base_sha = self
+                .executor
+                .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                    managed_root: self.data_dir.join("review-repositories"),
+                    worktree: repository_path.clone(),
+                    base_sha: job.base_ref.clone(),
+                    head_sha: job.head_sha.clone(),
+                    cancel: superseded.clone(),
+                })
+                .await
+                .map_err(|error| anyhow!(error))
+                .context("resolving the pull request merge base locally")?;
+            validate_sha(&job.review_base_sha)?;
+        }
+        if !self
+            .store
+            .set_code_review_job_review_base(&job.id, &job.review_base_sha)?
+        {
+            bail!("stale: review was superseded while selecting its diff base");
+        }
         let workspace = self.register_workspace(
             &repository_path.to_string_lossy(),
             Some(job.repository.clone()),
@@ -3469,6 +3661,10 @@ impl Engine {
                         worktree: session.worktree_path.clone().into(),
                         base_sha: job.review_base_sha.clone(),
                         cancel: superseded.clone(),
+                        head_sha: job.head_sha.clone(),
+                        max_files: REVIEW_DIFF_MAX_FILES,
+                        max_changed_lines: REVIEW_DIFF_MAX_CHANGED_LINES,
+                        max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
                     })
                     .await
                     .map_err(|error| anyhow!(error))?,
@@ -3477,14 +3673,97 @@ impl Engine {
             cache.insert(diff_cache_key, loaded.clone());
             loaded
         };
-        let batches = build_review_batches(&diff_files);
+        let (diff_files, reused_hunk_count) = if rewritten_history
+            && previous_pull_state.last_reviewed_head_sha == job.review_watermark_sha
+            && validate_sha(&previous_pull_state.last_reviewed_base_sha).is_ok()
+            && validate_sha(&previous_pull_state.last_reviewed_head_sha).is_ok()
+        {
+            let previous_merge_base = self
+                .executor
+                .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                    managed_root: self.data_dir.join("worktrees"),
+                    worktree: session.worktree_path.clone().into(),
+                    base_sha: previous_pull_state.last_reviewed_base_sha.clone(),
+                    head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
+                    cancel: superseded.clone(),
+                })
+                .await;
+            match previous_merge_base {
+                Ok(previous_merge_base) => {
+                    let previous_diff = self
+                        .executor
+                        .review_repository_diff(&ReviewRepositoryDiff {
+                            managed_root: self.data_dir.join("worktrees"),
+                            worktree: session.worktree_path.clone().into(),
+                            base_sha: previous_merge_base.clone(),
+                            head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
+                            cancel: superseded.clone(),
+                            max_files: REVIEW_DIFF_MAX_FILES,
+                            max_changed_lines: REVIEW_DIFF_MAX_CHANGED_LINES,
+                            max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
+                        })
+                        .await;
+                    match previous_diff {
+                        Ok(previous_diff) => {
+                            let previous_diff = previous_diff
+                                .into_iter()
+                                .map(|file| ReviewDiffFile {
+                                    path: file.path,
+                                    diff: file.diff,
+                                    generated_header: None,
+                                })
+                                .collect::<Vec<_>>();
+                            let (filtered, reused) =
+                                filter_previously_reviewed_hunks(&diff_files, &previous_diff);
+                            (Arc::new(filtered), reused)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = %job.id,
+                                previous_base = %previous_merge_base,
+                                previous_head = %previous_pull_state.last_reviewed_head_sha,
+                                %error,
+                                "could not load the previous review diff; reviewing the full current diff"
+                            );
+                            (diff_files, 0)
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        previous_base = %previous_pull_state.last_reviewed_base_sha,
+                        previous_head = %previous_pull_state.last_reviewed_head_sha,
+                        %error,
+                        "could not resolve the previous review merge base; reviewing the full current diff"
+                    );
+                    (diff_files, 0)
+                }
+            }
+        } else {
+            (diff_files, 0)
+        };
+        let batches = build_effective_review_batches(&diff_files, reused_hunk_count);
+        let batch_digest = review_batch_digest(
+            &job.review_base_sha,
+            &job.head_sha,
+            reused_hunk_count,
+            &batches,
+        );
+        let snapshot = self
+            .store
+            .prepare_code_review_batch_snapshot(&job.id, &batch_digest)?;
+        self.flush_pending_code_review_events(&job.id).await?;
         let reviewers = if record.reviewers.is_empty() {
             self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
         } else {
             record.reviewers.clone()
         };
+        let batch_snapshot_changed = snapshot.changed;
         let mut routing_decisions = self.store.code_review_routing_decisions(&job.id)?;
-        if !routing_decisions.is_empty()
+        if batch_snapshot_changed {
+            routing_decisions.clear();
+        } else if !routing_decisions.is_empty()
             && semantic_routing_enabled(&job)
             && !semantic_routing_candidates(&job, &reviewers).is_empty()
         {
@@ -3532,57 +3811,26 @@ impl Engine {
             })
             .collect::<HashMap<_, _>>();
         let catalog_reviewer_count = reviewers.len();
-        let selected_reviewer_count = selected_reviewer_count(
-            &routing_decisions,
-            if batches.is_empty() {
-                0
-            } else {
-                catalog_reviewer_count
-            },
-        );
+        let total_reviewers = if batches.is_empty() {
+            0
+        } else {
+            catalog_reviewer_count
+        };
+        let selected_reviewer_count = selected_reviewer_count(&routing_decisions, total_reviewers);
         let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
         let mut latest_tasks = HashMap::new();
-        for task in existing_tasks {
-            if task.role == trouve_protocol::CodeReviewTaskRole::Reviewer
-                && let Some(reviewer_id) = task.reviewer_id.clone()
-            {
-                latest_tasks.insert((reviewer_id, task.batch_index), task);
+        if !batch_snapshot_changed {
+            for task in existing_tasks {
+                if task.role == trouve_protocol::CodeReviewTaskRole::Reviewer
+                    && let Some(reviewer_id) = task.reviewer_id.clone()
+                {
+                    latest_tasks.insert((reviewer_id, task.batch_index), task);
+                }
             }
         }
-        for task in latest_tasks.values() {
-            let Some(batch) = batches.get(task.batch_index as usize) else {
-                bail!(
-                    "stale: persisted reviewer task {} refers to missing batch {}; retry the full review \
-                     on the current revision",
-                    task.id,
-                    task.batch_index + 1
-                );
-            };
-            if !persisted_task_matches_batch(
-                &task.prompt,
-                task.batch_index,
-                task.batch_count,
-                batch,
-                task.batch_index as usize,
-                batches.len(),
-            ) {
-                bail!(
-                    "stale: persisted reviewer task {} no longer matches review batch {}; retry the full \
-                     review on the current revision",
-                    task.id,
-                    task.batch_index + 1
-                );
-            }
-        }
-        let completed_reviewers = self.store.completed_code_review_personas(&job.id)?;
-        self.store.set_code_review_job_progress(
-            &job.id,
-            completed_reviewers,
-            catalog_reviewer_count as u64,
-        )?;
-        self.emit_code_review_progress(&job.id)?;
         let mut planned = Vec::new();
         let mut task_results = Vec::new();
+        let mut prompt_replaced_task_ids = Vec::new();
         // Interleave personas by batch so the first concurrency window makes
         // progress on every focused reviewer instead of serializing all
         // batches for the first persona.
@@ -3617,6 +3865,7 @@ impl Engine {
                         batch_index,
                         batches.len(),
                         &decision.reasons,
+                        reused_hunk_count,
                     )
                 } else {
                     review_batch_identity(&batch, batch_index, batches.len())
@@ -3629,6 +3878,17 @@ impl Engine {
                 };
                 let existing = latest_tasks.remove(&(reviewer.id.clone(), batch_index as u64));
                 match existing {
+                    Some(task) if task.prompt != prompt => {
+                        prompt_replaced_task_ids.push(task.id);
+                        planned.push((
+                            reviewer.clone(),
+                            batch_index,
+                            prompt,
+                            applies,
+                            skip_reason,
+                            None,
+                        ));
+                    }
                     Some(task) if task.status == "queued" => {
                         planned.push((
                             reviewer.clone(),
@@ -3685,6 +3945,25 @@ impl Engine {
                     }
                 }
             }
+        }
+        let completed_reviewers = if prompt_replaced_task_ids.is_empty() {
+            self.store.completed_code_review_personas(&job.id)?
+        } else {
+            let completed = self.store.supersede_code_review_tasks_for_prompt_change(
+                &job.id,
+                &prompt_replaced_task_ids,
+                total_reviewers as u64,
+            )?;
+            self.flush_pending_code_review_events(&job.id).await?;
+            completed
+        };
+        self.store.set_code_review_job_progress(
+            &job.id,
+            completed_reviewers,
+            total_reviewers as u64,
+        )?;
+        if prompt_replaced_task_ids.is_empty() {
+            self.emit_code_review_progress(&job.id)?;
         }
         self.store.set_code_review_job_phase_elapsed(
             &job.id,
@@ -3777,20 +4056,27 @@ impl Engine {
                                 finding,
                             })
                             .collect::<Vec<_>>();
-                        let task = engine
-                            .store
-                            .finish_code_review_task(
-                                &task.id,
-                                "succeeded",
-                                &turn.output,
-                                candidates.len() as u64,
-                                "",
-                            )?
-                            .ok_or_else(|| anyhow!("review task disappeared while finishing"))?;
+                        let Some(task) = engine.store.finish_code_review_task(
+                            &task.id,
+                            "succeeded",
+                            &turn.output,
+                            candidates.len() as u64,
+                            "",
+                        )?
+                        else {
+                            return Err(anyhow!(SupersededReviewTask));
+                        };
                         engine.emit_code_review_task(&job.id, task)?;
                         Ok::<_, anyhow::Error>(candidates)
                     }
                     .await;
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.downcast_ref::<SupersededReviewTask>().is_some())
+                    {
+                        engine.refresh_code_review_progress(&job.id).await?;
+                        return result;
+                    }
                     if let Err(error) = &result
                         && let Some(task) = engine.store.finish_code_review_task(
                             &task.id,
@@ -3845,7 +4131,11 @@ impl Engine {
         let coordinator_started = Instant::now();
         let parsed = if candidates.is_empty() && previous_findings.is_empty() {
             ReviewOutput {
-                summary: no_candidate_review_summary(selected_reviewer_count, diff_files.len()),
+                summary: no_candidate_review_summary(
+                    selected_reviewer_count,
+                    diff_files.len(),
+                    reused_hunk_count,
+                ),
                 findings: Vec::new(),
                 rejected_candidates: Vec::new(),
                 resolved_finding_ids: Vec::new(),
@@ -3859,6 +4149,7 @@ impl Engine {
                 &candidates,
                 &previous_findings,
                 &diff_files,
+                reused_hunk_count,
             )?;
             let task = self.store.create_code_review_task(&NewCodeReviewTask {
                 job_id: job.id.clone(),
@@ -6735,6 +7026,267 @@ fn should_replace_manual_review(
     mode == CodeReviewMode::Manual && review_superseded && manual_requested && generation.is_none()
 }
 
+#[derive(Debug)]
+struct ReusableDiff<'a> {
+    prefix: &'a str,
+    metadata: String,
+    preimage: String,
+    hunks: Vec<ReusableHunk<'a>>,
+}
+
+#[derive(Debug)]
+struct ReusableHunk<'a> {
+    text: &'a str,
+    fingerprint: String,
+    anchor: String,
+    old_location: u64,
+}
+
+/// Remove only complete, exactly equivalent textual hunks that were present in
+/// the prior full PR diff. The full preimage object and preimage-relative
+/// coordinate anchor semantic location; paths, metadata, context, and every
+/// added/removed byte remain part of the identity. New-file coordinates are
+/// ignored for existing files so added siblings do not invalidate an otherwise
+/// stable hunk. Repeated identities in the same path are retained because their
+/// relocation is ambiguous.
+fn filter_previously_reviewed_hunks(
+    current: &[ReviewDiffFile],
+    previous: &[ReviewDiffFile],
+) -> (Vec<ReviewDiffFile>, usize) {
+    let mut reviewed = HashMap::<(String, String, String, u64, String), usize>::new();
+    let mut reviewed_anchors = HashMap::<(String, String, String), usize>::new();
+    for file in previous {
+        let Some(parsed) = reusable_diff(&file.diff) else {
+            return (current.to_vec(), 0);
+        };
+        if parsed.hunks.is_empty() {
+            return (current.to_vec(), 0);
+        }
+        for hunk in parsed.hunks {
+            *reviewed_anchors
+                .entry((file.path.clone(), parsed.metadata.clone(), hunk.anchor))
+                .or_default() += 1;
+            *reviewed
+                .entry((
+                    file.path.clone(),
+                    parsed.metadata.clone(),
+                    parsed.preimage.clone(),
+                    hunk.old_location,
+                    hunk.fingerprint,
+                ))
+                .or_default() += 1;
+        }
+    }
+
+    let mut current_fingerprints = HashMap::<(String, String, String, u64, String), usize>::new();
+    for file in current {
+        let Some(parsed) = reusable_diff(&file.diff) else {
+            continue;
+        };
+        for hunk in parsed.hunks {
+            *current_fingerprints
+                .entry((
+                    file.path.clone(),
+                    parsed.metadata.clone(),
+                    parsed.preimage.clone(),
+                    hunk.old_location,
+                    hunk.fingerprint,
+                ))
+                .or_default() += 1;
+        }
+    }
+
+    let mut filtered = Vec::with_capacity(current.len());
+    let mut reused = 0;
+    let mut current_anchors = HashMap::<(String, String, String), usize>::new();
+    for file in current {
+        let Some(parsed) = reusable_diff(&file.diff) else {
+            filtered.push(file.clone());
+            continue;
+        };
+        let hunk_count = parsed.hunks.len();
+        let mut retained = Vec::new();
+        let mut matched_in_file = 0;
+        for hunk in parsed.hunks {
+            let anchor_key = (
+                file.path.clone(),
+                parsed.metadata.clone(),
+                hunk.anchor.clone(),
+            );
+            let key = (
+                file.path.clone(),
+                parsed.metadata.clone(),
+                parsed.preimage.clone(),
+                hunk.old_location,
+                hunk.fingerprint,
+            );
+            let unambiguous =
+                reviewed.get(&key) == Some(&1) && current_fingerprints.get(&key) == Some(&1);
+            let matched = unambiguous
+                && reviewed.get_mut(&key).is_some_and(|count| {
+                    if *count == 0 {
+                        return false;
+                    }
+                    *count -= 1;
+                    true
+                });
+            if matched {
+                reused += 1;
+                matched_in_file += 1;
+                if let Some(count) = reviewed_anchors.get_mut(&anchor_key) {
+                    *count = count.saturating_sub(1);
+                }
+            } else {
+                *current_anchors.entry(anchor_key).or_default() += 1;
+                retained.push(hunk.text);
+            }
+        }
+        if retained.is_empty() {
+            if matched_in_file == 0 || hunk_count == 0 {
+                filtered.push(file.clone());
+            }
+            continue;
+        }
+        if retained.len() == hunk_count {
+            filtered.push(file.clone());
+            continue;
+        }
+        let mut diff = parsed.prefix.to_string();
+        for hunk in retained {
+            diff.push_str(hunk);
+        }
+        filtered.push(ReviewDiffFile {
+            path: file.path.clone(),
+            diff,
+            generated_header: file.generated_header.clone(),
+        });
+    }
+    let every_old_hunk_accounted_for = reviewed_anchors.into_iter().all(|(key, count)| {
+        count == 0
+            || (!key.2.is_empty() && current_anchors.get(&key).copied().unwrap_or(0) >= count)
+    });
+    if !every_old_hunk_accounted_for {
+        return (current.to_vec(), 0);
+    }
+    (filtered, reused)
+}
+
+fn reusable_diff(diff: &str) -> Option<ReusableDiff<'_>> {
+    let mut hunk_starts = Vec::new();
+    let mut offset = 0;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("@@ ") {
+            hunk_starts.push(offset);
+        }
+        offset += line.len();
+    }
+    let first = hunk_starts.first().copied().unwrap_or(diff.len());
+    let prefix = &diff[..first];
+    let preimage = prefix.lines().find_map(|line| {
+        line.strip_prefix("index ")?
+            .split_once("..")
+            .map(|(preimage, _)| preimage.to_string())
+    })?;
+    let metadata = prefix
+        .lines()
+        .filter(|line| {
+            !line.starts_with("diff --git ")
+                && !line.starts_with("index ")
+                && !line.starts_with("--- ")
+                && !line.starts_with("+++ ")
+                && !line.is_empty()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut hunks = Vec::with_capacity(hunk_starts.len());
+    for (index, start) in hunk_starts.iter().copied().enumerate() {
+        let end = hunk_starts.get(index + 1).copied().unwrap_or(diff.len());
+        let text = &diff[start..end];
+        let (fingerprint, anchor, old_location, new_location) = complete_hunk_identity(text)?;
+        hunks.push(ReusableHunk {
+            text,
+            fingerprint,
+            anchor,
+            old_location: if preimage.bytes().all(|byte| byte == b'0') {
+                new_location
+            } else {
+                old_location
+            },
+        });
+    }
+    Some(ReusableDiff {
+        prefix,
+        metadata,
+        preimage,
+        hunks,
+    })
+}
+
+fn complete_hunk_identity(hunk: &str) -> Option<(String, String, u64, u64)> {
+    let (header, body) = hunk.split_once('\n').unwrap_or((hunk, ""));
+    let ranges = header.strip_prefix("@@ ")?;
+    let close = ranges.find(" @@")?;
+    let mut range_parts = ranges[..close].split_whitespace();
+    let (old_location, old_count) = diff_hunk_range(range_parts.next()?, '-')?;
+    let (new_location, new_count) = diff_hunk_range(range_parts.next()?, '+')?;
+    if range_parts.next().is_some() {
+        return None;
+    }
+    let suffix = &ranges[close + 3..];
+    let mut observed_old = 0_u64;
+    let mut observed_new = 0_u64;
+    let mut context = Vec::new();
+    for line in body.split_terminator('\n') {
+        match line.as_bytes().first().copied() {
+            Some(b' ') => {
+                observed_old += 1;
+                observed_new += 1;
+                context.push(line);
+            }
+            Some(b'-') => observed_old += 1,
+            Some(b'+') => observed_new += 1,
+            Some(b'\\') => {}
+            _ => return None,
+        }
+    }
+    if observed_old != old_count || observed_new != new_count {
+        return None;
+    }
+    let fingerprint = format!(
+        "{old_count}:{new_count}:{suffix}\n{}",
+        body.trim_end_matches('\n')
+    );
+    let anchor = if suffix.is_empty() && context.is_empty() {
+        String::new()
+    } else {
+        format!("{suffix}\n{}", context.join("\n"))
+    };
+    Some((fingerprint, anchor, old_location, new_location))
+}
+
+fn diff_hunk_range(range: &str, sigil: char) -> Option<(u64, u64)> {
+    let mut parts = range.strip_prefix(sigil)?.split(',');
+    let start = parts.next()?.parse::<u64>().ok()?;
+    let count = parts
+        .next()
+        .map(str::parse::<u64>)
+        .transpose()
+        .ok()?
+        .unwrap_or(1);
+    parts.next().is_none().then_some((start, count))
+}
+
+fn build_effective_review_batches(
+    files: &[ReviewDiffFile],
+    reused_hunk_count: usize,
+) -> Vec<ReviewBatch> {
+    if files.is_empty() && reused_hunk_count > 0 {
+        Vec::new()
+    } else {
+        build_review_batches(files)
+    }
+}
+
 fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
     if files.is_empty() {
         return vec![ReviewBatch {
@@ -6957,14 +7509,27 @@ fn selected_reviewer_count(
         .len()
 }
 
-fn no_candidate_review_summary(reviewer_count: usize, changed_file_count: usize) -> String {
+fn no_candidate_review_summary(
+    reviewer_count: usize,
+    changed_file_count: usize,
+    reused_hunk_count: usize,
+) -> String {
+    if changed_file_count == 0 && reused_hunk_count > 0 && reviewer_count == 0 {
+        return "All relevant hunks were reused from the prior review; no persona review was run."
+            .into();
+    }
     if reviewer_count == 0 {
         return format!(
             "No reviewer persona was selected for {changed_file_count} changed file(s); no persona review was run."
         );
     }
+    let reuse = if reused_hunk_count == 0 {
+        String::new()
+    } else {
+        format!(" after reusing {reused_hunk_count} unchanged hunk(s) from the prior review")
+    };
     format!(
-        "{reviewer_count} reviewer(s) examined {changed_file_count} changed file(s); no actionable issues were confirmed."
+        "{reviewer_count} reviewer(s) examined {changed_file_count} changed file(s){reuse}; no actionable issues were confirmed."
     )
 }
 
@@ -7107,6 +7672,32 @@ fn split_diff_chunks(diff: &str, limit: usize) -> Vec<&str> {
     chunks
 }
 
+fn review_batch_digest(
+    review_base_sha: &str,
+    head_sha: &str,
+    reused_hunk_count: usize,
+    batches: &[ReviewBatch],
+) -> String {
+    fn add_field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    add_field(&mut hasher, review_base_sha.as_bytes());
+    add_field(&mut hasher, head_sha.as_bytes());
+    hasher.update((reused_hunk_count as u64).to_le_bytes());
+    hasher.update((batches.len() as u64).to_le_bytes());
+    for batch in batches {
+        hasher.update((batch.paths.len() as u64).to_le_bytes());
+        for path in &batch.paths {
+            add_field(&mut hasher, path.as_bytes());
+        }
+        add_field(&mut hasher, batch.diff.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 fn reviewer_prompt(
     record: &CodeReviewJobRecord,
     reviewer: &ReviewerProfile,
@@ -7114,6 +7705,7 @@ fn reviewer_prompt(
     batch_index: usize,
     batch_count: usize,
     routing_reasons: &[CodeReviewRoutingReason],
+    reused_hunk_count: usize,
 ) -> String {
     let job = &record.job;
     let batch_identity = review_batch_identity(batch, batch_index, batch_count);
@@ -7127,11 +7719,18 @@ fn reviewer_prompt(
         .map(|reason| format!("- {:?}: {}", reason.source, reason.detail))
         .collect::<Vec<_>>()
         .join("\n");
+    let reuse_note = if reused_hunk_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "\nHistory was rewritten. {reused_hunk_count} exactly equivalent textual hunk(s) from the prior reviewed PR diff were omitted; the supplied hunks are the new or changed remainder.\n"
+        )
+    };
     format!(
         "{batch_identity}\nReview pull request #{number} ({title}) at immutable head {head}, compared with \
          base commit {base}. This is complete diff batch {batch_number} of {batch_count}. \
          \n\
-         {extra}\nChanged paths in this batch: {paths}\n\nUnified diff:\n{diff}\n\n\
+         {extra}{reuse_note}\nChanged paths in this batch: {paths}\n\nUnified diff:\n{diff}\n\n\
          You are the `{reviewer_name}` reviewer. Your focused mandate is:\n\
          {reviewer_instructions}\n\nRouting rationale:\n{routing}\n\n\
          Review every supplied file or fragment. Inspect relevant \
@@ -7157,6 +7756,7 @@ fn reviewer_prompt(
         batch_identity = batch_identity,
         paths = batch.paths.join(", "),
         diff = batch.diff,
+        reuse_note = reuse_note,
     )
 }
 
@@ -7165,6 +7765,7 @@ fn validation_prompt(
     candidates: &[CandidateFinding],
     previous_findings: &[trouve_protocol::CodeReviewFinding],
     files: &[ReviewDiffFile],
+    reused_hunk_count: usize,
 ) -> Result<String> {
     let job = &record.job;
     let relevant_paths = candidates
@@ -7179,6 +7780,13 @@ fn validation_prompt(
     let diff_context = coordinator_diff_context(files, &relevant_paths);
     let candidates = serde_json::to_string_pretty(candidates)?;
     let previous_findings = serde_json::to_string_pretty(previous_findings)?;
+    let reuse_note = if reused_hunk_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "History was rewritten, and {reused_hunk_count} exactly equivalent textual hunk(s) from the prior reviewed PR diff were omitted. Do not resolve a prior finding solely because its unchanged hunk is absent from the supplied remainder.\n\n"
+        )
+    };
     let paths = files
         .iter()
         .map(|file| file.path.as_str())
@@ -7202,7 +7810,7 @@ fn validation_prompt(
          of whether its severity/confidence combination will be posted to GitHub. Reassess each \
          candidate against the shared finding level rubric instead of copying its submitted \
          levels. Do not reject an otherwise real, actionable issue solely because its confidence \
-         is low; publication policy is applied after consolidation. Exact relevant diff context is \
+         is low; publication policy is applied after consolidation. {reuse_note}Exact relevant diff context is \
          supplied below; use tools only when surrounding unchanged code is necessary to settle \
          a concrete ambiguity. Do not add a finding merely because a \
          reviewer suggested it. Each retained finding must include every contributing \
@@ -7247,6 +7855,7 @@ fn validation_prompt(
         head = job.head_sha,
         level_guidance = FINDING_LEVEL_GUIDANCE,
         execution_guidance = COORDINATOR_EXECUTION_GUIDANCE,
+        reuse_note = reuse_note,
     ))
 }
 
@@ -7705,6 +8314,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_outbox_retry_delay_is_bounded_and_exponential() {
+        assert_eq!(review_outbox_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(review_outbox_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(review_outbox_retry_delay(4), Duration::from_secs(40));
+        assert_eq!(
+            review_outbox_retry_delay(u32::MAX),
+            REVIEW_OUTBOX_RETRY_MAX_DELAY
+        );
+    }
+
+    #[test]
     fn review_progress_preserves_capacity_and_coalesced_tool_stages() {
         use trouve_protocol::CodeReviewTaskLifecycleStage;
 
@@ -8080,6 +8700,242 @@ mod tests {
             .expect("review turn watchdog should not panic");
         assert_eq!(result.output, "done");
         assert_eq!(result.metrics.tool_call_count, 1);
+    }
+
+    #[test]
+    fn incremental_history_requires_a_proven_ancestry_result() {
+        let watermark = "1111111111111111111111111111111111111111";
+        assert_eq!(
+            classify_incremental_history(false, watermark, None),
+            IncrementalHistory::NotApplicable
+        );
+        assert_eq!(
+            classify_incremental_history(true, watermark, Some(watermark)),
+            IncrementalHistory::Linear
+        );
+        assert_eq!(
+            classify_incremental_history(
+                true,
+                watermark,
+                Some("2222222222222222222222222222222222222222")
+            ),
+            IncrementalHistory::Rewritten
+        );
+        assert_eq!(
+            classify_incremental_history(true, watermark, None),
+            IncrementalHistory::Unknown
+        );
+    }
+
+    #[test]
+    fn reviewer_batch_digest_covers_exact_effective_content() {
+        let batches = vec![ReviewBatch {
+            paths: vec!["src/lib.rs".into()],
+            diff: "+reviewed line  \n".into(),
+        }];
+        let digest = review_batch_digest("base", "head", 0, &batches);
+        assert_eq!(digest, review_batch_digest("base", "head", 0, &batches));
+        assert_ne!(digest, review_batch_digest("base", "head", 1, &batches));
+        let changed = vec![ReviewBatch {
+            paths: vec!["src/lib.rs".into()],
+            diff: "+reviewed line\n".into(),
+        }];
+        assert_ne!(digest, review_batch_digest("base", "head", 0, &changed));
+    }
+
+    #[test]
+    fn only_rewrite_reuse_turns_an_empty_diff_into_zero_batches() {
+        let unchanged_empty = build_effective_review_batches(&[], 0);
+        assert_eq!(unchanged_empty.len(), 1);
+        assert!(unchanged_empty[0].diff.contains("No textual file changes"));
+        assert!(build_effective_review_batches(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn rewritten_history_retains_a_hunk_moved_within_the_same_preimage() {
+        let previous = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
+                .into(),
+            generated_header: None,
+        }];
+        let current = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..333 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -30 +30 @@\n-old\n+new\n"
+                .into(),
+            generated_header: None,
+        }];
+
+        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
+        assert_eq!(reused, 0);
+        assert_eq!(filtered, current);
+    }
+
+    #[test]
+    fn rewritten_history_retains_a_hunk_when_its_file_preimage_changed() {
+        let previous = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
+                .into(),
+            generated_header: None,
+        }];
+        let current = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 333..444 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
+                .into(),
+            generated_header: None,
+        }];
+
+        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
+        assert_eq!(reused, 0);
+        assert_eq!(filtered, current);
+    }
+
+    #[test]
+    fn rewritten_history_reuses_an_exact_hunk_at_new_line_coordinates() {
+        let previous = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,3 @@ fn value() {\n context\n-old\n+new\n context\n"
+                .into(),
+            generated_header: None,
+        }];
+        let current = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..444 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +35,3 @@ fn value() {\n context\n-old\n+new\n context\n"
+                .into(),
+            generated_header: None,
+        }];
+
+        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
+        assert_eq!(reused, 1);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn rewritten_history_reviews_only_new_or_changed_hunks() {
+        let previous = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,3 @@ fn value() {\n context\n-old\n+new\n context\n"
+                .into(),
+            generated_header: None,
+        }];
+        let current = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..555 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +35,3 @@ fn value() {\n context\n-old\n+new\n context\n@@ -50 +55 @@ fn added() {\n-before\n+after\n"
+                .into(),
+            generated_header: None,
+        }];
+
+        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
+        assert_eq!(reused, 1);
+        assert_eq!(filtered.len(), 1);
+        assert!(!filtered[0].diff.contains("fn value"));
+        assert!(filtered[0].diff.contains("fn added"));
+        assert!(filtered[0].diff.contains("-before\n+after"));
+    }
+
+    #[test]
+    fn rewritten_history_keeps_a_modified_hunk_and_reuses_its_unchanged_siblings() {
+        let previous = vec![
+            ReviewDiffFile {
+                path: "src/a.rs".into(),
+                diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@ fn stable() {\n context\n-old\n+reviewed\n context\n"
+                    .into(),
+                generated_header: None,
+            },
+            ReviewDiffFile {
+                path: "src/b.rs".into(),
+                diff: "diff --git a/src/b.rs b/src/b.rs\nindex ccc..ddd 100644\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1,3 +1,3 @@ fn changed() {\n context\n-old\n+first\n context\n"
+                    .into(),
+                generated_header: None,
+            },
+        ];
+        let current = vec![
+            previous[0].clone(),
+            ReviewDiffFile {
+                path: "src/b.rs".into(),
+                diff: "diff --git a/src/b.rs b/src/b.rs\nindex ccc..eee 100644\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -20,3 +20,3 @@ fn changed() {\n context\n-old\n+second\n context\n"
+                    .into(),
+                generated_header: None,
+            },
+        ];
+
+        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
+        assert_eq!(reused, 1);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].path, "src/b.rs");
+        assert!(filtered[0].diff.contains("+second"));
+    }
+
+    #[test]
+    fn rewritten_history_falls_back_when_a_reviewed_hunk_disappears() {
+        let current = vec![ReviewDiffFile {
+            path: "src/a.rs".into(),
+            diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@ fn stable() {\n context\n-old\n+reviewed\n context\n"
+                .into(),
+            generated_header: None,
+        }];
+        let mut previous = current.clone();
+        previous.push(ReviewDiffFile {
+            path: "src/removed.rs".into(),
+            diff: "diff --git a/src/removed.rs b/src/removed.rs\nindex ccc..ddd 100644\n--- a/src/removed.rs\n+++ b/src/removed.rs\n@@ -1,3 +1,3 @@ fn removed() {\n context\n-old\n+gone\n context\n"
+                .into(),
+            generated_header: None,
+        });
+
+        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
+        assert_eq!(reused, 0);
+        assert_eq!(filtered, current);
+    }
+
+    #[test]
+    fn rewritten_history_falls_back_for_non_textual_prior_changes() {
+        let current = vec![ReviewDiffFile {
+            path: "src/a.rs".into(),
+            diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+reviewed\n"
+                .into(),
+            generated_header: None,
+        }];
+        let mut previous = current.clone();
+        previous.push(ReviewDiffFile {
+            path: "image.png".into(),
+            diff: "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
+                .into(),
+            generated_header: None,
+        });
+
+        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
+        assert_eq!(reused, 0);
+        assert_eq!(filtered, current);
+    }
+
+    #[test]
+    fn rewritten_history_preserves_whitespace_changes_and_incomplete_hunks() {
+        let previous = vec![ReviewDiffFile {
+            path: "config.yml".into(),
+            diff: "diff --git a/config.yml b/config.yml\nindex aaa..bbb 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -1 +1 @@\n-old\n+  value\n"
+                .into(),
+            generated_header: None,
+        }];
+        let current = vec![ReviewDiffFile {
+            path: "config.yml".into(),
+            diff: "diff --git a/config.yml b/config.yml\nindex aaa..ccc 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -8 +8 @@\n-old\n+\tvalue\n"
+                .into(),
+            generated_header: None,
+        }];
+
+        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
+        assert_eq!(reused, 0);
+        assert_eq!(filtered, current);
+
+        let incomplete = vec![ReviewDiffFile {
+            path: "config.yml".into(),
+            diff: "diff --git a/config.yml b/config.yml\nindex aaa..ddd 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -1,2 +1,2 @@\n-old\n+\tvalue\n"
+                .into(),
+            generated_header: None,
+        }];
+        let (_, reused) = filter_previously_reviewed_hunks(&current, &incomplete);
+        assert_eq!(reused, 0);
     }
 
     struct RouterThinkingProvider {
@@ -10011,6 +10867,10 @@ mod tests {
         assert!(should_log_code_review_job_failure("failed", None));
         assert!(!should_log_code_review_job_failure("failed", Some(false)));
         assert!(!should_log_code_review_job_failure("stale", None));
+        assert_eq!(
+            SupersededReviewTask.to_string(),
+            "stale: review task was superseded while finishing"
+        );
     }
 
     #[test]
@@ -11365,8 +12225,8 @@ mod tests {
             paths: vec!["src/lib.rs".into()],
             diff: "+fn changed() {}\n".into(),
         };
-        let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[]);
-        let coordinator_prompt = validation_prompt(&record, &[], &[], &[]).unwrap();
+        let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[], 0);
+        let coordinator_prompt = validation_prompt(&record, &[], &[], &[], 0).unwrap();
 
         for (name, prompt) in [
             ("reviewer", reviewer_prompt.as_str()),
@@ -12202,8 +13062,24 @@ mod tests {
         );
         assert_eq!(selected_reviewer_count(&decisions, reviewers.len()), 3);
         assert_eq!(
-            no_candidate_review_summary(3, 1),
+            no_candidate_review_summary(3, 1, 0),
             "3 reviewer(s) examined 1 changed file(s); no actionable issues were confirmed."
+        );
+        assert_eq!(
+            no_candidate_review_summary(0, 0, 2),
+            "All relevant hunks were reused from the prior review; no persona review was run."
+        );
+        assert_eq!(
+            no_candidate_review_summary(0, 1, 0),
+            "No reviewer persona was selected for 1 changed file(s); no persona review was run."
+        );
+        assert_eq!(
+            no_candidate_review_summary(0, 1, 2),
+            "No reviewer persona was selected for 1 changed file(s); no persona review was run."
+        );
+        assert_eq!(
+            no_candidate_review_summary(3, 1, 2),
+            "3 reviewer(s) examined 1 changed file(s) after reusing 2 unchanged hunk(s) from the prior review; no actionable issues were confirmed."
         );
     }
 

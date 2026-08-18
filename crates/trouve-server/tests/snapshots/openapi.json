@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.1"
+    "version": "7.2"
   },
   "paths": {
     "/v1/approvals": {
@@ -5750,6 +5750,10 @@
           "review_url": {
             "type": "string"
           },
+          "review_watermark_sha": {
+            "type": "string",
+            "description": "Immutable commit from the last successfully published review. This is\nthe incremental watermark even when history rewriting makes the\neffective `review_base_sha` fall back to the pull request merge base."
+          },
           "reviewer_elapsed_ms": {
             "type": "integer",
             "format": "int64",
@@ -6655,7 +6659,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`queued`, `running`, `succeeded`, `failed`, `cancelled`, or\n`not_applicable`."
+            "description": "`queued`, `running`, `succeeded`, `failed`, `cancelled`,\n`not_applicable`, or `superseded`."
           },
           "thinking": {
             "type": "string"

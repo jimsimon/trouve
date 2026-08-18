@@ -1359,7 +1359,7 @@ function JobDetailPane({
         <div>
           <dt>Revision</dt>
           <dd>
-            <code>{job.review_base_sha.slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
+            <code>{(job.review_base_sha || job.base_ref).slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
           </dd>
         </div>
         <div>
@@ -2970,6 +2970,13 @@ function ReviewPersonaSettings({
   );
   const effectiveModel = model || globalModel || "";
   const selectedModel = models.find((candidate) => candidate.id === effectiveModel);
+  useEffect(() => {
+    if (!personaInfo || !selectedModel) return;
+    setThinking((current) => {
+      if (!current || thinkingSelectionIsValid(selectedModel, current)) return current;
+      return defaultThinkingSelection(selectedModel);
+    });
+  }, [effectiveModel, selectedModel, personaInfo, personaInfo?.persona.default_thinking_level]);
   const options = thinkingOptions(selectedModel);
   const inheritedThinking = globalThinking
     ? thinkingLevelLabel(globalThinking)
@@ -3009,17 +3016,11 @@ function ReviewPersonaSettings({
                 onChange={(event) => {
                   const next = event.currentTarget.value;
                   setModel(next);
-                  const nextOptions = thinkingOptions(
-                    models.find((candidate) => candidate.id === (next || globalModel)),
-                  );
                   const nextModel = models.find(
                     (candidate) => candidate.id === (next || globalModel),
                   );
                   if (thinking && !thinkingSelectionIsValid(nextModel, thinking)) {
-                    setThinking(
-                      nextOptions.defaultValue ??
-                        (nextOptions.budget ? String(nextOptions.budget.minimum) : ""),
-                    );
+                    setThinking(defaultThinkingSelection(nextModel));
                   }
                 }}
               >

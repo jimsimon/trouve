@@ -2042,6 +2042,12 @@ export interface components {
              */
             review_base_sha?: string;
             review_url?: string;
+            /**
+             * @description Immutable commit from the last successfully published review. This is
+             *     the incremental watermark even when history rewriting makes the
+             *     effective `review_base_sha` fall back to the pull request merge base.
+             */
+            review_watermark_sha?: string;
             /** Format: int64 */
             reviewer_elapsed_ms?: number;
             /**
@@ -2404,8 +2410,8 @@ export interface components {
             /** Format: date-time */
             started_at?: string | null;
             /**
-             * @description `queued`, `running`, `succeeded`, `failed`, `cancelled`, or
-             *     `not_applicable`.
+             * @description `queued`, `running`, `succeeded`, `failed`, `cancelled`,
+             *     `not_applicable`, or `superseded`.
              */
             status: string;
             thinking?: string;

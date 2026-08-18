@@ -27,7 +27,7 @@ mod tests {
 
     #[test]
     fn rejects_older_newer_other_major_and_malformed_protocols() {
-        for server in ["4.0", "5.2", "6.1", "7.0", "7.2", "unknown", "7.1.1"] {
+        for server in ["4.0", "5.2", "6.1", "7.0", "7.1", "7.3", "unknown", "7.2.1"] {
             let error = ensure_compatible_protocol(server, PROTOCOL_VERSION)
                 .unwrap_err()
                 .to_string();
