@@ -6141,7 +6141,7 @@ fn lifecycle_finding_entry(
                 " _(not eligible for an inline comment)_"
             }
             trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy => {
-                " _(retained in Trouve; not posted by confidence policy)_"
+                " _(retained in Trouve; not posted by publication policy)_"
             }
             trouve_protocol::CodeReviewFindingPublicationStatus::Pending => {
                 " _(inline publication pending)_"
@@ -6298,7 +6298,7 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
     }
     if suppressed_count > 0 {
         body.push_str(&format!(
-            "_{} of {} confirmed finding(s) were retained in Trouve but not posted by the confidence policy._\n\n",
+            "_{} of {} confirmed finding(s) were retained in Trouve but not posted by the publication policy._\n\n",
             suppressed_count,
             detail.findings.len()
         ));
@@ -8506,7 +8506,7 @@ mod tests {
         assert!(body.contains("_(inline comment posted; link unavailable)_"));
         assert!(body.contains("Three confirmed issues, including uncertain issue details."));
         assert!(body.contains(
-            "1 of 3 confirmed finding(s) were retained in Trouve but not posted by the confidence policy"
+            "1 of 3 confirmed finding(s) were retained in Trouve but not posted by the publication policy"
         ));
         assert!(!body.contains("Uncertain issue details"));
         assert!(!body.contains("Fix all issues, including the uncertain issue"));
