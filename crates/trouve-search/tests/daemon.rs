@@ -214,16 +214,25 @@ fn proxy_falls_back_in_process_when_daemon_dies_unrestartably() {
     assert_eq!(response["result"]["isError"], false, "got {response}");
 
     // Kill the daemon and make respawning impossible: a regular file where
-    // the daemon directory belongs fails the successor's create_dir_all.
+    // the daemon directory belongs fails the successor's directory preparation.
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     let daemon_dir = PathBuf::from(&cache).join("daemon");
     std::fs::remove_dir_all(&daemon_dir).unwrap();
     std::fs::write(&daemon_dir, b"not a directory").unwrap();
 
-    // The reconnect attempt times out (~10s), then the session finishes
-    // in-process rather than going dark.
-    let response = search(&mut session, 3, repo.path(), "database connection");
+    // The launcher detects that the directory cannot be prepared, then the
+    // session finishes in-process rather than going dark.
+    let start = std::time::Instant::now();
+    let pong = session.request(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(8),
+        "fallback should not wait for a daemon that cannot be started"
+    );
+    assert_eq!(pong["id"], 3);
+
+    // Model loading and indexing are outside the fallback timing assertion.
+    let response = search(&mut session, 4, repo.path(), "database connection");
     assert_eq!(response["result"]["isError"], false, "got {response}");
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("db.py"), "got {text}");

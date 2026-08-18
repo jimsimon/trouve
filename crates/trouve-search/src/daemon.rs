@@ -55,7 +55,7 @@ pub fn run_daemon(content: &[ContentType]) -> ExitCode {
 mod unix {
     use std::fs;
     use std::io::{BufRead, BufReader, ErrorKind, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -118,21 +118,28 @@ mod unix {
             .join(format!("mcp-{}.sock", &digest.as_str()[..16]))
     }
 
+    fn ensure_daemon_dir(sock: &Path) -> std::io::Result<()> {
+        let dir = sock
+            .parent()
+            .ok_or_else(|| std::io::Error::other("daemon socket path has no parent"))?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        // Owner-only: the socket accepts tool calls from anyone who can
+        // connect, same trust boundary as the cache files next to it.
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+
     // ---------------------------------------------------------------- daemon
 
     pub(super) fn run_daemon(content: &[ContentType]) -> ExitCode {
         let sock = socket_path(content);
         let dir = sock.parent().expect("socket path has a parent");
-        if fs::create_dir_all(dir).is_err() {
-            eprintln!("cannot create daemon directory {}", dir.display());
-            return ExitCode::FAILURE;
-        }
-        // Owner-only: the socket accepts tool calls from anyone who can
-        // connect, same trust boundary as the cache files next to it. This
-        // is the actual isolation mechanism, so refusing to run beats
+        // This is the actual isolation mechanism, so refusing to run beats
         // silently serving from a world-traversable directory.
-        if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
-            eprintln!("cannot restrict permissions on {}: {e}", dir.display());
+        if let Err(e) = ensure_daemon_dir(&sock) {
+            eprintln!("cannot prepare daemon directory {}: {e}", dir.display());
             return ExitCode::FAILURE;
         }
 
@@ -253,7 +260,9 @@ mod unix {
         }
     }
 
-    fn spawn_daemon(content: &[ContentType]) -> std::io::Result<()> {
+    fn spawn_daemon(sock: &Path, content: &[ContentType]) -> std::io::Result<()> {
+        // Fail before starting a child that cannot create its socket.
+        ensure_daemon_dir(sock)?;
         let exe = std::env::current_exe()?;
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("daemon");
@@ -295,7 +304,7 @@ mod unix {
             Err(e) if e.kind() == ErrorKind::InvalidInput => return None,
             Err(_) => {}
         }
-        spawn_daemon(content).ok()?;
+        spawn_daemon(sock, content).ok()?;
         // Wait for a daemon to bind — ours, or a competing proxy's whose
         // daemon won the lock (just as good).
         let deadline = Instant::now() + SPAWN_WAIT;
@@ -438,6 +447,42 @@ mod unix {
                     .unwrap()
                     .to_string_lossy()
                     .starts_with("mcp-")
+            );
+        }
+
+        #[test]
+        fn ensure_daemon_dir_creates_private_parent() {
+            let root = tempfile::tempdir().unwrap();
+            let missing = root.path().join("missing");
+            let dir = missing.join("daemon");
+            let sock = dir.join("mcp-test.sock");
+
+            ensure_daemon_dir(&sock).unwrap();
+
+            assert!(dir.is_dir());
+            assert_eq!(
+                fs::metadata(missing).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+
+        #[test]
+        fn ensure_daemon_dir_hardens_existing_parent() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("daemon");
+            let sock = dir.join("mcp-test.sock");
+
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            ensure_daemon_dir(&sock).unwrap();
+
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
             );
         }
 
