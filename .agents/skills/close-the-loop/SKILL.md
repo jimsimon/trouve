@@ -175,8 +175,9 @@ by another actor, or loss of the target PR are the other terminal conditions.
    clean-snapshot convergence state, and confirm both that the new target
    remains within the user's requested scope and that its repository/ref is an
    authorized default or protected policy source established from trusted
-   repository state. Obtain explicit user approval before trusting any other
-   retargeted source. If only the recorded base revision changes, record the
+   repository state. Stop and obtain explicit user approval before continuing
+   whenever either the scope or policy-source check fails. If only the recorded
+   base revision changes, record the
    new revision, rediscover trusted workflow and check policy from it, and
    discard the same prior evidence and convergence state. Rerun every expected
    check under the new base, or verify from trusted run metadata that each
