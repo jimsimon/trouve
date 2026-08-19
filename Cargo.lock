@@ -7269,7 +7269,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-agents"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7297,7 +7297,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-app"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -7322,7 +7322,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-client-core"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7338,7 +7338,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-core"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7384,7 +7384,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-desktop-host"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -7405,11 +7405,11 @@ dependencies = [
 
 [[package]]
 name = "trouve-process"
-version = "3.7.0"
+version = "3.8.0"
 
 [[package]]
 name = "trouve-protocol"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "chrono",
  "serde",
@@ -7419,7 +7419,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-providers"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7447,7 +7447,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-search"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -7526,7 +7526,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-server"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7553,7 +7553,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-thread-view"
-version = "3.7.0"
+version = "3.8.0"
 dependencies = [
  "chrono",
  "serde",
