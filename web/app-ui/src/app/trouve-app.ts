@@ -1769,8 +1769,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         workspaceId,
         "ready",
       );
-      this.#newSessionOptionsError = completedAfterTimeout && wasBlocking
-        ? "Agent defaults finished loading. Untouched selections were updated."
+      this.#newSessionOptionsError = completedAfterTimeout
+        ? wasBlocking
+          ? "Agent defaults finished loading. Untouched selections were updated."
+          : "Agent defaults refresh finished. Untouched selections were updated."
         : "";
       this.#reconcileNewSessionDefaults(models);
       this.#subscribeToNewSessionLiveModels(generation, workspaceId, models);
