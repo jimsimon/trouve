@@ -2604,18 +2604,26 @@ impl Engine {
             ));
         }
         let reviewer_catalog = self.code_review_reviewer_catalog()?;
-        for reviewer_id in reviewer_ids
-            .iter()
-            .chain(&included_reviewer_ids)
-            .chain(&excluded_reviewer_ids)
-        {
-            if !reviewer_catalog
-                .iter()
-                .any(|reviewer| reviewer.id == *reviewer_id)
-            {
-                return Err(EngineError::BadRequest(format!(
-                    "unknown reviewer id {reviewer_id:?}"
-                )));
+        for reviewer_ids in [
+            &reviewer_ids,
+            &included_reviewer_ids,
+            &excluded_reviewer_ids,
+        ] {
+            let mut seen = HashSet::new();
+            for reviewer_id in reviewer_ids {
+                if !seen.insert(reviewer_id) {
+                    return Err(EngineError::BadRequest(format!(
+                        "duplicate reviewer id {reviewer_id:?}"
+                    )));
+                }
+                if !reviewer_catalog
+                    .iter()
+                    .any(|reviewer| reviewer.id == *reviewer_id)
+                {
+                    return Err(EngineError::BadRequest(format!(
+                        "unknown reviewer id {reviewer_id:?}"
+                    )));
+                }
             }
         }
         let excluded = excluded_reviewer_ids.iter().collect::<HashSet<_>>();

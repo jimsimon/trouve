@@ -278,7 +278,8 @@ pub use requests::*;
 // 7.2: code-review jobs expose the immutable incremental watermark separately
 // from the effective diff base selected after ancestry checks (additive).
 // 7.3: personas declare whether they are general or code-review personas.
-pub const PROTOCOL_VERSION: &str = "7.3";
+// 7.4: repository review updates document retryable 409 conflicts (additive).
+pub const PROTOCOL_VERSION: &str = "7.4";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";
