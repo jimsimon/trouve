@@ -156,9 +156,18 @@ export class ModelCatalogController {
     const generation = ++this.#generation;
     this.#livePendingForced = freshness === "force";
     this.#refreshing.set(true);
+    const finish = (promise: Promise<readonly ProtocolModelInfo[]>): boolean => {
+      if (this.#livePending !== promise) return false;
+      this.#livePending = undefined;
+      this.#livePendingForced = false;
+      this.#refreshing.set(false);
+      return true;
+    };
     const promise = this.#protocol.refreshModels().then(
       (models) => {
-        if (generation !== this.#generation) return this.#current.get();
+        if (!finish(promise) || generation !== this.#generation) {
+          return this.#current.get();
+        }
         const snapshot = Object.freeze([...models]);
         this.#lastLiveCheckedAt = this.#now();
         this.#liveLoaded.set(true);
@@ -168,8 +177,11 @@ export class ModelCatalogController {
         return snapshot;
       },
       (error: unknown) => {
-        if (generation !== this.#generation) return this.#current.get();
-        if (!this.#livePendingForced && this.#liveLoaded.get()) {
+        const forced = this.#livePendingForced;
+        if (!finish(promise) || generation !== this.#generation) {
+          return this.#current.get();
+        }
+        if (!forced && this.#liveLoaded.get()) {
           this.#lastLiveCheckedAt = this.#now();
         } else {
           this.#lastLiveCheckedAt = undefined;
@@ -178,13 +190,7 @@ export class ModelCatalogController {
         }
         throw error;
       },
-    ).finally(() => {
-      if (this.#livePending === promise) {
-        this.#livePending = undefined;
-        this.#livePendingForced = false;
-        this.#refreshing.set(false);
-      }
-    });
+    );
     this.#livePending = promise;
     return promise;
   }
