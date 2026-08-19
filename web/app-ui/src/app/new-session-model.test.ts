@@ -598,6 +598,14 @@ describe("new session model", () => {
     ).modelId).toBe("provider/available");
     expect(resolveNewThreadDefaults([], [], providers("provider/stale-global")).modelId)
       .toBe("");
+
+    const cursorDefault = model({}, "cursor/default");
+    const cursorFable = model({}, "cursor/claude-fable-5");
+    expect(resolveNewThreadDefaults(
+      [mode(null)],
+      [cursorFable, cursorDefault],
+      providers("provider/stale-global"),
+    ).modelId).toBe("cursor/default");
   });
 
   it("chooses an explicit base, repository branch, detached HEAD, then conventional trunks", () => {

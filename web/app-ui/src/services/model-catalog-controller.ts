@@ -86,7 +86,12 @@ export class ModelCatalogController {
   liveModels(
     freshness: ModelCatalogFreshness = "if-stale",
   ): Promise<readonly ProtocolModelInfo[]> {
-    return this.staticModels().then(() => this.#refreshLive(freshness));
+    return this.staticModels().then(
+      () => this.#refreshLive(freshness),
+      (staticError: unknown) => this.#refreshLive(freshness).catch(() => {
+        throw staticError;
+      }),
+    );
   }
 
   subscribeLive(

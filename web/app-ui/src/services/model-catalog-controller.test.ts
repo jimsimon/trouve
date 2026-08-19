@@ -83,6 +83,26 @@ describe("ModelCatalogController", () => {
     expect(staticCalls).toBe(1);
   });
 
+  it("discovers live models when the independent static catalog fails", async () => {
+    const staticError = new Error("static unavailable");
+    let liveSucceeds = true;
+    const controller = new ModelCatalogController({
+      models: async () => {
+        throw staticError;
+      },
+      refreshModels: async () => {
+        if (!liveSucceeds) throw new Error("live unavailable");
+        return [model("cursor/live")];
+      },
+    });
+
+    await expect(controller.liveModels()).resolves.toEqual([model("cursor/live")]);
+    expect(readSignal(controller.current)).toEqual([model("cursor/live")]);
+
+    liveSucceeds = false;
+    await expect(controller.liveModels("force")).rejects.toBe(staticError);
+  });
+
   it("coalesces concurrent static and live discovery", async () => {
     const staticResult = deferred<readonly ProtocolModelInfo[]>();
     const liveResult = deferred<readonly ProtocolModelInfo[]>();
