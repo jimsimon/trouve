@@ -6980,7 +6980,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(inserted)
+        Ok(Some(job))
     }
 
     pub fn supersede_code_review_jobs(
@@ -9534,10 +9534,12 @@ impl Store {
              WHERE publication_resolution_job_id = ?1 AND status = 'open'",
             params![id, resolved_at],
         )?;
-        tx.execute(
-            "UPDATE code_review_jobs SET fixed_issue_count = ?2 WHERE id = ?1",
-            params![id, fixed as i64],
-        )?;
+        if fixed > 0 {
+            tx.execute(
+                "UPDATE code_review_jobs SET fixed_issue_count = ?2 WHERE id = ?1",
+                params![id, fixed as i64],
+            )?;
+        }
         tx.execute(
             "INSERT INTO code_review_pr_state
                         (repository, pull_number, last_reviewed_head_sha,
@@ -14792,6 +14794,15 @@ mod tests {
             .prepare_code_review_finding_resolutions(&job.id, &[&finding.id])
             .unwrap();
 
+        assert!(
+            store
+                .reconcile_code_review_publication(
+                    &job.id,
+                    "https://example/recovered-review",
+                    &[],
+                )
+                .unwrap()
+        );
         assert!(
             store
                 .reconcile_code_review_publication(

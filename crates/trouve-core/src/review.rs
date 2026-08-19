@@ -60,6 +60,7 @@ const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60)
 /// retried by the dedicated collapse-retry task.
 const REVIEW_THREAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
+const REVIEW_THREAD_STATE_CACHE_TTL: Duration = Duration::from_secs(30);
 const REVIEW_PUBLICATION_LOOKUP_MAX_PAGES: u64 = 100;
 const REVIEW_PUBLICATION_LOOKUP_BUDGET: Duration = Duration::from_secs(60);
 const REVIEW_PUBLICATION_LOOKUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -340,6 +341,7 @@ struct ReviewThreadListingKey {
 struct ReviewThreadListingProgress {
     threads: HashMap<u64, (String, bool)>,
     refreshed_states: HashMap<String, bool>,
+    refresh_started_at: Option<Instant>,
     cursor: Option<String>,
     listing_complete: bool,
     saved_at: Instant,
@@ -350,6 +352,7 @@ impl ReviewThreadListingProgress {
         Self {
             threads: HashMap::new(),
             refreshed_states: HashMap::new(),
+            refresh_started_at: None,
             cursor: None,
             listing_complete: false,
             saved_at: Instant::now(),
@@ -3112,11 +3115,18 @@ impl Engine {
             had_errors = true;
             self.record_review_error(format!("reconciling review threads failed: {error:#}"));
         }
+        let cleanup_deadline = Instant::now() + REVIEW_BLOCKING_CLEANUP_PASS_BUDGET;
         for job in self
             .store
             .code_review_jobs_pending_blocking_review_cleanup(REVIEW_PROJECTION_REPAIR_LIMIT)?
         {
-            if let Err(error) = self.sync_code_review_blocking_review_cleanup(&job).await {
+            if Instant::now() >= cleanup_deadline {
+                break;
+            }
+            if let Err(error) = self
+                .sync_code_review_blocking_review_cleanup(&job, cleanup_deadline)
+                .await
+            {
                 had_errors = true;
                 self.record_review_error(format!(
                     "dismissing obsolete blocking reviews for {} failed: {error:#}",
@@ -3382,6 +3392,7 @@ impl Engine {
             )
         });
 
+        let mut first_error = None;
         for candidate in ordered {
             if Instant::now() >= deadline {
                 break;
@@ -3402,7 +3413,28 @@ impl Engine {
                         "reconciling resolved review findings for {}#{}",
                         candidate.repository.repository, candidate.pull.number
                     )
-                })?;
+                });
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.code_review
+                        .thread_listing_progress
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .retain(|progress_key, _| {
+                            progress_key.kind != ReviewThreadListingKind::Reconciliation
+                                || progress_key.repository != key.0
+                                || progress_key.pull_number != key.1
+                        });
+                    self.code_review
+                        .thread_reconciled_at
+                        .lock()
+                        .unwrap()
+                        .insert(key, Instant::now());
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
             self.code_review
                 .thread_reconciled_at
                 .lock()
@@ -3412,7 +3444,11 @@ impl Engine {
                 break;
             }
         }
-        Ok(())
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     fn supersede_automatic_code_reviews_for_draft(
@@ -3858,23 +3894,39 @@ impl Engine {
             .store
             .code_review_job_cancel_requested(&job_id)
             .unwrap_or(false);
-        let (status, review_url, error) = match result {
-            Ok(Ok(url)) => ("succeeded", url, String::new()),
-            Ok(Err(error)) if cancellation_requested => {
-                ("cancelled", String::new(), error.to_string())
+        let accepted_publication = match self.store.code_review_job(&job_id) {
+            Ok(Some(current)) if current.publication_accepted && current.review_published => {
+                Some(current.job.review_url)
             }
-            Ok(Err(error)) if error.to_string().starts_with("stale:") => {
-                ("stale", String::new(), error.to_string())
+            Ok(_) => None,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "checking accepted publication for review job {job_id}: {error:#}"
+                ));
+                None
             }
-            Ok(Err(error)) => ("failed", String::new(), format!("{error:#}")),
-            Err(_) => (
-                "failed",
-                String::new(),
-                format!(
-                    "review timed out after {}",
-                    compact_elapsed(review_timeout.as_millis().try_into().unwrap_or(u64::MAX))
+        };
+        let (status, review_url, error) = if let Some(review_url) = accepted_publication {
+            ("succeeded", review_url, String::new())
+        } else {
+            match result {
+                Ok(Ok(url)) => ("succeeded", url, String::new()),
+                Ok(Err(error)) if cancellation_requested => {
+                    ("cancelled", String::new(), error.to_string())
+                }
+                Ok(Err(error)) if error.to_string().starts_with("stale:") => {
+                    ("stale", String::new(), error.to_string())
+                }
+                Ok(Err(error)) => ("failed", String::new(), format!("{error:#}")),
+                Err(_) => (
+                    "failed",
+                    String::new(),
+                    format!(
+                        "review timed out after {}",
+                        compact_elapsed(review_timeout.as_millis().try_into().unwrap_or(u64::MAX))
+                    ),
                 ),
-            ),
+            }
         };
         let (finish_recorded, finish_transition) =
             match self
@@ -4812,18 +4864,6 @@ impl Engine {
             !has_unresolved_findings,
             &resolved_finding_ids,
         )?;
-        if !has_unresolved_findings
-            && let Err(error) = self
-                .sync_code_review_blocking_review_cleanup_with_api(&api, &job)
-                .await
-        {
-            tracing::warn!(
-                job_id = %job.id,
-                error = format!("{error:#}"),
-                "clean review was published, but obsolete blocking-review cleanup remains \
-                 pending for the poll repair task"
-            );
-        }
         // Collapsing the remote threads is cleanup detached from the round
         // entirely: it starts only after every piece of publication
         // bookkeeping, runs outside the job future with individually bounded
@@ -5787,26 +5827,40 @@ impl Engine {
     async fn sync_code_review_blocking_review_cleanup(
         &self,
         job: &trouve_protocol::CodeReviewJob,
+        deadline: Instant,
     ) -> Result<()> {
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
         let Some(claim_token) = self
             .store
             .claim_code_review_blocking_review_cleanup(&job.id)?
         else {
             return Ok(());
         };
-        let api = match self.installation_api(job.installation_id).await {
-            Ok(api) => api,
-            Err(error) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let api = match tokio::time::timeout(remaining, self.installation_api(job.installation_id))
+            .await
+        {
+            Ok(Ok(api)) => api,
+            Ok(Err(error)) => {
                 self.store
                     .defer_code_review_blocking_review_cleanup(&job.id, &claim_token)
                     .context("deferring blocking-review cleanup after credential failure")?;
                 return Err(error);
             }
+            Err(_) => {
+                self.store
+                    .defer_code_review_blocking_review_cleanup(&job.id, &claim_token)
+                    .context("deferring blocking-review cleanup after credential timeout")?;
+                bail!("loading blocking-review cleanup credentials timed out");
+            }
         };
-        self.sync_claimed_code_review_blocking_review_cleanup(&api, job, &claim_token)
+        self.sync_claimed_code_review_blocking_review_cleanup(&api, job, &claim_token, deadline)
             .await
     }
 
+    #[cfg(test)]
     async fn sync_code_review_blocking_review_cleanup_with_api(
         &self,
         api: &GithubApi,
@@ -5818,8 +5872,13 @@ impl Engine {
         else {
             return Ok(());
         };
-        self.sync_claimed_code_review_blocking_review_cleanup(api, job, &claim_token)
-            .await
+        self.sync_claimed_code_review_blocking_review_cleanup(
+            api,
+            job,
+            &claim_token,
+            Instant::now() + REVIEW_BLOCKING_CLEANUP_PASS_BUDGET,
+        )
+        .await
     }
 
     async fn sync_claimed_code_review_blocking_review_cleanup(
@@ -5827,6 +5886,7 @@ impl Engine {
         api: &GithubApi,
         job: &trouve_protocol::CodeReviewJob,
         claim_token: &str,
+        deadline: Instant,
     ) -> Result<()> {
         let record = self
             .store
@@ -5846,6 +5906,7 @@ impl Engine {
                 &record.job,
                 replacement_review_id,
                 start_page,
+                deadline,
             )
             .await
         }
@@ -5884,9 +5945,9 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         replacement_review_id: u64,
         mut page: u64,
+        deadline: Instant,
     ) -> Result<Option<u64>> {
         let bot_login = self.github_app_status()?.bot_login;
-        let deadline = Instant::now() + REVIEW_BLOCKING_CLEANUP_PASS_BUDGET;
         for _ in 0..REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -6905,6 +6966,14 @@ impl Engine {
             .collect::<Vec<_>>();
         thread_ids.sort();
         thread_ids.dedup();
+        let refresh_now = Instant::now();
+        let refresh_is_stale = progress.refresh_started_at.is_none_or(|started_at| {
+            refresh_now.saturating_duration_since(started_at) >= REVIEW_THREAD_STATE_CACHE_TTL
+        });
+        if refresh_is_stale {
+            progress.refreshed_states.clear();
+            progress.refresh_started_at = Some(refresh_now);
+        }
         let unrefreshed_thread_ids = thread_ids
             .into_iter()
             .filter(|thread_id| !progress.refreshed_states.contains_key(thread_id))
@@ -7104,7 +7173,6 @@ impl Engine {
             };
             let was_resolved = state.is_resolved == Some(true)
                 || matches!(state.finding.status.as_str(), "fixed" | "dismissed");
-            reopened |= state.recheck_pending;
             let (changed, generation) = self.store.record_code_review_thread_state(
                 &state.finding.id,
                 thread_id,
@@ -7124,6 +7192,7 @@ impl Engine {
             if matches!(state.finding.status.as_str(), "fixed" | "dismissed") && *is_resolved {
                 continue;
             }
+            reopened |= state.recheck_pending;
             all_resolved &= *is_resolved;
             state_key.push((state.finding.id.clone(), generation, *is_resolved));
         }
@@ -9457,6 +9526,13 @@ fn merge_review_task_metrics(
 mod tests {
     use super::*;
 
+    async fn await_mock_server(server: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("mock server did not finish")
+            .expect("mock server task failed");
+    }
+
     #[test]
     fn review_outbox_retry_delay_is_bounded_and_exponential() {
         assert_eq!(review_outbox_retry_delay(1), Duration::from_secs(5));
@@ -9595,6 +9671,28 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn deduped_thread_recheck_returns_the_covering_job() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut request = test_review_job_request("acme/widgets#42:thread-recheck-dedupe");
+        request.trigger = "thread-recheck".into();
+        let state_key = "state-a";
+        let mut covering_request = request.clone();
+        covering_request.dedupe_key =
+            format!("{}:{state_key}:attempt:1", covering_request.dedupe_key);
+        let covering = store
+            .enqueue_code_review_job(&covering_request)
+            .unwrap()
+            .unwrap();
+
+        let returned = store
+            .enqueue_code_review_thread_recheck(&request, state_key, &[], true, 3)
+            .unwrap()
+            .expect("the deduped recheck must retain its covering job");
+
+        assert_eq!(returned.id, covering.id);
     }
 
     #[test]
@@ -10541,7 +10639,7 @@ mod tests {
         );
         first.unwrap();
         second.unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
 
         let state = engine
             .store
@@ -11035,7 +11133,7 @@ mod tests {
         engine
             .capture_published_review_comments(&api, &job, 77, &findings)
             .await;
-        server.await.unwrap();
+        await_mock_server(server).await;
         let stored = engine.store.code_review_findings(&job.id).unwrap();
         assert_eq!(
             stored[0].github_comment_url,
@@ -11155,7 +11253,7 @@ mod tests {
         engine
             .capture_published_review_comments(&api, &job, 77, &findings)
             .await;
-        server.await.unwrap();
+        await_mock_server(server).await;
         let stored = engine.store.code_review_findings(&job.id).unwrap();
         assert!(!stored[0].github_comment_url.is_empty());
         assert!(stored.iter().all(|finding| {
@@ -11254,7 +11352,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        server.await.unwrap();
+        await_mock_server(server).await;
         let stored = engine.store.code_review_findings(&job.id).unwrap();
         assert_eq!(
             stored
@@ -11350,7 +11448,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        server.await.unwrap();
+        await_mock_server(server).await;
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert!(!record.publication_claimed);
         assert!(!record.publication_accepted);
@@ -11480,7 +11578,7 @@ mod tests {
                 .unwrap(),
             "https://github.com/acme/widgets/pull/42#pullrequestreview-77"
         );
-        server.await.unwrap();
+        await_mock_server(server).await;
         let stored = engine.store.code_review_findings(&job.id).unwrap();
         let published = &stored[0];
         assert_eq!(
@@ -11537,7 +11635,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        closed_server.await.unwrap();
+        await_mock_server(closed_server).await;
         assert_eq!(
             engine.store.code_review_findings(&pending_job.id).unwrap()[0]
                 .github_publication_status,
@@ -11610,7 +11708,7 @@ mod tests {
         .unwrap();
 
         let review = engine.find_published_review(&api, &job).await.unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
         assert_eq!(review.id, 777);
     }
 
@@ -11708,7 +11806,13 @@ mod tests {
         let mut page = 1;
         loop {
             let Some(next_page) = engine
-                .dismiss_prior_changes_requested_reviews(&api, &job, 778, page)
+                .dismiss_prior_changes_requested_reviews(
+                    &api,
+                    &job,
+                    778,
+                    page,
+                    Instant::now() + REVIEW_BLOCKING_CLEANUP_PASS_BUDGET,
+                )
                 .await
                 .unwrap()
             else {
@@ -11717,7 +11821,7 @@ mod tests {
             assert!(next_page > page);
             page = next_page;
         }
-        server.await.unwrap();
+        await_mock_server(server).await;
     }
 
     #[tokio::test]
@@ -11797,7 +11901,7 @@ mod tests {
                 .unwrap(),
             ""
         );
-        server.await.unwrap();
+        await_mock_server(server).await;
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert!(record.publication_claimed);
         assert!(record.publication_accepted);
@@ -11862,7 +11966,7 @@ mod tests {
             .sync_code_review_publication_projection(&api, &job)
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert_eq!(
             record.job.review_url,
@@ -11979,7 +12083,7 @@ mod tests {
                 .unwrap(),
             "https://github.com/review-77"
         );
-        server.await.unwrap();
+        await_mock_server(server).await;
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert!(record.publication_accepted);
         assert_eq!(
@@ -12106,7 +12210,7 @@ mod tests {
             .sync_code_review_blocking_review_cleanup_with_api(&api, &job)
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
         assert!(
             !engine
                 .store
@@ -12264,7 +12368,7 @@ mod tests {
             .publish_review(&api, &job, &findings, true)
             .await
             .unwrap_err();
-        server.await.unwrap();
+        await_mock_server(server).await;
         assert!(error.to_string().contains("GitHub API 500"), "{error:#}");
         assert!(
             !error
@@ -12305,7 +12409,7 @@ mod tests {
                 .unwrap(),
             "https://github.com/review-77"
         );
-        server.await.unwrap();
+        await_mock_server(server).await;
         assert_eq!(
             engine.store.code_review_findings(&job.id).unwrap()[0].github_publication_status,
             trouve_protocol::CodeReviewFindingPublicationStatus::Pending
@@ -12659,7 +12763,7 @@ mod tests {
             .sync_code_review_lifecycle_projection(&api, &queued)
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
         let state = engine
             .store
             .code_review_pull_state("acme/widgets", 42)
@@ -12852,7 +12956,7 @@ mod tests {
         assert_eq!(rate.remaining, Some(4998));
         assert_eq!(other, vec![3]);
         assert_eq!(cache.lock().unwrap().entries.len(), 2);
-        server.await.unwrap();
+        await_mock_server(server).await;
     }
 
     #[tokio::test]
@@ -12943,7 +13047,7 @@ mod tests {
             .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42]))
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
 
         assert_eq!(
             engine
@@ -13219,6 +13323,7 @@ mod tests {
         let progress = |comment_id, saved_at| ReviewThreadListingProgress {
             threads: HashMap::from([(comment_id, (format!("T{comment_id}"), false))]),
             refreshed_states: HashMap::new(),
+            refresh_started_at: None,
             cursor: Some(format!("c{comment_id}")),
             listing_complete: false,
             saved_at,
@@ -13332,7 +13437,7 @@ mod tests {
             .supersede_automatic_code_reviews_if_currently_draft(&api, "acme/widgets", 42)
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
         assert_eq!(
             engine
                 .store
@@ -13405,7 +13510,7 @@ mod tests {
             .revalidate_code_review_publication(&api, &manual)
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
     }
 
     #[tokio::test]
@@ -13442,6 +13547,13 @@ mod tests {
             .await
             .unwrap();
         server.abort();
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("aborted mock server did not stop");
+        assert!(
+            cancelled.is_err(),
+            "aborted mock server unexpectedly completed"
+        );
 
         assert!(matches!(outcome, ReviewThreadListingOutcome::Incomplete));
         let key = review_thread_listing_key(
@@ -13581,7 +13693,10 @@ mod tests {
                 key.clone(),
                 ReviewThreadListingProgress {
                     threads: HashMap::from([(9000, ("thread-9000".into(), false))]),
-                    refreshed_states: HashMap::new(),
+                    refreshed_states: HashMap::from([("thread-9000".into(), false)]),
+                    refresh_started_at: Some(
+                        Instant::now() - REVIEW_THREAD_STATE_CACHE_TTL - Duration::from_secs(1),
+                    ),
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -13605,7 +13720,7 @@ mod tests {
             )
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
 
         let ReviewThreadListingOutcome::Authoritative((threads, complete)) = outcome else {
             panic!("listing did not finish")
@@ -13666,6 +13781,7 @@ mod tests {
                         (9001, ("thread-9001".into(), true)),
                     ]),
                     refreshed_states: HashMap::new(),
+                    refresh_started_at: None,
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -13689,7 +13805,7 @@ mod tests {
             )
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
 
         assert!(matches!(outcome, ReviewThreadListingOutcome::Incomplete));
         let cache = engine.code_review.thread_listing_progress.lock().unwrap();
@@ -13826,7 +13942,7 @@ mod tests {
             .resolve_review_threads(&api, "acme/widgets", 42, &persisted)
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
         assert!(
             engine
                 .store
@@ -13923,7 +14039,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        server.await.unwrap();
+        await_mock_server(server).await;
         let pending = engine
             .store
             .pending_code_review_thread_collapses(later, 16, &[])
@@ -13960,7 +14076,7 @@ mod tests {
             .resolve_review_threads(&api, "acme/widgets", 42, &remaining)
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
         assert!(
             engine
                 .store
@@ -14048,7 +14164,7 @@ mod tests {
             )
             .await
             .unwrap();
-        server.await.unwrap();
+        await_mock_server(server).await;
         assert_eq!(
             engine
                 .store
@@ -14132,7 +14248,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        server.await.unwrap();
+        await_mock_server(server).await;
         let pending = engine
             .store
             .pending_code_review_thread_collapses(later, 16, &[])
