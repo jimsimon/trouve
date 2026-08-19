@@ -103,6 +103,22 @@ describe("ModelCatalogController", () => {
     await expect(controller.liveModels("force")).rejects.toBe(staticError);
   });
 
+  it("does not wait for a stalled static catalog before live discovery", async () => {
+    const staticResult = deferred<readonly ProtocolModelInfo[]>();
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: () => staticResult.promise,
+      refreshModels: async () => {
+        liveCalls += 1;
+        return [model("cursor/live")];
+      },
+    });
+
+    await expect(controller.liveModels()).resolves.toEqual([model("cursor/live")]);
+    expect(liveCalls).toBe(1);
+    expect(readSignal(controller.current)).toEqual([model("cursor/live")]);
+  });
+
   it("coalesces concurrent static and live discovery", async () => {
     const staticResult = deferred<readonly ProtocolModelInfo[]>();
     const liveResult = deferred<readonly ProtocolModelInfo[]>();

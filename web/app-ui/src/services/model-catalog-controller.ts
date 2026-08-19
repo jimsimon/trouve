@@ -86,12 +86,15 @@ export class ModelCatalogController {
   liveModels(
     freshness: ModelCatalogFreshness = "if-stale",
   ): Promise<readonly ProtocolModelInfo[]> {
-    return this.staticModels().then(
-      () => this.#refreshLive(freshness),
-      (staticError: unknown) => this.#refreshLive(freshness).catch(() => {
-        throw staticError;
-      }),
+    const staticOutcome = this.staticModels().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
     );
+    return this.#refreshLive(freshness).catch(async (liveError: unknown) => {
+      const outcome = await staticOutcome;
+      if (!outcome.ok) throw outcome.error;
+      throw liveError;
+    });
   }
 
   subscribeLive(
