@@ -411,7 +411,7 @@ describe("new session model", () => {
     });
   });
 
-  it("omits synthesized option overrides after a required load times out", () => {
+  it("omits synthesized persona and model overrides but keeps displayed permission after timeout", () => {
     const snapshot = snapshotNewSessionSubmission({
       selections: {
         modeId: "code",
@@ -434,6 +434,7 @@ describe("new session model", () => {
     })).toEqual({
       session_id: "session-1",
       title: "Fallback title",
+      permission_mode: "yolo",
     });
   });
 
@@ -480,6 +481,12 @@ describe("new session model", () => {
       [discoveredDefault, liveStatic],
       true,
     )).toEqual([discoveredDefault, staticModel]);
+    expect(mergeNewSessionModelCatalogs(
+      [staticModel, unavailableStatic],
+      [discoveredDefault, liveStatic],
+      true,
+      "provider/unavailable",
+    )).toEqual([discoveredDefault, staticModel, unavailableStatic]);
     expect(mergeNewSessionModelCatalogs([staticModel], [], false)).toEqual([
       staticModel,
     ]);
@@ -501,6 +508,30 @@ describe("new session model", () => {
       modelId: "provider/discovered",
       thinking: "low",
     });
+  });
+
+  it("always serializes the displayed permission when defaults are degraded", () => {
+    const snapshot = snapshotNewSessionSubmission({
+      selections: {
+        modeId: "code",
+        modelId: "provider/model",
+        thinking: "",
+        permissionMode: "ask",
+      },
+      edits: createNewThreadOptionEdits(),
+      modes: [mode()],
+      providers: providers("provider/model"),
+      selectableModels: [model({})],
+      inheritedPermissionMode: undefined,
+      inheritedThinking: undefined,
+      optionsAuthoritative: false,
+    });
+
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Thread",
+      snapshot,
+    })).toMatchObject({ permission_mode: "ask" });
   });
 
   it("replaces an untouched configured default that live discovery removed", () => {

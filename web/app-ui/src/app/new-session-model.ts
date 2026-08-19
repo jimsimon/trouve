@@ -211,11 +211,17 @@ export const mergeNewSessionModelCatalogs = (
   staticModels: readonly ProtocolModelInfo[],
   liveModels: readonly ProtocolModelInfo[],
   liveLoaded: boolean,
+  preservedModelId?: string,
 ): readonly ProtocolModelInfo[] => {
   if (!liveLoaded) return staticModels;
   const staticById = new Map(staticModels.map((model) => [model.id, model]));
-  return liveModels
-    .map((model) => staticById.get(model.id) ?? model)
+  const merged = liveModels.map((model) => staticById.get(model.id) ?? model);
+  const preserved = nonEmpty(preservedModelId);
+  if (preserved !== undefined && !merged.some((model) => model.id === preserved)) {
+    const metadata = staticById.get(preserved);
+    if (metadata !== undefined) merged.push(metadata);
+  }
+  return merged
     .sort((left, right) => left.id.localeCompare(right.id));
 };
 
@@ -515,7 +521,10 @@ export const createNewSessionThreadRequestFromSnapshot = (input: {
   const includeModel = snapshot.optionsAuthoritative
     || snapshot.edits.model
     || snapshot.edits.thinking;
-  const includePermission = snapshot.optionsAuthoritative || snapshot.edits.permission;
+  // Permission is always serialized: in degraded mode there is no trustworthy
+  // inherited value, so omitting the displayed choice could let the server use
+  // a different (and potentially more permissive) default.
+  const includePermission = true;
   const includeThinking = snapshot.optionsAuthoritative || snapshot.edits.thinking;
   return createNewSessionThreadRequest({
     sessionId: input.sessionId,

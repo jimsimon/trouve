@@ -1689,10 +1689,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionLiveUnsubscribe = this.#modelCatalog.subscribeLive(() => {
       if (
         generation !== this.#newSessionOptionsGeneration
-        || !newSessionOptionsAreAuthoritative(
-          this.#newSessionOptionsLifecycle,
-          workspaceId,
-        )
+        || this.#newSessionOptionsLifecycle.workspaceId !== workspaceId
       ) return;
       this.#reconcileNewSessionDefaults(models);
       this.requestUpdate();
@@ -1716,13 +1713,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionOptionEdits = loadState.edits;
     this.#newSessionInheritedThinking = loadState.inheritedThinking;
     this.#newSessionInheritedPermissionMode = loadState.inheritedPermissionMode;
-    if (newSessionOptionsAreAuthoritative(loadState.lifecycle, workspaceId)) {
-      this.#subscribeToNewSessionLiveModels(
-        generation,
-        workspaceId,
-        this.#newSessionModels,
-      );
-    }
+    // Keep degraded and loading forms reconciled with every live publication;
+    // the generation/workspace checks prevent stale loads from changing them.
+    this.#subscribeToNewSessionLiveModels(
+      generation,
+      workspaceId,
+      this.#newSessionModels,
+    );
     this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current);
     this.requestUpdate();
 
@@ -1763,6 +1760,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.#protocolClient.providers(),
       ]);
       if (generation !== this.#newSessionOptionsGeneration) return;
+      const completedAfterTimeout = this.#newSessionOptionsLifecycle.status === "timed-out";
       this.#newSessionModes = modes;
       this.#newSessionModels = models;
       this.#newSessionProviders = providers;
@@ -1771,7 +1769,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         workspaceId,
         "ready",
       );
-      this.#newSessionOptionsError = "";
+      this.#newSessionOptionsError = completedAfterTimeout
+        ? "Agent defaults finished loading. Untouched selections were updated."
+        : "";
       this.#reconcileNewSessionDefaults(models);
       this.#subscribeToNewSessionLiveModels(generation, workspaceId, models);
       void liveModelsPending.then((liveLoaded) => {
@@ -1807,6 +1807,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionModels,
       readSignal(this.#modelCatalog.current),
       readSignal(this.#modelCatalog.liveLoaded),
+      this.#newSessionOptionEdits.model ? this.#newSessionModelId : undefined,
     );
   }
 
