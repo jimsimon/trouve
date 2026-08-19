@@ -50,8 +50,12 @@ Bring one existing current-session pull request all the way to the product's
    branch matching, stop and ask for the missing choice. Do not create a PR.
 3. Record the PR number, URL, base branch, head branch, and exact head SHA.
    Confirm the local branch can safely update that PR head.
-4. If the PR is a draft, run `gh pr ready`. Re-read the PR and verify it is
-   open and no longer a draft before continuing.
+4. If the PR is a draft, inspect its auto-merge and merge-queue state before
+   running `gh pr ready`. If becoming ready could trigger either automation,
+   do not change readiness; disable the automation only with explicit user
+   authorization, otherwise report the blocker. After any ready transition,
+   immediately re-read the PR and verify it remains open, targets the recorded
+   repository and branches, and is no longer a draft.
 
 ## Build a complete state snapshot
 
@@ -79,6 +83,14 @@ completion claims only about observable state.
 ## Iterate to convergence
 
 Repeat this loop until the completion criteria all hold:
+
+Bound unchanged external waits. Use a repository-defined timeout when one
+exists; otherwise allow at most 30 minutes without observable progress for one
+check, review, or mergeability state. Retry a demonstrated transient CI or API
+failure at most once for the same cause and head SHA. Observable progress or a
+new head resets the no-progress clock, but not the retry count for the same
+cause. If the bound is reached or the same blocker survives its retry, report
+the exact non-terminal or failed blocker and stop without claiming readiness.
 
 1. Classify every unresolved thread, submitted review body, and top-level
    feedback item as actionable, already addressed, informational, duplicate,
@@ -128,12 +140,15 @@ timeouts, action-required states, and stale checks as not green.
 
 Finish only when one full snapshot proves all of the following:
 
-- The same target PR is open, non-draft, and still points to the recorded head
-  SHA.
+- Both stable snapshots match the recorded repository, PR number, base branch,
+  head branch, and head SHA, and the same target PR is open and non-draft.
 - Every applicable CI check for that SHA is terminal and successful, or is an
   expected skipped or neutral non-required check. No check is queued, pending,
   running, failing, cancelled, timed out, stale, or action-required.
-- No observable review or automated review job is queued, pending, or running.
+- Every observable automated review job for the exact head SHA is successful
+  or explicitly classified as an expected non-blocking neutral result. Queued,
+  pending, running, failed, cancelled, timed-out, errored, action-required,
+  stale, or other terminal non-success states are blockers.
 - All required approvals are present. Use `reviewDecision` and, when needed,
   each reviewer's latest non-dismissed effective verdict to determine whether
   a blocking change request remains; do not let a superseded historical
