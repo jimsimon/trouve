@@ -13933,27 +13933,25 @@ fn structured_repository_matches(args: &serde_json::Value, owner: &str, repo: &s
         return false;
     }
     if let Some(actual_repo) = args.get("repo").and_then(serde_json::Value::as_str) {
-        let matches = if actual_repo.contains('/') {
-            actual_repo
-                .trim_matches('/')
-                .eq_ignore_ascii_case(&expected_full_name)
+        let normalized_repo = actual_repo.trim_matches('/');
+        let matches = if normalized_repo.contains('/') {
+            normalized_repo.eq_ignore_ascii_case(&expected_full_name)
         } else {
-            actual_repo.eq_ignore_ascii_case(repo)
+            normalized_repo.eq_ignore_ascii_case(repo)
         };
         if !matches {
             return false;
         }
     }
     if let Some(actual_repository) = args.get("repository").and_then(serde_json::Value::as_str) {
-        let matches = if actual_repository.contains('/') {
-            actual_repository
-                .trim_matches('/')
-                .eq_ignore_ascii_case(&expected_full_name)
+        let normalized_repository = actual_repository.trim_matches('/');
+        let matches = if normalized_repository.contains('/') {
+            normalized_repository.eq_ignore_ascii_case(&expected_full_name)
         } else {
             args.get("owner")
                 .and_then(serde_json::Value::as_str)
                 .is_some()
-                && actual_repository.eq_ignore_ascii_case(repo)
+                && normalized_repository.eq_ignore_ascii_case(repo)
         };
         if !matches {
             return false;
@@ -13977,8 +13975,8 @@ fn structured_repository_identifies(args: &serde_json::Value, owner: &str, repo:
     let repo_value = args.get("repo").and_then(serde_json::Value::as_str);
     let repository_value = args.get("repository").and_then(serde_json::Value::as_str);
     full_name
-        || repo_value.is_some_and(|value| value.contains('/'))
-        || repository_value.is_some_and(|value| value.contains('/'))
+        || repo_value.is_some_and(|value| value.trim_matches('/').contains('/'))
+        || repository_value.is_some_and(|value| value.trim_matches('/').contains('/'))
         || (owner_present && (repo_value.is_some() || repository_value.is_some()))
 }
 
@@ -18918,6 +18916,19 @@ default_permission_mode = "ask"
                     "action": "create_pr",
                     "owner": "o",
                     "repository": "r"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Confirmed
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "github",
+                &serde_json::json!({
+                    "action": "create_pr",
+                    "owner": "o",
+                    "repository": "r/"
                 }),
                 "o",
                 "r"
