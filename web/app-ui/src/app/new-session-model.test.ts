@@ -6,17 +6,27 @@ import type {
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
 import {
+  beginNewSessionOptionLoad,
+  canSubmitNewSession,
+  createNewSessionOptionsLifecycle,
   createNewSessionThreadRequest,
+  createNewSessionThreadRequestFromSnapshot,
   createNewThreadOptionEdits,
+  interruptNewSessionOptionLoad,
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
   NEW_THREAD_TITLE_FALLBACK,
+  newSessionOptionsAreAuthoritative,
+  newSessionOptionsBlockSubmission,
   newThreadInheritanceForWorkspace,
+  mergeNewSessionModelCatalogs,
   reconcileNewThreadDefaults,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   sessionTitleFallback,
+  settleNewSessionOptionLoad,
+  snapshotNewSessionSubmission,
   thinkingOption,
   threadTitleFallback,
 } from "./new-session-model.js";
@@ -252,6 +262,265 @@ describe("new session model", () => {
       inheritedThinking: "high",
       permissionMode: "ask",
       inheritedPermissionMode: undefined,
+    });
+  });
+
+  it("tracks required loads, authoritative refreshes, and timeout fallback per workspace", () => {
+    const current = {
+      lifecycle: createNewSessionOptionsLifecycle(),
+      edits: { mode: true, model: true, thinking: true, permission: true },
+      inheritedThinking: "high",
+      inheritedPermissionMode: "yolo" as const,
+    };
+
+    const reconnectBeforeReady = beginNewSessionOptionLoad(
+      current,
+      "workspace-1",
+      true,
+    );
+    expect(reconnectBeforeReady.lifecycle).toEqual({
+      status: "loading",
+      workspaceId: "workspace-1",
+      catalogWorkspaceId: "",
+    });
+    expect(newSessionOptionsBlockSubmission(reconnectBeforeReady.lifecycle)).toBe(true);
+    expect(reconnectBeforeReady.edits).toEqual(current.edits);
+    expect(interruptNewSessionOptionLoad(reconnectBeforeReady.lifecycle).status)
+      .toBe("failed");
+
+    const ready = settleNewSessionOptionLoad(
+      reconnectBeforeReady.lifecycle,
+      "workspace-1",
+      "ready",
+    );
+    const refresh = beginNewSessionOptionLoad(
+      { ...current, lifecycle: ready },
+      "workspace-1",
+      true,
+    );
+    expect(refresh.lifecycle.status).toBe("refreshing");
+    expect(newSessionOptionsAreAuthoritative(refresh.lifecycle, "workspace-1"))
+      .toBe(true);
+    expect(newSessionOptionsBlockSubmission(refresh.lifecycle)).toBe(false);
+    const refreshTimedOut = settleNewSessionOptionLoad(
+      refresh.lifecycle,
+      "workspace-1",
+      "timed-out",
+    );
+    expect(refreshTimedOut.status).toBe("timed-out");
+    expect(newSessionOptionsAreAuthoritative(refreshTimedOut, "workspace-1"))
+      .toBe(true);
+    const lateRefreshFailure = settleNewSessionOptionLoad(
+      refreshTimedOut,
+      "workspace-1",
+      "failed",
+    );
+    expect(lateRefreshFailure.status).toBe("failed");
+    expect(newSessionOptionsAreAuthoritative(lateRefreshFailure, "workspace-1"))
+      .toBe(true);
+
+    const workspaceChange = beginNewSessionOptionLoad(
+      { ...current, lifecycle: ready },
+      "workspace-2",
+      false,
+    );
+    expect(workspaceChange).toEqual({
+      lifecycle: {
+        status: "loading",
+        workspaceId: "workspace-2",
+        catalogWorkspaceId: "",
+      },
+      edits: createNewThreadOptionEdits(),
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    });
+    const timedOut = settleNewSessionOptionLoad(
+      workspaceChange.lifecycle,
+      "workspace-2",
+      "timed-out",
+    );
+    expect(timedOut.status).toBe("timed-out");
+    expect(newSessionOptionsAreAuthoritative(timedOut, "workspace-2")).toBe(false);
+    expect(newSessionOptionsBlockSubmission(timedOut)).toBe(false);
+  });
+
+  it("blocks submission while required options, attachments, or submission are pending", () => {
+    const ready = {
+      sessionPending: false,
+      optionsBlocking: false,
+      attachmentPending: false,
+    };
+    expect(canSubmitNewSession(ready)).toBe(true);
+    for (const pending of [
+      "sessionPending",
+      "optionsBlocking",
+      "attachmentPending",
+    ] as const) {
+      expect(canSubmitNewSession({ ...ready, [pending]: true })).toBe(false);
+    }
+  });
+
+  it("keeps the pre-await submission options when live form state changes", async () => {
+    const selectedModel = model({
+      properties: {
+        thinking_level: {
+          type: "string",
+          enum: ["low", "high"],
+          default: "high",
+        },
+      },
+    }, "provider/selected");
+    const input = {
+      selections: {
+        modeId: "review",
+        modelId: selectedModel.id,
+        thinking: "low",
+        permissionMode: "ask",
+      },
+      modes: [{ ...mode(), id: "review" }],
+      providers: providers("provider/default"),
+      selectableModels: [selectedModel],
+      inheritedThinking: "high",
+      inheritedPermissionMode: "yolo",
+      optionsAuthoritative: true,
+      edits: createNewThreadOptionEdits(),
+    };
+    const submission = snapshotNewSessionSubmission(input);
+
+    await Promise.resolve();
+    input.selections.modeId = "code";
+    input.selections.modelId = "provider/changed";
+    input.selections.thinking = "high";
+    input.selections.permissionMode = "yolo";
+    input.inheritedThinking = "low";
+    input.inheritedPermissionMode = "ask";
+    input.selectableModels = [];
+    input.optionsAuthoritative = false;
+
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Generated title",
+      snapshot: submission,
+    })).toEqual({
+      session_id: "session-1",
+      title: "Generated title",
+      mode: "review",
+      model: "provider/selected",
+      permission_mode: "ask",
+      model_options: { thinking_level: "low" },
+    });
+  });
+
+  it("omits synthesized option overrides after a required load times out", () => {
+    const snapshot = snapshotNewSessionSubmission({
+      selections: {
+        modeId: "code",
+        modelId: "provider/fallback",
+        thinking: "high",
+        permissionMode: "yolo",
+      },
+      modes: [mode("provider/fallback")],
+      providers: providers("provider/fallback"),
+      selectableModels: [model({}, "provider/fallback")],
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+      optionsAuthoritative: false,
+      edits: createNewThreadOptionEdits(),
+    });
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Fallback title",
+      snapshot,
+    })).toEqual({
+      session_id: "session-1",
+      title: "Fallback title",
+    });
+  });
+
+  it("serializes explicit permission edits when catalog loading falls back", () => {
+    const snapshot = snapshotNewSessionSubmission({
+      selections: {
+        modeId: "code",
+        modelId: "provider/fallback",
+        thinking: "high",
+        permissionMode: "ask",
+      },
+      edits: { ...createNewThreadOptionEdits(), permission: true },
+      modes: [mode("provider/fallback")],
+      providers: providers("provider/fallback"),
+      selectableModels: [model({}, "provider/fallback")],
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+      optionsAuthoritative: false,
+    });
+
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Fallback title",
+      snapshot,
+    })).toEqual({
+      session_id: "session-1",
+      title: "Fallback title",
+      permission_mode: "ask",
+    });
+  });
+
+  it("uses live availability without replacing authoritative static metadata", () => {
+    const staticModel = model({}, "provider/static");
+    const unavailableStatic = model({}, "provider/unavailable");
+    const discoveredDefault = model({
+      properties: {
+        thinking_level: { type: "string", enum: ["low", "high"], default: "low" },
+      },
+    }, "provider/discovered");
+    const liveStatic = model({ properties: { effort: { enum: ["max"] } } }, "provider/static");
+
+    expect(mergeNewSessionModelCatalogs(
+      [staticModel, unavailableStatic],
+      [discoveredDefault, liveStatic],
+      true,
+    )).toEqual([discoveredDefault, staticModel]);
+    expect(mergeNewSessionModelCatalogs([staticModel], [], false)).toEqual([
+      staticModel,
+    ]);
+    expect(mergeNewSessionModelCatalogs([staticModel], [], true)).toEqual([]);
+
+    expect(reconcileNewThreadDefaults(
+      {
+        modeId: "code",
+        modelId: "provider/discovered",
+        thinking: "low",
+        permissionMode: "ask",
+      },
+      [mode()],
+      [staticModel],
+      providers("provider/static"),
+      { ...createNewThreadOptionEdits(), model: true },
+      [staticModel, discoveredDefault],
+    )).toMatchObject({
+      modelId: "provider/discovered",
+      thinking: "low",
+    });
+  });
+
+  it("replaces an untouched configured default that live discovery removed", () => {
+    const unavailableDefault = model({}, "provider/unavailable");
+    const available = model({}, "provider/available");
+
+    expect(reconcileNewThreadDefaults(
+      {
+        modeId: "code",
+        modelId: "provider/unavailable",
+        thinking: "",
+        permissionMode: "ask",
+      },
+      [mode("provider/unavailable")],
+      [unavailableDefault, available],
+      providers("provider/unavailable"),
+      createNewThreadOptionEdits(),
+      [available],
+    )).toMatchObject({
+      modelId: "provider/available",
     });
   });
 

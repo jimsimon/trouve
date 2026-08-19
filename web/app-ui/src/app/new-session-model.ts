@@ -8,6 +8,7 @@ import type {
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
 export const NEW_SESSION_TITLE_FALLBACK = "New session";
 export const NEW_THREAD_TITLE_FALLBACK = "New thread";
+export const NEW_SESSION_OPTIONS_TIMEOUT_MS = 10_000;
 
 type ThinkingOptionKey =
   | "thinking_level"
@@ -50,6 +51,48 @@ export interface NewThreadOptionSelections {
   readonly modelId: string;
   readonly thinking: string;
   readonly permissionMode: string;
+}
+
+export type NewSessionOptionsStatus =
+  | "unloaded"
+  | "loading"
+  | "refreshing"
+  | "ready"
+  | "failed"
+  | "timed-out";
+
+export interface NewSessionOptionsLifecycle {
+  readonly status: NewSessionOptionsStatus;
+  /** Workspace targeted by the current or most recently settled request. */
+  readonly workspaceId: string;
+  /** Workspace whose successfully loaded catalog remains authoritative. */
+  readonly catalogWorkspaceId: string;
+}
+
+export interface NewSessionOptionLoadState {
+  readonly lifecycle: NewSessionOptionsLifecycle;
+  readonly edits: NewThreadOptionEdits;
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: string | undefined;
+}
+
+export interface NewSessionSubmissionSnapshotInput {
+  readonly selections: NewThreadOptionSelections;
+  readonly edits: NewThreadOptionEdits;
+  readonly modes: readonly ProtocolAgentPersona[];
+  readonly providers: ProtocolProvidersResponse | null | undefined;
+  readonly selectableModels: readonly ProtocolModelInfo[];
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: string | undefined;
+  readonly optionsAuthoritative: boolean;
+}
+
+export interface NewSessionSubmissionSnapshot extends NewThreadOptionSelections {
+  readonly edits: NewThreadOptionEdits;
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: string | undefined;
+  readonly modelInfo: ProtocolModelInfo | undefined;
+  readonly optionsAuthoritative: boolean;
 }
 
 export interface NewSessionThreadRequestInput {
@@ -163,6 +206,19 @@ export const resolveNewSessionModel = (
   ?? nonEmpty(selectedMode?.default_model)
   ?? nonEmpty(providers?.default_model);
 
+/** Use settled live availability without allowing it to replace static metadata. */
+export const mergeNewSessionModelCatalogs = (
+  staticModels: readonly ProtocolModelInfo[],
+  liveModels: readonly ProtocolModelInfo[],
+  liveLoaded: boolean,
+): readonly ProtocolModelInfo[] => {
+  if (!liveLoaded) return staticModels;
+  const staticById = new Map(staticModels.map((model) => [model.id, model]));
+  return liveModels
+    .map((model) => staticById.get(model.id) ?? model)
+    .sort((left, right) => left.id.localeCompare(right.id));
+};
+
 const validPermissionMode = (value: unknown): ResolvedPermissionMode | undefined =>
   value === "ask" || value === "allow_list" || value === "yolo" ? value : undefined;
 
@@ -213,6 +269,113 @@ export const createNewThreadOptionEdits = (): NewThreadOptionEdits => ({
   permission: false,
 });
 
+export const createNewSessionOptionsLifecycle = (): NewSessionOptionsLifecycle => ({
+  status: "unloaded",
+  workspaceId: "",
+  catalogWorkspaceId: "",
+});
+
+export const newSessionOptionsAreAuthoritative = (
+  lifecycle: NewSessionOptionsLifecycle,
+  workspaceId: string,
+): boolean =>
+  workspaceId !== "" && lifecycle.catalogWorkspaceId === workspaceId;
+
+export const newSessionOptionsAreLoading = (
+  lifecycle: NewSessionOptionsLifecycle,
+): boolean => lifecycle.status === "loading" || lifecycle.status === "refreshing";
+
+export const newSessionOptionsBlockSubmission = (
+  lifecycle: NewSessionOptionsLifecycle,
+): boolean => lifecycle.status === "loading";
+
+export const newSessionOptionsCatalogWorkspaceId = (
+  lifecycle: NewSessionOptionsLifecycle,
+): string => lifecycle.catalogWorkspaceId;
+
+/** Starts a required load or a nonblocking refresh of authoritative metadata. */
+export const beginNewSessionOptionLoad = (
+  current: NewSessionOptionLoadState,
+  workspaceId: string,
+  preserveSelections: boolean,
+): NewSessionOptionLoadState => {
+  const refresh = preserveSelections
+    && newSessionOptionsAreAuthoritative(current.lifecycle, workspaceId);
+  const lifecycle: NewSessionOptionsLifecycle = {
+    status: refresh ? "refreshing" : "loading",
+    workspaceId,
+    catalogWorkspaceId: refresh ? workspaceId : "",
+  };
+  return preserveSelections
+    ? {
+        ...current,
+        lifecycle,
+        edits: { ...current.edits },
+      }
+    : {
+        lifecycle,
+        edits: createNewThreadOptionEdits(),
+        inheritedThinking: undefined,
+        inheritedPermissionMode: undefined,
+      };
+};
+
+export const settleNewSessionOptionLoad = (
+  current: NewSessionOptionsLifecycle,
+  workspaceId: string,
+  outcome: "ready" | "failed" | "timed-out",
+): NewSessionOptionsLifecycle => {
+  if (current.workspaceId !== workspaceId) return current;
+  return {
+    status: outcome,
+    workspaceId,
+    catalogWorkspaceId: outcome === "ready"
+      ? workspaceId
+      : current.catalogWorkspaceId,
+  };
+};
+
+export const interruptNewSessionOptionLoad = (
+  current: NewSessionOptionsLifecycle,
+): NewSessionOptionsLifecycle =>
+  current.status === "loading" || current.status === "refreshing"
+    ? {
+        status: current.catalogWorkspaceId === "" ? "failed" : "ready",
+        workspaceId: current.workspaceId,
+        catalogWorkspaceId: current.catalogWorkspaceId,
+      }
+    : current;
+
+/** Submission is safe only after every producer of form state has settled. */
+export const canSubmitNewSession = (state: {
+  readonly sessionPending: boolean;
+  readonly optionsBlocking: boolean;
+  readonly attachmentPending: boolean;
+}): boolean =>
+  !state.sessionPending && !state.optionsBlocking && !state.attachmentPending;
+
+/** Capture the option values used after asynchronous title generation completes. */
+export const snapshotNewSessionSubmission = (
+  input: NewSessionSubmissionSnapshotInput,
+): NewSessionSubmissionSnapshot => {
+  const selectedMode = input.modes.find(
+    (mode) => mode.id === input.selections.modeId,
+  );
+  const effectiveModel = resolveNewSessionModel(
+    input.selections.modelId,
+    selectedMode,
+    input.providers,
+  );
+  return Object.freeze({
+    ...input.selections,
+    edits: Object.freeze({ ...input.edits }),
+    inheritedThinking: input.inheritedThinking,
+    inheritedPermissionMode: input.inheritedPermissionMode,
+    modelInfo: input.selectableModels.find((model) => model.id === effectiveModel),
+    optionsAuthoritative: input.optionsAuthoritative,
+  });
+};
+
 /** Merge a refreshed catalog into fields the user has not edited. */
 export const reconcileNewThreadDefaults = (
   selections: NewThreadOptionSelections,
@@ -220,17 +383,32 @@ export const reconcileNewThreadDefaults = (
   models: readonly ProtocolModelInfo[],
   providers: ProtocolProvidersResponse | null | undefined,
   edits: NewThreadOptionEdits,
+  selectableModels: readonly ProtocolModelInfo[] = models,
 ): ResolvedNewThreadDefaults => {
-  const initial = resolveNewThreadDefaults(modes, models, providers);
+  const initial = resolveNewThreadDefaults(modes, selectableModels, providers);
   const modeId = edits.mode && modes.some((mode) => mode.id === selections.modeId)
     ? selections.modeId
     : initial.modeId;
-  const modeDefaults = resolveNewThreadDefaults(modes, models, providers, { modeId });
-  const modelId = edits.model && models.some((model) => model.id === selections.modelId)
+  const modeDefaults = resolveNewThreadDefaults(
+    modes,
+    selectableModels,
+    providers,
+    { modeId },
+  );
+  const keepModel = edits.model
+    && selectableModels.some((model) => model.id === selections.modelId);
+  const modelId = keepModel
     ? selections.modelId
     : modeDefaults.modelId;
-  const refreshed = resolveNewThreadDefaults(modes, models, providers, { modeId, modelId });
-  const option = thinkingOption(models.find((model) => model.id === refreshed.modelId));
+  const refreshed = resolveNewThreadDefaults(
+    modes,
+    selectableModels,
+    providers,
+    { modeId, modelId },
+  );
+  const option = thinkingOption(
+    selectableModels.find((model) => model.id === refreshed.modelId),
+  );
   const keepThinking = edits.thinking
     && option?.values.includes(selections.thinking) === true;
   const permissionMode = validPermissionMode(selections.permissionMode);
@@ -320,4 +498,39 @@ export const createNewSessionThreadRequest = (
     ...(permissionOverride ? { permission_mode: permissionMode } : {}),
     ...(modelOptions === undefined ? {} : { model_options: modelOptions }),
   };
+};
+
+/**
+ * Serialize authoritative selections plus any deliberate edits made while
+ * catalog metadata was unavailable. Thinking edits also pin their model
+ * because the option schema is model-specific.
+ */
+export const createNewSessionThreadRequestFromSnapshot = (input: {
+  readonly sessionId: string;
+  readonly title: string;
+  readonly snapshot: NewSessionSubmissionSnapshot;
+}): ProtocolCreateThreadRequest => {
+  const { snapshot } = input;
+  const includeMode = snapshot.optionsAuthoritative || snapshot.edits.mode;
+  const includeModel = snapshot.optionsAuthoritative
+    || snapshot.edits.model
+    || snapshot.edits.thinking;
+  const includePermission = snapshot.optionsAuthoritative || snapshot.edits.permission;
+  const includeThinking = snapshot.optionsAuthoritative || snapshot.edits.thinking;
+  return createNewSessionThreadRequest({
+    sessionId: input.sessionId,
+    title: input.title,
+    ...(includeMode ? { mode: snapshot.modeId } : {}),
+    ...(includeModel ? { model: snapshot.modelId } : {}),
+    ...(includePermission ? { permissionMode: snapshot.permissionMode } : {}),
+    ...(includeThinking ? { thinking: snapshot.thinking } : {}),
+    ...(snapshot.optionsAuthoritative
+        && snapshot.inheritedPermissionMode !== undefined
+      ? { inheritedPermissionMode: snapshot.inheritedPermissionMode }
+      : {}),
+    ...(snapshot.optionsAuthoritative && snapshot.inheritedThinking !== undefined
+      ? { inheritedThinking: snapshot.inheritedThinking }
+      : {}),
+    ...(snapshot.modelInfo === undefined ? {} : { modelInfo: snapshot.modelInfo }),
+  });
 };
