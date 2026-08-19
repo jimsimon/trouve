@@ -561,8 +561,7 @@ jobs:
           version="${RELEASE_TAG#v}"
 
           published() {
-            curl --fail --silent --show-error \
-              "https://crates.io/api/v1/crates/$1/$version" >/dev/null
+            cargo info --registry crates-io "$1@$version" >/dev/null 2>&1
           }
 
           publish_with_retries() {
