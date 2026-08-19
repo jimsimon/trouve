@@ -77,7 +77,7 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("this.#modelCatalog.subscribeLive");
     expect(source).toContain("this.#unsubscribeFromNewSessionLiveModels()");
     expect(source).toContain(
-      "this.#newSessionOptionsGeneration += 1;\n    this.#unsubscribeFromNewSessionLiveModels();\n    this.#newSessionOptionsPending = false;\n    this.#newSessionOptionsBlocking = false;\n    this.#protocolIngress.stop();",
+      "this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(",
     );
     expect(source).toContain(
       'if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "")',
@@ -87,7 +87,11 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("if (!canSubmitNewSession({");
     expect(source).toContain("const newSessionCanSubmit = canSubmitNewSession({");
     expect(source).toContain("?disabled=${!newSessionCanSubmit");
-    expect(source).toContain("await withNewSessionOptionsTimeout(");
+    expect(source).toContain("const timeout = globalThis.setTimeout(");
+    expect(source).toContain("const [modes, models, providers] = await Promise.all([");
+    expect(source).toContain('"timed-out",');
+    expect(source).toContain('"ready",');
+    expect(source).toContain("createNewSessionThreadRequestFromSnapshot({");
     expect(source).toContain("Loading agent defaults before this session can start…");
     expect(source).toContain(
       "this.#reconcileNewSessionDefaults(this.#newSessionModels)",

@@ -53,9 +53,21 @@ export interface NewThreadOptionSelections {
   readonly permissionMode: string;
 }
 
+export type NewSessionOptionsStatus =
+  | "unloaded"
+  | "loading"
+  | "refreshing"
+  | "ready"
+  | "failed"
+  | "timed-out";
+
+export interface NewSessionOptionsLifecycle {
+  readonly status: NewSessionOptionsStatus;
+  readonly workspaceId: string;
+}
+
 export interface NewSessionOptionLoadState {
-  readonly optionsWorkspaceId: string;
-  readonly blocksSubmission: boolean;
+  readonly lifecycle: NewSessionOptionsLifecycle;
   readonly edits: NewThreadOptionEdits;
   readonly inheritedThinking: string | undefined;
   readonly inheritedPermissionMode: string | undefined;
@@ -68,12 +80,14 @@ export interface NewSessionSubmissionSnapshotInput {
   readonly selectableModels: readonly ProtocolModelInfo[];
   readonly inheritedThinking: string | undefined;
   readonly inheritedPermissionMode: string | undefined;
+  readonly optionsAuthoritative: boolean;
 }
 
 export interface NewSessionSubmissionSnapshot extends NewThreadOptionSelections {
   readonly inheritedThinking: string | undefined;
   readonly inheritedPermissionMode: string | undefined;
   readonly modelInfo: ProtocolModelInfo | undefined;
+  readonly optionsAuthoritative: boolean;
 }
 
 export interface NewSessionThreadRequestInput {
@@ -250,24 +264,79 @@ export const createNewThreadOptionEdits = (): NewThreadOptionEdits => ({
   permission: false,
 });
 
-/** Starts an option load without making reconnects indistinguishable from workspace changes. */
+export const createNewSessionOptionsLifecycle = (): NewSessionOptionsLifecycle => ({
+  status: "unloaded",
+  workspaceId: "",
+});
+
+export const newSessionOptionsAreAuthoritative = (
+  lifecycle: NewSessionOptionsLifecycle,
+  workspaceId: string,
+): boolean =>
+  lifecycle.workspaceId === workspaceId
+  && (lifecycle.status === "ready" || lifecycle.status === "refreshing");
+
+export const newSessionOptionsAreLoading = (
+  lifecycle: NewSessionOptionsLifecycle,
+): boolean => lifecycle.status === "loading" || lifecycle.status === "refreshing";
+
+export const newSessionOptionsBlockSubmission = (
+  lifecycle: NewSessionOptionsLifecycle,
+): boolean => lifecycle.status === "loading";
+
+export const newSessionOptionsCatalogWorkspaceId = (
+  lifecycle: NewSessionOptionsLifecycle,
+): string =>
+  lifecycle.status === "ready" || lifecycle.status === "refreshing"
+    ? lifecycle.workspaceId
+    : "";
+
+/** Starts a required load or a nonblocking refresh of authoritative metadata. */
 export const beginNewSessionOptionLoad = (
   current: NewSessionOptionLoadState,
+  workspaceId: string,
   preserveSelections: boolean,
-): NewSessionOptionLoadState =>
-  preserveSelections
+): NewSessionOptionLoadState => {
+  const refresh = preserveSelections
+    && newSessionOptionsAreAuthoritative(current.lifecycle, workspaceId);
+  const lifecycle: NewSessionOptionsLifecycle = {
+    status: refresh ? "refreshing" : "loading",
+    workspaceId,
+  };
+  return preserveSelections
     ? {
         ...current,
-        blocksSubmission: false,
+        lifecycle,
         edits: { ...current.edits },
       }
     : {
-        optionsWorkspaceId: "",
-        blocksSubmission: true,
+        lifecycle,
         edits: createNewThreadOptionEdits(),
         inheritedThinking: undefined,
         inheritedPermissionMode: undefined,
       };
+};
+
+export const settleNewSessionOptionLoad = (
+  current: NewSessionOptionsLifecycle,
+  workspaceId: string,
+  outcome: "ready" | "failed" | "timed-out",
+): NewSessionOptionsLifecycle => {
+  if (current.workspaceId !== workspaceId) return current;
+  if (outcome === "ready") return { status: "ready", workspaceId };
+  return current.status === "refreshing"
+    ? { status: "ready", workspaceId }
+    : { status: outcome, workspaceId };
+};
+
+export const interruptNewSessionOptionLoad = (
+  current: NewSessionOptionsLifecycle,
+): NewSessionOptionsLifecycle =>
+  current.status === "refreshing"
+    ? { status: "ready", workspaceId: current.workspaceId }
+    : current.status === "loading"
+      ? { status: "failed", workspaceId: current.workspaceId }
+      : current;
 
 /** Submission is safe only after every producer of form state has settled. */
 export const canSubmitNewSession = (state: {
@@ -276,25 +345,6 @@ export const canSubmitNewSession = (state: {
   readonly attachmentPending: boolean;
 }): boolean =>
   !state.sessionPending && !state.optionsBlocking && !state.attachmentPending;
-
-/** Bound required metadata reconciliation so server defaults remain a fallback. */
-export const withNewSessionOptionsTimeout = async <T>(
-  pending: Promise<T>,
-  timeoutMs = NEW_SESSION_OPTIONS_TIMEOUT_MS,
-): Promise<T> => {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<never>((_resolve, reject) => {
-    timeout = globalThis.setTimeout(
-      () => reject(new Error("New session options timed out.")),
-      timeoutMs,
-    );
-  });
-  try {
-    return await Promise.race([pending, timedOut]);
-  } finally {
-    if (timeout !== undefined) globalThis.clearTimeout(timeout);
-  }
-};
 
 /** Capture the option values used after asynchronous title generation completes. */
 export const snapshotNewSessionSubmission = (
@@ -313,6 +363,7 @@ export const snapshotNewSessionSubmission = (
     inheritedThinking: input.inheritedThinking,
     inheritedPermissionMode: input.inheritedPermissionMode,
     modelInfo: input.selectableModels.find((model) => model.id === effectiveModel),
+    optionsAuthoritative: input.optionsAuthoritative,
   });
 };
 
@@ -439,3 +490,36 @@ export const createNewSessionThreadRequest = (
     ...(modelOptions === undefined ? {} : { model_options: modelOptions }),
   };
 };
+
+/** Omit synthesized form overrides until workspace metadata is authoritative. */
+export const createNewSessionThreadRequestFromSnapshot = (input: {
+  readonly sessionId: string;
+  readonly title: string;
+  readonly snapshot: NewSessionSubmissionSnapshot;
+}): ProtocolCreateThreadRequest =>
+  input.snapshot.optionsAuthoritative
+    ? createNewSessionThreadRequest({
+        sessionId: input.sessionId,
+        title: input.title,
+        mode: input.snapshot.modeId,
+        model: input.snapshot.modelId,
+        ...(input.snapshot.permissionMode === "ask"
+            || input.snapshot.permissionMode === "allow_list"
+            || input.snapshot.permissionMode === "yolo"
+          ? { permissionMode: input.snapshot.permissionMode }
+          : {}),
+        thinking: input.snapshot.thinking,
+        ...(input.snapshot.inheritedPermissionMode === undefined
+          ? {}
+          : { inheritedPermissionMode: input.snapshot.inheritedPermissionMode }),
+        ...(input.snapshot.inheritedThinking === undefined
+          ? {}
+          : { inheritedThinking: input.snapshot.inheritedThinking }),
+        ...(input.snapshot.modelInfo === undefined
+          ? {}
+          : { modelInfo: input.snapshot.modelInfo }),
+      })
+    : createNewSessionThreadRequest({
+        sessionId: input.sessionId,
+        title: input.title,
+      });

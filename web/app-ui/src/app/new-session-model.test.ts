@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import type {
   ProtocolAgentPersona,
@@ -8,11 +8,16 @@ import type {
 import {
   beginNewSessionOptionLoad,
   canSubmitNewSession,
+  createNewSessionOptionsLifecycle,
   createNewSessionThreadRequest,
+  createNewSessionThreadRequestFromSnapshot,
   createNewThreadOptionEdits,
+  interruptNewSessionOptionLoad,
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
   NEW_THREAD_TITLE_FALLBACK,
+  newSessionOptionsAreAuthoritative,
+  newSessionOptionsBlockSubmission,
   newThreadInheritanceForWorkspace,
   mergeNewSessionModelCatalogs,
   reconcileNewThreadDefaults,
@@ -20,10 +25,10 @@ import {
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   sessionTitleFallback,
+  settleNewSessionOptionLoad,
   snapshotNewSessionSubmission,
   thinkingOption,
   threadTitleFallback,
-  withNewSessionOptionsTimeout,
 } from "./new-session-model.js";
 
 const model = (
@@ -260,26 +265,67 @@ describe("new session model", () => {
     });
   });
 
-  it("preserves options for reconnect loads and resets them for ordinary loads", () => {
+  it("tracks required loads, authoritative refreshes, and timeout fallback per workspace", () => {
     const current = {
-      optionsWorkspaceId: "workspace-1",
-      blocksSubmission: true,
+      lifecycle: createNewSessionOptionsLifecycle(),
       edits: { mode: true, model: true, thinking: true, permission: true },
       inheritedThinking: "high",
       inheritedPermissionMode: "yolo" as const,
     };
 
-    const preserved = beginNewSessionOptionLoad(current, true);
-    expect(preserved).toEqual({ ...current, blocksSubmission: false });
-    expect(preserved).not.toBe(current);
-    expect(preserved.edits).not.toBe(current.edits);
-    expect(beginNewSessionOptionLoad(current, false)).toEqual({
-      optionsWorkspaceId: "",
-      blocksSubmission: true,
+    const reconnectBeforeReady = beginNewSessionOptionLoad(
+      current,
+      "workspace-1",
+      true,
+    );
+    expect(reconnectBeforeReady.lifecycle).toEqual({
+      status: "loading",
+      workspaceId: "workspace-1",
+    });
+    expect(newSessionOptionsBlockSubmission(reconnectBeforeReady.lifecycle)).toBe(true);
+    expect(reconnectBeforeReady.edits).toEqual(current.edits);
+    expect(interruptNewSessionOptionLoad(reconnectBeforeReady.lifecycle).status)
+      .toBe("failed");
+
+    const ready = settleNewSessionOptionLoad(
+      reconnectBeforeReady.lifecycle,
+      "workspace-1",
+      "ready",
+    );
+    const refresh = beginNewSessionOptionLoad(
+      { ...current, lifecycle: ready },
+      "workspace-1",
+      true,
+    );
+    expect(refresh.lifecycle.status).toBe("refreshing");
+    expect(newSessionOptionsAreAuthoritative(refresh.lifecycle, "workspace-1"))
+      .toBe(true);
+    expect(newSessionOptionsBlockSubmission(refresh.lifecycle)).toBe(false);
+    expect(settleNewSessionOptionLoad(
+      refresh.lifecycle,
+      "workspace-1",
+      "timed-out",
+    ).status).toBe("ready");
+
+    const workspaceChange = beginNewSessionOptionLoad(
+      { ...current, lifecycle: ready },
+      "workspace-2",
+      false,
+    );
+    expect(workspaceChange).toEqual({
+      lifecycle: { status: "loading", workspaceId: "workspace-2" },
       edits: createNewThreadOptionEdits(),
       inheritedThinking: undefined,
       inheritedPermissionMode: undefined,
     });
+    const timedOut = settleNewSessionOptionLoad(
+      workspaceChange.lifecycle,
+      "workspace-2",
+      "timed-out",
+    );
+    expect(timedOut.status).toBe("timed-out");
+    expect(newSessionOptionsAreAuthoritative(timedOut, "workspace-2")).toBe(false);
+    expect(newSessionOptionsBlockSubmission(timedOut)).toBe(false);
   });
 
   it("blocks submission while required options, attachments, or submission are pending", () => {
@@ -295,18 +341,6 @@ describe("new session model", () => {
       "attachmentPending",
     ] as const) {
       expect(canSubmitNewSession({ ...ready, [pending]: true })).toBe(false);
-    }
-  });
-
-  it("bounds required option loads that never settle", async () => {
-    vi.useFakeTimers();
-    try {
-      const pending = withNewSessionOptionsTimeout(new Promise<never>(() => undefined), 100);
-      const rejected = expect(pending).rejects.toThrow("New session options timed out.");
-      await vi.advanceTimersByTimeAsync(100);
-      await rejected;
-    } finally {
-      vi.useRealTimers();
     }
   });
 
@@ -332,6 +366,7 @@ describe("new session model", () => {
       selectableModels: [selectedModel],
       inheritedThinking: "high",
       inheritedPermissionMode: "yolo",
+      optionsAuthoritative: true,
     };
     const submission = snapshotNewSessionSubmission(input);
 
@@ -343,26 +378,44 @@ describe("new session model", () => {
     input.inheritedThinking = "low";
     input.inheritedPermissionMode = "ask";
     input.selectableModels = [];
+    input.optionsAuthoritative = false;
 
-    expect(createNewSessionThreadRequest({
+    expect(createNewSessionThreadRequestFromSnapshot({
       sessionId: "session-1",
-      mode: submission.modeId,
-      model: submission.modelId,
-      thinking: submission.thinking,
-      permissionMode: submission.permissionMode,
-      ...(submission.inheritedThinking === undefined
-        ? {}
-        : { inheritedThinking: submission.inheritedThinking }),
-      ...(submission.inheritedPermissionMode === undefined
-        ? {}
-        : { inheritedPermissionMode: submission.inheritedPermissionMode }),
-      ...(submission.modelInfo === undefined ? {} : { modelInfo: submission.modelInfo }),
+      title: "Generated title",
+      snapshot: submission,
     })).toEqual({
       session_id: "session-1",
+      title: "Generated title",
       mode: "review",
       model: "provider/selected",
       permission_mode: "ask",
       model_options: { thinking_level: "low" },
+    });
+  });
+
+  it("omits synthesized option overrides after a required load times out", () => {
+    const snapshot = snapshotNewSessionSubmission({
+      selections: {
+        modeId: "code",
+        modelId: "provider/fallback",
+        thinking: "high",
+        permissionMode: "yolo",
+      },
+      modes: [mode("provider/fallback")],
+      providers: providers("provider/fallback"),
+      selectableModels: [model({}, "provider/fallback")],
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+      optionsAuthoritative: false,
+    });
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Fallback title",
+      snapshot,
+    })).toEqual({
+      session_id: "session-1",
+      title: "Fallback title",
     });
   });
 

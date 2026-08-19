@@ -114,18 +114,25 @@ import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
   beginNewSessionOptionLoad,
   canSubmitNewSession,
-  createNewSessionThreadRequest,
+  createNewSessionOptionsLifecycle,
+  createNewSessionThreadRequestFromSnapshot,
   createNewThreadOptionEdits,
+  interruptNewSessionOptionLoad,
   mergeNewSessionModelCatalogs,
+  NEW_SESSION_OPTIONS_TIMEOUT_MS,
+  newSessionOptionsAreAuthoritative,
+  newSessionOptionsAreLoading,
+  newSessionOptionsBlockSubmission,
+  newSessionOptionsCatalogWorkspaceId,
   newThreadInheritanceForWorkspace,
   reconcileNewThreadDefaults,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   sessionTitleFallback,
+  settleNewSessionOptionLoad,
   snapshotNewSessionSubmission,
   thinkingOption,
-  withNewSessionOptionsTimeout,
   type NewThreadOptionEdits,
 } from "./new-session-model.js";
 import {
@@ -401,10 +408,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionThinking = "";
   #newSessionInheritedPermissionMode: string | undefined;
   #newSessionInheritedThinking: string | undefined;
-  #newSessionOptionsWorkspaceId = "";
+  #newSessionOptionsLifecycle = createNewSessionOptionsLifecycle();
   #newSessionOptionEdits: NewThreadOptionEdits = createNewThreadOptionEdits();
-  #newSessionOptionsPending = false;
-  #newSessionOptionsBlocking = false;
   #newSessionOptionsError = "";
   #newSessionOptionsGeneration = 0;
   #newSessionLiveUnsubscribe: (() => void) | undefined;
@@ -526,8 +531,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     );
     this.#newSessionOptionsGeneration += 1;
     this.#unsubscribeFromNewSessionLiveModels();
-    this.#newSessionOptionsPending = false;
-    this.#newSessionOptionsBlocking = false;
+    this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(
+      this.#newSessionOptionsLifecycle,
+    );
     this.#protocolIngress.stop();
     this.#threadIngress.close();
     if (this.#githubRefreshTimer !== undefined) {
@@ -1680,17 +1686,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   ): Promise<void> {
     const generation = ++this.#newSessionOptionsGeneration;
     this.#unsubscribeFromNewSessionLiveModels();
-    this.#newSessionOptionsPending = true;
     this.#newSessionOptionsError = "";
     const loadState = beginNewSessionOptionLoad({
-      optionsWorkspaceId: this.#newSessionOptionsWorkspaceId,
-      blocksSubmission: this.#newSessionOptionsBlocking,
+      lifecycle: this.#newSessionOptionsLifecycle,
       edits: this.#newSessionOptionEdits,
       inheritedThinking: this.#newSessionInheritedThinking,
       inheritedPermissionMode: this.#newSessionInheritedPermissionMode,
-    }, preserveSelections);
-    this.#newSessionOptionsWorkspaceId = loadState.optionsWorkspaceId;
-    this.#newSessionOptionsBlocking = loadState.blocksSubmission;
+    }, workspaceId, preserveSelections);
+    this.#newSessionOptionsLifecycle = loadState.lifecycle;
     this.#newSessionOptionEdits = loadState.edits;
     this.#newSessionInheritedThinking = loadState.inheritedThinking;
     this.#newSessionInheritedPermissionMode = loadState.inheritedPermissionMode;
@@ -1698,8 +1701,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.requestUpdate();
 
     // Provider usage may launch vendor helpers. It decorates the model picker
-    // but is not part of the static setup catalog, so refresh it independently
-    // and never hold the form behind it.
+    // but is not part of the static setup catalog, so refresh it independently.
     void this.#subscriptionHealth.refresh("if-stale").then(
       (subscriptionHealth) => {
         if (generation !== this.#newSessionOptionsGeneration) return;
@@ -1714,24 +1716,44 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       () => true,
       () => false,
     );
-    try {
-      const [modes, models, providers] = await withNewSessionOptionsTimeout(
-        Promise.all([
-          this.#protocolClient.personas(workspaceId),
-          this.#modelCatalog.staticModels(),
-          this.#protocolClient.providers(),
-        ]),
+    const wasBlocking = newSessionOptionsBlockSubmission(loadState.lifecycle);
+    const timeout = globalThis.setTimeout(() => {
+      if (generation !== this.#newSessionOptionsGeneration) return;
+      this.#newSessionOptionsLifecycle = settleNewSessionOptionLoad(
+        this.#newSessionOptionsLifecycle,
+        workspaceId,
+        "timed-out",
       );
+      if (wasBlocking) {
+        this.#newSessionOptionsError =
+          "Agent defaults timed out. Server defaults will be used unless loading finishes.";
+      }
+      this.requestUpdate();
+    }, NEW_SESSION_OPTIONS_TIMEOUT_MS);
+    try {
+      const [modes, models, providers] = await Promise.all([
+        this.#protocolClient.personas(workspaceId),
+        this.#modelCatalog.staticModels(),
+        this.#protocolClient.providers(),
+      ]);
       if (generation !== this.#newSessionOptionsGeneration) return;
       this.#newSessionModes = modes;
       this.#newSessionModels = models;
       this.#newSessionProviders = providers;
-      this.#newSessionOptionsWorkspaceId = workspaceId;
+      this.#newSessionOptionsLifecycle = settleNewSessionOptionLoad(
+        this.#newSessionOptionsLifecycle,
+        workspaceId,
+        "ready",
+      );
+      this.#newSessionOptionsError = "";
       this.#reconcileNewSessionDefaults(models);
       this.#newSessionLiveUnsubscribe = this.#modelCatalog.subscribeLive(() => {
         if (
           generation !== this.#newSessionOptionsGeneration
-          || this.#newSessionOptionsWorkspaceId !== workspaceId
+          || !newSessionOptionsAreAuthoritative(
+            this.#newSessionOptionsLifecycle,
+            workspaceId,
+          )
         ) return;
         this.#reconcileNewSessionDefaults(models);
         this.requestUpdate();
@@ -1740,21 +1762,27 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         if (
           !liveLoaded
           || generation !== this.#newSessionOptionsGeneration
-          || this.#newSessionOptionsWorkspaceId !== workspaceId
+          || !newSessionOptionsAreAuthoritative(
+            this.#newSessionOptionsLifecycle,
+            workspaceId,
+          )
         ) return;
         this.#reconcileNewSessionDefaults(models);
         this.requestUpdate();
       });
     } catch {
       if (generation !== this.#newSessionOptionsGeneration) return;
-      this.#newSessionOptionsError =
-        "Persona and model choices could not be loaded. Current displayed choices will be preserved.";
+      this.#newSessionOptionsLifecycle = settleNewSessionOptionLoad(
+        this.#newSessionOptionsLifecycle,
+        workspaceId,
+        "failed",
+      );
+      this.#newSessionOptionsError = wasBlocking
+        ? "Persona and model choices could not be loaded. Server defaults will be used."
+        : "Persona and model choices could not be refreshed. Existing choices were preserved.";
     } finally {
-      if (generation === this.#newSessionOptionsGeneration) {
-        this.#newSessionOptionsPending = false;
-        this.#newSessionOptionsBlocking = false;
-        this.requestUpdate();
-      }
+      globalThis.clearTimeout(timeout);
+      if (generation === this.#newSessionOptionsGeneration) this.requestUpdate();
     }
   }
 
@@ -1768,9 +1796,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   #resetNewSessionOptionsForWorkspace(workspaceId: string): void {
     this.#newSessionOptionEdits = createNewThreadOptionEdits();
-    if (this.#newSessionOptionsWorkspaceId !== workspaceId) {
+    if (!newSessionOptionsAreAuthoritative(
+      this.#newSessionOptionsLifecycle,
+      workspaceId,
+    )) {
       this.#newSessionModes = [];
-      this.#newSessionOptionsWorkspaceId = "";
+      this.#newSessionOptionsLifecycle = createNewSessionOptionsLifecycle();
     }
     const staticModels = this.#newSessionModels.length > 0
       ? this.#newSessionModels
@@ -1786,7 +1817,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPermissionMode = defaults.permissionMode;
     const inheritance = newThreadInheritanceForWorkspace(
       defaults,
-      this.#newSessionOptionsWorkspaceId,
+      newSessionOptionsCatalogWorkspaceId(this.#newSessionOptionsLifecycle),
       workspaceId,
     );
     this.#newSessionInheritedThinking = inheritance.inheritedThinking;
@@ -1813,7 +1844,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPermissionMode = defaults.permissionMode;
     const inheritance = newThreadInheritanceForWorkspace(
       defaults,
-      this.#newSessionOptionsWorkspaceId,
+      newSessionOptionsCatalogWorkspaceId(this.#newSessionOptionsLifecycle),
       this.#newSessionWorkspaceId,
     );
     this.#newSessionInheritedThinking = inheritance.inheritedThinking;
@@ -1853,8 +1884,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionBranchesPending = false;
     this.#newSessionBranchError = "";
-    this.#newSessionOptionsPending = false;
-    this.#newSessionOptionsBlocking = false;
+    this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(
+      this.#newSessionOptionsLifecycle,
+    );
     this.#newSessionOptionsError = "";
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;
@@ -2044,7 +2076,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     event.preventDefault();
     if (!canSubmitNewSession({
       sessionPending: this.#newSessionPending,
-      optionsBlocking: this.#newSessionOptionsBlocking,
+      optionsBlocking: newSessionOptionsBlockSubmission(this.#newSessionOptionsLifecycle),
       attachmentPending: this.#newSessionAttachmentPending,
     })) return;
     const form = event.currentTarget as HTMLFormElement;
@@ -2069,6 +2101,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       selectableModels: this.#availableNewSessionModels(),
       inheritedPermissionMode: this.#newSessionInheritedPermissionMode,
       inheritedThinking: this.#newSessionInheritedThinking,
+      optionsAuthoritative: newSessionOptionsAreAuthoritative(
+        this.#newSessionOptionsLifecycle,
+        workspaceId,
+      ),
     });
     const submissionAttachments = this.#newSessionAttachments.map(({ upload }) => upload);
     this.#newSessionPending = true;
@@ -2102,28 +2138,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     let threadId: string | undefined;
     try {
       const thread = await this.#protocolClient.createThread(
-        createNewSessionThreadRequest({
+        createNewSessionThreadRequestFromSnapshot({
           sessionId: session.id,
           title: session.title,
-          mode: submissionOptions.modeId,
-          model: submissionOptions.modelId,
-          ...(
-            submissionOptions.permissionMode === "ask"
-            || submissionOptions.permissionMode === "allow_list"
-            || submissionOptions.permissionMode === "yolo"
-              ? { permissionMode: submissionOptions.permissionMode }
-              : {}
-          ),
-          thinking: submissionOptions.thinking,
-          ...(submissionOptions.inheritedPermissionMode === undefined
-            ? {}
-            : { inheritedPermissionMode: submissionOptions.inheritedPermissionMode }),
-          ...(submissionOptions.inheritedThinking === undefined
-            ? {}
-            : { inheritedThinking: submissionOptions.inheritedThinking }),
-          ...(submissionOptions.modelInfo === undefined
-            ? {}
-            : { modelInfo: submissionOptions.modelInfo }),
+          snapshot: submissionOptions,
         }),
       );
       this.#store.upsertThread(thread);
@@ -2148,6 +2166,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionBranchGeneration += 1;
     this.#newSessionOptionsGeneration += 1;
     this.#unsubscribeFromNewSessionLiveModels();
+    this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(
+      this.#newSessionOptionsLifecycle,
+    );
     this.#newSessionPrompt = "";
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;
@@ -2519,9 +2540,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const newSessionThinkingOption = thinkingOption(
       newSessionModels.find((model) => model.id === effectiveNewSessionModel),
     );
+    const newSessionOptionsLoading = newSessionOptionsAreLoading(
+      this.#newSessionOptionsLifecycle,
+    );
+    const newSessionOptionsBlocking = newSessionOptionsBlockSubmission(
+      this.#newSessionOptionsLifecycle,
+    );
     const newSessionCanSubmit = canSubmitNewSession({
       sessionPending: this.#newSessionPending,
-      optionsBlocking: this.#newSessionOptionsBlocking,
+      optionsBlocking: newSessionOptionsBlocking,
       attachmentPending: this.#newSessionAttachmentPending,
     });
     const serverOffline = readSignal(this.#store.serverInfo)?.online === false;
@@ -3012,7 +3039,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 <trouve-model-picker
                   accessible-label="Model"
                   placement="down"
-                  placeholder=${this.#newSessionOptionsPending
+                  placeholder=${newSessionOptionsLoading
                     ? "Loading models…"
                     : "No model available"}
                   empty-label=""
@@ -3039,7 +3066,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     this.#newSessionThinking = defaults.thinking;
                     this.#newSessionInheritedThinking = newThreadInheritanceForWorkspace(
                       defaults,
-                      this.#newSessionOptionsWorkspaceId,
+                      newSessionOptionsCatalogWorkspaceId(this.#newSessionOptionsLifecycle),
                       this.#newSessionWorkspaceId,
                     ).inheritedThinking;
                     this.requestUpdate();
@@ -3114,7 +3141,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             ${this.#newSessionPermissionMode === "yolo"
               ? html`<div class="new-session-yolo-warning" role="note"><strong>${fontAwesomeIcon("triangle-exclamation")} Unattended execution (YOLO) is dangerous</strong><span>The agent can run commands and change or delete files without asking for approval.</span></div>`
               : nothing}
-            ${this.#newSessionOptionsBlocking
+            ${newSessionOptionsBlocking
               ? html`<p class="dialog-warning new-session-options-loading" role="status" aria-live="polite">Loading agent defaults before this session can start…</p>`
               : nothing}
             ${this.#newSessionOptionsError === ""
@@ -3124,7 +3151,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               ? nothing
               : html`<p class="dialog-error new-session-error" role="alert">${this.#newSessionError}</p>`}
             <footer>
-              <button class="primary" type="submit" ?disabled=${!newSessionCanSubmit || (this.#newSessionPrompt.trim() === "" && this.#newSessionAttachments.length === 0)}>${this.#newSessionPending ? "Starting…" : this.#newSessionOptionsBlocking ? "Loading defaults…" : "Start session"}</button>
+              <button class="primary" type="submit" ?disabled=${!newSessionCanSubmit || (this.#newSessionPrompt.trim() === "" && this.#newSessionAttachments.length === 0)}>${this.#newSessionPending ? "Starting…" : newSessionOptionsBlocking ? "Loading defaults…" : "Start session"}</button>
               <button type="button" ?disabled=${this.#newSessionPending} @click=${this.#closeNewSession}>Cancel</button>
             </footer>
           </form>
