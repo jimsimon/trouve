@@ -411,6 +411,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionOptionsLifecycle = createNewSessionOptionsLifecycle();
   #newSessionOptionEdits: NewThreadOptionEdits = createNewThreadOptionEdits();
   #newSessionOptionsError = "";
+  #newSessionOptionsStatus = "";
   #newSessionOptionsGeneration = 0;
   #newSessionLiveUnsubscribe: (() => void) | undefined;
   #newSessionPrompt = "";
@@ -1703,6 +1704,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const generation = ++this.#newSessionOptionsGeneration;
     this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionOptionsError = "";
+    this.#newSessionOptionsStatus = "";
     const loadState = beginNewSessionOptionLoad({
       lifecycle: this.#newSessionOptionsLifecycle,
       edits: this.#newSessionOptionEdits,
@@ -1769,7 +1771,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         workspaceId,
         "ready",
       );
-      this.#newSessionOptionsError = completedAfterTimeout
+      this.#newSessionOptionsError = "";
+      this.#newSessionOptionsStatus = completedAfterTimeout
         ? wasBlocking
           ? "Agent defaults finished loading. Untouched selections were updated."
           : "Agent defaults refresh finished. Untouched selections were updated."
@@ -1790,6 +1793,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       });
     } catch {
       if (generation !== this.#newSessionOptionsGeneration) return;
+      this.#newSessionOptionsStatus = "";
       this.#newSessionOptionsLifecycle = settleNewSessionOptionLoad(
         this.#newSessionOptionsLifecycle,
         workspaceId,
@@ -1907,6 +1911,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionOptionsLifecycle,
     );
     this.#newSessionOptionsError = "";
+    this.#newSessionOptionsStatus = "";
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;
     this.#newSessionPrompt = "";
@@ -3167,6 +3172,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             ${this.#newSessionOptionsError === ""
               ? nothing
               : html`<p class="dialog-warning new-session-options-warning" role="status">${this.#newSessionOptionsError}</p>`}
+            ${this.#newSessionOptionsStatus === ""
+              ? nothing
+              : html`<p class="new-session-options-status" role="status">${this.#newSessionOptionsStatus}</p>`}
             ${this.#newSessionError === ""
               ? nothing
               : html`<p class="dialog-error new-session-error" role="alert">${this.#newSessionError}</p>`}
