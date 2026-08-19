@@ -83,6 +83,9 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("this.#modelCatalog.subscribeLive");
     expect(source).toContain("this.#unsubscribeFromNewSessionLiveModels()");
     expect(source).toContain(
+      "this.#newSessionOptionsGeneration += 1;\n    this.#unsubscribeFromNewSessionLiveModels();\n    this.#protocolIngress.stop();",
+    );
+    expect(source).toContain(
       "this.#reconcileNewSessionDefaults(this.#newSessionModels)",
     );
     expect(source).not.toContain("this.#reconcileNewSessionModelCatalog()");

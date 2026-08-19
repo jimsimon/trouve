@@ -516,6 +516,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       "visibilitychange",
       this.#retryProtocolAfterVisibility,
     );
+    this.#newSessionOptionsGeneration += 1;
     this.#unsubscribeFromNewSessionLiveModels();
     this.#protocolIngress.stop();
     this.#threadIngress.close();
