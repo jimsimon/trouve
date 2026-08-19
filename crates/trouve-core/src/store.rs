@@ -338,7 +338,9 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0,
   blocking_review_cleanup_page INTEGER NOT NULL DEFAULT 1,
   blocking_review_cleanup_attempts INTEGER NOT NULL DEFAULT 0,
-  blocking_review_cleanup_next_attempt_at TEXT
+  blocking_review_cleanup_next_attempt_at TEXT,
+  blocking_review_cleanup_claim_token TEXT,
+  blocking_review_cleanup_claim_until TEXT
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -419,6 +421,7 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   collapse_pending INTEGER NOT NULL DEFAULT 0,
   collapse_attempts INTEGER NOT NULL DEFAULT 0,
   collapse_next_attempt_at TEXT,
+  publication_resolution_job_id TEXT,
   created_at TEXT NOT NULL
 );
 -- The partial index on collapse_pending lives in MIGRATIONS only: SCHEMA
@@ -569,6 +572,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_page INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_next_attempt_at TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_claim_token TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_claim_until TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
@@ -612,6 +617,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_pending INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
+    "ALTER TABLE code_review_findings ADD COLUMN publication_resolution_job_id TEXT",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
 ];
@@ -6860,6 +6866,24 @@ impl Store {
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let competing_job_exists: bool = tx.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM code_review_jobs
+               WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                 AND status IN ('queued', 'running')
+                 AND trigger != 'thread-recheck'
+             )",
+            params![
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.head_sha
+            ],
+            |row| row.get(0),
+        )?;
+        if competing_job_exists {
+            tx.commit()?;
+            return Ok(None);
+        }
         let current: Option<(i64, String, bool)> = tx
             .query_row(
                 "SELECT r.attempt_count, j.status, j.review_published
@@ -9487,23 +9511,50 @@ impl Store {
              WHERE id = ?1 AND publication_claimed != 0",
             params![id, review_url],
         )?;
-        if updated > 0 {
-            tx.execute(
-                "INSERT INTO code_review_pr_state
+        if updated == 0 {
+            return Ok(false);
+        }
+        let resolved_at = chrono::Utc::now().to_rfc3339();
+        let fixed = tx.execute(
+            "UPDATE code_review_findings
+             SET status = 'fixed', resolved_at = ?2,
+                 publication_resolution_job_id = NULL,
+                 collapse_attempts = CASE
+                     WHEN github_comment_id IS NOT NULL THEN 0
+                     ELSE collapse_attempts
+                 END,
+                 collapse_next_attempt_at = CASE
+                     WHEN github_comment_id IS NOT NULL THEN NULL
+                     ELSE collapse_next_attempt_at
+                 END,
+                 collapse_pending = CASE
+                     WHEN github_comment_id IS NOT NULL THEN 1
+                     ELSE 0
+                 END
+             WHERE publication_resolution_job_id = ?1 AND status = 'open'",
+            params![id, resolved_at],
+        )?;
+        tx.execute(
+            "UPDATE code_review_jobs SET fixed_issue_count = ?2 WHERE id = ?1",
+            params![id, fixed as i64],
+        )?;
+        tx.execute(
+            "INSERT INTO code_review_pr_state
                         (repository, pull_number, last_reviewed_head_sha,
                          last_reviewed_base_sha, last_reviewed_at)
-                 SELECT repository, pull_number, head_sha, base_ref, ?2
+                 SELECT repository, pull_number, head_sha, base_ref, created_at
                  FROM code_review_jobs
                  WHERE id = ?1 AND status != 'stale'
                  ON CONFLICT(repository, pull_number) DO UPDATE SET
                    last_reviewed_head_sha = excluded.last_reviewed_head_sha,
                    last_reviewed_base_sha = excluded.last_reviewed_base_sha,
-                   last_reviewed_at = excluded.last_reviewed_at",
-                params![id, chrono::Utc::now().to_rfc3339()],
-            )?;
-        }
+                   last_reviewed_at = excluded.last_reviewed_at
+                 WHERE code_review_pr_state.last_reviewed_at IS NULL
+                    OR code_review_pr_state.last_reviewed_at <= excluded.last_reviewed_at",
+            params![id],
+        )?;
         tx.commit()?;
-        Ok(updated > 0)
+        Ok(true)
     }
 
     pub fn set_code_review_job_check_run(
@@ -9672,8 +9723,46 @@ impl Store {
         Ok(())
     }
 
+    pub fn prepare_code_review_finding_resolutions(
+        &self,
+        job_id: &str,
+        finding_ids: &[&str],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET publication_resolution_job_id = ?2
+                 WHERE id = ?1 AND status = 'open'",
+                params![finding_id, job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // The PR identity fields intentionally stay explicit: they are written
     // atomically with both publication and cleanup state in this transaction.
+    pub fn prepare_code_review_blocking_review_cleanup(
+        &self,
+        id: &str,
+        required: bool,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_pending = ?2,
+                 blocking_review_cleanup_page = 1,
+                 blocking_review_cleanup_attempts = 0,
+                 blocking_review_cleanup_next_attempt_at = NULL,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND publication_claimed != 0
+               AND review_published = 0",
+            params![id, required],
+        )? > 0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_code_review_publication(
         &self,
@@ -9684,17 +9773,52 @@ impl Store {
         head_sha: &str,
         review_url: &str,
         blocking_review_cleanup_pending: bool,
-    ) -> Result<()> {
+        resolved_finding_ids: &[&str],
+    ) -> Result<u64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let resolved_at = chrono::Utc::now().to_rfc3339();
+        for finding_id in resolved_finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET publication_resolution_job_id = ?2
+                 WHERE id = ?1 AND status = 'open'",
+                params![finding_id, id],
+            )?;
+        }
+        let fixed = tx.execute(
+            "UPDATE code_review_findings
+                 SET status = 'fixed', resolved_at = ?2,
+                     publication_resolution_job_id = NULL,
+                     collapse_attempts = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 0
+                         ELSE collapse_attempts
+                     END,
+                     collapse_next_attempt_at = CASE
+                         WHEN github_comment_id IS NOT NULL THEN NULL
+                         ELSE collapse_next_attempt_at
+                     END,
+                     collapse_pending = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 1
+                         ELSE 0
+                     END
+                 WHERE publication_resolution_job_id = ?1 AND status = 'open'",
+            params![id, resolved_at],
+        )? as u64;
         let updated = tx.execute(
             "UPDATE code_review_jobs
              SET publication_accepted = 1,
                  review_published = 1,
                  review_url = CASE WHEN ?2 = '' THEN review_url ELSE ?2 END,
-                 blocking_review_cleanup_pending = ?3
+                 blocking_review_cleanup_pending = ?3,
+                 fixed_issue_count = ?4
              WHERE id = ?1 AND publication_claimed != 0",
-            params![id, review_url, blocking_review_cleanup_pending],
+            params![
+                id,
+                review_url,
+                blocking_review_cleanup_pending,
+                fixed as i64
+            ],
         )?;
         if updated == 0 {
             anyhow::bail!("review job changed before GitHub publication was recorded");
@@ -9722,19 +9846,45 @@ impl Store {
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(fixed)
     }
 
-    pub fn clear_code_review_blocking_review_cleanup(&self, id: &str) -> Result<bool> {
+    pub fn claim_code_review_blocking_review_cleanup(&self, id: &str) -> Result<Option<String>> {
+        let token = format!("brc_{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        let claim_until = now + chrono::Duration::minutes(2);
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_claim_token = ?2,
+                 blocking_review_cleanup_claim_until = ?3
+             WHERE id = ?1 AND review_published != 0
+               AND blocking_review_cleanup_pending != 0
+               AND (blocking_review_cleanup_next_attempt_at IS NULL
+                    OR blocking_review_cleanup_next_attempt_at <= ?4)
+               AND (blocking_review_cleanup_claim_until IS NULL
+                    OR blocking_review_cleanup_claim_until <= ?4)",
+            params![id, token, claim_until.to_rfc3339(), now.to_rfc3339()],
+        )?;
+        Ok((updated > 0).then_some(token))
+    }
+
+    pub fn clear_code_review_blocking_review_cleanup(
+        &self,
+        id: &str,
+        claim_token: &str,
+    ) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
              SET blocking_review_cleanup_pending = 0,
                  blocking_review_cleanup_page = 1,
                  blocking_review_cleanup_attempts = 0,
-                 blocking_review_cleanup_next_attempt_at = NULL
+                 blocking_review_cleanup_next_attempt_at = NULL,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
              WHERE id = ?1 AND review_published != 0
-               AND blocking_review_cleanup_pending != 0",
-            [id],
+               AND blocking_review_cleanup_pending != 0
+               AND blocking_review_cleanup_claim_token = ?2",
+            params![id, claim_token],
         )? > 0)
     }
 
@@ -9746,7 +9896,7 @@ impl Store {
             .query_row(
                 "SELECT blocking_review_cleanup_page
                  FROM code_review_jobs WHERE id = ?1",
-                [id],
+                params![id],
                 |row| row.get::<_, i64>(0),
             )?
             .max(1) as u64)
@@ -9754,44 +9904,65 @@ impl Store {
 
     /// Continue a healthy but incomplete cleanup on a later poll. Keeping its
     /// page durable bounds each pass without restarting a large review list.
-    pub fn requeue_code_review_blocking_review_cleanup(&self, id: &str, page: u64) -> Result<()> {
+    pub fn requeue_code_review_blocking_review_cleanup(
+        &self,
+        id: &str,
+        claim_token: &str,
+        page: u64,
+    ) -> Result<bool> {
         let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(60);
-        self.conn.lock().unwrap().execute(
+        Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
              SET blocking_review_cleanup_page = ?2,
-                 blocking_review_cleanup_next_attempt_at = ?3
-             WHERE id = ?1 AND blocking_review_cleanup_pending != 0",
-            params![id, page.max(1) as i64, next_attempt.to_rfc3339()],
-        )?;
-        Ok(())
+                 blocking_review_cleanup_attempts = 0,
+                 blocking_review_cleanup_next_attempt_at = ?3,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND blocking_review_cleanup_pending != 0
+               AND blocking_review_cleanup_claim_token = ?4",
+            params![
+                id,
+                page.max(1) as i64,
+                next_attempt.to_rfc3339(),
+                claim_token
+            ],
+        )? > 0)
     }
 
     /// Back off a cleanup that made an API attempt and failed, so an old
     /// poison row cannot occupy every fixed-size repair batch forever.
-    pub fn defer_code_review_blocking_review_cleanup(&self, id: &str) -> Result<()> {
+    pub fn defer_code_review_blocking_review_cleanup(
+        &self,
+        id: &str,
+        claim_token: &str,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let attempts: i64 = tx
             .query_row(
                 "SELECT blocking_review_cleanup_attempts
-                 FROM code_review_jobs WHERE id = ?1",
-                [id],
+                 FROM code_review_jobs
+                 WHERE id = ?1 AND blocking_review_cleanup_claim_token = ?2",
+                params![id, claim_token],
                 |row| row.get(0),
             )
             .optional()?
             .unwrap_or(0);
         let delay_seconds = (60_i64 << attempts.clamp(0, 6)).min(3600);
         let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE code_review_jobs
              SET blocking_review_cleanup_attempts =
                    blocking_review_cleanup_attempts + 1,
-                 blocking_review_cleanup_next_attempt_at = ?2
-             WHERE id = ?1 AND blocking_review_cleanup_pending != 0",
-            params![id, next_attempt.to_rfc3339()],
+                 blocking_review_cleanup_next_attempt_at = ?2,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND blocking_review_cleanup_pending != 0
+               AND blocking_review_cleanup_claim_token = ?3",
+            params![id, next_attempt.to_rfc3339(), claim_token],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     pub fn code_review_jobs_pending_blocking_review_cleanup(
@@ -9805,6 +9976,8 @@ impl Store {
              WHERE review_published != 0 AND blocking_review_cleanup_pending != 0
                AND (blocking_review_cleanup_next_attempt_at IS NULL
                     OR blocking_review_cleanup_next_attempt_at <= ?2)
+               AND (blocking_review_cleanup_claim_until IS NULL
+                    OR blocking_review_cleanup_claim_until <= ?2)
              ORDER BY COALESCE(blocking_review_cleanup_next_attempt_at, created_at), id
              LIMIT ?1"
         ))?;
@@ -14334,6 +14507,7 @@ mod tests {
                 &job.head_sha,
                 "https://example/review",
                 false,
+                &[],
             )
             .unwrap();
         store
@@ -14464,8 +14638,12 @@ mod tests {
             )
             .unwrap();
 
+        let oldest_claim = store
+            .claim_code_review_blocking_review_cleanup(&oldest.id)
+            .unwrap()
+            .unwrap();
         store
-            .defer_code_review_blocking_review_cleanup(&oldest.id)
+            .defer_code_review_blocking_review_cleanup(&oldest.id, &oldest_claim)
             .unwrap();
         let due = store
             .code_review_jobs_pending_blocking_review_cleanup(1)
@@ -14474,7 +14652,22 @@ mod tests {
         assert_eq!(due[0].id, newer.id);
 
         store
-            .requeue_code_review_blocking_review_cleanup(&newer.id, 4)
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_attempts = 3
+                 WHERE id = ?1",
+                params![newer.id],
+            )
+            .unwrap();
+        let newer_claim = store
+            .claim_code_review_blocking_review_cleanup(&newer.id)
+            .unwrap()
+            .unwrap();
+        store
+            .requeue_code_review_blocking_review_cleanup(&newer.id, &newer_claim, 4)
             .unwrap();
         assert_eq!(
             store
@@ -14482,12 +14675,178 @@ mod tests {
                 .unwrap(),
             4
         );
+        let attempts: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT blocking_review_cleanup_attempts
+                 FROM code_review_jobs WHERE id = ?1",
+                params![newer.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
         assert!(
             store
                 .code_review_jobs_pending_blocking_review_cleanup(1)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn blocking_review_cleanup_claims_fence_stale_workers() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'succeeded', review_published = 1,
+                     blocking_review_cleanup_pending = 1
+                 WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        let first = store
+            .claim_code_review_blocking_review_cleanup(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .claim_code_review_blocking_review_cleanup(&job.id)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_claim_until = ?2
+                 WHERE id = ?1",
+                params![
+                    job.id,
+                    (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+        let replacement = store
+            .claim_code_review_blocking_review_cleanup(&job.id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, replacement);
+        assert!(
+            !store
+                .clear_code_review_blocking_review_cleanup(&job.id, &first)
+                .unwrap()
+        );
+        assert!(
+            store
+                .clear_code_review_blocking_review_cleanup(&job.id, &replacement)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn recovered_clean_publication_closes_intended_findings_and_arms_cleanup() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_blocking_review_cleanup(&job.id, true)
+                .unwrap()
+        );
+        store
+            .prepare_code_review_finding_resolutions(&job.id, &[&finding.id])
+            .unwrap();
+
+        assert!(
+            store
+                .reconcile_code_review_publication(
+                    &job.id,
+                    "https://example/recovered-review",
+                    &[],
+                )
+                .unwrap()
+        );
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.review_published);
+        assert!(record.blocking_review_cleanup_pending);
+        assert_eq!(record.job.fixed_issue_count, 1);
+        assert_eq!(
+            store.code_review_findings(&job.id).unwrap()[0].status,
+            "fixed"
+        );
+    }
+
+    #[test]
+    fn late_publication_repair_does_not_regress_the_pull_watermark() {
+        let store = Store::open_in_memory().unwrap();
+        let older = enqueue_backoff_test_job(&store);
+        let newer = store.retry_code_review_job(&older.id).unwrap().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'failed', publication_claimed = 1,
+                     head_sha = CASE WHEN id = ?1 THEN 'older-head' ELSE 'newer-head' END,
+                     created_at = CASE
+                         WHEN id = ?1 THEN '2026-01-01T00:00:00Z'
+                         ELSE '2026-01-02T00:00:00Z'
+                     END
+                 WHERE id IN (?1, ?2)",
+                params![older.id, newer.id],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .reconcile_code_review_publication(&newer.id, "https://example/newer-review", &[],)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reconcile_code_review_publication(&older.id, "https://example/older-review", &[],)
+                .unwrap()
+        );
+        let state = store
+            .code_review_pull_state(&older.repository, older.pull_number)
+            .unwrap();
+        assert_eq!(state.last_reviewed_head_sha, "newer-head");
     }
 
     #[test]
@@ -14523,6 +14882,7 @@ mod tests {
                 &job.head_sha,
                 "https://example/review",
                 false,
+                &[],
             )
             .unwrap();
         let record = store.code_review_job(&job.id).unwrap().unwrap();

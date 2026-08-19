@@ -60,6 +60,9 @@ const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60)
 /// retried by the dedicated collapse-retry task.
 const REVIEW_THREAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
+const REVIEW_PUBLICATION_LOOKUP_MAX_PAGES: u64 = 100;
+const REVIEW_PUBLICATION_LOOKUP_BUDGET: Duration = Duration::from_secs(60);
+const REVIEW_PUBLICATION_LOOKUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Obsolete blocking verdict cleanup is resumable and deliberately small so
 /// it cannot monopolize the repository poll behind a large review history.
 const REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS: u64 = 3;
@@ -175,15 +178,6 @@ fn code_review_poll_interval() -> Duration {
     }
 }
 
-/// One candidate is reconciled per poll. Derive retention from the configured
-/// cadence so every bounded-cache candidate can get another turn before its
-/// partial pagination expires, even when polling is intentionally slowed.
-fn review_thread_progress_ttl() -> Duration {
-    code_review_poll_interval()
-        .saturating_mul(REVIEW_THREAD_PROGRESS_MAX_ENTRIES as u32 + 1)
-        .saturating_add(REVIEW_RECONCILIATION_PASS_BUDGET)
-}
-
 fn parse_code_review_timeout(value: &str) -> Option<Duration> {
     value
         .trim()
@@ -281,6 +275,7 @@ pub struct CodeReviewRuntime {
     warned_job_concurrency_override: AtomicUsize,
     thread_reconciled_at: Mutex<HashMap<(String, u64), Instant>>,
     thread_listing_progress: Mutex<HashMap<ReviewThreadListingKey, ReviewThreadListingProgress>>,
+    thread_listing_locks: Mutex<HashMap<ReviewThreadListingKey, Weak<tokio::sync::Mutex<()>>>>,
     running: Mutex<HashMap<String, RunningReview>>,
     projection_queue: Mutex<HashMap<String, ProjectionQueueState>>,
     projection_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
@@ -320,6 +315,13 @@ enum ReviewThreadListingOutcome {
     Incomplete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewThreadReconciliationOutcome {
+    Skipped,
+    Deferred,
+    Completed,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ReviewThreadListingKind {
     Reconciliation,
@@ -334,8 +336,10 @@ struct ReviewThreadListingKey {
     targets: Vec<u64>,
 }
 
+#[derive(Clone)]
 struct ReviewThreadListingProgress {
     threads: HashMap<u64, (String, bool)>,
+    refreshed_states: HashMap<String, bool>,
     cursor: Option<String>,
     listing_complete: bool,
     saved_at: Instant,
@@ -345,6 +349,7 @@ impl ReviewThreadListingProgress {
     fn new() -> Self {
         Self {
             threads: HashMap::new(),
+            refreshed_states: HashMap::new(),
             cursor: None,
             listing_complete: false,
             saved_at: Instant::now(),
@@ -371,13 +376,11 @@ fn review_thread_listing_key(
 fn take_review_thread_listing_progress(
     cache: &mut HashMap<ReviewThreadListingKey, ReviewThreadListingProgress>,
     key: &ReviewThreadListingKey,
-    now: Instant,
+    _now: Instant,
 ) -> ReviewThreadListingProgress {
-    cache.retain(|_, progress| {
-        now.saturating_duration_since(progress.saved_at) <= review_thread_progress_ttl()
-    });
     cache
-        .remove(key)
+        .get(key)
+        .cloned()
         .unwrap_or_else(ReviewThreadListingProgress::new)
 }
 
@@ -387,9 +390,6 @@ fn save_review_thread_listing_progress(
     mut progress: ReviewThreadListingProgress,
     now: Instant,
 ) {
-    cache.retain(|_, cached| {
-        now.saturating_duration_since(cached.saved_at) <= review_thread_progress_ttl()
-    });
     if !cache.contains_key(&key)
         && cache.len() >= REVIEW_THREAD_PROGRESS_MAX_ENTRIES
         && let Some(oldest) = cache
@@ -429,6 +429,7 @@ impl ReviewReconciliationCandidate {
     }
 }
 
+#[cfg(test)]
 fn least_recently_reconciled_key(
     candidates: &[(String, u64)],
     reconciled_at: &HashMap<(String, u64), Instant>,
@@ -564,6 +565,17 @@ impl CodeReviewRuntime {
 
     fn publication_lock(&self, repository: &str, pull_number: u64) -> Arc<tokio::sync::Mutex<()>> {
         self.projection_lock(format!("publication:{repository}#{pull_number}"))
+    }
+
+    fn thread_listing_lock(&self, key: &ReviewThreadListingKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.thread_listing_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
     }
 
     fn cancel_superseded(&self, job_ids: &[String]) {
@@ -3345,37 +3357,62 @@ impl Engine {
         &self,
         candidates: &[ReviewReconciliationCandidate],
     ) -> Result<()> {
-        let keys = candidates
-            .iter()
-            .map(ReviewReconciliationCandidate::key)
-            .collect::<Vec<_>>();
-        let selected_key = {
-            let mut reconciled_at = self.code_review.thread_reconciled_at.lock().unwrap();
-            let Some(key) = least_recently_reconciled_key(&keys, &reconciled_at) else {
-                return Ok(());
-            };
-            reconciled_at.insert(key.clone(), Instant::now());
-            key
-        };
-        let candidate = candidates
-            .iter()
-            .find(|candidate| candidate.key() == selected_key)
-            .ok_or_else(|| anyhow!("selected review-thread candidate disappeared"))?;
-        self.reconcile_user_resolved_review_findings(
-            &candidate.api,
-            &candidate.repository,
-            &candidate.reviewers,
-            &candidate.config_hash,
-            &candidate.pull,
-            Instant::now() + REVIEW_RECONCILIATION_PASS_BUDGET,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "reconciling resolved review findings for {}#{}",
-                candidate.repository.repository, candidate.pull.number
+        let deadline = Instant::now() + REVIEW_RECONCILIATION_PASS_BUDGET;
+        let progress_keys = self
+            .code_review
+            .thread_listing_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .filter(|key| key.kind == ReviewThreadListingKind::Reconciliation)
+            .map(|key| (key.repository.clone(), key.pull_number))
+            .collect::<HashSet<_>>();
+        let reconciled_at = self
+            .code_review
+            .thread_reconciled_at
+            .lock()
+            .unwrap()
+            .clone();
+        let mut ordered = candidates.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|candidate| {
+            let key = candidate.key();
+            (
+                !progress_keys.contains(&key),
+                reconciled_at.get(&key).copied(),
             )
-        })
+        });
+
+        for candidate in ordered {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let key = candidate.key();
+            let outcome = self
+                .reconcile_user_resolved_review_findings(
+                    &candidate.api,
+                    &candidate.repository,
+                    &candidate.reviewers,
+                    &candidate.config_hash,
+                    &candidate.pull,
+                    deadline,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "reconciling resolved review findings for {}#{}",
+                        candidate.repository.repository, candidate.pull.number
+                    )
+                })?;
+            self.code_review
+                .thread_reconciled_at
+                .lock()
+                .unwrap()
+                .insert(key, Instant::now());
+            if outcome != ReviewThreadReconciliationOutcome::Skipped {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn supersede_automatic_code_reviews_for_draft(
@@ -4753,6 +4790,14 @@ impl Engine {
             &previous_finding_ids,
             &resolved_finding_ids,
         );
+        if !self
+            .store
+            .prepare_code_review_blocking_review_cleanup(&job.id, !has_unresolved_findings)?
+        {
+            bail!("review job changed before cleanup intent was recorded");
+        }
+        self.store
+            .prepare_code_review_finding_resolutions(&job.id, &resolved_finding_ids)?;
         let review_url = self
             .publish_review(&api, &job, &persisted, has_unresolved_findings)
             .await
@@ -4765,6 +4810,7 @@ impl Engine {
             &job.head_sha,
             &review_url,
             !has_unresolved_findings,
+            &resolved_finding_ids,
         )?;
         if !has_unresolved_findings
             && let Err(error) = self
@@ -4778,14 +4824,6 @@ impl Engine {
                  pending for the poll repair task"
             );
         }
-        // Closing the store rows runs only after the replacement review and
-        // its durable publication marker are recorded, so a later local
-        // bookkeeping failure cannot make published findings look reusable.
-        let fixed = self
-            .close_fixed_review_findings(&previous_findings, &parsed.resolved_finding_ids)
-            .context("closing previously reported review findings")?;
-        self.store
-            .set_code_review_job_fixed_issue_count(&job.id, fixed)?;
         // Collapsing the remote threads is cleanup detached from the round
         // entirely: it starts only after every piece of publication
         // bookkeeping, runs outside the job future with individually bounded
@@ -5697,14 +5735,24 @@ impl Engine {
     ) -> Result<PublishedReview> {
         let marker = inline_review_marker(&job.id);
         let bot_login = self.github_app_status()?.bot_login;
+        let deadline = Instant::now() + REVIEW_PUBLICATION_LOOKUP_BUDGET;
         let mut page = 1_u64;
-        loop {
-            let (reviews, rate): (Vec<PublishedReview>, _) = api
-                .get(&format!(
-                    "/repos/{}/pulls/{}/reviews?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
-                    job.repository, job.pull_number
-                ))
-                .await?;
+        while page <= REVIEW_PUBLICATION_LOOKUP_MAX_PAGES {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("finding an accepted GitHub review timed out");
+            }
+            let path = format!(
+                "/repos/{}/pulls/{}/reviews?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
+                job.repository, job.pull_number
+            );
+            let request = api.get(&path);
+            let (reviews, rate): (Vec<PublishedReview>, _) = tokio::time::timeout(
+                REVIEW_PUBLICATION_LOOKUP_REQUEST_TIMEOUT.min(remaining),
+                request,
+            )
+            .await
+            .context("finding an accepted GitHub review timed out")??;
             self.record_review_rate(rate);
             let count = reviews.len();
             if let Some(review) = reviews.into_iter().find(|review| {
@@ -5726,6 +5774,10 @@ impl Engine {
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("GitHub review pagination overflowed"))?;
         }
+        bail!(
+            "accepted GitHub review was not found within {} pages",
+            REVIEW_PUBLICATION_LOOKUP_MAX_PAGES
+        )
     }
 
     /// Clear this app's earlier blocking verdict after the replacement clean
@@ -5736,8 +5788,22 @@ impl Engine {
         &self,
         job: &trouve_protocol::CodeReviewJob,
     ) -> Result<()> {
-        let api = self.installation_api(job.installation_id).await?;
-        self.sync_code_review_blocking_review_cleanup_with_api(&api, job)
+        let Some(claim_token) = self
+            .store
+            .claim_code_review_blocking_review_cleanup(&job.id)?
+        else {
+            return Ok(());
+        };
+        let api = match self.installation_api(job.installation_id).await {
+            Ok(api) => api,
+            Err(error) => {
+                self.store
+                    .defer_code_review_blocking_review_cleanup(&job.id, &claim_token)
+                    .context("deferring blocking-review cleanup after credential failure")?;
+                return Err(error);
+            }
+        };
+        self.sync_claimed_code_review_blocking_review_cleanup(&api, job, &claim_token)
             .await
     }
 
@@ -5745,6 +5811,22 @@ impl Engine {
         &self,
         api: &GithubApi,
         job: &trouve_protocol::CodeReviewJob,
+    ) -> Result<()> {
+        let Some(claim_token) = self
+            .store
+            .claim_code_review_blocking_review_cleanup(&job.id)?
+        else {
+            return Ok(());
+        };
+        self.sync_claimed_code_review_blocking_review_cleanup(api, job, &claim_token)
+            .await
+    }
+
+    async fn sync_claimed_code_review_blocking_review_cleanup(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+        claim_token: &str,
     ) -> Result<()> {
         let record = self
             .store
@@ -5772,19 +5854,22 @@ impl Engine {
             Ok(next_page) => next_page,
             Err(error) => {
                 self.store
-                    .defer_code_review_blocking_review_cleanup(&job.id)
+                    .defer_code_review_blocking_review_cleanup(&job.id, claim_token)
                     .context("deferring failed blocking-review cleanup")?;
                 return Err(error);
             }
         };
         if let Some(next_page) = next_page {
-            self.store
-                .requeue_code_review_blocking_review_cleanup(&job.id, next_page)?;
+            self.store.requeue_code_review_blocking_review_cleanup(
+                &job.id,
+                claim_token,
+                next_page,
+            )?;
             return Ok(());
         }
         if !self
             .store
-            .clear_code_review_blocking_review_cleanup(&job.id)?
+            .clear_code_review_blocking_review_cleanup(&job.id, claim_token)?
         {
             bail!("blocking-review cleanup changed before it was recorded");
         }
@@ -5850,7 +5935,17 @@ impl Engine {
                 .context("dismissing a blocking review timed out")??;
                 let status = response.status();
                 self.record_review_rate(rate_info(response.headers()));
-                let body = response.text().await.unwrap_or_default();
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(Some(page));
+                }
+                let body = tokio::time::timeout(
+                    REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT.min(remaining),
+                    response.text(),
+                )
+                .await
+                .context("reading a blocking-review dismissal response timed out")?
+                .context("reading a blocking-review dismissal response failed")?;
                 if !status.is_success() {
                     bail!("GitHub API {status}: {}", compact_api_error(&body));
                 }
@@ -6247,6 +6342,7 @@ impl Engine {
     /// remote calls. Closing and arming the collapse are one committed
     /// write, and arming derives from the row's current comment — not this
     /// snapshot — so a comment published concurrently is never missed.
+    #[cfg(test)]
     fn close_fixed_review_findings(
         &self,
         previous_findings: &[trouve_protocol::CodeReviewFinding],
@@ -6709,6 +6805,8 @@ impl Engine {
             .ok_or_else(|| anyhow!("invalid repository"))?;
         let progress_key =
             review_thread_listing_key(repository, pull_number, listing_kind, targets);
+        let listing_lock = self.code_review.thread_listing_lock(&progress_key);
+        let _listing_guard = listing_lock.lock().await;
         let mut progress = take_review_thread_listing_progress(
             &mut self
                 .code_review
@@ -6786,7 +6884,9 @@ impl Engine {
                 self.save_review_thread_listing_progress(progress_key, progress);
                 bail!("GitHub review-thread pagination omitted its end cursor");
             }
+            self.save_review_thread_listing_progress(progress_key.clone(), progress.clone());
         }
+        self.save_review_thread_listing_progress(progress_key.clone(), progress.clone());
 
         // Pagination progress may span polls, so its `isResolved` values are
         // discovery hints only. Refresh every matched thread by node id before
@@ -6805,8 +6905,11 @@ impl Engine {
             .collect::<Vec<_>>();
         thread_ids.sort();
         thread_ids.dedup();
-        let mut state_by_thread = HashMap::new();
-        for ids in thread_ids.chunks(100) {
+        let unrefreshed_thread_ids = thread_ids
+            .into_iter()
+            .filter(|thread_id| !progress.refreshed_states.contains_key(thread_id))
+            .collect::<Vec<_>>();
+        for ids in unrefreshed_thread_ids.chunks(100) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 self.save_review_thread_listing_progress(progress_key, progress);
@@ -6843,16 +6946,20 @@ impl Engine {
                 if let (Some(thread_id), Some(is_resolved)) =
                     (thread["id"].as_str(), thread["isResolved"].as_bool())
                 {
-                    state_by_thread.insert(thread_id.to_owned(), is_resolved);
+                    progress
+                        .refreshed_states
+                        .insert(thread_id.to_owned(), is_resolved);
                 }
             }
+            self.save_review_thread_listing_progress(progress_key.clone(), progress.clone());
         }
         let fresh_threads = progress
             .threads
             .iter()
             .filter(|(comment_id, _)| targets.contains(comment_id))
             .filter_map(|(comment_id, (thread_id, _))| {
-                state_by_thread
+                progress
+                    .refreshed_states
                     .get(thread_id)
                     .map(|is_resolved| (*comment_id, (thread_id.clone(), *is_resolved)))
             })
@@ -6865,6 +6972,11 @@ impl Engine {
             self.save_review_thread_listing_progress(progress_key, progress);
             return Ok(ReviewThreadListingOutcome::Incomplete);
         }
+        self.code_review
+            .thread_listing_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&progress_key);
         Ok(ReviewThreadListingOutcome::Authoritative((
             fresh_threads,
             progress.listing_complete,
@@ -6879,7 +6991,7 @@ impl Engine {
         config_hash: &str,
         pull: &GithubPullRequest,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<ReviewThreadReconciliationOutcome> {
         let pull_state = self
             .store
             .code_review_pull_state(&repository.repository, pull.number)?;
@@ -6890,7 +7002,7 @@ impl Engine {
                 &pull.head.sha,
             )?
         {
-            return Ok(());
+            return Ok(ReviewThreadReconciliationOutcome::Skipped);
         }
         let initial_findings = self
             .store
@@ -6900,8 +7012,15 @@ impl Engine {
             .filter_map(|state| state.finding.github_comment_id)
             .collect::<HashSet<_>>();
         if targets.is_empty() {
-            return Ok(());
+            return Ok(ReviewThreadReconciliationOutcome::Skipped);
         }
+        let publication_lock = self
+            .code_review
+            .publication_lock(&repository.repository, pull.number);
+        let Ok(preflight_guard) = publication_lock.try_lock() else {
+            return Ok(ReviewThreadReconciliationOutcome::Skipped);
+        };
+        drop(preflight_guard);
         let listing = self
             .load_review_threads(
                 api,
@@ -6915,16 +7034,13 @@ impl Engine {
         let ReviewThreadListingOutcome::Authoritative((thread_by_comment, listing_complete)) =
             listing
         else {
-            bail!("review-thread reconciliation pass budget was exhausted");
+            return Ok(ReviewThreadReconciliationOutcome::Deferred);
         };
         if !review_thread_listing_is_authoritative(&thread_by_comment, listing_complete, &targets) {
-            return Ok(());
+            return Ok(ReviewThreadReconciliationOutcome::Skipped);
         }
-        let publication_lock = self
-            .code_review
-            .publication_lock(&repository.repository, pull.number);
         let Ok(publication_guard) = publication_lock.try_lock() else {
-            return Ok(());
+            return Ok(ReviewThreadReconciliationOutcome::Skipped);
         };
         let pull_state = self
             .store
@@ -6936,7 +7052,7 @@ impl Engine {
                 &pull.head.sha,
             )?
         {
-            return Ok(());
+            return Ok(ReviewThreadReconciliationOutcome::Skipped);
         }
 
         let findings = self
@@ -6969,7 +7085,7 @@ impl Engine {
             })
             .collect::<BTreeSet<_>>();
         if initial_ids != current_ids {
-            return Ok(());
+            return Ok(ReviewThreadReconciliationOutcome::Skipped);
         }
 
         let mut changed_jobs = HashSet::new();
@@ -7062,7 +7178,7 @@ impl Engine {
             self.emit_code_review_updated(Some(job.id.clone()))?;
             self.code_review.job_wake.notify_one();
         }
-        Ok(())
+        Ok(ReviewThreadReconciliationOutcome::Completed)
     }
 
     async fn collapse_review_thread(&self, api: &GithubApi, thread_id: &str) -> Result<()> {
@@ -9454,6 +9570,34 @@ mod tests {
     }
 
     #[test]
+    fn thread_recheck_enqueue_rechecks_for_active_automatic_work_in_transaction() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let automatic = enqueue_test_review_job(&store, "acme/widgets#42:automatic-active");
+        let mut request = test_review_job_request("acme/widgets#42:thread-recheck-race");
+        request.trigger = "thread-recheck".into();
+
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            automatic.id
+        );
+        store
+            .finish_code_review_job(&automatic.id, "succeeded", "review-url", "")
+            .unwrap();
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn thread_rechecks_retry_terminal_failures_without_looping_or_exceeding_the_cap() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let mut request = test_review_job_request("acme/widgets#42:thread-recheck");
@@ -9532,6 +9676,7 @@ mod tests {
                 &job.head_sha,
                 "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
                 false,
+                &[],
             )
             .unwrap();
         assert!(
@@ -11936,6 +12081,7 @@ mod tests {
                 &job.head_sha,
                 &review_url,
                 true,
+                &[],
             )
             .unwrap();
         assert!(
@@ -11993,6 +12139,7 @@ mod tests {
                 &job.head_sha,
                 "https://github.com/acme/widgets/pull/42#pullrequestreview-11",
                 true,
+                &[],
             )
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -13059,7 +13206,7 @@ mod tests {
     }
 
     #[test]
-    fn review_thread_progress_is_target_scoped_expiring_and_bounded() {
+    fn review_thread_progress_is_target_scoped_resumable_and_bounded() {
         let now = Instant::now();
         let key = |target| {
             review_thread_listing_key(
@@ -13071,6 +13218,7 @@ mod tests {
         };
         let progress = |comment_id, saved_at| ReviewThreadListingProgress {
             threads: HashMap::from([(comment_id, (format!("T{comment_id}"), false))]),
+            refreshed_states: HashMap::new(),
             cursor: Some(format!("c{comment_id}")),
             listing_complete: false,
             saved_at,
@@ -13081,18 +13229,14 @@ mod tests {
         save_review_thread_listing_progress(&mut cache, key(2), progress(2, now), now);
         let first = take_review_thread_listing_progress(&mut cache, &key(1), now);
         assert_eq!(first.cursor.as_deref(), Some("c1"));
+        assert!(cache.contains_key(&key(1)));
         assert!(cache.contains_key(&key(2)));
 
-        cache.insert(
-            key(3),
-            progress(
-                3,
-                now - review_thread_progress_ttl() - Duration::from_millis(1),
-            ),
-        );
-        let expired = take_review_thread_listing_progress(&mut cache, &key(3), now);
-        assert!(expired.threads.is_empty());
-        assert!(!cache.contains_key(&key(3)));
+        let old = now - Duration::from_secs(24 * 60 * 60);
+        cache.insert(key(3), progress(3, old));
+        let resumed = take_review_thread_listing_progress(&mut cache, &key(3), now);
+        assert_eq!(resumed.cursor.as_deref(), Some("c3"));
+        assert!(cache.contains_key(&key(3)));
 
         cache.clear();
         for target in 0..=REVIEW_THREAD_PROGRESS_MAX_ENTRIES as u64 {
@@ -13437,6 +13581,7 @@ mod tests {
                 key.clone(),
                 ReviewThreadListingProgress {
                     threads: HashMap::from([(9000, ("thread-9000".into(), false))]),
+                    refreshed_states: HashMap::new(),
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -13520,6 +13665,7 @@ mod tests {
                         (9000, ("thread-9000".into(), false)),
                         (9001, ("thread-9001".into(), true)),
                     ]),
+                    refreshed_states: HashMap::new(),
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -13550,6 +13696,10 @@ mod tests {
         let progress = cache.get(&key).expect("progress should be retained");
         assert_eq!(progress.cursor.as_deref(), Some("cursor-1"));
         assert_eq!(progress.threads.len(), 2);
+        assert_eq!(
+            progress.refreshed_states,
+            HashMap::from([("thread-9000".into(), true)])
+        );
     }
 
     #[tokio::test]
