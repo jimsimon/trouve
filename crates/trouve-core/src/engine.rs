@@ -5083,6 +5083,61 @@ impl Engine {
         Ok(())
     }
 
+    /// Verify provider-reported PR numbers against GitHub before persisting
+    /// them. A creation result is trusted to identify a candidate number, but
+    /// only the fetched PR head may authorize a durable session association.
+    async fn record_verified_session_pr_numbers(
+        &self,
+        session: &Session,
+        repository: &(String, String, String),
+        numbers: impl IntoIterator<Item = u64>,
+        branch_evidence: &[String],
+        commit_ids: &HashSet<String>,
+        recorded: &mut HashSet<u64>,
+    ) -> Result<(), EngineError> {
+        let github = match self.github_for_session(session) {
+            Ok(github) => github,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = session.id,
+                    error = %error,
+                    "cannot verify provider-reported pull request"
+                );
+                return Ok(());
+            }
+        };
+        for number in numbers {
+            if recorded.contains(&number) {
+                continue;
+            }
+            match github.pr(number).await {
+                Ok(pr)
+                    if pr.head == session.branch
+                        || crate::github::pr_matches_session_evidence(
+                            &pr,
+                            branch_evidence,
+                            commit_ids,
+                        ) =>
+                {
+                    self.record_session_pr_numbers(&session.id, repository, [number], recorded)?;
+                }
+                Ok(pr) => tracing::warn!(
+                    session_id = session.id,
+                    pr_number = number,
+                    pr_head = pr.head,
+                    "ignoring pull request without matching session branch or commit evidence"
+                ),
+                Err(error) => tracing::warn!(
+                    session_id = session.id,
+                    pr_number = number,
+                    error = %error,
+                    "ignoring unverified pull request creation result"
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// PR numbers already linked through persisted session events.
     fn recorded_session_pr_numbers(&self, session_id: &str) -> Result<HashSet<u64>, EngineError> {
         Ok(self
@@ -5178,13 +5233,6 @@ impl Engine {
         let (host, owner, repo) = &repository;
         let github = self.github_for_session(&session)?;
         let mut evidence = self.session_pr_evidence(session_id, host, owner, repo)?;
-        let explicit_numbers = evidence.numbers.iter().copied().collect::<Vec<_>>();
-        self.record_session_pr_numbers(
-            session_id,
-            &repository,
-            explicit_numbers,
-            &mut evidence.recorded_numbers,
-        )?;
         let mut prs = github
             .prs_for_branch(&session.branch)
             .await
@@ -5208,7 +5256,28 @@ impl Engine {
         for number in evidence.numbers {
             if seen.insert(number) {
                 match github.pr(number).await {
-                    Ok(pr) => prs.push(pr),
+                    Ok(pr)
+                        if pr.head == session.branch
+                            || crate::github::pr_matches_session_evidence(
+                                &pr,
+                                &evidence.successful_tool_args,
+                                &evidence.commit_ids,
+                            ) =>
+                    {
+                        self.record_session_pr_numbers(
+                            session_id,
+                            &repository,
+                            [number],
+                            &mut evidence.recorded_numbers,
+                        )?;
+                        prs.push(pr);
+                    }
+                    Ok(pr) => tracing::warn!(
+                        session_id,
+                        pr_number = number,
+                        pr_head = pr.head,
+                        "skipping linked pull request without matching session evidence"
+                    ),
                     Err(error) => tracing::warn!(
                         session_id,
                         pr_number = number,
@@ -11512,8 +11581,14 @@ impl Engine {
                     }
                     tool_started_at.insert(call_id.clone(), Instant::now());
                     if github_repository.is_none()
-                        && might_request_pull_request_creation(&tool, &args)
                         && let Ok(repository) = self.github_repository_for_session(session)
+                        && {
+                            let (_, owner, repo) = &repository;
+                            !matches!(
+                                classify_pull_request_creation(&tool, &args, owner, repo),
+                                PullRequestCreationRequest::Rejected
+                            )
+                        }
                     {
                         recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
                         github_repository = Some(repository);
@@ -11796,29 +11871,45 @@ impl Engine {
                     if ok
                         && let Some(repository @ (host, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
-                        && might_request_pull_request_creation(tool, args)
                     {
-                        let mut numbers = pr_numbers_in_value(args, host, owner, repo);
-                        let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
-                        let output_numbers = github_creation_output
-                            .remove(&call_id)
-                            .map(|output| {
-                                crate::github::pr_numbers_in_text(&output, host, owner, repo)
-                            })
-                            .unwrap_or_default();
                         let request = classify_pull_request_creation(tool, args, owner, repo);
+                        if matches!(request, PullRequestCreationRequest::Rejected) {
+                            github_creation_output.remove(&call_id);
+                            persisted.push(Event::ToolCompleted {
+                                call_id,
+                                status,
+                                result,
+                                execution_duration_ms,
+                            });
+                            if let Some(todos) = todos {
+                                persisted.push(Event::TodosUpdated { todos });
+                            }
+                            continue;
+                        }
+                        let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
+                        let creation_output =
+                            github_creation_output.remove(&call_id).unwrap_or_default();
+                        let output_numbers =
+                            crate::github::pr_numbers_in_text(&creation_output, host, owner, repo);
                         if matches!(request, PullRequestCreationRequest::Confirmed)
                             || (matches!(request, PullRequestCreationRequest::Unresolved)
                                 && (!result_numbers.is_empty() || !output_numbers.is_empty()))
                         {
-                            numbers.extend(result_numbers);
+                            let mut numbers = result_numbers;
                             numbers.extend(output_numbers);
-                            self.record_session_pr_numbers(
-                                &session.id,
+                            let branch_evidence = vec![args.to_string()];
+                            let mut commit_ids = git_commit_ids_in_value(args);
+                            commit_ids.extend(git_commit_ids_in_value(&result));
+                            commit_ids.extend(git_commit_ids_in_text(&creation_output));
+                            self.record_verified_session_pr_numbers(
+                                session,
                                 repository,
                                 numbers,
+                                &branch_evidence,
+                                &commit_ids,
                                 &mut recorded_prs,
-                            )?;
+                            )
+                            .await?;
                         }
                     } else {
                         github_creation_output.remove(&call_id);
@@ -12844,25 +12935,30 @@ impl Engine {
             Some(&call.arguments),
         )?;
         if matches!(outcome.status, ToolStatus::Ok)
-            && might_request_pull_request_creation(&call.name, &call.arguments)
             && let Ok(repository) = self.github_repository_for_session(session)
         {
             let (host, owner, repo) = &repository;
             let mut recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
-            let mut numbers = pr_numbers_in_value(&call.arguments, host, owner, repo);
-            let result_numbers = pr_numbers_in_value(&outcome.result, host, owner, repo);
             let request = classify_pull_request_creation(&call.name, &call.arguments, owner, repo);
-            if matches!(request, PullRequestCreationRequest::Confirmed)
-                || (matches!(request, PullRequestCreationRequest::Unresolved)
-                    && !result_numbers.is_empty())
-            {
-                numbers.extend(result_numbers);
-                self.record_session_pr_numbers(
-                    &session.id,
-                    &repository,
-                    numbers,
-                    &mut recorded_prs,
-                )?;
+            if !matches!(request, PullRequestCreationRequest::Rejected) {
+                let result_numbers = pr_numbers_in_value(&outcome.result, host, owner, repo);
+                if matches!(request, PullRequestCreationRequest::Confirmed)
+                    || (matches!(request, PullRequestCreationRequest::Unresolved)
+                        && !result_numbers.is_empty())
+                {
+                    let branch_evidence = vec![call.arguments.to_string()];
+                    let mut commit_ids = git_commit_ids_in_value(&call.arguments);
+                    commit_ids.extend(git_commit_ids_in_value(&outcome.result));
+                    self.record_verified_session_pr_numbers(
+                        session,
+                        &repository,
+                        result_numbers,
+                        &branch_evidence,
+                        &commit_ids,
+                        &mut recorded_prs,
+                    )
+                    .await?;
+                }
             }
         }
         let model_result = outcome.result.to_string();
@@ -13884,20 +13980,49 @@ fn contains_rest_mutation(
     }
 }
 
+fn is_activity_tool_wrapper(tool: &str) -> bool {
+    matches!(
+        compact_activity(tool).as_str(),
+        "mcptoolcall" | "dynamictoolcall"
+    )
+}
+
+/// Generic provider wrappers are only authoritative when they came through
+/// the authenticated connector bridge. Otherwise a backend could self-report
+/// a nested GitHub creator and authorize an unrelated PR.
+fn trusted_activity_tool_wrapper(args: &serde_json::Value) -> bool {
+    ["server", "serverName", "mcpServer", "mcpServerName"]
+        .iter()
+        .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
+        .is_some_and(|server| server.eq_ignore_ascii_case("codex_apps"))
+}
+
+fn trusted_activity_tool_name(tool: &str) -> bool {
+    let normalized = compact_activity(tool);
+    normalized.starts_with("github")
+        || matches!(
+            normalized.as_str(),
+            "apigraphql" | "apirequest" | "httprequest"
+        )
+}
+
 /// Resolve provider-owned generic tool wrappers to the operation they carry.
-/// Keep this provider-neutral: Codex currently emits `mcpToolCall`, while
-/// other backends may use `dynamicToolCall` with the same nested shape.
 fn effective_activity_tool_call<'a>(
     tool: &'a str,
     args: &'a serde_json::Value,
 ) -> Option<(&'a str, std::borrow::Cow<'a, serde_json::Value>)> {
-    let normalized = compact_activity(tool);
-    if !matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall") {
+    if !is_activity_tool_wrapper(tool) {
         return Some((tool, std::borrow::Cow::Borrowed(args)));
+    }
+    if !trusted_activity_tool_wrapper(args) {
+        return None;
     }
     let nested_tool = ["tool", "toolName", "name"]
         .iter()
         .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))?;
+    if !trusted_activity_tool_name(nested_tool) {
+        return None;
+    }
     let nested_args = match args.get("arguments")? {
         value if value.is_object() => std::borrow::Cow::Borrowed(value),
         serde_json::Value::String(encoded) => {
@@ -13991,64 +14116,6 @@ fn has_structured_pull_request_creation_operation(args: &serde_json::Value) -> b
     })
 }
 
-/// A successful tool call that actually creates a pull request. Merely
-/// listing, viewing, or mentioning a PR must not associate it with a session.
-fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
-    let normalized = compact_activity(tool);
-    if matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall")
-        && let Some(nested_tool) = ["tool", "toolName", "name"]
-            .iter()
-            .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
-    {
-        let nested_compact = compact_activity(nested_tool);
-        if nested_compact.contains("createpullrequest") || nested_compact.ends_with("createpr") {
-            return true;
-        }
-    }
-    let Some((tool, args)) = effective_activity_tool_call(tool, args) else {
-        return false;
-    };
-    let args = args.as_ref();
-    let tool_compact = compact_activity(tool);
-    if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
-        return true;
-    }
-
-    // Restrict argument inspection to execution/integration tools. File and
-    // search arguments often contain phrases such as "pull request" but can
-    // never create one; treating those as candidates caused a git subprocess
-    // after nearly every successful read/search call.
-    let execution_like = [
-        "shell",
-        "bash",
-        "command",
-        "terminal",
-        "exec",
-        "gh",
-        "github",
-        "browser",
-        "web",
-        "playwright",
-        "mcp",
-        "dynamictoolcall",
-    ]
-    .iter()
-    .any(|marker| tool_compact.contains(marker));
-    if !execution_like {
-        return false;
-    }
-
-    let args_text = args.to_string();
-    let args_words = activity_words(&args_text);
-    let args_compact = compact_activity(&args_text);
-    has_structured_pull_request_creation_operation(args)
-        || args_words.contains("gh pr create")
-        || args_words.contains("create pull request")
-        || args_compact.contains("createpullrequest")
-        || (args_words.split_whitespace().any(|word| word == "post")
-            && args_text.to_ascii_lowercase().contains("/pulls"))
-}
-
 fn monotonic_elapsed_ms(started: std::time::Instant) -> u64 {
     // UI durations are integral milliseconds. Round a real sub-millisecond
     // execution up instead of presenting the misleading "0ms" placeholder.
@@ -14061,6 +14128,12 @@ fn requests_pull_request_creation(
     owner: &str,
     repo: &str,
 ) -> bool {
+    if is_activity_tool_wrapper(tool)
+        && (!trusted_activity_tool_wrapper(args)
+            || !structured_repository_matches(args, owner, repo))
+    {
+        return false;
+    }
     let Some((tool, args)) = effective_activity_tool_call(tool, args) else {
         return false;
     };
@@ -14119,8 +14192,10 @@ fn classify_pull_request_creation(
         return PullRequestCreationRequest::Confirmed;
     }
 
-    let normalized = compact_activity(tool);
-    if !matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall") {
+    if !is_activity_tool_wrapper(tool)
+        || !trusted_activity_tool_wrapper(args)
+        || !structured_repository_matches(args, owner, repo)
+    {
         return PullRequestCreationRequest::Rejected;
     }
     let Some(nested_tool) = ["tool", "toolName", "name"]
@@ -14133,6 +14208,7 @@ fn classify_pull_request_creation(
     let named_creator =
         nested_compact.contains("createpullrequest") || nested_compact.ends_with("createpr");
     if named_creator
+        && trusted_activity_tool_name(nested_tool)
         && structured_repository_matches(args, owner, repo)
         && effective_activity_tool_call(tool, args).is_none()
     {
@@ -14237,18 +14313,24 @@ fn pr_evidence_from_events(
                 if matches!(status, ToolStatus::Ok)
                     && let Some((tool, args)) = request
                 {
-                    let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
-                    let output_numbers =
-                        crate::github::pr_numbers_in_text(&output, host, owner, repo);
                     let request = classify_pull_request_creation(&tool, &args, owner, repo);
+                    let (result_numbers, output_numbers) = if matches!(
+                        request,
+                        PullRequestCreationRequest::Confirmed
+                            | PullRequestCreationRequest::Unresolved
+                    ) {
+                        (
+                            pr_numbers_in_value(&result, host, owner, repo),
+                            crate::github::pr_numbers_in_text(&output, host, owner, repo),
+                        )
+                    } else {
+                        (HashSet::new(), Vec::new())
+                    };
                     let creates_pr = matches!(request, PullRequestCreationRequest::Confirmed)
                         || (matches!(request, PullRequestCreationRequest::Unresolved)
                             && (!result_numbers.is_empty() || !output_numbers.is_empty()));
                     let mutates_ref = requests_remote_ref_mutation(&tool, &args, owner, repo);
                     if creates_pr {
-                        evidence
-                            .numbers
-                            .extend(pr_numbers_in_value(&args, host, owner, repo));
                         evidence.numbers.extend(result_numbers);
                         evidence.numbers.extend(output_numbers);
                     }
@@ -18833,16 +18915,10 @@ default_permission_mode = "ask"
             "o",
             "r"
         ));
-        assert!(might_request_pull_request_creation(
-            "mcpToolCall",
-            &serde_json::json!({
-                "tool": "github.create_pull_request",
-                "arguments": "{undecodable"
-            })
-        ));
         assert!(requests_pull_request_creation(
             "mcpToolCall",
             &serde_json::json!({
+                "server": "codex_apps",
                 "tool": "github.create_pull_request",
                 "arguments": "{\"repository_full_name\":\"o/r\",\"head_branch\":\"fix/string\"}"
             }),
@@ -18866,6 +18942,7 @@ default_permission_mode = "ask"
             classify_pull_request_creation(
                 "mcpToolCall",
                 &serde_json::json!({
+                    "server": "codex_apps",
                     "tool": "github.create_pull_request",
                     "repository": "other/project",
                     "arguments": "{undecodable"
@@ -18874,16 +18951,6 @@ default_permission_mode = "ask"
                 "r"
             ),
             PullRequestCreationRequest::Rejected
-        ));
-        assert!(!might_request_pull_request_creation(
-            "mcpToolCall",
-            &serde_json::json!({
-                "tool": "github.get_pull_request",
-                "arguments": {
-                    "repository_full_name": "o/r",
-                    "pr_number": 75
-                }
-            })
         ));
         assert!(matches!(
             classify_pull_request_creation(
@@ -18960,13 +19027,6 @@ default_permission_mode = "ask"
             ),
             PullRequestCreationRequest::Rejected
         ));
-        assert!(might_request_pull_request_creation(
-            "github",
-            &serde_json::json!({
-                "action": "create_pr",
-                "repository_full_name": "o/r"
-            })
-        ));
         assert!(matches!(
             classify_pull_request_creation(
                 "connector",
@@ -19016,6 +19076,61 @@ default_permission_mode = "ask"
             }),
             "o",
             "r"
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "http_request",
+                &serde_json::json!({
+                    "method": "POST",
+                    "url": "https://api.github.com/repos/o/r/pulls"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Confirmed
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "mcpToolCall",
+                &serde_json::json!({
+                    "server": "codex_apps",
+                    "repository_full_name": "o/r",
+                    "tool": "api.graphql",
+                    "arguments": {
+                        "query": "mutation { createPullRequest(input: $input) { pullRequest { url } } }"
+                    }
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Confirmed
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "mcpToolCall",
+                &serde_json::json!({
+                    "server": "codex_apps",
+                    "repository_full_name": "other/project",
+                    "tool": "github.create_pull_request",
+                    "arguments": { "repository_full_name": "o/r" }
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Rejected
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "mcpToolCall",
+                &serde_json::json!({
+                    "server": "untrusted",
+                    "tool": "github.create_pull_request",
+                    "arguments": { "repository_full_name": "o/r" }
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Rejected
         ));
         assert!(requests_pull_request_creation(
             "functions.exec",
@@ -19088,7 +19203,8 @@ default_permission_mode = "ask"
                     "arguments": {
                         "repository_full_name": "jimsimon/trouve",
                         "base_branch": "main",
-                        "head_branch": "agent/separate-harness-search-readmes"
+                        "head_branch": "agent/separate-harness-search-readmes",
+                        "title": "Follow-up to https://github.com/jimsimon/trouve/pull/274"
                     }
                 }),
                 requires_approval: false,
@@ -19170,6 +19286,7 @@ default_permission_mode = "ask"
                 call_id: "create-malformed-other-pr".into(),
                 tool: "mcpToolCall".into(),
                 args: serde_json::json!({
+                    "server": "codex_apps",
                     "tool": "github.create_pull_request",
                     "repository": "other/project",
                     "arguments": "{undecodable"
@@ -19193,6 +19310,7 @@ default_permission_mode = "ask"
                 call_id: "read-pr".into(),
                 tool: "mcpToolCall".into(),
                 args: serde_json::json!({
+                    "server": "codex_apps",
                     "tool": "github.get_pull_request",
                     "arguments": {
                         "repository_full_name": "jimsimon/trouve",
@@ -19214,6 +19332,7 @@ default_permission_mode = "ask"
                 call_id: "create-other-with-local-result".into(),
                 tool: "mcpToolCall".into(),
                 args: serde_json::json!({
+                    "server": "codex_apps",
                     "tool": "github.create_pull_request",
                     "arguments": {
                         "repository_full_name": "other/project",
@@ -19227,6 +19346,28 @@ default_permission_mode = "ask"
                 status: ToolStatus::Ok,
                 result: serde_json::json!({
                     "url": "https://github.com/jimsimon/trouve/pull/270"
+                }),
+                execution_duration_ms: Some(400),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "untrusted-create".into(),
+                tool: "mcpToolCall".into(),
+                args: serde_json::json!({
+                    "server": "untrusted",
+                    "tool": "github.create_pull_request",
+                    "arguments": {
+                        "repository_full_name": "jimsimon/trouve",
+                        "head_branch": "agent/separate-harness-search-readmes"
+                    }
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "untrusted-create".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "url": "https://github.com/jimsimon/trouve/pull/275"
                 }),
                 execution_duration_ms: Some(400),
             },

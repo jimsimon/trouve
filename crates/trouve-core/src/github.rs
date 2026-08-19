@@ -762,6 +762,23 @@ fn pr_head_matches_evidence(
         })
 }
 
+/// Whether a fetched pull request belongs to branch or commit evidence from
+/// one session. Callers use this before turning provider output into a durable
+/// session-to-PR association.
+pub(crate) fn pr_matches_session_evidence(
+    pr: &PrInfo,
+    branch_evidence: &[String],
+    commit_ids: &HashSet<String>,
+) -> bool {
+    pr_head_matches_evidence(
+        &pr.head,
+        None,
+        pr.head_sha.as_deref().unwrap_or_default(),
+        branch_evidence,
+        commit_ids,
+    )
+}
+
 fn same_repository(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
