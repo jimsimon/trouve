@@ -334,7 +334,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   publication_accepted INTEGER NOT NULL DEFAULT 0,
   publication_generation INTEGER NOT NULL DEFAULT 0,
-  review_published INTEGER NOT NULL DEFAULT 0
+  review_published INTEGER NOT NULL DEFAULT 0,
+  blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -561,6 +562,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN publication_accepted INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_generation INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN review_published INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
@@ -2056,6 +2058,7 @@ pub struct CodeReviewJobRecord {
     pub publication_claimed: bool,
     pub publication_accepted: bool,
     pub review_published: bool,
+    pub blocking_review_cleanup_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2168,6 +2171,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         publication_claimed: r.get(38)?,
         publication_accepted: r.get(52)?,
         review_published: r.get(53)?,
+        blocking_review_cleanup_pending: r.get(54)?,
     })
 }
 
@@ -2180,7 +2184,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
-     review_published";
+     review_published, blocking_review_cleanup_pending";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -9662,6 +9666,9 @@ impl Store {
         Ok(())
     }
 
+    // The PR identity fields intentionally stay explicit: they are written
+    // atomically with both publication and cleanup state in this transaction.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_code_review_publication(
         &self,
         id: &str,
@@ -9670,6 +9677,7 @@ impl Store {
         base_sha: &str,
         head_sha: &str,
         review_url: &str,
+        blocking_review_cleanup_pending: bool,
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -9677,9 +9685,10 @@ impl Store {
             "UPDATE code_review_jobs
              SET publication_accepted = 1,
                  review_published = 1,
-                 review_url = CASE WHEN ?2 = '' THEN review_url ELSE ?2 END
+                 review_url = CASE WHEN ?2 = '' THEN review_url ELSE ?2 END,
+                 blocking_review_cleanup_pending = ?3
              WHERE id = ?1 AND publication_claimed != 0",
-            params![id, review_url],
+            params![id, review_url, blocking_review_cleanup_pending],
         )?;
         if updated == 0 {
             anyhow::bail!("review job changed before GitHub publication was recorded");
@@ -9708,6 +9717,35 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn clear_code_review_blocking_review_cleanup(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_pending = 0
+             WHERE id = ?1 AND review_published != 0
+               AND blocking_review_cleanup_pending != 0",
+            [id],
+        )? > 0)
+    }
+
+    pub fn code_review_jobs_pending_blocking_review_cleanup(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CODE_REVIEW_JOB_COLUMNS}
+             FROM code_review_jobs
+             WHERE review_published != 0 AND blocking_review_cleanup_pending != 0
+             ORDER BY completed_at, created_at, id
+             LIMIT ?1"
+        ))?;
+        Ok(stmt
+            .query_map(params![limit as i64], |row| {
+                row_to_code_review_job(row).map(|record| record.job)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn set_code_review_job_fixed_issue_count(&self, id: &str, count: u64) -> Result<()> {
@@ -14227,6 +14265,7 @@ mod tests {
                 &job.base_ref,
                 &job.head_sha,
                 "https://example/review",
+                false,
             )
             .unwrap();
         store
@@ -14370,6 +14409,7 @@ mod tests {
                 &job.base_ref,
                 &job.head_sha,
                 "https://example/review",
+                false,
             )
             .unwrap();
         let record = store.code_review_job(&job.id).unwrap().unwrap();
