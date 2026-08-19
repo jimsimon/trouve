@@ -95,13 +95,31 @@ describe("ModelCatalogController", () => {
     });
 
     await expect(controller.liveModels()).resolves.toEqual([]);
-    await expect(controller.refresh()).resolves.toEqual([
-      model("cursor/static"),
-    ]);
+    await expect(controller.refresh()).resolves.toEqual([]);
+    await vi.waitFor(() => expect(staticCalls).toBe(2));
     await expect(controller.staticModels()).resolves.toEqual([
       model("cursor/static"),
     ]);
     expect(staticCalls).toBe(2);
+  });
+
+  it("keeps usable live models while retrying a missing static catalog", async () => {
+    let staticCalls = 0;
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => {
+        staticCalls += 1;
+        throw new Error("static unavailable");
+      },
+      refreshModels: async () => [model(`cursor/live-${++liveCalls}`)],
+    }, { liveTtlMs: 0 });
+
+    await expect(controller.liveModels()).resolves.toEqual([model("cursor/live-1")]);
+    await expect(controller.refresh()).resolves.toEqual([model("cursor/live-1")]);
+    await vi.waitFor(() => expect(staticCalls).toBe(2));
+    await vi.waitFor(() => expect(readSignal(controller.current)).toEqual([
+      model("cursor/live-2"),
+    ]));
   });
 
   it("discovers live models when the independent static catalog fails", async () => {
@@ -277,6 +295,39 @@ describe("ModelCatalogController", () => {
       model("cursor/live-3"),
     ]);
     expect(liveCalls).toBe(3);
+  });
+
+  it("preserves live models and applies a cooldown after background refresh failure", async () => {
+    let now = 0;
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => [model("cursor/static")],
+      refreshModels: async () => {
+        liveCalls += 1;
+        if (liveCalls === 2) throw new Error("live unavailable");
+        return [model(`cursor/live-${liveCalls}`)];
+      },
+    }, { now: () => now, liveTtlMs: 10 });
+
+    await controller.refresh();
+    await vi.waitFor(() => expect(readSignal(controller.current)).toEqual([
+      model("cursor/live-1"),
+    ]));
+
+    now = 20;
+    await expect(controller.refresh()).resolves.toEqual([model("cursor/live-1")]);
+    await vi.waitFor(() => expect(readSignal(controller.refreshing)).toBe(false));
+    expect(readSignal(controller.current)).toEqual([model("cursor/live-1")]);
+    expect(readSignal(controller.liveLoaded)).toBe(true);
+
+    await controller.refresh();
+    expect(liveCalls).toBe(2);
+
+    now = 40;
+    await controller.refresh();
+    await vi.waitFor(() => expect(readSignal(controller.current)).toEqual([
+      model("cursor/live-3"),
+    ]));
   });
 
   it("uses a cached static snapshot when a forced reload fails", async () => {

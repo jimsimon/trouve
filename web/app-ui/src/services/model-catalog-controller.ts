@@ -42,7 +42,7 @@ export class ModelCatalogController {
   #livePending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #staticLoaded = false;
   #staticFailure: { readonly error: unknown } | undefined;
-  #lastLiveResolvedAt: number | undefined;
+  #lastLiveCheckedAt: number | undefined;
   #generation = 0;
 
   constructor(
@@ -60,9 +60,9 @@ export class ModelCatalogController {
     const current = this.#current.get();
     if (
       freshness === "if-stale"
-      && this.#staticLoaded
       && (current.length > 0 || this.#liveLoaded.get())
     ) {
+      if (!this.#staticLoaded) void this.#loadStatic().catch(() => undefined);
       void this.#refreshLive(freshness).catch(() => undefined);
       return Promise.resolve(current);
     }
@@ -143,8 +143,8 @@ export class ModelCatalogController {
   ): Promise<readonly ProtocolModelInfo[]> {
     if (this.#livePending !== undefined) return this.#livePending;
     const now = this.#now();
-    const fresh = this.#lastLiveResolvedAt !== undefined
-      && Math.max(0, now - this.#lastLiveResolvedAt) < this.#liveTtlMs;
+    const fresh = this.#lastLiveCheckedAt !== undefined
+      && Math.max(0, now - this.#lastLiveCheckedAt) < this.#liveTtlMs;
     if (freshness === "if-stale" && fresh) {
       return Promise.resolve(this.#current.get());
     }
@@ -155,7 +155,7 @@ export class ModelCatalogController {
       (models) => {
         if (generation !== this.#generation) return this.#current.get();
         const snapshot = Object.freeze([...models]);
-        this.#lastLiveResolvedAt = this.#now();
+        this.#lastLiveCheckedAt = this.#now();
         this.#liveLoaded.set(true);
         this.#live.set(snapshot);
         this.#current.set(snapshot);
@@ -164,9 +164,13 @@ export class ModelCatalogController {
       },
       (error: unknown) => {
         if (generation !== this.#generation) return this.#current.get();
-        this.#lastLiveResolvedAt = undefined;
-        this.#liveLoaded.set(false);
-        if (this.#staticLoaded) this.#current.set(this.#static.get());
+        if (freshness === "if-stale" && this.#liveLoaded.get()) {
+          this.#lastLiveCheckedAt = this.#now();
+        } else {
+          this.#lastLiveCheckedAt = undefined;
+          this.#liveLoaded.set(false);
+          if (this.#staticLoaded) this.#current.set(this.#static.get());
+        }
         throw error;
       },
     ).finally(() => {
