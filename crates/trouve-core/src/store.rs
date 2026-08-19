@@ -788,13 +788,28 @@ fn backfill_code_review_watermarks(conn: &mut Connection) -> Result<()> {
 fn repair_legacy_code_review_publications(conn: &Connection) -> Result<()> {
     conn.execute(
         "UPDATE code_review_jobs
-         SET publication_accepted = 1,
-             review_published = 1
-         WHERE review_published = 0
-           AND (
-             publication_accepted != 0
-             OR (review_url != '' AND review_url != lifecycle_comment_url)
-           )",
+         SET lifecycle_comment_url = COALESCE((
+             SELECT state.lifecycle_comment_url
+             FROM code_review_pr_state state
+             WHERE state.repository = code_review_jobs.repository
+               AND state.pull_number = code_review_jobs.pull_number
+               AND state.lifecycle_comment_url != ''
+         ), lifecycle_comment_url)
+         WHERE lifecycle_comment_url = ''",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE code_review_jobs
+         SET publication_accepted = CASE
+                 WHEN publication_accepted != 0
+                   OR review_url LIKE '%#pullrequestreview-%'
+                 THEN 1 ELSE 0
+             END,
+             review_published = CASE
+                 WHEN publication_accepted != 0
+                   OR review_url LIKE '%#pullrequestreview-%'
+                 THEN 1 ELSE 0
+             END",
         [],
     )?;
     Ok(())
@@ -8332,8 +8347,9 @@ impl Store {
         )? > 0)
     }
 
-    /// Marks a finding's thread collapse as done; retry state resets with
-    /// it. The clear only applies while the row still carries
+    /// Marks a finding's thread collapse as done, records the successfully
+    /// resolved thread state when one was present, and resets retry state.
+    /// The clear only applies while the row still carries
     /// `expected_comment_id`: if concurrent publication re-armed the row
     /// with a different comment after the caller's snapshot, the newly armed
     /// work survives instead of being wiped by a stale pass.
@@ -8341,12 +8357,23 @@ impl Store {
         &self,
         id: &str,
         expected_comment_id: Option<u64>,
+        resolved_thread_id: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
-             SET collapse_pending = 0, collapse_attempts = 0, collapse_next_attempt_at = NULL
+             SET collapse_pending = 0, collapse_attempts = 0, collapse_next_attempt_at = NULL,
+                 github_thread_id = CASE
+                     WHEN ?3 IS NOT NULL THEN ?3 ELSE github_thread_id
+                 END,
+                 github_thread_resolved = CASE
+                     WHEN ?3 IS NOT NULL THEN 1 ELSE github_thread_resolved
+                 END
              WHERE id = ?1 AND github_comment_id IS ?2",
-            params![id, expected_comment_id.map(|value| value as i64)],
+            params![
+                id,
+                expected_comment_id.map(|value| value as i64),
+                resolved_thread_id
+            ],
         )?;
         Ok(())
     }
@@ -11238,20 +11265,35 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE code_review_jobs (
                 id TEXT PRIMARY KEY,
+                repository TEXT NOT NULL,
+                pull_number INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 publication_accepted INTEGER NOT NULL DEFAULT 0,
                 review_published INTEGER NOT NULL DEFAULT 0,
                 review_url TEXT NOT NULL DEFAULT '',
                 lifecycle_comment_url TEXT NOT NULL DEFAULT ''
              );
+             CREATE TABLE code_review_pr_state (
+                repository TEXT NOT NULL,
+                pull_number INTEGER NOT NULL,
+                lifecycle_comment_url TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (repository, pull_number)
+             );
              INSERT INTO code_review_jobs
-               (id, status, publication_accepted, review_url, lifecycle_comment_url)
+               (id, repository, pull_number, status, publication_accepted,
+                review_published, review_url, lifecycle_comment_url)
              VALUES
-               ('published', 'succeeded', 0, 'https://example/review/1', ''),
-               ('accepted', 'running', 1, '', ''),
-               ('lifecycle-only', 'succeeded', 0, 'https://example/comment/1',
-                'https://example/comment/1'),
-               ('clean', 'succeeded', 0, '', '');",
+               ('published', 'acme/widgets', 1, 'succeeded', 0, 0,
+                'https://github.com/acme/widgets/pull/1#pullrequestreview-1', ''),
+               ('accepted', 'acme/widgets', 2, 'running', 1, 0, '', ''),
+               ('lifecycle-only', 'acme/widgets', 3, 'succeeded', 0, 1,
+                'https://github.com/acme/widgets/issues/3#issuecomment-1', ''),
+               ('false-positive', 'acme/widgets', 4, 'succeeded', 0, 1, '', ''),
+               ('clean', 'acme/widgets', 5, 'succeeded', 0, 0, '', '');
+             INSERT INTO code_review_pr_state
+               (repository, pull_number, lifecycle_comment_url)
+             VALUES ('acme/widgets', 3,
+                     'https://github.com/acme/widgets/issues/3#issuecomment-1');",
         )
         .unwrap();
 
@@ -11268,11 +11310,22 @@ mod tests {
         assert_eq!(state("published"), (1, 1));
         assert_eq!(state("accepted"), (1, 1));
         assert_eq!(state("lifecycle-only"), (0, 0));
+        assert_eq!(state("false-positive"), (0, 0));
         assert_eq!(state("clean"), (0, 0));
+        assert_eq!(
+            conn.query_row(
+                "SELECT lifecycle_comment_url FROM code_review_jobs WHERE id = 'lifecycle-only'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "https://github.com/acme/widgets/issues/3#issuecomment-1"
+        );
 
         conn.execute(
-            "INSERT INTO code_review_jobs (id, status, review_url)
-             VALUES ('rollback-review', 'succeeded', 'https://example/review/2')",
+            "INSERT INTO code_review_jobs (id, repository, pull_number, status, review_url)
+             VALUES ('rollback-review', 'acme/widgets', 6, 'succeeded',
+                     'https://github.com/acme/widgets/pull/6#pullrequestreview-2')",
             [],
         )
         .unwrap();
@@ -14032,7 +14085,9 @@ mod tests {
 
         // A clear guarded on a stale comment id is a no-op: the re-armed
         // work survives a pass that snapshotted the row before publication.
-        store.clear_code_review_thread_collapse(&id, None).unwrap();
+        store
+            .clear_code_review_thread_collapse(&id, None, None)
+            .unwrap();
         assert_eq!(
             store
                 .pending_code_review_thread_collapses(due, 16, &[])
@@ -14041,7 +14096,7 @@ mod tests {
             1
         );
         store
-            .clear_code_review_thread_collapse(&id, Some(9001))
+            .clear_code_review_thread_collapse(&id, Some(9001), Some("thread-9001"))
             .unwrap();
         assert!(
             store
@@ -14201,12 +14256,9 @@ mod tests {
         assert_eq!(first_unresolved[0].is_resolved, Some(false));
         assert!(!first_unresolved[0].recheck_pending);
 
-        assert!(
-            store
-                .record_code_review_thread_state(&finding.id, "thread-1", true)
-                .unwrap()
-                .0
-        );
+        store
+            .clear_code_review_thread_collapse(&finding.id, Some(9001), Some("thread-1"))
+            .unwrap();
         let resolved = store
             .reconcilable_code_review_findings(&job.repository, job.pull_number)
             .unwrap();
