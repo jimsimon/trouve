@@ -2321,6 +2321,16 @@ impl Engine {
                     break;
                 }
             };
+            // A replacement may have consumed the intent while this worker
+            // waited for the mutation lane.
+            match self.store.persona_deletion_pending(&claim.id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(persona_id = %claim.id, %error, "failed to recheck persona deletion intent");
+                    continue;
+                }
+            }
             let result = self
                 .executor
                 .delete_persona_file(config_dir, &claim.id, true)
@@ -4688,6 +4698,39 @@ impl Engine {
             default_thinking_level: req.default_thinking_level,
         };
         let _mutation = self.persona_mutations.lock().await;
+        let current = self.resolve_personas(None)?;
+        if personas::find_persona(&current, id).is_some_and(|existing| {
+            existing.group == trouve_protocol::PersonaGroup::Reviewer
+                && persona.group == trouve_protocol::PersonaGroup::General
+        }) {
+            let referenced = self
+                .store
+                .list_code_review_repositories()?
+                .iter()
+                .any(|repository| {
+                    repository
+                        .reviewer_ids
+                        .iter()
+                        .any(|candidate| candidate == id)
+                        || repository
+                            .included_reviewer_ids
+                            .iter()
+                            .any(|candidate| candidate == id)
+                        || repository
+                            .excluded_reviewer_ids
+                            .iter()
+                            .any(|candidate| candidate == id)
+                        || repository
+                            .reviewer_overrides
+                            .iter()
+                            .any(|entry| entry.reviewer_id == id)
+                });
+            if referenced {
+                return Err(EngineError::BadRequest(format!(
+                    "reviewer persona {id} is selected by a code review repository and cannot be moved to the general group"
+                )));
+            }
+        }
         let replacement_claim = if self.store.persona_deletion_pending(id)? {
             Some(self.store.claim_persona_deletion(id)?.ok_or_else(|| {
                 EngineError::BadRequest(format!("persona {id} is currently being deleted"))
@@ -4695,11 +4738,23 @@ impl Engine {
         } else {
             None
         };
-        if let Err(error) = self
-            .executor
-            .upsert_persona_file(config_dir, &persona)
-            .await
-        {
+        let write_result = if let Some(claim) = replacement_claim.as_deref() {
+            let write = self.executor.upsert_persona_file(config_dir, &persona);
+            tokio::pin!(write);
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    result = &mut write => break result,
+                    _ = interval.tick() => self.store.renew_persona_deletion_claim(id, claim)?,
+                }
+            }
+        } else {
+            self.executor
+                .upsert_persona_file(config_dir, &persona)
+                .await
+        };
+        if let Err(error) = write_result {
             if let Some(claim) = replacement_claim.as_deref() {
                 self.store.release_persona_deletion_claim(id, claim)?;
             }
@@ -4760,6 +4815,14 @@ impl Engine {
         if !system_persona {
             return Err(EngineError::BadRequest(format!(
                 "persona {id} is not a user-configurable persona"
+            )));
+        }
+        let has_override = personas::user_persona_file(config_dir, id)
+            .map_err(EngineError::Internal)?
+            .is_some();
+        if !has_override {
+            return Err(EngineError::BadRequest(format!(
+                "persona {id} is a built-in with no user override to remove"
             )));
         }
         self.executor
@@ -12746,14 +12809,20 @@ impl Engine {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .context("prompt is required")?;
-        let child_mode = args
+        let requested_child_mode = args
             .get("mode")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&thread.mode);
-        let child_mode = personas::canonical_persona_id(child_mode).to_string();
+        let available_personas = self.resolve_personas(Some(Path::new(&session.worktree_path)))?;
+        let child_mode = personas::find_persona(&available_personas, requested_child_mode)
+            .with_context(|| format!("unknown persona {requested_child_mode}"))?
+            .id
+            .clone();
+        let parent_mode_id = personas::find_persona(&available_personas, &thread.mode)
+            .map_or(thread.mode.as_str(), |persona| persona.id.as_str());
         // A read-only parent must not launch an agent that can do what it
         // itself cannot.
-        if mode.read_only && child_mode != personas::canonical_persona_id(&thread.mode) {
+        if mode.read_only && child_mode != parent_mode_id {
             bail!("read-only personas can only spawn children in the same mode");
         }
         let child_model = args

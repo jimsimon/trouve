@@ -160,7 +160,21 @@ fn load_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
             continue;
         };
         match toml::from_str::<AgentPersona>(&text) {
-            Ok(persona) => {
+            Ok(mut persona) => {
+                // `group` was introduced when modes and reviewer profiles were
+                // unified. Preserve a built-in's group for old overrides and
+                // treat old standalone persona files as reviewer personas,
+                // matching their pre-unification availability to code review.
+                let declares_group = toml::from_str::<toml::Value>(&text)
+                    .ok()
+                    .and_then(|value| value.as_table().map(|table| table.contains_key("group")))
+                    .unwrap_or(false);
+                if !declares_group {
+                    persona.group = personas
+                        .iter()
+                        .find(|candidate| candidate.id == persona.id)
+                        .map_or(PersonaGroup::Reviewer, |base| base.group);
+                }
                 // Later layers override earlier ones by id.
                 personas.retain(|m| m.id != persona.id);
                 personas.push(persona);
@@ -328,10 +342,14 @@ pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<Pa
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let persona = toml::from_str::<AgentPersona>(&text)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            tracing::warn!("ignoring unreadable persona file {}", path.display());
+            continue;
+        };
+        let Ok(persona) = toml::from_str::<AgentPersona>(&text) else {
+            tracing::warn!("ignoring invalid persona file {}", path.display());
+            continue;
+        };
         if persona.id == id {
             return Ok(Some(path));
         }
@@ -373,11 +391,62 @@ pub fn upsert_user_persona(config_dir: &Path, persona: &AgentPersona) -> Result<
         return Err(error).with_context(|| format!("writing {}", temporary.display()));
     }
     drop(file);
-    if let Err(error) = std::fs::rename(&temporary, &path) {
+    let replacing_existing = path.is_file();
+    if let Err(error) = replace_persona_file(&temporary, &path, replacing_existing) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error).with_context(|| format!("replacing {}", path.display()));
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_persona_file(
+    temporary: &Path,
+    path: &Path,
+    _replacing_existing: bool,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, path)
+}
+
+#[cfg(windows)]
+fn replace_persona_file(
+    temporary: &Path,
+    path: &Path,
+    replacing_existing: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
+    };
+    let temporary = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        if replacing_existing {
+            ReplaceFileW(
+                path.as_ptr(),
+                temporary.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } else {
+            MoveFileExW(temporary.as_ptr(), path.as_ptr(), MOVEFILE_WRITE_THROUGH)
+        }
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Remove the user-level file for a persona: deletes a custom persona outright,
@@ -572,6 +641,47 @@ default_permission_mode = "ask"
         // Nothing left to delete.
         assert!(delete_user_persona(config, "plan").is_err());
         assert!(delete_user_persona(config, "docs").is_err());
+    }
+
+    #[test]
+    fn legacy_persona_files_keep_their_pre_unification_review_availability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("personas");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("legacy.toml"),
+            "id = \"legacy\"\ndisplay_name = \"Legacy\"\nsystem_prompt = \"Review\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("code.toml"),
+            "id = \"code\"\ndisplay_name = \"Custom engineer\"\nsystem_prompt = \"Build\"\n",
+        )
+        .unwrap();
+
+        let personas = resolve_personas(Some(tmp.path()), None);
+        assert_eq!(
+            find_persona(&personas, "legacy").unwrap().group,
+            PersonaGroup::Reviewer
+        );
+        assert_eq!(
+            find_persona(&personas, "code").unwrap().group,
+            PersonaGroup::General
+        );
+    }
+
+    #[test]
+    fn malformed_unrelated_persona_does_not_block_mutations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("personas");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.toml"), "not valid = [").unwrap();
+        let mut persona = builtin_personas().remove(0);
+        persona.id = "custom".into();
+
+        upsert_user_persona(tmp.path(), &persona).unwrap();
+        assert!(user_persona_file(tmp.path(), "custom").unwrap().is_some());
+        delete_user_persona(tmp.path(), "custom").unwrap();
     }
 
     #[test]

@@ -6302,6 +6302,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn renew_persona_deletion_claim(&self, id: &str, token: &str) -> Result<()> {
+        let claim_until = (chrono::Utc::now()
+            + chrono::Duration::minutes(PERSONA_DELETION_CLAIM_MINUTES))
+        .to_rfc3339();
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE persona_cleanup_intents SET claim_until = ?3
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![id, token, claim_until],
+        )?;
+        anyhow::ensure!(updated == 1, "persona deletion claim for {id} was lost");
+        Ok(())
+    }
+
     /// Consume a pending deletion because the persona was recreated. Unlike
     /// deletion completion, repository selections and overrides are retained.
     pub fn cancel_persona_deletion(&self, id: &str) -> Result<()> {

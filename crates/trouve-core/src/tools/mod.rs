@@ -43,6 +43,7 @@ const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const REVIEW_HISTORY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
 const REVIEW_HISTORY_REF_LIMIT: usize = 3;
+static PERSONA_FILE_MUTATIONS: Mutex<()> = Mutex::new(());
 const REVIEW_GIT_TRACE_ENV_VARS: &[&str] = &[
     "GIT_TRACE",
     "GIT_TRACE2",
@@ -2523,8 +2524,15 @@ impl ToolExecutor for LocalToolExecutor {
         config_dir: &Path,
         persona: &AgentPersona,
     ) -> Result<(), String> {
-        crate::personas::upsert_user_persona(config_dir, persona)
-            .map_err(|error| format!("{error:#}"))
+        let config_dir = config_dir.to_path_buf();
+        let persona = persona.clone();
+        tokio::task::spawn_blocking(move || {
+            let _mutation = PERSONA_FILE_MUTATIONS.lock().unwrap();
+            crate::personas::upsert_user_persona(&config_dir, &persona)
+        })
+        .await
+        .map_err(|error| format!("persona file worker failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
     }
 
     async fn delete_persona_file(
@@ -2533,14 +2541,20 @@ impl ToolExecutor for LocalToolExecutor {
         id: &str,
         allow_missing: bool,
     ) -> Result<(), String> {
-        if allow_missing
-            && crate::personas::user_persona_file(config_dir, id)
-                .map_err(|error| format!("{error:#}"))?
-                .is_none()
-        {
-            return Ok(());
-        }
-        crate::personas::delete_user_persona(config_dir, id).map_err(|error| format!("{error:#}"))
+        let config_dir = config_dir.to_path_buf();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            // This lock outlives a cancelled async waiter, so a detached
+            // blocking operation cannot overlap a later persona mutation.
+            let _mutation = PERSONA_FILE_MUTATIONS.lock().unwrap();
+            if allow_missing && crate::personas::user_persona_file(&config_dir, &id)?.is_none() {
+                return Ok(());
+            }
+            crate::personas::delete_user_persona(&config_dir, &id)
+        })
+        .await
+        .map_err(|error| format!("persona file worker failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
     }
 
     async fn checkpoint_worktree(

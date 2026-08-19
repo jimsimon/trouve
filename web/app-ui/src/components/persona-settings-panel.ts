@@ -106,11 +106,19 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
   #modeFormModelId: string | undefined;
   #modeFormThinkingDraft: string | undefined;
 
-  async #restoreFocus(label: string): Promise<void> {
+  async #restorePersonaFocus(id: string): Promise<void> {
     await this.updateComplete;
     const button = [...this.renderRoot.querySelectorAll<HTMLButtonElement>("button")]
-      .find((candidate) => candidate.getAttribute("aria-label") === label);
+      .find((candidate) => candidate.dataset["personaFocus"] === id);
     button?.focus();
+  }
+
+  async #reloadAfterMutation(success: string): Promise<boolean> {
+    if (await this.#load()) return true;
+    this.#message = `${success} The updated persona list could not be refreshed.`;
+    this.#error = true;
+    this.requestUpdate();
+    return false;
   }
 
   #availableModels(): readonly ProtocolModelInfo[] {
@@ -172,8 +180,9 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
         default_thinking_level: thinking || null,
         permission_mode: permission,
       });
-      if (!await this.#load()) return;
-      this.#message = "Defaults saved for new threads.";
+      const success = "Defaults saved for new threads.";
+      if (!await this.#reloadAfterMutation(success)) return;
+      this.#message = success;
       this.requestUpdate();
     } catch {
       await this.#load();
@@ -236,10 +245,11 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       this.#editingModeId = "";
       this.#modeFormModelId = undefined;
       this.#modeFormThinkingDraft = undefined;
-      if (!await this.#load()) return;
-      this.#message = `Saved persona ${id}.`;
+      const success = `Saved persona ${id}.`;
+      if (!await this.#reloadAfterMutation(success)) return;
+      this.#message = success;
       this.requestUpdate();
-      void this.#restoreFocus(existing === undefined ? "Add persona" : `Edit ${displayName}`);
+      void this.#restorePersonaFocus(existing === undefined ? "__add__" : id);
     } catch {
       this.#message = `Persona ${id} could not be saved.`;
       this.#error = true;
@@ -260,10 +270,10 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       const success = info.origin === "custom"
         ? `Deleted persona ${info.persona.id}.`
         : `Reset persona ${info.persona.id} to its built-in definition.`;
-      if (!await this.#load()) return;
+      if (!await this.#reloadAfterMutation(success)) return;
       this.#message = success;
       this.requestUpdate();
-      void this.#restoreFocus("Add persona");
+      void this.#restorePersonaFocus("__add__");
     } catch {
       this.#message = `Persona ${info.persona.id} could not be ${info.origin === "custom" ? "deleted" : "reset"}.`;
       this.#error = true;
@@ -308,7 +318,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
         </div>
         ${readOnly
           ? html`<p class="meta">Workspace personas are managed by the repository’s .agents configuration.</p>`
-          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add persona" : "Save persona"}</button><button type="button" @click=${() => { const focusLabel = mode === undefined ? "Add persona" : `Edit ${mode.display_name}`; this.#editingModeId = ""; this.#modeFormModelId = undefined; this.#modeFormThinkingDraft = undefined; this.requestUpdate(); void this.#restoreFocus(focusLabel); }}>Cancel</button></div>`}
+          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add persona" : "Save persona"}</button><button type="button" @click=${() => { const focusId = mode?.id ?? "__add__"; this.#editingModeId = ""; this.#modeFormModelId = undefined; this.#modeFormThinkingDraft = undefined; this.requestUpdate(); void this.#restorePersonaFocus(focusId); }}>Cancel</button></div>`}
       </form>
     `;
   }
@@ -338,8 +348,9 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
           ? mode.default_thinking_level ?? null
           : update.thinking,
       });
-      if (!await this.#load()) return;
-      this.#message = `Saved persona ${mode.id}.`;
+      const success = `Saved persona ${mode.id}.`;
+      if (!await this.#reloadAfterMutation(success)) return;
+      this.#message = success;
       this.requestUpdate();
     } catch {
       this.#message = `Persona ${mode.id} could not be saved.`;
@@ -383,7 +394,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
               ><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select>`}
         </div>
         <div class="mode-row-actions">
-          ${readOnly ? nothing : html`<button type="button" aria-label=${`Edit ${mode.display_name}`} @click=${() => { this.#editingModeId = mode.id; this.#modeFormModelId = mode.default_model ?? ""; this.#modeFormThinkingDraft = mode.default_thinking_level ?? ""; this.requestUpdate(); }}>Edit</button>`}
+          ${readOnly ? nothing : html`<button type="button" data-persona-focus=${mode.id} aria-label=${`Edit ${mode.display_name}`} @click=${() => { this.#editingModeId = mode.id; this.#modeFormModelId = mode.default_model ?? ""; this.#modeFormThinkingDraft = mode.default_thinking_level ?? ""; this.requestUpdate(); }}>Edit</button>`}
           ${info.origin === "customized" || info.origin === "custom"
             ? html`<button class="danger" type="button" aria-label=${`${info.origin === "custom" ? "Remove" : "Reset"} ${mode.display_name}`} ?disabled=${this.#busy} @click=${() => void this.#resetMode(info)}>${info.origin === "custom" ? "Remove" : "Reset"}</button>`
             : nothing}
@@ -426,7 +437,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
         <p class="modes-copy">Reviewer personas are available to sessions and threads and may also be selected by code review.</p>
         <section class="mode-list" aria-label="Reviewer personas">${this.#modes.filter((info) => info.persona.group === "reviewer").map((info) => this.#modeRow(info))}</section>
         ${this.#editingModeId === ""
-          ? html`<div class="row"><button type="button" aria-label="Add persona" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add persona</button></div>`
+          ? html`<div class="row"><button type="button" data-persona-focus="__add__" aria-label="Add persona" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add persona</button></div>`
           : this.#editingModeId === "__new__"
             ? this.#modeForm()
             : this.#modeForm(this.#modes.find((info) => info.persona.id === this.#editingModeId))}
