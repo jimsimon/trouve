@@ -7,14 +7,19 @@ name: Release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
-  # A manual run can repair the binary assets on an existing release without
-  # republishing immutable crates, npm packages, or container images.
+  # A manual run repairs binary assets on an existing release. Set the
+  # explicit recovery switch to also publish any missing immutable crates.
   workflow_dispatch:
     inputs:
       tag:
         description: Existing vX.Y.Z release tag to rebuild
         required: true
         type: string
+      publish_crates:
+        description: Publish missing crates.io packages for this tag
+        required: false
+        default: false
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
@@ -542,15 +547,64 @@ jobs:
 
   publish-crate:
     needs: release
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.publish_crates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish to crates.io
-        run: cargo publish --package trouve-search
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+
+          published() {
+            curl --fail --silent --show-error \
+              "https://crates.io/api/v1/crates/$1/$version" >/dev/null
+          }
+
+          publish_with_retries() {
+            local crate="$1"
+            local attempts="$2"
+            local attempt
+            for attempt in $(seq 1 "$attempts"); do
+              if published "$crate"; then
+                echo "$crate@$version is already published; skipping."
+                return 0
+              fi
+              if cargo publish --locked --package "$crate"; then
+                return 0
+              fi
+              if published "$crate"; then
+                echo "$crate@$version was published despite a transient client error."
+                return 0
+              fi
+              if [ "$attempt" -lt "$attempts" ]; then
+                echo "Publish attempt $attempt for $crate@$version failed; retrying in 10 seconds." >&2
+                sleep 10
+              fi
+            done
+            return 1
+          }
+
+          publish_with_retries trouve-process 6
+
+          # crates.io may accept a crate before its sparse index entry is visible
+          # to a dependent package. Wait for that entry before publishing search.
+          for attempt in $(seq 1 18); do
+            if published trouve-process; then
+              break
+            fi
+            if [ "$attempt" -eq 18 ]; then
+              echo "trouve-process@$version did not become visible on crates.io." >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+          publish_with_retries trouve-search 6
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
