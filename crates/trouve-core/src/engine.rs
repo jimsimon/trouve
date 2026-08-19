@@ -13866,9 +13866,34 @@ fn contains_rest_mutation(
     }
 }
 
+/// Resolve provider-owned generic tool wrappers to the operation they carry.
+/// Keep this provider-neutral: Codex currently emits `mcpToolCall`, while
+/// other backends may use `dynamicToolCall` with the same nested shape.
+fn effective_activity_tool_call<'a>(
+    tool: &'a str,
+    args: &'a serde_json::Value,
+) -> (&'a str, &'a serde_json::Value) {
+    let normalized = compact_activity(tool);
+    if !matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall") {
+        return (tool, args);
+    }
+    let Some(nested_tool) = ["tool", "toolName", "name"]
+        .iter()
+        .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
+    else {
+        return (tool, args);
+    };
+    let nested_args = args
+        .get("arguments")
+        .filter(|value| value.is_object())
+        .unwrap_or(args);
+    (nested_tool, nested_args)
+}
+
 /// A successful tool call that actually creates a pull request. Merely
 /// listing, viewing, or mentioning a PR must not associate it with a session.
 fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
+    let (tool, args) = effective_activity_tool_call(tool, args);
     let tool_compact = compact_activity(tool);
     if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
         return true;
@@ -13920,6 +13945,7 @@ fn requests_pull_request_creation(
     owner: &str,
     repo: &str,
 ) -> bool {
+    let (tool, args) = effective_activity_tool_call(tool, args);
     let tool_words = activity_words(tool);
     let tool_compact = compact_activity(tool);
     let args_text = args.to_string();
@@ -18610,6 +18636,21 @@ default_permission_mode = "ask"
     #[test]
     fn recognizes_creation_without_treating_pr_reads_as_associations() {
         assert!(requests_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "type": "mcpToolCall",
+                "server": "codex_apps",
+                "tool": "github.create_pull_request",
+                "arguments": {
+                    "repository_full_name": "o/r",
+                    "base_branch": "main",
+                    "head_branch": "agent/fix-association"
+                }
+            }),
+            "o",
+            "r"
+        ));
+        assert!(requests_pull_request_creation(
             "functions.exec",
             &serde_json::json!({"cmd": "gh pr create --head fix/other"}),
             "o",
@@ -18630,6 +18671,16 @@ default_permission_mode = "ask"
             "functions.exec",
             &serde_json::json!({
                 "cmd": "gh api repos/o/r/pulls --method POST --field title=test"
+            }),
+            "o",
+            "r"
+        ));
+        assert!(!requests_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "server": "codex_apps",
+                "tool": "github.get_pull_request",
+                "arguments": { "repository_full_name": "o/r", "pr_number": 75 }
             }),
             "o",
             "r"
@@ -18671,6 +18722,45 @@ default_permission_mode = "ask"
             "o",
             "r"
         ));
+    }
+
+    #[test]
+    fn records_pull_request_created_through_generic_mcp_wrapper() {
+        let events = [
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "create-pr".into(),
+                tool: "mcpToolCall".into(),
+                args: serde_json::json!({
+                    "type": "mcpToolCall",
+                    "server": "codex_apps",
+                    "tool": "github.create_pull_request",
+                    "arguments": {
+                        "repository_full_name": "jimsimon/trouve",
+                        "base_branch": "main",
+                        "head_branch": "agent/separate-harness-search-readmes"
+                    }
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "create-pr".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "result": {
+                        "structuredContent": {
+                            "number": 267,
+                            "url": "https://github.com/jimsimon/trouve/pull/267"
+                        }
+                    }
+                }),
+                execution_duration_ms: Some(1_492),
+            },
+        ];
+
+        let evidence = pr_evidence_from_events(events, "github.com", "jimsimon", "trouve");
+        assert_eq!(evidence.numbers, HashSet::from([267]));
+        assert_eq!(evidence.successful_tool_args.len(), 1);
     }
 
     #[test]
