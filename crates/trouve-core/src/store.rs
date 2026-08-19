@@ -852,7 +852,7 @@ fn migrate_thread_status_projection(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = write_transaction(conn)?;
     tx.execute("DELETE FROM thread_statuses", [])?;
     let threads_have_session_id = {
         let mut stmt = tx.prepare("PRAGMA table_info(threads)")?;
@@ -920,7 +920,7 @@ fn migrate_session_summary_projection(conn: &Connection) -> Result<()> {
         .optional()?
         .is_some();
     if !applied {
-        let tx = conn.unchecked_transaction()?;
+        let tx = write_transaction(conn)?;
         tx.execute("DELETE FROM session_summary_attention", [])?;
         tx.execute("DELETE FROM session_summaries", [])?;
         tx.execute(
@@ -3473,7 +3473,7 @@ fn insert_event_batch<'a>(
     event_count: usize,
     code_review_outbox_ids: impl IntoIterator<Item = i64>,
 ) -> Result<InsertedEventBatch> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = write_transaction(conn)?;
     let code_review_outbox_ids = code_review_outbox_ids.into_iter().collect::<Vec<_>>();
     if !code_review_outbox_ids.is_empty() {
         let mut stmt = tx.prepare_cached(
@@ -3914,8 +3914,8 @@ fn serialize_lifecycle_events(
 /// code 5 / "database is locked"). `IMMEDIATE` makes SQLite's busy handler
 /// wait before the read, so every read-modify-write transaction sees the
 /// snapshot it can commit.
-fn write_transaction(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+fn write_transaction(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
 }
 
 impl Store {
@@ -4178,8 +4178,8 @@ impl Store {
             projection.snapshot.total_items = 0;
             projection.snapshot.has_older = false;
             let state = serde_json::to_string(&projection)?;
-            let mut conn = self.conn.lock().unwrap();
-            let tx = write_transaction(&mut conn)?;
+            let conn = self.conn.lock().unwrap();
+            let tx = write_transaction(&conn)?;
             let current_cache = tx
                 .query_row(
                     "SELECT cursor, schema_version FROM thread_view_cache WHERE thread_id = ?1",
@@ -4708,7 +4708,7 @@ impl Store {
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         // One transaction so a failure can't leave a half-deleted session.
-        let tx = conn.unchecked_transaction()?;
+        let tx = write_transaction(&conn)?;
         delete_session_rows(&tx, id)?;
         tx.commit()?;
         Ok(())
@@ -4744,7 +4744,7 @@ impl Store {
         }
         let mut job = ArtifactCleanupJob::attachments(attachment_paths);
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
+        let tx = write_transaction(&conn)?;
         insert_artifact_cleanup_job(&tx, &job, chrono::Utc::now())?;
         // The preparing request owns this job. A crashed request releases it
         // automatically when the bounded lease expires.
@@ -4778,7 +4778,7 @@ impl Store {
         requested_id: Option<&str>,
     ) -> Result<Option<ArtifactCleanupJob>> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
+        let tx = write_transaction(&conn)?;
         let now_at = chrono::Utc::now();
         let now = now_at.to_rfc3339();
         for _ in 0..MAX_POISONED_ARTIFACT_CLEANUP_ROWS_PER_CLAIM {
@@ -5073,8 +5073,8 @@ impl Store {
         parent: &str,
         kind: &str,
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         insert_thread_row(&tx, thread, model_options)?;
         tx.execute(
             "INSERT INTO spawned_threads (child_thread_id, parent_thread_id, kind)
@@ -5475,8 +5475,8 @@ impl Store {
         removed_ids: &[String],
         staging_cleanup_claim: Option<&ArtifactCleanupClaim>,
     ) -> Result<Option<Option<ArtifactCleanupJob>>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let Some(thread_id) = tx
             .query_row(
                 "SELECT thread_id FROM queued_prompts WHERE id = ?1 AND claimed = 0",
@@ -5564,8 +5564,8 @@ impl Store {
         &self,
         id: &str,
     ) -> Result<Option<(String, Option<ArtifactCleanupJob>)>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let Some((thread_id, attachments_json)) = tx
             .query_row(
                 "SELECT thread_id, attachments FROM queued_prompts
@@ -5614,8 +5614,8 @@ impl Store {
     /// queue; returns false (changing nothing) when it isn't, so a reorder
     /// racing a dispatch fails cleanly instead of corrupting positions.
     pub fn reorder_queued_prompts(&self, thread_id: &str, ids: &[String]) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let mut current: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM queued_prompts
@@ -5648,8 +5648,8 @@ impl Store {
         id: &str,
         claim: bool,
     ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let Some(mut prompt) = tx
             .query_row(
                 "SELECT thread_id, content, attachments, created_at
@@ -5705,8 +5705,8 @@ impl Store {
         &self,
         thread_id: &str,
     ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let front = tx
             .query_row(
                 "SELECT id, position, content, attachments, created_at FROM queued_prompts
@@ -5792,7 +5792,7 @@ impl Store {
         attachment_ids: &[String],
     ) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
+        let tx = write_transaction(&conn)?;
         let mut paths = Vec::with_capacity(attachment_ids.len());
         for attachment_id in attachment_ids {
             let path = tx
@@ -6044,8 +6044,8 @@ impl Store {
     }
 
     pub fn delete_custom_reviewer_profile(&self, id: &str) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let deleted = tx.execute(
             "DELETE FROM code_review_identities WHERE id = ?1 AND built_in = 0",
             params![id],
@@ -6514,8 +6514,8 @@ impl Store {
         head_sha: &str,
         config_hash: &str,
     ) -> Result<Vec<String>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let ids = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM code_review_jobs
@@ -6566,8 +6566,8 @@ impl Store {
         repository: &str,
         pull_number: u64,
     ) -> Result<Vec<String>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let ids = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM code_review_jobs
@@ -6682,8 +6682,8 @@ impl Store {
     }
 
     pub fn recover_code_review_jobs(&self) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         let interrupted_reviewers = {
             let mut stmt = tx.prepare(&format!(
@@ -6769,8 +6769,16 @@ impl Store {
     }
 
     pub fn claim_code_review_job(&self) -> Result<Option<CodeReviewJobRecord>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let queued = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_review_jobs WHERE status = 'queued')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !queued {
+            return Ok(None);
+        }
+        let tx = write_transaction(&conn)?;
         let id: Option<String> = tx
             .query_row(
                 "SELECT id FROM code_review_jobs WHERE status = 'queued'
@@ -6830,8 +6838,8 @@ impl Store {
         job_id: &str,
         digest: &str,
     ) -> Result<CodeReviewBatchSnapshotUpdate> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let (status, current_digest): (String, String) = tx.query_row(
             "SELECT status, review_batch_digest FROM code_review_jobs WHERE id = ?1",
             [job_id],
@@ -7037,8 +7045,8 @@ impl Store {
         job_id: &str,
         decisions: &[trouve_protocol::CodeReviewRoutingDecision],
     ) -> Result<Vec<trouve_protocol::CodeReviewRoutingDecision>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let existing: i64 = tx.query_row(
             "SELECT COUNT(*) FROM code_review_routing_decisions WHERE job_id = ?1",
             [job_id],
@@ -7462,8 +7470,8 @@ impl Store {
         if task_ids.is_empty() {
             return self.completed_code_review_personas(job_id);
         }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let running: bool = tx.query_row(
             "SELECT status = 'running' FROM code_review_jobs WHERE id = ?1",
             [job_id],
@@ -7530,8 +7538,8 @@ impl Store {
         id: &str,
         reviewer_id: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let old = tx
             .query_row(
                 &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
@@ -7630,8 +7638,8 @@ impl Store {
         findings: &[NewCodeReviewFinding],
         candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         tx.execute(
             "DELETE FROM code_review_finding_sources
              WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
@@ -7839,8 +7847,8 @@ impl Store {
             }
             trouve_protocol::CodeReviewFindingPublicationStatus::Failed => "failed",
         };
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let mut updated = 0;
         for id in ids {
             updated += tx.execute(
@@ -7935,8 +7943,8 @@ impl Store {
     /// backoff (one minute doubling up to one hour), so a persistently
     /// failing finding cannot consume API quota on every retry pass.
     pub fn defer_code_review_thread_collapse(&self, id: &str) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let attempts: i64 = tx
             .query_row(
                 "SELECT collapse_attempts FROM code_review_findings WHERE id = ?1",
@@ -8614,8 +8622,8 @@ impl Store {
         &self,
         id: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let state: Option<(String, bool)> = tx
             .query_row(
                 "SELECT status, publication_claimed FROM code_review_jobs WHERE id = ?1",
@@ -8667,8 +8675,8 @@ impl Store {
         &self,
         id: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let old = tx
             .query_row(
                 &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
@@ -8804,8 +8812,8 @@ impl Store {
         review_url: &str,
         finding_ids: &[&str],
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         for finding_id in finding_ids {
             tx.execute(
                 "UPDATE code_review_findings
@@ -8867,8 +8875,8 @@ impl Store {
         error: &str,
         retryable: bool,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let current_attempts = tx
             .query_row(
                 "SELECT projection_retry_count FROM code_review_jobs WHERE id = ?1",
@@ -9038,8 +9046,8 @@ impl Store {
         pull_number: u64,
         requested: bool,
     ) -> Result<Option<u64>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let previous: Option<(bool, i64)> = tx
             .query_row(
                 "SELECT manual_requested, manual_generation FROM code_review_pr_state
@@ -9071,8 +9079,8 @@ impl Store {
         delivery_id: &str,
         manual_request: Option<(&str, u64, &str)>,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO github_webhook_deliveries (delivery_id, received_at)
              VALUES (?1, ?2)",
@@ -9150,8 +9158,8 @@ impl Store {
         comment_id: u64,
         manual_request: Option<(u64, &str)>,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO code_review_polled_comments
                     (repository, comment_id, seen_at)
@@ -9207,8 +9215,8 @@ impl Store {
 
     /// Atomically replace a thread's provider transcript (context compaction).
     pub fn replace_messages(&self, thread_id: &str, payloads: &[serde_json::Value]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&mut conn)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         tx.execute(
             "DELETE FROM messages WHERE thread_id = ?1",
             params![thread_id],
@@ -9373,7 +9381,7 @@ impl Store {
         // One transaction: truncating the redo tail, clearing undo_pos, and
         // inserting the checkpoint must be all-or-nothing, or a crash between
         // them loses the redo tail without recording the new checkpoint.
-        let tx = conn.unchecked_transaction()?;
+        let tx = write_transaction(&conn)?;
         append_checkpoint_row(&tx, row, chrono::Utc::now())?;
         tx.commit()?;
         Ok(())
@@ -9671,6 +9679,41 @@ mod tests {
         let claimed = claim.join().unwrap().unwrap().unwrap();
         assert_eq!(claimed.job.status, "running");
         assert_eq!(claimed.job.pull_title, "Committed title");
+    }
+
+    #[test]
+    fn empty_code_review_claim_does_not_wait_for_a_concurrent_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static HIT_BUSY_HANDLER: AtomicBool = AtomicBool::new(false);
+
+        fn stop_waiting_for_writer(_: i32) -> bool {
+            HIT_BUSY_HANDLER.store(true, Ordering::SeqCst);
+            false
+        }
+
+        HIT_BUSY_HANDLER.store(false, Ordering::SeqCst);
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("empty-review-write-contention.sqlite3");
+        let store = Store::open(&database).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .busy_handler(Some(stop_waiting_for_writer))
+            .unwrap();
+
+        let mut blocker = Connection::open(&database).unwrap();
+        let blocker_tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        assert!(store.claim_code_review_job().unwrap().is_none());
+        assert!(
+            !HIT_BUSY_HANDLER.load(Ordering::SeqCst),
+            "an empty review poll tried to reserve SQLite's writer slot"
+        );
+        blocker_tx.rollback().unwrap();
     }
 
     #[test]
