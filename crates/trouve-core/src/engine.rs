@@ -11248,6 +11248,13 @@ impl Engine {
                         mut attachment_cleanup,
                         response,
                     } = command;
+                    // Cancellation can arrive while the selected steer command
+                    // flushes pending backend events. Reject it before either
+                    // persisting the user message or calling the backend.
+                    if cancel.is_cancelled() {
+                        let _ = response.send(Err("turn cancelled".into()));
+                        break;
+                    }
                     let staged = attachment_rows
                         .iter()
                         .map(|(attachment, path)| AttachmentMaterializationFile {
@@ -11255,31 +11262,37 @@ impl Engine {
                             source: PathBuf::from(path),
                         })
                         .collect::<Vec<_>>();
-                    let lane = self.tool_execution_lock(&session.id);
-                    let _materialization_permit = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            let _ = response.send(Err("turn cancelled".into()));
-                            bail!("turn cancelled");
+                    // Text-only steering does not touch the worktree and must
+                    // reach the active vendor turn even while one of its tools
+                    // owns the session mutation lane.
+                    let materialized = if staged.is_empty() {
+                        Vec::new()
+                    } else {
+                        let lane = self.tool_execution_lock(&session.id);
+                        let _materialization_permit = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                let _ = response.send(Err("turn cancelled".into()));
+                                bail!("turn cancelled");
+                            }
+                            permit = lane.write_owned() => permit,
+                        };
+                        match self.executor.materialize_attachments(
+                            &AttachmentMaterialization {
+                                source_root: self.data_dir.join("attachments"),
+                                managed_worktree_root: self.data_dir.join("worktrees"),
+                                worktree: PathBuf::from(&session.worktree_path),
+                                files: staged,
+                                cancel: cancel.clone(),
+                            },
+                        ).await {
+                            Ok(materialized) => materialized,
+                            Err(error) => {
+                                let _ = response.send(Err(error.clone()));
+                                bail!("steering attachment materialization failed: {error}");
+                            }
                         }
-                        permit = lane.write_owned() => permit,
                     };
-                    let materialized = match self.executor.materialize_attachments(
-                        &AttachmentMaterialization {
-                            source_root: self.data_dir.join("attachments"),
-                            managed_worktree_root: self.data_dir.join("worktrees"),
-                            worktree: PathBuf::from(&session.worktree_path),
-                            files: staged,
-                            cancel: cancel.clone(),
-                        },
-                    ).await {
-                        Ok(materialized) => materialized,
-                        Err(error) => {
-                            let _ = response.send(Err(error.clone()));
-                            bail!("steering attachment materialization failed: {error}");
-                        }
-                    };
-                    drop(_materialization_permit);
                     let (images, files): (Vec<_>, Vec<_>) = materialized
                         .into_iter()
                         .partition(|file| file.attachment.mime.starts_with("image/"));
