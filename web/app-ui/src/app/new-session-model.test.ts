@@ -256,6 +256,38 @@ describe("new session model", () => {
     });
   });
 
+  it("preserves explicit selections while reconnect metadata is reconciled", () => {
+    const selectedModel = model({
+      properties: {
+        thinking_level: { type: "string", enum: ["low", "high"], default: "high" },
+      },
+    }, "provider/selected");
+    const selections = {
+      modeId: "review",
+      modelId: selectedModel.id,
+      thinking: "low",
+      permissionMode: "ask",
+    };
+    const reviewMode: ProtocolAgentPersona = {
+      ...mode("provider/default"),
+      id: "review",
+      default_permission_mode: "yolo",
+      default_thinking_level: "high",
+    };
+
+    expect(reconcileNewThreadDefaults(
+      selections,
+      [mode("provider/default"), reviewMode],
+      [model({}, "provider/default"), selectedModel],
+      providers("provider/default"),
+      { mode: true, model: true, thinking: true, permission: true },
+    )).toMatchObject({
+      ...selections,
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+    });
+  });
+
   it("uses live availability without replacing authoritative static metadata", () => {
     const staticModel = model({}, "provider/static");
     const unavailableStatic = model({}, "provider/unavailable");

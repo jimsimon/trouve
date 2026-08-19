@@ -89,8 +89,14 @@ describe("root shell parity wiring", () => {
       'if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "")',
     );
     expect(source).toContain(
-      "void this.#loadNewSessionOptions(this.#newSessionWorkspaceId)",
+      "void this.#loadNewSessionOptions(this.#newSessionWorkspaceId, true)",
     );
+    const submissionSnapshot = source.indexOf("const submissionOptions = {");
+    expect(submissionSnapshot).toBeGreaterThan(0);
+    expect(source.indexOf(
+      "await this.#generateSessionTitle(prompt)",
+      submissionSnapshot,
+    )).toBeGreaterThan(submissionSnapshot);
     expect(source).toContain(
       "this.#reconcileNewSessionDefaults(this.#newSessionModels)",
     );

@@ -505,7 +505,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#startProtocolIngress();
     }
     if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "") {
-      void this.#loadNewSessionOptions(this.#newSessionWorkspaceId);
+      void this.#loadNewSessionOptions(this.#newSessionWorkspaceId, true);
     }
   }
 
@@ -1667,16 +1667,21 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionLiveUnsubscribe = undefined;
   }
 
-  async #loadNewSessionOptions(workspaceId: string): Promise<void> {
+  async #loadNewSessionOptions(
+    workspaceId: string,
+    preserveSelections = false,
+  ): Promise<void> {
     const generation = ++this.#newSessionOptionsGeneration;
     this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionOptionsPending = true;
     this.#newSessionOptionsError = "";
-    this.#newSessionOptionsWorkspaceId = "";
-    this.#newSessionOptionEdits = createNewThreadOptionEdits();
-    // Until this workspace's metadata arrives, preserve the values shown as explicit choices.
-    this.#newSessionInheritedPermissionMode = undefined;
-    this.#newSessionInheritedThinking = undefined;
+    if (!preserveSelections) {
+      this.#newSessionOptionsWorkspaceId = "";
+      this.#newSessionOptionEdits = createNewThreadOptionEdits();
+      // Until this workspace's metadata arrives, preserve displayed values as explicit choices.
+      this.#newSessionInheritedPermissionMode = undefined;
+      this.#newSessionInheritedThinking = undefined;
+    }
     this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current);
     this.requestUpdate();
 
@@ -2032,6 +2037,26 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       workspaceId === ""
       || (prompt === "" && this.#newSessionAttachments.length === 0)
     ) return;
+    const modeId = this.#newSessionModeId;
+    const modelId = this.#newSessionModelId;
+    const selectedMode = this.#newSessionModes.find((mode) => mode.id === modeId);
+    const effectiveModel = resolveNewSessionModel(
+      modelId,
+      selectedMode,
+      this.#newSessionProviders,
+    );
+    const submissionOptions = {
+      modeId,
+      modelId,
+      thinking: this.#newSessionThinking,
+      permissionMode: String(data.get("permission_mode") ?? ""),
+      inheritedPermissionMode: this.#newSessionInheritedPermissionMode,
+      inheritedThinking: this.#newSessionInheritedThinking,
+      modelInfo: this.#availableNewSessionModels().find(
+        (model) => model.id === effectiveModel,
+      ),
+      attachments: this.#newSessionAttachments.map(({ upload }) => upload),
+    } as const;
     this.#newSessionPending = true;
     this.#newSessionError = "";
     this.requestUpdate();
@@ -2062,39 +2087,29 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#store.upsertSessionMetadata(session);
     let threadId: string | undefined;
     try {
-      const selectedMode = this.#newSessionModes.find(
-        (mode) => mode.id === this.#newSessionModeId,
-      );
-      const effectiveModel = resolveNewSessionModel(
-        this.#newSessionModelId,
-        selectedMode,
-        this.#newSessionProviders,
-      );
-      const modelInfo = this.#availableNewSessionModels().find(
-        (model) => model.id === effectiveModel,
-      );
-      const permissionMode = String(data.get("permission_mode") ?? "");
       const thread = await this.#protocolClient.createThread(
         createNewSessionThreadRequest({
           sessionId: session.id,
           title: session.title,
-          mode: this.#newSessionModeId,
-          model: this.#newSessionModelId,
+          mode: submissionOptions.modeId,
+          model: submissionOptions.modelId,
           ...(
-            permissionMode === "ask" ||
-            permissionMode === "allow_list" ||
-            permissionMode === "yolo"
-              ? { permissionMode }
+            submissionOptions.permissionMode === "ask"
+            || submissionOptions.permissionMode === "allow_list"
+            || submissionOptions.permissionMode === "yolo"
+              ? { permissionMode: submissionOptions.permissionMode }
               : {}
           ),
-          thinking: this.#newSessionThinking,
-          ...(this.#newSessionInheritedPermissionMode === undefined
+          thinking: submissionOptions.thinking,
+          ...(submissionOptions.inheritedPermissionMode === undefined
             ? {}
-            : { inheritedPermissionMode: this.#newSessionInheritedPermissionMode }),
-          ...(this.#newSessionInheritedThinking === undefined
+            : { inheritedPermissionMode: submissionOptions.inheritedPermissionMode }),
+          ...(submissionOptions.inheritedThinking === undefined
             ? {}
-            : { inheritedThinking: this.#newSessionInheritedThinking }),
-          ...(modelInfo === undefined ? {} : { modelInfo }),
+            : { inheritedThinking: submissionOptions.inheritedThinking }),
+          ...(submissionOptions.modelInfo === undefined
+            ? {}
+            : { modelInfo: submissionOptions.modelInfo }),
         }),
       );
       this.#store.upsertThread(thread);
@@ -2106,13 +2121,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       try {
         await this.#protocolClient.sendMessage(threadId, {
           content: prompt,
-          ...(this.#newSessionAttachments.length === 0
+          ...(submissionOptions.attachments.length === 0
             ? {}
-            : {
-                attachments: this.#newSessionAttachments.map(
-                  ({ upload }) => upload,
-                ),
-              }),
+            : { attachments: submissionOptions.attachments }),
         });
       } catch {
         this.#shellNotice = "Session and thread created, but the initial prompt could not be sent.";
