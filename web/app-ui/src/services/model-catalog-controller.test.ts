@@ -14,10 +14,12 @@ const model = (id: string): ProtocolModelInfo => ({
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
     resolve = accept;
+    reject = decline;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 };
 
 describe("ModelCatalogController", () => {
@@ -147,6 +149,42 @@ describe("ModelCatalogController", () => {
     expect(staticCalls).toBe(2);
     expect(readSignal(controller.staticCurrent).map(({ id }) => id)).toEqual([
       "codex/gpt-5.6-sol",
+    ]);
+  });
+
+  it("uses a cached static snapshot when a forced reload fails", async () => {
+    const forcedStatic = deferred<readonly ProtocolModelInfo[]>();
+    let staticCalls = 0;
+    const controller = new ModelCatalogController({
+      models: () => {
+        staticCalls += 1;
+        return staticCalls === 1
+          ? Promise.resolve([model("cursor/cached")])
+          : forcedStatic.promise;
+      },
+      refreshModels: async () => [model("cursor/live")],
+    });
+
+    await controller.refresh();
+    await vi.waitFor(() => expect(readSignal(controller.current)).toEqual([
+      model("cursor/live"),
+    ]));
+
+    const force = controller.refresh("force");
+    await vi.waitFor(() => expect(staticCalls).toBe(2));
+    const joinedStatic = controller.staticModels();
+    const forceRejected = expect(force).rejects.toThrow("reload failed");
+    const joinedResolved = expect(joinedStatic).resolves.toEqual([
+      model("cursor/cached"),
+    ]);
+
+    forcedStatic.reject(new Error("reload failed"));
+    await Promise.all([forceRejected, joinedResolved]);
+    expect(readSignal(controller.staticCurrent)).toEqual([
+      model("cursor/cached"),
+    ]);
+    expect(readSignal(controller.current)).toEqual([
+      model("cursor/live"),
     ]);
   });
 });

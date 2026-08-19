@@ -234,19 +234,30 @@ export const reconcileNewThreadDefaults = (
   edits: NewThreadOptionEdits,
   selectableModels: readonly ProtocolModelInfo[] = models,
 ): ResolvedNewThreadDefaults => {
-  const initial = resolveNewThreadDefaults(modes, models, providers);
+  const initial = resolveNewThreadDefaults(modes, selectableModels, providers);
   const modeId = edits.mode && modes.some((mode) => mode.id === selections.modeId)
     ? selections.modeId
     : initial.modeId;
-  const modeDefaults = resolveNewThreadDefaults(modes, models, providers, { modeId });
+  const modeDefaults = resolveNewThreadDefaults(
+    modes,
+    selectableModels,
+    providers,
+    { modeId },
+  );
   const keepModel = edits.model
     && selectableModels.some((model) => model.id === selections.modelId);
   const modelId = keepModel
     ? selections.modelId
     : modeDefaults.modelId;
-  const effectiveModels = keepModel ? selectableModels : models;
-  const refreshed = resolveNewThreadDefaults(modes, effectiveModels, providers, { modeId, modelId });
-  const option = thinkingOption(effectiveModels.find((model) => model.id === refreshed.modelId));
+  const refreshed = resolveNewThreadDefaults(
+    modes,
+    selectableModels,
+    providers,
+    { modeId, modelId },
+  );
+  const option = thinkingOption(
+    selectableModels.find((model) => model.id === refreshed.modelId),
+  );
   const keepThinking = edits.thinking
     && option?.values.includes(selections.thinking) === true;
   const permissionMode = validPermissionMode(selections.permissionMode);

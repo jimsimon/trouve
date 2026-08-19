@@ -289,6 +289,27 @@ describe("new session model", () => {
     });
   });
 
+  it("replaces an untouched configured default that live discovery removed", () => {
+    const unavailableDefault = model({}, "provider/unavailable");
+    const available = model({}, "provider/available");
+
+    expect(reconcileNewThreadDefaults(
+      {
+        modeId: "code",
+        modelId: "provider/unavailable",
+        thinking: "",
+        permissionMode: "ask",
+      },
+      [mode("provider/unavailable")],
+      [unavailableDefault, available],
+      providers("provider/unavailable"),
+      createNewThreadOptionEdits(),
+      [available],
+    )).toMatchObject({
+      modelId: "provider/available",
+    });
+  });
+
   it("emits displayed schema and safety fallbacks when metadata is unavailable", () => {
     const modelInfo = model({
       properties: {

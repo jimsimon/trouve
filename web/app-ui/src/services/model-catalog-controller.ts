@@ -66,7 +66,11 @@ export class ModelCatalogController {
 
   /** Authoritative offline-safe metadata used to resolve configured defaults. */
   staticModels(): Promise<readonly ProtocolModelInfo[]> {
-    if (this.#staticPending !== undefined) return this.#staticPending;
+    if (this.#staticPending !== undefined) {
+      return this.#staticLoaded
+        ? this.#staticPending.catch(() => this.#static.get())
+        : this.#staticPending;
+    }
     const current = this.#static.get();
     return this.#staticLoaded ? Promise.resolve(current) : this.#loadStatic();
   }
