@@ -46,6 +46,7 @@ const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 /// paginated thread walk. Ordinary pull discovery and review enqueueing for
 /// later repositories therefore never wait behind several slow walks.
 const REVIEW_RECONCILIATION_PASS_BUDGET: Duration = Duration::from_secs(45);
+const REVIEW_THREAD_VERIFICATION_EPOCH: Duration = Duration::from_secs(90);
 const REVIEW_RECONCILIATION_FAILURE_RESET_THRESHOLD: u32 = 3;
 const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
@@ -343,6 +344,7 @@ struct ReviewThreadListingProgress {
     threads: HashMap<u64, (String, bool)>,
     refreshed_states: HashMap<String, bool>,
     verification_states: HashMap<String, bool>,
+    verification_started_at: Option<Instant>,
     cursor: Option<String>,
     listing_complete: bool,
     saved_at: Instant,
@@ -354,6 +356,7 @@ impl ReviewThreadListingProgress {
             threads: HashMap::new(),
             refreshed_states: HashMap::new(),
             verification_states: HashMap::new(),
+            verification_started_at: None,
             cursor: None,
             listing_complete: false,
             saved_at: Instant::now(),
@@ -420,6 +423,19 @@ fn review_thread_listing_is_authoritative(
 
 fn review_thread_was_reopened(previous: Option<bool>, current: bool) -> bool {
     previous == Some(true) && !current
+}
+
+fn prepare_review_thread_verification_epoch(
+    progress: &mut ReviewThreadListingProgress,
+    now: Instant,
+) {
+    let expired = progress.verification_started_at.is_some_and(|started_at| {
+        now.saturating_duration_since(started_at) >= REVIEW_THREAD_VERIFICATION_EPOCH
+    });
+    if progress.verification_started_at.is_none() || expired {
+        progress.verification_states.clear();
+        progress.verification_started_at = Some(now);
+    }
 }
 
 #[derive(Clone)]
@@ -3401,12 +3417,39 @@ impl Engine {
                 break;
             }
             let key = candidate.key();
-            let outcome = async {
-                let api = self
-                    .installation_api(candidate.repository.installation_id)
-                    .await
-                    .context("refreshing GitHub App credentials before reconciliation")?;
-                self.reconcile_user_resolved_review_findings(
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let api = match tokio::time::timeout(
+                remaining,
+                self.installation_api(candidate.repository.installation_id),
+            )
+            .await
+            {
+                Ok(Ok(api)) => api,
+                Ok(Err(error)) => {
+                    self.code_review
+                        .thread_reconciled_at
+                        .lock()
+                        .unwrap()
+                        .insert(key, Instant::now());
+                    first_error.get_or_insert(error.context(format!(
+                        "refreshing GitHub App credentials before reconciliation for {}#{}",
+                        candidate.repository.repository, candidate.pull.number
+                    )));
+                    continue;
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        anyhow!(
+                            "refreshing GitHub App credentials before reconciliation for {}#{} timed out",
+                            candidate.repository.repository,
+                            candidate.pull.number
+                        )
+                    });
+                    break;
+                }
+            };
+            let outcome = self
+                .reconcile_user_resolved_review_findings(
                     &api,
                     &candidate.repository,
                     &candidate.reviewers,
@@ -3415,14 +3458,12 @@ impl Engine {
                     deadline,
                 )
                 .await
-            }
-            .await
-            .with_context(|| {
-                format!(
-                    "reconciling resolved review findings for {}#{}",
-                    candidate.repository.repository, candidate.pull.number
-                )
-            });
+                .with_context(|| {
+                    format!(
+                        "reconciling resolved review findings for {}#{}",
+                        candidate.repository.repository, candidate.pull.number
+                    )
+                });
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -7125,6 +7166,7 @@ impl Engine {
         // cannot cover the verification, keep the accumulated cursor/state
         // progress and retry only this final verification next poll.
         let authoritative_states = if refresh_resumed {
+            prepare_review_thread_verification_epoch(&mut progress, Instant::now());
             let mut missing_thread_ids = HashSet::new();
             let unverified_thread_ids = thread_ids
                 .iter()
@@ -9783,6 +9825,23 @@ mod tests {
         assert!(!review_thread_was_reopened(None, false));
         assert!(!review_thread_was_reopened(Some(false), false));
         assert!(!review_thread_was_reopened(Some(true), true));
+    }
+
+    #[test]
+    fn review_thread_verification_progress_expires_as_one_epoch() {
+        let now = Instant::now();
+        let mut progress = ReviewThreadListingProgress::new();
+        progress.verification_started_at = Some(now);
+        progress.verification_states.insert("thread-1".into(), true);
+        prepare_review_thread_verification_epoch(&mut progress, now + Duration::from_secs(89));
+        assert_eq!(progress.verification_states.get("thread-1"), Some(&true));
+
+        prepare_review_thread_verification_epoch(&mut progress, now + Duration::from_secs(90));
+        assert!(progress.verification_states.is_empty());
+        assert_eq!(
+            progress.verification_started_at,
+            Some(now + Duration::from_secs(90))
+        );
     }
 
     #[test]
@@ -13525,6 +13584,7 @@ mod tests {
             threads: HashMap::from([(comment_id, (format!("T{comment_id}"), false))]),
             refreshed_states: HashMap::new(),
             verification_states: HashMap::new(),
+            verification_started_at: None,
             cursor: Some(format!("c{comment_id}")),
             listing_complete: false,
             saved_at,
@@ -13940,6 +14000,7 @@ mod tests {
                     threads: HashMap::from([(9000, ("thread-9000".into(), false))]),
                     refreshed_states: HashMap::new(),
                     verification_states: HashMap::new(),
+                    verification_started_at: None,
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -14025,6 +14086,7 @@ mod tests {
                     ]),
                     refreshed_states: HashMap::new(),
                     verification_states: HashMap::new(),
+                    verification_started_at: None,
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -14064,15 +14126,14 @@ mod tests {
                 HashMap::from([("thread-9000".into(), true)])
             );
         }
-        engine
-            .code_review
-            .thread_listing_progress
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .unwrap()
-            .verification_states
-            .insert("thread-9000".into(), false);
+        {
+            let mut cache = engine.code_review.thread_listing_progress.lock().unwrap();
+            let progress = cache.get_mut(&key).unwrap();
+            progress.verification_started_at = Some(Instant::now());
+            progress
+                .verification_states
+                .insert("thread-9000".into(), false);
+        }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

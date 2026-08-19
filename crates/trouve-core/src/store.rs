@@ -334,6 +334,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   publication_accepted INTEGER NOT NULL DEFAULT 0,
   publication_generation INTEGER NOT NULL DEFAULT 0,
+  publication_order INTEGER NOT NULL DEFAULT 0,
   review_published INTEGER NOT NULL DEFAULT 0,
   blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0,
   blocking_review_cleanup_page INTEGER NOT NULL DEFAULT 1,
@@ -464,6 +465,7 @@ CREATE TABLE IF NOT EXISTS code_review_pr_state (
   last_reviewed_head_sha TEXT NOT NULL DEFAULT '',
   last_reviewed_base_sha TEXT NOT NULL DEFAULT '',
   last_reviewed_at TEXT,
+  last_reviewed_publication_order INTEGER NOT NULL DEFAULT 0,
   lifecycle_comment_id INTEGER,
   lifecycle_comment_url TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (repository, pull_number)
@@ -567,6 +569,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN publication_claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_accepted INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_generation INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_order INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN review_published INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_page INTEGER NOT NULL DEFAULT 1",
@@ -589,6 +592,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_head_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_base_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_at TEXT",
+    "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_publication_order INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_comment_id INTEGER",
     "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_comment_url TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_identities ADD COLUMN thinking_level TEXT",
@@ -618,6 +622,19 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN publication_resolution_job_id TEXT",
+    "UPDATE code_review_jobs
+       SET publication_order = rowid
+       WHERE publication_order = 0 AND publication_claimed != 0",
+    "UPDATE code_review_pr_state
+       SET last_reviewed_publication_order = COALESCE((
+         SELECT MAX(job.publication_order)
+         FROM code_review_jobs AS job
+         WHERE job.repository = code_review_pr_state.repository
+           AND job.pull_number = code_review_pr_state.pull_number
+           AND job.head_sha = code_review_pr_state.last_reviewed_head_sha
+           AND job.review_published != 0
+       ), 0)
+       WHERE last_reviewed_publication_order = 0",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
 ];
@@ -9507,7 +9524,17 @@ impl Store {
 
     pub fn claim_code_review_publication(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET publication_claimed = 1
+            "UPDATE code_review_jobs
+             SET publication_claimed = 1,
+                 publication_order = CASE
+                   WHEN publication_order != 0 THEN publication_order
+                   ELSE (
+                     SELECT COALESCE(MAX(existing.publication_order), 0) + 1
+                     FROM code_review_jobs AS existing
+                     WHERE existing.repository = code_review_jobs.repository
+                       AND existing.pull_number = code_review_jobs.pull_number
+                   )
+                 END
              WHERE id = ?1 AND status = 'running'
                AND cancel_requested = 0 AND publication_claimed = 0
                AND NOT EXISTS (
@@ -9539,7 +9566,8 @@ impl Store {
     pub fn release_code_review_publication_claim(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET publication_claimed = 0, publication_accepted = 0
+             SET publication_claimed = 0, publication_accepted = 0,
+                 publication_order = 0
              WHERE id = ?1 AND publication_accepted = 0",
             params![id],
         )? > 0)
@@ -9647,16 +9675,19 @@ impl Store {
         tx.execute(
             "INSERT INTO code_review_pr_state
                         (repository, pull_number, last_reviewed_head_sha,
-                         last_reviewed_base_sha, last_reviewed_at)
-                 SELECT repository, pull_number, head_sha, base_ref, created_at
+                         last_reviewed_base_sha, last_reviewed_at,
+                         last_reviewed_publication_order)
+                 SELECT repository, pull_number, head_sha, base_ref, created_at,
+                        publication_order
                  FROM code_review_jobs
                  WHERE id = ?1 AND ?2
                  ON CONFLICT(repository, pull_number) DO UPDATE SET
                    last_reviewed_head_sha = excluded.last_reviewed_head_sha,
                    last_reviewed_base_sha = excluded.last_reviewed_base_sha,
-                   last_reviewed_at = excluded.last_reviewed_at
-                 WHERE code_review_pr_state.last_reviewed_at IS NULL
-                    OR code_review_pr_state.last_reviewed_at <= excluded.last_reviewed_at",
+                   last_reviewed_at = excluded.last_reviewed_at,
+                   last_reviewed_publication_order = excluded.last_reviewed_publication_order
+                 WHERE code_review_pr_state.last_reviewed_publication_order
+                       <= excluded.last_reviewed_publication_order",
             params![id, current_publication],
         )?;
         tx.commit()?;
@@ -9812,12 +9843,15 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
-                     last_reviewed_base_sha, last_reviewed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                     last_reviewed_base_sha, last_reviewed_at,
+                     last_reviewed_publication_order)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)
              ON CONFLICT(repository, pull_number) DO UPDATE SET
                last_reviewed_head_sha = excluded.last_reviewed_head_sha,
                last_reviewed_base_sha = excluded.last_reviewed_base_sha,
-               last_reviewed_at = excluded.last_reviewed_at",
+               last_reviewed_at = excluded.last_reviewed_at,
+               last_reviewed_publication_order =
+                 code_review_pr_state.last_reviewed_publication_order + 1",
             params![
                 repository,
                 pull_number as i64,
@@ -9977,8 +10011,10 @@ impl Store {
         tx.execute(
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
-                     last_reviewed_base_sha, last_reviewed_at)
-             SELECT repository, pull_number, head_sha, base_ref, created_at
+                     last_reviewed_base_sha, last_reviewed_at,
+                     last_reviewed_publication_order)
+             SELECT repository, pull_number, head_sha, base_ref, created_at,
+                    publication_order
              FROM code_review_jobs
              WHERE id = ?1 AND status = 'running'
                AND repository = ?2 AND pull_number = ?3
@@ -9987,9 +10023,10 @@ impl Store {
              ON CONFLICT(repository, pull_number) DO UPDATE SET
                last_reviewed_head_sha = excluded.last_reviewed_head_sha,
                last_reviewed_base_sha = excluded.last_reviewed_base_sha,
-               last_reviewed_at = excluded.last_reviewed_at
-             WHERE code_review_pr_state.last_reviewed_at IS NULL
-                OR code_review_pr_state.last_reviewed_at <= excluded.last_reviewed_at",
+               last_reviewed_at = excluded.last_reviewed_at,
+               last_reviewed_publication_order = excluded.last_reviewed_publication_order
+             WHERE code_review_pr_state.last_reviewed_publication_order
+                   <= excluded.last_reviewed_publication_order",
             params![
                 id,
                 repository,
@@ -15521,13 +15558,24 @@ mod tests {
             .unwrap()
             .execute(
                 "UPDATE code_review_jobs
-                 SET status = 'failed', publication_claimed = 1,
+                 SET status = 'running', publication_claimed = 0, cancel_requested = 0,
                      head_sha = CASE WHEN id = ?1 THEN 'older-head' ELSE 'newer-head' END,
                      created_at = CASE
                          WHEN id = ?1 THEN '2026-01-01T00:00:00Z'
                          ELSE '2026-01-02T00:00:00Z'
                      END
                  WHERE id IN (?1, ?2)",
+                params![older.id, newer.id],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&older.id).unwrap());
+        assert!(store.claim_code_review_publication(&newer.id).unwrap());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'failed' WHERE id IN (?1, ?2)",
                 params![older.id, newer.id],
             )
             .unwrap();
@@ -15559,7 +15607,7 @@ mod tests {
             .unwrap()
             .execute(
                 "UPDATE code_review_jobs
-                 SET status = 'running', publication_claimed = 1,
+                 SET status = 'running', publication_claimed = 0, cancel_requested = 0,
                      head_sha = CASE WHEN id = ?1 THEN 'older-head' ELSE 'newer-head' END,
                      created_at = CASE
                          WHEN id = ?1 THEN '2026-01-01T00:00:00Z'
@@ -15567,6 +15615,36 @@ mod tests {
                      END
                  WHERE id IN (?1, ?2)",
                 params![older.id, newer.id],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&older.id).unwrap());
+        assert!(store.claim_code_review_publication(&newer.id).unwrap());
+
+        let orders: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT older.publication_order, newer.publication_order
+                 FROM code_review_jobs AS older, code_review_jobs AS newer
+                 WHERE older.id = ?1 AND newer.id = ?2",
+                params![older.id, newer.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(orders.0 < orders.1);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO code_review_pr_state
+                        (repository, pull_number, last_reviewed_head_sha,
+                         last_reviewed_base_sha, last_reviewed_at,
+                         last_reviewed_publication_order)
+                 VALUES (?1, ?2, 'legacy-head', 'legacy-base',
+                         '2030-01-01T00:00:00Z', 0)",
+                params![older.repository, older.pull_number as i64],
             )
             .unwrap();
 
