@@ -3517,6 +3517,9 @@ fn apply_store_mutation(
 }
 
 fn code_review_outbox_rows_exist(conn: &Connection, ids: &[i64]) -> rusqlite::Result<bool> {
+    if ids.is_empty() {
+        return Ok(true);
+    }
     let mut stmt = conn
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM code_review_pending_events WHERE id = ?1)")?;
     for id in ids {
@@ -4838,12 +4841,13 @@ impl Store {
         requested_id: Option<&str>,
     ) -> Result<Option<ArtifactCleanupJob>> {
         let conn = self.conn.lock().unwrap();
-        let now_at = chrono::Utc::now();
-        let now = now_at.to_rfc3339();
-        if !artifact_cleanup_job_is_claimable(&conn, requested_id, &now)? {
+        let probe_now = chrono::Utc::now().to_rfc3339();
+        if !artifact_cleanup_job_is_claimable(&conn, requested_id, &probe_now)? {
             return Ok(None);
         }
         let tx = write_transaction(&conn)?;
+        let now_at = chrono::Utc::now();
+        let now = now_at.to_rfc3339();
         for _ in 0..MAX_POISONED_ARTIFACT_CLEANUP_ROWS_PER_CLAIM {
             let raw: Option<RawArtifactCleanupJob> = if let Some(id) = requested_id {
                 tx.query_row(
