@@ -11000,6 +11000,13 @@ impl Engine {
                         mut attachment_cleanup,
                         response,
                     } = command;
+                    // Cancellation can arrive while the selected steer command
+                    // flushes pending backend events. Reject it before either
+                    // persisting the user message or calling the backend.
+                    if cancel.is_cancelled() {
+                        let _ = response.send(Err("turn cancelled".into()));
+                        bail!("turn cancelled");
+                    }
                     let staged = attachment_rows
                         .iter()
                         .map(|(attachment, path)| AttachmentMaterializationFile {
