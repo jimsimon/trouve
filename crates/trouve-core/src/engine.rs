@@ -2328,13 +2328,10 @@ impl Engine {
                 Ok(false) => continue,
                 Err(error) => {
                     tracing::warn!(persona_id = %claim.id, %error, "failed to recheck persona deletion intent");
-                    if let Err(release_error) = self
-                        .store
-                        .release_persona_deletion_claim(&claim.id, &claim.token)
-                    {
-                        tracing::warn!(persona_id = %claim.id, %release_error, "failed to release persona deletion claim after recheck error");
+                    if let Err(store_error) = self.store.fail_claimed_persona_deletion(&claim) {
+                        tracing::warn!(persona_id = %claim.id, %store_error, "failed to back off persona deletion after recheck error");
                     }
-                    continue;
+                    break;
                 }
             }
             let result = self
@@ -4712,17 +4709,44 @@ impl Engine {
             default_model: req.default_model,
             default_thinking_level: req.default_thinking_level,
         };
+        let mutation = self.persona_mutations.clone().lock_owned().await;
         if legacy_reviewer {
             if persona.group != trouve_protocol::PersonaGroup::Reviewer {
                 return Err(EngineError::BadRequest(
                     "legacy reviewer personas cannot be moved to the general group".into(),
                 ));
             }
+            let existing = self
+                .store
+                .list_custom_reviewer_profiles()?
+                .into_iter()
+                .find(|reviewer| reviewer.id == id)
+                .expect("legacy reviewer was validated above");
+            let policy = crate::reviewers::reviewer_as_persona(&existing);
+            if persona.allowed_tools != policy.allowed_tools
+                || persona.read_only != policy.read_only
+                || persona.default_permission_mode != policy.default_permission_mode
+            {
+                return Err(EngineError::BadRequest(
+                    "legacy reviewer policy fields cannot be changed until the reviewer is migrated"
+                        .into(),
+                ));
+            }
+            let replacement_claim = if self.store.persona_deletion_pending(id)? {
+                Some(self.store.claim_persona_deletion(id)?.ok_or_else(|| {
+                    EngineError::BadRequest(format!("persona {id} is currently being deleted"))
+                })?)
+            } else {
+                None
+            };
             self.store
                 .upsert_reviewer_profile(&crate::reviewers::persona_as_reviewer(&persona, false))?;
+            if let Some(claim) = replacement_claim {
+                self.store.cancel_claimed_persona_deletion(id, &claim)?;
+            }
+            drop(mutation);
             return Ok(());
         }
-        let mutation = self.persona_mutations.clone().lock_owned().await;
         let current = self.resolve_personas(None)?;
         if personas::find_persona(&current, id).is_some_and(|existing| {
             existing.group == trouve_protocol::PersonaGroup::Reviewer
@@ -4770,7 +4794,12 @@ impl Engine {
             let id = id.to_string();
             return tokio::spawn(async move {
                 let _mutation = mutation;
-                let write = executor.upsert_persona_file(&config_dir, &persona);
+                let write = executor.replace_persona_file(
+                    &config_dir,
+                    &persona,
+                    store.clone(),
+                    claim.clone(),
+                );
                 tokio::pin!(write);
                 let period = Duration::from_secs(60);
                 let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -4789,7 +4818,6 @@ impl Engine {
                     store.release_persona_deletion_claim(&id, &claim)?;
                     return Err(EngineError::Internal(anyhow::anyhow!(error)));
                 }
-                store.cancel_claimed_persona_deletion(&id, &claim)?;
                 Ok(())
             })
             .await
@@ -4830,6 +4858,14 @@ impl Engine {
         let custom_reviewer = reviewer_catalog
             .iter()
             .any(|reviewer| reviewer.id == id && !reviewer.built_in);
+        if custom_reviewer
+            && !personas::is_valid_persona_id(id)
+            && personas::legacy_user_persona_file(config_dir, id)?
+        {
+            return Err(EngineError::BadRequest(format!(
+                "legacy reviewer {id} is shadowed by a persona file; remove that file before deleting the reviewer"
+            )));
+        }
         let system_persona = personas::builtin_personas()
             .iter()
             .any(|persona| persona.id == id)
@@ -14942,8 +14978,19 @@ mod tests {
             .unwrap();
         let engine = Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
             .with_config_dir(Some(tmp.path().join("config")));
-        let mut request = persona_request("Updated legacy");
-        request.group = trouve_protocol::PersonaGroup::Reviewer;
+        let policy = crate::reviewers::reviewer_as_persona(
+            &store.list_custom_reviewer_profiles().unwrap()[0],
+        );
+        let request = trouve_protocol::UpsertPersonaRequest {
+            display_name: "Updated legacy".into(),
+            group: policy.group,
+            system_prompt: policy.system_prompt,
+            allowed_tools: policy.allowed_tools,
+            read_only: policy.read_only,
+            default_permission_mode: policy.default_permission_mode,
+            default_model: policy.default_model,
+            default_thinking_level: policy.default_thinking_level,
+        };
 
         engine
             .upsert_persona("custom:legacy", request)

@@ -230,14 +230,14 @@ pub fn resolve_personas(
 ) -> Vec<AgentPersona> {
     let mut personas = builtin_personas();
     if let Some(dir) = config_dir {
-        let bases = personas.clone();
+        let bases = builtin_personas();
         load_dir(
             &dir.join("modes"),
             &mut personas,
             &bases,
             PersonaGroup::General,
         );
-        let bases = personas.clone();
+        let bases = builtin_personas();
         load_dir(
             &dir.join("personas"),
             &mut personas,
@@ -383,8 +383,20 @@ pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<Pa
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if path.file_stem().and_then(|stem| stem.to_str()) == Some(id) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "ignoring unreadable unrelated persona file {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
         let Ok(persona) = toml::from_str::<AgentPersona>(&text) else {
             tracing::warn!("ignoring invalid persona file {}", path.display());
             continue;
@@ -394,6 +406,28 @@ pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<Pa
         }
     }
     Ok(None)
+}
+
+pub(crate) fn legacy_user_persona_file(config_dir: &Path, id: &str) -> Result<bool> {
+    let dir = config_dir.join("personas");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if toml::from_str::<AgentPersona>(&text).is_ok_and(|persona| persona.id == id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Write (create or replace) the user-level TOML file for a persona. Saving

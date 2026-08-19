@@ -797,6 +797,20 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<(), String> {
         Err("persona persistence is unavailable in this executor".into())
     }
+    /// Persist a persona replacing a pending deletion, and consume the claim
+    /// before releasing the executor's filesystem mutation boundary.
+    async fn replace_persona_file(
+        &self,
+        config_dir: &Path,
+        persona: &AgentPersona,
+        store: crate::store::Store,
+        claim: String,
+    ) -> Result<(), String> {
+        self.upsert_persona_file(config_dir, persona).await?;
+        store
+            .cancel_claimed_persona_deletion(&persona.id, &claim)
+            .map_err(|error| format!("{error:#}"))
+    }
     /// Remove a user-level persona through the trusted filesystem boundary.
     /// `allow_missing` is reserved for replaying a durable deletion intent
     /// after the file mutation may already have completed.
@@ -2533,6 +2547,27 @@ impl ToolExecutor for LocalToolExecutor {
         .await
         .map_err(|error| format!("persona file worker failed: {error}"))?
         .map_err(|error| format!("{error:#}"))
+    }
+
+    async fn replace_persona_file(
+        &self,
+        config_dir: &Path,
+        persona: &AgentPersona,
+        store: crate::store::Store,
+        claim: String,
+    ) -> Result<(), String> {
+        let config_dir = config_dir.to_path_buf();
+        let persona = persona.clone();
+        tokio::task::spawn_blocking(move || {
+            let _mutation = PERSONA_FILE_MUTATIONS.lock().unwrap();
+            crate::personas::upsert_user_persona(&config_dir, &persona)
+                .map_err(|error| format!("{error:#}"))?;
+            store
+                .cancel_claimed_persona_deletion(&persona.id, &claim)
+                .map_err(|error| format!("{error:#}"))
+        })
+        .await
+        .map_err(|error| format!("persona file worker failed: {error}"))?
     }
 
     async fn delete_persona_file(
