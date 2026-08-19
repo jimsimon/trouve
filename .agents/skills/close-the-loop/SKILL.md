@@ -110,11 +110,16 @@ immediately when its failure is demonstrated as transient. Before retrying a
 mutation whose outcome is unknown, re-read its target state and retry only when
 the first attempt is confirmed not to have applied; an operation with a trusted
 idempotency key may be retried instead. This applies to comments, reviewer
-requests, thread resolution, pushes, and other writes. For a persistent
-failure, avoid hammering the provider: keep monitoring and apply bounded
-backoff. When the provider advertises a cooldown, do not retry before it
-expires; retry promptly once it does. When no cooldown is available, retry
-after an observable external-state change or another 30-minute interval.
+requests, thread resolution, pushes, and other writes. Prefer operation-specific
+durable evidence, such as a commit SHA, comment ID, requested-reviewer state, or
+thread state. If current state is ambiguous, perform bounded reconciliation
+reads across the provider's consistency window. If neither safe retry nor
+confirmation becomes possible, report the exact unresolved operation and ask
+for direction rather than guessing. For a persistent failure, avoid hammering
+the provider: keep monitoring and apply bounded backoff. When the provider
+advertises a cooldown, do not retry before it expires; retry promptly once it
+does. When no cooldown is available, retry after an observable external-state
+change or another 30-minute interval.
 Reset the no-progress clock when the blocker changes or progresses; a new head
 resets its retry record. Never manufacture readiness by ignoring a non-terminal
 or failed blocker.
@@ -167,15 +172,17 @@ by another actor, or loss of the target PR are the other terminal conditions.
    Re-read the complete live base target—repository, branch or ref, and OID—in
    every snapshot too. If its repository or branch changes, re-resolve and
    record the complete target, discard all prior policy, check evidence, and
-   clean-snapshot convergence state, and confirm the new target remains within
-   the user's requested scope; ask before continuing if it does not. If only
-   the recorded base revision changes, record the new revision, rediscover
-   trusted workflow and check policy from it, and discard the same prior
-   evidence and convergence state. Rerun every expected check under the new
-   base, or verify from trusted run metadata that each accepted result binds
-   both the current head and exact base revision, such as through their
-   verified synthetic merge commit. A run for the base alone is insufficient.
-   Then restart the loop.
+   clean-snapshot convergence state, and confirm both that the new target
+   remains within the user's requested scope and that its repository/ref is an
+   authorized default or protected policy source established from trusted
+   repository state. Obtain explicit user approval before trusting any other
+   retargeted source. If only the recorded base revision changes, record the
+   new revision, rediscover trusted workflow and check policy from it, and
+   discard the same prior evidence and convergence state. Rerun every expected
+   check under the new base, or verify from trusted run metadata that each
+   accepted result binds both the current head and exact base revision, such as
+   through their verified synthetic merge commit. A run for the base alone is
+   insufficient. Then restart the loop.
 
 After a push, do not mistake an empty check list for success when the previous
 head had checks. Allow workflows to register, then monitor every expected
