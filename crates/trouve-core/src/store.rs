@@ -3906,6 +3906,18 @@ fn serialize_lifecycle_events(
     Ok(pending)
 }
 
+/// Reserve SQLite's writer slot before a write transaction reads state.
+///
+/// The event log uses a dedicated connection. A deferred transaction could
+/// therefore read a snapshot, lose the writer race to an event-log commit,
+/// and fail its later write with `SQLITE_BUSY_SNAPSHOT` (reported as error
+/// code 5 / "database is locked"). `IMMEDIATE` makes SQLite's busy handler
+/// wait before the read, so every read-modify-write transaction sees the
+/// snapshot it can commit.
+fn write_transaction(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -4167,7 +4179,7 @@ impl Store {
             projection.snapshot.has_older = false;
             let state = serde_json::to_string(&projection)?;
             let mut conn = self.conn.lock().unwrap();
-            let tx = conn.transaction()?;
+            let tx = write_transaction(&mut conn)?;
             let current_cache = tx
                 .query_row(
                     "SELECT cursor, schema_version FROM thread_view_cache WHERE thread_id = ?1",
@@ -5062,7 +5074,7 @@ impl Store {
         kind: &str,
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         insert_thread_row(&tx, thread, model_options)?;
         tx.execute(
             "INSERT INTO spawned_threads (child_thread_id, parent_thread_id, kind)
@@ -5464,7 +5476,7 @@ impl Store {
         staging_cleanup_claim: Option<&ArtifactCleanupClaim>,
     ) -> Result<Option<Option<ArtifactCleanupJob>>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let Some(thread_id) = tx
             .query_row(
                 "SELECT thread_id FROM queued_prompts WHERE id = ?1 AND claimed = 0",
@@ -5553,7 +5565,7 @@ impl Store {
         id: &str,
     ) -> Result<Option<(String, Option<ArtifactCleanupJob>)>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let Some((thread_id, attachments_json)) = tx
             .query_row(
                 "SELECT thread_id, attachments FROM queued_prompts
@@ -5603,7 +5615,7 @@ impl Store {
     /// racing a dispatch fails cleanly instead of corrupting positions.
     pub fn reorder_queued_prompts(&self, thread_id: &str, ids: &[String]) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let mut current: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM queued_prompts
@@ -5637,7 +5649,7 @@ impl Store {
         claim: bool,
     ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let Some(mut prompt) = tx
             .query_row(
                 "SELECT thread_id, content, attachments, created_at
@@ -5694,7 +5706,7 @@ impl Store {
         thread_id: &str,
     ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let front = tx
             .query_row(
                 "SELECT id, position, content, attachments, created_at FROM queued_prompts
@@ -6033,7 +6045,7 @@ impl Store {
 
     pub fn delete_custom_reviewer_profile(&self, id: &str) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let deleted = tx.execute(
             "DELETE FROM code_review_identities WHERE id = ?1 AND built_in = 0",
             params![id],
@@ -6503,7 +6515,7 @@ impl Store {
         config_hash: &str,
     ) -> Result<Vec<String>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let ids = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM code_review_jobs
@@ -6555,7 +6567,7 @@ impl Store {
         pull_number: u64,
     ) -> Result<Vec<String>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let ids = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM code_review_jobs
@@ -6671,7 +6683,7 @@ impl Store {
 
     pub fn recover_code_review_jobs(&self) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         let interrupted_reviewers = {
             let mut stmt = tx.prepare(&format!(
@@ -6758,7 +6770,7 @@ impl Store {
 
     pub fn claim_code_review_job(&self) -> Result<Option<CodeReviewJobRecord>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let id: Option<String> = tx
             .query_row(
                 "SELECT id FROM code_review_jobs WHERE status = 'queued'
@@ -6819,7 +6831,7 @@ impl Store {
         digest: &str,
     ) -> Result<CodeReviewBatchSnapshotUpdate> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let (status, current_digest): (String, String) = tx.query_row(
             "SELECT status, review_batch_digest FROM code_review_jobs WHERE id = ?1",
             [job_id],
@@ -7026,7 +7038,7 @@ impl Store {
         decisions: &[trouve_protocol::CodeReviewRoutingDecision],
     ) -> Result<Vec<trouve_protocol::CodeReviewRoutingDecision>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let existing: i64 = tx.query_row(
             "SELECT COUNT(*) FROM code_review_routing_decisions WHERE job_id = ?1",
             [job_id],
@@ -7451,7 +7463,7 @@ impl Store {
             return self.completed_code_review_personas(job_id);
         }
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let running: bool = tx.query_row(
             "SELECT status = 'running' FROM code_review_jobs WHERE id = ?1",
             [job_id],
@@ -7519,7 +7531,7 @@ impl Store {
         reviewer_id: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let old = tx
             .query_row(
                 &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
@@ -7619,7 +7631,7 @@ impl Store {
         candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         tx.execute(
             "DELETE FROM code_review_finding_sources
              WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
@@ -7828,7 +7840,7 @@ impl Store {
             trouve_protocol::CodeReviewFindingPublicationStatus::Failed => "failed",
         };
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let mut updated = 0;
         for id in ids {
             updated += tx.execute(
@@ -7924,7 +7936,7 @@ impl Store {
     /// failing finding cannot consume API quota on every retry pass.
     pub fn defer_code_review_thread_collapse(&self, id: &str) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let attempts: i64 = tx
             .query_row(
                 "SELECT collapse_attempts FROM code_review_findings WHERE id = ?1",
@@ -8603,7 +8615,7 @@ impl Store {
         id: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let state: Option<(String, bool)> = tx
             .query_row(
                 "SELECT status, publication_claimed FROM code_review_jobs WHERE id = ?1",
@@ -8656,7 +8668,7 @@ impl Store {
         id: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let old = tx
             .query_row(
                 &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
@@ -8793,7 +8805,7 @@ impl Store {
         finding_ids: &[&str],
     ) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         for finding_id in finding_ids {
             tx.execute(
                 "UPDATE code_review_findings
@@ -8856,7 +8868,7 @@ impl Store {
         retryable: bool,
     ) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let current_attempts = tx
             .query_row(
                 "SELECT projection_retry_count FROM code_review_jobs WHERE id = ?1",
@@ -9027,7 +9039,7 @@ impl Store {
         requested: bool,
     ) -> Result<Option<u64>> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let previous: Option<(bool, i64)> = tx
             .query_row(
                 "SELECT manual_requested, manual_generation FROM code_review_pr_state
@@ -9060,7 +9072,7 @@ impl Store {
         manual_request: Option<(&str, u64, &str)>,
     ) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO github_webhook_deliveries (delivery_id, received_at)
              VALUES (?1, ?2)",
@@ -9139,7 +9151,7 @@ impl Store {
         manual_request: Option<(u64, &str)>,
     ) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO code_review_polled_comments
                     (repository, comment_id, seen_at)
@@ -9196,7 +9208,7 @@ impl Store {
     /// Atomically replace a thread's provider transcript (context compaction).
     pub fn replace_messages(&self, thread_id: &str, payloads: &[serde_json::Value]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = write_transaction(&mut conn)?;
         tx.execute(
             "DELETE FROM messages WHERE thread_id = ?1",
             params![thread_id],
@@ -9593,6 +9605,72 @@ mod tests {
             event_writer_sqlite_error_code(&error),
             Some(rusqlite::ErrorCode::DatabaseLocked)
         );
+    }
+
+    #[test]
+    fn code_review_claim_waits_for_a_concurrent_writer_before_reading() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static HIT_BUSY_HANDLER: AtomicBool = AtomicBool::new(false);
+
+        fn keep_waiting_for_writer(_: i32) -> bool {
+            HIT_BUSY_HANDLER.store(true, Ordering::SeqCst);
+            true
+        }
+
+        HIT_BUSY_HANDLER.store(false, Ordering::SeqCst);
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("review-write-contention.sqlite3");
+        let store = Store::open(&database).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO code_review_jobs
+                        (id, dedupe_key, installation_id, repository, pull_number,
+                         pull_title, pull_url, head_sha, base_ref, head_ref,
+                         trigger, status, created_at)
+                 VALUES ('rv_busy', 'busy', 1, 'acme/widgets', 42,
+                         'Original title', 'https://github.com/acme/widgets/pull/42',
+                         'head', 'base', 'feature', 'automatic', 'queued', ?1)",
+                [chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .busy_handler(Some(keep_waiting_for_writer))
+            .unwrap();
+
+        let mut blocker = Connection::open(&database).unwrap();
+        let blocker_tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        blocker_tx
+            .execute(
+                "UPDATE code_review_jobs SET pull_title = 'Committed title'
+                 WHERE id = 'rv_busy'",
+                [],
+            )
+            .unwrap();
+
+        let claiming_store = store.clone();
+        let claim = std::thread::spawn(move || claiming_store.claim_code_review_job());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !HIT_BUSY_HANDLER.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "review claim never waited for the concurrent writer"
+            );
+            std::thread::yield_now();
+        }
+        blocker_tx.commit().unwrap();
+
+        let claimed = claim.join().unwrap().unwrap().unwrap();
+        assert_eq!(claimed.job.status, "running");
+        assert_eq!(claimed.job.pull_title, "Committed title");
     }
 
     #[test]
