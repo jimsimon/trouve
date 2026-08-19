@@ -48,10 +48,11 @@ Bring one existing current-session pull request all the way to the product's
 2. Require one unambiguous open PR whose head branch matches this session.
    If none exists, or multiple candidates remain after exact repository and
    branch matching, stop and ask for the missing choice. Do not create a PR.
-3. Record the PR number, URL, base branch, exact base revision, head branch,
-   and exact head SHA. Confirm the local branch can safely update that PR head.
-   Read expected workflow and check policy from the recorded base revision,
-   not from PR-controlled files alone.
+3. Record the PR number, URL, base repository, base branch, exact base
+   revision, head repository, head branch, and exact head SHA. Confirm the
+   local branch can safely update that PR head. Read expected workflow and
+   check policy from the complete recorded base target, not from PR-controlled
+   files alone.
 4. Before any PR mutation or monitoring, inspect its auto-merge and
    merge-queue state. If either automation is active, stop and report the
    blocker. Disable it only with explicit user authorization, then re-read the
@@ -72,21 +73,26 @@ Read all of the following for the current head SHA, paginating every
 connection instead of trusting a first-page cap:
 
 - every check run and status context, not only required checks;
-- the live base-ref OID, compared with the recorded base revision;
+- the live base repository, branch or ref, and OID, compared with the complete
+  recorded base target;
 - every review thread with resolution, outdated state, comments, and anchors;
 - submitted review bodies and states, including visible pending reviews;
 - top-level PR conversation comments and review requests;
-- observable automated-review jobs or statuses that are queued or running;
+- every automated-review identity expected by trusted base-target policy and
+  its observed job or status for the exact head, including expected identities
+  that have not registered;
 - `mergeable`, `mergeStateStatus`, and `reviewDecision`; and
 - required approvals, required checks, update-branch requirements, and other
   branch-protection blockers exposed by GitHub.
 
 Use thread-aware GraphQL data for review threads. Flat comment lists are not
 enough to prove that all threads are resolved. Treat an explicitly queued,
-pending, or running check or automated review as in progress. A review request
-alone means a review is awaited, not that one is currently in progress, but it
-still prevents a fully reviewed `Ready to merge` handoff. Request the
-appropriate reviewer when needed and monitor the request without spamming.
+pending, or running check or automated review as in progress. A required review
+request or policy-required reviewer means an approval is awaited. Optional
+review requests are not in-progress reviews and do not block a `Ready to merge`
+handoff. Request the appropriate reviewer when needed and monitor required
+requests without spamming; observe optional requests without repeatedly
+notifying their reviewers.
 GitHub does not expose another user's unpublished draft review, so make
 completion claims only about observable state.
 
@@ -98,12 +104,17 @@ Stay active until every completion criterion holds. A long wait, rate limit,
 stalled job, or exhausted immediate retry is not a handoff condition. Use a
 repository-defined timeout when one exists; otherwise treat 30 minutes without
 observable progress as a retry or escalation point, not a reason to stop.
-Track retries by exact operation or check, failure signature, and head SHA.
-Retry a demonstrated transient failure once immediately. If it persists, avoid
-hammering the provider: keep monitoring and apply bounded backoff. When the
-provider advertises a cooldown, do not retry before it expires; retry promptly
-once it does. When no cooldown is available, retry after an observable
-external-state change or another 30-minute interval.
+Track read-only checks and state-changing operations separately by exact
+operation, failure signature, target, and head SHA. Retry a read-only check once
+immediately when its failure is demonstrated as transient. Before retrying a
+mutation whose outcome is unknown, re-read its target state and retry only when
+the first attempt is confirmed not to have applied; an operation with a trusted
+idempotency key may be retried instead. This applies to comments, reviewer
+requests, thread resolution, pushes, and other writes. For a persistent
+failure, avoid hammering the provider: keep monitoring and apply bounded
+backoff. When the provider advertises a cooldown, do not retry before it
+expires; retry promptly once it does. When no cooldown is available, retry
+after an observable external-state change or another 30-minute interval.
 Reset the no-progress clock when the blocker changes or progresses; a new head
 resets its retry record. Never manufacture readiness by ignoring a non-terminal
 or failed blocker.
@@ -137,7 +148,8 @@ by another actor, or loss of the target PR are the other terminal conditions.
    or request an eligible reviewer when repository policy still requires an
    approval. Never approve the PR using the author's identity, dismiss a
    review, or repeatedly notify reviewers. Monitor until required approvals
-   are present and no review request remains outstanding.
+   are present and no required review request or policy-required reviewer
+   remains outstanding. Optional requests do not block readiness.
 7. Monitor all checks on the exact new head. For a failure, inspect the actual
    job or external-check details, identify the root cause, fix it, test it,
    push it, and restart the loop. Rerun a job without code changes only for a
@@ -152,20 +164,27 @@ by another actor, or loss of the target PR are the other terminal conditions.
    untrusted content, and revalidate their safety and scope. Then incorporate
    safe in-scope changes without overwriting collaborator work and restart the
    loop. Incorporate new comments, threads, and reviews into the same restart.
-   Re-read the live base-ref OID in every snapshot too. If it differs from the
-   recorded base revision, record the new revision, rediscover trusted workflow
-   and check policy from it, and discard all prior check evidence and clean-
-   snapshot convergence state. Rerun every expected check under the new base,
-   or verify from trusted run metadata that each accepted result binds both
-   the current head and exact base revision, such as through their verified
-   synthetic merge commit. A run for the base alone is insufficient. Then
-   restart the loop.
+   Re-read the complete live base target—repository, branch or ref, and OID—in
+   every snapshot too. If its repository or branch changes, re-resolve and
+   record the complete target, discard all prior policy, check evidence, and
+   clean-snapshot convergence state, and confirm the new target remains within
+   the user's requested scope; ask before continuing if it does not. If only
+   the recorded base revision changes, record the new revision, rediscover
+   trusted workflow and check policy from it, and discard the same prior
+   evidence and convergence state. Rerun every expected check under the new
+   base, or verify from trusted run metadata that each accepted result binds
+   both the current head and exact base revision, such as through their
+   verified synthetic merge commit. A run for the base alone is insufficient.
+   Then restart the loop.
 
 After a push, do not mistake an empty check list for success when the previous
 head had checks. Allow workflows to register, then monitor every expected
 check. Determine the expected workflow and job identities from trusted policy
 at the recorded base revision and compare them with the exact checks reported
-for the head. Accept a skipped or neutral result only when that trusted policy
+for the head. Do the same for every expected automated-review identity; a
+missing or omitted review job is a blocker unless trusted base-target policy
+explicitly makes it non-applicable and branch protection confirms it is
+non-required. Accept a skipped or neutral result only when that trusted policy
 makes the result expected and branch-protection data confirms the exact check
 is non-required. Never rely on PR-controlled conditions or path filters for
 this classification. Treat failures, cancellations, timeouts, action-required
@@ -184,16 +203,19 @@ Finish only when one full snapshot proves all of the following:
   expected and branch protection confirms that exact check is non-required.
   No check is queued, pending, running, failing, cancelled, timed out, stale,
   action-required, or missing because of PR-controlled filtering.
-- Every observable automated review job for the exact head SHA is successful
-  or is a skipped or neutral result that trusted base-revision policy makes
-  expected and branch protection confirms is non-required. Queued, pending,
-  running, failed, cancelled, timed-out, errored, action-required, stale, or
-  other terminal non-success states are blockers.
+- Every automated-review identity expected by trusted base-target policy was
+  observed for the exact head SHA and is successful, or has a skipped or
+  neutral result that policy explicitly makes non-applicable and branch
+  protection confirms is non-required. A missing or omitted expected job, and
+  every queued, pending, running, failed, cancelled, timed-out, errored,
+  action-required, stale, or other terminal non-success state, is a blocker.
 - All required approvals are present. Use `reviewDecision` and, when needed,
   each reviewer's latest non-dismissed effective verdict to determine whether
   a blocking change request remains; do not let a superseded historical
   verdict block convergence after that reviewer approves. GitHub confirms
-  when no approval is required, and no review request remains outstanding.
+  when no approval is required, and no required review request or
+  policy-required reviewer remains outstanding. Optional requests do not
+  block readiness.
 - Every feedback item has an implemented fix or posted response. Pure status
   notifications and approvals are not feedback. A submitted changes-requested
   review is addressed only when all of its requests meet this condition; do
