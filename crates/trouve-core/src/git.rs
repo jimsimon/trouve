@@ -1725,6 +1725,21 @@ pub fn checked_out_branch_head(repo: &Path) -> Result<(String, String)> {
         head.len() == 40 && head.chars().all(|ch| ch.is_ascii_hexdigit()),
         "HEAD did not resolve to a full commit id"
     );
+    let branch_revision = format!("refs/heads/{branch}^{{commit}}");
+    let branch_head = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &branch_revision,
+        ],
+    )?;
+    let current_branch = git(repo, &["symbolic-ref", "--short", "HEAD"])?;
+    anyhow::ensure!(
+        current_branch == branch && branch_head.eq_ignore_ascii_case(&head),
+        "HEAD changed while collecting branch ownership evidence"
+    );
     Ok((branch, head))
 }
 
@@ -1745,6 +1760,32 @@ pub fn local_branch_matches_commit(repo: &Path, branch: &str, commit: &str) -> b
         &["rev-parse", "--verify", "--end-of-options", &revision],
     )
     .is_ok_and(|resolved| resolved.eq_ignore_ascii_case(commit))
+}
+
+/// Whether this worktree still has `branch` checked out at `head` and the
+/// completion-time `ancestor` is in that exact branch history. This permits a
+/// session branch to advance after creating a PR without trusting a remote-only
+/// commit or a different worktree's ref.
+pub fn checked_out_branch_descends_from(
+    repo: &Path,
+    branch: &str,
+    head: &str,
+    ancestor: &str,
+) -> bool {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || [head, ancestor]
+            .iter()
+            .any(|commit| commit.len() != 40 || !commit.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        return false;
+    }
+    let Ok((checked_out_branch, checked_out_head)) = checked_out_branch_head(repo) else {
+        return false;
+    };
+    checked_out_branch == branch
+        && checked_out_head.eq_ignore_ascii_case(head)
+        && git(repo, &["merge-base", "--is-ancestor", ancestor, head]).is_ok()
 }
 
 /// Local branch names, most recently committed first.
@@ -3302,6 +3343,43 @@ mod tests {
 
         run(tmp.path(), &["checkout", "--detach", &commit]);
         assert!(checked_out_branch_head(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn checked_out_branch_history_requires_the_exact_worktree_tip() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["switch", "-c", "agent/clean-pr"]);
+        let ancestor = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("next.txt"), "next\n").unwrap();
+        run(tmp.path(), &["add", "next.txt"]);
+        run(tmp.path(), &["commit", "-m", "advance session branch"]);
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        assert!(checked_out_branch_descends_from(
+            tmp.path(),
+            "agent/clean-pr",
+            &head,
+            &ancestor
+        ));
+        assert!(!checked_out_branch_descends_from(
+            tmp.path(),
+            "other",
+            &head,
+            &ancestor
+        ));
+        assert!(!checked_out_branch_descends_from(
+            tmp.path(),
+            "agent/clean-pr",
+            &ancestor,
+            &ancestor
+        ));
+        assert!(!checked_out_branch_descends_from(
+            tmp.path(),
+            "agent/clean-pr",
+            &head,
+            &"0".repeat(40)
+        ));
     }
 
     #[test]

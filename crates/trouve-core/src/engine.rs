@@ -46,6 +46,9 @@ const MAX_ITERATIONS: usize = 32;
 /// monopolize the runtime. Results are still written to the provider
 /// transcript in request order.
 const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+/// Keep one slow repository from delaying every session while still bounding
+/// concurrent GitHub traffic from the durable PR-verification worker.
+const MAX_PARALLEL_SESSION_PR_VERIFICATIONS: usize = 4;
 const MAX_ATTACHMENTS_PER_PROMPT: usize = 4;
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_ATTACHMENT_TOTAL_BYTES: usize = 20 * 1024 * 1024;
@@ -5173,7 +5176,7 @@ impl Engine {
             .map_err(EngineError::Internal)
     }
 
-    fn pr_matches_verification_intent(
+    fn pr_repository_and_branch_match(
         fetched: &crate::github::PullRequestWithHeadRepository,
         intent: &SessionPrVerificationIntent,
     ) -> bool {
@@ -5187,11 +5190,40 @@ impl Engine {
                 .repository
                 .eq_ignore_ascii_case(&expected_repository)
             && fetched.info.head == intent.branch
+    }
+
+    fn pr_matches_verification_intent(
+        fetched: &crate::github::PullRequestWithHeadRepository,
+        intent: &SessionPrVerificationIntent,
+    ) -> bool {
+        Self::pr_repository_and_branch_match(fetched, intent)
             && fetched
                 .info
                 .head_sha
                 .as_deref()
                 .is_some_and(|sha| sha.eq_ignore_ascii_case(&intent.head_sha))
+    }
+
+    /// Accept a PR whose head advanced only when this exact session worktree
+    /// now has the same branch and fetched tip checked out and the immutable
+    /// completion-time commit is its ancestor. Remote-only movement remains
+    /// untrusted and retryable.
+    async fn pr_matches_advanced_session_head(
+        session: &Session,
+        fetched: &crate::github::PullRequestWithHeadRepository,
+        intent: &SessionPrVerificationIntent,
+    ) -> bool {
+        let Some(head_sha) = fetched.info.head_sha.clone() else {
+            return false;
+        };
+        let worktree = PathBuf::from(&session.worktree_path);
+        let branch = intent.branch.clone();
+        let ancestor = intent.head_sha.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::git::checked_out_branch_descends_from(&worktree, &branch, &head_sha, &ancestor)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn reconcile_session_pr_verifications(&self, session_id: &str) {
@@ -5206,7 +5238,7 @@ impl Engine {
         if self.deleting_sessions.lock().unwrap().contains(session_id) {
             return;
         }
-        let Ok(Some(_session)) = self.store.session(session_id) else {
+        let Ok(Some(session)) = self.store.session(session_id) else {
             return;
         };
         let intents = match self
@@ -5245,7 +5277,33 @@ impl Engine {
             )
             .await;
             match fetched {
-                Ok(Ok(fetched)) if Self::pr_matches_verification_intent(&fetched, &intent) => {
+                Ok(Ok(fetched)) => {
+                    let repository_and_branch_match =
+                        Self::pr_repository_and_branch_match(&fetched, &intent);
+                    let verified = Self::pr_matches_verification_intent(&fetched, &intent)
+                        || (repository_and_branch_match
+                            && Self::pr_matches_advanced_session_head(&session, &fetched, &intent)
+                                .await);
+                    if !verified {
+                        if repository_and_branch_match {
+                            tracing::debug!(
+                                session_id,
+                                pr_number = intent.number,
+                                pr_head = fetched.info.head,
+                                "deferring pull request whose head moved without matching the session worktree"
+                            );
+                            let _ = self.store.defer_session_pr_verification(&intent);
+                        } else {
+                            tracing::warn!(
+                                session_id,
+                                pr_number = intent.number,
+                                pr_head = fetched.info.head,
+                                "discarding pull request that does not match session-owned repository and branch evidence"
+                            );
+                            let _ = self.store.discard_session_pr_verification(&intent);
+                        }
+                        continue;
+                    }
                     let event = Event::SessionPrOpened {
                         number: intent.number,
                         url: crate::github::pr_url(
@@ -5270,15 +5328,6 @@ impl Engine {
                             "cannot complete verified pull request association"
                         ),
                     }
-                }
-                Ok(Ok(fetched)) => {
-                    tracing::warn!(
-                        session_id,
-                        pr_number = intent.number,
-                        pr_head = fetched.info.head,
-                        "discarding pull request that does not match session-owned head evidence"
-                    );
-                    let _ = self.store.discard_session_pr_verification(&intent);
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(
@@ -5309,9 +5358,14 @@ impl Engine {
                 return;
             }
         };
-        for session_id in sessions {
-            self.reconcile_session_pr_verifications(&session_id).await;
-        }
+        futures::stream::iter(sessions)
+            .for_each_concurrent(
+                MAX_PARALLEL_SESSION_PR_VERIFICATIONS,
+                |session_id| async move {
+                    self.reconcile_session_pr_verifications(&session_id).await;
+                },
+            )
+            .await;
     }
 
     pub fn start_session_pr_verification_worker(self: &Arc<Self>) {
@@ -11405,7 +11459,8 @@ impl Engine {
         // Vendor-native todo tools are reported as ordinary tool events.
         // Remember their names until completion so their result can update
         // the same persisted snapshot as trouve's bridged/native tool.
-        let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
+        let mut tool_calls =
+            HashMap::<String, (String, serde_json::Value, PullRequestCreationRequest)>::new();
         let mut tool_started_at = HashMap::<String, Instant>::new();
         // Creation tools sometimes stream their final PR URL before the
         // completion payload. Buffer output only for calls whose request is
@@ -11418,7 +11473,7 @@ impl Engine {
         // Repository discovery shells out to Git. Defer it until a tool call
         // can plausibly create a pull request so ordinary turns do not pay
         // that process-startup cost.
-        let mut github_repository = None;
+        let mut github_repository: Option<(String, String, String)> = None;
         let mut vendor_threads = HashMap::<String, String>::new();
         if let Some(vendor_session_id) = active_vendor_session.as_ref() {
             vendor_threads.insert(vendor_session_id.clone(), thread.id.clone());
@@ -11764,20 +11819,25 @@ impl Engine {
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
                     tool_started_at.insert(call_id.clone(), Instant::now());
-                    if github_repository.is_none()
-                        && could_request_pull_request_creation(&tool, &args)
-                        && let Ok(repository) = self.github_repository_for_session(session)
-                        && {
+                    let could_create = could_request_pull_request_creation(&tool, &args);
+                    let mut creation_request = PullRequestCreationRequest::Rejected;
+                    if could_create {
+                        if let Some((_, owner, repo)) = &github_repository {
+                            creation_request =
+                                classify_pull_request_creation(&tool, &args, owner, repo);
+                        } else if let Ok(repository) = self.github_repository_for_session(session) {
                             let (_, owner, repo) = &repository;
-                            !matches!(
-                                classify_pull_request_creation(&tool, &args, owner, repo),
-                                PullRequestCreationRequest::Rejected
-                            )
+                            creation_request =
+                                classify_pull_request_creation(&tool, &args, owner, repo);
+                            if !matches!(creation_request, PullRequestCreationRequest::Rejected) {
+                                github_repository = Some(repository);
+                            }
                         }
-                    {
-                        github_repository = Some(repository);
                     }
-                    tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
+                    tool_calls.insert(
+                        call_id.clone(),
+                        (tool.clone(), args.clone(), creation_request),
+                    );
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -11805,12 +11865,9 @@ impl Engine {
                     if suppressed_bridge_calls.contains(&call_id) {
                         continue;
                     }
-                    if let Some((_, owner, repo)) = &github_repository
-                        && let Some((tool, args)) = tool_calls.get(&call_id)
-                        && !matches!(
-                            classify_pull_request_creation(tool, args, owner, repo),
-                            PullRequestCreationRequest::Rejected
-                        )
+                    if github_repository.is_some()
+                        && let Some((_, _, request)) = tool_calls.get(&call_id)
+                        && !matches!(request, PullRequestCreationRequest::Rejected)
                     {
                         github_creation_output
                             .entry(call_id.clone())
@@ -12039,7 +12096,7 @@ impl Engine {
                     let execution_duration_ms =
                         tool_started_at.remove(&call_id).map(monotonic_elapsed_ms);
                     let todos = match tool_calls.get(&call_id) {
-                        Some((tool, args)) => self.persist_todos_from_result(
+                        Some((tool, args, _)) => self.persist_todos_from_result(
                             &thread.id,
                             tool,
                             status,
@@ -12051,9 +12108,8 @@ impl Engine {
                     let mut verification = None;
                     if ok
                         && let Some(repository @ (host, owner, repo)) = &github_repository
-                        && let Some((tool, args)) = tool_calls.get(&call_id)
+                        && let Some((_, _, request)) = tool_calls.get(&call_id)
                     {
-                        let request = classify_pull_request_creation(tool, args, owner, repo);
                         if !matches!(request, PullRequestCreationRequest::Rejected) {
                             let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
                             let creation_output =
@@ -12077,16 +12133,25 @@ impl Engine {
                     } else {
                         github_creation_output.remove(&call_id);
                     }
-                    // Snapshot only while the vendor mutation permit is still
-                    // held. An unprotected read must never become ownership
-                    // evidence for a provider-nominated PR.
-                    let evidence = if verification.is_some()
-                        && backend_mutation_permits.contains_key(&call_id)
-                    {
+                    // Some vendor-native/Yolo completions do not arrive with
+                    // an approval-acquired permit. Take the session mutation
+                    // lane before reading branch ownership evidence instead of
+                    // silently dropping otherwise valid connector creations.
+                    let needs_evidence = verification
+                        .as_ref()
+                        .is_some_and(|(_, numbers)| !numbers.is_empty());
+                    let supplemental_permit =
+                        if needs_evidence && !backend_mutation_permits.contains_key(&call_id) {
+                            Some(self.tool_execution_lock(&session.id).write_owned().await)
+                        } else {
+                            None
+                        };
+                    let evidence = if needs_evidence {
                         Self::capture_session_pr_head(session).await
                     } else {
                         None
                     };
+                    drop(supplemental_permit);
                     backend_mutation_permits.remove(&call_id);
 
                     let mut completion_events = vec![Event::ToolCompleted {
@@ -13041,7 +13106,10 @@ impl Engine {
         let execution_lock = self.tool_execution_lock(&session.id);
         let permit = if matches!(call.name.as_str(), "shell_output" | "shell_kill") {
             Some(ExecutionPermit::BackgroundControl)
-        } else if mutates {
+        } else if mutates || pr_creation.is_some() {
+            // A confirmed or unresolved creator must hold the write lane even
+            // if its tool metadata incorrectly labels it read-only: the exact
+            // branch/HEAD snapshot is durable authorization evidence.
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => None,
@@ -14204,6 +14272,43 @@ fn contains_rest_mutation(
     }
 }
 
+/// Conservative repository-independent half of the REST creation predicate.
+/// False positives are harmless here: the repository-aware classifier runs
+/// after discovery and still requires the exact `/repos/{owner}/{repo}/pulls`
+/// collection.
+fn contains_pull_request_collection_post(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(contains_pull_request_collection_post),
+        serde_json::Value::Object(fields) => {
+            let direct = fields
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+                && fields
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| {
+                        let path = url
+                            .split(['?', '#'])
+                            .next()
+                            .unwrap_or(url)
+                            .trim_end_matches('/')
+                            .to_ascii_lowercase();
+                        let suffix = path
+                            .split_once("/repos/")
+                            .map(|(_, suffix)| suffix)
+                            .or_else(|| path.strip_prefix("repos/"));
+                        suffix.is_some_and(|suffix| {
+                            let segments = suffix.split('/').collect::<Vec<_>>();
+                            matches!(segments.as_slice(), [owner, repo, "pulls"] if !owner.is_empty() && !repo.is_empty())
+                        })
+                    });
+            direct || fields.values().any(contains_pull_request_collection_post)
+        }
+        _ => false,
+    }
+}
+
 fn is_activity_tool_wrapper(tool: &str) -> bool {
     matches!(
         compact_activity(tool).as_str(),
@@ -14244,6 +14349,16 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
             .is_some_and(trusted_activity_tool_name);
     }
 
+    let args_text = args.to_string();
+    let args_words = activity_words(&args_text);
+    let args_compact = compact_activity(&args_text);
+    if (args_words.split_whitespace().any(|word| word == "mutation")
+        && args_compact.contains("createpullrequest"))
+        || contains_pull_request_collection_post(args)
+    {
+        return true;
+    }
+
     let tool_compact = compact_activity(tool);
     if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
         return true;
@@ -14269,7 +14384,7 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
     if !integration_like {
         return false;
     }
-    let text = args.to_string().to_ascii_lowercase();
+    let text = args_text.to_ascii_lowercase();
     text.contains("create") || text.contains("gh pr") || text.contains("/pulls")
 }
 
@@ -18739,6 +18854,10 @@ default_permission_mode = "ask"
         fetched.head_repository = Some("acme/widgets".into());
         fetched.info.head = "other-session".into();
         assert!(!Engine::pr_matches_verification_intent(&fetched, &intent));
+        fetched.info.head = intent.branch.clone();
+        fetched.info.head_sha = Some("2".repeat(40));
+        assert!(Engine::pr_repository_and_branch_match(&fetched, &intent));
+        assert!(!Engine::pr_matches_verification_intent(&fetched, &intent));
     }
 
     fn projection_detail(info: trouve_protocol::PrInfo) -> trouve_protocol::PrDetail {
@@ -19397,6 +19516,15 @@ default_permission_mode = "ask"
                 "url": "https://api.github.com/repos/o/r/pulls"
             })
         ));
+        assert!(could_request_pull_request_creation(
+            "fetch",
+            &serde_json::json!({
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.github.com/repos/o/r/pulls"
+                }
+            })
+        ));
         assert!(matches!(
             classify_pull_request_creation(
                 "mcpToolCall",
@@ -19433,6 +19561,10 @@ default_permission_mode = "ask"
         ));
         assert!(could_request_pull_request_creation(
             "graphql",
+            &graphql_create
+        ));
+        assert!(could_request_pull_request_creation(
+            "run_query",
             &graphql_create
         ));
         let click_create = serde_json::json!({"text": "Create pull request"});

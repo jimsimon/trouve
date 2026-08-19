@@ -12242,6 +12242,68 @@ mod tests {
             vec![intent.clone()]
         );
 
+        store.defer_session_pr_verification(&intent).unwrap();
+        let (attempts, next_attempt_at): (i64, String) = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT attempts, next_attempt_at
+                 FROM session_pr_verification_intents
+                 WHERE session_id = ?1 AND host = ?2 AND owner = ?3
+                   AND repository = ?4 AND pull_number = ?5
+                   AND branch = ?6 AND head_sha = ?7",
+                params![
+                    intent.session_id,
+                    intent.host,
+                    intent.owner,
+                    intent.repository,
+                    intent.number as i64,
+                    intent.branch,
+                    intent.head_sha,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(attempts, 1);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&next_attempt_at).unwrap() > chrono::Utc::now()
+        );
+        assert!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap()
+                .is_empty(),
+            "deferred intent must not remain immediately due"
+        );
+
+        store.discard_session_pr_verification(&intent).unwrap();
+        let remaining: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_pr_verification_intents
+                 WHERE session_id = ?1",
+                params![intent.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        store
+            .append_events_with_session_pr_verification_intents(
+                Scope::Thread("th_pr_intent".into()),
+                vec![Event::ToolCompleted {
+                    call_id: "call-pr-requeued".into(),
+                    status: ToolStatus::Ok,
+                    result: serde_json::json!({"number": 42}),
+                    execution_duration_ms: Some(1),
+                }],
+                vec![intent.clone()],
+            )
+            .await
+            .unwrap();
+
         store
             .complete_session_pr_verification(
                 intent.clone(),
