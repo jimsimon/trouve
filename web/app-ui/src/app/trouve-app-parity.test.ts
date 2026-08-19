@@ -49,16 +49,10 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("this.#composerDrafts.discard(threadId)");
   });
 
-  it("renders new-session agent controls without waiting for catalog refreshes", () => {
+  it("renders new-session agent controls while catalog refreshes", () => {
     expect(source).toContain('name="mode"');
     expect(source).toContain('name="thinking"');
     expect(source).toContain('name="permission_mode"');
-    expect(source).not.toContain(
-      '?disabled=${this.#newSessionPending || this.#newSessionOptionsPending}',
-    );
-    expect(source).not.toContain(
-      '.disabled=${this.#newSessionPending || this.#newSessionOptionsPending}',
-    );
     expect(source).toContain(
       'this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current)',
     );
@@ -76,5 +70,33 @@ describe("root shell parity wiring", () => {
     expect(source).toContain(
       '.selected=${this.#newSessionPermissionMode === "yolo"}',
     );
+    expect(source).toContain("this.#modelCatalog.staticModels()");
+    expect(source).toContain("readSignal(this.#modelCatalog.staticCurrent)");
+    expect(source).toContain('this.#modelCatalog.liveModels("if-stale")');
+    expect(source).toContain("readSignal(this.#modelCatalog.liveLoaded)");
+    expect(source).toContain("this.#modelCatalog.subscribeLive");
+    expect(source).toContain("this.#unsubscribeFromNewSessionLiveModels()");
+    expect(source).toContain(
+      "this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(",
+    );
+    expect(source).toContain(
+      'if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "")',
+    );
+    expect(source).toContain("beginNewSessionOptionLoad({");
+    expect(source).toContain("snapshotNewSessionSubmission({");
+    expect(source).toContain("if (!canSubmitNewSession({");
+    expect(source).toContain("const newSessionCanSubmit = canSubmitNewSession({");
+    expect(source).toContain("?disabled=${!newSessionCanSubmit");
+    expect(source).toContain("const timeout = globalThis.setTimeout(");
+    expect(source).toContain("const [modes, models, providers] = await Promise.all([");
+    expect(source).toContain('"timed-out",');
+    expect(source).toContain('"ready",');
+    expect(source).toContain("createNewSessionThreadRequestFromSnapshot({");
+    expect(source).toContain("Loading agent defaults before this session can start…");
+    expect(source).toContain(
+      "this.#reconcileNewSessionDefaults(this.#newSessionModels)",
+    );
+    expect(source).not.toContain("this.#reconcileNewSessionModelCatalog()");
+    expect(source).toContain("this.#resetNewSessionOptionsForWorkspace(workspaceId)");
   });
 });

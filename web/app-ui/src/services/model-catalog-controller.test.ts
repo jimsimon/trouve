@@ -14,10 +14,12 @@ const model = (id: string): ProtocolModelInfo => ({
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
     resolve = accept;
+    reject = decline;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 };
 
 describe("ModelCatalogController", () => {
@@ -40,6 +42,8 @@ describe("ModelCatalogController", () => {
     expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
       "cursor/default",
     ]);
+    await expect(controller.staticModels()).resolves.toEqual([model("cursor/default")]);
+    expect(readSignal(controller.liveLoaded)).toBe(false);
     expect(readSignal(controller.refreshing)).toBe(true);
 
     live.resolve([model("cursor/default"), model("cursor/gpt-5.6")]);
@@ -50,10 +54,33 @@ describe("ModelCatalogController", () => {
       "cursor/default",
       "cursor/gpt-5.6",
     ]);
+    expect(readSignal(controller.liveLoaded)).toBe(true);
+    expect(readSignal(controller.staticCurrent).map(({ id }) => id)).toEqual([
+      "cursor/default",
+    ]);
+    await expect(controller.staticModels()).resolves.toEqual([model("cursor/default")]);
     expect(readSignal(controller.refreshing)).toBe(false);
     await expect(controller.refresh()).resolves.toHaveLength(2);
     expect(staticCalls).toBe(1);
     expect(liveCalls).toBe(1);
+  });
+
+  it("distinguishes an authoritative empty live catalog from static fallback", async () => {
+    let staticCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => {
+        staticCalls += 1;
+        return [model("cursor/static")];
+      },
+      refreshModels: async () => [],
+    });
+
+    await expect(controller.refresh()).resolves.toEqual([model("cursor/static")]);
+    await expect(controller.liveModels()).resolves.toEqual([]);
+    expect(readSignal(controller.liveLoaded)).toBe(true);
+    expect(readSignal(controller.current)).toEqual([]);
+    await expect(controller.refresh()).resolves.toEqual([]);
+    expect(staticCalls).toBe(1);
   });
 
   it("coalesces concurrent static and live discovery", async () => {
@@ -85,20 +112,22 @@ describe("ModelCatalogController", () => {
   });
 
   it("forces fresh static and live snapshots after connectivity recovers", async () => {
+    const forcedStatic = deferred<readonly ProtocolModelInfo[]>();
+    const forcedLive = deferred<readonly ProtocolModelInfo[]>();
     let staticCalls = 0;
     let liveCalls = 0;
     const controller = new ModelCatalogController({
-      models: async () => {
+      models: () => {
         staticCalls += 1;
         return staticCalls === 1
-          ? [model("local/offline")]
-          : [model("codex/gpt-5.6-sol")];
+          ? Promise.resolve([model("local/offline")])
+          : forcedStatic.promise;
       },
-      refreshModels: async () => {
+      refreshModels: () => {
         liveCalls += 1;
         return liveCalls === 1
-          ? [model("local/offline")]
-          : [model("codex/gpt-5.6-sol"), model("cursor/gpt-5.6")];
+          ? Promise.resolve([model("local/offline")])
+          : forcedLive.promise;
       },
     });
 
@@ -108,13 +137,100 @@ describe("ModelCatalogController", () => {
       "local/offline",
     ]);
 
-    await controller.refresh("force");
-    await vi.waitFor(() => expect(liveCalls).toBe(2));
-
-    expect(staticCalls).toBe(2);
+    const force = controller.refresh("force");
+    await vi.waitFor(() => expect(staticCalls).toBe(2));
+    const joinedStatic = controller.staticModels();
+    let staticResolved = false;
+    void joinedStatic.then(() => {
+      staticResolved = true;
+    });
+    await Promise.resolve();
+    expect(staticResolved).toBe(false);
     expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
+      "local/offline",
+    ]);
+
+    forcedStatic.resolve([model("codex/gpt-5.6-sol")]);
+    await expect(Promise.all([force, joinedStatic])).resolves.toEqual([
+      [model("codex/gpt-5.6-sol")],
+      [model("codex/gpt-5.6-sol")],
+    ]);
+    await vi.waitFor(() => expect(liveCalls).toBe(2));
+    expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
+      "local/offline",
+    ]);
+
+    forcedLive.resolve([model("codex/gpt-5.6-sol"), model("cursor/gpt-5.6")]);
+    await vi.waitFor(() => expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
       "codex/gpt-5.6-sol",
       "cursor/gpt-5.6",
+    ]));
+
+    expect(staticCalls).toBe(2);
+    expect(readSignal(controller.staticCurrent).map(({ id }) => id)).toEqual([
+      "codex/gpt-5.6-sol",
+    ]);
+  });
+
+  it("uses a cached static snapshot when a forced reload fails", async () => {
+    const forcedStatic = deferred<readonly ProtocolModelInfo[]>();
+    let staticCalls = 0;
+    const controller = new ModelCatalogController({
+      models: () => {
+        staticCalls += 1;
+        return staticCalls === 1
+          ? Promise.resolve([model("cursor/cached")])
+          : forcedStatic.promise;
+      },
+      refreshModels: async () => [model("cursor/live")],
+    });
+
+    await controller.refresh();
+    await vi.waitFor(() => expect(readSignal(controller.current)).toEqual([
+      model("cursor/live"),
+    ]));
+
+    const force = controller.refresh("force");
+    await vi.waitFor(() => expect(staticCalls).toBe(2));
+    const joinedStatic = controller.staticModels();
+    const forceRejected = expect(force).rejects.toThrow("reload failed");
+    const joinedResolved = expect(joinedStatic).resolves.toEqual([
+      model("cursor/cached"),
+    ]);
+
+    forcedStatic.reject(new Error("reload failed"));
+    await Promise.all([forceRejected, joinedResolved]);
+    expect(readSignal(controller.staticCurrent)).toEqual([
+      model("cursor/cached"),
+    ]);
+    expect(readSignal(controller.current)).toEqual([
+      model("cursor/live"),
+    ]);
+  });
+
+  it("publishes every successful live refresh until the listener unsubscribes", async () => {
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => [model("cursor/static")],
+      refreshModels: async () => [model(`cursor/live-${++liveCalls}`)],
+    });
+    const published: string[][] = [];
+    const unsubscribe = controller.subscribeLive((models) => {
+      published.push(models.map(({ id }) => id));
+    });
+
+    await controller.liveModels("force");
+    await controller.liveModels("force");
+    expect(published).toEqual([
+      ["cursor/live-1"],
+      ["cursor/live-2"],
+    ]);
+
+    unsubscribe();
+    await controller.liveModels("force");
+    expect(published).toEqual([
+      ["cursor/live-1"],
+      ["cursor/live-2"],
     ]);
   });
 });

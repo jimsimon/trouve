@@ -316,9 +316,19 @@ impl AgentBackend for CursorBackend {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        // Cursor's automatic selection is a transport-owned model with no
-        // public catalog identity. Live discovery supplies the rest.
-        vec![model(&self.id, "default", "Cursor Auto", 0)]
+        // Cursor is a distinct serving surface, like Codex: a trouve-owned
+        // static roster inherits public metadata where possible and owns
+        // Cursor-only models. ACP discovery adds availability and transport
+        // controls without being required to resolve configured defaults.
+        self.catalog
+            .provider_models("cursor", &self.id, OptionsDialect::ClaudeCli)
+            .into_iter()
+            .map(|mut model| {
+                model.input_price_per_mtok = None;
+                model.output_price_per_mtok = None;
+                model
+            })
+            .collect()
     }
 
     async fn list_models(&self) -> Vec<ModelInfo> {
@@ -776,19 +786,10 @@ async fn apply_model_config(
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        match key.as_str() {
-            // Pre-ACP threads stored the thinking dropdown under
-            // thinking_level (cursor) or reasoning_effort (codex-style).
-            "thinking_level" | "reasoning_effort" => {
-                options.push(("effort".into(), value.clone()));
-                options.push(("reasoning".into(), value));
-            }
-            _ => options.push((key.clone(), value)),
-        }
+        push_cursor_model_option(&mut options, key, value);
     }
     if let Some(level) = legacy_level {
-        options.push(("effort".into(), level.to_string()));
-        options.push(("reasoning".into(), level.to_string()));
+        push_cursor_model_option(&mut options, "effort", level.to_string());
     }
     if legacy_fast {
         options.push(("fast".into(), "true".into()));
@@ -808,6 +809,20 @@ async fn apply_model_config(
         }
     }
     Ok(())
+}
+
+fn push_cursor_model_option(options: &mut Vec<(String, String)>, key: &str, value: String) {
+    match key {
+        // Pre-ACP threads stored the thinking dropdown under
+        // thinking_level (cursor) or reasoning_effort (codex-style).
+        // Static Cursor models use effort across upstream providers, so
+        // normalize it through both ACP spellings as well.
+        "thinking_level" | "reasoning_effort" | "effort" => {
+            options.push(("effort".into(), value.clone()));
+            options.push(("reasoning".into(), value));
+        }
+        _ => options.push((key.to_string(), value)),
+    }
 }
 
 /// Pull one option's currentValue out of a `set_config_option` response
@@ -1251,11 +1266,11 @@ fn parse_usage(usage: &Value) -> Usage {
 
 // --- model catalog -----------------------------------------------------------
 
-/// Replace metadata for public vendor models that models.dev can identify
-/// while preserving Cursor-only execution controls. Recognizable public ids
+/// Replace metadata for statically catalogued Cursor and public vendor models
+/// while preserving live Cursor execution controls. Recognizable public ids
 /// absent from the catalog are omitted rather than accepting ACP metadata as a
-/// second source of truth. `default`, Composer models, and other Cursor-owned
-/// ids deliberately keep the ACP adapter record intact.
+/// second source of truth. Brand-new Cursor-owned ids may remain additive live
+/// records until they are promoted into the checked-in serving-surface roster.
 fn canonicalize_cursor_model(
     catalog: &ModelsDevCatalog,
     backend_id: &str,
@@ -1265,16 +1280,22 @@ fn canonicalize_cursor_model(
         .id
         .strip_prefix(backend_id)
         .and_then(|id| id.strip_prefix('/'))
-        .unwrap_or(&live.id);
-    let canonical = [
-        ("anthropic", OptionsDialect::ClaudeCli),
-        ("openai", OptionsDialect::CodexCli),
-        ("google", OptionsDialect::Gemini),
-    ]
-    .into_iter()
-    .find_map(|(provider, dialect)| catalog.model(provider, backend_id, raw_id, dialect));
+        .unwrap_or(&live.id)
+        .to_string();
+    let canonical = catalog
+        .model("cursor", backend_id, &raw_id, OptionsDialect::ClaudeCli)
+        .or_else(|| {
+            [
+                ("anthropic", OptionsDialect::ClaudeCli),
+                ("openai", OptionsDialect::CodexCli),
+                ("google", OptionsDialect::Gemini),
+                ("xai", OptionsDialect::OpenAi),
+            ]
+            .into_iter()
+            .find_map(|(provider, dialect)| catalog.model(provider, backend_id, &raw_id, dialect))
+        });
     let Some(mut canonical) = canonical else {
-        return (!looks_like_public_cursor_model(raw_id)).then_some(live);
+        return (!looks_like_public_cursor_model(&raw_id)).then_some(live);
     };
 
     // The account-visible spelling is what Cursor accepts at execution time.
@@ -1283,8 +1304,10 @@ fn canonicalize_cursor_model(
     canonical.output_price_per_mtok = None;
 
     // Context selection and fast mode are Cursor transport controls, not
-    // public model capabilities. Generic reasoning settings remain
-    // catalog-owned even when ACP advertises a conflicting list/default.
+    // public model capabilities. Cursor-owned models have no upstream option
+    // schema, so ACP remains authoritative for all of their controls. Generic
+    // reasoning settings on public models remain catalog-owned even when ACP
+    // advertises a conflicting list/default.
     if let (Some(canonical_properties), Some(live_properties)) = (
         canonical
             .options_schema
@@ -1294,9 +1317,15 @@ fn canonicalize_cursor_model(
             .pointer("/properties")
             .and_then(Value::as_object),
     ) {
-        for key in ["context", "fast"] {
-            if let Some(property) = live_properties.get(key) {
-                canonical_properties.insert(key.into(), property.clone());
+        if raw_id == "default" || raw_id.starts_with("composer-") {
+            for (key, property) in live_properties {
+                canonical_properties.insert(key.clone(), property.clone());
+            }
+        } else {
+            for key in ["context", "fast"] {
+                if let Some(property) = live_properties.get(key) {
+                    canonical_properties.insert(key.into(), property.clone());
+                }
             }
         }
     }
@@ -2220,6 +2249,72 @@ mod tests {
     }
 
     #[test]
+    fn static_cursor_catalog_is_authoritative_and_live_models_filter_availability() {
+        let backend = CursorBackend::new("cursor", None, None);
+        let static_models = backend.models();
+        let static_ids: Vec<_> = static_models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert_eq!(
+            static_ids,
+            vec![
+                "cursor/claude-fable-5",
+                "cursor/claude-opus-5",
+                "cursor/claude-sonnet-5",
+                "cursor/composer-2.5",
+                "cursor/default",
+                "cursor/gemini-3.1-pro",
+                "cursor/gemini-3.7-flash",
+                "cursor/gpt-5.6-luna",
+                "cursor/gpt-5.6-sol",
+                "cursor/gpt-5.6-terra",
+                "cursor/grok-4.5",
+                "cursor/grok-4.6",
+            ]
+        );
+        assert!(static_models.iter().all(|model| {
+            model.input_price_per_mtok.is_none() && model.output_price_per_mtok.is_none()
+        }));
+
+        let live = parse_acp_models(
+            "cursor",
+            &json!({ "models": [
+                { "value": "claude-fable-5", "name": "Live override", "configOptions": [
+                    { "id": "context", "currentValue": "300k",
+                      "options": [ { "value": "300k" }, { "value": "1m" } ] }
+                ]},
+                { "value": "cursor-next", "name": "Cursor Next", "configOptions": [] }
+            ]}),
+        );
+        let merged = backend.canonicalize_models(live);
+        assert_eq!(merged.len(), 2);
+        let fable = merged
+            .iter()
+            .find(|model| model.id == "cursor/claude-fable-5")
+            .unwrap();
+        assert_eq!(fable.display_name, "Claude Fable 5");
+        assert_eq!(
+            fable.options_schema.pointer("/properties/context/enum"),
+            Some(&json!(["300k", "1m"]))
+        );
+        assert!(merged.iter().any(|model| model.id == "cursor/cursor-next"));
+    }
+
+    #[test]
+    fn effort_options_try_both_cursor_reasoning_dialects() {
+        let mut options = Vec::new();
+        push_cursor_model_option(&mut options, "effort", "high".into());
+        assert_eq!(
+            options,
+            vec![
+                ("effort".to_string(), "high".to_string()),
+                ("reasoning".to_string(), "high".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn parses_acp_model_catalog() {
         let result = json!({ "models": [
             { "value": "default", "name": "Auto", "configOptions": [] },
@@ -2313,7 +2408,8 @@ mod tests {
                   "options": [ { "value": "false" }, { "value": "true" } ] }
             ]},
             { "value": "gpt-future", "name": "Uncatalogued public model",
-              "configOptions": [] }
+              "configOptions": [] },
+            { "value": "grok-future", "name": "New Cursor Grok", "configOptions": [] }
         ]});
         let live = parse_acp_models("cursor", &result);
         let models: Vec<_> = live
@@ -2321,7 +2417,7 @@ mod tests {
             .filter_map(|model| canonicalize_cursor_model(&catalog, "cursor", model))
             .collect();
 
-        assert_eq!(models.len(), 2, "unknown public ids are not guessed");
+        assert_eq!(models.len(), 3, "unknown public ids are not guessed");
         let fable = &models[0];
         assert_eq!(fable.display_name, "Claude Fable 5");
         assert_eq!(fable.context_window, 1_000_000);
@@ -2344,6 +2440,10 @@ mod tests {
             composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(true))
         );
+
+        let grok = &models[2];
+        assert_eq!(grok.id, "cursor/grok-future");
+        assert_eq!(grok.display_name, "New Cursor Grok");
     }
 
     #[test]

@@ -1744,7 +1744,7 @@ pub struct Engine {
     pub(crate) config_dir: Option<PathBuf>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
-    /// still contribute models the catalog cannot represent (notably Cursor).
+    /// still contribute newly released or account-specific live models.
     model_catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Providers registered programmatically (`with_provider`); preserved

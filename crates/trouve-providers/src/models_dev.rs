@@ -2,12 +2,13 @@
 //!
 //! Provider APIs may contribute account-specific availability, while this
 //! catalog remains authoritative for provider identity, model metadata, model
-//! rosters, and model-specific option schemas. Cursor remains an explicit
-//! exception because its CLI is the only source for Cursor-only models. A
-//! generated snapshot keeps the complete public provider roster plus model
-//! details available offline; a small trouve-owned overlay describes serving
-//! surfaces that models.dev does not yet distinguish. A validated disk cache
-//! is refreshed from models.dev when the server has connectivity monitoring.
+//! rosters, and model-specific option schemas. A generated snapshot keeps the
+//! complete public provider roster plus model details available offline; a
+//! small trouve-owned overlay describes serving surfaces that models.dev does
+//! not yet distinguish, including Cursor's stable roster and Cursor-only
+//! models. Live vendor discovery may add newly released Cursor models and
+//! account-specific transport controls. A validated disk cache is refreshed
+//! from models.dev when the server has connectivity monitoring.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1251,6 +1252,31 @@ mod tests {
                 .iter()
                 .all(|provider| provider.id != "openai-codex")
         );
+    }
+
+    #[test]
+    fn trouve_owned_cursor_provider_is_available_offline() {
+        let catalog = ModelsDevCatalog::embedded();
+        let models = catalog.provider_models("cursor", "cursor", OptionsDialect::ClaudeCli);
+        assert_eq!(models.len(), 12);
+
+        let fable = models
+            .iter()
+            .find(|model| model.id == "cursor/claude-fable-5")
+            .unwrap();
+        assert_eq!(fable.display_name, "Claude Fable 5");
+        assert_eq!(fable.context_window, 1_000_000);
+        assert_eq!(
+            fable.options_schema.pointer("/properties/effort/default"),
+            Some(&json!("medium"))
+        );
+
+        let composer = models
+            .iter()
+            .find(|model| model.id == "cursor/composer-2.5")
+            .unwrap();
+        assert_eq!(composer.context_window, 200_000);
+        assert!(composer.supports_tools);
     }
 
     #[test]
