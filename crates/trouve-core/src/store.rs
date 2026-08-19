@@ -584,6 +584,38 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
+    // General personas are no longer code-review specialists. Remove their
+    // pre-unification selections while preserving a usable manual fallback.
+    "UPDATE code_review_repositories SET
+       identity_ids = CASE
+         WHEN EXISTS (
+           SELECT 1 FROM json_each(identity_ids)
+           WHERE value NOT IN ('code', 'plan', 'review')
+         ) THEN (
+           SELECT json_group_array(value) FROM json_each(identity_ids)
+           WHERE value NOT IN ('code', 'plan', 'review')
+         )
+         ELSE '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'
+       END,
+       included_reviewer_ids = (
+         SELECT json_group_array(value) FROM json_each(included_reviewer_ids)
+         WHERE value NOT IN ('code', 'plan', 'review')
+       ),
+       excluded_reviewer_ids = (
+         SELECT json_group_array(value) FROM json_each(excluded_reviewer_ids)
+         WHERE value NOT IN ('code', 'plan', 'review')
+       ),
+       reviewer_overrides = (
+         SELECT json_group_array(value) FROM json_each(reviewer_overrides)
+         WHERE json_extract(value, '$.reviewer_id') NOT IN ('code', 'plan', 'review')
+       )
+     WHERE EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value IN ('code', 'plan', 'review'))
+        OR EXISTS (SELECT 1 FROM json_each(included_reviewer_ids) WHERE value IN ('code', 'plan', 'review'))
+        OR EXISTS (SELECT 1 FROM json_each(excluded_reviewer_ids) WHERE value IN ('code', 'plan', 'review'))
+        OR EXISTS (
+          SELECT 1 FROM json_each(reviewer_overrides)
+          WHERE json_extract(value, '$.reviewer_id') IN ('code', 'plan', 'review')
+        )",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
