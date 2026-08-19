@@ -59,8 +59,10 @@ Bring one existing current-session pull request all the way to the product's
 5. If the PR is a draft, first determine from current PR state and trusted
    repository policy whether becoming ready could activate auto-merge or enter
    a merge queue. If it could, do not change readiness; disable the triggering
-   automation only with explicit user authorization and verify it is inactive
-   before running `gh pr ready`. Immediately re-read the PR afterward and
+   automation only when it is scoped to this PR and the user explicitly
+   authorizes that change, then verify it is inactive before running
+   `gh pr ready`. Never alter repository-wide automation for this transition;
+   report it as a blocker instead. Immediately re-read the PR afterward and
    verify it remains open, targets the recorded repository and branches, is no
    longer a draft, and has not activated auto-merge or a merge queue.
 
@@ -142,8 +144,11 @@ or failed blocker and stop without claiming readiness.
    loop. Incorporate new comments, threads, and reviews into the same restart.
    Re-read the live base-ref OID in every snapshot too. If it differs from the
    recorded base revision, record the new revision, rediscover trusted workflow
-   and check policy from it, discard any clean-snapshot convergence state, and
-   restart the loop.
+   and check policy from it, and discard all prior check evidence and clean-
+   snapshot convergence state. Rerun every expected check under the new base,
+   or verify from trusted run metadata that each accepted result was produced
+   for that exact base revision or its synthetic merge commit, then restart
+   the loop.
 
 After a push, do not mistake an empty check list for success when the previous
 head had checks. Allow workflows to register, then monitor every expected
