@@ -1819,7 +1819,7 @@ pub struct Engine {
     provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Serializes persona-file mutations with durable deletion replay so a
     /// recreate cannot race a pending cleanup of the same user-level file.
-    persona_mutations: tokio::sync::Mutex<()>,
+    persona_mutations: Arc<tokio::sync::Mutex<()>>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -2189,7 +2189,7 @@ impl Engine {
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
-            persona_mutations: tokio::sync::Mutex::new(()),
+            persona_mutations: Arc::new(tokio::sync::Mutex::new(())),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -2328,6 +2328,12 @@ impl Engine {
                 Ok(false) => continue,
                 Err(error) => {
                     tracing::warn!(persona_id = %claim.id, %error, "failed to recheck persona deletion intent");
+                    if let Err(release_error) = self
+                        .store
+                        .release_persona_deletion_claim(&claim.id, &claim.token)
+                    {
+                        tracing::warn!(persona_id = %claim.id, %release_error, "failed to release persona deletion claim after recheck error");
+                    }
                     continue;
                 }
             }
@@ -4673,7 +4679,16 @@ impl Engine {
         id: &str,
         req: trouve_protocol::UpsertPersonaRequest,
     ) -> Result<(), EngineError> {
-        validate_persona_id(id)?;
+        let legacy_reviewer = !personas::is_valid_persona_id(id)
+            && id.starts_with("custom:")
+            && self
+                .store
+                .list_custom_reviewer_profiles()?
+                .iter()
+                .any(|reviewer| reviewer.id == id);
+        if !legacy_reviewer {
+            validate_persona_id(id)?;
+        }
         let config_dir = self
             .config_dir
             .as_deref()
@@ -4697,7 +4712,17 @@ impl Engine {
             default_model: req.default_model,
             default_thinking_level: req.default_thinking_level,
         };
-        let _mutation = self.persona_mutations.lock().await;
+        if legacy_reviewer {
+            if persona.group != trouve_protocol::PersonaGroup::Reviewer {
+                return Err(EngineError::BadRequest(
+                    "legacy reviewer personas cannot be moved to the general group".into(),
+                ));
+            }
+            self.store
+                .upsert_reviewer_profile(&crate::reviewers::persona_as_reviewer(&persona, false))?;
+            return Ok(());
+        }
+        let mutation = self.persona_mutations.clone().lock_owned().await;
         let current = self.resolve_personas(None)?;
         if personas::find_persona(&current, id).is_some_and(|existing| {
             existing.group == trouve_protocol::PersonaGroup::Reviewer
@@ -4738,32 +4763,46 @@ impl Engine {
         } else {
             None
         };
-        let write_result = if let Some(claim) = replacement_claim.as_deref() {
-            let write = self.executor.upsert_persona_file(config_dir, &persona);
-            tokio::pin!(write);
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    result = &mut write => break result,
-                    _ = interval.tick() => self.store.renew_persona_deletion_claim(id, claim)?,
+        if let Some(claim) = replacement_claim {
+            let store = self.store.clone();
+            let executor = self.executor.clone();
+            let config_dir = config_dir.to_path_buf();
+            let id = id.to_string();
+            return tokio::spawn(async move {
+                let _mutation = mutation;
+                let write = executor.upsert_persona_file(&config_dir, &persona);
+                tokio::pin!(write);
+                let period = Duration::from_secs(60);
+                let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let write_result = loop {
+                    tokio::select! {
+                        result = &mut write => break result,
+                        _ = interval.tick() => {
+                            if let Err(error) = store.renew_persona_deletion_claim(&id, &claim) {
+                                tracing::warn!(persona_id = %id, %error, "failed to renew persona replacement claim");
+                            }
+                        }
+                    }
+                };
+                if let Err(error) = write_result {
+                    store.release_persona_deletion_claim(&id, &claim)?;
+                    return Err(EngineError::Internal(anyhow::anyhow!(error)));
                 }
-            }
+                store.cancel_claimed_persona_deletion(&id, &claim)?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow::anyhow!("persona replacement task failed: {error}")))?;
         } else {
-            self.executor
+            let write_result = self
+                .executor
                 .upsert_persona_file(config_dir, &persona)
-                .await
-        };
-        if let Err(error) = write_result {
-            if let Some(claim) = replacement_claim.as_deref() {
-                self.store.release_persona_deletion_claim(id, claim)?;
+                .await;
+            drop(mutation);
+            if let Err(error) = write_result {
+                return Err(EngineError::Internal(anyhow::anyhow!(error)));
             }
-            return Err(EngineError::Internal(anyhow::anyhow!(error)));
-        }
-        if let Some(claim) = replacement_claim.as_deref() {
-            self.store
-                .cancel_claimed_persona_deletion(id, claim)
-                .map_err(EngineError::Internal)?;
         }
         Ok(())
     }
@@ -4771,7 +4810,16 @@ impl Engine {
     /// Remove a user-level persona file: deletes a custom persona, or resets a
     /// customized built-in to its defaults.
     pub async fn delete_persona(&self, id: &str) -> Result<(), EngineError> {
-        validate_persona_id(id)?;
+        if !personas::is_valid_persona_id(id)
+            && !(id.starts_with("custom:")
+                && self
+                    .store
+                    .list_custom_reviewer_profiles()?
+                    .iter()
+                    .any(|reviewer| reviewer.id == id))
+        {
+            validate_persona_id(id)?;
+        }
         let config_dir = self
             .config_dir
             .as_deref()
@@ -4799,11 +4847,14 @@ impl Engine {
             let claim = self.store.claim_persona_deletion(id)?.ok_or_else(|| {
                 EngineError::BadRequest(format!("persona {id} is currently being deleted"))
             })?;
-            if let Err(error) = self
-                .executor
-                .delete_persona_file(config_dir, id, deletion_pending || custom_reviewer)
-                .await
-            {
+            let file_result = if custom_reviewer && !personas::is_valid_persona_id(id) {
+                Ok(())
+            } else {
+                self.executor
+                    .delete_persona_file(config_dir, id, deletion_pending || custom_reviewer)
+                    .await
+            };
+            if let Err(error) = file_result {
                 self.store.release_persona_deletion_claim(id, &claim)?;
                 return Err(EngineError::Internal(anyhow::anyhow!(error)));
             }
@@ -14707,6 +14758,11 @@ mod tests {
         attempted: Arc<std::sync::atomic::AtomicBool>,
     }
 
+    struct BlockingPersonaUpsertExecutor {
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
     #[async_trait::async_trait]
     impl ToolExecutor for RejectingPersonaDeletionExecutor {
         async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
@@ -14748,6 +14804,40 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ToolExecutor for BlockingPersonaUpsertExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error(format!("unknown tool: {name}"))
+        }
+
+        async fn upsert_persona_file(
+            &self,
+            _config_dir: &Path,
+            _persona: &AgentPersona,
+        ) -> Result<(), String> {
+            self.started.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?
+                .forget();
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn failed_persona_upsert_does_not_consume_pending_deletion() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14771,6 +14861,42 @@ mod tests {
         );
         assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
         assert!(store.persona_deletion_pending("custom").unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelled_replacement_waiter_does_not_detach_its_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store.begin_persona_deletion("custom").unwrap();
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+                .with_config_dir(Some(tmp.path().join("config")))
+                .with_executor(Arc::new(BlockingPersonaUpsertExecutor {
+                    started: started.clone(),
+                    release: release.clone(),
+                })),
+        );
+        let request = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_persona("custom", persona_request("Custom"))
+                    .await
+            }
+        });
+        started.acquire().await.unwrap().forget();
+        request.abort();
+        release.add_permits(1);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.persona_deletion_pending("custom").unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -14798,6 +14924,37 @@ mod tests {
             ));
         }
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "sentinel");
+    }
+
+    #[tokio::test]
+    async fn legacy_colon_reviewer_ids_remain_editable_and_deletable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_reviewer_profile(&trouve_protocol::ReviewerProfile {
+                id: "custom:legacy".into(),
+                name: "Legacy".into(),
+                prompt: "Review".into(),
+                model: None,
+                default_thinking_level: None,
+                built_in: false,
+            })
+            .unwrap();
+        let engine = Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(Some(tmp.path().join("config")));
+        let mut request = persona_request("Updated legacy");
+        request.group = trouve_protocol::PersonaGroup::Reviewer;
+
+        engine
+            .upsert_persona("custom:legacy", request)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_custom_reviewer_profiles().unwrap()[0].name,
+            "Updated legacy"
+        );
+        engine.delete_persona("custom:legacy").await.unwrap();
+        assert!(store.list_custom_reviewer_profiles().unwrap().is_empty());
     }
 
     #[tokio::test]

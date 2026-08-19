@@ -250,8 +250,10 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       this.#message = success;
       this.requestUpdate();
       void this.#restorePersonaFocus(existing === undefined ? "__add__" : id);
-    } catch {
-      this.#message = `Persona ${id} could not be saved.`;
+    } catch (error) {
+      this.#message = error instanceof Error && error.message !== ""
+        ? error.message
+        : `Persona ${id} could not be saved.`;
       this.#error = true;
       this.#busy = false;
       this.requestUpdate();

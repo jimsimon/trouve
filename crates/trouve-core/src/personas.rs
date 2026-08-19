@@ -147,7 +147,12 @@ pub fn fallback_persona() -> AgentPersona {
     }
 }
 
-fn load_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
+fn load_dir(
+    dir: &Path,
+    personas: &mut Vec<AgentPersona>,
+    group_bases: &[AgentPersona],
+    missing_group: PersonaGroup,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -170,10 +175,10 @@ fn load_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
                     .and_then(|value| value.as_table().map(|table| table.contains_key("group")))
                     .unwrap_or(false);
                 if !declares_group {
-                    persona.group = personas
+                    persona.group = group_bases
                         .iter()
                         .find(|candidate| candidate.id == persona.id)
-                        .map_or(PersonaGroup::Reviewer, |base| base.group);
+                        .map_or(missing_group, |base| base.group);
                 }
                 // Later layers override earlier ones by id.
                 personas.retain(|m| m.id != persona.id);
@@ -184,9 +189,9 @@ fn load_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
     }
 }
 
-fn load_workspace_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
+fn load_workspace_dir(dir: &Path, personas: &mut Vec<AgentPersona>, missing_group: PersonaGroup) {
     let mut workspace = Vec::new();
-    load_dir(dir, &mut workspace);
+    load_dir(dir, &mut workspace, personas, missing_group);
     let restricted_tools = fallback_persona().allowed_tools;
     for mut persona in workspace {
         if let Some(base) = personas.iter().find(|candidate| candidate.id == persona.id) {
@@ -225,12 +230,32 @@ pub fn resolve_personas(
 ) -> Vec<AgentPersona> {
     let mut personas = builtin_personas();
     if let Some(dir) = config_dir {
-        load_dir(&dir.join("modes"), &mut personas);
-        load_dir(&dir.join("personas"), &mut personas);
+        let bases = personas.clone();
+        load_dir(
+            &dir.join("modes"),
+            &mut personas,
+            &bases,
+            PersonaGroup::General,
+        );
+        let bases = personas.clone();
+        load_dir(
+            &dir.join("personas"),
+            &mut personas,
+            &bases,
+            PersonaGroup::Reviewer,
+        );
     }
     if let Some(root) = workspace_root {
-        load_workspace_dir(&root.join(".agents").join("modes"), &mut personas);
-        load_workspace_dir(&root.join(".agents").join("personas"), &mut personas);
+        load_workspace_dir(
+            &root.join(".agents").join("modes"),
+            &mut personas,
+            PersonaGroup::General,
+        );
+        load_workspace_dir(
+            &root.join(".agents").join("personas"),
+            &mut personas,
+            PersonaGroup::Reviewer,
+        );
     }
     personas
 }
@@ -275,9 +300,13 @@ pub fn resolve_persona_infos(
             origin: "builtin".into(),
         })
         .collect();
-    let mut overlay = |dir: &Path, origin_over_builtin: &str, origin_new: &str| {
+    let mut overlay = |dir: &Path, origin_over_builtin: &str, origin_new: &str, missing_group| {
         let mut personas = Vec::new();
-        load_dir(dir, &mut personas);
+        let bases = infos
+            .iter()
+            .map(|info| info.persona.clone())
+            .collect::<Vec<_>>();
+        load_dir(dir, &mut personas, &bases, missing_group);
         for persona in personas {
             let origin = if builtin_ids.contains(&persona.id) {
                 origin_over_builtin.to_string()
@@ -289,19 +318,31 @@ pub fn resolve_persona_infos(
         }
     };
     if let Some(dir) = config_dir {
-        overlay(&dir.join("modes"), "customized", "custom");
-        overlay(&dir.join("personas"), "customized", "custom");
+        overlay(
+            &dir.join("modes"),
+            "customized",
+            "custom",
+            PersonaGroup::General,
+        );
+        overlay(
+            &dir.join("personas"),
+            "customized",
+            "custom",
+            PersonaGroup::Reviewer,
+        );
     }
     if let Some(root) = workspace_root {
         overlay(
             &root.join(".agents").join("modes"),
             "workspace",
             "workspace",
+            PersonaGroup::General,
         );
         overlay(
             &root.join(".agents").join("personas"),
             "workspace",
             "workspace",
+            PersonaGroup::Reviewer,
         );
     }
     // Stable order: built-ins first in their canonical order, then the rest
@@ -342,10 +383,8 @@ pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<Pa
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            tracing::warn!("ignoring unreadable persona file {}", path.display());
-            continue;
-        };
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
         let Ok(persona) = toml::from_str::<AgentPersona>(&text) else {
             tracing::warn!("ignoring invalid persona file {}", path.display());
             continue;
@@ -647,10 +686,17 @@ default_permission_mode = "ask"
     fn legacy_persona_files_keep_their_pre_unification_review_availability() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("personas");
+        let modes_dir = tmp.path().join("modes");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&modes_dir).unwrap();
         std::fs::write(
             dir.join("legacy.toml"),
             "id = \"legacy\"\ndisplay_name = \"Legacy\"\nsystem_prompt = \"Review\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            modes_dir.join("legacy-mode.toml"),
+            "id = \"legacy-mode\"\ndisplay_name = \"Legacy mode\"\nsystem_prompt = \"Work\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -666,6 +712,10 @@ default_permission_mode = "ask"
         );
         assert_eq!(
             find_persona(&personas, "code").unwrap().group,
+            PersonaGroup::General
+        );
+        assert_eq!(
+            find_persona(&personas, "legacy-mode").unwrap().group,
             PersonaGroup::General
         );
     }
