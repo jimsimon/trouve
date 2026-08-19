@@ -13917,7 +13917,7 @@ fn effective_activity_tool_call<'a>(
 /// command-, GraphQL-, or REST-specific checks below.
 fn structured_repository_matches(args: &serde_json::Value, owner: &str, repo: &str) -> bool {
     let expected_full_name = format!("{owner}/{repo}");
-    for key in ["repository_full_name", "repo_full_name", "repository"] {
+    for key in ["repository_full_name", "repo_full_name"] {
         if let Some(actual) = args.get(key).and_then(serde_json::Value::as_str)
             && !actual
                 .trim_matches('/')
@@ -13944,6 +13944,21 @@ fn structured_repository_matches(args: &serde_json::Value, owner: &str, repo: &s
             return false;
         }
     }
+    if let Some(actual_repository) = args.get("repository").and_then(serde_json::Value::as_str) {
+        let matches = if actual_repository.contains('/') {
+            actual_repository
+                .trim_matches('/')
+                .eq_ignore_ascii_case(&expected_full_name)
+        } else {
+            args.get("owner")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+                && actual_repository.eq_ignore_ascii_case(repo)
+        };
+        if !matches {
+            return false;
+        }
+    }
 
     true
 }
@@ -13952,17 +13967,19 @@ fn structured_repository_identifies(args: &serde_json::Value, owner: &str, repo:
     if !structured_repository_matches(args, owner, repo) {
         return false;
     }
-    let full_name = ["repository_full_name", "repo_full_name", "repository"]
+    let full_name = ["repository_full_name", "repo_full_name"]
         .iter()
         .any(|key| args.get(key).and_then(serde_json::Value::as_str).is_some());
+    let owner_present = args
+        .get("owner")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
     let repo_value = args.get("repo").and_then(serde_json::Value::as_str);
+    let repository_value = args.get("repository").and_then(serde_json::Value::as_str);
     full_name
         || repo_value.is_some_and(|value| value.contains('/'))
-        || (args
-            .get("owner")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
-            && repo_value.is_some())
+        || repository_value.is_some_and(|value| value.contains('/'))
+        || (owner_present && (repo_value.is_some() || repository_value.is_some()))
 }
 
 fn has_structured_pull_request_creation_operation(args: &serde_json::Value) -> bool {
@@ -18893,6 +18910,44 @@ default_permission_mode = "ask"
                 "r"
             ),
             PullRequestCreationRequest::Confirmed
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "github",
+                &serde_json::json!({
+                    "action": "create_pr",
+                    "owner": "o",
+                    "repository": "r"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Confirmed
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "github",
+                &serde_json::json!({
+                    "action": "create_pr",
+                    "owner": "other",
+                    "repository": "r"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Rejected
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "github",
+                &serde_json::json!({
+                    "action": "create_pr",
+                    "repository": "r"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Rejected
         ));
         assert!(might_request_pull_request_creation(
             "github",
