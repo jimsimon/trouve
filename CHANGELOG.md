@@ -4,6 +4,72 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.0] - 2026-08-18
+
+This release moves the shipping desktop application to the shared Lit/Wry
+frontend, expands native agent collaboration and inspection workflows, and
+makes code reviews more selective and resilient.
+
+### Added
+
+- **Shared desktop and PWA frontend**: the Lit application now powers the Wry
+  desktop client and browser installation, with responsive session, chat,
+  terminal, settings, automation, and pull request workflows behind the same
+  protocol boundary.
+- **Deeper agent workflows**: recursive subagents have visible, navigable
+  transcripts; active Codex turns can be steered; and durable TODOs, turn
+  metadata, checkpoint actions, hashline edits, and scoped external file reads
+  give agents richer tools without bypassing the permission boundary.
+- **Review intelligence and capacity controls**: review roles and agent modes
+  share one configurable persona catalog, while confidence-aware publication,
+  generated finding titles, cross-finding themes, and live parallel-review
+  limits make automated reviews easier to tune and act on.
+- **Reproducible search benchmarks**: the repository now includes comparison
+  tooling and documented results for trouve search, grep, and ripgrep.
+
+### Changed
+
+- **Exact client/server compatibility**: generated clients now require an
+  exact protocol-version match and reject incompatible servers during
+  bootstrap. Upgrade desktop or PWA clients and `trouve-server` together.
+- **One shipping desktop stack**: the former Slint frontend and reusable Slint
+  widgets are retired; the typed desktop host owns native capabilities and a
+  single embedded server while durable state continues through HTTP and SSE.
+- **Scalable session history**: materialized, pageable thread views, bounded
+  diffs, coalesced replay, and attention summaries keep large and concurrent
+  sessions responsive without replaying or rendering their complete history.
+- **More reliable incremental reviews**: reviews preserve unchanged findings
+  across rebases, fall back safely when history cannot be matched, reduce task
+  fan-out, skip automatic runs for draft pull requests, and reconcile
+  publication and resolved-thread state durably.
+- **Consistent session setup**: repository and global mode, model, and
+  permission defaults now resolve consistently for new sessions and threads,
+  with clearer Modes & Models settings and improved generated session names.
+
+### Fixed
+
+- **Agent routing and cancellation**: Codex child requests stay attached to
+  the correct parent turn across startup, replacement, interruption, and
+  transport teardown, while late prompts and transient activity remain
+  visible in the frontend.
+- **GitHub review authentication**: long-running reviews refresh installation
+  credentials before publication and surface missing permissions as an
+  actionable reauthentication request.
+- **Large-session resource bounds**: ignored files no longer inflate
+  checkpoints, pathological diffs are rejected before transfer, transcript
+  paging preserves scroll position, and desktop notification and worker
+  lifetimes remain bounded.
+- **Review and daemon recovery**: rewritten review histories, empty summaries,
+  generated-marker retries, daemon-directory startup, and immediate search
+  fallback recover without losing durable state or hanging the workflow.
+
+### Security
+
+- **Confined side effects and process launches**: vendor mutations remain
+  behind `ToolExecutor`, external reads are limited to registered roots, and
+  trouve-owned child processes share one synchronized launch boundary to
+  prevent cross-process sentinel and cleanup races.
+
 ## [3.7.0] - 2026-07-31
 
 ### Added
@@ -630,6 +696,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.8.0]: https://github.com/jimsimon/trouve/compare/v3.7.0...v3.8.0
 [3.7.0]: https://github.com/jimsimon/trouve/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/jimsimon/trouve/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/jimsimon/trouve/compare/v3.4.2...v3.5.0
