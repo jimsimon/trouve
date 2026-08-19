@@ -101,8 +101,9 @@ observable progress as a retry or escalation point, not a reason to stop.
 Track retries by exact operation or check, failure signature, and head SHA.
 Retry a demonstrated transient failure once immediately. If it persists, avoid
 hammering the provider: keep monitoring and apply bounded backoff. When the
-provider advertises a cooldown, do not retry before it expires. Otherwise,
-retry after an observable external-state change or another 30-minute interval.
+provider advertises a cooldown, do not retry before it expires; retry promptly
+once it does. When no cooldown is available, retry after an observable
+external-state change or another 30-minute interval.
 Reset the no-progress clock when the blocker changes or progresses; a new head
 resets its retry record. Never manufacture readiness by ignoring a non-terminal
 or failed blocker.
