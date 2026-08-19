@@ -2524,11 +2524,6 @@ impl Engine {
             router_model.as_deref().or(model.as_deref()),
         )
         .await?;
-        // Repository updates are partial read-modify-writes, and persona-backed
-        // reviewer defaults can change concurrently. Hold the shared mutation
-        // lane from the existing-state read through catalog validation and
-        // persistence so every field is derived from one coherent snapshot.
-        let _persona_mutation = self.persona_mutations.lock().await;
         let existing = self
             .store
             .list_code_review_repositories()?
@@ -2650,6 +2645,27 @@ impl Engine {
                     .or(model.as_deref()),
             )
             .await?;
+        }
+        // Provider catalog lookups above may involve network I/O. Serialize only
+        // the final optimistic check and write: if either snapshot changed while
+        // validation was in flight, reject this partial update so the client can
+        // retry without overwriting newer repository or persona state.
+        let _persona_mutation = self.persona_mutations.lock().await;
+        let current = self
+            .store
+            .list_code_review_repositories()?
+            .into_iter()
+            .find(|repository| repository.repository == request.repository);
+        let current_catalog = self.code_review_reviewer_catalog()?;
+        let repository_changed = serde_json::to_vec(&current)
+            .map_err(|error| EngineError::Internal(error.into()))?
+            != serde_json::to_vec(&existing)
+                .map_err(|error| EngineError::Internal(error.into()))?;
+        if repository_changed || current_catalog != reviewer_catalog {
+            return Err(EngineError::BadRequest(
+                "code review configuration changed while the update was validated; retry the request"
+                    .into(),
+            ));
         }
         let normalized = UpdateCodeReviewRepositoryRequest {
             installation_id: request.installation_id,
