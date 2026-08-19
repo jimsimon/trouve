@@ -13872,22 +13872,16 @@ fn contains_rest_mutation(
 fn effective_activity_tool_call<'a>(
     tool: &'a str,
     args: &'a serde_json::Value,
-) -> (&'a str, &'a serde_json::Value) {
+) -> Option<(&'a str, &'a serde_json::Value)> {
     let normalized = compact_activity(tool);
     if !matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall") {
-        return (tool, args);
+        return Some((tool, args));
     }
-    let Some(nested_tool) = ["tool", "toolName", "name"]
+    let nested_tool = ["tool", "toolName", "name"]
         .iter()
-        .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
-    else {
-        return (tool, args);
-    };
-    let nested_args = args
-        .get("arguments")
-        .filter(|value| value.is_object())
-        .unwrap_or(args);
-    (nested_tool, nested_args)
+        .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))?;
+    let nested_args = args.get("arguments").filter(|value| value.is_object())?;
+    Some((nested_tool, nested_args))
 }
 
 /// Reject explicit repository identities that do not describe the session
@@ -13929,7 +13923,9 @@ fn structured_repository_matches(args: &serde_json::Value, owner: &str, repo: &s
 /// A successful tool call that actually creates a pull request. Merely
 /// listing, viewing, or mentioning a PR must not associate it with a session.
 fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
-    let (tool, args) = effective_activity_tool_call(tool, args);
+    let Some((tool, args)) = effective_activity_tool_call(tool, args) else {
+        return false;
+    };
     let tool_compact = compact_activity(tool);
     if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
         return true;
@@ -13981,7 +13977,9 @@ fn requests_pull_request_creation(
     owner: &str,
     repo: &str,
 ) -> bool {
-    let (tool, args) = effective_activity_tool_call(tool, args);
+    let Some((tool, args)) = effective_activity_tool_call(tool, args) else {
+        return false;
+    };
     if !structured_repository_matches(args, owner, repo) {
         return false;
     }
@@ -18704,6 +18702,19 @@ default_permission_mode = "ask"
             "o",
             "r"
         ));
+        assert!(!requests_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "type": "mcpToolCall",
+                "server": "codex_apps",
+                "tool": "github.create_pull_request",
+                "repository": "other/project",
+                "head_branch": "agent/fix-association",
+                "arguments": "{undecodable"
+            }),
+            "o",
+            "r"
+        ));
         assert!(requests_pull_request_creation(
             "functions.exec",
             &serde_json::json!({"cmd": "gh pr create --head fix/other"}),
@@ -18838,6 +18849,33 @@ default_permission_mode = "ask"
                     }
                 }),
                 execution_duration_ms: Some(800),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "create-malformed-pr".into(),
+                tool: "mcpToolCall".into(),
+                args: serde_json::json!({
+                    "type": "mcpToolCall",
+                    "server": "codex_apps",
+                    "tool": "github.create_pull_request",
+                    "repository": "other/project",
+                    "head_branch": "agent/separate-harness-search-readmes",
+                    "arguments": "{undecodable"
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "create-malformed-pr".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "result": {
+                        "structuredContent": {
+                            "number": 43,
+                            "url": "https://github.com/other/project/pull/43"
+                        }
+                    }
+                }),
+                execution_duration_ms: Some(600),
             },
         ];
 
