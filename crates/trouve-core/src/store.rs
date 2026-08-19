@@ -2979,6 +2979,9 @@ enum StoreMutation {
 struct AppendRequest {
     events: Vec<PendingEvent>,
     code_review_outbox_ids: Vec<i64>,
+    /// Conditional mutations must not roll unrelated callers back when their
+    /// precondition is stale.
+    isolated: bool,
     reply: AppendReply,
     queued_at: std::time::Instant,
 }
@@ -3076,13 +3079,14 @@ fn spawn_event_writer(
                 };
                 let mut event_count = first.events.len();
                 let queued_at = first.queued_at;
-                let isolate_outbox_request = !first.code_review_outbox_ids.is_empty();
+                let isolate_request = first.isolated || !first.code_review_outbox_ids.is_empty();
                 let mut requests = vec![first];
-                while !isolate_outbox_request && event_count < APPEND_BATCH_MAX {
+                while !isolate_request && event_count < APPEND_BATCH_MAX {
                     let Ok(request) = rx.try_recv() else {
                         break;
                     };
-                    if !request.code_review_outbox_ids.is_empty()
+                    if request.isolated
+                        || !request.code_review_outbox_ids.is_empty()
                         || event_count.saturating_add(request.events.len()) > APPEND_BATCH_MAX
                     {
                         deferred = Some(request);
@@ -3429,7 +3433,7 @@ fn apply_store_mutation(
     conn: &Connection,
     mutation: &StoreMutation,
     timestamp: chrono::DateTime<chrono::Utc>,
-) -> Result<()> {
+) -> Result<bool> {
     match mutation {
         StoreMutation::Insert {
             session,
@@ -3523,11 +3527,18 @@ fn apply_store_mutation(
                         head_sha, attempts, next_attempt_at, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)
                      ON CONFLICT(session_id, host, owner, repository, pull_number)
-                     DO UPDATE SET branch = excluded.branch,
-                                   head_sha = excluded.head_sha,
-                                   attempts = 0,
-                                   next_attempt_at = NULL,
-                                   created_at = excluded.created_at",
+                     DO UPDATE SET
+                       attempts = CASE
+                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                           THEN attempts ELSE 0 END,
+                       next_attempt_at = CASE
+                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                           THEN next_attempt_at ELSE NULL END,
+                       created_at = CASE
+                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                           THEN created_at ELSE excluded.created_at END,
+                       branch = excluded.branch,
+                       head_sha = excluded.head_sha",
                     params![
                         intent.session_id,
                         intent.host,
@@ -3557,10 +3568,9 @@ fn apply_store_mutation(
                     intent.head_sha,
                 ],
             )?;
-            anyhow::ensure!(
-                deleted == 1,
-                "pull request verification intent changed before completion"
-            );
+            if deleted == 0 {
+                return Ok(false);
+            }
         }
         StoreMutation::AcceptPrompt {
             prompt,
@@ -3678,7 +3688,7 @@ fn apply_store_mutation(
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn code_review_outbox_rows_exist(conn: &Connection, ids: &[i64]) -> rusqlite::Result<bool> {
@@ -3721,8 +3731,14 @@ fn insert_event_batch<'a>(
     let mut published = Vec::with_capacity(event_count.saturating_mul(2));
     let mut thread_events = Vec::new();
     for event in batch {
-        if let Some(mutation) = event.mutation.as_ref() {
-            apply_store_mutation(&tx, mutation, event.ts)?;
+        if let Some(mutation) = event.mutation.as_ref()
+            && !apply_store_mutation(&tx, mutation, event.ts)?
+        {
+            return Ok(InsertedEventBatch {
+                skipped: true,
+                source_cursors: Vec::new(),
+                published: Vec::new(),
+            });
         }
         let (kind, id) = scope_cols(&event.scope);
         tx.execute(
@@ -4237,6 +4253,7 @@ impl Store {
             .send(AppendRequest {
                 events,
                 code_review_outbox_ids: Vec::new(),
+                isolated: false,
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -4263,6 +4280,7 @@ impl Store {
             .send(AppendRequest {
                 events: serialize_events(scope, events)?,
                 code_review_outbox_ids: Vec::new(),
+                isolated: false,
                 reply: AppendReply::Async(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -4298,11 +4316,18 @@ impl Store {
         &self,
         events: Vec<PendingEvent>,
     ) -> Result<Vec<EventEnvelope>> {
+        let isolated = events.iter().any(|event| {
+            matches!(
+                event.mutation.as_ref(),
+                Some(StoreMutation::CompleteSessionPrVerificationIntent { .. })
+            )
+        });
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.append_tx
             .send(AppendRequest {
                 events,
                 code_review_outbox_ids: Vec::new(),
+                isolated,
                 reply: AppendReply::Async(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -4365,14 +4390,17 @@ impl Store {
             .map_err(Into::into)
     }
 
+    fn session_pr_verification_retry_delay(attempts: u32) -> i64 {
+        (1_i64 << attempts.min(9)).min(300)
+    }
+
     /// Keep a transient failure durable while bounding GitHub request rate.
     /// The delay grows exponentially and caps at five minutes.
     pub(crate) fn defer_session_pr_verification(
         &self,
         intent: &SessionPrVerificationIntent,
     ) -> Result<()> {
-        let exponent = intent.attempts.min(8);
-        let delay = (1_i64 << exponent).min(300);
+        let delay = Self::session_pr_verification_retry_delay(intent.attempts);
         let next_attempt_at = (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339();
         self.conn.lock().unwrap().execute(
             "UPDATE session_pr_verification_intents
@@ -4423,18 +4451,14 @@ impl Store {
         &self,
         intent: SessionPrVerificationIntent,
         event: Event,
-    ) -> Result<EventEnvelope> {
+    ) -> Result<Option<EventEnvelope>> {
         let pending = serialize_lifecycle_events(
             vec![(Scope::Session(intent.session_id.clone()), event)],
             StoreMutation::CompleteSessionPrVerificationIntent {
                 intent: Box::new(intent),
             },
         )?;
-        Ok(self
-            .append_pending_events_async(pending)
-            .await?
-            .pop()
-            .expect("one PR association returns one envelope"))
+        Ok(self.append_pending_events_async(pending).await?.pop())
     }
 
     /// Persist one event without blocking a Tokio worker thread, while
@@ -7487,6 +7511,7 @@ impl Store {
             .send(AppendRequest {
                 events: serialize_events(Scope::CodeReviewJob(job_id.to_owned()), events)?,
                 code_review_outbox_ids: ids,
+                isolated: false,
                 reply: AppendReply::Async(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -12211,7 +12236,7 @@ mod tests {
         store
             .insert_thread(&thread, &serde_json::Map::new())
             .unwrap();
-        let intent = SessionPrVerificationIntent {
+        let mut intent = SessionPrVerificationIntent {
             session_id: session.id.clone(),
             host: "github.com".into(),
             owner: "o".into(),
@@ -12276,6 +12301,72 @@ mod tests {
             "deferred intent must not remain immediately due"
         );
 
+        store
+            .append_events_with_session_pr_verification_intents(
+                Scope::Thread("th_pr_intent".into()),
+                vec![Event::ToolCompleted {
+                    call_id: "call-pr-duplicate".into(),
+                    status: ToolStatus::Ok,
+                    result: serde_json::json!({"number": 42}),
+                    execution_duration_ms: Some(1),
+                }],
+                vec![intent.clone()],
+            )
+            .await
+            .unwrap();
+        let attempts_after_duplicate: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT attempts FROM session_pr_verification_intents
+                 WHERE session_id = ?1 AND host = ?2 AND owner = ?3
+                   AND repository = ?4 AND pull_number = ?5",
+                params![
+                    intent.session_id,
+                    intent.host,
+                    intent.owner,
+                    intent.repository,
+                    intent.number as i64,
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts_after_duplicate, 1);
+        assert!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap()
+                .is_empty(),
+            "identical evidence must preserve accumulated backoff"
+        );
+
+        let replacement = SessionPrVerificationIntent {
+            head_sha: "2".repeat(40),
+            ..intent.clone()
+        };
+        store
+            .append_events_with_session_pr_verification_intents(
+                Scope::Thread("th_pr_intent".into()),
+                vec![Event::ToolCompleted {
+                    call_id: "call-pr-replaced".into(),
+                    status: ToolStatus::Ok,
+                    result: serde_json::json!({"number": 42}),
+                    execution_duration_ms: Some(1),
+                }],
+                vec![replacement.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap(),
+            vec![replacement.clone()],
+            "new evidence must reset retry state"
+        );
+        intent = replacement;
+
         store.discard_session_pr_verification(&intent).unwrap();
         let remaining: i64 = store
             .conn
@@ -12304,16 +12395,19 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .complete_session_pr_verification(
-                intent.clone(),
-                Event::SessionPrOpened {
-                    number: 42,
-                    url: "https://github.com/o/r/pull/42".into(),
-                },
-            )
-            .await
-            .unwrap();
+        assert!(
+            store
+                .complete_session_pr_verification(
+                    intent.clone(),
+                    Event::SessionPrOpened {
+                        number: 42,
+                        url: "https://github.com/o/r/pull/42".into(),
+                    },
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(
             store
                 .due_session_pr_verification_intents(&session.id, 10)
@@ -12330,9 +12424,19 @@ mod tests {
                     },
                 )
                 .await
-                .is_err(),
-            "a completed intent cannot publish a duplicate association"
+                .unwrap()
+                .is_none(),
+            "a completed intent is an idempotent no-op"
         );
+        store
+            .append_event(
+                Scope::Server,
+                Event::AssistantDelta {
+                    turn: 1,
+                    text: "unrelated append survives stale completion".into(),
+                },
+            )
+            .unwrap();
         let associations = store
             .events_after(&Scope::Session(session.id), 0)
             .unwrap()
@@ -12362,6 +12466,13 @@ mod tests {
                 .is_empty(),
             "session deletion must remove pending PR verification work"
         );
+    }
+
+    #[test]
+    fn pr_verification_retry_delay_reaches_five_minute_cap() {
+        assert_eq!(Store::session_pr_verification_retry_delay(8), 256);
+        assert_eq!(Store::session_pr_verification_retry_delay(9), 300);
+        assert_eq!(Store::session_pr_verification_retry_delay(u32::MAX), 300);
     }
 
     #[test]
@@ -15168,6 +15279,7 @@ mod tests {
             .send(AppendRequest {
                 events: stale_events,
                 code_review_outbox_ids: stale_ids,
+                isolated: false,
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })

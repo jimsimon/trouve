@@ -49,6 +49,13 @@ const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 /// Keep one slow repository from delaying every session while still bounding
 /// concurrent GitHub traffic from the durable PR-verification worker.
 const MAX_PARALLEL_SESSION_PR_VERIFICATIONS: usize = 4;
+/// A single successful creator call cannot nominate unbounded durable work.
+const MAX_SESSION_PR_VERIFICATIONS_PER_CREATION_CALL: usize = 16;
+/// Transient failures stop consuming GitHub quota after this many requests.
+const MAX_SESSION_PR_VERIFICATION_ATTEMPTS: u32 = 8;
+/// Vendor completion processing must never wait indefinitely behind another
+/// call whose permit can only be released by the same backend event loop.
+const SESSION_PR_EVIDENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ATTACHMENTS_PER_PROMPT: usize = 4;
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_ATTACHMENT_TOTAL_BYTES: usize = 20 * 1024 * 1024;
@@ -5136,6 +5143,7 @@ impl Engine {
             .collect::<Vec<_>>();
         numbers.sort_unstable();
         numbers.dedup();
+        numbers.truncate(MAX_SESSION_PR_VERIFICATIONS_PER_CREATION_CALL);
         numbers
             .into_iter()
             .map(|number| SessionPrVerificationIntent {
@@ -5234,29 +5242,31 @@ impl Engine {
             return;
         }
         let lifecycle = self.session_lock(session_id);
-        let _lifecycle_guard = lifecycle.read().await;
-        if self.deleting_sessions.lock().unwrap().contains(session_id) {
-            return;
-        }
-        let Ok(Some(session)) = self.store.session(session_id) else {
-            return;
-        };
-        let intents = match self
-            .store
-            .due_session_pr_verification_intents(session_id, 100)
-        {
-            Ok(intents) => intents,
-            Err(error) => {
-                tracing::warn!(session_id, %error, "cannot load PR verification intents");
+        let (intents, mut recorded) = {
+            let _lifecycle_guard = lifecycle.read().await;
+            if self.deleting_sessions.lock().unwrap().contains(session_id)
+                || !matches!(self.store.session(session_id), Ok(Some(_)))
+            {
                 return;
             }
-        };
-        let mut recorded = match self.recorded_session_pr_numbers(session_id) {
-            Ok(recorded) => recorded,
-            Err(error) => {
-                tracing::warn!(session_id, %error, "cannot load recorded pull requests");
-                return;
-            }
+            let intents = match self
+                .store
+                .due_session_pr_verification_intents(session_id, 100)
+            {
+                Ok(intents) => intents,
+                Err(error) => {
+                    tracing::warn!(session_id, %error, "cannot load PR verification intents");
+                    return;
+                }
+            };
+            let recorded = match self.recorded_session_pr_numbers(session_id) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    tracing::warn!(session_id, %error, "cannot load recorded pull requests");
+                    return;
+                }
+            };
+            (intents, recorded)
         };
         for intent in intents {
             if recorded.contains(&intent.number) {
@@ -5267,7 +5277,7 @@ impl Engine {
                 Ok(github) => github,
                 Err(error) => {
                     tracing::warn!(session_id, error = %error, "cannot authenticate PR verification");
-                    let _ = self.store.defer_session_pr_verification(&intent);
+                    self.defer_or_discard_session_pr_verification(&intent);
                     continue;
                 }
             };
@@ -5277,7 +5287,17 @@ impl Engine {
             )
             .await;
             match fetched {
-                Ok(Ok(fetched)) => {
+                Ok(Ok(Some(fetched))) => {
+                    // Remote I/O above deliberately runs without the session
+                    // lifecycle guard. Reacquire it before touching the
+                    // worktree or committing session-local durable state.
+                    let _lifecycle_guard = lifecycle.read().await;
+                    if self.deleting_sessions.lock().unwrap().contains(session_id) {
+                        return;
+                    }
+                    let Ok(Some(session)) = self.store.session(session_id) else {
+                        return;
+                    };
                     let repository_and_branch_match =
                         Self::pr_repository_and_branch_match(&fetched, &intent);
                     let verified = Self::pr_matches_verification_intent(&fetched, &intent)
@@ -5292,7 +5312,7 @@ impl Engine {
                                 pr_head = fetched.info.head,
                                 "deferring pull request whose head moved without matching the session worktree"
                             );
-                            let _ = self.store.defer_session_pr_verification(&intent);
+                            self.defer_or_discard_session_pr_verification(&intent);
                         } else {
                             tracing::warn!(
                                 session_id,
@@ -5318,9 +5338,10 @@ impl Engine {
                         .complete_session_pr_verification(intent.clone(), event)
                         .await
                     {
-                        Ok(_) => {
+                        Ok(Some(_)) => {
                             recorded.insert(intent.number);
                         }
+                        Ok(None) => {}
                         Err(error) => tracing::warn!(
                             session_id,
                             pr_number = intent.number,
@@ -5329,6 +5350,14 @@ impl Engine {
                         ),
                     }
                 }
+                Ok(Ok(None)) => {
+                    tracing::warn!(
+                        session_id,
+                        pr_number = intent.number,
+                        "discarding pull request verification that no longer exists"
+                    );
+                    let _ = self.store.discard_session_pr_verification(&intent);
+                }
                 Ok(Err(error)) => {
                     tracing::warn!(
                         session_id,
@@ -5336,7 +5365,7 @@ impl Engine {
                         %error,
                         "deferring unavailable pull request verification"
                     );
-                    let _ = self.store.defer_session_pr_verification(&intent);
+                    self.defer_or_discard_session_pr_verification(&intent);
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -5344,9 +5373,25 @@ impl Engine {
                         pr_number = intent.number,
                         "deferring timed-out pull request verification"
                     );
-                    let _ = self.store.defer_session_pr_verification(&intent);
+                    self.defer_or_discard_session_pr_verification(&intent);
                 }
             }
+        }
+    }
+
+    fn defer_or_discard_session_pr_verification(&self, intent: &SessionPrVerificationIntent) {
+        let result = if intent.attempts.saturating_add(1) >= MAX_SESSION_PR_VERIFICATION_ATTEMPTS {
+            self.store.discard_session_pr_verification(intent)
+        } else {
+            self.store.defer_session_pr_verification(intent)
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                session_id = intent.session_id,
+                pr_number = intent.number,
+                %error,
+                "cannot update pull request verification retry state"
+            );
         }
     }
 
@@ -12140,17 +12185,32 @@ impl Engine {
                     let needs_evidence = verification
                         .as_ref()
                         .is_some_and(|(_, numbers)| !numbers.is_empty());
-                    let supplemental_permit =
-                        if needs_evidence && !backend_mutation_permits.contains_key(&call_id) {
-                            Some(self.tool_execution_lock(&session.id).write_owned().await)
-                        } else {
-                            None
-                        };
-                    let evidence = if needs_evidence {
-                        Self::capture_session_pr_head(session).await
+                    let already_permitted = backend_mutation_permits.contains_key(&call_id);
+                    let supplemental_permit = if needs_evidence && !already_permitted {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => None,
+                            permit = tokio::time::timeout(
+                                SESSION_PR_EVIDENCE_LOCK_TIMEOUT,
+                                self.tool_execution_lock(&session.id).write_owned(),
+                            ) => permit.ok(),
+                        }
                     } else {
                         None
                     };
+                    let evidence =
+                        if needs_evidence && (already_permitted || supplemental_permit.is_some()) {
+                            Self::capture_session_pr_head(session).await
+                        } else {
+                            if needs_evidence {
+                                tracing::warn!(
+                                    session_id = session.id,
+                                    %call_id,
+                                    "skipping PR evidence after bounded mutation-lane wait"
+                                );
+                            }
+                            None
+                        };
                     drop(supplemental_permit);
                     backend_mutation_permits.remove(&call_id);
 
@@ -18858,6 +18918,39 @@ default_permission_mode = "ask"
         fetched.info.head_sha = Some("2".repeat(40));
         assert!(Engine::pr_repository_and_branch_match(&fetched, &intent));
         assert!(!Engine::pr_matches_verification_intent(&fetched, &intent));
+    }
+
+    #[test]
+    fn pr_verification_nominations_are_bounded_per_creator_call() {
+        let session = Session {
+            id: "se_bounded_prs".into(),
+            workspace_id: "ws".into(),
+            title: "Bounded PRs".into(),
+            branch: "agent/bounded".into(),
+            worktree_path: "/tmp/bounded-prs".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let intents = Engine::session_pr_verification_intents(
+            &session,
+            ("github.com".into(), "acme".into(), "widgets".into()),
+            (1..=(MAX_SESSION_PR_VERIFICATIONS_PER_CREATION_CALL as u64 + 5)).rev(),
+            Some((session.branch.clone(), "1".repeat(40))),
+        );
+
+        assert_eq!(
+            intents.len(),
+            MAX_SESSION_PR_VERIFICATIONS_PER_CREATION_CALL
+        );
+        assert_eq!(
+            intents
+                .iter()
+                .map(|intent| intent.number)
+                .collect::<Vec<_>>(),
+            (1..=MAX_SESSION_PR_VERIFICATIONS_PER_CREATION_CALL as u64).collect::<Vec<_>>()
+        );
     }
 
     fn projection_detail(info: trouve_protocol::PrInfo) -> trouve_protocol::PrDetail {

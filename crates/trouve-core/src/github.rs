@@ -3208,11 +3208,10 @@ impl GitHub {
     pub(crate) async fn pr_with_head_repository(
         &self,
         number: u64,
-    ) -> Result<PullRequestWithHeadRepository> {
+    ) -> Result<Option<PullRequestWithHeadRepository>> {
         self.graphql
             .pull_request(&self.owner, &self.repo, number)
-            .await?
-            .with_context(|| format!("pull request #{number} not found"))
+            .await
     }
 
     /// Full, lazily loaded PR-page state for one selected pull request.
