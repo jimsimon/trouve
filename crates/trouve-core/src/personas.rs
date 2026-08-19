@@ -302,10 +302,8 @@ pub fn resolve_persona_infos(
         .collect();
     let mut overlay = |dir: &Path, origin_over_builtin: &str, origin_new: &str, missing_group| {
         let mut personas = Vec::new();
-        let bases = infos
-            .iter()
-            .map(|info| info.persona.clone())
-            .collect::<Vec<_>>();
+        // Keep group inference layer-local, matching `resolve_personas`.
+        let bases = builtin_personas();
         load_dir(dir, &mut personas, &bases, missing_group);
         for persona in personas {
             let origin = if builtin_ids.contains(&persona.id) {
@@ -361,8 +359,7 @@ pub fn resolve_persona_infos(
 
 /// The user-level persona file defining `id`, if any. Prefers `<id>.toml` but
 /// falls back to scanning (files may be named freely).
-pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<PathBuf>> {
-    let dir = config_dir.join("personas");
+fn persona_file_in_dir(dir: &Path, id: &str) -> Result<Option<PathBuf>> {
     let canonical = dir.join(format!("{id}.toml"));
     match std::fs::metadata(&canonical) {
         Ok(metadata) if metadata.is_file() => return Ok(Some(canonical)),
@@ -372,7 +369,7 @@ pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<Pa
             return Err(error).with_context(|| format!("reading {}", canonical.display()));
         }
     }
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
@@ -406,6 +403,13 @@ pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<Pa
         }
     }
     Ok(None)
+}
+
+pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<PathBuf>> {
+    if let Some(path) = persona_file_in_dir(&config_dir.join("personas"), id)? {
+        return Ok(Some(path));
+    }
+    persona_file_in_dir(&config_dir.join("modes"), id)
 }
 
 pub(crate) fn legacy_user_persona_file(config_dir: &Path, id: &str) -> Result<bool> {
@@ -446,16 +450,32 @@ pub fn upsert_user_persona(config_dir: &Path, persona: &AgentPersona) -> Result<
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(persona).context("serializing persona")?;
-    let temporary = path.with_extension(format!(
-        "toml.tmp-{}-{}",
-        std::process::id(),
-        PERSONA_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .with_context(|| format!("creating {}", temporary.display()))?;
+    let (temporary, mut file) = loop {
+        let temporary = path.with_extension(format!(
+            "toml.tmp-{}-{}",
+            std::process::id(),
+            PERSONA_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("creating {}", temporary.display()));
+            }
+        }
+    };
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        std::fs::set_permissions(&temporary, metadata.permissions())
+            .with_context(|| format!("preserving permissions for {}", path.display()))?;
+    }
     if let Err(error) = file
         .write_all(text.as_bytes())
         .and_then(|()| file.sync_all())

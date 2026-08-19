@@ -2208,20 +2208,28 @@ impl Engine {
             .into_iter()
             .map(|persona| persona.id)
             .collect();
-        for persona in personas
-            .into_iter()
-            .filter(|persona| persona.group == trouve_protocol::PersonaGroup::Reviewer)
-        {
+        for persona in personas {
             let existing = reviewers
                 .iter()
                 .find(|candidate| candidate.id == persona.id)
                 .cloned();
+            reviewers.retain(|reviewer| reviewer.id != persona.id);
+            if persona.group != trouve_protocol::PersonaGroup::Reviewer {
+                continue;
+            }
             let built_in = existing
                 .as_ref()
                 .is_some_and(|candidate| candidate.built_in)
                 || builtin_ids.contains(&persona.id);
-            reviewers.retain(|reviewer| reviewer.id != persona.id);
-            reviewers.push(crate::reviewers::persona_as_reviewer(&persona, built_in));
+            let mut reviewer = crate::reviewers::persona_as_reviewer(&persona, built_in);
+            if let Some(existing) = existing {
+                reviewer.model = persona.default_model.clone().or(existing.model);
+                reviewer.default_thinking_level = persona
+                    .default_thinking_level
+                    .clone()
+                    .or(existing.default_thinking_level);
+            }
+            reviewers.push(reviewer);
         }
         Ok(reviewers)
     }
@@ -2440,6 +2448,7 @@ impl Engine {
         &self,
         request: &UpdateCodeReviewRepositoryRequest,
     ) -> Result<CodeReviewRepository, EngineError> {
+        let _persona_mutation = self.persona_mutations.lock().await;
         validate_repository(&request.repository)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
         // Disabling must always be an escape hatch for legacy or otherwise

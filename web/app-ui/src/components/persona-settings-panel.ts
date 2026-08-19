@@ -246,7 +246,10 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       this.#modeFormModelId = undefined;
       this.#modeFormThinkingDraft = undefined;
       const success = `Saved persona ${id}.`;
-      if (!await this.#reloadAfterMutation(success)) return;
+      if (!await this.#reloadAfterMutation(success)) {
+        void this.#restorePersonaFocus(existing === undefined ? "__add__" : id);
+        return;
+      }
       this.#message = success;
       this.requestUpdate();
       void this.#restorePersonaFocus(existing === undefined ? "__add__" : id);
@@ -272,10 +275,17 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       const success = info.origin === "custom"
         ? `Deleted persona ${info.persona.id}.`
         : `Reset persona ${info.persona.id} to its built-in definition.`;
-      if (!await this.#reloadAfterMutation(success)) return;
+      const focusId = info.origin === "custom" ? "__add__" : info.persona.id;
+      if (info.origin === "custom") {
+        this.#modes = this.#modes.filter((candidate) => candidate.persona.id !== info.persona.id);
+      }
+      if (!await this.#reloadAfterMutation(success)) {
+        void this.#restorePersonaFocus(focusId);
+        return;
+      }
       this.#message = success;
       this.requestUpdate();
-      void this.#restorePersonaFocus("__add__");
+      void this.#restorePersonaFocus(focusId);
     } catch {
       this.#message = `Persona ${info.persona.id} could not be ${info.origin === "custom" ? "deleted" : "reset"}.`;
       this.#error = true;

@@ -6033,6 +6033,46 @@ impl Store {
         Ok(())
     }
 
+    pub fn replace_claimed_reviewer_profile(
+        &self,
+        reviewer: &trouve_protocol::ReviewerProfile,
+        claim_token: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO code_review_identities
+                    (id, name, prompt, model, thinking_level, built_in, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name, prompt = excluded.prompt, model = excluded.model,
+               thinking_level = excluded.thinking_level, built_in = excluded.built_in,
+               updated_at = excluded.updated_at",
+            params![
+                reviewer.id,
+                reviewer.name,
+                reviewer.prompt,
+                reviewer.model,
+                reviewer.default_thinking_level,
+                reviewer.built_in,
+                now,
+            ],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM persona_cleanup_intents
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![reviewer.id, claim_token],
+        )?;
+        anyhow::ensure!(
+            deleted == 1,
+            "persona deletion claim for {} was lost",
+            reviewer.id
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_custom_reviewer_profile(&self, id: &str) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;

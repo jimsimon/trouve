@@ -1819,7 +1819,7 @@ pub struct Engine {
     provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Serializes persona-file mutations with durable deletion replay so a
     /// recreate cannot race a pending cleanup of the same user-level file.
-    persona_mutations: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) persona_mutations: Arc<tokio::sync::Mutex<()>>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -4721,7 +4721,11 @@ impl Engine {
                 .list_custom_reviewer_profiles()?
                 .into_iter()
                 .find(|reviewer| reviewer.id == id)
-                .expect("legacy reviewer was validated above");
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "legacy reviewer persona {id} no longer exists"
+                    ))
+                })?;
             let policy = crate::reviewers::reviewer_as_persona(&existing);
             if persona.allowed_tools != policy.allowed_tools
                 || persona.read_only != policy.read_only
@@ -4739,10 +4743,17 @@ impl Engine {
             } else {
                 None
             };
-            self.store
-                .upsert_reviewer_profile(&crate::reviewers::persona_as_reviewer(&persona, false))?;
+            let reviewer = crate::reviewers::persona_as_reviewer(&persona, false);
             if let Some(claim) = replacement_claim {
-                self.store.cancel_claimed_persona_deletion(id, &claim)?;
+                if let Err(error) = self
+                    .store
+                    .replace_claimed_reviewer_profile(&reviewer, &claim)
+                {
+                    let _ = self.store.release_persona_deletion_claim(id, &claim);
+                    return Err(EngineError::Internal(error));
+                }
+            } else {
+                self.store.upsert_reviewer_profile(&reviewer)?;
             }
             drop(mutation);
             return Ok(());
@@ -4852,7 +4863,7 @@ impl Engine {
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
-        let _mutation = self.persona_mutations.lock().await;
+        let mutation = self.persona_mutations.clone().lock_owned().await;
         let deletion_pending = self.store.persona_deletion_pending(id)?;
         let reviewer_catalog = self.code_review_reviewer_catalog()?;
         let custom_reviewer = reviewer_catalog
@@ -4883,21 +4894,33 @@ impl Engine {
             let claim = self.store.claim_persona_deletion(id)?.ok_or_else(|| {
                 EngineError::BadRequest(format!("persona {id} is currently being deleted"))
             })?;
-            let file_result = if custom_reviewer && !personas::is_valid_persona_id(id) {
+            let store = self.store.clone();
+            let executor = self.executor.clone();
+            let config_dir = config_dir.to_path_buf();
+            let id = id.to_string();
+            return tokio::spawn(async move {
+                let _mutation = mutation;
+                let file_result = if custom_reviewer && !personas::is_valid_persona_id(&id) {
+                    Ok(())
+                } else {
+                    executor
+                        .delete_persona_file(&config_dir, &id, deletion_pending || custom_reviewer)
+                        .await
+                };
+                if let Err(error) = file_result {
+                    store.release_persona_deletion_claim(&id, &claim)?;
+                    return Err(EngineError::Internal(anyhow::anyhow!(error)));
+                }
+                if let Err(error) = store.complete_claimed_persona_deletion_token(&id, &claim) {
+                    let _ = store.release_persona_deletion_claim(&id, &claim);
+                    return Err(EngineError::Internal(error));
+                }
                 Ok(())
-            } else {
-                self.executor
-                    .delete_persona_file(config_dir, id, deletion_pending || custom_reviewer)
-                    .await
-            };
-            if let Err(error) = file_result {
-                self.store.release_persona_deletion_claim(id, &claim)?;
-                return Err(EngineError::Internal(anyhow::anyhow!(error)));
-            }
-            return self
-                .store
-                .complete_claimed_persona_deletion_token(id, &claim)
-                .map_err(EngineError::Internal);
+            })
+            .await
+            .map_err(|error| {
+                EngineError::Internal(anyhow::anyhow!("persona deletion task failed: {error}"))
+            })?;
         }
         if !system_persona {
             return Err(EngineError::BadRequest(format!(
