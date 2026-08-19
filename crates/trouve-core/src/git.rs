@@ -1714,6 +1714,25 @@ pub fn head_ref(repo: &Path) -> Result<String> {
     }
 }
 
+/// Whether a local branch currently points at `commit`. This is trusted
+/// ownership evidence for remote objects reported by a provider: both the ref
+/// and object id must already exist in the session repository.
+pub fn local_branch_matches_commit(repo: &Path, branch: &str, commit: &str) -> bool {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || commit.len() != 40
+        || !commit.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let revision = format!("refs/heads/{branch}^{{commit}}");
+    git(
+        repo,
+        &["rev-parse", "--verify", "--end-of-options", &revision],
+    )
+    .is_ok_and(|resolved| resolved.eq_ignore_ascii_case(commit))
+}
+
 /// Local branch names, most recently committed first.
 pub fn list_branches(repo: &Path) -> Result<Vec<String>> {
     let out = git(
@@ -3228,6 +3247,31 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         run(dir, &["add", "-A"]);
         run(dir, &["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn local_branch_commit_proof_rejects_provider_forgery() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let commit = run(tmp.path(), &["rev-parse", "HEAD"]);
+        run(tmp.path(), &["branch", "agent/created-pr", &commit]);
+
+        assert!(local_branch_matches_commit(
+            tmp.path(),
+            "agent/created-pr",
+            &commit
+        ));
+        assert!(!local_branch_matches_commit(tmp.path(), "forged", &commit));
+        assert!(!local_branch_matches_commit(
+            tmp.path(),
+            "agent/created-pr",
+            "0000000000000000000000000000000000000000"
+        ));
+        assert!(!local_branch_matches_commit(
+            tmp.path(),
+            "agent/created-pr",
+            "not-a-commit"
+        ));
     }
 
     #[test]

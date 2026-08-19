@@ -5083,59 +5083,98 @@ impl Engine {
         Ok(())
     }
 
-    /// Verify provider-reported PR numbers against GitHub before persisting
-    /// them. A creation result is trusted to identify a candidate number, but
-    /// only the fetched PR head may authorize a durable session association.
-    async fn record_verified_session_pr_numbers(
-        &self,
-        session: &Session,
-        repository: &(String, String, String),
-        numbers: impl IntoIterator<Item = u64>,
-        branch_evidence: &[String],
-        commit_ids: &HashSet<String>,
-        recorded: &mut HashSet<u64>,
-    ) -> Result<(), EngineError> {
-        let github = match self.github_for_session(session) {
-            Ok(github) => github,
-            Err(error) => {
-                tracing::warn!(
-                    session_id = session.id,
-                    error = %error,
-                    "cannot verify provider-reported pull request"
-                );
-                return Ok(());
-            }
+    /// A provider may nominate a PR number, but only a local branch ref at the
+    /// fetched GitHub head SHA proves that this session repository owns it.
+    async fn pr_has_locally_verified_head(session: &Session, pr: &trouve_protocol::PrInfo) -> bool {
+        let Some(commit) = pr.head_sha.clone() else {
+            return false;
         };
-        for number in numbers {
-            if recorded.contains(&number) {
-                continue;
-            }
-            match github.pr(number).await {
-                Ok(pr)
-                    if pr.head == session.branch
-                        || crate::github::pr_matches_session_evidence(
-                            &pr,
-                            branch_evidence,
-                            commit_ids,
-                        ) =>
-                {
-                    self.record_session_pr_numbers(&session.id, repository, [number], recorded)?;
+        let branch = pr.head.clone();
+        let worktree = PathBuf::from(&session.worktree_path);
+        tokio::task::spawn_blocking(move || {
+            crate::git::local_branch_matches_commit(&worktree, &branch, &commit)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Verify provider-reported candidates after ToolCompleted is durable, so
+    /// GitHub latency never stalls stream processing or model continuation.
+    fn schedule_session_pr_verification(
+        self: &Arc<Self>,
+        session: Session,
+        repository: (String, String, String),
+        numbers: Vec<u64>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let github = match engine.github_for_session(&session) {
+                Ok(github) => github,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = session.id,
+                        error = %error,
+                        "cannot verify provider-reported pull request"
+                    );
+                    return;
                 }
-                Ok(pr) => tracing::warn!(
-                    session_id = session.id,
-                    pr_number = number,
-                    pr_head = pr.head,
-                    "ignoring pull request without matching session branch or commit evidence"
-                ),
-                Err(error) => tracing::warn!(
-                    session_id = session.id,
-                    pr_number = number,
-                    error = %error,
-                    "ignoring unverified pull request creation result"
-                ),
+            };
+            for number in numbers {
+                let fetched = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    fetched = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        github.pr(number),
+                    ) => fetched,
+                };
+                match fetched {
+                    Ok(Ok(pr)) if Self::pr_has_locally_verified_head(&session, &pr).await => {
+                        let mut recorded = match engine.recorded_session_pr_numbers(&session.id) {
+                            Ok(recorded) => recorded,
+                            Err(error) => {
+                                tracing::warn!(
+                                    session_id = session.id,
+                                    error = %error,
+                                    "cannot load recorded pull requests"
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(error) = engine.record_session_pr_numbers(
+                            &session.id,
+                            &repository,
+                            [number],
+                            &mut recorded,
+                        ) {
+                            tracing::warn!(
+                                session_id = session.id,
+                                pr_number = number,
+                                error = %error,
+                                "cannot persist verified pull request association"
+                            );
+                        }
+                    }
+                    Ok(Ok(pr)) => tracing::warn!(
+                        session_id = session.id,
+                        pr_number = number,
+                        pr_head = pr.head,
+                        "ignoring pull request without a matching local branch ref"
+                    ),
+                    Ok(Err(error)) => tracing::warn!(
+                        session_id = session.id,
+                        pr_number = number,
+                        error = %error,
+                        "ignoring unavailable pull request creation result"
+                    ),
+                    Err(_) => tracing::warn!(
+                        session_id = session.id,
+                        pr_number = number,
+                        "timed out verifying pull request creation result"
+                    ),
+                }
             }
-        }
-        Ok(())
+        });
     }
 
     /// PR numbers already linked through persisted session events.
@@ -5243,6 +5282,9 @@ impl Engine {
             .await
             .map_err(github_engine_error)?
         {
+            if !Self::pr_has_locally_verified_head(&session, &pr).await {
+                continue;
+            }
             self.record_session_pr_numbers(
                 session_id,
                 &repository,
@@ -5256,14 +5298,7 @@ impl Engine {
         for number in evidence.numbers {
             if seen.insert(number) {
                 match github.pr(number).await {
-                    Ok(pr)
-                        if pr.head == session.branch
-                            || crate::github::pr_matches_session_evidence(
-                                &pr,
-                                &evidence.successful_tool_args,
-                                &evidence.commit_ids,
-                            ) =>
-                    {
+                    Ok(pr) if Self::pr_has_locally_verified_head(&session, &pr).await => {
                         self.record_session_pr_numbers(
                             session_id,
                             &repository,
@@ -11234,7 +11269,6 @@ impl Engine {
         // can plausibly create a pull request so ordinary turns do not pay
         // that process-startup cost.
         let mut github_repository = None;
-        let mut recorded_prs = HashSet::new();
         let mut vendor_threads = HashMap::<String, String>::new();
         if let Some(vendor_session_id) = active_vendor_session.as_ref() {
             vendor_threads.insert(vendor_session_id.clone(), thread.id.clone());
@@ -11581,6 +11615,7 @@ impl Engine {
                     }
                     tool_started_at.insert(call_id.clone(), Instant::now());
                     if github_repository.is_none()
+                        && could_request_pull_request_creation(&tool, &args)
                         && let Ok(repository) = self.github_repository_for_session(session)
                         && {
                             let (_, owner, repo) = &repository;
@@ -11590,7 +11625,6 @@ impl Engine {
                             )
                         }
                     {
-                        recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
                         github_repository = Some(repository);
                     }
                     tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
@@ -11868,49 +11902,32 @@ impl Engine {
                         )?,
                         None => None,
                     };
+                    let mut verification = None;
                     if ok
                         && let Some(repository @ (host, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
                     {
                         let request = classify_pull_request_creation(tool, args, owner, repo);
-                        if matches!(request, PullRequestCreationRequest::Rejected) {
-                            github_creation_output.remove(&call_id);
-                            persisted.push(Event::ToolCompleted {
-                                call_id,
-                                status,
-                                result,
-                                execution_duration_ms,
-                            });
-                            if let Some(todos) = todos {
-                                persisted.push(Event::TodosUpdated { todos });
+                        if !matches!(request, PullRequestCreationRequest::Rejected) {
+                            let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
+                            let creation_output =
+                                github_creation_output.remove(&call_id).unwrap_or_default();
+                            let output_numbers = crate::github::pr_numbers_in_text(
+                                &creation_output,
+                                host,
+                                owner,
+                                repo,
+                            );
+                            if matches!(request, PullRequestCreationRequest::Confirmed)
+                                || (matches!(request, PullRequestCreationRequest::Unresolved)
+                                    && (!result_numbers.is_empty() || !output_numbers.is_empty()))
+                            {
+                                let mut numbers = result_numbers.into_iter().collect::<Vec<_>>();
+                                numbers.extend(output_numbers);
+                                verification = Some((repository.clone(), numbers));
                             }
-                            continue;
                         }
-                        let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
-                        let creation_output =
-                            github_creation_output.remove(&call_id).unwrap_or_default();
-                        let output_numbers =
-                            crate::github::pr_numbers_in_text(&creation_output, host, owner, repo);
-                        if matches!(request, PullRequestCreationRequest::Confirmed)
-                            || (matches!(request, PullRequestCreationRequest::Unresolved)
-                                && (!result_numbers.is_empty() || !output_numbers.is_empty()))
-                        {
-                            let mut numbers = result_numbers;
-                            numbers.extend(output_numbers);
-                            let branch_evidence = vec![args.to_string()];
-                            let mut commit_ids = git_commit_ids_in_value(args);
-                            commit_ids.extend(git_commit_ids_in_value(&result));
-                            commit_ids.extend(git_commit_ids_in_text(&creation_output));
-                            self.record_verified_session_pr_numbers(
-                                session,
-                                repository,
-                                numbers,
-                                &branch_evidence,
-                                &commit_ids,
-                                &mut recorded_prs,
-                            )
-                            .await?;
-                        }
+                        github_creation_output.remove(&call_id);
                     } else {
                         github_creation_output.remove(&call_id);
                     }
@@ -11922,6 +11939,15 @@ impl Engine {
                     });
                     if let Some(todos) = todos {
                         persisted.push(Event::TodosUpdated { todos });
+                    }
+                    if let Some((repository, numbers)) = verification {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        self.schedule_session_pr_verification(
+                            session.clone(),
+                            repository,
+                            numbers,
+                            cancel.child_token(),
+                        );
                     }
                 }
                 BackendEvent::ApprovalNeeded {
@@ -12934,11 +12960,12 @@ impl Engine {
             &outcome.result,
             Some(&call.arguments),
         )?;
+        let mut verification = None;
         if matches!(outcome.status, ToolStatus::Ok)
+            && could_request_pull_request_creation(&call.name, &call.arguments)
             && let Ok(repository) = self.github_repository_for_session(session)
         {
             let (host, owner, repo) = &repository;
-            let mut recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
             let request = classify_pull_request_creation(&call.name, &call.arguments, owner, repo);
             if !matches!(request, PullRequestCreationRequest::Rejected) {
                 let result_numbers = pr_numbers_in_value(&outcome.result, host, owner, repo);
@@ -12946,18 +12973,7 @@ impl Engine {
                     || (matches!(request, PullRequestCreationRequest::Unresolved)
                         && !result_numbers.is_empty())
                 {
-                    let branch_evidence = vec![call.arguments.to_string()];
-                    let mut commit_ids = git_commit_ids_in_value(&call.arguments);
-                    commit_ids.extend(git_commit_ids_in_value(&outcome.result));
-                    self.record_verified_session_pr_numbers(
-                        session,
-                        &repository,
-                        result_numbers,
-                        &branch_evidence,
-                        &commit_ids,
-                        &mut recorded_prs,
-                    )
-                    .await?;
+                    verification = Some((repository, result_numbers.into_iter().collect()));
                 }
             }
         }
@@ -12974,6 +12990,14 @@ impl Engine {
         self.store
             .append_events_async(scope, completion_events)
             .await?;
+        if let Some((repository, numbers)) = verification {
+            self.schedule_session_pr_verification(
+                session.clone(),
+                repository,
+                numbers,
+                cancel.child_token(),
+            );
+        }
         Ok((model_result, images))
     }
 
@@ -14004,6 +14028,47 @@ fn trusted_activity_tool_name(tool: &str) -> bool {
             normalized.as_str(),
             "apigraphql" | "apirequest" | "httprequest"
         )
+}
+
+/// Cheap classifier-owned superset used before repository discovery. Every
+/// Confirmed or Unresolved call must pass this gate; false positives only pay
+/// the one-time repository lookup and are rejected by the full classifier.
+fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
+    if is_activity_tool_wrapper(tool) {
+        if !trusted_activity_tool_wrapper(args) {
+            return false;
+        }
+        return ["tool", "toolName", "name"]
+            .iter()
+            .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
+            .is_some_and(trusted_activity_tool_name);
+    }
+
+    let tool_compact = compact_activity(tool);
+    if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
+        return true;
+    }
+    let integration_like = [
+        "shell",
+        "bash",
+        "command",
+        "terminal",
+        "exec",
+        "gh",
+        "github",
+        "browser",
+        "playwright",
+        "web",
+        "http",
+        "api",
+    ]
+    .iter()
+    .any(|marker| tool_compact.contains(marker));
+    if !integration_like {
+        return false;
+    }
+    let text = args.to_string().to_ascii_lowercase();
+    text.contains("create") || text.contains("gh pr") || text.contains("/pulls")
 }
 
 /// Resolve provider-owned generic tool wrappers to the operation they carry.
@@ -18885,6 +18950,14 @@ default_permission_mode = "ask"
 
     #[test]
     fn recognizes_creation_without_treating_pr_reads_as_associations() {
+        assert!(could_request_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "server": "codex_apps",
+                "tool": "github.create_pull_request",
+                "arguments": "{undecodable"
+            })
+        ));
         assert!(requests_pull_request_creation(
             "mcpToolCall",
             &serde_json::json!({
@@ -19089,6 +19162,13 @@ default_permission_mode = "ask"
             ),
             PullRequestCreationRequest::Confirmed
         ));
+        assert!(could_request_pull_request_creation(
+            "http_request",
+            &serde_json::json!({
+                "method": "POST",
+                "url": "https://api.github.com/repos/o/r/pulls"
+            })
+        ));
         assert!(matches!(
             classify_pull_request_creation(
                 "mcpToolCall",
@@ -19104,6 +19184,17 @@ default_permission_mode = "ask"
                 "r"
             ),
             PullRequestCreationRequest::Confirmed
+        ));
+        assert!(could_request_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "server": "codex_apps",
+                "repository_full_name": "o/r",
+                "tool": "api.graphql",
+                "arguments": {
+                    "query": "mutation { createPullRequest(input: $input) { pullRequest { url } } }"
+                }
+            })
         ));
         assert!(matches!(
             classify_pull_request_creation(
