@@ -618,7 +618,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         }
     }
     backfill_code_review_watermarks(conn)?;
-    backfill_legacy_code_review_publications(conn)?;
+    repair_legacy_code_review_publications(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
     migrate_general_persona_reviewer_references(conn)?;
@@ -780,35 +780,23 @@ fn backfill_code_review_watermarks(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Marks jobs that succeeded before review_published existed. The data update
-/// and migration marker share one transaction, so a crash cannot leave the
-/// new column present while permanently skipping its historical backfill.
-fn backfill_legacy_code_review_publications(conn: &mut Connection) -> Result<()> {
-    const MIGRATION_ID: &str = "code-review-published-backfill-v1";
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let applied = tx
-        .query_row(
-            "SELECT 1 FROM store_migrations WHERE id = ?1",
-            [MIGRATION_ID],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if applied {
-        tx.commit()?;
-        return Ok(());
-    }
-    tx.execute(
+/// Repairs publication state from conclusive evidence on every startup. This
+/// intentionally has no one-time migration marker: an older binary restored
+/// during rollback can create more legacy rows before the current version is
+/// started again. A lifecycle-comment URL is not evidence that a PR review
+/// was published.
+fn repair_legacy_code_review_publications(conn: &Connection) -> Result<()> {
+    conn.execute(
         "UPDATE code_review_jobs
-         SET review_published = 1
-         WHERE status = 'succeeded' AND review_published = 0",
+         SET publication_accepted = 1,
+             review_published = 1
+         WHERE review_published = 0
+           AND (
+             publication_accepted != 0
+             OR (review_url != '' AND review_url != lifecycle_comment_url)
+           )",
         [],
     )?;
-    tx.execute(
-        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
-        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
-    )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -8687,10 +8675,10 @@ impl Store {
             return Ok((false, 0));
         };
         let state_changed = previous_resolved != Some(is_resolved);
-        let reopened_closed_finding =
-            matches!(status.as_str(), "fixed" | "dismissed") && !is_resolved;
-        let recheck_pending =
-            reopened_closed_finding || (previous_resolved == Some(true) && !is_resolved);
+        let reopened_closed_finding = matches!(status.as_str(), "fixed" | "dismissed")
+            && previous_resolved == Some(true)
+            && !is_resolved;
+        let recheck_pending = previous_resolved == Some(true) && !is_resolved;
         let changed = state_changed
             || reopened_closed_finding
             || previous_thread_id.as_deref() != Some(thread_id);
@@ -9660,7 +9648,8 @@ impl Store {
         let tx = conn.transaction()?;
         let updated = tx.execute(
             "UPDATE code_review_jobs
-             SET review_published = 1,
+             SET publication_accepted = 1,
+                 review_published = 1,
                  review_url = CASE WHEN ?2 = '' THEN review_url ELSE ?2 END
              WHERE id = ?1 AND publication_claimed != 0",
             params![id, review_url],
@@ -11090,10 +11079,14 @@ mod tests {
                 "INSERT INTO code_review_jobs
                         (id, dedupe_key, installation_id, repository, pull_number,
                          pull_title, pull_url, head_sha, base_ref, head_ref, trigger,
-                         status, created_at)
+                         status, created_at, review_url)
                  VALUES ('review-1', 'dedupe-1', 7, 'acme/widgets', 42,
                          'Widgets', 'https://example.test/pull/42', 'head', 'base',
-                         'branch', 'automatic', 'succeeded', '2026-01-01T00:00:00Z')",
+                         'branch', 'automatic', 'succeeded', '2026-01-01T00:00:00Z',
+                         'https://example.test/pull/42#pullrequestreview-1'),
+                        ('review-2', 'dedupe-2', 7, 'acme/widgets', 43,
+                         'Widgets clean', 'https://example.test/pull/43', 'head-2', 'base',
+                         'branch-2', 'automatic', 'succeeded', '2026-01-01T00:00:00Z', '')",
                 [],
             )
             .unwrap();
@@ -11127,6 +11120,14 @@ mod tests {
             )
             .unwrap();
         assert!(published);
+        let clean_without_review: bool = conn
+            .query_row(
+                "SELECT review_published FROM code_review_jobs WHERE id = 'review-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!clean_without_review);
     }
 
     #[test]
@@ -11232,72 +11233,51 @@ mod tests {
     }
 
     #[test]
-    fn legacy_review_publication_backfill_retries_atomically() {
-        let mut conn = Connection::open_in_memory().unwrap();
+    fn legacy_review_publication_repair_is_evidence_based_and_repeatable() {
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE store_migrations (
-                id TEXT PRIMARY KEY,
-                applied_at TEXT NOT NULL
-             );
-             CREATE TABLE code_review_jobs (
+            "CREATE TABLE code_review_jobs (
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
-                review_published INTEGER NOT NULL DEFAULT 0
+                publication_accepted INTEGER NOT NULL DEFAULT 0,
+                review_published INTEGER NOT NULL DEFAULT 0,
+                review_url TEXT NOT NULL DEFAULT '',
+                lifecycle_comment_url TEXT NOT NULL DEFAULT ''
              );
-             INSERT INTO code_review_jobs (id, status) VALUES
-                ('published', 'succeeded'),
-                ('failed', 'failed');
-             CREATE TRIGGER reject_review_publication_marker
-             BEFORE INSERT ON store_migrations
-             WHEN NEW.id = 'code-review-published-backfill-v1'
-             BEGIN
-                SELECT RAISE(FAIL, 'migration marker write blocked');
-             END;",
+             INSERT INTO code_review_jobs
+               (id, status, publication_accepted, review_url, lifecycle_comment_url)
+             VALUES
+               ('published', 'succeeded', 0, 'https://example/review/1', ''),
+               ('accepted', 'running', 1, '', ''),
+               ('lifecycle-only', 'succeeded', 0, 'https://example/comment/1',
+                'https://example/comment/1'),
+               ('clean', 'succeeded', 0, '', '');",
         )
         .unwrap();
 
-        assert!(backfill_legacy_code_review_publications(&mut conn).is_err());
-        assert_eq!(
+        repair_legacy_code_review_publications(&conn).unwrap();
+        let state = |id: &str| {
             conn.query_row(
-                "SELECT review_published FROM code_review_jobs WHERE id = 'published'",
-                [],
-                |row| row.get::<_, i64>(0),
+                "SELECT publication_accepted, review_published
+                 FROM code_review_jobs WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
-            .unwrap(),
-            0
-        );
-        conn.execute_batch("DROP TRIGGER reject_review_publication_marker")
-            .unwrap();
+            .unwrap()
+        };
+        assert_eq!(state("published"), (1, 1));
+        assert_eq!(state("accepted"), (1, 1));
+        assert_eq!(state("lifecycle-only"), (0, 0));
+        assert_eq!(state("clean"), (0, 0));
 
-        backfill_legacy_code_review_publications(&mut conn).unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT review_published FROM code_review_jobs WHERE id = 'published'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT review_published FROM code_review_jobs WHERE id = 'failed'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM store_migrations
-                 WHERE id = 'code-review-published-backfill-v1'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            1
-        );
+        conn.execute(
+            "INSERT INTO code_review_jobs (id, status, review_url)
+             VALUES ('rollback-review', 'succeeded', 'https://example/review/2')",
+            [],
+        )
+        .unwrap();
+        repair_legacy_code_review_publications(&conn).unwrap();
+        assert_eq!(state("rollback-review"), (1, 1));
     }
 
     #[test]
@@ -14207,6 +14187,19 @@ mod tests {
                 .resolve_code_review_finding(&finding.id, "fixed")
                 .unwrap()
         );
+
+        assert!(
+            store
+                .record_code_review_thread_state(&finding.id, "thread-1", false)
+                .unwrap()
+                .0
+        );
+        let first_unresolved = store
+            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert_eq!(first_unresolved[0].finding.status, "fixed");
+        assert_eq!(first_unresolved[0].is_resolved, Some(false));
+        assert!(!first_unresolved[0].recheck_pending);
 
         assert!(
             store

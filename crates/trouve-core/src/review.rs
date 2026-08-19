@@ -42,12 +42,10 @@ const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
 const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
 const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
-const REVIEW_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(305);
-/// Keep paginated thread loading inside the surrounding reconciliation
-/// timeout so it can return its graceful incomplete result before the outer
-/// watchdog reports a poll failure.
-const REVIEW_THREAD_LISTING_BUDGET: Duration =
-    REVIEW_RECONCILIATION_TIMEOUT.saturating_sub(Duration::from_secs(15));
+/// Reconcile one rotating pull request per poll and bound its complete
+/// paginated thread walk. Ordinary pull discovery and review enqueueing for
+/// later repositories therefore never wait behind several slow walks.
+const REVIEW_RECONCILIATION_PASS_BUDGET: Duration = Duration::from_secs(45);
 const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_OUTBOX_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
@@ -266,6 +264,7 @@ pub struct CodeReviewRuntime {
     poll_wake: Notify,
     job_wake: Notify,
     warned_job_concurrency_override: AtomicUsize,
+    thread_reconcile_cursor: AtomicUsize,
     running: Mutex<HashMap<String, RunningReview>>,
     projection_queue: Mutex<HashMap<String, ProjectionQueueState>>,
     projection_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
@@ -298,6 +297,35 @@ struct RunningReview {
 /// whether it is already resolved — plus whether the listing reached the
 /// final page.
 type ReviewThreadListing = (HashMap<u64, (String, bool)>, bool);
+
+fn review_thread_listing_is_authoritative(
+    threads: &HashMap<u64, (String, bool)>,
+    listing_complete: bool,
+    targets: &HashSet<u64>,
+) -> bool {
+    listing_complete
+        || targets
+            .iter()
+            .all(|comment_id| threads.contains_key(comment_id))
+}
+
+struct ReviewReconciliationPass {
+    target: usize,
+    seen: usize,
+    attempted: bool,
+}
+
+impl ReviewReconciliationPass {
+    fn select(&mut self) -> Option<Instant> {
+        let selected = !self.attempted && self.seen >= self.target;
+        self.seen = self.seen.saturating_add(1);
+        if !selected {
+            return None;
+        }
+        self.attempted = true;
+        Some(Instant::now() + REVIEW_RECONCILIATION_PASS_BUDGET)
+    }
+}
 
 /// How one finding fared inside a collapse pass: `Completed` means its
 /// pending flag was settled (thread collapsed or provably absent), while
@@ -2911,12 +2939,24 @@ impl Engine {
         }
 
         let repositories = self.store.list_code_review_repositories()?;
+        let reconcile_target = self
+            .code_review
+            .thread_reconcile_cursor
+            .load(Ordering::Relaxed);
+        let mut reconciliation_pass = ReviewReconciliationPass {
+            target: reconcile_target,
+            seen: 0,
+            attempted: false,
+        };
         for repository in repositories.iter().filter(|repository| {
             repository.mode != CodeReviewMode::Off
                 && active_repositories
                     .contains(&(repository.installation_id, repository.repository.clone()))
         }) {
-            match self.poll_code_review_repository(repository).await {
+            match self
+                .poll_code_review_repository(repository, &mut reconciliation_pass)
+                .await
+            {
                 Ok(repository_had_errors) => had_errors |= repository_had_errors,
                 Err(error) => {
                     had_errors = true;
@@ -2927,6 +2967,14 @@ impl Engine {
                 }
             }
         }
+        let next_reconcile_target = if reconciliation_pass.seen == 0 {
+            0
+        } else {
+            reconcile_target.saturating_add(1) % reconciliation_pass.seen
+        };
+        self.code_review
+            .thread_reconcile_cursor
+            .store(next_reconcile_target, Ordering::Relaxed);
         for job in self
             .store
             .code_review_jobs_with_projection_errors(REVIEW_PROJECTION_REPAIR_LIMIT)?
@@ -2944,7 +2992,11 @@ impl Engine {
         Ok(())
     }
 
-    async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<bool> {
+    async fn poll_code_review_repository(
+        &self,
+        repository: &CodeReviewRepository,
+        reconciliation_pass: &mut ReviewReconciliationPass,
+    ) -> Result<bool> {
         validate_repository(&repository.repository)?;
         let reviewers = self.reviewers_for_repository_policy(repository)?;
         let config_hash = Self::code_review_config_hash(repository, &reviewers)?;
@@ -3130,22 +3182,18 @@ impl Engine {
                     "processing pull request {}#{} failed: {error:#}",
                     repository.repository, pull_number
                 ));
-            } else {
-                let reconciliation = tokio::time::timeout(
-                    REVIEW_RECONCILIATION_TIMEOUT,
-                    self.reconcile_user_resolved_review_findings(
+            } else if let Some(deadline) = reconciliation_pass.select() {
+                let reconciliation = self
+                    .reconcile_user_resolved_review_findings(
                         &api,
                         repository,
                         &reviewers,
                         &config_hash,
                         &pull,
-                    ),
-                )
-                .await;
-                if let Err(error) = reconciliation
-                    .map_err(|_| anyhow!("review-thread reconciliation timed out"))
-                    .and_then(|result| result)
-                {
+                        deadline,
+                    )
+                    .await;
+                if let Err(error) = reconciliation {
                     had_errors = true;
                     self.record_review_error(format!(
                         "reconciling resolved review findings for {}#{} failed: {error:#}",
@@ -3437,7 +3485,15 @@ impl Engine {
                         )),
                     }
                 }
-                if let Err(error) = engine.poll_code_review_repository(&repository).await {
+                let mut reconciliation_pass = ReviewReconciliationPass {
+                    target: 0,
+                    seen: 0,
+                    attempted: false,
+                };
+                if let Err(error) = engine
+                    .poll_code_review_repository(&repository, &mut reconciliation_pass)
+                    .await
+                {
                     engine.record_review_error(format!("webhook reconciliation failed: {error:#}"));
                 }
             });
@@ -5401,10 +5457,29 @@ impl Engine {
                 return Ok(published.html_url);
             }
 
-            let body = response
-                .text()
-                .await
-                .with_context(|| format!("reading GitHub API {status} response"))?;
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(error) => {
+                    if status.is_client_error() {
+                        if let Err(release_error) =
+                            self.store.release_code_review_publication_claim(&job.id)
+                        {
+                            tracing::warn!(
+                                job_id = %job.id,
+                                error = %release_error,
+                                "releasing rejected GitHub review publication claim failed"
+                            );
+                        }
+                        self.persist_publication_status_best_effort(
+                            &job.id,
+                            &eligible_ids,
+                            trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                        );
+                    }
+                    return Err(error)
+                        .with_context(|| format!("reading GitHub API {status} response"));
+                }
+            };
             if status.as_u16() == 422 && github_review_should_fallback_to_comment(event, &body) {
                 event = "COMMENT";
                 continue;
@@ -6271,7 +6346,8 @@ impl Engine {
         let mut thread_by_comment = HashMap::new();
         let mut cursor: Option<String> = None;
         loop {
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 // Budget exhaustion is not a request failure: return the
                 // incomplete listing so unmatched findings are requeued
                 // without a backoff penalty.
@@ -6287,10 +6363,12 @@ impl Engine {
                 }
             });
             let request = api.post("/graphql", &body);
+            let page_timeout = REVIEW_THREAD_REQUEST_TIMEOUT.min(remaining);
             let (response, rate): (serde_json::Value, _) =
-                tokio::time::timeout(REVIEW_THREAD_REQUEST_TIMEOUT, request)
-                    .await
-                    .context("loading review threads timed out")??;
+                match tokio::time::timeout(page_timeout, request).await {
+                    Ok(result) => result?,
+                    Err(_) => return Ok((thread_by_comment, false)),
+                };
             self.record_review_rate(rate);
             if response["errors"].is_array() {
                 bail!("GitHub GraphQL error while loading review threads");
@@ -6333,6 +6411,7 @@ impl Engine {
         reviewers: &[ReviewerProfile],
         config_hash: &str,
         pull: &GithubPullRequest,
+        deadline: Instant,
     ) -> Result<()> {
         let pull_state = self
             .store
@@ -6356,15 +6435,12 @@ impl Engine {
         if targets.is_empty() {
             return Ok(());
         }
-        let (thread_by_comment, _) = self
-            .load_review_threads(
-                api,
-                &repository.repository,
-                pull.number,
-                &targets,
-                Instant::now() + REVIEW_THREAD_LISTING_BUDGET,
-            )
+        let (thread_by_comment, listing_complete) = self
+            .load_review_threads(api, &repository.repository, pull.number, &targets, deadline)
             .await?;
+        if !review_thread_listing_is_authoritative(&thread_by_comment, listing_complete, &targets) {
+            return Ok(());
+        }
         let publication_lock = self
             .code_review
             .publication_lock(&repository.repository, pull.number);
@@ -6393,8 +6469,10 @@ impl Engine {
                 (
                     state.finding.id.as_str(),
                     state.finding.github_comment_id,
+                    state.finding.status.as_str(),
                     state.is_resolved,
                     state.generation,
+                    state.recheck_pending,
                 )
             })
             .collect::<BTreeSet<_>>();
@@ -6404,8 +6482,10 @@ impl Engine {
                 (
                     state.finding.id.as_str(),
                     state.finding.github_comment_id,
+                    state.finding.status.as_str(),
                     state.is_resolved,
                     state.generation,
+                    state.recheck_pending,
                 )
             })
             .collect::<BTreeSet<_>>();
@@ -6617,9 +6697,10 @@ fn github_review_event(has_findings: bool) -> &'static str {
     if has_findings {
         "REQUEST_CHANGES"
     } else {
-        // Review input is untrusted and model output is fallible. A clean
-        // automated pass must not satisfy an approval-based branch rule.
-        "COMMENT"
+        // A clean result is reached only after the current revision has been
+        // reviewed (including the full recheck queued for user-resolved
+        // threads), so replace this app's earlier blocking verdict.
+        "APPROVE"
     }
 }
 
@@ -8796,8 +8877,38 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_pass_rotates_to_one_pull_request() {
+        let mut pass = ReviewReconciliationPass {
+            target: 1,
+            seen: 0,
+            attempted: false,
+        };
+        assert!(pass.select().is_none());
+        assert!(pass.select().is_some());
+        assert!(pass.select().is_none());
+        assert_eq!(pass.seen, 3);
+    }
+
+    #[test]
+    fn partial_thread_listings_must_cover_every_target() {
+        let targets = HashSet::from([11, 12]);
+        let mut threads = HashMap::from([(11, ("thread-11".into(), true))]);
+        assert!(!review_thread_listing_is_authoritative(
+            &threads, false, &targets
+        ));
+        threads.insert(12, ("thread-12".into(), false));
+        assert!(review_thread_listing_is_authoritative(
+            &threads, false, &targets
+        ));
+        threads.clear();
+        assert!(review_thread_listing_is_authoritative(
+            &threads, true, &targets
+        ));
+    }
+
+    #[test]
     fn github_review_verdict_matches_confirmed_findings() {
-        assert_eq!(github_review_event(false), "COMMENT");
+        assert_eq!(github_review_event(false), "APPROVE");
         assert_eq!(github_review_event(true), "REQUEST_CHANGES");
     }
 
@@ -8925,11 +9036,6 @@ mod tests {
             job.id
         );
         assert!(store.claim_code_review_publication(&job.id).unwrap());
-        assert!(
-            store
-                .mark_code_review_publication_accepted(&job.id)
-                .unwrap()
-        );
         store
             .record_code_review_publication(
                 &job.id,
@@ -8940,6 +9046,13 @@ mod tests {
                 "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
             )
             .unwrap();
+        assert!(
+            store
+                .code_review_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .publication_accepted
+        );
         store
             .finish_code_review_job(&job.id, "failed", "", "post-publication failure")
             .unwrap();
@@ -10537,6 +10650,81 @@ mod tests {
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert!(record.publication_claimed);
         assert!(!record.publication_accepted);
+    }
+
+    #[tokio::test]
+    async fn truncated_client_error_releases_the_publication_claim() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:truncated-client-error");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One issue.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Test issue".into(),
+                    body: "Eligible issue.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 422 Unprocessable Entity\r\ncontent-type: application/json\r\ncontent-length: 1000\r\nconnection: close\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        assert!(
+            engine
+                .publish_review(&api, &job, &findings, true)
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+        let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(!record.publication_claimed);
+        assert!(!record.publication_accepted);
+        assert_eq!(
+            engine.store.code_review_findings(&job.id).unwrap()[0].github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+        );
     }
 
     #[tokio::test]
@@ -12232,6 +12420,45 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn thread_listing_caps_each_request_by_the_remaining_pass_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let (threads, complete) = engine
+            .load_review_threads(
+                &api,
+                "acme/widgets",
+                42,
+                &HashSet::from([9001]),
+                Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        server.abort();
+
+        assert!(threads.is_empty());
+        assert!(!complete);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
