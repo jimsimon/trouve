@@ -59,8 +59,12 @@ const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60)
 /// cleanup runs outside the job future, and any finding it leaves pending is
 /// retried by the dedicated collapse-retry task.
 const REVIEW_THREAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const REVIEW_THREAD_PROGRESS_TTL: Duration = Duration::from_secs(2 * 60);
 const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
+/// Obsolete blocking verdict cleanup is resumable and deliberately small so
+/// it cannot monopolize the repository poll behind a large review history.
+const REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS: u64 = 3;
+const REVIEW_BLOCKING_CLEANUP_PASS_BUDGET: Duration = Duration::from_secs(30);
+const REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cadence of the dedicated collapse-retry task. It runs independently of
 /// the job scheduler, so a slow pass never delays review dispatch.
 const REVIEW_COLLAPSE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -169,6 +173,15 @@ fn code_review_poll_interval() -> Duration {
             DEFAULT_RECONCILE_INTERVAL
         }
     }
+}
+
+/// One candidate is reconciled per poll. Derive retention from the configured
+/// cadence so every bounded-cache candidate can get another turn before its
+/// partial pagination expires, even when polling is intentionally slowed.
+fn review_thread_progress_ttl() -> Duration {
+    code_review_poll_interval()
+        .saturating_mul(REVIEW_THREAD_PROGRESS_MAX_ENTRIES as u32 + 1)
+        .saturating_add(REVIEW_RECONCILIATION_PASS_BUDGET)
 }
 
 fn parse_code_review_timeout(value: &str) -> Option<Duration> {
@@ -361,7 +374,7 @@ fn take_review_thread_listing_progress(
     now: Instant,
 ) -> ReviewThreadListingProgress {
     cache.retain(|_, progress| {
-        now.saturating_duration_since(progress.saved_at) <= REVIEW_THREAD_PROGRESS_TTL
+        now.saturating_duration_since(progress.saved_at) <= review_thread_progress_ttl()
     });
     cache
         .remove(key)
@@ -375,7 +388,7 @@ fn save_review_thread_listing_progress(
     now: Instant,
 ) {
     cache.retain(|_, cached| {
-        now.saturating_duration_since(cached.saved_at) <= REVIEW_THREAD_PROGRESS_TTL
+        now.saturating_duration_since(cached.saved_at) <= review_thread_progress_ttl()
     });
     if !cache.contains_key(&key)
         && cache.len() >= REVIEW_THREAD_PROGRESS_MAX_ENTRIES
@@ -918,6 +931,11 @@ fn manual_request_can_satisfy_automatic_review(
     trigger: &str,
 ) -> bool {
     trigger == "manual" && mode == CodeReviewMode::Automatic && !draft
+}
+
+fn review_id_from_url(url: &str) -> Option<u64> {
+    url.split_once("#pullrequestreview-")
+        .and_then(|(_, id)| id.parse().ok())
 }
 
 #[derive(Deserialize)]
@@ -5735,8 +5753,35 @@ impl Engine {
         if !record.blocking_review_cleanup_pending {
             return Ok(());
         }
-        self.dismiss_prior_changes_requested_reviews(api, job)
-            .await?;
+        let cleanup = async {
+            let replacement_review_id = review_id_from_url(&record.job.review_url)
+                .context("clean review URL does not identify its GitHub review")?;
+            let start_page = self
+                .store
+                .code_review_blocking_review_cleanup_page(&job.id)?;
+            self.dismiss_prior_changes_requested_reviews(
+                api,
+                &record.job,
+                replacement_review_id,
+                start_page,
+            )
+            .await
+        }
+        .await;
+        let next_page = match cleanup {
+            Ok(next_page) => next_page,
+            Err(error) => {
+                self.store
+                    .defer_code_review_blocking_review_cleanup(&job.id)
+                    .context("deferring failed blocking-review cleanup")?;
+                return Err(error);
+            }
+        };
+        if let Some(next_page) = next_page {
+            self.store
+                .requeue_code_review_blocking_review_cleanup(&job.id, next_page)?;
+            return Ok(());
+        }
         if !self
             .store
             .clear_code_review_blocking_review_cleanup(&job.id)?
@@ -5752,36 +5797,57 @@ impl Engine {
         &self,
         api: &GithubApi,
         job: &trouve_protocol::CodeReviewJob,
-    ) -> Result<()> {
+        replacement_review_id: u64,
+        mut page: u64,
+    ) -> Result<Option<u64>> {
         let bot_login = self.github_app_status()?.bot_login;
-        let mut page = 1_u64;
-        loop {
-            let (reviews, rate): (Vec<PublishedReview>, _) = api
-                .get(&format!(
-                    "/repos/{}/pulls/{}/reviews?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
-                    job.repository, job.pull_number
-                ))
-                .await?;
+        let deadline = Instant::now() + REVIEW_BLOCKING_CLEANUP_PASS_BUDGET;
+        for _ in 0..REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(Some(page));
+            }
+            let path = format!(
+                "/repos/{}/pulls/{}/reviews?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
+                job.repository, job.pull_number
+            );
+            let request = api.get(&path);
+            let (reviews, rate): (Vec<PublishedReview>, _) = tokio::time::timeout(
+                REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT.min(remaining),
+                request,
+            )
+            .await
+            .context("listing blocking reviews timed out")??;
             self.record_review_rate(rate);
             let count = reviews.len();
             for review in reviews.into_iter().filter(|review| {
-                review.state.eq_ignore_ascii_case("CHANGES_REQUESTED")
+                review.id < replacement_review_id
+                    && review.state.eq_ignore_ascii_case("CHANGES_REQUESTED")
                     && review.user.as_ref().is_some_and(|user| {
                         user.kind == "Bot" && user.login.eq_ignore_ascii_case(&bot_login)
                     })
             }) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(Some(page));
+                }
                 let path = format!(
                     "/repos/{}/pulls/{}/reviews/{}/dismissals",
                     job.repository, job.pull_number, review.id
                 );
-                let response = api
+                let request = api
                     .request(reqwest::Method::PUT, &path)
                     .json(&serde_json::json!({
                         "message": "Superseded by a clean Trouve review.",
                         "event": "DISMISS",
                     }))
-                    .send()
-                    .await?;
+                    .send();
+                let response = tokio::time::timeout(
+                    REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT.min(remaining),
+                    request,
+                )
+                .await
+                .context("dismissing a blocking review timed out")??;
                 let status = response.status();
                 self.record_review_rate(rate_info(response.headers()));
                 let body = response.text().await.unwrap_or_default();
@@ -5790,12 +5856,13 @@ impl Engine {
                 }
             }
             if count < REVIEW_COMMENT_PAGE_SIZE {
-                return Ok(());
+                return Ok(None);
             }
             page = page
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("GitHub review pagination overflowed"))?;
         }
+        Ok(Some(page))
     }
 
     async fn sync_code_review_projection(&self, job: &trouve_protocol::CodeReviewJob) {
@@ -6795,6 +6862,7 @@ impl Engine {
                 .iter()
                 .all(|comment_id| fresh_threads.contains_key(comment_id))
         {
+            self.save_review_thread_listing_progress(progress_key, progress);
             return Ok(ReviewThreadListingOutcome::Incomplete);
         }
         Ok(ReviewThreadListingOutcome::Authoritative((
@@ -11403,6 +11471,8 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_review_cleanup_continues_beyond_the_former_page_limit() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
         let store = crate::store::Store::open_in_memory().unwrap();
         let job = enqueue_test_review_job(&store, "acme/widgets#42:dismiss-page-limit");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11417,18 +11487,70 @@ mod tests {
             REVIEW_COMMENT_PAGE_SIZE
         ])
         .unwrap();
-        let mut responses = vec![full_page; REVIEW_COMMENT_MAX_PAGES as usize];
-        responses.push(
-            serde_json::json!([{
-                "id": 777,
-                "html_url": "https://github.com/review-777",
-                "state": "CHANGES_REQUESTED",
-                "user": {"login": "trouve-ai[bot]", "type": "Bot"},
-            }])
-            .to_string(),
-        );
-        responses.push(r#"{"id":777,"state":"DISMISSED"}"#.into());
-        let server = scripted_github_server(listener, responses);
+        let server = tokio::spawn(async move {
+            for page in 1..=REVIEW_COMMENT_MAX_PAGES + 1 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(
+                    request.starts_with(&format!(
+                        "get /repos/acme/widgets/pulls/42/reviews?per_page=100&page={page} "
+                    )),
+                    "{request}"
+                );
+                let body = if page == REVIEW_COMMENT_MAX_PAGES + 1 {
+                    serde_json::json!([
+                        {
+                            "id": 777,
+                            "html_url": "https://github.com/review-777",
+                            "state": "CHANGES_REQUESTED",
+                            "user": {"login": "trouve-ai[bot]", "type": "Bot"},
+                        },
+                        {
+                            "id": 999,
+                            "html_url": "https://github.com/review-999",
+                            "state": "CHANGES_REQUESTED",
+                            "user": {"login": "trouve-ai[bot]", "type": "Bot"},
+                        }
+                    ])
+                    .to_string()
+                } else {
+                    full_page.clone()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(
+                request.starts_with("put /repos/acme/widgets/pulls/42/reviews/777/dismissals "),
+                "{request}"
+            );
+            let body = r#"{"id":777,"state":"DISMISSED"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
         let api = GithubApi::with_base_url(
@@ -11438,10 +11560,18 @@ mod tests {
         )
         .unwrap();
 
-        engine
-            .dismiss_prior_changes_requested_reviews(&api, &job)
-            .await
-            .unwrap();
+        let mut page = 1;
+        loop {
+            let Some(next_page) = engine
+                .dismiss_prior_changes_requested_reviews(&api, &job, 778, page)
+                .await
+                .unwrap()
+            else {
+                break;
+            };
+            assert!(next_page > page);
+            page = next_page;
+        }
         server.await.unwrap();
     }
 
@@ -11728,7 +11858,7 @@ mod tests {
                 (
                     "post /repos/acme/widgets/pulls/42/reviews ",
                     Some(r#""event":"comment""#),
-                    r#"{"id":11,"html_url":"https://github.com/review-11","state":"COMMENTED"}"#,
+                    r#"{"id":11,"html_url":"https://github.com/acme/widgets/pull/42#pullrequestreview-11","state":"COMMENTED"}"#,
                 ),
                 (
                     "get /repos/acme/widgets/pulls/42/reviews?per_page=100&page=1 ",
@@ -11792,7 +11922,10 @@ mod tests {
         .unwrap();
 
         let review_url = engine.publish_review(&api, &job, &[], false).await.unwrap();
-        assert_eq!(review_url, "https://github.com/review-11");
+        assert_eq!(
+            review_url,
+            "https://github.com/acme/widgets/pull/42#pullrequestreview-11"
+        );
         engine
             .store
             .record_code_review_publication(
@@ -11858,7 +11991,7 @@ mod tests {
                 job.pull_number,
                 &job.base_ref,
                 &job.head_sha,
-                "https://github.com/review-11",
+                "https://github.com/acme/widgets/pull/42#pullrequestreview-11",
                 true,
             )
             .unwrap();
@@ -11888,13 +12021,13 @@ mod tests {
                 .unwrap()
                 .blocking_review_cleanup_pending
         );
-        assert_eq!(
+        assert!(
             engine
                 .store
                 .code_review_jobs_pending_blocking_review_cleanup(10)
                 .unwrap()
-                .len(),
-            1
+                .is_empty(),
+            "a failed oldest cleanup must back off instead of occupying every repair batch"
         );
     }
 
@@ -12954,7 +13087,7 @@ mod tests {
             key(3),
             progress(
                 3,
-                now - REVIEW_THREAD_PROGRESS_TTL - Duration::from_millis(1),
+                now - review_thread_progress_ttl() - Duration::from_millis(1),
             ),
         );
         let expired = take_review_thread_listing_progress(&mut cache, &key(3), now);
@@ -13225,7 +13358,7 @@ mod tests {
                     "pageInfo": {"hasNextPage": false, "endCursor": null},
                     "nodes": [{
                         "id": "thread-9001",
-                        "isResolved": false,
+                        "isResolved": true,
                         "comments": {"nodes": [{"databaseId": 9001}]}
                     }]
                 }}}}
@@ -13303,7 +13436,7 @@ mod tests {
             .insert(
                 key.clone(),
                 ReviewThreadListingProgress {
-                    threads: HashMap::from([(9000, ("thread-9000".into(), true))]),
+                    threads: HashMap::from([(9000, ("thread-9000".into(), false))]),
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -13334,6 +13467,8 @@ mod tests {
         };
         assert!(complete);
         assert_eq!(threads.len(), 2);
+        assert_eq!(threads.get(&9000), Some(&("thread-9000".into(), true)));
+        assert_eq!(threads.get(&9001), Some(&("thread-9001".into(), false)));
         assert!(
             !engine
                 .code_review
@@ -13342,6 +13477,79 @@ mod tests {
                 .unwrap()
                 .contains_key(&key)
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_state_refresh_preserves_saved_pagination_progress() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(
+            listener,
+            vec![
+                serde_json::json!({
+                    "data": {"nodes": [
+                        {"id": "thread-9000", "isResolved": true}
+                    ]}
+                })
+                .to_string(),
+            ],
+        );
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let targets = HashSet::from([9000, 9001]);
+        let key = review_thread_listing_key(
+            "acme/widgets",
+            42,
+            ReviewThreadListingKind::Reconciliation,
+            &targets,
+        );
+        engine
+            .code_review
+            .thread_listing_progress
+            .lock()
+            .unwrap()
+            .insert(
+                key.clone(),
+                ReviewThreadListingProgress {
+                    threads: HashMap::from([
+                        (9000, ("thread-9000".into(), false)),
+                        (9001, ("thread-9001".into(), true)),
+                    ]),
+                    cursor: Some("cursor-1".into()),
+                    listing_complete: false,
+                    saved_at: Instant::now(),
+                },
+            );
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let outcome = engine
+            .load_review_threads(
+                &api,
+                "acme/widgets",
+                42,
+                &targets,
+                ReviewThreadListingKind::Reconciliation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert!(matches!(outcome, ReviewThreadListingOutcome::Incomplete));
+        let cache = engine.code_review.thread_listing_progress.lock().unwrap();
+        let progress = cache.get(&key).expect("progress should be retained");
+        assert_eq!(progress.cursor.as_deref(), Some("cursor-1"));
+        assert_eq!(progress.threads.len(), 2);
     }
 
     #[tokio::test]

@@ -335,7 +335,10 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   publication_accepted INTEGER NOT NULL DEFAULT 0,
   publication_generation INTEGER NOT NULL DEFAULT 0,
   review_published INTEGER NOT NULL DEFAULT 0,
-  blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0
+  blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0,
+  blocking_review_cleanup_page INTEGER NOT NULL DEFAULT 1,
+  blocking_review_cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+  blocking_review_cleanup_next_attempt_at TEXT
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -563,6 +566,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN publication_generation INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN review_published INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_page INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_next_attempt_at TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
@@ -9722,11 +9728,70 @@ impl Store {
     pub fn clear_code_review_blocking_review_cleanup(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET blocking_review_cleanup_pending = 0
+             SET blocking_review_cleanup_pending = 0,
+                 blocking_review_cleanup_page = 1,
+                 blocking_review_cleanup_attempts = 0,
+                 blocking_review_cleanup_next_attempt_at = NULL
              WHERE id = ?1 AND review_published != 0
                AND blocking_review_cleanup_pending != 0",
             [id],
         )? > 0)
+    }
+
+    pub fn code_review_blocking_review_cleanup_page(&self, id: &str) -> Result<u64> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT blocking_review_cleanup_page
+                 FROM code_review_jobs WHERE id = ?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(1) as u64)
+    }
+
+    /// Continue a healthy but incomplete cleanup on a later poll. Keeping its
+    /// page durable bounds each pass without restarting a large review list.
+    pub fn requeue_code_review_blocking_review_cleanup(&self, id: &str, page: u64) -> Result<()> {
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(60);
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_page = ?2,
+                 blocking_review_cleanup_next_attempt_at = ?3
+             WHERE id = ?1 AND blocking_review_cleanup_pending != 0",
+            params![id, page.max(1) as i64, next_attempt.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Back off a cleanup that made an API attempt and failed, so an old
+    /// poison row cannot occupy every fixed-size repair batch forever.
+    pub fn defer_code_review_blocking_review_cleanup(&self, id: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let attempts: i64 = tx
+            .query_row(
+                "SELECT blocking_review_cleanup_attempts
+                 FROM code_review_jobs WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let delay_seconds = (60_i64 << attempts.clamp(0, 6)).min(3600);
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_attempts =
+                   blocking_review_cleanup_attempts + 1,
+                 blocking_review_cleanup_next_attempt_at = ?2
+             WHERE id = ?1 AND blocking_review_cleanup_pending != 0",
+            params![id, next_attempt.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn code_review_jobs_pending_blocking_review_cleanup(
@@ -9738,13 +9803,16 @@ impl Store {
             "SELECT {CODE_REVIEW_JOB_COLUMNS}
              FROM code_review_jobs
              WHERE review_published != 0 AND blocking_review_cleanup_pending != 0
-             ORDER BY completed_at, created_at, id
+               AND (blocking_review_cleanup_next_attempt_at IS NULL
+                    OR blocking_review_cleanup_next_attempt_at <= ?2)
+             ORDER BY COALESCE(blocking_review_cleanup_next_attempt_at, created_at), id
              LIMIT ?1"
         ))?;
         Ok(stmt
-            .query_map(params![limit as i64], |row| {
-                row_to_code_review_job(row).map(|record| record.job)
-            })?
+            .query_map(
+                params![limit as i64, chrono::Utc::now().to_rfc3339()],
+                |row| row_to_code_review_job(row).map(|record| record.job),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -14375,6 +14443,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(generation, 10);
+    }
+
+    #[test]
+    fn blocking_review_cleanup_backoff_rotates_the_repair_batch() {
+        let store = Store::open_in_memory().unwrap();
+        let oldest = enqueue_backoff_test_job(&store);
+        let newer = store.retry_code_review_job(&oldest.id).unwrap().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'succeeded', review_published = 1,
+                     blocking_review_cleanup_pending = 1,
+                     completed_at = created_at
+                 WHERE id IN (?1, ?2)",
+                params![oldest.id, newer.id],
+            )
+            .unwrap();
+
+        store
+            .defer_code_review_blocking_review_cleanup(&oldest.id)
+            .unwrap();
+        let due = store
+            .code_review_jobs_pending_blocking_review_cleanup(1)
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, newer.id);
+
+        store
+            .requeue_code_review_blocking_review_cleanup(&newer.id, 4)
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_blocking_review_cleanup_page(&newer.id)
+                .unwrap(),
+            4
+        );
+        assert!(
+            store
+                .code_review_jobs_pending_blocking_review_cleanup(1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
