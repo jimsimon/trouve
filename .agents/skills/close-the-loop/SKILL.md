@@ -146,9 +146,10 @@ or failed blocker and stop without claiming readiness.
    recorded base revision, record the new revision, rediscover trusted workflow
    and check policy from it, and discard all prior check evidence and clean-
    snapshot convergence state. Rerun every expected check under the new base,
-   or verify from trusted run metadata that each accepted result was produced
-   for that exact base revision or its synthetic merge commit, then restart
-   the loop.
+   or verify from trusted run metadata that each accepted result binds both
+   the current head and exact base revision, such as through their verified
+   synthetic merge commit. A run for the base alone is insufficient. Then
+   restart the loop.
 
 After a push, do not mistake an empty check list for success when the previous
 head had checks. Allow workflows to register, then monitor every expected
