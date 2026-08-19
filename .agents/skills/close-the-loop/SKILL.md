@@ -86,11 +86,13 @@ Repeat this loop until the completion criteria all hold:
 
 Bound unchanged external waits. Use a repository-defined timeout when one
 exists; otherwise allow at most 30 minutes without observable progress for one
-check, review, or mergeability state. Retry a demonstrated transient CI or API
-failure at most once for the same cause and head SHA. Observable progress or a
-new head resets the no-progress clock, but not the retry count for the same
-cause. If the bound is reached or the same blocker survives its retry, report
-the exact non-terminal or failed blocker and stop without claiming readiness.
+check, review, or mergeability state. Track retries separately by exact
+operation or check, failure signature, and head SHA. Retry each demonstrated
+transient failure at most once. Reset that blocker's no-progress clock and
+retry record when it clears or the head changes; progress that does not clear
+the blocker resets only its no-progress clock. If the bound is reached or the
+same blocker survives its retry, report the exact non-terminal or failed
+blocker and stop without claiming readiness.
 
 1. Classify every unresolved thread, submitted review body, and top-level
    feedback item as actionable, already addressed, informational, duplicate,
@@ -140,15 +142,15 @@ timeouts, action-required states, and stale checks as not green.
 
 Finish only when one full snapshot proves all of the following:
 
-- Both stable snapshots match the recorded repository, PR number, base branch,
+- The current snapshot matches the recorded repository, PR number, base branch,
   head branch, and head SHA, and the same target PR is open and non-draft.
 - Every applicable CI check for that SHA is terminal and successful, or is an
   expected skipped or neutral non-required check. No check is queued, pending,
   running, failing, cancelled, timed out, stale, or action-required.
 - Every observable automated review job for the exact head SHA is successful
-  or explicitly classified as an expected non-blocking neutral result. Queued,
-  pending, running, failed, cancelled, timed-out, errored, action-required,
-  stale, or other terminal non-success states are blockers.
+  or explicitly verified as an expected non-blocking skipped or neutral result.
+  Queued, pending, running, failed, cancelled, timed-out, errored,
+  action-required, stale, or other terminal non-success states are blockers.
 - All required approvals are present. Use `reviewDecision` and, when needed,
   each reviewer's latest non-dismissed effective verdict to determine whether
   a blocking change request remains; do not let a superseded historical
@@ -166,7 +168,8 @@ Finish only when one full snapshot proves all of the following:
 - No new feedback or head change appeared after the last mutation.
 
 Then perform one more complete read after a normal polling interval. Require
-the same head SHA and the same clean result in two consecutive snapshots. If
+the second snapshot to match the recorded repository, PR number, base branch,
+head branch, and head SHA and independently satisfy every criterion above. If
 anything changed, restart the loop. If authentication, permissions, an
 external system, or conflicting feedback prevents convergence, report the
 specific blocker and do not claim success.
