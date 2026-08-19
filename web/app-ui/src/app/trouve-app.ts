@@ -125,6 +125,7 @@ import {
   sessionTitleFallback,
   snapshotNewSessionSubmission,
   thinkingOption,
+  withNewSessionOptionsTimeout,
   type NewThreadOptionEdits,
 } from "./new-session-model.js";
 import {
@@ -403,6 +404,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionOptionsWorkspaceId = "";
   #newSessionOptionEdits: NewThreadOptionEdits = createNewThreadOptionEdits();
   #newSessionOptionsPending = false;
+  #newSessionOptionsBlocking = false;
   #newSessionOptionsError = "";
   #newSessionOptionsGeneration = 0;
   #newSessionLiveUnsubscribe: (() => void) | undefined;
@@ -524,6 +526,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     );
     this.#newSessionOptionsGeneration += 1;
     this.#unsubscribeFromNewSessionLiveModels();
+    this.#newSessionOptionsPending = false;
+    this.#newSessionOptionsBlocking = false;
     this.#protocolIngress.stop();
     this.#threadIngress.close();
     if (this.#githubRefreshTimer !== undefined) {
@@ -1680,11 +1684,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionOptionsError = "";
     const loadState = beginNewSessionOptionLoad({
       optionsWorkspaceId: this.#newSessionOptionsWorkspaceId,
+      blocksSubmission: this.#newSessionOptionsBlocking,
       edits: this.#newSessionOptionEdits,
       inheritedThinking: this.#newSessionInheritedThinking,
       inheritedPermissionMode: this.#newSessionInheritedPermissionMode,
     }, preserveSelections);
     this.#newSessionOptionsWorkspaceId = loadState.optionsWorkspaceId;
+    this.#newSessionOptionsBlocking = loadState.blocksSubmission;
     this.#newSessionOptionEdits = loadState.edits;
     this.#newSessionInheritedThinking = loadState.inheritedThinking;
     this.#newSessionInheritedPermissionMode = loadState.inheritedPermissionMode;
@@ -1709,11 +1715,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       () => false,
     );
     try {
-      const [modes, models, providers] = await Promise.all([
-        this.#protocolClient.personas(workspaceId),
-        this.#modelCatalog.staticModels(),
-        this.#protocolClient.providers(),
-      ]);
+      const [modes, models, providers] = await withNewSessionOptionsTimeout(
+        Promise.all([
+          this.#protocolClient.personas(workspaceId),
+          this.#modelCatalog.staticModels(),
+          this.#protocolClient.providers(),
+        ]),
+      );
       if (generation !== this.#newSessionOptionsGeneration) return;
       this.#newSessionModes = modes;
       this.#newSessionModels = models;
@@ -1744,6 +1752,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     } finally {
       if (generation === this.#newSessionOptionsGeneration) {
         this.#newSessionOptionsPending = false;
+        this.#newSessionOptionsBlocking = false;
         this.requestUpdate();
       }
     }
@@ -1845,6 +1854,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionBranchesPending = false;
     this.#newSessionBranchError = "";
     this.#newSessionOptionsPending = false;
+    this.#newSessionOptionsBlocking = false;
     this.#newSessionOptionsError = "";
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;
@@ -2034,7 +2044,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     event.preventDefault();
     if (!canSubmitNewSession({
       sessionPending: this.#newSessionPending,
-      optionsPending: this.#newSessionOptionsPending,
+      optionsBlocking: this.#newSessionOptionsBlocking,
       attachmentPending: this.#newSessionAttachmentPending,
     })) return;
     const form = event.currentTarget as HTMLFormElement;
@@ -2511,7 +2521,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     );
     const newSessionCanSubmit = canSubmitNewSession({
       sessionPending: this.#newSessionPending,
-      optionsPending: this.#newSessionOptionsPending,
+      optionsBlocking: this.#newSessionOptionsBlocking,
       attachmentPending: this.#newSessionAttachmentPending,
     });
     const serverOffline = readSignal(this.#store.serverInfo)?.online === false;
@@ -3104,6 +3114,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             ${this.#newSessionPermissionMode === "yolo"
               ? html`<div class="new-session-yolo-warning" role="note"><strong>${fontAwesomeIcon("triangle-exclamation")} Unattended execution (YOLO) is dangerous</strong><span>The agent can run commands and change or delete files without asking for approval.</span></div>`
               : nothing}
+            ${this.#newSessionOptionsBlocking
+              ? html`<p class="dialog-warning new-session-options-loading" role="status" aria-live="polite">Loading agent defaults before this session can start…</p>`
+              : nothing}
             ${this.#newSessionOptionsError === ""
               ? nothing
               : html`<p class="dialog-warning new-session-options-warning" role="status">${this.#newSessionOptionsError}</p>`}
@@ -3111,7 +3124,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               ? nothing
               : html`<p class="dialog-error new-session-error" role="alert">${this.#newSessionError}</p>`}
             <footer>
-              <button class="primary" type="submit" ?disabled=${!newSessionCanSubmit || (this.#newSessionPrompt.trim() === "" && this.#newSessionAttachments.length === 0)}>${this.#newSessionPending ? "Starting…" : "Start session"}</button>
+              <button class="primary" type="submit" ?disabled=${!newSessionCanSubmit || (this.#newSessionPrompt.trim() === "" && this.#newSessionAttachments.length === 0)}>${this.#newSessionPending ? "Starting…" : this.#newSessionOptionsBlocking ? "Loading defaults…" : "Start session"}</button>
               <button type="button" ?disabled=${this.#newSessionPending} @click=${this.#closeNewSession}>Cancel</button>
             </footer>
           </form>

@@ -8,6 +8,7 @@ import type {
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
 export const NEW_SESSION_TITLE_FALLBACK = "New session";
 export const NEW_THREAD_TITLE_FALLBACK = "New thread";
+export const NEW_SESSION_OPTIONS_TIMEOUT_MS = 10_000;
 
 type ThinkingOptionKey =
   | "thinking_level"
@@ -54,6 +55,7 @@ export interface NewThreadOptionSelections {
 
 export interface NewSessionOptionLoadState {
   readonly optionsWorkspaceId: string;
+  readonly blocksSubmission: boolean;
   readonly edits: NewThreadOptionEdits;
   readonly inheritedThinking: string | undefined;
   readonly inheritedPermissionMode: string | undefined;
@@ -254,9 +256,14 @@ export const beginNewSessionOptionLoad = (
   preserveSelections: boolean,
 ): NewSessionOptionLoadState =>
   preserveSelections
-    ? { ...current, edits: { ...current.edits } }
+    ? {
+        ...current,
+        blocksSubmission: false,
+        edits: { ...current.edits },
+      }
     : {
         optionsWorkspaceId: "",
+        blocksSubmission: true,
         edits: createNewThreadOptionEdits(),
         inheritedThinking: undefined,
         inheritedPermissionMode: undefined,
@@ -265,10 +272,29 @@ export const beginNewSessionOptionLoad = (
 /** Submission is safe only after every producer of form state has settled. */
 export const canSubmitNewSession = (state: {
   readonly sessionPending: boolean;
-  readonly optionsPending: boolean;
+  readonly optionsBlocking: boolean;
   readonly attachmentPending: boolean;
 }): boolean =>
-  !state.sessionPending && !state.optionsPending && !state.attachmentPending;
+  !state.sessionPending && !state.optionsBlocking && !state.attachmentPending;
+
+/** Bound required metadata reconciliation so server defaults remain a fallback. */
+export const withNewSessionOptionsTimeout = async <T>(
+  pending: Promise<T>,
+  timeoutMs = NEW_SESSION_OPTIONS_TIMEOUT_MS,
+): Promise<T> => {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timeout = globalThis.setTimeout(
+      () => reject(new Error("New session options timed out.")),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([pending, timedOut]);
+  } finally {
+    if (timeout !== undefined) globalThis.clearTimeout(timeout);
+  }
+};
 
 /** Capture the option values used after asynchronous title generation completes. */
 export const snapshotNewSessionSubmission = (

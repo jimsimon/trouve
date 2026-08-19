@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type {
   ProtocolAgentPersona,
@@ -23,6 +23,7 @@ import {
   snapshotNewSessionSubmission,
   thinkingOption,
   threadTitleFallback,
+  withNewSessionOptionsTimeout,
 } from "./new-session-model.js";
 
 const model = (
@@ -262,36 +263,50 @@ describe("new session model", () => {
   it("preserves options for reconnect loads and resets them for ordinary loads", () => {
     const current = {
       optionsWorkspaceId: "workspace-1",
+      blocksSubmission: true,
       edits: { mode: true, model: true, thinking: true, permission: true },
       inheritedThinking: "high",
       inheritedPermissionMode: "yolo" as const,
     };
 
     const preserved = beginNewSessionOptionLoad(current, true);
-    expect(preserved).toEqual(current);
+    expect(preserved).toEqual({ ...current, blocksSubmission: false });
     expect(preserved).not.toBe(current);
     expect(preserved.edits).not.toBe(current.edits);
     expect(beginNewSessionOptionLoad(current, false)).toEqual({
       optionsWorkspaceId: "",
+      blocksSubmission: true,
       edits: createNewThreadOptionEdits(),
       inheritedThinking: undefined,
       inheritedPermissionMode: undefined,
     });
   });
 
-  it("blocks submission while options, attachments, or another submission are pending", () => {
+  it("blocks submission while required options, attachments, or submission are pending", () => {
     const ready = {
       sessionPending: false,
-      optionsPending: false,
+      optionsBlocking: false,
       attachmentPending: false,
     };
     expect(canSubmitNewSession(ready)).toBe(true);
     for (const pending of [
       "sessionPending",
-      "optionsPending",
+      "optionsBlocking",
       "attachmentPending",
     ] as const) {
       expect(canSubmitNewSession({ ...ready, [pending]: true })).toBe(false);
+    }
+  });
+
+  it("bounds required option loads that never settle", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = withNewSessionOptionsTimeout(new Promise<never>(() => undefined), 100);
+      const rejected = expect(pending).rejects.toThrow("New session options timed out.");
+      await vi.advanceTimersByTimeAsync(100);
+      await rejected;
+    } finally {
+      vi.useRealTimers();
     }
   });
 
