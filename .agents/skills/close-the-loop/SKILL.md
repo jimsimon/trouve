@@ -94,16 +94,24 @@ completion claims only about observable state.
 
 Repeat this loop until the completion criteria all hold:
 
-Bound unchanged external waits. Use a repository-defined timeout when one
-exists; otherwise allow at most 30 minutes without observable progress for one
-check, review, or mergeability state. Track retries separately by exact
-operation or check, failure signature, and head SHA. Retry each demonstrated
-transient failure at most once. When a blocker clears, reset its no-progress
-clock but retain its exact retry record for the lifetime of that head SHA; a
-new head resets both. Progress that does not clear the blocker resets only its
-no-progress clock. If the bound is reached, the same blocker survives its
-retry, or it recurs after exhausting that retry, report the exact non-terminal
-or failed blocker and stop without claiming readiness.
+Stay active until every completion criterion holds. A long wait, rate limit,
+stalled job, or exhausted immediate retry is not a handoff condition. Use a
+repository-defined timeout when one exists; otherwise treat 30 minutes without
+observable progress as a retry or escalation point, not a reason to stop.
+Track retries by exact operation or check, failure signature, and head SHA.
+Retry a demonstrated transient failure once immediately. If it persists, avoid
+hammering the provider: keep monitoring, apply bounded backoff, and retry again
+after an advertised cooldown, observable external-state change, or another
+30-minute interval. Reset the no-progress clock when the blocker changes or
+progresses; a new head resets its retry record. Never manufacture readiness by
+ignoring a non-terminal or failed blocker.
+
+Pause only when continuing requires new user authority or input, such as
+credentials, permission changes, disabling repository-wide automation,
+destructive action, or an ambiguous material product decision. When an
+external blocker can clear without user action, keep monitoring and resume the
+loop when it does. Explicit user cancellation, the PR being closed or merged
+by another actor, or loss of the target PR are the other terminal conditions.
 
 1. Classify every unresolved thread, submitted review body, and top-level
    feedback item as actionable, already addressed, informational, duplicate,
@@ -205,9 +213,11 @@ branch, and head SHA; exclude only volatile request IDs and timestamps.
 Then perform one more complete read after a normal polling interval. Require
 the second snapshot to have exactly the same canonical readiness fingerprint
 as the first and independently satisfy every criterion above. If anything
-changed, restart the loop. If authentication, permissions, an external system,
-or conflicting feedback prevents convergence, report the specific blocker and
-do not claim success.
+changed, restart the loop. Keep working through authentication-independent
+external delays and transient failures. If convergence requires credentials,
+permissions, broader authority, or resolution of conflicting feedback, report
+the exact required user action, pause without claiming success, and resume
+when the user supplies it.
 
 ## Report the handoff
 
