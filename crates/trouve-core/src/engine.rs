@@ -13947,6 +13947,34 @@ fn structured_repository_matches(args: &serde_json::Value, owner: &str, repo: &s
     true
 }
 
+fn structured_repository_identifies(args: &serde_json::Value, owner: &str, repo: &str) -> bool {
+    if !structured_repository_matches(args, owner, repo) {
+        return false;
+    }
+    let full_name = ["repository_full_name", "repo_full_name"]
+        .iter()
+        .any(|key| args.get(key).and_then(serde_json::Value::as_str).is_some());
+    let repo_value = args.get("repo").and_then(serde_json::Value::as_str);
+    full_name
+        || repo_value.is_some_and(|value| value.contains('/'))
+        || (args
+            .get("owner")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+            && repo_value.is_some())
+}
+
+fn has_structured_pull_request_creation_operation(args: &serde_json::Value) -> bool {
+    ["operation", "action"].iter().any(|key| {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| {
+                let operation = compact_activity(value);
+                operation == "createpullrequest" || operation == "createpr"
+            })
+    })
+}
+
 /// A successful tool call that actually creates a pull request. Merely
 /// listing, viewing, or mentioning a PR must not associate it with a session.
 fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
@@ -13997,7 +14025,8 @@ fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
     let args_text = args.to_string();
     let args_words = activity_words(&args_text);
     let args_compact = compact_activity(&args_text);
-    args_words.contains("gh pr create")
+    has_structured_pull_request_creation_operation(args)
+        || args_words.contains("gh pr create")
         || args_words.contains("create pull request")
         || args_compact.contains("createpullrequest")
         || (args_words.split_whitespace().any(|word| word == "post")
@@ -14043,18 +14072,10 @@ fn requests_pull_request_creation(
             || args_text.contains(" -f ")
             || args_text.contains(" --field ")
             || args_text.contains(" --raw-field "));
-    let integration_like = ["github", "mcp", "connector", "integration"]
-        .iter()
-        .any(|word| tool_words.split_whitespace().any(|part| part == *word));
-    let structured_creation_operation = integration_like
-        && ["operation", "action"].iter().any(|key| {
-            args.get(key)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| {
-                    let operation = compact_activity(value);
-                    operation == "createpullrequest" || operation == "createpr"
-                })
-        });
+    let github_like = tool_compact == "github";
+    let structured_creation_operation = github_like
+        && structured_repository_identifies(args, owner, repo)
+        && has_structured_pull_request_creation_operation(args);
     tool_compact.contains("createpullrequest")
         || tool_compact.ends_with("createpr")
         || structured_creation_operation
@@ -18836,7 +18857,7 @@ default_permission_mode = "ask"
         ));
         assert!(matches!(
             classify_pull_request_creation(
-                "github_connector",
+                "github",
                 &serde_json::json!({
                     "action": "create_pr",
                     "repository_full_name": "o/r"
@@ -18845,6 +18866,34 @@ default_permission_mode = "ask"
                 "r"
             ),
             PullRequestCreationRequest::Confirmed
+        ));
+        assert!(might_request_pull_request_creation(
+            "github",
+            &serde_json::json!({
+                "action": "create_pr",
+                "repository_full_name": "o/r"
+            })
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "connector",
+                &serde_json::json!({
+                    "operation": "create_pull_request",
+                    "repository_full_name": "o/r"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Rejected
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "github",
+                &serde_json::json!({ "operation": "create_pull_request" }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Rejected
         ));
         assert!(matches!(
             classify_pull_request_creation(
@@ -19081,6 +19130,24 @@ default_permission_mode = "ask"
                 status: ToolStatus::Ok,
                 result: serde_json::json!({
                     "url": "https://github.com/jimsimon/trouve/pull/271"
+                }),
+                execution_duration_ms: Some(400),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "forge-structured-pr".into(),
+                tool: "connector".into(),
+                args: serde_json::json!({
+                    "action": "create_pr",
+                    "repository_full_name": "jimsimon/trouve"
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "forge-structured-pr".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "url": "https://github.com/jimsimon/trouve/pull/272"
                 }),
                 execution_duration_ms: Some(400),
             },
