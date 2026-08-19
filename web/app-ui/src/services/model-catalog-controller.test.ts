@@ -43,6 +43,7 @@ describe("ModelCatalogController", () => {
       "cursor/default",
     ]);
     await expect(controller.staticModels()).resolves.toEqual([model("cursor/default")]);
+    expect(readSignal(controller.liveLoaded)).toBe(false);
     expect(readSignal(controller.refreshing)).toBe(true);
 
     live.resolve([model("cursor/default"), model("cursor/gpt-5.6")]);
@@ -53,6 +54,7 @@ describe("ModelCatalogController", () => {
       "cursor/default",
       "cursor/gpt-5.6",
     ]);
+    expect(readSignal(controller.liveLoaded)).toBe(true);
     expect(readSignal(controller.staticCurrent).map(({ id }) => id)).toEqual([
       "cursor/default",
     ]);
@@ -61,6 +63,24 @@ describe("ModelCatalogController", () => {
     await expect(controller.refresh()).resolves.toHaveLength(2);
     expect(staticCalls).toBe(1);
     expect(liveCalls).toBe(1);
+  });
+
+  it("distinguishes an authoritative empty live catalog from static fallback", async () => {
+    let staticCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => {
+        staticCalls += 1;
+        return [model("cursor/static")];
+      },
+      refreshModels: async () => [],
+    });
+
+    await expect(controller.refresh()).resolves.toEqual([model("cursor/static")]);
+    await expect(controller.liveModels()).resolves.toEqual([]);
+    expect(readSignal(controller.liveLoaded)).toBe(true);
+    expect(readSignal(controller.current)).toEqual([]);
+    await expect(controller.refresh()).resolves.toEqual([]);
+    expect(staticCalls).toBe(1);
   });
 
   it("coalesces concurrent static and live discovery", async () => {

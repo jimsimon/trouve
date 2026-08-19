@@ -1679,9 +1679,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       },
       () => undefined,
     );
-    // Live discovery may add picker choices, but configured defaults resolve
-    // exclusively against the authoritative static catalog below.
-    void this.#modelCatalog.refresh("if-stale").catch(() => undefined);
+    // Settle live availability independently, then reconcile it only after
+    // this workspace's static metadata has established the initial form.
+    const liveModelsPending = this.#modelCatalog.liveModels("if-stale").then(
+      () => true,
+      () => false,
+    );
     try {
       const [modes, models, providers] = await Promise.all([
         this.#protocolClient.personas(workspaceId),
@@ -1694,6 +1697,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionProviders = providers;
       this.#newSessionOptionsWorkspaceId = workspaceId;
       this.#reconcileNewSessionDefaults(models);
+      void liveModelsPending.then((liveLoaded) => {
+        if (
+          !liveLoaded
+          || generation !== this.#newSessionOptionsGeneration
+          || this.#newSessionOptionsWorkspaceId !== workspaceId
+        ) return;
+        this.#reconcileNewSessionDefaults(models);
+        this.requestUpdate();
+      });
     } catch {
       if (generation !== this.#newSessionOptionsGeneration) return;
       this.#newSessionOptionsError =
@@ -1710,6 +1722,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     return mergeNewSessionModelCatalogs(
       this.#newSessionModels,
       readSignal(this.#modelCatalog.current),
+      readSignal(this.#modelCatalog.liveLoaded),
     );
   }
 
@@ -2926,24 +2939,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       thinking: false,
                       permission: false,
                     };
-                    const defaults = resolveNewThreadDefaults(
-                      this.#newSessionModes,
-                      this.#newSessionModels,
-                      this.#newSessionProviders,
-                      { modeId: (event.currentTarget as HTMLSelectElement).value },
-                    );
-                    this.#newSessionModeId = defaults.modeId;
-                    this.#newSessionModelId = defaults.modelId;
-                    this.#newSessionThinking = defaults.thinking;
-                    this.#newSessionPermissionMode = defaults.permissionMode;
-                    const inheritance = newThreadInheritanceForWorkspace(
-                      defaults,
-                      this.#newSessionOptionsWorkspaceId,
-                      this.#newSessionWorkspaceId,
-                    );
-                    this.#newSessionInheritedThinking = inheritance.inheritedThinking;
-                    this.#newSessionInheritedPermissionMode =
-                      inheritance.inheritedPermissionMode;
+                    this.#newSessionModeId =
+                      (event.currentTarget as HTMLSelectElement).value;
+                    this.#reconcileNewSessionDefaults(this.#newSessionModels);
                     this.requestUpdate();
                   }}
                 >

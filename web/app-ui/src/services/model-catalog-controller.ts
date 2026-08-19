@@ -30,13 +30,14 @@ export class ModelCatalogController {
   readonly #live = createSignal<readonly ProtocolModelInfo[]>(
     Object.freeze([]),
   );
+  readonly #liveLoaded = createSignal(false);
+  readonly liveLoaded: ReadonlySignal<boolean> = this.#liveLoaded;
   readonly #refreshing = createSignal(false);
   readonly refreshing: ReadonlySignal<boolean> = this.#refreshing;
 
   #staticPending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #livePending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #staticLoaded = false;
-  #liveLoaded = false;
   #lastLiveResolvedAt: number | undefined;
   #generation = 0;
 
@@ -53,7 +54,10 @@ export class ModelCatalogController {
     freshness: ModelCatalogFreshness = "if-stale",
   ): Promise<readonly ProtocolModelInfo[]> {
     const current = this.#current.get();
-    if (freshness === "if-stale" && current.length > 0) {
+    if (
+      freshness === "if-stale"
+      && (current.length > 0 || this.#liveLoaded.get())
+    ) {
       void this.#refreshLive(freshness).catch(() => undefined);
       return Promise.resolve(current);
     }
@@ -75,13 +79,20 @@ export class ModelCatalogController {
     return this.#staticLoaded ? Promise.resolve(current) : this.#loadStatic();
   }
 
+  /** Wait for live availability while retaining the static first-paint path. */
+  liveModels(
+    freshness: ModelCatalogFreshness = "if-stale",
+  ): Promise<readonly ProtocolModelInfo[]> {
+    return this.staticModels().then(() => this.#refreshLive(freshness));
+  }
+
   #loadStatic(): Promise<readonly ProtocolModelInfo[]> {
     if (this.#staticPending !== undefined) return this.#staticPending;
     const promise = this.#protocol.models().then((models) => {
       const snapshot = Object.freeze([...models]);
       this.#staticLoaded = true;
       this.#static.set(snapshot);
-      this.#current.set(this.#liveLoaded ? this.#live.get() : snapshot);
+      this.#current.set(this.#liveLoaded.get() ? this.#live.get() : snapshot);
       return snapshot;
     }).finally(() => {
       if (this.#staticPending === promise) this.#staticPending = undefined;
@@ -108,7 +119,7 @@ export class ModelCatalogController {
         if (generation !== this.#generation) return this.#current.get();
         const snapshot = Object.freeze([...models]);
         this.#lastLiveResolvedAt = this.#now();
-        this.#liveLoaded = true;
+        this.#liveLoaded.set(true);
         this.#live.set(snapshot);
         this.#current.set(snapshot);
         return snapshot;

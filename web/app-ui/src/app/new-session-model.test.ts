@@ -269,7 +269,12 @@ describe("new session model", () => {
     expect(mergeNewSessionModelCatalogs(
       [staticModel, unavailableStatic],
       [discoveredDefault, liveStatic],
+      true,
     )).toEqual([discoveredDefault, staticModel]);
+    expect(mergeNewSessionModelCatalogs([staticModel], [], false)).toEqual([
+      staticModel,
+    ]);
+    expect(mergeNewSessionModelCatalogs([staticModel], [], true)).toEqual([]);
 
     expect(reconcileNewThreadDefaults(
       {

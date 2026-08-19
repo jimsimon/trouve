@@ -78,6 +78,11 @@ describe("root shell parity wiring", () => {
     );
     expect(source).toContain("this.#modelCatalog.staticModels()");
     expect(source).toContain("readSignal(this.#modelCatalog.staticCurrent)");
+    expect(source).toContain('this.#modelCatalog.liveModels("if-stale")');
+    expect(source).toContain("readSignal(this.#modelCatalog.liveLoaded)");
+    expect(source).toContain(
+      "this.#reconcileNewSessionDefaults(this.#newSessionModels)",
+    );
     expect(source).not.toContain("this.#reconcileNewSessionModelCatalog()");
     expect(source).toContain("this.#resetNewSessionOptionsForWorkspace(workspaceId)");
   });

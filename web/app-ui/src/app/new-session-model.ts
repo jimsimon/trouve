@@ -163,12 +163,13 @@ export const resolveNewSessionModel = (
   ?? nonEmpty(selectedMode?.default_model)
   ?? nonEmpty(providers?.default_model);
 
-/** Use live availability when present without allowing it to replace static metadata. */
+/** Use settled live availability without allowing it to replace static metadata. */
 export const mergeNewSessionModelCatalogs = (
   staticModels: readonly ProtocolModelInfo[],
   liveModels: readonly ProtocolModelInfo[],
+  liveLoaded: boolean,
 ): readonly ProtocolModelInfo[] => {
-  if (liveModels.length === 0) return staticModels;
+  if (!liveLoaded) return staticModels;
   const staticById = new Map(staticModels.map((model) => [model.id, model]));
   return liveModels
     .map((model) => staticById.get(model.id) ?? model)
