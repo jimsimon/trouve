@@ -11548,8 +11548,10 @@ impl Engine {
                     }
                     if let Some((_, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
-                        && (requests_pull_request_creation(tool, args, owner, repo)
-                            || might_request_pull_request_creation(tool, args))
+                        && !matches!(
+                            classify_pull_request_creation(tool, args, owner, repo),
+                            PullRequestCreationRequest::Rejected
+                        )
                     {
                         github_creation_output
                             .entry(call_id.clone())
@@ -11803,9 +11805,10 @@ impl Engine {
                                 crate::github::pr_numbers_in_text(&output, host, owner, repo)
                             })
                             .unwrap_or_default();
-                        if requests_pull_request_creation(tool, args, owner, repo)
-                            || !result_numbers.is_empty()
-                            || !output_numbers.is_empty()
+                        let request = classify_pull_request_creation(tool, args, owner, repo);
+                        if matches!(request, PullRequestCreationRequest::Confirmed)
+                            || (matches!(request, PullRequestCreationRequest::Unresolved)
+                                && (!result_numbers.is_empty() || !output_numbers.is_empty()))
                         {
                             numbers.extend(result_numbers);
                             numbers.extend(output_numbers);
@@ -12847,8 +12850,10 @@ impl Engine {
             let mut recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
             let mut numbers = pr_numbers_in_value(&call.arguments, host, owner, repo);
             let result_numbers = pr_numbers_in_value(&outcome.result, host, owner, repo);
-            if requests_pull_request_creation(&call.name, &call.arguments, owner, repo)
-                || !result_numbers.is_empty()
+            let request = classify_pull_request_creation(&call.name, &call.arguments, owner, repo);
+            if matches!(request, PullRequestCreationRequest::Confirmed)
+                || (matches!(request, PullRequestCreationRequest::Unresolved)
+                    && !result_numbers.is_empty())
             {
                 numbers.extend(result_numbers);
                 self.record_session_pr_numbers(
@@ -14048,6 +14053,43 @@ fn requests_pull_request_creation(
         || contains_rest_mutation(args, &rest_path, &["POST"], false)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PullRequestCreationRequest {
+    Confirmed,
+    Unresolved,
+    Rejected,
+}
+
+fn classify_pull_request_creation(
+    tool: &str,
+    args: &serde_json::Value,
+    owner: &str,
+    repo: &str,
+) -> PullRequestCreationRequest {
+    if requests_pull_request_creation(tool, args, owner, repo) {
+        return PullRequestCreationRequest::Confirmed;
+    }
+
+    let normalized = compact_activity(tool);
+    if !matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall") {
+        return PullRequestCreationRequest::Rejected;
+    }
+    let Some(nested_tool) = ["tool", "toolName", "name"]
+        .iter()
+        .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
+    else {
+        return PullRequestCreationRequest::Rejected;
+    };
+    let nested_compact = compact_activity(nested_tool);
+    let named_creator =
+        nested_compact.contains("createpullrequest") || nested_compact.ends_with("createpr");
+    if named_creator && effective_activity_tool_call(tool, args).is_none() {
+        PullRequestCreationRequest::Unresolved
+    } else {
+        PullRequestCreationRequest::Rejected
+    }
+}
+
 /// A successful tool call that creates or updates a remote branch. This is
 /// the evidence needed to find a PR opened later through github.com.
 fn requests_remote_ref_mutation(
@@ -14146,8 +14188,9 @@ fn pr_evidence_from_events(
                     let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
                     let output_numbers =
                         crate::github::pr_numbers_in_text(&output, host, owner, repo);
-                    let creates_pr = requests_pull_request_creation(&tool, &args, owner, repo)
-                        || (might_request_pull_request_creation(&tool, &args)
+                    let request = classify_pull_request_creation(&tool, &args, owner, repo);
+                    let creates_pr = matches!(request, PullRequestCreationRequest::Confirmed)
+                        || (matches!(request, PullRequestCreationRequest::Unresolved)
                             && (!result_numbers.is_empty() || !output_numbers.is_empty()));
                     let mutates_ref = requests_remote_ref_mutation(&tool, &args, owner, repo);
                     if creates_pr {
@@ -18931,6 +18974,48 @@ default_permission_mode = "ask"
                     }
                 }),
                 execution_duration_ms: Some(600),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "read-pr".into(),
+                tool: "mcpToolCall".into(),
+                args: serde_json::json!({
+                    "tool": "github.get_pull_request",
+                    "arguments": {
+                        "repository_full_name": "jimsimon/trouve",
+                        "pr_number": 269
+                    }
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "read-pr".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "url": "https://github.com/jimsimon/trouve/pull/269"
+                }),
+                execution_duration_ms: Some(300),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "create-other-with-local-result".into(),
+                tool: "mcpToolCall".into(),
+                args: serde_json::json!({
+                    "tool": "github.create_pull_request",
+                    "arguments": {
+                        "repository_full_name": "other/project",
+                        "head_branch": "agent/separate-harness-search-readmes"
+                    }
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "create-other-with-local-result".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "url": "https://github.com/jimsimon/trouve/pull/270"
+                }),
+                execution_duration_ms: Some(400),
             },
         ];
 
