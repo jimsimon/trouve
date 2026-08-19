@@ -41,7 +41,7 @@
 //! when it goes stale the user runs any `cursor-agent` command, which
 //! refreshes `auth.json` through the sanctioned path.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -140,18 +140,10 @@ impl CursorBackend {
     }
 
     fn canonicalize_models(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
-        let mut merged: BTreeMap<_, _> = self
-            .models()
-            .into_iter()
-            .map(|model| (model.id.clone(), model))
-            .collect();
-        for model in models
+        models
             .into_iter()
             .filter_map(|live| canonicalize_cursor_model(&self.catalog, &self.id, live))
-        {
-            merged.insert(model.id.clone(), model);
-        }
-        merged.into_values().collect()
+            .collect()
     }
 
     /// The pooled child for this worktree, spawned (cwd-pinned) on first
@@ -794,19 +786,10 @@ async fn apply_model_config(
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        match key.as_str() {
-            // Pre-ACP threads stored the thinking dropdown under
-            // thinking_level (cursor) or reasoning_effort (codex-style).
-            "thinking_level" | "reasoning_effort" => {
-                options.push(("effort".into(), value.clone()));
-                options.push(("reasoning".into(), value));
-            }
-            _ => options.push((key.clone(), value)),
-        }
+        push_cursor_model_option(&mut options, key, value);
     }
     if let Some(level) = legacy_level {
-        options.push(("effort".into(), level.to_string()));
-        options.push(("reasoning".into(), level.to_string()));
+        push_cursor_model_option(&mut options, "effort", level.to_string());
     }
     if legacy_fast {
         options.push(("fast".into(), "true".into()));
@@ -826,6 +809,20 @@ async fn apply_model_config(
         }
     }
     Ok(())
+}
+
+fn push_cursor_model_option(options: &mut Vec<(String, String)>, key: &str, value: String) {
+    match key {
+        // Pre-ACP threads stored the thinking dropdown under
+        // thinking_level (cursor) or reasoning_effort (codex-style).
+        // Static Cursor models use effort across upstream providers, so
+        // normalize it through both ACP spellings as well.
+        "thinking_level" | "reasoning_effort" | "effort" => {
+            options.push(("effort".into(), value.clone()));
+            options.push(("reasoning".into(), value));
+        }
+        _ => options.push((key.to_string(), value)),
+    }
 }
 
 /// Pull one option's currentValue out of a `set_config_option` response
@@ -1339,7 +1336,6 @@ fn looks_like_public_cursor_model(id: &str) -> bool {
     id.starts_with("claude-")
         || id.starts_with("gemini-")
         || id.starts_with("gpt-")
-        || id.starts_with("grok-")
         || id.starts_with("chatgpt-")
         || id.starts_with("codex-")
         || id.starts_with("computer-use-")
@@ -2253,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn static_cursor_catalog_is_authoritative_and_live_models_are_additive() {
+    fn static_cursor_catalog_is_authoritative_and_live_models_filter_availability() {
         let backend = CursorBackend::new("cursor", None, None);
         let static_models = backend.models();
         let static_ids: Vec<_> = static_models
@@ -2292,7 +2288,7 @@ mod tests {
             ]}),
         );
         let merged = backend.canonicalize_models(live);
-        assert_eq!(merged.len(), static_models.len() + 1);
+        assert_eq!(merged.len(), 2);
         let fable = merged
             .iter()
             .find(|model| model.id == "cursor/claude-fable-5")
@@ -2303,6 +2299,19 @@ mod tests {
             Some(&json!(["300k", "1m"]))
         );
         assert!(merged.iter().any(|model| model.id == "cursor/cursor-next"));
+    }
+
+    #[test]
+    fn effort_options_try_both_cursor_reasoning_dialects() {
+        let mut options = Vec::new();
+        push_cursor_model_option(&mut options, "effort", "high".into());
+        assert_eq!(
+            options,
+            vec![
+                ("effort".to_string(), "high".to_string()),
+                ("reasoning".to_string(), "high".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -2399,7 +2408,8 @@ mod tests {
                   "options": [ { "value": "false" }, { "value": "true" } ] }
             ]},
             { "value": "gpt-future", "name": "Uncatalogued public model",
-              "configOptions": [] }
+              "configOptions": [] },
+            { "value": "grok-future", "name": "New Cursor Grok", "configOptions": [] }
         ]});
         let live = parse_acp_models("cursor", &result);
         let models: Vec<_> = live
@@ -2407,7 +2417,7 @@ mod tests {
             .filter_map(|model| canonicalize_cursor_model(&catalog, "cursor", model))
             .collect();
 
-        assert_eq!(models.len(), 2, "unknown public ids are not guessed");
+        assert_eq!(models.len(), 3, "unknown public ids are not guessed");
         let fable = &models[0];
         assert_eq!(fable.display_name, "Claude Fable 5");
         assert_eq!(fable.context_window, 1_000_000);
@@ -2430,6 +2440,10 @@ mod tests {
             composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(true))
         );
+
+        let grok = &models[2];
+        assert_eq!(grok.id, "cursor/grok-future");
+        assert_eq!(grok.display_name, "New Cursor Grok");
     }
 
     #[test]

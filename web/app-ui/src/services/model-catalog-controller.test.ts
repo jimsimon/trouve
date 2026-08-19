@@ -90,20 +90,22 @@ describe("ModelCatalogController", () => {
   });
 
   it("forces fresh static and live snapshots after connectivity recovers", async () => {
+    const forcedStatic = deferred<readonly ProtocolModelInfo[]>();
+    const forcedLive = deferred<readonly ProtocolModelInfo[]>();
     let staticCalls = 0;
     let liveCalls = 0;
     const controller = new ModelCatalogController({
-      models: async () => {
+      models: () => {
         staticCalls += 1;
         return staticCalls === 1
-          ? [model("local/offline")]
-          : [model("codex/gpt-5.6-sol")];
+          ? Promise.resolve([model("local/offline")])
+          : forcedStatic.promise;
       },
-      refreshModels: async () => {
+      refreshModels: () => {
         liveCalls += 1;
         return liveCalls === 1
-          ? [model("local/offline")]
-          : [model("codex/gpt-5.6-sol"), model("cursor/gpt-5.6")];
+          ? Promise.resolve([model("local/offline")])
+          : forcedLive.promise;
       },
     });
 
@@ -113,13 +115,38 @@ describe("ModelCatalogController", () => {
       "local/offline",
     ]);
 
-    await controller.refresh("force");
-    await vi.waitFor(() => expect(liveCalls).toBe(2));
-
-    expect(staticCalls).toBe(2);
+    const force = controller.refresh("force");
+    await vi.waitFor(() => expect(staticCalls).toBe(2));
+    const joinedStatic = controller.staticModels();
+    let staticResolved = false;
+    void joinedStatic.then(() => {
+      staticResolved = true;
+    });
+    await Promise.resolve();
+    expect(staticResolved).toBe(false);
     expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
+      "local/offline",
+    ]);
+
+    forcedStatic.resolve([model("codex/gpt-5.6-sol")]);
+    await expect(Promise.all([force, joinedStatic])).resolves.toEqual([
+      [model("codex/gpt-5.6-sol")],
+      [model("codex/gpt-5.6-sol")],
+    ]);
+    await vi.waitFor(() => expect(liveCalls).toBe(2));
+    expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
+      "local/offline",
+    ]);
+
+    forcedLive.resolve([model("codex/gpt-5.6-sol"), model("cursor/gpt-5.6")]);
+    await vi.waitFor(() => expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
       "codex/gpt-5.6-sol",
       "cursor/gpt-5.6",
+    ]));
+
+    expect(staticCalls).toBe(2);
+    expect(readSignal(controller.staticCurrent).map(({ id }) => id)).toEqual([
+      "codex/gpt-5.6-sol",
     ]);
   });
 });

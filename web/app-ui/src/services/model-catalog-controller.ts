@@ -27,12 +27,16 @@ export class ModelCatalogController {
     Object.freeze([]),
   );
   readonly staticCurrent: ReadonlySignal<readonly ProtocolModelInfo[]> = this.#static;
+  readonly #live = createSignal<readonly ProtocolModelInfo[]>(
+    Object.freeze([]),
+  );
   readonly #refreshing = createSignal(false);
   readonly refreshing: ReadonlySignal<boolean> = this.#refreshing;
 
   #staticPending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #livePending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #staticLoaded = false;
+  #liveLoaded = false;
   #lastLiveResolvedAt: number | undefined;
   #generation = 0;
 
@@ -62,6 +66,7 @@ export class ModelCatalogController {
 
   /** Authoritative offline-safe metadata used to resolve configured defaults. */
   staticModels(): Promise<readonly ProtocolModelInfo[]> {
+    if (this.#staticPending !== undefined) return this.#staticPending;
     const current = this.#static.get();
     return this.#staticLoaded ? Promise.resolve(current) : this.#loadStatic();
   }
@@ -72,7 +77,7 @@ export class ModelCatalogController {
       const snapshot = Object.freeze([...models]);
       this.#staticLoaded = true;
       this.#static.set(snapshot);
-      this.#current.set(snapshot);
+      this.#current.set(this.#liveLoaded ? this.#live.get() : snapshot);
       return snapshot;
     }).finally(() => {
       if (this.#staticPending === promise) this.#staticPending = undefined;
@@ -99,6 +104,8 @@ export class ModelCatalogController {
         if (generation !== this.#generation) return this.#current.get();
         const snapshot = Object.freeze([...models]);
         this.#lastLiveResolvedAt = this.#now();
+        this.#liveLoaded = true;
+        this.#live.set(snapshot);
         this.#current.set(snapshot);
         return snapshot;
       },

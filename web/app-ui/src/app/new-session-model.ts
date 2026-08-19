@@ -163,15 +163,16 @@ export const resolveNewSessionModel = (
   ?? nonEmpty(selectedMode?.default_model)
   ?? nonEmpty(providers?.default_model);
 
-/** Add live-only choices without allowing them to replace static metadata. */
+/** Use live availability when present without allowing it to replace static metadata. */
 export const mergeNewSessionModelCatalogs = (
   staticModels: readonly ProtocolModelInfo[],
   liveModels: readonly ProtocolModelInfo[],
 ): readonly ProtocolModelInfo[] => {
   if (liveModels.length === 0) return staticModels;
-  const models = new Map(liveModels.map((model) => [model.id, model]));
-  for (const model of staticModels) models.set(model.id, model);
-  return [...models.values()].sort((left, right) => left.id.localeCompare(right.id));
+  const staticById = new Map(staticModels.map((model) => [model.id, model]));
+  return liveModels
+    .map((model) => staticById.get(model.id) ?? model)
+    .sort((left, right) => left.id.localeCompare(right.id));
 };
 
 const validPermissionMode = (value: unknown): ResolvedPermissionMode | undefined =>

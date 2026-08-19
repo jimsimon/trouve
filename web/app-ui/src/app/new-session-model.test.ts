@@ -256,8 +256,9 @@ describe("new session model", () => {
     });
   });
 
-  it("adds live-only choices without replacing authoritative static metadata", () => {
+  it("uses live availability without replacing authoritative static metadata", () => {
     const staticModel = model({}, "provider/static");
+    const unavailableStatic = model({}, "provider/unavailable");
     const discoveredDefault = model({
       properties: {
         thinking_level: { type: "string", enum: ["low", "high"], default: "low" },
@@ -266,7 +267,7 @@ describe("new session model", () => {
     const liveStatic = model({ properties: { effort: { enum: ["max"] } } }, "provider/static");
 
     expect(mergeNewSessionModelCatalogs(
-      [staticModel],
+      [staticModel, unavailableStatic],
       [discoveredDefault, liveStatic],
     )).toEqual([discoveredDefault, staticModel]);
 

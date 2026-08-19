@@ -1719,9 +1719,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionModes = [];
       this.#newSessionOptionsWorkspaceId = "";
     }
+    const staticModels = this.#newSessionModels.length > 0
+      ? this.#newSessionModels
+      : readSignal(this.#modelCatalog.staticCurrent);
     const defaults = resolveNewThreadDefaults(
       this.#newSessionModes,
-      this.#newSessionModels,
+      staticModels,
       this.#newSessionProviders,
     );
     this.#newSessionModeId = defaults.modeId;

@@ -77,6 +77,7 @@ describe("root shell parity wiring", () => {
       '.selected=${this.#newSessionPermissionMode === "yolo"}',
     );
     expect(source).toContain("this.#modelCatalog.staticModels()");
+    expect(source).toContain("readSignal(this.#modelCatalog.staticCurrent)");
     expect(source).not.toContain("this.#reconcileNewSessionModelCatalog()");
     expect(source).toContain("this.#resetNewSessionOptionsForWorkspace(workspaceId)");
   });
