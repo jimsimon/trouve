@@ -41,6 +41,7 @@ export class ModelCatalogController {
   #staticPending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #livePending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #staticLoaded = false;
+  #staticFailure: { readonly error: unknown } | undefined;
   #lastLiveResolvedAt: number | undefined;
   #generation = 0;
 
@@ -59,6 +60,7 @@ export class ModelCatalogController {
     const current = this.#current.get();
     if (
       freshness === "if-stale"
+      && this.#staticLoaded
       && (current.length > 0 || this.#liveLoaded.get())
     ) {
       void this.#refreshLive(freshness).catch(() => undefined);
@@ -86,13 +88,13 @@ export class ModelCatalogController {
   liveModels(
     freshness: ModelCatalogFreshness = "if-stale",
   ): Promise<readonly ProtocolModelInfo[]> {
-    const staticOutcome = this.staticModels().then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    );
-    return this.#refreshLive(freshness).catch(async (liveError: unknown) => {
-      const outcome = await staticOutcome;
-      if (!outcome.ok) throw outcome.error;
+    const knownStaticFailure = this.#staticFailure;
+    void this.staticModels().catch(() => undefined);
+    return this.#refreshLive(freshness).catch((liveError: unknown) => {
+      if (!this.#staticLoaded) {
+        const failure = this.#staticFailure ?? knownStaticFailure;
+        if (failure !== undefined) throw failure.error;
+      }
       throw liveError;
     });
   }
@@ -116,13 +118,20 @@ export class ModelCatalogController {
 
   #loadStatic(): Promise<readonly ProtocolModelInfo[]> {
     if (this.#staticPending !== undefined) return this.#staticPending;
-    const promise = this.#protocol.models().then((models) => {
-      const snapshot = Object.freeze([...models]);
-      this.#staticLoaded = true;
-      this.#static.set(snapshot);
-      this.#current.set(this.#liveLoaded.get() ? this.#live.get() : snapshot);
-      return snapshot;
-    }).finally(() => {
+    const promise = this.#protocol.models().then(
+      (models) => {
+        const snapshot = Object.freeze([...models]);
+        this.#staticLoaded = true;
+        this.#staticFailure = undefined;
+        this.#static.set(snapshot);
+        this.#current.set(this.#liveLoaded.get() ? this.#live.get() : snapshot);
+        return snapshot;
+      },
+      (error: unknown) => {
+        this.#staticFailure = { error };
+        throw error;
+      },
+    ).finally(() => {
       if (this.#staticPending === promise) this.#staticPending = undefined;
     });
     this.#staticPending = promise;
@@ -155,6 +164,9 @@ export class ModelCatalogController {
       },
       (error: unknown) => {
         if (generation !== this.#generation) return this.#current.get();
+        this.#lastLiveResolvedAt = undefined;
+        this.#liveLoaded.set(false);
+        if (this.#staticLoaded) this.#current.set(this.#static.get());
         throw error;
       },
     ).finally(() => {

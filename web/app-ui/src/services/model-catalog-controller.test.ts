@@ -83,6 +83,27 @@ describe("ModelCatalogController", () => {
     expect(staticCalls).toBe(1);
   });
 
+  it("retries a missing static catalog after an authoritative empty live result", async () => {
+    let staticCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => {
+        staticCalls += 1;
+        if (staticCalls === 1) throw new Error("static unavailable");
+        return [model("cursor/static")];
+      },
+      refreshModels: async () => [],
+    });
+
+    await expect(controller.liveModels()).resolves.toEqual([]);
+    await expect(controller.refresh()).resolves.toEqual([
+      model("cursor/static"),
+    ]);
+    await expect(controller.staticModels()).resolves.toEqual([
+      model("cursor/static"),
+    ]);
+    expect(staticCalls).toBe(2);
+  });
+
   it("discovers live models when the independent static catalog fails", async () => {
     const staticError = new Error("static unavailable");
     let liveSucceeds = true;
@@ -117,6 +138,24 @@ describe("ModelCatalogController", () => {
     await expect(controller.liveModels()).resolves.toEqual([model("cursor/live")]);
     expect(liveCalls).toBe(1);
     expect(readSignal(controller.current)).toEqual([model("cursor/live")]);
+  });
+
+  it("does not wait for a stalled static catalog after live discovery fails", async () => {
+    const staticResult = deferred<readonly ProtocolModelInfo[]>();
+    const liveError = new Error("live unavailable");
+    const controller = new ModelCatalogController({
+      models: () => staticResult.promise,
+      refreshModels: async () => {
+        throw liveError;
+      },
+    });
+    let rejection: unknown;
+
+    void controller.liveModels().catch((error: unknown) => {
+      rejection = error;
+    });
+
+    await vi.waitFor(() => expect(rejection).toBe(liveError));
   });
 
   it("coalesces concurrent static and live discovery", async () => {
@@ -206,6 +245,38 @@ describe("ModelCatalogController", () => {
     expect(readSignal(controller.staticCurrent).map(({ id }) => id)).toEqual([
       "codex/gpt-5.6-sol",
     ]);
+  });
+
+  it("falls back to refreshed static models when a forced live refresh fails", async () => {
+    let staticCalls = 0;
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => [model(`cursor/static-${++staticCalls}`)],
+      refreshModels: async () => {
+        liveCalls += 1;
+        if (liveCalls === 2) throw new Error("live unavailable");
+        return [model(`cursor/live-${liveCalls}`)];
+      },
+    });
+
+    await controller.refresh();
+    await vi.waitFor(() =>
+      expect(readSignal(controller.current)).toEqual([model("cursor/live-1")]),
+    );
+
+    await expect(controller.refresh("force")).resolves.toEqual([
+      model("cursor/static-2"),
+    ]);
+    await vi.waitFor(() =>
+      expect(readSignal(controller.refreshing)).toBe(false),
+    );
+    expect(readSignal(controller.current)).toEqual([model("cursor/static-2")]);
+    expect(readSignal(controller.liveLoaded)).toBe(false);
+
+    await expect(controller.liveModels()).resolves.toEqual([
+      model("cursor/live-3"),
+    ]);
+    expect(liveCalls).toBe(3);
   });
 
   it("uses a cached static snapshot when a forced reload fails", async () => {
