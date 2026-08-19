@@ -342,6 +342,7 @@ struct ReviewThreadListingKey {
 struct ReviewThreadListingProgress {
     threads: HashMap<u64, (String, bool)>,
     refreshed_states: HashMap<String, bool>,
+    verification_states: HashMap<String, bool>,
     cursor: Option<String>,
     listing_complete: bool,
     saved_at: Instant,
@@ -352,6 +353,7 @@ impl ReviewThreadListingProgress {
         Self {
             threads: HashMap::new(),
             refreshed_states: HashMap::new(),
+            verification_states: HashMap::new(),
             cursor: None,
             listing_complete: false,
             saved_at: Instant::now(),
@@ -416,9 +418,12 @@ fn review_thread_listing_is_authoritative(
             .all(|comment_id| threads.contains_key(comment_id))
 }
 
+fn review_thread_was_reopened(previous: Option<bool>, current: bool) -> bool {
+    previous == Some(true) && !current
+}
+
 #[derive(Clone)]
 struct ReviewReconciliationCandidate {
-    api: GithubApi,
     repository: CodeReviewRepository,
     reviewers: Vec<ReviewerProfile>,
     config_hash: String,
@@ -431,20 +436,16 @@ impl ReviewReconciliationCandidate {
     }
 }
 
-#[cfg(test)]
-fn least_recently_reconciled_key(
-    candidates: &[(String, u64)],
+fn review_reconciliation_order_key(
+    candidate: &(String, u64),
     reconciled_at: &HashMap<(String, u64), Instant>,
-) -> Option<(String, u64)> {
-    candidates
-        .iter()
-        .min_by(|left, right| {
-            reconciled_at
-                .get(*left)
-                .cmp(&reconciled_at.get(*right))
-                .then_with(|| left.cmp(right))
-        })
-        .cloned()
+    progress_keys: &HashSet<(String, u64)>,
+) -> (Option<Instant>, bool, (String, u64)) {
+    (
+        reconciled_at.get(candidate).copied(),
+        !progress_keys.contains(candidate),
+        candidate.clone(),
+    )
 }
 
 /// How one finding fared inside a collapse pass: `Completed` means its
@@ -3349,7 +3350,6 @@ impl Engine {
                 ));
             } else {
                 reconciliation_candidates.push(ReviewReconciliationCandidate {
-                    api: api.clone(),
                     repository: repository.clone(),
                     reviewers: reviewers.clone(),
                     config_hash: config_hash.clone(),
@@ -3392,10 +3392,7 @@ impl Engine {
         let mut ordered = candidates.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|candidate| {
             let key = candidate.key();
-            (
-                reconciled_at.get(&key).copied(),
-                !progress_keys.contains(&key),
-            )
+            review_reconciliation_order_key(&key, &reconciled_at, &progress_keys)
         });
 
         let mut first_error = None;
@@ -3404,9 +3401,13 @@ impl Engine {
                 break;
             }
             let key = candidate.key();
-            let outcome = self
-                .reconcile_user_resolved_review_findings(
-                    &candidate.api,
+            let outcome = async {
+                let api = self
+                    .installation_api(candidate.repository.installation_id)
+                    .await
+                    .context("refreshing GitHub App credentials before reconciliation")?;
+                self.reconcile_user_resolved_review_findings(
+                    &api,
                     &candidate.repository,
                     &candidate.reviewers,
                     &candidate.config_hash,
@@ -3414,12 +3415,14 @@ impl Engine {
                     deadline,
                 )
                 .await
-                .with_context(|| {
-                    format!(
-                        "reconciling resolved review findings for {}#{}",
-                        candidate.repository.repository, candidate.pull.number
-                    )
-                });
+            }
+            .await
+            .with_context(|| {
+                format!(
+                    "reconciling resolved review findings for {}#{}",
+                    candidate.repository.repository, candidate.pull.number
+                )
+            });
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -5640,6 +5643,13 @@ impl Engine {
         let mut event = github_review_event(has_unresolved_findings);
         let mut include_comments = !comments.is_empty();
         loop {
+            if !include_comments
+                && !self
+                    .store
+                    .prepare_code_review_commentless_publication(&job.id, &eligible_ids)?
+            {
+                bail!("review changed before commentless publication was prepared");
+            }
             let submitted_comments = if include_comments {
                 comments.as_slice()
             } else {
@@ -7096,6 +7106,9 @@ impl Engine {
             progress
                 .refreshed_states
                 .retain(|thread_id, _| !missing_thread_ids.contains(thread_id));
+            progress
+                .verification_states
+                .retain(|thread_id, _| !missing_thread_ids.contains(thread_id));
             thread_ids.retain(|thread_id| !missing_thread_ids.contains(thread_id));
         }
         if !thread_ids
@@ -7112,9 +7125,13 @@ impl Engine {
         // cannot cover the verification, keep the accumulated cursor/state
         // progress and retry only this final verification next poll.
         let authoritative_states = if refresh_resumed {
-            let mut states = HashMap::new();
             let mut missing_thread_ids = HashSet::new();
-            for ids in thread_ids.chunks(100) {
+            let unverified_thread_ids = thread_ids
+                .iter()
+                .filter(|thread_id| !progress.verification_states.contains_key(*thread_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            for ids in unverified_thread_ids.chunks(100) {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     self.save_review_thread_listing_progress(progress_key, progress);
@@ -7153,7 +7170,9 @@ impl Engine {
                         (thread["id"].as_str(), thread["isResolved"].as_bool())
                     {
                         returned_ids.insert(thread_id.to_owned());
-                        states.insert(thread_id.to_owned(), is_resolved);
+                        progress
+                            .verification_states
+                            .insert(thread_id.to_owned(), is_resolved);
                     }
                 }
                 missing_thread_ids.extend(
@@ -7161,6 +7180,7 @@ impl Engine {
                         .filter(|thread_id| !returned_ids.contains(*thread_id))
                         .cloned(),
                 );
+                self.save_review_thread_listing_progress(progress_key.clone(), progress.clone());
             }
             if !missing_thread_ids.is_empty() {
                 progress
@@ -7169,16 +7189,19 @@ impl Engine {
                 progress
                     .refreshed_states
                     .retain(|thread_id, _| !missing_thread_ids.contains(thread_id));
+                progress
+                    .verification_states
+                    .retain(|thread_id, _| !missing_thread_ids.contains(thread_id));
                 thread_ids.retain(|thread_id| !missing_thread_ids.contains(thread_id));
             }
             if !thread_ids
                 .iter()
-                .all(|thread_id| states.contains_key(thread_id))
+                .all(|thread_id| progress.verification_states.contains_key(thread_id))
             {
                 self.save_review_thread_listing_progress(progress_key, progress);
                 return Ok(ReviewThreadListingOutcome::Incomplete);
             }
-            states
+            progress.verification_states.clone()
         } else {
             progress.refreshed_states.clone()
         };
@@ -7265,10 +7288,10 @@ impl Engine {
             return Ok(ReviewThreadReconciliationOutcome::Deferred);
         };
         if !review_thread_listing_is_authoritative(&thread_by_comment, listing_complete, &targets) {
-            return Ok(ReviewThreadReconciliationOutcome::Skipped);
+            return Ok(ReviewThreadReconciliationOutcome::Deferred);
         }
         let Ok(publication_guard) = publication_lock.try_lock() else {
-            return Ok(ReviewThreadReconciliationOutcome::Skipped);
+            return Ok(ReviewThreadReconciliationOutcome::Deferred);
         };
         let pull_state = self
             .store
@@ -7280,7 +7303,7 @@ impl Engine {
                 &pull.head.sha,
             )?
         {
-            return Ok(ReviewThreadReconciliationOutcome::Skipped);
+            return Ok(ReviewThreadReconciliationOutcome::Deferred);
         }
 
         let findings = self
@@ -7313,7 +7336,7 @@ impl Engine {
             })
             .collect::<BTreeSet<_>>();
         if initial_ids != current_ids {
-            return Ok(ReviewThreadReconciliationOutcome::Skipped);
+            return Ok(ReviewThreadReconciliationOutcome::Deferred);
         }
 
         let mut changed_jobs = HashSet::new();
@@ -7333,8 +7356,6 @@ impl Engine {
                 all_resolved = false;
                 continue;
             };
-            let was_resolved = state.is_resolved == Some(true)
-                || matches!(state.finding.status.as_str(), "fixed" | "dismissed");
             let (changed, generation) = self.store.record_code_review_thread_state(
                 &state.finding.id,
                 thread_id,
@@ -7346,7 +7367,7 @@ impl Engine {
             reconciled_finding_ids.push(state.finding.id.clone());
             if changed {
                 changed_jobs.insert(state.finding.job_id.clone());
-                reopened |= was_resolved && !is_resolved;
+                reopened |= review_thread_was_reopened(state.is_resolved, *is_resolved);
             }
             // Closed findings remain in reconciliation solely so a remotely
             // reopened thread can restore them to `open`. A thread that is
@@ -9707,7 +9728,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_selects_the_least_recent_stable_pull_identity() {
+    fn reconciliation_order_prioritizes_age_then_saved_progress_then_identity() {
         let now = Instant::now();
         let first = ("acme/first".to_owned(), 1);
         let second = ("acme/second".to_owned(), 2);
@@ -9716,18 +9737,27 @@ mod tests {
             (first.clone(), now),
             (second.clone(), now - Duration::from_secs(10)),
         ]);
+        let progress = HashSet::from([second.clone()]);
+        let mut candidates = vec![second.clone(), new.clone(), first.clone()];
+        candidates.sort_by_key(|candidate| {
+            review_reconciliation_order_key(candidate, &reconciled_at, &progress)
+        });
+        assert_eq!(candidates, vec![new, second, first]);
 
-        assert_eq!(
-            least_recently_reconciled_key(
-                &[second.clone(), new.clone(), first.clone()],
-                &reconciled_at,
-            ),
-            Some(new)
-        );
-        assert_eq!(
-            least_recently_reconciled_key(&[first, second.clone()], &reconciled_at),
-            Some(second)
-        );
+        let left = ("acme/a".to_owned(), 1);
+        let right = ("acme/b".to_owned(), 1);
+        let same_age = HashMap::from([(left.clone(), now), (right.clone(), now)]);
+        let mut progress_tie = vec![left.clone(), right.clone()];
+        progress_tie.sort_by_key(|candidate| {
+            review_reconciliation_order_key(candidate, &same_age, &HashSet::from([right.clone()]))
+        });
+        assert_eq!(progress_tie, vec![right.clone(), left.clone()]);
+
+        let mut tied = vec![right.clone(), left.clone()];
+        tied.sort_by_key(|candidate| {
+            review_reconciliation_order_key(candidate, &same_age, &HashSet::new())
+        });
+        assert_eq!(tied, vec![left, right]);
     }
 
     #[test]
@@ -9745,6 +9775,14 @@ mod tests {
         assert!(review_thread_listing_is_authoritative(
             &threads, true, &targets
         ));
+    }
+
+    #[test]
+    fn only_a_durable_resolved_to_unresolved_transition_is_a_reopen() {
+        assert!(review_thread_was_reopened(Some(true), false));
+        assert!(!review_thread_was_reopened(None, false));
+        assert!(!review_thread_was_reopened(Some(false), false));
+        assert!(!review_thread_was_reopened(Some(true), true));
     }
 
     #[test]
@@ -13486,6 +13524,7 @@ mod tests {
         let progress = |comment_id, saved_at| ReviewThreadListingProgress {
             threads: HashMap::from([(comment_id, (format!("T{comment_id}"), false))]),
             refreshed_states: HashMap::new(),
+            verification_states: HashMap::new(),
             cursor: Some(format!("c{comment_id}")),
             listing_complete: false,
             saved_at,
@@ -13900,6 +13939,7 @@ mod tests {
                 ReviewThreadListingProgress {
                     threads: HashMap::from([(9000, ("thread-9000".into(), false))]),
                     refreshed_states: HashMap::new(),
+                    verification_states: HashMap::new(),
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -13984,6 +14024,7 @@ mod tests {
                         (9001, ("thread-9001".into(), true)),
                     ]),
                     refreshed_states: HashMap::new(),
+                    verification_states: HashMap::new(),
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -14023,6 +14064,15 @@ mod tests {
                 HashMap::from([("thread-9000".into(), true)])
             );
         }
+        engine
+            .code_review
+            .thread_listing_progress
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .verification_states
+            .insert("thread-9000".into(), false);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -14048,7 +14098,6 @@ mod tests {
                 .to_string(),
                 serde_json::json!({
                     "data": {"nodes": [
-                        {"id": "thread-9000", "isResolved": false},
                         {"id": "thread-9001", "isResolved": true}
                     ]}
                 })

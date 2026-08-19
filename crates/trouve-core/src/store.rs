@@ -802,14 +802,20 @@ fn backfill_code_review_watermarks(conn: &mut Connection) -> Result<()> {
 fn repair_legacy_code_review_publications(conn: &Connection) -> Result<()> {
     conn.execute(
         "UPDATE code_review_jobs
-         SET lifecycle_comment_url = COALESCE((
+         SET lifecycle_comment_url = (
              SELECT state.lifecycle_comment_url
              FROM code_review_pr_state state
              WHERE state.repository = code_review_jobs.repository
                AND state.pull_number = code_review_jobs.pull_number
                AND state.lifecycle_comment_url != ''
-         ), lifecycle_comment_url)
-         WHERE lifecycle_comment_url = ''",
+         )
+         WHERE lifecycle_comment_url = ''
+           AND EXISTS (
+             SELECT 1 FROM code_review_pr_state state
+             WHERE state.repository = code_review_jobs.repository
+               AND state.pull_number = code_review_jobs.pull_number
+               AND state.lifecycle_comment_url != ''
+           )",
         [],
     )?;
     conn.execute(
@@ -820,6 +826,16 @@ fn repair_legacy_code_review_publications(conn: &Connection) -> Result<()> {
                  THEN 1 ELSE 0
              END,
              review_published = CASE
+                 WHEN publication_accepted != 0
+                   OR review_url LIKE '%#pullrequestreview-%'
+                 THEN 1 ELSE 0
+             END
+         WHERE publication_accepted != CASE
+                 WHEN publication_accepted != 0
+                   OR review_url LIKE '%#pullrequestreview-%'
+                 THEN 1 ELSE 0
+             END
+            OR review_published != CASE
                  WHEN publication_accepted != 0
                    OR review_url LIKE '%#pullrequestreview-%'
                  THEN 1 ELSE 0
@@ -8362,6 +8378,40 @@ impl Store {
         Ok(updated)
     }
 
+    /// Durably records that the next GitHub review attempt will omit inline
+    /// comments. This must commit before the POST so reconciliation after an
+    /// accepted response cannot mistake those findings for published comments.
+    pub fn prepare_code_review_commentless_publication(
+        &self,
+        job_id: &str,
+        finding_ids: &[&str],
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs
+               WHERE id = ?1 AND publication_claimed != 0
+                 AND publication_accepted = 0
+             )",
+            params![job_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !current {
+            return Ok(false);
+        }
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET github_publication_status = 'failed'
+                 WHERE id = ?1 AND job_id = ?2",
+                params![finding_id, job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Closes an open finding and, in the same committed write, arms its
     /// thread collapse when the row currently has a published comment. The
     /// row's own github_comment_id decides — not a caller snapshot, which
@@ -9586,12 +9636,6 @@ impl Store {
                 params![id, resolved_at],
             )?
         } else {
-            tx.execute(
-                "UPDATE code_review_findings
-                 SET publication_resolution_job_id = NULL
-                 WHERE publication_resolution_job_id = ?1",
-                params![id],
-            )?;
             0
         };
         if fixed > 0 {
@@ -9888,16 +9932,10 @@ impl Store {
                     params![finding_id, id],
                 )?;
             }
-        } else {
+        }
+        let fixed = if current_publication {
             tx.execute(
                 "UPDATE code_review_findings
-                 SET publication_resolution_job_id = NULL
-                 WHERE publication_resolution_job_id = ?1",
-                params![id],
-            )?;
-        }
-        let fixed = tx.execute(
-            "UPDATE code_review_findings
                  SET status = 'fixed', resolved_at = ?2,
                      publication_resolution_job_id = NULL,
                      collapse_attempts = CASE
@@ -9913,8 +9951,11 @@ impl Store {
                          ELSE 0
                      END
                  WHERE publication_resolution_job_id = ?1 AND status = 'open'",
-            params![id, resolved_at],
-        )? as u64;
+                params![id, resolved_at],
+            )? as u64
+        } else {
+            0
+        };
         let updated = tx.execute(
             "UPDATE code_review_jobs
              SET publication_accepted = 1,
@@ -9937,22 +9978,25 @@ impl Store {
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
                      last_reviewed_base_sha, last_reviewed_at)
-             SELECT repository, pull_number, head_sha, base_ref, ?6
+             SELECT repository, pull_number, head_sha, base_ref, created_at
              FROM code_review_jobs
              WHERE id = ?1 AND status = 'running'
                AND repository = ?2 AND pull_number = ?3
                AND base_ref = ?4 AND head_sha = ?5
+               AND ?6
              ON CONFLICT(repository, pull_number) DO UPDATE SET
                last_reviewed_head_sha = excluded.last_reviewed_head_sha,
                last_reviewed_base_sha = excluded.last_reviewed_base_sha,
-               last_reviewed_at = excluded.last_reviewed_at",
+               last_reviewed_at = excluded.last_reviewed_at
+             WHERE code_review_pr_state.last_reviewed_at IS NULL
+                OR code_review_pr_state.last_reviewed_at <= excluded.last_reviewed_at",
             params![
                 id,
                 repository,
                 pull_number as i64,
                 base_sha,
                 head_sha,
-                chrono::Utc::now().to_rfc3339()
+                current_publication
             ],
         )?;
         tx.commit()?;
@@ -10162,6 +10206,20 @@ impl Store {
                     OR blocking_review_cleanup_next_attempt_at <= ?2)
                AND (blocking_review_cleanup_claim_until IS NULL
                     OR blocking_review_cleanup_claim_until <= ?2)
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )
              ORDER BY COALESCE(blocking_review_cleanup_next_attempt_at, created_at), id
              LIMIT ?1"
         ))?;
@@ -11794,6 +11852,9 @@ mod tests {
         .unwrap();
         repair_legacy_code_review_publications(&conn).unwrap();
         assert_eq!(state("rollback-review"), (1, 1));
+        let changes = conn.total_changes();
+        repair_legacy_code_review_publications(&conn).unwrap();
+        assert_eq!(conn.total_changes(), changes);
     }
 
     #[test]
@@ -15050,6 +15111,12 @@ mod tests {
                 .code_review_blocking_review_cleanup_claim_is_current(&job.id, &claim)
                 .unwrap()
         );
+        assert!(
+            store
+                .code_review_jobs_pending_blocking_review_cleanup(1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -15154,6 +15221,58 @@ mod tests {
     }
 
     #[test]
+    fn commentless_publication_mode_is_durable_before_acceptance() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_commentless_publication(&job.id, &[&finding.id])
+                .unwrap()
+        );
+        assert_eq!(
+            store.code_review_findings(&job.id).unwrap()[0].github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+        );
+
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&job.id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .prepare_code_review_commentless_publication(&job.id, &[&finding.id])
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn superseded_publication_cannot_arm_cleanup_or_close_findings() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
@@ -15219,6 +15338,18 @@ mod tests {
             store.code_review_findings(&job.id).unwrap()[0].status,
             "open"
         );
+        let resolution_job: Option<String> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT publication_resolution_job_id
+                 FROM code_review_findings WHERE id = ?1",
+                params![finding.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolution_job.as_deref(), Some(job.id.as_str()));
     }
 
     #[test]
@@ -15287,6 +15418,18 @@ mod tests {
             store.code_review_findings(&job.id).unwrap()[0].status,
             "open"
         );
+        let resolution_job: Option<String> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT publication_resolution_job_id
+                 FROM code_review_findings WHERE id = ?1",
+                params![finding.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolution_job.as_deref(), Some(job.id.as_str()));
     }
 
     #[test]
@@ -15399,6 +15542,59 @@ mod tests {
                 .reconcile_code_review_publication(&older.id, "https://example/older-review", &[],)
                 .unwrap()
         );
+        let state = store
+            .code_review_pull_state(&older.repository, older.pull_number)
+            .unwrap();
+        assert_eq!(state.last_reviewed_head_sha, "newer-head");
+    }
+
+    #[test]
+    fn superseded_direct_publication_does_not_regress_the_pull_watermark() {
+        let store = Store::open_in_memory().unwrap();
+        let older = enqueue_backoff_test_job(&store);
+        let newer = store.retry_code_review_job(&older.id).unwrap().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'running', publication_claimed = 1,
+                     head_sha = CASE WHEN id = ?1 THEN 'older-head' ELSE 'newer-head' END,
+                     created_at = CASE
+                         WHEN id = ?1 THEN '2026-01-01T00:00:00Z'
+                         ELSE '2026-01-02T00:00:00Z'
+                     END
+                 WHERE id IN (?1, ?2)",
+                params![older.id, newer.id],
+            )
+            .unwrap();
+
+        store
+            .record_code_review_publication(
+                &newer.id,
+                &newer.repository,
+                newer.pull_number,
+                &newer.base_ref,
+                "newer-head",
+                "https://example/newer-review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .record_code_review_publication(
+                &older.id,
+                &older.repository,
+                older.pull_number,
+                &older.base_ref,
+                "older-head",
+                "https://example/older-review",
+                false,
+                &[],
+            )
+            .unwrap();
+
         let state = store
             .code_review_pull_state(&older.repository, older.pull_number)
             .unwrap();
