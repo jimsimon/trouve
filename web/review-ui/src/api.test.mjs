@@ -50,6 +50,7 @@ test("existing reviewers preserve persona policy when updated", async (context) 
   assert.equal(requests[1].init.method, "PUT");
   assert.deepEqual(JSON.parse(requests[1].init.body), {
     display_name: "Renamed reviewer",
+    group: "reviewer",
     system_prompt: "Updated prompt",
     allowed_tools: ["read_file"],
     read_only: true,

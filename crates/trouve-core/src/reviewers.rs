@@ -116,14 +116,6 @@ pub fn persona_as_reviewer(persona: &AgentPersona, built_in: bool) -> ReviewerPr
     }
 }
 
-pub fn merge_persona_with_reviewer(
-    persona: &AgentPersona,
-    _existing: Option<&ReviewerProfile>,
-    built_in: bool,
-) -> ReviewerProfile {
-    persona_as_reviewer(persona, built_in)
-}
-
 pub fn default_reviewer_ids() -> Vec<String> {
     DEFAULT_REVIEWER_IDS
         .iter()
@@ -204,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_persona_values_replace_legacy_reviewer_values() {
+    fn persona_conversion_preserves_canonical_values() {
         let persona = AgentPersona {
             id: "correctness".into(),
             display_name: "Correctness".into(),
@@ -216,16 +208,7 @@ mod tests {
             default_model: Some("provider/default".into()),
             default_thinking_level: Some("medium".into()),
         };
-        let legacy = ReviewerProfile {
-            id: persona.id.clone(),
-            name: "Legacy label".into(),
-            prompt: "Customized prompt".into(),
-            model: Some("provider/custom".into()),
-            default_thinking_level: Some("high".into()),
-            built_in: true,
-        };
-
-        let merged = merge_persona_with_reviewer(&persona, Some(&legacy), true);
+        let merged = persona_as_reviewer(&persona, true);
         assert_eq!(merged.name, "Correctness");
         assert_eq!(merged.prompt, "Canonical prompt");
         assert_eq!(merged.model.as_deref(), Some("provider/default"));

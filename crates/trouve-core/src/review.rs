@@ -2221,11 +2221,7 @@ impl Engine {
                 .is_some_and(|candidate| candidate.built_in)
                 || builtin_ids.contains(&persona.id);
             reviewers.retain(|reviewer| reviewer.id != persona.id);
-            reviewers.push(crate::reviewers::merge_persona_with_reviewer(
-                &persona,
-                existing.as_ref(),
-                built_in,
-            ));
+            reviewers.push(crate::reviewers::persona_as_reviewer(&persona, built_in));
         }
         Ok(reviewers)
     }

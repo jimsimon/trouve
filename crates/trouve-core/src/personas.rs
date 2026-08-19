@@ -177,6 +177,7 @@ fn load_workspace_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
     for mut persona in workspace {
         if let Some(base) = personas.iter().find(|candidate| candidate.id == persona.id) {
             persona.read_only |= base.read_only;
+            persona.default_permission_mode = base.default_permission_mode;
             if !base.allowed_tools.is_empty() {
                 if persona.allowed_tools.is_empty() {
                     persona.allowed_tools.clone_from(&base.allowed_tools);
@@ -188,6 +189,7 @@ fn load_workspace_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
             }
         } else {
             persona.read_only = true;
+            persona.default_permission_mode = Some(trouve_protocol::PermissionMode::Ask);
             if persona.allowed_tools.is_empty() {
                 persona.allowed_tools.clone_from(&restricted_tools);
             } else {
@@ -381,6 +383,9 @@ pub fn upsert_user_persona(config_dir: &Path, persona: &AgentPersona) -> Result<
 /// Remove the user-level file for a persona: deletes a custom persona outright,
 /// or resets a customized built-in back to its defaults.
 pub fn delete_user_persona(config_dir: &Path, id: &str) -> Result<()> {
+    if !is_valid_persona_id(id) {
+        bail!("persona id must be non-empty and [a-zA-Z0-9_-] only");
+    }
     let Some(path) = user_persona_file(config_dir, id)? else {
         if builtin_personas().iter().any(|m| m.id == id) {
             bail!("persona '{id}' is a built-in with no user override to remove");
@@ -505,6 +510,7 @@ default_permission_mode = "ask"
         let personas = resolve_personas(None, Some(tmp.path()));
         let plan = find_persona(&personas, "plan").unwrap();
         assert_eq!(plan.display_name, "Custom Plan");
+        assert_eq!(plan.default_permission_mode, None);
         // Built-ins that weren't overridden are still present.
         assert!(find_persona(&personas, "code").is_some());
     }
@@ -579,5 +585,6 @@ default_permission_mode = "ask"
         assert!(is_valid_persona_id("review_2-alpha"));
         assert!(!is_valid_persona_id("../evil"));
         assert!(!is_valid_persona_id(""));
+        assert!(delete_user_persona(tmp.path(), "../evil").is_err());
     }
 }
