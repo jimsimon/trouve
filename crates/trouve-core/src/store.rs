@@ -9776,7 +9776,22 @@ impl Store {
                  blocking_review_cleanup_claim_token = NULL,
                  blocking_review_cleanup_claim_until = NULL
              WHERE id = ?1 AND publication_claimed != 0
-               AND review_published = 0",
+               AND status = 'running' AND cancel_requested = 0
+               AND review_published = 0
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )",
             params![id, required],
         )? > 0)
     }
@@ -9795,13 +9810,46 @@ impl Store {
     ) -> Result<u64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let current_publication = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs AS current_job
+               WHERE current_job.id = ?1 AND current_job.status = 'running'
+                 AND current_job.cancel_requested = 0
+                 AND current_job.publication_claimed != 0
+                 AND NOT EXISTS (
+                   SELECT 1 FROM code_review_jobs AS newer
+                   WHERE newer.repository = current_job.repository
+                     AND newer.pull_number = current_job.pull_number
+                     AND newer.head_sha = current_job.head_sha
+                     AND (
+                       newer.publication_generation > current_job.publication_generation
+                       OR (
+                         newer.publication_generation = current_job.publication_generation
+                         AND newer.rowid > current_job.rowid
+                       )
+                     )
+                     AND newer.status IN ('queued', 'running', 'succeeded')
+                 )
+             )",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )?;
         let resolved_at = chrono::Utc::now().to_rfc3339();
-        for finding_id in resolved_finding_ids {
+        if current_publication {
+            for finding_id in resolved_finding_ids {
+                tx.execute(
+                    "UPDATE code_review_findings
+                     SET publication_resolution_job_id = ?2
+                     WHERE id = ?1 AND status = 'open'",
+                    params![finding_id, id],
+                )?;
+            }
+        } else {
             tx.execute(
                 "UPDATE code_review_findings
-                 SET publication_resolution_job_id = ?2
-                 WHERE id = ?1 AND status = 'open'",
-                params![finding_id, id],
+                 SET publication_resolution_job_id = NULL
+                 WHERE publication_resolution_job_id = ?1",
+                params![id],
             )?;
         }
         let fixed = tx.execute(
@@ -9834,7 +9882,7 @@ impl Store {
             params![
                 id,
                 review_url,
-                blocking_review_cleanup_pending,
+                current_publication && blocking_review_cleanup_pending,
                 fixed as i64
             ],
         )?;
@@ -9928,23 +9976,46 @@ impl Store {
         claim_token: &str,
         page: u64,
     ) -> Result<bool> {
-        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(60);
-        Ok(self.conn.lock().unwrap().execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some((current_page, attempts)) = tx
+            .query_row(
+                "SELECT blocking_review_cleanup_page,
+                        blocking_review_cleanup_attempts
+                 FROM code_review_jobs
+                 WHERE id = ?1 AND blocking_review_cleanup_pending != 0
+                   AND blocking_review_cleanup_claim_token = ?2",
+                params![id, claim_token],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let page = page.max(1) as i64;
+        let progressed = page > current_page.max(1);
+        let delay_seconds = if progressed {
+            60
+        } else {
+            (60_i64 << attempts.clamp(0, 6)).min(3600)
+        };
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+        let updated = tx.execute(
             "UPDATE code_review_jobs
              SET blocking_review_cleanup_page = ?2,
-                 blocking_review_cleanup_attempts = 0,
-                 blocking_review_cleanup_next_attempt_at = ?3,
+                 blocking_review_cleanup_attempts = CASE
+                     WHEN ?3 THEN 0
+                     ELSE blocking_review_cleanup_attempts + 1
+                 END,
+                 blocking_review_cleanup_next_attempt_at = ?4,
                  blocking_review_cleanup_claim_token = NULL,
                  blocking_review_cleanup_claim_until = NULL
              WHERE id = ?1 AND blocking_review_cleanup_pending != 0
-               AND blocking_review_cleanup_claim_token = ?4",
-            params![
-                id,
-                page.max(1) as i64,
-                next_attempt.to_rfc3339(),
-                claim_token
-            ],
-        )? > 0)
+               AND blocking_review_cleanup_claim_token = ?5",
+            params![id, page, progressed, next_attempt.to_rfc3339(), claim_token],
+        )?;
+        tx.commit()?;
+        Ok(updated > 0)
     }
 
     /// Back off a cleanup that made an API attempt and failed, so an old
@@ -14711,6 +14782,43 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_attempts = 3,
+                     blocking_review_cleanup_next_attempt_at = NULL
+                 WHERE id = ?1",
+                params![newer.id],
+            )
+            .unwrap();
+        let no_progress_claim = store
+            .claim_code_review_blocking_review_cleanup(&newer.id)
+            .unwrap()
+            .unwrap();
+        store
+            .requeue_code_review_blocking_review_cleanup(&newer.id, &no_progress_claim, 4)
+            .unwrap();
+        let (attempts, next_attempt): (i64, String) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT blocking_review_cleanup_attempts,
+                        blocking_review_cleanup_next_attempt_at
+                 FROM code_review_jobs WHERE id = ?1",
+                params![newer.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 4);
+        let next_attempt = chrono::DateTime::parse_from_rfc3339(&next_attempt)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(next_attempt - chrono::Utc::now() > chrono::Duration::minutes(7));
     }
 
     #[test]
@@ -14870,6 +14978,74 @@ mod tests {
         assert_eq!(record.job.status, "succeeded");
         assert_eq!(record.job.review_url, "https://example/accepted-review");
         assert!(record.job.error.is_empty());
+    }
+
+    #[test]
+    fn superseded_publication_cannot_arm_cleanup_or_close_findings() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_blocking_review_cleanup(&job.id, true)
+                .unwrap()
+        );
+        store
+            .prepare_code_review_finding_resolutions(&job.id, &[&finding.id])
+            .unwrap();
+
+        let mut replacement = backoff_test_job_request();
+        replacement.dedupe_key = "acme/widgets#42:replacement".into();
+        store
+            .enqueue_code_review_job(&replacement)
+            .unwrap()
+            .unwrap();
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/stale-review",
+                true,
+                &[&finding.id],
+            )
+            .unwrap();
+
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.review_published);
+        assert!(!record.blocking_review_cleanup_pending);
+        assert_eq!(record.job.fixed_issue_count, 0);
+        assert_eq!(
+            store.code_review_findings(&job.id).unwrap()[0].status,
+            "open"
+        );
     }
 
     #[test]

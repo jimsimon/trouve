@@ -6904,7 +6904,13 @@ impl Engine {
         let progress_key =
             review_thread_listing_key(repository, pull_number, listing_kind, targets);
         let listing_lock = self.code_review.thread_listing_lock(&progress_key);
-        let _listing_guard = listing_lock.lock().await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(ReviewThreadListingOutcome::Incomplete);
+        }
+        let Ok(_listing_guard) = tokio::time::timeout(remaining, listing_lock.lock()).await else {
+            return Ok(ReviewThreadListingOutcome::Incomplete);
+        };
         let mut progress = take_review_thread_listing_progress(
             &mut self
                 .code_review
@@ -7009,6 +7015,7 @@ impl Engine {
             .filter(|&thread_id| !progress.refreshed_states.contains_key(thread_id))
             .cloned()
             .collect::<Vec<_>>();
+        let mut missing_thread_ids = HashSet::new();
         for ids in unrefreshed_thread_ids.chunks(100) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -7042,16 +7049,32 @@ impl Engine {
                 self.save_review_thread_listing_progress(progress_key, progress);
                 bail!("GitHub GraphQL error while refreshing review thread states");
             }
+            let mut returned_ids = HashSet::new();
             for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
                 if let (Some(thread_id), Some(is_resolved)) =
                     (thread["id"].as_str(), thread["isResolved"].as_bool())
                 {
+                    returned_ids.insert(thread_id.to_owned());
                     progress
                         .refreshed_states
                         .insert(thread_id.to_owned(), is_resolved);
                 }
             }
+            missing_thread_ids.extend(
+                ids.iter()
+                    .filter(|thread_id| !returned_ids.contains(*thread_id))
+                    .cloned(),
+            );
             self.save_review_thread_listing_progress(progress_key.clone(), progress.clone());
+        }
+        if !missing_thread_ids.is_empty() {
+            progress
+                .threads
+                .retain(|_, (thread_id, _)| !missing_thread_ids.contains(thread_id));
+            progress
+                .refreshed_states
+                .retain(|thread_id, _| !missing_thread_ids.contains(thread_id));
+            thread_ids.retain(|thread_id| !missing_thread_ids.contains(thread_id));
         }
         if !thread_ids
             .iter()
@@ -7068,6 +7091,7 @@ impl Engine {
         // progress and retry only this final verification next poll.
         let authoritative_states = if refresh_resumed {
             let mut states = HashMap::new();
+            let mut missing_thread_ids = HashSet::new();
             for ids in thread_ids.chunks(100) {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -7101,13 +7125,29 @@ impl Engine {
                     self.save_review_thread_listing_progress(progress_key, progress);
                     bail!("GitHub GraphQL error while verifying review thread states");
                 }
+                let mut returned_ids = HashSet::new();
                 for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
                     if let (Some(thread_id), Some(is_resolved)) =
                         (thread["id"].as_str(), thread["isResolved"].as_bool())
                     {
+                        returned_ids.insert(thread_id.to_owned());
                         states.insert(thread_id.to_owned(), is_resolved);
                     }
                 }
+                missing_thread_ids.extend(
+                    ids.iter()
+                        .filter(|thread_id| !returned_ids.contains(*thread_id))
+                        .cloned(),
+                );
+            }
+            if !missing_thread_ids.is_empty() {
+                progress
+                    .threads
+                    .retain(|_, (thread_id, _)| !missing_thread_ids.contains(thread_id));
+                progress
+                    .refreshed_states
+                    .retain(|thread_id, _| !missing_thread_ids.contains(thread_id));
+                thread_ids.retain(|thread_id| !missing_thread_ids.contains(thread_id));
             }
             if !thread_ids
                 .iter()
@@ -7261,6 +7301,9 @@ impl Engine {
         let mut all_resolved = true;
         for state in &findings {
             let Some(comment_id) = state.finding.github_comment_id else {
+                if matches!(state.finding.status.as_str(), "fixed" | "dismissed") {
+                    continue;
+                }
                 all_resolved = false;
                 continue;
             };
@@ -13642,6 +13685,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let elapsed = started.elapsed();
         server.abort();
         let cancelled = tokio::time::timeout(Duration::from_secs(1), server)
             .await
@@ -13666,7 +13710,50 @@ mod tests {
                 .unwrap()
                 .contains_key(&key)
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn thread_listing_lock_wait_respects_the_pass_deadline() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let targets = HashSet::from([9001]);
+        let key = review_thread_listing_key(
+            "acme/widgets",
+            42,
+            ReviewThreadListingKind::Reconciliation,
+            &targets,
+        );
+        let lock = engine.code_review.thread_listing_lock(&key);
+        let _guard = lock.lock().await;
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            "http://127.0.0.1:1",
+            "installation:7".into(),
+        )
+        .unwrap();
+        let started = Instant::now();
+
+        let outcome = engine
+            .load_review_threads(
+                &api,
+                "acme/widgets",
+                42,
+                &targets,
+                ReviewThreadListingKind::Reconciliation,
+                Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(outcome, ReviewThreadListingOutcome::Incomplete));
+        assert!(elapsed < Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -13833,7 +13920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_state_refresh_preserves_saved_pagination_progress() {
+    async fn missing_state_node_is_evicted_and_pagination_resumes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = scripted_github_server(
@@ -13904,7 +13991,10 @@ mod tests {
             let cache = engine.code_review.thread_listing_progress.lock().unwrap();
             let progress = cache.get(&key).expect("progress should be retained");
             assert_eq!(progress.cursor.as_deref(), Some("cursor-1"));
-            assert_eq!(progress.threads.len(), 2);
+            assert_eq!(
+                progress.threads,
+                HashMap::from([(9000, ("thread-9000".into(), false))])
+            );
             assert_eq!(
                 progress.refreshed_states,
                 HashMap::from([("thread-9000".into(), true)])
@@ -13916,6 +14006,17 @@ mod tests {
         let server = scripted_github_server(
             listener,
             vec![
+                serde_json::json!({
+                    "data": {"repository": {"pullRequest": {"reviewThreads": {
+                        "pageInfo": {"hasNextPage": false, "endCursor": null},
+                        "nodes": [{
+                            "id": "thread-9001",
+                            "isResolved": false,
+                            "comments": {"nodes": [{"databaseId": 9001}]}
+                        }]
+                    }}}}
+                })
+                .to_string(),
                 serde_json::json!({
                     "data": {"nodes": [
                         {"id": "thread-9001", "isResolved": false}
@@ -14283,9 +14384,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            drop(stream);
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(stream);
+            }
         });
         let api = GithubApi::with_base_url(
             "Bearer token".into(),
