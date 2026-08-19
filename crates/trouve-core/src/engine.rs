@@ -13890,6 +13890,42 @@ fn effective_activity_tool_call<'a>(
     (nested_tool, nested_args)
 }
 
+/// Reject explicit repository identities that do not describe the session
+/// repository. Calls without structured repository fields still need the
+/// command-, GraphQL-, or REST-specific checks below.
+fn structured_repository_matches(args: &serde_json::Value, owner: &str, repo: &str) -> bool {
+    let expected_full_name = format!("{owner}/{repo}");
+    for key in ["repository_full_name", "repo_full_name"] {
+        if let Some(actual) = args.get(key).and_then(serde_json::Value::as_str)
+            && !actual
+                .trim_matches('/')
+                .eq_ignore_ascii_case(&expected_full_name)
+        {
+            return false;
+        }
+    }
+
+    if let Some(actual_owner) = args.get("owner").and_then(serde_json::Value::as_str)
+        && !actual_owner.eq_ignore_ascii_case(owner)
+    {
+        return false;
+    }
+    if let Some(actual_repo) = args.get("repo").and_then(serde_json::Value::as_str) {
+        let matches = if actual_repo.contains('/') {
+            actual_repo
+                .trim_matches('/')
+                .eq_ignore_ascii_case(&expected_full_name)
+        } else {
+            actual_repo.eq_ignore_ascii_case(repo)
+        };
+        if !matches {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// A successful tool call that actually creates a pull request. Merely
 /// listing, viewing, or mentioning a PR must not associate it with a session.
 fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
@@ -13946,6 +13982,9 @@ fn requests_pull_request_creation(
     repo: &str,
 ) -> bool {
     let (tool, args) = effective_activity_tool_call(tool, args);
+    if !structured_repository_matches(args, owner, repo) {
+        return false;
+    }
     let tool_words = activity_words(tool);
     let tool_compact = compact_activity(tool);
     let args_text = args.to_string();
@@ -18650,6 +18689,21 @@ default_permission_mode = "ask"
             "o",
             "r"
         ));
+        assert!(!requests_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "type": "mcpToolCall",
+                "server": "codex_apps",
+                "tool": "github.create_pull_request",
+                "arguments": {
+                    "repository_full_name": "other/project",
+                    "base_branch": "main",
+                    "head_branch": "agent/fix-association"
+                }
+            }),
+            "o",
+            "r"
+        ));
         assert!(requests_pull_request_creation(
             "functions.exec",
             &serde_json::json!({"cmd": "gh pr create --head fix/other"}),
@@ -18755,6 +18809,35 @@ default_permission_mode = "ask"
                     }
                 }),
                 execution_duration_ms: Some(1_492),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "create-other-pr".into(),
+                tool: "mcpToolCall".into(),
+                args: serde_json::json!({
+                    "type": "mcpToolCall",
+                    "server": "codex_apps",
+                    "tool": "github.create_pull_request",
+                    "arguments": {
+                        "repository_full_name": "other/project",
+                        "base_branch": "main",
+                        "head_branch": "agent/separate-harness-search-readmes"
+                    }
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "create-other-pr".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "result": {
+                        "structuredContent": {
+                            "number": 42,
+                            "url": "https://github.com/other/project/pull/42"
+                        }
+                    }
+                }),
+                execution_duration_ms: Some(800),
             },
         ];
 
