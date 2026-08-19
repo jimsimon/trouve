@@ -112,6 +112,8 @@ import { AppStore } from "../state/app-store.js";
 import { createSignal, readSignal, withSignalTracking } from "../state/reactivity.js";
 import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
+  beginNewSessionOptionLoad,
+  canSubmitNewSession,
   createNewSessionThreadRequest,
   createNewThreadOptionEdits,
   mergeNewSessionModelCatalogs,
@@ -121,6 +123,7 @@ import {
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   sessionTitleFallback,
+  snapshotNewSessionSubmission,
   thinkingOption,
   type NewThreadOptionEdits,
 } from "./new-session-model.js";
@@ -1675,13 +1678,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionOptionsPending = true;
     this.#newSessionOptionsError = "";
-    if (!preserveSelections) {
-      this.#newSessionOptionsWorkspaceId = "";
-      this.#newSessionOptionEdits = createNewThreadOptionEdits();
-      // Until this workspace's metadata arrives, preserve displayed values as explicit choices.
-      this.#newSessionInheritedPermissionMode = undefined;
-      this.#newSessionInheritedThinking = undefined;
-    }
+    const loadState = beginNewSessionOptionLoad({
+      optionsWorkspaceId: this.#newSessionOptionsWorkspaceId,
+      edits: this.#newSessionOptionEdits,
+      inheritedThinking: this.#newSessionInheritedThinking,
+      inheritedPermissionMode: this.#newSessionInheritedPermissionMode,
+    }, preserveSelections);
+    this.#newSessionOptionsWorkspaceId = loadState.optionsWorkspaceId;
+    this.#newSessionOptionEdits = loadState.edits;
+    this.#newSessionInheritedThinking = loadState.inheritedThinking;
+    this.#newSessionInheritedPermissionMode = loadState.inheritedPermissionMode;
     this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current);
     this.requestUpdate();
 
@@ -2026,7 +2032,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   readonly #createSession = async (event: SubmitEvent): Promise<void> => {
     event.preventDefault();
-    if (this.#newSessionPending) return;
+    if (!canSubmitNewSession({
+      sessionPending: this.#newSessionPending,
+      optionsPending: this.#newSessionOptionsPending,
+      attachmentPending: this.#newSessionAttachmentPending,
+    })) return;
     const form = event.currentTarget as HTMLFormElement;
     const data = new FormData(form);
     const workspaceId = String(data.get("workspace_id") ?? "");
@@ -2037,26 +2047,20 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       workspaceId === ""
       || (prompt === "" && this.#newSessionAttachments.length === 0)
     ) return;
-    const modeId = this.#newSessionModeId;
-    const modelId = this.#newSessionModelId;
-    const selectedMode = this.#newSessionModes.find((mode) => mode.id === modeId);
-    const effectiveModel = resolveNewSessionModel(
-      modelId,
-      selectedMode,
-      this.#newSessionProviders,
-    );
-    const submissionOptions = {
-      modeId,
-      modelId,
-      thinking: this.#newSessionThinking,
-      permissionMode: String(data.get("permission_mode") ?? ""),
+    const submissionOptions = snapshotNewSessionSubmission({
+      selections: {
+        modeId: this.#newSessionModeId,
+        modelId: this.#newSessionModelId,
+        thinking: this.#newSessionThinking,
+        permissionMode: this.#newSessionPermissionMode,
+      },
+      modes: this.#newSessionModes,
+      providers: this.#newSessionProviders,
+      selectableModels: this.#availableNewSessionModels(),
       inheritedPermissionMode: this.#newSessionInheritedPermissionMode,
       inheritedThinking: this.#newSessionInheritedThinking,
-      modelInfo: this.#availableNewSessionModels().find(
-        (model) => model.id === effectiveModel,
-      ),
-      attachments: this.#newSessionAttachments.map(({ upload }) => upload),
-    } as const;
+    });
+    const submissionAttachments = this.#newSessionAttachments.map(({ upload }) => upload);
     this.#newSessionPending = true;
     this.#newSessionError = "";
     this.requestUpdate();
@@ -2121,9 +2125,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       try {
         await this.#protocolClient.sendMessage(threadId, {
           content: prompt,
-          ...(submissionOptions.attachments.length === 0
+          ...(submissionAttachments.length === 0
             ? {}
-            : { attachments: submissionOptions.attachments }),
+            : { attachments: submissionAttachments }),
         });
       } catch {
         this.#shellNotice = "Session and thread created, but the initial prompt could not be sent.";
@@ -2505,6 +2509,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const newSessionThinkingOption = thinkingOption(
       newSessionModels.find((model) => model.id === effectiveNewSessionModel),
     );
+    const newSessionCanSubmit = canSubmitNewSession({
+      sessionPending: this.#newSessionPending,
+      optionsPending: this.#newSessionOptionsPending,
+      attachmentPending: this.#newSessionAttachmentPending,
+    });
     const serverOffline = readSignal(this.#store.serverInfo)?.online === false;
     const connectionLabel = this.#hostError
       ? "Host unavailable"
@@ -3102,7 +3111,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               ? nothing
               : html`<p class="dialog-error new-session-error" role="alert">${this.#newSessionError}</p>`}
             <footer>
-              <button class="primary" type="submit" ?disabled=${this.#newSessionPending || this.#newSessionAttachmentPending || (this.#newSessionPrompt.trim() === "" && this.#newSessionAttachments.length === 0)}>${this.#newSessionPending ? "Starting…" : "Start session"}</button>
+              <button class="primary" type="submit" ?disabled=${!newSessionCanSubmit || (this.#newSessionPrompt.trim() === "" && this.#newSessionAttachments.length === 0)}>${this.#newSessionPending ? "Starting…" : "Start session"}</button>
               <button type="button" ?disabled=${this.#newSessionPending} @click=${this.#closeNewSession}>Cancel</button>
             </footer>
           </form>

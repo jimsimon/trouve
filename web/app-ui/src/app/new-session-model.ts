@@ -52,6 +52,28 @@ export interface NewThreadOptionSelections {
   readonly permissionMode: string;
 }
 
+export interface NewSessionOptionLoadState {
+  readonly optionsWorkspaceId: string;
+  readonly edits: NewThreadOptionEdits;
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: string | undefined;
+}
+
+export interface NewSessionSubmissionSnapshotInput {
+  readonly selections: NewThreadOptionSelections;
+  readonly modes: readonly ProtocolAgentPersona[];
+  readonly providers: ProtocolProvidersResponse | null | undefined;
+  readonly selectableModels: readonly ProtocolModelInfo[];
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: string | undefined;
+}
+
+export interface NewSessionSubmissionSnapshot extends NewThreadOptionSelections {
+  readonly inheritedThinking: string | undefined;
+  readonly inheritedPermissionMode: string | undefined;
+  readonly modelInfo: ProtocolModelInfo | undefined;
+}
+
 export interface NewSessionThreadRequestInput {
   readonly sessionId: string;
   readonly title?: string | null;
@@ -225,6 +247,48 @@ export const createNewThreadOptionEdits = (): NewThreadOptionEdits => ({
   thinking: false,
   permission: false,
 });
+
+/** Starts an option load without making reconnects indistinguishable from workspace changes. */
+export const beginNewSessionOptionLoad = (
+  current: NewSessionOptionLoadState,
+  preserveSelections: boolean,
+): NewSessionOptionLoadState =>
+  preserveSelections
+    ? { ...current, edits: { ...current.edits } }
+    : {
+        optionsWorkspaceId: "",
+        edits: createNewThreadOptionEdits(),
+        inheritedThinking: undefined,
+        inheritedPermissionMode: undefined,
+      };
+
+/** Submission is safe only after every producer of form state has settled. */
+export const canSubmitNewSession = (state: {
+  readonly sessionPending: boolean;
+  readonly optionsPending: boolean;
+  readonly attachmentPending: boolean;
+}): boolean =>
+  !state.sessionPending && !state.optionsPending && !state.attachmentPending;
+
+/** Capture the option values used after asynchronous title generation completes. */
+export const snapshotNewSessionSubmission = (
+  input: NewSessionSubmissionSnapshotInput,
+): NewSessionSubmissionSnapshot => {
+  const selectedMode = input.modes.find(
+    (mode) => mode.id === input.selections.modeId,
+  );
+  const effectiveModel = resolveNewSessionModel(
+    input.selections.modelId,
+    selectedMode,
+    input.providers,
+  );
+  return Object.freeze({
+    ...input.selections,
+    inheritedThinking: input.inheritedThinking,
+    inheritedPermissionMode: input.inheritedPermissionMode,
+    modelInfo: input.selectableModels.find((model) => model.id === effectiveModel),
+  });
+};
 
 /** Merge a refreshed catalog into fields the user has not edited. */
 export const reconcileNewThreadDefaults = (

@@ -49,16 +49,10 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("this.#composerDrafts.discard(threadId)");
   });
 
-  it("renders new-session agent controls without waiting for catalog refreshes", () => {
+  it("renders new-session agent controls while catalog refreshes", () => {
     expect(source).toContain('name="mode"');
     expect(source).toContain('name="thinking"');
     expect(source).toContain('name="permission_mode"');
-    expect(source).not.toContain(
-      '?disabled=${this.#newSessionPending || this.#newSessionOptionsPending}',
-    );
-    expect(source).not.toContain(
-      '.disabled=${this.#newSessionPending || this.#newSessionOptionsPending}',
-    );
     expect(source).toContain(
       'this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current)',
     );
@@ -88,15 +82,11 @@ describe("root shell parity wiring", () => {
     expect(source).toContain(
       'if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "")',
     );
-    expect(source).toContain(
-      "void this.#loadNewSessionOptions(this.#newSessionWorkspaceId, true)",
-    );
-    const submissionSnapshot = source.indexOf("const submissionOptions = {");
-    expect(submissionSnapshot).toBeGreaterThan(0);
-    expect(source.indexOf(
-      "await this.#generateSessionTitle(prompt)",
-      submissionSnapshot,
-    )).toBeGreaterThan(submissionSnapshot);
+    expect(source).toContain("beginNewSessionOptionLoad({");
+    expect(source).toContain("snapshotNewSessionSubmission({");
+    expect(source).toContain("if (!canSubmitNewSession({");
+    expect(source).toContain("const newSessionCanSubmit = canSubmitNewSession({");
+    expect(source).toContain("?disabled=${!newSessionCanSubmit");
     expect(source).toContain(
       "this.#reconcileNewSessionDefaults(this.#newSessionModels)",
     );

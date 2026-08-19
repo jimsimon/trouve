@@ -6,6 +6,8 @@ import type {
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
 import {
+  beginNewSessionOptionLoad,
+  canSubmitNewSession,
   createNewSessionThreadRequest,
   createNewThreadOptionEdits,
   NEW_SESSION_TITLE_FALLBACK,
@@ -18,6 +20,7 @@ import {
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   sessionTitleFallback,
+  snapshotNewSessionSubmission,
   thinkingOption,
   threadTitleFallback,
 } from "./new-session-model.js";
@@ -256,35 +259,95 @@ describe("new session model", () => {
     });
   });
 
-  it("preserves explicit selections while reconnect metadata is reconciled", () => {
-    const selectedModel = model({
-      properties: {
-        thinking_level: { type: "string", enum: ["low", "high"], default: "high" },
-      },
-    }, "provider/selected");
-    const selections = {
-      modeId: "review",
-      modelId: selectedModel.id,
-      thinking: "low",
-      permissionMode: "ask",
-    };
-    const reviewMode: ProtocolAgentPersona = {
-      ...mode("provider/default"),
-      id: "review",
-      default_permission_mode: "yolo",
-      default_thinking_level: "high",
+  it("preserves options for reconnect loads and resets them for ordinary loads", () => {
+    const current = {
+      optionsWorkspaceId: "workspace-1",
+      edits: { mode: true, model: true, thinking: true, permission: true },
+      inheritedThinking: "high",
+      inheritedPermissionMode: "yolo" as const,
     };
 
-    expect(reconcileNewThreadDefaults(
-      selections,
-      [mode("provider/default"), reviewMode],
-      [model({}, "provider/default"), selectedModel],
-      providers("provider/default"),
-      { mode: true, model: true, thinking: true, permission: true },
-    )).toMatchObject({
-      ...selections,
+    const preserved = beginNewSessionOptionLoad(current, true);
+    expect(preserved).toEqual(current);
+    expect(preserved).not.toBe(current);
+    expect(preserved.edits).not.toBe(current.edits);
+    expect(beginNewSessionOptionLoad(current, false)).toEqual({
+      optionsWorkspaceId: "",
+      edits: createNewThreadOptionEdits(),
       inheritedThinking: undefined,
       inheritedPermissionMode: undefined,
+    });
+  });
+
+  it("blocks submission while options, attachments, or another submission are pending", () => {
+    const ready = {
+      sessionPending: false,
+      optionsPending: false,
+      attachmentPending: false,
+    };
+    expect(canSubmitNewSession(ready)).toBe(true);
+    for (const pending of [
+      "sessionPending",
+      "optionsPending",
+      "attachmentPending",
+    ] as const) {
+      expect(canSubmitNewSession({ ...ready, [pending]: true })).toBe(false);
+    }
+  });
+
+  it("keeps the pre-await submission options when live form state changes", async () => {
+    const selectedModel = model({
+      properties: {
+        thinking_level: {
+          type: "string",
+          enum: ["low", "high"],
+          default: "high",
+        },
+      },
+    }, "provider/selected");
+    const input = {
+      selections: {
+        modeId: "review",
+        modelId: selectedModel.id,
+        thinking: "low",
+        permissionMode: "ask",
+      },
+      modes: [{ ...mode(), id: "review" }],
+      providers: providers("provider/default"),
+      selectableModels: [selectedModel],
+      inheritedThinking: "high",
+      inheritedPermissionMode: "yolo",
+    };
+    const submission = snapshotNewSessionSubmission(input);
+
+    await Promise.resolve();
+    input.selections.modeId = "code";
+    input.selections.modelId = "provider/changed";
+    input.selections.thinking = "high";
+    input.selections.permissionMode = "yolo";
+    input.inheritedThinking = "low";
+    input.inheritedPermissionMode = "ask";
+    input.selectableModels = [];
+
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      mode: submission.modeId,
+      model: submission.modelId,
+      thinking: submission.thinking,
+      permissionMode: submission.permissionMode,
+      ...(submission.inheritedThinking === undefined
+        ? {}
+        : { inheritedThinking: submission.inheritedThinking }),
+      ...(submission.inheritedPermissionMode === undefined
+        ? {}
+        : { inheritedPermissionMode: submission.inheritedPermissionMode }),
+      ...(submission.modelInfo === undefined ? {} : { modelInfo: submission.modelInfo }),
+    })).toEqual({
+      session_id: "session-1",
+      mode: "review",
+      model: "provider/selected",
+      permission_mode: "ask",
+      model_options: { thinking_level: "low" },
     });
   });
 
