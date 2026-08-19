@@ -93,25 +93,19 @@ jobs:
             web/app-ui/dist/npm-sbom.cdx.json
           if-no-files-found: error
 
-  # Playwright projects are independent. Each shard installs only its browser
-  # and runs one project, avoiding serial desktop/mobile work on the same runner.
+  # Keep browser engines isolated and parallel while sharing one immutable,
+  # pre-provisioned Playwright environment between each engine's projects.
+  # The container removes apt and browser downloads from the critical path.
   app-ui-browser:
-    name: App UI browser (${{ matrix.project }})
+    name: App UI browser (${{ matrix.engine }})
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - engine: chromium
-            project: desktop-chromium
-          - engine: chromium
-            project: mobile-chromium
-          - engine: firefox
-            project: desktop-firefox
-          - engine: webkit
-            project: desktop-webkit
-          - engine: webkit
-            project: mobile-webkit
+        engine: [chromium, firefox, webkit]
     runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.62.0-noble@sha256:baed2032d533817f3dbe6425de795788430ba345e819a1201337009ba17c9d07
+      options: --user 1001 --ipc=host
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -124,12 +118,27 @@ jobs:
       - name: Install app UI dependencies
         working-directory: web/app-ui
         run: npm ci
-      - name: Install ${{ matrix.engine }}
+      - name: Verify container browser revision
         working-directory: web/app-ui
-        run: ./node_modules/.bin/playwright install --with-deps ${{ matrix.engine }}
+        env:
+          BROWSER_ENGINE: ${{ matrix.engine }}
+        run: >-
+          node --input-type=module -e
+          'import { accessSync, constants } from "node:fs";
+          import { chromium, firefox, webkit } from "@playwright/test";
+          const engine = { chromium, firefox, webkit }[process.env.BROWSER_ENGINE];
+          accessSync(engine.executablePath(), constants.X_OK);'
       - name: Browser, accessibility, and visual checks
+        shell: bash
         working-directory: web/app-ui
-        run: npm run test:browser -- --project=${{ matrix.project }}
+        env:
+          BROWSER_ENGINE: ${{ matrix.engine }}
+        run: |
+          projects=("--project=desktop-${BROWSER_ENGINE}")
+          if [ "$BROWSER_ENGINE" != firefox ]; then
+            projects+=("--project=mobile-${BROWSER_ENGINE}")
+          fi
+          npm run test:browser -- "${projects[@]}"
 
   repository-checks:
     runs-on: ubuntu-latest
