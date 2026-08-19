@@ -14274,7 +14274,6 @@ fn classify_pull_request_creation(
         nested_compact.contains("createpullrequest") || nested_compact.ends_with("createpr");
     if named_creator
         && trusted_activity_tool_name(nested_tool)
-        && structured_repository_matches(args, owner, repo)
         && effective_activity_tool_call(tool, args).is_none()
     {
         PullRequestCreationRequest::Unresolved
