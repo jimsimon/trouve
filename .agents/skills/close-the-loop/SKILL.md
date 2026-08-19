@@ -48,14 +48,17 @@ Bring one existing current-session pull request all the way to the product's
 2. Require one unambiguous open PR whose head branch matches this session.
    If none exists, or multiple candidates remain after exact repository and
    branch matching, stop and ask for the missing choice. Do not create a PR.
-3. Record the PR number, URL, base branch, head branch, and exact head SHA.
-   Confirm the local branch can safely update that PR head.
-4. If the PR is a draft, inspect its auto-merge and merge-queue state before
-   running `gh pr ready`. If becoming ready could trigger either automation,
-   do not change readiness; disable the automation only with explicit user
-   authorization, otherwise report the blocker. After any ready transition,
-   immediately re-read the PR and verify it remains open, targets the recorded
-   repository and branches, and is no longer a draft.
+3. Record the PR number, URL, base branch, exact base revision, head branch,
+   and exact head SHA. Confirm the local branch can safely update that PR head.
+   Read expected workflow and check policy from the recorded base revision,
+   not from PR-controlled files alone.
+4. Before any PR mutation or monitoring, inspect its auto-merge and
+   merge-queue state. If either automation is active, stop and report the
+   blocker. Disable it only with explicit user authorization, then re-read the
+   PR and verify both states are inactive before continuing.
+5. If the PR is a draft, run `gh pr ready`, then immediately re-read the PR
+   and verify it remains open, targets the recorded repository and branches,
+   is no longer a draft, and has not activated auto-merge or a merge queue.
 
 ## Build a complete state snapshot
 
@@ -135,9 +138,13 @@ or failed blocker and stop without claiming readiness.
 
 After a push, do not mistake an empty check list for success when the previous
 head had checks. Allow workflows to register, then monitor every expected
-check. Accept intentionally skipped or neutral non-required checks only when
-the workflow makes that state expected. Treat failures, cancellations,
-timeouts, action-required states, and stale checks as not green.
+check. Determine the expected workflow and job identities from trusted policy
+at the recorded base revision and compare them with the exact checks reported
+for the head. Accept a skipped or neutral result only when that trusted policy
+makes the result expected and branch-protection data confirms the exact check
+is non-required. Never rely on PR-controlled conditions or path filters for
+this classification. Treat failures, cancellations, timeouts, action-required
+states, and stale checks as not green.
 
 ## Completion criteria
 
@@ -145,13 +152,17 @@ Finish only when one full snapshot proves all of the following:
 
 - The current snapshot matches the recorded repository, PR number, base branch,
   head branch, and head SHA, and the same target PR is open and non-draft.
-- Every applicable CI check for that SHA is terminal and successful, or is an
-  expected skipped or neutral non-required check. No check is queued, pending,
-  running, failing, cancelled, timed out, stale, or action-required.
+- Every applicable CI check for that SHA and every check expected by trusted
+  policy at the recorded base revision is terminal and successful. A skipped
+  or neutral result is acceptable only when the base-revision policy makes it
+  expected and branch protection confirms that exact check is non-required.
+  No check is queued, pending, running, failing, cancelled, timed out, stale,
+  action-required, or missing because of PR-controlled filtering.
 - Every observable automated review job for the exact head SHA is successful
-  or explicitly verified as an expected non-blocking skipped or neutral result.
-  Queued, pending, running, failed, cancelled, timed-out, errored,
-  action-required, stale, or other terminal non-success states are blockers.
+  or is a skipped or neutral result that trusted base-revision policy makes
+  expected and branch protection confirms is non-required. Queued, pending,
+  running, failed, cancelled, timed-out, errored, action-required, stale, or
+  other terminal non-success states are blockers.
 - All required approvals are present. Use `reviewDecision` and, when needed,
   each reviewer's latest non-dismissed effective verdict to determine whether
   a blocking change request remains; do not let a superseded historical
@@ -168,12 +179,19 @@ Finish only when one full snapshot proves all of the following:
   it as `Ready to merge` and no hook is pending or failing.
 - No new feedback or head change appeared after the last mutation.
 
+For the first clean snapshot, record a canonical readiness fingerprint with
+sorted check identities and outcomes, automated-review states, review requests
+and effective verdicts, review-thread identities and resolution states,
+open/draft and automation state, and mergeability and `mergeStateStatus`.
+Include the recorded repository, PR number, base branch and revision, head
+branch, and head SHA; exclude only volatile request IDs and timestamps.
+
 Then perform one more complete read after a normal polling interval. Require
-the second snapshot to match the recorded repository, PR number, base branch,
-head branch, and head SHA and independently satisfy every criterion above. If
-anything changed, restart the loop. If authentication, permissions, an
-external system, or conflicting feedback prevents convergence, report the
-specific blocker and do not claim success.
+the second snapshot to have exactly the same canonical readiness fingerprint
+as the first and independently satisfy every criterion above. If anything
+changed, restart the loop. If authentication, permissions, an external system,
+or conflicting feedback prevents convergence, report the specific blocker and
+do not claim success.
 
 ## Report the handoff
 
