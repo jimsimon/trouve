@@ -189,12 +189,17 @@ fn load_dir(
     }
 }
 
-fn load_workspace_dir(dir: &Path, personas: &mut Vec<AgentPersona>, missing_group: PersonaGroup) {
+fn load_workspace_personas(
+    dir: &Path,
+    bases: &[AgentPersona],
+    missing_group: PersonaGroup,
+) -> Vec<AgentPersona> {
     let mut workspace = Vec::new();
-    load_dir(dir, &mut workspace, personas, missing_group);
+    load_dir(dir, &mut workspace, bases, missing_group);
     let restricted_tools = fallback_persona().allowed_tools;
+    let mut restricted = Vec::new();
     for mut persona in workspace {
-        if let Some(base) = personas.iter().find(|candidate| candidate.id == persona.id) {
+        if let Some(base) = bases.iter().find(|candidate| candidate.id == persona.id) {
             persona.read_only |= base.read_only;
             persona.default_permission_mode = base.default_permission_mode;
             if !base.allowed_tools.is_empty() {
@@ -217,6 +222,13 @@ fn load_workspace_dir(dir: &Path, personas: &mut Vec<AgentPersona>, missing_grou
                     .retain(|tool| restricted_tools.contains(tool));
             }
         }
+        restricted.push(persona);
+    }
+    restricted
+}
+
+fn load_workspace_dir(dir: &Path, personas: &mut Vec<AgentPersona>, missing_group: PersonaGroup) {
+    for persona in load_workspace_personas(dir, personas, missing_group) {
         personas.retain(|candidate| candidate.id != persona.id);
         personas.push(persona);
     }
@@ -301,7 +313,7 @@ pub fn resolve_persona_infos(
         })
         .collect();
     let mut overlay = |dir: &Path, origin_over_builtin: &str, origin_new: &str, missing_group| {
-        let mut personas = Vec::new();
+        let mut personas;
         // Config-directory group inference is layer-local, while workspace
         // overrides inherit the accumulated effective persona just like
         // `load_workspace_dir` does at runtime.
@@ -310,7 +322,12 @@ pub fn resolve_persona_infos(
         } else {
             builtin_personas()
         };
-        load_dir(dir, &mut personas, &bases, missing_group);
+        if origin_new == "workspace" {
+            personas = load_workspace_personas(dir, &bases, missing_group);
+        } else {
+            personas = Vec::new();
+            load_dir(dir, &mut personas, &bases, missing_group);
+        }
         for persona in personas {
             let origin = if builtin_ids.contains(&persona.id) {
                 origin_over_builtin.to_string()
@@ -419,25 +436,7 @@ pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<Pa
 }
 
 pub(crate) fn legacy_user_persona_file(config_dir: &Path, id: &str) -> Result<bool> {
-    let dir = config_dir.join("personas");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
-    };
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if toml::from_str::<AgentPersona>(&text).is_ok_and(|persona| persona.id == id) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(user_persona_file(config_dir, id)?.is_some())
 }
 
 /// Write (create or replace) the user-level TOML file for a persona. Saving

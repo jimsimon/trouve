@@ -4669,6 +4669,30 @@ impl Engine {
         Ok(personas)
     }
 
+    fn sync_persisted_reviewer_profile(
+        store: &Store,
+        persona: &AgentPersona,
+    ) -> Result<(), EngineError> {
+        if persona.group != trouve_protocol::PersonaGroup::Reviewer {
+            return Ok(());
+        }
+        let built_in = store
+            .list_built_in_reviewer_defaults()?
+            .iter()
+            .any(|reviewer| reviewer.id == persona.id);
+        let persisted = built_in
+            || store
+                .list_custom_reviewer_profiles()?
+                .iter()
+                .any(|reviewer| reviewer.id == persona.id);
+        if persisted {
+            store.upsert_reviewer_profile(&crate::reviewers::persona_as_reviewer(
+                persona, built_in,
+            ))?;
+        }
+        Ok(())
+    }
+
     /// Create or update a user-level persona. Saving under a built-in id
     /// customizes that built-in; the file lands in `<config>/personas/`.
     pub async fn upsert_persona(
@@ -4709,7 +4733,6 @@ impl Engine {
             default_model: req.default_model,
             default_thinking_level: req.default_thinking_level,
         };
-        let persona_for_reviewer = persona.clone();
         let mutation = self.persona_mutations.clone().lock_owned().await;
         if legacy_reviewer {
             if persona.group != trouve_protocol::PersonaGroup::Reviewer {
@@ -4830,39 +4853,27 @@ impl Engine {
                     store.release_persona_deletion_claim(&id, &claim)?;
                     return Err(EngineError::Internal(anyhow::anyhow!(error)));
                 }
+                Self::sync_persisted_reviewer_profile(&store, &persona)?;
                 Ok(())
             })
             .await
             .map_err(|error| EngineError::Internal(anyhow::anyhow!("persona replacement task failed: {error}")))??;
         } else {
-            let write_result = self
-                .executor
-                .upsert_persona_file(config_dir, &persona)
-                .await;
-            drop(mutation);
-            if let Err(error) = write_result {
-                return Err(EngineError::Internal(anyhow::anyhow!(error)));
-            }
-        }
-        if persona_for_reviewer.group == trouve_protocol::PersonaGroup::Reviewer {
-            let built_in = self
-                .store
-                .list_built_in_reviewer_defaults()?
-                .iter()
-                .any(|reviewer| reviewer.id == id);
-            let persisted = built_in
-                || self
-                    .store
-                    .list_custom_reviewer_profiles()?
-                    .iter()
-                    .any(|reviewer| reviewer.id == id);
-            if persisted {
-                self.store
-                    .upsert_reviewer_profile(&crate::reviewers::persona_as_reviewer(
-                        &persona_for_reviewer,
-                        built_in,
-                    ))?;
-            }
+            let store = self.store.clone();
+            let executor = self.executor.clone();
+            let config_dir = config_dir.to_path_buf();
+            tokio::spawn(async move {
+                let _mutation = mutation;
+                executor
+                    .upsert_persona_file(&config_dir, &persona)
+                    .await
+                    .map_err(|error| EngineError::Internal(anyhow::anyhow!(error)))?;
+                Self::sync_persisted_reviewer_profile(&store, &persona)
+            })
+            .await
+            .map_err(|error| {
+                EngineError::Internal(anyhow::anyhow!("persona upsert task failed: {error}"))
+            })??;
         }
         Ok(())
     }
