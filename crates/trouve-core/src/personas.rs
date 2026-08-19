@@ -302,8 +302,14 @@ pub fn resolve_persona_infos(
         .collect();
     let mut overlay = |dir: &Path, origin_over_builtin: &str, origin_new: &str, missing_group| {
         let mut personas = Vec::new();
-        // Keep group inference layer-local, matching `resolve_personas`.
-        let bases = builtin_personas();
+        // Config-directory group inference is layer-local, while workspace
+        // overrides inherit the accumulated effective persona just like
+        // `load_workspace_dir` does at runtime.
+        let bases = if origin_new == "workspace" {
+            infos.iter().map(|info| info.persona.clone()).collect()
+        } else {
+            builtin_personas()
+        };
         load_dir(dir, &mut personas, &bases, missing_group);
         for persona in personas {
             let origin = if builtin_ids.contains(&persona.id) {
@@ -472,16 +478,24 @@ pub fn upsert_user_persona(config_dir: &Path, persona: &AgentPersona) -> Result<
         }
     };
     #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(&path) {
-        std::fs::set_permissions(&temporary, metadata.permissions())
-            .with_context(|| format!("preserving permissions for {}", path.display()))?;
-    }
+    let existing_permissions = std::fs::metadata(&path)
+        .ok()
+        .map(|metadata| metadata.permissions());
     if let Err(error) = file
         .write_all(text.as_bytes())
         .and_then(|()| file.sync_all())
     {
         let _ = std::fs::remove_file(&temporary);
         return Err(error).with_context(|| format!("writing {}", temporary.display()));
+    }
+    #[cfg(unix)]
+    if let Some(permissions) = existing_permissions
+        && let Err(error) = file.set_permissions(permissions)
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("preserving permissions for {}", path.display()));
     }
     drop(file);
     let replacing_existing = path.is_file();

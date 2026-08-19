@@ -584,38 +584,6 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
-    // General personas are no longer code-review specialists. Remove their
-    // pre-unification selections while preserving a usable manual fallback.
-    "UPDATE code_review_repositories SET
-       identity_ids = CASE
-         WHEN EXISTS (
-           SELECT 1 FROM json_each(identity_ids)
-           WHERE value NOT IN ('code', 'plan', 'review')
-         ) THEN (
-           SELECT json_group_array(value) FROM json_each(identity_ids)
-           WHERE value NOT IN ('code', 'plan', 'review')
-         )
-         ELSE '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'
-       END,
-       included_reviewer_ids = (
-         SELECT json_group_array(value) FROM json_each(included_reviewer_ids)
-         WHERE value NOT IN ('code', 'plan', 'review')
-       ),
-       excluded_reviewer_ids = (
-         SELECT json_group_array(value) FROM json_each(excluded_reviewer_ids)
-         WHERE value NOT IN ('code', 'plan', 'review')
-       ),
-       reviewer_overrides = (
-         SELECT json_group_array(value) FROM json_each(reviewer_overrides)
-         WHERE json_extract(value, '$.reviewer_id') NOT IN ('code', 'plan', 'review')
-       )
-     WHERE EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value IN ('code', 'plan', 'review'))
-        OR EXISTS (SELECT 1 FROM json_each(included_reviewer_ids) WHERE value IN ('code', 'plan', 'review'))
-        OR EXISTS (SELECT 1 FROM json_each(excluded_reviewer_ids) WHERE value IN ('code', 'plan', 'review'))
-        OR EXISTS (
-          SELECT 1 FROM json_each(reviewer_overrides)
-          WHERE json_extract(value, '$.reviewer_id') IN ('code', 'plan', 'review')
-        )",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
@@ -630,6 +598,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     backfill_code_review_watermarks(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
+    migrate_general_persona_reviewer_references(conn)?;
     backfill_code_review_collapse_pending(conn)?;
     backfill_code_review_titles(conn)?;
     normalize_draft_stale_code_review_dedupe_keys(conn)?;
@@ -638,6 +607,79 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+fn migrate_general_persona_reviewer_references(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "general-persona-reviewer-references-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute_batch(
+        "UPDATE code_review_repositories SET
+           identity_ids = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM json_each(identity_ids)
+               WHERE value IN ('code', 'plan', 'review')
+             ) THEN CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM json_each(identity_ids)
+                 WHERE value NOT IN ('code', 'plan', 'review')
+               ) THEN (
+                 SELECT json_group_array(value) FROM json_each(identity_ids)
+                 WHERE value NOT IN ('code', 'plan', 'review')
+               )
+               ELSE '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'
+             END
+             ELSE identity_ids
+           END,
+           included_reviewer_ids = (
+             SELECT json_group_array(value) FROM json_each(included_reviewer_ids)
+             WHERE value NOT IN ('code', 'plan', 'review')
+           ),
+           excluded_reviewer_ids = (
+             SELECT json_group_array(value) FROM json_each(excluded_reviewer_ids)
+             WHERE value NOT IN ('code', 'plan', 'review')
+           ),
+           reviewer_overrides = (
+             SELECT json_group_array(value) FROM json_each(reviewer_overrides)
+             WHERE json_extract(value, '$.reviewer_id') NOT IN ('code', 'plan', 'review')
+           )
+         WHERE EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value IN ('code', 'plan', 'review'))
+            OR EXISTS (SELECT 1 FROM json_each(included_reviewer_ids) WHERE value IN ('code', 'plan', 'review'))
+            OR EXISTS (SELECT 1 FROM json_each(excluded_reviewer_ids) WHERE value IN ('code', 'plan', 'review'))
+            OR EXISTS (
+              SELECT 1 FROM json_each(reviewer_overrides)
+              WHERE json_extract(value, '$.reviewer_id') IN ('code', 'plan', 'review')
+            );",
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

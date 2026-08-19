@@ -2448,13 +2448,13 @@ impl Engine {
         &self,
         request: &UpdateCodeReviewRepositoryRequest,
     ) -> Result<CodeReviewRepository, EngineError> {
-        let _persona_mutation = self.persona_mutations.lock().await;
         validate_repository(&request.repository)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
         // Disabling must always be an escape hatch for legacy or otherwise
         // invalid enabled policies. Persist the dormant configuration as-is;
         // it will be normalized and validated before a later re-enable.
         if request.mode == CodeReviewMode::Off {
+            let _persona_mutation = self.persona_mutations.lock().await;
             self.store.update_code_review_repository(request)?;
             let repository = self
                 .store
@@ -2646,6 +2646,15 @@ impl Engine {
             )
             .await?;
         }
+        // Provider validation above can be slow. Acquire the persona lane only
+        // for the catalog-dependent validation and durable policy write.
+        let _persona_mutation = self.persona_mutations.lock().await;
+        self.resolve_code_review_reviewers(&reviewer_ids)?;
+        self.resolve_code_review_reviewers(&included_reviewer_ids)?;
+        self.resolve_code_review_reviewers(&excluded_reviewer_ids)?;
+        let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        let reviewer_overrides =
+            self.normalize_reviewer_overrides(&reviewer_overrides, &reviewer_catalog)?;
         let normalized = UpdateCodeReviewRepositoryRequest {
             installation_id: request.installation_id,
             repository: request.repository.clone(),

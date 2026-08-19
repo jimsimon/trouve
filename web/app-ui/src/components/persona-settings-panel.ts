@@ -110,7 +110,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     await this.updateComplete;
     const button = [...this.renderRoot.querySelectorAll<HTMLButtonElement>("button")]
       .find((candidate) => candidate.dataset["personaFocus"] === id);
-    button?.focus();
+    (button ?? this.renderRoot.querySelector<HTMLElement>(".stack"))?.focus();
   }
 
   async #reloadAfterMutation(success: string): Promise<boolean> {
@@ -420,7 +420,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const selected = models.find((model) => model.id === (this.#defaultModelDraft || this.#providers?.default_model));
     const thinking = thinkingOptions(selected);
     return html`
-      <div class="stack">
+      <div class="stack" tabindex="-1">
         <h2>Personas &amp; Models</h2>
         ${models.length === 0 && !this.#busy
           ? html`<div class="no-models"><span>No models available — configure a provider to enable the model selectors.</span><button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Configure providers</button></div>`

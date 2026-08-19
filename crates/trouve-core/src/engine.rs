@@ -4709,6 +4709,7 @@ impl Engine {
             default_model: req.default_model,
             default_thinking_level: req.default_thinking_level,
         };
+        let persona_for_reviewer = persona.clone();
         let mutation = self.persona_mutations.clone().lock_owned().await;
         if legacy_reviewer {
             if persona.group != trouve_protocol::PersonaGroup::Reviewer {
@@ -4803,7 +4804,7 @@ impl Engine {
             let executor = self.executor.clone();
             let config_dir = config_dir.to_path_buf();
             let id = id.to_string();
-            return tokio::spawn(async move {
+            tokio::spawn(async move {
                 let _mutation = mutation;
                 let write = executor.replace_persona_file(
                     &config_dir,
@@ -4832,7 +4833,7 @@ impl Engine {
                 Ok(())
             })
             .await
-            .map_err(|error| EngineError::Internal(anyhow::anyhow!("persona replacement task failed: {error}")))?;
+            .map_err(|error| EngineError::Internal(anyhow::anyhow!("persona replacement task failed: {error}")))??;
         } else {
             let write_result = self
                 .executor
@@ -4841,6 +4842,26 @@ impl Engine {
             drop(mutation);
             if let Err(error) = write_result {
                 return Err(EngineError::Internal(anyhow::anyhow!(error)));
+            }
+        }
+        if persona_for_reviewer.group == trouve_protocol::PersonaGroup::Reviewer {
+            let built_in = self
+                .store
+                .list_built_in_reviewer_defaults()?
+                .iter()
+                .any(|reviewer| reviewer.id == id);
+            let persisted = built_in
+                || self
+                    .store
+                    .list_custom_reviewer_profiles()?
+                    .iter()
+                    .any(|reviewer| reviewer.id == id);
+            if persisted {
+                self.store
+                    .upsert_reviewer_profile(&crate::reviewers::persona_as_reviewer(
+                        &persona_for_reviewer,
+                        built_in,
+                    ))?;
             }
         }
         Ok(())
@@ -4898,29 +4919,43 @@ impl Engine {
             let executor = self.executor.clone();
             let config_dir = config_dir.to_path_buf();
             let id = id.to_string();
-            return tokio::spawn(async move {
+            let task_claim = claim.clone();
+            let task_id = id.clone();
+            let result = tokio::spawn(async move {
                 let _mutation = mutation;
-                let file_result = if custom_reviewer && !personas::is_valid_persona_id(&id) {
+                let file_result = if custom_reviewer && !personas::is_valid_persona_id(&task_id) {
                     Ok(())
                 } else {
                     executor
-                        .delete_persona_file(&config_dir, &id, deletion_pending || custom_reviewer)
+                        .delete_persona_file(
+                            &config_dir,
+                            &task_id,
+                            deletion_pending || custom_reviewer,
+                        )
                         .await
                 };
                 if let Err(error) = file_result {
-                    store.release_persona_deletion_claim(&id, &claim)?;
+                    store.release_persona_deletion_claim(&task_id, &task_claim)?;
                     return Err(EngineError::Internal(anyhow::anyhow!(error)));
                 }
-                if let Err(error) = store.complete_claimed_persona_deletion_token(&id, &claim) {
-                    let _ = store.release_persona_deletion_claim(&id, &claim);
+                if let Err(error) =
+                    store.complete_claimed_persona_deletion_token(&task_id, &task_claim)
+                {
+                    store.release_persona_deletion_claim(&task_id, &task_claim)?;
                     return Err(EngineError::Internal(error));
                 }
                 Ok(())
             })
-            .await
-            .map_err(|error| {
-                EngineError::Internal(anyhow::anyhow!("persona deletion task failed: {error}"))
-            })?;
+            .await;
+            return match result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.store.release_persona_deletion_claim(&id, &claim)?;
+                    Err(EngineError::Internal(anyhow::anyhow!(
+                        "persona deletion task failed: {error}"
+                    )))
+                }
+            };
         }
         if !system_persona {
             return Err(EngineError::BadRequest(format!(
