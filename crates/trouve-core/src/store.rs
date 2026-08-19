@@ -6918,6 +6918,13 @@ impl Store {
             *published || matches!(status.as_str(), "queued" | "running" | "succeeded")
         });
         if current.is_none() && !allow_new_state {
+            for finding_id in finding_ids {
+                tx.execute(
+                    "UPDATE code_review_findings
+                     SET github_thread_recheck_pending = 0 WHERE id = ?1",
+                    params![finding_id],
+                )?;
+            }
             tx.commit()?;
             return Ok(None);
         }
@@ -9251,14 +9258,23 @@ impl Store {
     ) -> Result<bool> {
         let updated = self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET status = ?2,
+             SET status = CASE
+                     WHEN publication_accepted != 0 AND review_published != 0
+                     THEN 'succeeded'
+                     ELSE ?2
+                 END,
                  review_url = CASE
+                     WHEN publication_accepted != 0 AND review_published != 0
+                          AND review_url != '' THEN review_url
                      WHEN ?3 != '' THEN ?3
                      WHEN lifecycle_comment_url != '' THEN lifecycle_comment_url
                      ELSE review_url
                  END,
-                 error = ?4,
-                    completed_at = ?5
+                 error = CASE
+                     WHEN publication_accepted != 0 AND review_published != 0 THEN ''
+                     ELSE ?4
+                 END,
+                 completed_at = ?5
              WHERE id = ?1 AND status = 'running'",
             params![
                 id,
@@ -14823,6 +14839,118 @@ mod tests {
     }
 
     #[test]
+    fn accepted_publication_atomically_wins_terminal_failure() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/accepted-review",
+                false,
+                &[],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .finish_code_review_job(&job.id, "failed", "", "late timeout")
+                .unwrap()
+        );
+
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert_eq!(record.job.status, "succeeded");
+        assert_eq!(record.job.review_url, "https://example/accepted-review");
+        assert!(record.job.error.is_empty());
+    }
+
+    #[test]
+    fn ineligible_thread_recheck_still_consumes_reconciled_markers() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', github_thread_recheck_pending = 1
+                 WHERE id = ?1",
+                params![finding.id],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+        let mut request = backoff_test_job_request();
+        request.dedupe_key = "acme/widgets#42:ineligible-thread-recheck".into();
+        request.trigger = "thread-recheck".into();
+
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(
+                    &request,
+                    "empty-state",
+                    &[&finding.id],
+                    false,
+                    3,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let states = store
+            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert!(!states[0].recheck_pending);
+    }
+
+    #[test]
     fn late_publication_repair_does_not_regress_the_pull_watermark() {
         let store = Store::open_in_memory().unwrap();
         let older = enqueue_backoff_test_job(&store);
@@ -14905,37 +15033,41 @@ mod tests {
         assert!(pull_state.last_reviewed_head_sha.is_empty());
     }
 
+    fn backoff_test_job_request() -> NewCodeReviewJob {
+        NewCodeReviewJob {
+            dedupe_key: "acme/widgets#42:backoff".into(),
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            pull_title: "Ship widgets".into(),
+            pull_url: "https://github.com/acme/widgets/pull/42".into(),
+            head_sha: "2222222222222222222222222222222222222222".into(),
+            review_base_sha: "1111111111111111111111111111111111111111".into(),
+            base_ref: "main".into(),
+            head_ref: "ship".into(),
+            scope: trouve_protocol::CodeReviewJobScope::Incremental,
+            trigger: "automatic".into(),
+            retry_of: None,
+            model: Some("provider/default".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: "Review it".into(),
+            reviewers: crate::reviewers::built_in_reviewers()
+                .into_iter()
+                .take(1)
+                .collect(),
+            routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+            semantic_routing: false,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            config_hash: "config".into(),
+        }
+    }
+
     fn enqueue_backoff_test_job(store: &Store) -> trouve_protocol::CodeReviewJob {
         store
-            .enqueue_code_review_job(&NewCodeReviewJob {
-                dedupe_key: "acme/widgets#42:backoff".into(),
-                installation_id: 7,
-                repository: "acme/widgets".into(),
-                pull_number: 42,
-                pull_title: "Ship widgets".into(),
-                pull_url: "https://github.com/acme/widgets/pull/42".into(),
-                head_sha: "2222222222222222222222222222222222222222".into(),
-                review_base_sha: "1111111111111111111111111111111111111111".into(),
-                base_ref: "main".into(),
-                head_ref: "ship".into(),
-                scope: trouve_protocol::CodeReviewJobScope::Incremental,
-                trigger: "automatic".into(),
-                retry_of: None,
-                model: Some("provider/default".into()),
-                coordinator_thinking_level: None,
-                router_model: None,
-                router_thinking_level: None,
-                prompt: "Review it".into(),
-                reviewers: crate::reviewers::built_in_reviewers()
-                    .into_iter()
-                    .take(1)
-                    .collect(),
-                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
-                semantic_routing: false,
-                included_reviewer_ids: Vec::new(),
-                excluded_reviewer_ids: Vec::new(),
-                config_hash: "config".into(),
-            })
+            .enqueue_code_review_job(&backoff_test_job_request())
             .unwrap()
             .unwrap()
     }

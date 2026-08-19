@@ -46,6 +46,7 @@ const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 /// paginated thread walk. Ordinary pull discovery and review enqueueing for
 /// later repositories therefore never wait behind several slow walks.
 const REVIEW_RECONCILIATION_PASS_BUDGET: Duration = Duration::from_secs(45);
+const REVIEW_RECONCILIATION_FAILURE_RESET_THRESHOLD: u32 = 3;
 const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_OUTBOX_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
@@ -60,7 +61,6 @@ const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60)
 /// retried by the dedicated collapse-retry task.
 const REVIEW_THREAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
-const REVIEW_THREAD_STATE_CACHE_TTL: Duration = Duration::from_secs(30);
 const REVIEW_PUBLICATION_LOOKUP_MAX_PAGES: u64 = 100;
 const REVIEW_PUBLICATION_LOOKUP_BUDGET: Duration = Duration::from_secs(60);
 const REVIEW_PUBLICATION_LOOKUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -275,6 +275,7 @@ pub struct CodeReviewRuntime {
     job_wake: Notify,
     warned_job_concurrency_override: AtomicUsize,
     thread_reconciled_at: Mutex<HashMap<(String, u64), Instant>>,
+    thread_reconciliation_failures: Mutex<HashMap<(String, u64), u32>>,
     thread_listing_progress: Mutex<HashMap<ReviewThreadListingKey, ReviewThreadListingProgress>>,
     thread_listing_locks: Mutex<HashMap<ReviewThreadListingKey, Weak<tokio::sync::Mutex<()>>>>,
     running: Mutex<HashMap<String, RunningReview>>,
@@ -341,7 +342,6 @@ struct ReviewThreadListingKey {
 struct ReviewThreadListingProgress {
     threads: HashMap<u64, (String, bool)>,
     refreshed_states: HashMap<String, bool>,
-    refresh_started_at: Option<Instant>,
     cursor: Option<String>,
     listing_complete: bool,
     saved_at: Instant,
@@ -352,7 +352,6 @@ impl ReviewThreadListingProgress {
         Self {
             threads: HashMap::new(),
             refreshed_states: HashMap::new(),
-            refresh_started_at: None,
             cursor: None,
             listing_complete: false,
             saved_at: Instant::now(),
@@ -3108,6 +3107,11 @@ impl Engine {
             .lock()
             .unwrap()
             .retain(|key, _| active_reconciliation_keys.contains(key));
+        self.code_review
+            .thread_reconciliation_failures
+            .lock()
+            .unwrap()
+            .retain(|key, _| active_reconciliation_keys.contains(key));
         if let Err(error) = self
             .reconcile_oldest_review_thread_candidate(&reconciliation_candidates)
             .await
@@ -3120,7 +3124,9 @@ impl Engine {
             .store
             .code_review_jobs_pending_blocking_review_cleanup(REVIEW_PROJECTION_REPAIR_LIMIT)?
         {
-            if Instant::now() >= cleanup_deadline {
+            if cleanup_deadline.saturating_duration_since(Instant::now())
+                < REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT
+            {
                 break;
             }
             if let Err(error) = self
@@ -3387,8 +3393,8 @@ impl Engine {
         ordered.sort_by_key(|candidate| {
             let key = candidate.key();
             (
-                !progress_keys.contains(&key),
                 reconciled_at.get(&key).copied(),
+                !progress_keys.contains(&key),
             )
         });
 
@@ -3417,15 +3423,32 @@ impl Engine {
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    self.code_review
-                        .thread_listing_progress
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .retain(|progress_key, _| {
-                            progress_key.kind != ReviewThreadListingKind::Reconciliation
-                                || progress_key.repository != key.0
-                                || progress_key.pull_number != key.1
-                        });
+                    let reset_progress = {
+                        let mut failures = self
+                            .code_review
+                            .thread_reconciliation_failures
+                            .lock()
+                            .unwrap();
+                        let attempts = failures.entry(key.clone()).or_default();
+                        *attempts = attempts.saturating_add(1);
+                        if *attempts >= REVIEW_RECONCILIATION_FAILURE_RESET_THRESHOLD {
+                            failures.remove(&key);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if reset_progress {
+                        self.code_review
+                            .thread_listing_progress
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .retain(|progress_key, _| {
+                                progress_key.kind != ReviewThreadListingKind::Reconciliation
+                                    || progress_key.repository != key.0
+                                    || progress_key.pull_number != key.1
+                            });
+                    }
                     self.code_review
                         .thread_reconciled_at
                         .lock()
@@ -3435,6 +3458,11 @@ impl Engine {
                     continue;
                 }
             };
+            self.code_review
+                .thread_reconciliation_failures
+                .lock()
+                .unwrap()
+                .remove(&key);
             self.code_review
                 .thread_reconciled_at
                 .lock()
@@ -3894,39 +3922,23 @@ impl Engine {
             .store
             .code_review_job_cancel_requested(&job_id)
             .unwrap_or(false);
-        let accepted_publication = match self.store.code_review_job(&job_id) {
-            Ok(Some(current)) if current.publication_accepted && current.review_published => {
-                Some(current.job.review_url)
+        let (status, review_url, error) = match result {
+            Ok(Ok(url)) => ("succeeded", url, String::new()),
+            Ok(Err(error)) if cancellation_requested => {
+                ("cancelled", String::new(), error.to_string())
             }
-            Ok(_) => None,
-            Err(error) => {
-                self.record_review_error(format!(
-                    "checking accepted publication for review job {job_id}: {error:#}"
-                ));
-                None
+            Ok(Err(error)) if error.to_string().starts_with("stale:") => {
+                ("stale", String::new(), error.to_string())
             }
-        };
-        let (status, review_url, error) = if let Some(review_url) = accepted_publication {
-            ("succeeded", review_url, String::new())
-        } else {
-            match result {
-                Ok(Ok(url)) => ("succeeded", url, String::new()),
-                Ok(Err(error)) if cancellation_requested => {
-                    ("cancelled", String::new(), error.to_string())
-                }
-                Ok(Err(error)) if error.to_string().starts_with("stale:") => {
-                    ("stale", String::new(), error.to_string())
-                }
-                Ok(Err(error)) => ("failed", String::new(), format!("{error:#}")),
-                Err(_) => (
-                    "failed",
-                    String::new(),
-                    format!(
-                        "review timed out after {}",
-                        compact_elapsed(review_timeout.as_millis().try_into().unwrap_or(u64::MAX))
-                    ),
+            Ok(Err(error)) => ("failed", String::new(), format!("{error:#}")),
+            Err(_) => (
+                "failed",
+                String::new(),
+                format!(
+                    "review timed out after {}",
+                    compact_elapsed(review_timeout.as_millis().try_into().unwrap_or(u64::MAX))
                 ),
-            }
+            ),
         };
         let (finish_recorded, finish_transition) =
             match self
@@ -3941,7 +3953,11 @@ impl Engine {
                     (false, None)
                 }
             };
-        if should_log_code_review_job_failure(status, finish_transition) {
+        let completed = self.store.code_review_job(&job_id).ok().flatten();
+        let completed_status = completed
+            .as_ref()
+            .map_or(status, |record| record.job.status.as_str());
+        if should_log_code_review_job_failure(completed_status, finish_transition) {
             tracing::error!(
                 job_id = %job_id,
                 repository = %record.job.repository,
@@ -3952,7 +3968,7 @@ impl Engine {
         }
         // Superseding can make the guarded finish a no-op, but the already
         // terminal row still needs its Check Run/comment projection.
-        if let Ok(Some(completed)) = self.store.code_review_job(&job_id) {
+        if let Some(completed) = completed {
             self.sync_code_review_projection(&completed.job).await;
         }
         if finish_recorded {
@@ -5850,10 +5866,15 @@ impl Engine {
                 return Err(error);
             }
             Err(_) => {
-                self.store
-                    .defer_code_review_blocking_review_cleanup(&job.id, &claim_token)
-                    .context("deferring blocking-review cleanup after credential timeout")?;
-                bail!("loading blocking-review cleanup credentials timed out");
+                let page = self
+                    .store
+                    .code_review_blocking_review_cleanup_page(&job.id)?;
+                self.store.requeue_code_review_blocking_review_cleanup(
+                    &job.id,
+                    &claim_token,
+                    page,
+                )?;
+                return Ok(());
             }
         };
         self.sync_claimed_code_review_blocking_review_cleanup(&api, job, &claim_token, deadline)
@@ -5958,12 +5979,17 @@ impl Engine {
                 job.repository, job.pull_number
             );
             let request = api.get(&path);
-            let (reviews, rate): (Vec<PublishedReview>, _) = tokio::time::timeout(
+            let budget_limited = remaining < REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT;
+            let (reviews, rate): (Vec<PublishedReview>, _) = match tokio::time::timeout(
                 REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT.min(remaining),
                 request,
             )
             .await
-            .context("listing blocking reviews timed out")??;
+            {
+                Ok(result) => result.context("listing blocking reviews")?,
+                Err(_) if budget_limited => return Ok(Some(page)),
+                Err(_) => bail!("listing blocking reviews timed out"),
+            };
             self.record_review_rate(rate);
             let count = reviews.len();
             for review in reviews.into_iter().filter(|review| {
@@ -5988,25 +6014,36 @@ impl Engine {
                         "event": "DISMISS",
                     }))
                     .send();
-                let response = tokio::time::timeout(
+                let budget_limited = remaining < REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT;
+                let response = match tokio::time::timeout(
                     REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT.min(remaining),
                     request,
                 )
                 .await
-                .context("dismissing a blocking review timed out")??;
+                {
+                    Ok(result) => result.context("dismissing a blocking review")?,
+                    Err(_) if budget_limited => return Ok(Some(page)),
+                    Err(_) => bail!("dismissing a blocking review timed out"),
+                };
                 let status = response.status();
                 self.record_review_rate(rate_info(response.headers()));
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Ok(Some(page));
                 }
-                let body = tokio::time::timeout(
+                let budget_limited = remaining < REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT;
+                let body = match tokio::time::timeout(
                     REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT.min(remaining),
                     response.text(),
                 )
                 .await
-                .context("reading a blocking-review dismissal response timed out")?
-                .context("reading a blocking-review dismissal response failed")?;
+                {
+                    Ok(result) => {
+                        result.context("reading a blocking-review dismissal response failed")?
+                    }
+                    Err(_) if budget_limited => return Ok(Some(page)),
+                    Err(_) => bail!("reading a blocking-review dismissal response timed out"),
+                };
                 if !status.is_success() {
                     bail!("GitHub API {status}: {}", compact_api_error(&body));
                 }
@@ -6966,17 +7003,11 @@ impl Engine {
             .collect::<Vec<_>>();
         thread_ids.sort();
         thread_ids.dedup();
-        let refresh_now = Instant::now();
-        let refresh_is_stale = progress.refresh_started_at.is_none_or(|started_at| {
-            refresh_now.saturating_duration_since(started_at) >= REVIEW_THREAD_STATE_CACHE_TTL
-        });
-        if refresh_is_stale {
-            progress.refreshed_states.clear();
-            progress.refresh_started_at = Some(refresh_now);
-        }
+        let refresh_resumed = !progress.refreshed_states.is_empty();
         let unrefreshed_thread_ids = thread_ids
-            .into_iter()
-            .filter(|thread_id| !progress.refreshed_states.contains_key(thread_id))
+            .iter()
+            .filter(|&thread_id| !progress.refreshed_states.contains_key(thread_id))
+            .cloned()
             .collect::<Vec<_>>();
         for ids in unrefreshed_thread_ids.chunks(100) {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -7022,13 +7053,79 @@ impl Engine {
             }
             self.save_review_thread_listing_progress(progress_key.clone(), progress.clone());
         }
+        if !thread_ids
+            .iter()
+            .all(|thread_id| progress.refreshed_states.contains_key(thread_id))
+        {
+            self.save_review_thread_listing_progress(progress_key, progress);
+            return Ok(ReviewThreadListingOutcome::Incomplete);
+        }
+
+        // A resumed refresh can span scheduler rotations. Preserve that work
+        // to reach this stage, then verify the complete state set once more in
+        // the single pass that returns Authoritative. If the shared deadline
+        // cannot cover the verification, keep the accumulated cursor/state
+        // progress and retry only this final verification next poll.
+        let authoritative_states = if refresh_resumed {
+            let mut states = HashMap::new();
+            for ids in thread_ids.chunks(100) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    self.save_review_thread_listing_progress(progress_key, progress);
+                    return Ok(ReviewThreadListingOutcome::Incomplete);
+                }
+                let body = serde_json::json!({
+                    "query": state_query,
+                    "variables": {"ids": ids},
+                });
+                let request = api.post("/graphql", &body);
+                let budget_limited = remaining < REVIEW_THREAD_REQUEST_TIMEOUT;
+                let request_timeout = REVIEW_THREAD_REQUEST_TIMEOUT.min(remaining);
+                let (response, rate): (serde_json::Value, _) =
+                    match tokio::time::timeout(request_timeout, request).await {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(error)) => {
+                            self.save_review_thread_listing_progress(progress_key, progress);
+                            return Err(error).context("verifying refreshed review thread states");
+                        }
+                        Err(_) => {
+                            self.save_review_thread_listing_progress(progress_key, progress);
+                            if budget_limited {
+                                return Ok(ReviewThreadListingOutcome::Incomplete);
+                            }
+                            bail!("verifying refreshed review thread states timed out");
+                        }
+                    };
+                self.record_review_rate(rate);
+                if response["errors"].is_array() {
+                    self.save_review_thread_listing_progress(progress_key, progress);
+                    bail!("GitHub GraphQL error while verifying review thread states");
+                }
+                for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
+                    if let (Some(thread_id), Some(is_resolved)) =
+                        (thread["id"].as_str(), thread["isResolved"].as_bool())
+                    {
+                        states.insert(thread_id.to_owned(), is_resolved);
+                    }
+                }
+            }
+            if !thread_ids
+                .iter()
+                .all(|thread_id| states.contains_key(thread_id))
+            {
+                self.save_review_thread_listing_progress(progress_key, progress);
+                return Ok(ReviewThreadListingOutcome::Incomplete);
+            }
+            states
+        } else {
+            progress.refreshed_states.clone()
+        };
         let fresh_threads = progress
             .threads
             .iter()
             .filter(|(comment_id, _)| targets.contains(comment_id))
             .filter_map(|(comment_id, (thread_id, _))| {
-                progress
-                    .refreshed_states
+                authoritative_states
                     .get(thread_id)
                     .map(|is_resolved| (*comment_id, (thread_id.clone(), *is_resolved)))
             })
@@ -13323,7 +13420,6 @@ mod tests {
         let progress = |comment_id, saved_at| ReviewThreadListingProgress {
             threads: HashMap::from([(comment_id, (format!("T{comment_id}"), false))]),
             refreshed_states: HashMap::new(),
-            refresh_started_at: None,
             cursor: Some(format!("c{comment_id}")),
             listing_complete: false,
             saved_at,
@@ -13693,10 +13789,7 @@ mod tests {
                 key.clone(),
                 ReviewThreadListingProgress {
                     threads: HashMap::from([(9000, ("thread-9000".into(), false))]),
-                    refreshed_states: HashMap::from([("thread-9000".into(), false)]),
-                    refresh_started_at: Some(
-                        Instant::now() - REVIEW_THREAD_STATE_CACHE_TTL - Duration::from_secs(1),
-                    ),
+                    refreshed_states: HashMap::new(),
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -13781,7 +13874,6 @@ mod tests {
                         (9001, ("thread-9001".into(), true)),
                     ]),
                     refreshed_states: HashMap::new(),
-                    refresh_started_at: None,
                     cursor: Some("cursor-1".into()),
                     listing_complete: false,
                     saved_at: Instant::now(),
@@ -13808,14 +13900,62 @@ mod tests {
         await_mock_server(server).await;
 
         assert!(matches!(outcome, ReviewThreadListingOutcome::Incomplete));
-        let cache = engine.code_review.thread_listing_progress.lock().unwrap();
-        let progress = cache.get(&key).expect("progress should be retained");
-        assert_eq!(progress.cursor.as_deref(), Some("cursor-1"));
-        assert_eq!(progress.threads.len(), 2);
-        assert_eq!(
-            progress.refreshed_states,
-            HashMap::from([("thread-9000".into(), true)])
+        {
+            let cache = engine.code_review.thread_listing_progress.lock().unwrap();
+            let progress = cache.get(&key).expect("progress should be retained");
+            assert_eq!(progress.cursor.as_deref(), Some("cursor-1"));
+            assert_eq!(progress.threads.len(), 2);
+            assert_eq!(
+                progress.refreshed_states,
+                HashMap::from([("thread-9000".into(), true)])
+            );
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(
+            listener,
+            vec![
+                serde_json::json!({
+                    "data": {"nodes": [
+                        {"id": "thread-9001", "isResolved": false}
+                    ]}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "data": {"nodes": [
+                        {"id": "thread-9000", "isResolved": false},
+                        {"id": "thread-9001", "isResolved": true}
+                    ]}
+                })
+                .to_string(),
+            ],
         );
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let outcome = engine
+            .load_review_threads(
+                &api,
+                "acme/widgets",
+                42,
+                &targets,
+                ReviewThreadListingKind::Reconciliation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        await_mock_server(server).await;
+
+        let ReviewThreadListingOutcome::Authoritative((threads, _)) = outcome else {
+            panic!("resumed refresh did not complete")
+        };
+        assert_eq!(threads.get(&9000), Some(&("thread-9000".into(), false)));
+        assert_eq!(threads.get(&9001), Some(&("thread-9001".into(), true)));
     }
 
     #[tokio::test]
