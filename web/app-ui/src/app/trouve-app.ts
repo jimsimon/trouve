@@ -1680,6 +1680,25 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionLiveUnsubscribe = undefined;
   }
 
+  #subscribeToNewSessionLiveModels(
+    generation: number,
+    workspaceId: string,
+    models: readonly ProtocolModelInfo[],
+  ): void {
+    this.#unsubscribeFromNewSessionLiveModels();
+    this.#newSessionLiveUnsubscribe = this.#modelCatalog.subscribeLive(() => {
+      if (
+        generation !== this.#newSessionOptionsGeneration
+        || !newSessionOptionsAreAuthoritative(
+          this.#newSessionOptionsLifecycle,
+          workspaceId,
+        )
+      ) return;
+      this.#reconcileNewSessionDefaults(models);
+      this.requestUpdate();
+    });
+  }
+
   async #loadNewSessionOptions(
     workspaceId: string,
     preserveSelections = false,
@@ -1697,6 +1716,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionOptionEdits = loadState.edits;
     this.#newSessionInheritedThinking = loadState.inheritedThinking;
     this.#newSessionInheritedPermissionMode = loadState.inheritedPermissionMode;
+    if (newSessionOptionsAreAuthoritative(loadState.lifecycle, workspaceId)) {
+      this.#subscribeToNewSessionLiveModels(
+        generation,
+        workspaceId,
+        this.#newSessionModels,
+      );
+    }
     this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current);
     this.requestUpdate();
 
@@ -1747,17 +1773,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       );
       this.#newSessionOptionsError = "";
       this.#reconcileNewSessionDefaults(models);
-      this.#newSessionLiveUnsubscribe = this.#modelCatalog.subscribeLive(() => {
-        if (
-          generation !== this.#newSessionOptionsGeneration
-          || !newSessionOptionsAreAuthoritative(
-            this.#newSessionOptionsLifecycle,
-            workspaceId,
-          )
-        ) return;
-        this.#reconcileNewSessionDefaults(models);
-        this.requestUpdate();
-      });
+      this.#subscribeToNewSessionLiveModels(generation, workspaceId, models);
       void liveModelsPending.then((liveLoaded) => {
         if (
           !liveLoaded
@@ -2096,6 +2112,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         thinking: this.#newSessionThinking,
         permissionMode: this.#newSessionPermissionMode,
       },
+      edits: this.#newSessionOptionEdits,
       modes: this.#newSessionModes,
       providers: this.#newSessionProviders,
       selectableModels: this.#availableNewSessionModels(),

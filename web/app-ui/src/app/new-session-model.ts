@@ -63,7 +63,10 @@ export type NewSessionOptionsStatus =
 
 export interface NewSessionOptionsLifecycle {
   readonly status: NewSessionOptionsStatus;
+  /** Workspace targeted by the current or most recently settled request. */
   readonly workspaceId: string;
+  /** Workspace whose successfully loaded catalog remains authoritative. */
+  readonly catalogWorkspaceId: string;
 }
 
 export interface NewSessionOptionLoadState {
@@ -75,6 +78,7 @@ export interface NewSessionOptionLoadState {
 
 export interface NewSessionSubmissionSnapshotInput {
   readonly selections: NewThreadOptionSelections;
+  readonly edits: NewThreadOptionEdits;
   readonly modes: readonly ProtocolAgentPersona[];
   readonly providers: ProtocolProvidersResponse | null | undefined;
   readonly selectableModels: readonly ProtocolModelInfo[];
@@ -84,6 +88,7 @@ export interface NewSessionSubmissionSnapshotInput {
 }
 
 export interface NewSessionSubmissionSnapshot extends NewThreadOptionSelections {
+  readonly edits: NewThreadOptionEdits;
   readonly inheritedThinking: string | undefined;
   readonly inheritedPermissionMode: string | undefined;
   readonly modelInfo: ProtocolModelInfo | undefined;
@@ -267,14 +272,14 @@ export const createNewThreadOptionEdits = (): NewThreadOptionEdits => ({
 export const createNewSessionOptionsLifecycle = (): NewSessionOptionsLifecycle => ({
   status: "unloaded",
   workspaceId: "",
+  catalogWorkspaceId: "",
 });
 
 export const newSessionOptionsAreAuthoritative = (
   lifecycle: NewSessionOptionsLifecycle,
   workspaceId: string,
 ): boolean =>
-  lifecycle.workspaceId === workspaceId
-  && (lifecycle.status === "ready" || lifecycle.status === "refreshing");
+  workspaceId !== "" && lifecycle.catalogWorkspaceId === workspaceId;
 
 export const newSessionOptionsAreLoading = (
   lifecycle: NewSessionOptionsLifecycle,
@@ -286,10 +291,7 @@ export const newSessionOptionsBlockSubmission = (
 
 export const newSessionOptionsCatalogWorkspaceId = (
   lifecycle: NewSessionOptionsLifecycle,
-): string =>
-  lifecycle.status === "ready" || lifecycle.status === "refreshing"
-    ? lifecycle.workspaceId
-    : "";
+): string => lifecycle.catalogWorkspaceId;
 
 /** Starts a required load or a nonblocking refresh of authoritative metadata. */
 export const beginNewSessionOptionLoad = (
@@ -302,6 +304,7 @@ export const beginNewSessionOptionLoad = (
   const lifecycle: NewSessionOptionsLifecycle = {
     status: refresh ? "refreshing" : "loading",
     workspaceId,
+    catalogWorkspaceId: refresh ? workspaceId : "",
   };
   return preserveSelections
     ? {
@@ -323,20 +326,25 @@ export const settleNewSessionOptionLoad = (
   outcome: "ready" | "failed" | "timed-out",
 ): NewSessionOptionsLifecycle => {
   if (current.workspaceId !== workspaceId) return current;
-  if (outcome === "ready") return { status: "ready", workspaceId };
-  return current.status === "refreshing"
-    ? { status: "ready", workspaceId }
-    : { status: outcome, workspaceId };
+  return {
+    status: outcome,
+    workspaceId,
+    catalogWorkspaceId: outcome === "ready"
+      ? workspaceId
+      : current.catalogWorkspaceId,
+  };
 };
 
 export const interruptNewSessionOptionLoad = (
   current: NewSessionOptionsLifecycle,
 ): NewSessionOptionsLifecycle =>
-  current.status === "refreshing"
-    ? { status: "ready", workspaceId: current.workspaceId }
-    : current.status === "loading"
-      ? { status: "failed", workspaceId: current.workspaceId }
-      : current;
+  current.status === "loading" || current.status === "refreshing"
+    ? {
+        status: current.catalogWorkspaceId === "" ? "failed" : "ready",
+        workspaceId: current.workspaceId,
+        catalogWorkspaceId: current.catalogWorkspaceId,
+      }
+    : current;
 
 /** Submission is safe only after every producer of form state has settled. */
 export const canSubmitNewSession = (state: {
@@ -360,6 +368,7 @@ export const snapshotNewSessionSubmission = (
   );
   return Object.freeze({
     ...input.selections,
+    edits: Object.freeze({ ...input.edits }),
     inheritedThinking: input.inheritedThinking,
     inheritedPermissionMode: input.inheritedPermissionMode,
     modelInfo: input.selectableModels.find((model) => model.id === effectiveModel),
@@ -491,35 +500,37 @@ export const createNewSessionThreadRequest = (
   };
 };
 
-/** Omit synthesized form overrides until workspace metadata is authoritative. */
+/**
+ * Serialize authoritative selections plus any deliberate edits made while
+ * catalog metadata was unavailable. Thinking edits also pin their model
+ * because the option schema is model-specific.
+ */
 export const createNewSessionThreadRequestFromSnapshot = (input: {
   readonly sessionId: string;
   readonly title: string;
   readonly snapshot: NewSessionSubmissionSnapshot;
-}): ProtocolCreateThreadRequest =>
-  input.snapshot.optionsAuthoritative
-    ? createNewSessionThreadRequest({
-        sessionId: input.sessionId,
-        title: input.title,
-        mode: input.snapshot.modeId,
-        model: input.snapshot.modelId,
-        ...(input.snapshot.permissionMode === "ask"
-            || input.snapshot.permissionMode === "allow_list"
-            || input.snapshot.permissionMode === "yolo"
-          ? { permissionMode: input.snapshot.permissionMode }
-          : {}),
-        thinking: input.snapshot.thinking,
-        ...(input.snapshot.inheritedPermissionMode === undefined
-          ? {}
-          : { inheritedPermissionMode: input.snapshot.inheritedPermissionMode }),
-        ...(input.snapshot.inheritedThinking === undefined
-          ? {}
-          : { inheritedThinking: input.snapshot.inheritedThinking }),
-        ...(input.snapshot.modelInfo === undefined
-          ? {}
-          : { modelInfo: input.snapshot.modelInfo }),
-      })
-    : createNewSessionThreadRequest({
-        sessionId: input.sessionId,
-        title: input.title,
-      });
+}): ProtocolCreateThreadRequest => {
+  const { snapshot } = input;
+  const includeMode = snapshot.optionsAuthoritative || snapshot.edits.mode;
+  const includeModel = snapshot.optionsAuthoritative
+    || snapshot.edits.model
+    || snapshot.edits.thinking;
+  const includePermission = snapshot.optionsAuthoritative || snapshot.edits.permission;
+  const includeThinking = snapshot.optionsAuthoritative || snapshot.edits.thinking;
+  return createNewSessionThreadRequest({
+    sessionId: input.sessionId,
+    title: input.title,
+    ...(includeMode ? { mode: snapshot.modeId } : {}),
+    ...(includeModel ? { model: snapshot.modelId } : {}),
+    ...(includePermission ? { permissionMode: snapshot.permissionMode } : {}),
+    ...(includeThinking ? { thinking: snapshot.thinking } : {}),
+    ...(snapshot.optionsAuthoritative
+        && snapshot.inheritedPermissionMode !== undefined
+      ? { inheritedPermissionMode: snapshot.inheritedPermissionMode }
+      : {}),
+    ...(snapshot.optionsAuthoritative && snapshot.inheritedThinking !== undefined
+      ? { inheritedThinking: snapshot.inheritedThinking }
+      : {}),
+    ...(snapshot.modelInfo === undefined ? {} : { modelInfo: snapshot.modelInfo }),
+  });
+};

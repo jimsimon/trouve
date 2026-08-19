@@ -281,6 +281,7 @@ describe("new session model", () => {
     expect(reconnectBeforeReady.lifecycle).toEqual({
       status: "loading",
       workspaceId: "workspace-1",
+      catalogWorkspaceId: "",
     });
     expect(newSessionOptionsBlockSubmission(reconnectBeforeReady.lifecycle)).toBe(true);
     expect(reconnectBeforeReady.edits).toEqual(current.edits);
@@ -301,11 +302,22 @@ describe("new session model", () => {
     expect(newSessionOptionsAreAuthoritative(refresh.lifecycle, "workspace-1"))
       .toBe(true);
     expect(newSessionOptionsBlockSubmission(refresh.lifecycle)).toBe(false);
-    expect(settleNewSessionOptionLoad(
+    const refreshTimedOut = settleNewSessionOptionLoad(
       refresh.lifecycle,
       "workspace-1",
       "timed-out",
-    ).status).toBe("ready");
+    );
+    expect(refreshTimedOut.status).toBe("timed-out");
+    expect(newSessionOptionsAreAuthoritative(refreshTimedOut, "workspace-1"))
+      .toBe(true);
+    const lateRefreshFailure = settleNewSessionOptionLoad(
+      refreshTimedOut,
+      "workspace-1",
+      "failed",
+    );
+    expect(lateRefreshFailure.status).toBe("failed");
+    expect(newSessionOptionsAreAuthoritative(lateRefreshFailure, "workspace-1"))
+      .toBe(true);
 
     const workspaceChange = beginNewSessionOptionLoad(
       { ...current, lifecycle: ready },
@@ -313,7 +325,11 @@ describe("new session model", () => {
       false,
     );
     expect(workspaceChange).toEqual({
-      lifecycle: { status: "loading", workspaceId: "workspace-2" },
+      lifecycle: {
+        status: "loading",
+        workspaceId: "workspace-2",
+        catalogWorkspaceId: "",
+      },
       edits: createNewThreadOptionEdits(),
       inheritedThinking: undefined,
       inheritedPermissionMode: undefined,
@@ -367,6 +383,7 @@ describe("new session model", () => {
       inheritedThinking: "high",
       inheritedPermissionMode: "yolo",
       optionsAuthoritative: true,
+      edits: createNewThreadOptionEdits(),
     };
     const submission = snapshotNewSessionSubmission(input);
 
@@ -408,6 +425,7 @@ describe("new session model", () => {
       inheritedThinking: undefined,
       inheritedPermissionMode: undefined,
       optionsAuthoritative: false,
+      edits: createNewThreadOptionEdits(),
     });
     expect(createNewSessionThreadRequestFromSnapshot({
       sessionId: "session-1",
@@ -416,6 +434,34 @@ describe("new session model", () => {
     })).toEqual({
       session_id: "session-1",
       title: "Fallback title",
+    });
+  });
+
+  it("serializes explicit permission edits when catalog loading falls back", () => {
+    const snapshot = snapshotNewSessionSubmission({
+      selections: {
+        modeId: "code",
+        modelId: "provider/fallback",
+        thinking: "high",
+        permissionMode: "ask",
+      },
+      edits: { ...createNewThreadOptionEdits(), permission: true },
+      modes: [mode("provider/fallback")],
+      providers: providers("provider/fallback"),
+      selectableModels: [model({}, "provider/fallback")],
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+      optionsAuthoritative: false,
+    });
+
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Fallback title",
+      snapshot,
+    })).toEqual({
+      session_id: "session-1",
+      title: "Fallback title",
+      permission_mode: "ask",
     });
   });
 
