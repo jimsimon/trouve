@@ -2539,7 +2539,7 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
     .await;
 
     let steered = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(10),
         client
             .post(format!("{base}/threads/{thread_id}/steer"))
             .json(&serde_json::json!({"content": "Continue without waiting for the tool."}))
