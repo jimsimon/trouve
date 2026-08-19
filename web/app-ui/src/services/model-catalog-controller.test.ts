@@ -361,6 +361,41 @@ describe("ModelCatalogController", () => {
     expect(readSignal(controller.liveLoaded)).toBe(false);
   });
 
+  it("starts new forced work when force arrives after fulfillment handling", async () => {
+    const background = deferred<readonly ProtocolModelInfo[]>();
+    const forcedFollowup = deferred<readonly ProtocolModelInfo[]>();
+    let now = 0;
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => [model("cursor/static")],
+      refreshModels: () => {
+        liveCalls += 1;
+        if (liveCalls === 1) return Promise.resolve([model("cursor/live")]);
+        return liveCalls === 2 ? background.promise : forcedFollowup.promise;
+      },
+    }, { now: () => now, liveTtlMs: 10 });
+
+    await controller.refresh();
+    await vi.waitFor(() => expect(readSignal(controller.current)).toEqual([
+      model("cursor/live"),
+    ]));
+
+    now = 20;
+    await controller.refresh();
+    let lateForced: Promise<readonly ProtocolModelInfo[]> | undefined;
+    void background.promise.then(() => {
+      lateForced = controller.liveModels("force");
+    });
+    background.resolve([model("cursor/background")]);
+
+    await vi.waitFor(() => expect(liveCalls).toBe(3));
+    await vi.waitFor(() => expect(lateForced).toBeDefined());
+    forcedFollowup.resolve([model("cursor/forced")]);
+    await expect(lateForced).resolves.toEqual([model("cursor/forced")]);
+    expect(readSignal(controller.current)).toEqual([model("cursor/forced")]);
+    expect(readSignal(controller.liveLoaded)).toBe(true);
+  });
+
   it("starts new forced work when force arrives after rejection handling", async () => {
     const background = deferred<readonly ProtocolModelInfo[]>();
     const forcedFollowup = deferred<readonly ProtocolModelInfo[]>();
@@ -391,9 +426,10 @@ describe("ModelCatalogController", () => {
     background.reject(backgroundError);
 
     await vi.waitFor(() => expect(liveCalls).toBe(3));
-    forcedFollowup.reject(forcedError);
     await vi.waitFor(() => expect(lateForced).toBeDefined());
-    await expect(lateForced).rejects.toBe(forcedError);
+    const forcedRejected = expect(lateForced).rejects.toBe(forcedError);
+    forcedFollowup.reject(forcedError);
+    await forcedRejected;
     expect(readSignal(controller.current)).toEqual([model("cursor/static")]);
     expect(readSignal(controller.liveLoaded)).toBe(false);
   });
