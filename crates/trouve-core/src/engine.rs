@@ -11005,7 +11005,7 @@ impl Engine {
                     // persisting the user message or calling the backend.
                     if cancel.is_cancelled() {
                         let _ = response.send(Err("turn cancelled".into()));
-                        bail!("turn cancelled");
+                        break;
                     }
                     let staged = attachment_rows
                         .iter()
