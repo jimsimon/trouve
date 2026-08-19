@@ -11796,6 +11796,7 @@ impl Engine {
                     if ok
                         && let Some(repository @ (host, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
+                        && might_request_pull_request_creation(tool, args)
                     {
                         let mut numbers = pr_numbers_in_value(args, host, owner, repo);
                         let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
@@ -13916,7 +13917,7 @@ fn effective_activity_tool_call<'a>(
 /// command-, GraphQL-, or REST-specific checks below.
 fn structured_repository_matches(args: &serde_json::Value, owner: &str, repo: &str) -> bool {
     let expected_full_name = format!("{owner}/{repo}");
-    for key in ["repository_full_name", "repo_full_name"] {
+    for key in ["repository_full_name", "repo_full_name", "repository"] {
         if let Some(actual) = args.get(key).and_then(serde_json::Value::as_str)
             && !actual
                 .trim_matches('/')
@@ -13951,7 +13952,7 @@ fn structured_repository_identifies(args: &serde_json::Value, owner: &str, repo:
     if !structured_repository_matches(args, owner, repo) {
         return false;
     }
-    let full_name = ["repository_full_name", "repo_full_name"]
+    let full_name = ["repository_full_name", "repo_full_name", "repository"]
         .iter()
         .any(|key| args.get(key).and_then(serde_json::Value::as_str).is_some());
     let repo_value = args.get("repo").and_then(serde_json::Value::as_str);
@@ -14116,7 +14117,10 @@ fn classify_pull_request_creation(
     let nested_compact = compact_activity(nested_tool);
     let named_creator =
         nested_compact.contains("createpullrequest") || nested_compact.ends_with("createpr");
-    if named_creator && effective_activity_tool_call(tool, args).is_none() {
+    if named_creator
+        && structured_repository_matches(args, owner, repo)
+        && effective_activity_tool_call(tool, args).is_none()
+    {
         PullRequestCreationRequest::Unresolved
     } else {
         PullRequestCreationRequest::Rejected
@@ -18845,6 +18849,29 @@ default_permission_mode = "ask"
         ));
         assert!(matches!(
             classify_pull_request_creation(
+                "mcpToolCall",
+                &serde_json::json!({
+                    "tool": "github.create_pull_request",
+                    "repository": "other/project",
+                    "arguments": "{undecodable"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Rejected
+        ));
+        assert!(!might_request_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "tool": "github.get_pull_request",
+                "arguments": {
+                    "repository_full_name": "o/r",
+                    "pr_number": 75
+                }
+            })
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
                 "github",
                 &serde_json::json!({
                     "operation": "create_pull_request",
@@ -19050,7 +19077,7 @@ default_permission_mode = "ask"
                     "type": "mcpToolCall",
                     "server": "codex_apps",
                     "tool": "github.create_pull_request",
-                    "repository": "other/project",
+                    "repository": "jimsimon/trouve",
                     "head_branch": "agent/separate-harness-search-readmes",
                     "arguments": "{undecodable"
                 }),
@@ -19071,6 +19098,29 @@ default_permission_mode = "ask"
                     }
                 }),
                 execution_duration_ms: Some(600),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "create-malformed-other-pr".into(),
+                tool: "mcpToolCall".into(),
+                args: serde_json::json!({
+                    "tool": "github.create_pull_request",
+                    "repository": "other/project",
+                    "arguments": "{undecodable"
+                }),
+                requires_approval: false,
+            },
+            Event::ToolOutput {
+                call_id: "create-malformed-other-pr".into(),
+                chunk: "Opened https://github.com/jimsimon/trouve/pull/273".into(),
+            },
+            Event::ToolCompleted {
+                call_id: "create-malformed-other-pr".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "url": "https://github.com/jimsimon/trouve/pull/273"
+                }),
+                execution_duration_ms: Some(400),
             },
             Event::ToolRequested {
                 turn: 1,
