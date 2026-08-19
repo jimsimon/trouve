@@ -2676,6 +2676,55 @@ fn raw_artifact_cleanup_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArti
     ))
 }
 
+fn artifact_cleanup_job_is_claimable(
+    conn: &Connection,
+    requested_id: Option<&str>,
+    now: &str,
+) -> rusqlite::Result<bool> {
+    if let Some(id) = requested_id {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM artifact_cleanup_jobs
+                 WHERE id = ?1
+                   AND (claim_until IS NULL
+                        OR typeof(claim_until) != 'text'
+                        OR length(CAST(claim_until AS BLOB)) > ?3
+                        OR instr(claim_until, 'T') != 11
+                        OR julianday(claim_until) IS NULL
+                        OR julianday(claim_until) <= julianday(?2))
+                   AND (next_attempt_at IS NULL
+                        OR typeof(next_attempt_at) != 'text'
+                        OR length(CAST(next_attempt_at AS BLOB)) > ?3
+                        OR instr(next_attempt_at, 'T') != 11
+                        OR julianday(next_attempt_at) IS NULL
+                        OR julianday(next_attempt_at) <= julianday(?2))
+             )",
+            params![id, now, MAX_ARTIFACT_CLEANUP_TIMESTAMP_BYTES as i64],
+            |row| row.get(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM artifact_cleanup_jobs
+                 WHERE (claim_until IS NULL
+                        OR typeof(claim_until) != 'text'
+                        OR length(CAST(claim_until AS BLOB)) > ?2
+                        OR instr(claim_until, 'T') != 11
+                        OR julianday(claim_until) IS NULL
+                        OR julianday(claim_until) <= julianday(?1))
+                   AND (next_attempt_at IS NULL
+                        OR typeof(next_attempt_at) != 'text'
+                        OR length(CAST(next_attempt_at AS BLOB)) > ?2
+                        OR instr(next_attempt_at, 'T') != 11
+                        OR julianday(next_attempt_at) IS NULL
+                        OR julianday(next_attempt_at) <= julianday(?1))
+             )",
+            params![now, MAX_ARTIFACT_CLEANUP_TIMESTAMP_BYTES as i64],
+            |row| row.get(0),
+        )
+    }
+}
+
 fn decode_artifact_cleanup_job(
     id: String,
     kind: String,
@@ -3467,27 +3516,38 @@ fn apply_store_mutation(
     Ok(())
 }
 
+fn code_review_outbox_rows_exist(conn: &Connection, ids: &[i64]) -> rusqlite::Result<bool> {
+    let mut stmt = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM code_review_pending_events WHERE id = ?1)")?;
+    for id in ids {
+        if !stmt.query_row([id], |row| row.get::<_, bool>(0))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn insert_event_batch<'a>(
     conn: &Connection,
     batch: impl IntoIterator<Item = &'a PendingEvent>,
     event_count: usize,
     code_review_outbox_ids: impl IntoIterator<Item = i64>,
 ) -> Result<InsertedEventBatch> {
-    let tx = write_transaction(conn)?;
     let code_review_outbox_ids = code_review_outbox_ids.into_iter().collect::<Vec<_>>();
-    if !code_review_outbox_ids.is_empty() {
-        let mut stmt = tx.prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM code_review_pending_events WHERE id = ?1)",
-        )?;
-        for id in &code_review_outbox_ids {
-            if !stmt.query_row([id], |row| row.get::<_, bool>(0))? {
-                return Ok(InsertedEventBatch {
-                    skipped: true,
-                    source_cursors: Vec::new(),
-                    published: Vec::new(),
-                });
-            }
-        }
+    if !code_review_outbox_rows_exist(conn, &code_review_outbox_ids)? {
+        return Ok(InsertedEventBatch {
+            skipped: true,
+            source_cursors: Vec::new(),
+            published: Vec::new(),
+        });
+    }
+    let tx = write_transaction(conn)?;
+    if !code_review_outbox_rows_exist(&tx, &code_review_outbox_ids)? {
+        return Ok(InsertedEventBatch {
+            skipped: true,
+            source_cursors: Vec::new(),
+            published: Vec::new(),
+        });
     }
     let mut source_cursors = Vec::with_capacity(event_count);
     let mut published = Vec::with_capacity(event_count.saturating_mul(2));
@@ -4778,9 +4838,12 @@ impl Store {
         requested_id: Option<&str>,
     ) -> Result<Option<ArtifactCleanupJob>> {
         let conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&conn)?;
         let now_at = chrono::Utc::now();
         let now = now_at.to_rfc3339();
+        if !artifact_cleanup_job_is_claimable(&conn, requested_id, &now)? {
+            return Ok(None);
+        }
+        let tx = write_transaction(&conn)?;
         for _ in 0..MAX_POISONED_ARTIFACT_CLEANUP_ROWS_PER_CLAIM {
             let raw: Option<RawArtifactCleanupJob> = if let Some(id) = requested_id {
                 tx.query_row(
@@ -9712,6 +9775,49 @@ mod tests {
         assert!(
             !HIT_BUSY_HANDLER.load(Ordering::SeqCst),
             "an empty review poll tried to reserve SQLite's writer slot"
+        );
+        blocker_tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn no_work_event_and_cleanup_polls_do_not_wait_for_a_concurrent_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static HIT_BUSY_HANDLER: AtomicBool = AtomicBool::new(false);
+
+        fn stop_waiting_for_writer(_: i32) -> bool {
+            HIT_BUSY_HANDLER.store(true, Ordering::SeqCst);
+            false
+        }
+
+        HIT_BUSY_HANDLER.store(false, Ordering::SeqCst);
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("no-work-write-contention.sqlite3");
+        let store = Store::open(&database).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .busy_handler(Some(stop_waiting_for_writer))
+            .unwrap();
+
+        let mut blocker = Connection::open(&database).unwrap();
+        let blocker_tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let stale = insert_event_batch(
+            &store.conn.lock().unwrap(),
+            std::iter::empty::<&PendingEvent>(),
+            0,
+            [i64::MAX],
+        )
+        .unwrap();
+        assert!(stale.skipped);
+        assert!(store.claim_next_artifact_cleanup_job().unwrap().is_none());
+        assert!(
+            !HIT_BUSY_HANDLER.load(Ordering::SeqCst),
+            "a no-work event or cleanup poll tried to reserve SQLite's writer slot"
         );
         blocker_tx.rollback().unwrap();
     }
