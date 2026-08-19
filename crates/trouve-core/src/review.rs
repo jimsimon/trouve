@@ -2444,6 +2444,19 @@ impl Engine {
         )))
     }
 
+    fn code_review_snapshots_changed(
+        previous_repository: &Option<CodeReviewRepository>,
+        current_repository: &Option<CodeReviewRepository>,
+        previous_catalog: &[ReviewerProfile],
+        current_catalog: &[ReviewerProfile],
+    ) -> Result<bool, EngineError> {
+        let repository_changed = serde_json::to_vec(previous_repository)
+            .map_err(|error| EngineError::Internal(error.into()))?
+            != serde_json::to_vec(current_repository)
+                .map_err(|error| EngineError::Internal(error.into()))?;
+        Ok(repository_changed || previous_catalog != current_catalog)
+    }
+
     pub async fn update_code_review_repository(
         &self,
         request: &UpdateCodeReviewRepositoryRequest,
@@ -2590,10 +2603,21 @@ impl Engine {
                 "an enabled Manual repository must select at least one reviewer".into(),
             ));
         }
-        self.resolve_code_review_reviewers(&reviewer_ids)?;
-        self.resolve_code_review_reviewers(&included_reviewer_ids)?;
-        self.resolve_code_review_reviewers(&excluded_reviewer_ids)?;
         let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        for reviewer_id in reviewer_ids
+            .iter()
+            .chain(&included_reviewer_ids)
+            .chain(&excluded_reviewer_ids)
+        {
+            if !reviewer_catalog
+                .iter()
+                .any(|reviewer| reviewer.id == *reviewer_id)
+            {
+                return Err(EngineError::BadRequest(format!(
+                    "unknown reviewer id {reviewer_id:?}"
+                )));
+            }
+        }
         let excluded = excluded_reviewer_ids.iter().collect::<HashSet<_>>();
         if let Some(overlap) = included_reviewer_ids
             .iter()
@@ -2657,12 +2681,13 @@ impl Engine {
             .into_iter()
             .find(|repository| repository.repository == request.repository);
         let current_catalog = self.code_review_reviewer_catalog()?;
-        let repository_changed = serde_json::to_vec(&current)
-            .map_err(|error| EngineError::Internal(error.into()))?
-            != serde_json::to_vec(&existing)
-                .map_err(|error| EngineError::Internal(error.into()))?;
-        if repository_changed || current_catalog != reviewer_catalog {
-            return Err(EngineError::BadRequest(
+        if Self::code_review_snapshots_changed(
+            &existing,
+            &current,
+            &reviewer_catalog,
+            &current_catalog,
+        )? {
+            return Err(EngineError::Conflict(
                 "code review configuration changed while the update was validated; retry the request"
                     .into(),
             ));
@@ -12757,6 +12782,65 @@ mod tests {
         assert_ne!(
             Engine::code_review_config_hash(&repository, &reviewers).unwrap(),
             initial
+        );
+    }
+
+    #[test]
+    fn optimistic_review_update_detects_repository_and_catalog_drift() {
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let repository = CodeReviewRepository {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            private: false,
+            mode: CodeReviewMode::Automatic,
+            model: Some("provider/review".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: String::new(),
+            reviewer_ids: crate::reviewers::default_reviewer_ids(),
+            routing_mode: CodeReviewRoutingMode::Automatic,
+            semantic_routing: true,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            reviewer_overrides: Vec::new(),
+        };
+        let previous = Some(repository.clone());
+        assert!(
+            !Engine::code_review_snapshots_changed(
+                &previous,
+                &Some(repository.clone()),
+                &reviewers,
+                &reviewers,
+            )
+            .unwrap()
+        );
+
+        let mut changed_repository = repository;
+        changed_repository.prompt = "newer update".into();
+        assert!(
+            Engine::code_review_snapshots_changed(
+                &previous,
+                &Some(changed_repository),
+                &reviewers,
+                &reviewers,
+            )
+            .unwrap()
+        );
+
+        let mut changed_catalog = reviewers.clone();
+        changed_catalog[0].model = Some("provider/newer".into());
+        assert!(
+            Engine::code_review_snapshots_changed(
+                &previous,
+                &previous,
+                &reviewers,
+                &changed_catalog,
+            )
+            .unwrap()
         );
     }
 
