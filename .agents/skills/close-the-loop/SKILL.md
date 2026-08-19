@@ -88,11 +88,12 @@ Bound unchanged external waits. Use a repository-defined timeout when one
 exists; otherwise allow at most 30 minutes without observable progress for one
 check, review, or mergeability state. Track retries separately by exact
 operation or check, failure signature, and head SHA. Retry each demonstrated
-transient failure at most once. Reset that blocker's no-progress clock and
-retry record when it clears or the head changes; progress that does not clear
-the blocker resets only its no-progress clock. If the bound is reached or the
-same blocker survives its retry, report the exact non-terminal or failed
-blocker and stop without claiming readiness.
+transient failure at most once. When a blocker clears, reset its no-progress
+clock but retain its exact retry record for the lifetime of that head SHA; a
+new head resets both. Progress that does not clear the blocker resets only its
+no-progress clock. If the bound is reached or the same blocker survives its
+retry, report the exact non-terminal or failed blocker and stop without
+claiming readiness.
 
 1. Classify every unresolved thread, submitted review body, and top-level
    feedback item as actionable, already addressed, informational, duplicate,
