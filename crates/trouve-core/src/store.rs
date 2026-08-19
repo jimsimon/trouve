@@ -9972,10 +9972,60 @@ impl Store {
                AND (blocking_review_cleanup_next_attempt_at IS NULL
                     OR blocking_review_cleanup_next_attempt_at <= ?4)
                AND (blocking_review_cleanup_claim_until IS NULL
-                    OR blocking_review_cleanup_claim_until <= ?4)",
+                    OR blocking_review_cleanup_claim_until <= ?4)
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )",
             params![id, token, claim_until.to_rfc3339(), now.to_rfc3339()],
         )?;
         Ok((updated > 0).then_some(token))
+    }
+
+    pub fn code_review_blocking_review_cleanup_claim_is_current(
+        &self,
+        id: &str,
+        claim_token: &str,
+    ) -> Result<bool> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs AS current_job
+               WHERE current_job.id = ?1
+                 AND current_job.review_published != 0
+                 AND current_job.blocking_review_cleanup_pending != 0
+                 AND current_job.blocking_review_cleanup_claim_token = ?2
+                 AND NOT EXISTS (
+                   SELECT 1 FROM code_review_jobs AS newer
+                   WHERE newer.repository = current_job.repository
+                     AND newer.pull_number = current_job.pull_number
+                     AND newer.head_sha = current_job.head_sha
+                     AND (
+                       newer.publication_generation > current_job.publication_generation
+                       OR (
+                         newer.publication_generation = current_job.publication_generation
+                         AND newer.rowid > current_job.rowid
+                       )
+                     )
+                     AND newer.status IN ('queued', 'running', 'succeeded')
+                 )
+             )",
+                params![id, claim_token],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn clear_code_review_blocking_review_cleanup(
@@ -14757,7 +14807,13 @@ mod tests {
     fn blocking_review_cleanup_backoff_rotates_the_repair_batch() {
         let store = Store::open_in_memory().unwrap();
         let oldest = enqueue_backoff_test_job(&store);
-        let newer = store.retry_code_review_job(&oldest.id).unwrap().unwrap();
+        let mut newer_request = backoff_test_job_request();
+        newer_request.dedupe_key = "acme/widgets#43:backoff".into();
+        newer_request.pull_number = 43;
+        let newer = store
+            .enqueue_code_review_job(&newer_request)
+            .unwrap()
+            .unwrap();
         store
             .conn
             .lock()
@@ -14952,6 +15008,46 @@ mod tests {
         assert!(
             store
                 .clear_code_review_blocking_review_cleanup(&job.id, &replacement)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn newer_publication_generation_invalidates_cleanup_claim() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'succeeded', review_published = 1,
+                     blocking_review_cleanup_pending = 1
+                 WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+        let claim = store
+            .claim_code_review_blocking_review_cleanup(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .code_review_blocking_review_cleanup_claim_is_current(&job.id, &claim)
+                .unwrap()
+        );
+
+        let mut replacement = backoff_test_job_request();
+        replacement.dedupe_key = "acme/widgets#42:cleanup-replacement".into();
+        store
+            .enqueue_code_review_job(&replacement)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !store
+                .code_review_blocking_review_cleanup_claim_is_current(&job.id, &claim)
                 .unwrap()
         );
     }

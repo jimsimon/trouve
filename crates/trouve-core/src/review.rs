@@ -5929,6 +5929,7 @@ impl Engine {
                 replacement_review_id,
                 start_page,
                 deadline,
+                Some(claim_token),
             )
             .await
         }
@@ -5942,6 +5943,12 @@ impl Engine {
                 return Err(error);
             }
         };
+        if !self
+            .store
+            .code_review_blocking_review_cleanup_claim_is_current(&job.id, claim_token)?
+        {
+            return Ok(());
+        }
         if let Some(next_page) = next_page {
             self.store.requeue_code_review_blocking_review_cleanup(
                 &job.id,
@@ -5969,6 +5976,7 @@ impl Engine {
         replacement_review_id: u64,
         mut page: u64,
         deadline: Instant,
+        claim_token: Option<&str>,
     ) -> Result<(Option<u64>, bool)> {
         let bot_login = self.github_app_status()?.bot_login;
         let mut made_progress = false;
@@ -6002,6 +6010,16 @@ impl Engine {
                         user.kind == "Bot" && user.login.eq_ignore_ascii_case(&bot_login)
                     })
             }) {
+                if let Some(claim_token) = claim_token
+                    && !self
+                        .store
+                        .code_review_blocking_review_cleanup_claim_is_current(
+                            &job.id,
+                            claim_token,
+                        )?
+                {
+                    return Ok((Some(page), made_progress));
+                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Ok((Some(page), made_progress));
@@ -11956,6 +11974,7 @@ mod tests {
                     778,
                     page,
                     Instant::now() + REVIEW_BLOCKING_CLEANUP_PASS_BUDGET,
+                    None,
                 )
                 .await
                 .unwrap();
