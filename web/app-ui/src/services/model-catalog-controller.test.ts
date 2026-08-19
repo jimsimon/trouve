@@ -40,6 +40,7 @@ describe("ModelCatalogController", () => {
     expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
       "cursor/default",
     ]);
+    await expect(controller.staticModels()).resolves.toEqual([model("cursor/default")]);
     expect(readSignal(controller.refreshing)).toBe(true);
 
     live.resolve([model("cursor/default"), model("cursor/gpt-5.6")]);
@@ -50,6 +51,10 @@ describe("ModelCatalogController", () => {
       "cursor/default",
       "cursor/gpt-5.6",
     ]);
+    expect(readSignal(controller.staticCurrent).map(({ id }) => id)).toEqual([
+      "cursor/default",
+    ]);
+    await expect(controller.staticModels()).resolves.toEqual([model("cursor/default")]);
     expect(readSignal(controller.refreshing)).toBe(false);
     await expect(controller.refresh()).resolves.toHaveLength(2);
     expect(staticCalls).toBe(1);

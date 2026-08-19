@@ -12,6 +12,7 @@ import {
   NEW_SESSION_TITLE_MAX_LENGTH,
   NEW_THREAD_TITLE_FALLBACK,
   newThreadInheritanceForWorkspace,
+  mergeNewSessionModelCatalogs,
   reconcileNewThreadDefaults,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
@@ -252,6 +253,38 @@ describe("new session model", () => {
       inheritedThinking: "high",
       permissionMode: "ask",
       inheritedPermissionMode: undefined,
+    });
+  });
+
+  it("adds live-only choices without replacing authoritative static metadata", () => {
+    const staticModel = model({}, "provider/static");
+    const discoveredDefault = model({
+      properties: {
+        thinking_level: { type: "string", enum: ["low", "high"], default: "low" },
+      },
+    }, "provider/discovered");
+    const liveStatic = model({ properties: { effort: { enum: ["max"] } } }, "provider/static");
+
+    expect(mergeNewSessionModelCatalogs(
+      [staticModel],
+      [discoveredDefault, liveStatic],
+    )).toEqual([discoveredDefault, staticModel]);
+
+    expect(reconcileNewThreadDefaults(
+      {
+        modeId: "code",
+        modelId: "provider/discovered",
+        thinking: "low",
+        permissionMode: "ask",
+      },
+      [mode()],
+      [staticModel],
+      providers("provider/static"),
+      { ...createNewThreadOptionEdits(), model: true },
+      [staticModel, discoveredDefault],
+    )).toMatchObject({
+      modelId: "provider/discovered",
+      thinking: "low",
     });
   });
 

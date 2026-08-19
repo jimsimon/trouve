@@ -163,6 +163,17 @@ export const resolveNewSessionModel = (
   ?? nonEmpty(selectedMode?.default_model)
   ?? nonEmpty(providers?.default_model);
 
+/** Add live-only choices without allowing them to replace static metadata. */
+export const mergeNewSessionModelCatalogs = (
+  staticModels: readonly ProtocolModelInfo[],
+  liveModels: readonly ProtocolModelInfo[],
+): readonly ProtocolModelInfo[] => {
+  if (liveModels.length === 0) return staticModels;
+  const models = new Map(liveModels.map((model) => [model.id, model]));
+  for (const model of staticModels) models.set(model.id, model);
+  return [...models.values()].sort((left, right) => left.id.localeCompare(right.id));
+};
+
 const validPermissionMode = (value: unknown): ResolvedPermissionMode | undefined =>
   value === "ask" || value === "allow_list" || value === "yolo" ? value : undefined;
 
@@ -220,17 +231,21 @@ export const reconcileNewThreadDefaults = (
   models: readonly ProtocolModelInfo[],
   providers: ProtocolProvidersResponse | null | undefined,
   edits: NewThreadOptionEdits,
+  selectableModels: readonly ProtocolModelInfo[] = models,
 ): ResolvedNewThreadDefaults => {
   const initial = resolveNewThreadDefaults(modes, models, providers);
   const modeId = edits.mode && modes.some((mode) => mode.id === selections.modeId)
     ? selections.modeId
     : initial.modeId;
   const modeDefaults = resolveNewThreadDefaults(modes, models, providers, { modeId });
-  const modelId = edits.model && models.some((model) => model.id === selections.modelId)
+  const keepModel = edits.model
+    && selectableModels.some((model) => model.id === selections.modelId);
+  const modelId = keepModel
     ? selections.modelId
     : modeDefaults.modelId;
-  const refreshed = resolveNewThreadDefaults(modes, models, providers, { modeId, modelId });
-  const option = thinkingOption(models.find((model) => model.id === refreshed.modelId));
+  const effectiveModels = keepModel ? selectableModels : models;
+  const refreshed = resolveNewThreadDefaults(modes, effectiveModels, providers, { modeId, modelId });
+  const option = thinkingOption(effectiveModels.find((model) => model.id === refreshed.modelId));
   const keepThinking = edits.thinking
     && option?.values.includes(selections.thinking) === true;
   const permissionMode = validPermissionMode(selections.permissionMode);

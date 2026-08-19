@@ -430,9 +430,9 @@ pub trait AgentBackend: Send + Sync {
     fn models(&self) -> Vec<ModelInfo>;
 
     /// Models available for this backend. Catalog-covered backends use their
-    /// canonical static roster; explicit adapters own integrations that cannot
-    /// be catalogued, notably Cursor-only models discovered through Cursor's
-    /// CLI. The default returns the canonical snapshot.
+    /// canonical static roster; explicit adapters may add newly released or
+    /// account-specific models discovered through a vendor CLI. The default
+    /// returns the canonical snapshot.
     async fn list_models(&self) -> Vec<ModelInfo> {
         self.models()
     }
