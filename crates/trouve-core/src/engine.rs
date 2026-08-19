@@ -14043,9 +14043,21 @@ fn requests_pull_request_creation(
             || args_text.contains(" -f ")
             || args_text.contains(" --field ")
             || args_text.contains(" --raw-field "));
-
+    let integration_like = ["github", "mcp", "connector", "integration"]
+        .iter()
+        .any(|word| tool_words.split_whitespace().any(|part| part == *word));
+    let structured_creation_operation = integration_like
+        && ["operation", "action"].iter().any(|key| {
+            args.get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| {
+                    let operation = compact_activity(value);
+                    operation == "createpullrequest" || operation == "createpr"
+                })
+        });
     tool_compact.contains("createpullrequest")
         || tool_compact.ends_with("createpr")
+        || structured_creation_operation
         || (shell_like && args_words.contains("gh pr create"))
         || graphql_mutation
         || (browser_like && args_words.contains("create pull request"))
@@ -18810,6 +18822,42 @@ default_permission_mode = "ask"
             "o",
             "r"
         ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "github",
+                &serde_json::json!({
+                    "operation": "create_pull_request",
+                    "repository_full_name": "o/r"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Confirmed
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "github_connector",
+                &serde_json::json!({
+                    "action": "create_pr",
+                    "repository_full_name": "o/r"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Confirmed
+        ));
+        assert!(matches!(
+            classify_pull_request_creation(
+                "github",
+                &serde_json::json!({
+                    "operation": "create_pull_request",
+                    "repository_full_name": "other/project"
+                }),
+                "o",
+                "r"
+            ),
+            PullRequestCreationRequest::Rejected
+        ));
         assert!(requests_pull_request_creation(
             "functions.exec",
             &serde_json::json!({"cmd": "gh pr create --head fix/other"}),
@@ -19017,11 +19065,30 @@ default_permission_mode = "ask"
                 }),
                 execution_duration_ms: Some(400),
             },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "create-structured-pr".into(),
+                tool: "github".into(),
+                args: serde_json::json!({
+                    "operation": "create_pull_request",
+                    "repository_full_name": "jimsimon/trouve",
+                    "head_branch": "agent/separate-harness-search-readmes"
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "create-structured-pr".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({
+                    "url": "https://github.com/jimsimon/trouve/pull/271"
+                }),
+                execution_duration_ms: Some(400),
+            },
         ];
 
         let evidence = pr_evidence_from_events(events, "github.com", "jimsimon", "trouve");
-        assert_eq!(evidence.numbers, HashSet::from([267, 268]));
-        assert_eq!(evidence.successful_tool_args.len(), 2);
+        assert_eq!(evidence.numbers, HashSet::from([267, 268, 271]));
+        assert_eq!(evidence.successful_tool_args.len(), 3);
     }
 
     #[test]
