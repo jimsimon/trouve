@@ -504,6 +504,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#applyAppearanceToElement(this.#appearance.current.get());
       this.#startProtocolIngress();
     }
+    if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "") {
+      void this.#loadNewSessionOptions(this.#newSessionWorkspaceId);
+    }
   }
 
   override disconnectedCallback(): void {

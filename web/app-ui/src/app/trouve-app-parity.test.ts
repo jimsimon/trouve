@@ -86,6 +86,12 @@ describe("root shell parity wiring", () => {
       "this.#newSessionOptionsGeneration += 1;\n    this.#unsubscribeFromNewSessionLiveModels();\n    this.#protocolIngress.stop();",
     );
     expect(source).toContain(
+      'if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "")',
+    );
+    expect(source).toContain(
+      "void this.#loadNewSessionOptions(this.#newSessionWorkspaceId)",
+    );
+    expect(source).toContain(
       "this.#reconcileNewSessionDefaults(this.#newSessionModels)",
     );
     expect(source).not.toContain("this.#reconcileNewSessionModelCatalog()");
