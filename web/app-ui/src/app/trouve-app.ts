@@ -402,6 +402,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionOptionsPending = false;
   #newSessionOptionsError = "";
   #newSessionOptionsGeneration = 0;
+  #newSessionLiveUnsubscribe: (() => void) | undefined;
   #newSessionPrompt = "";
   #newSessionPromptComposing = false;
   #newSessionAttachments: PendingAttachment[] = [];
@@ -515,6 +516,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       "visibilitychange",
       this.#retryProtocolAfterVisibility,
     );
+    this.#unsubscribeFromNewSessionLiveModels();
     this.#protocolIngress.stop();
     this.#threadIngress.close();
     if (this.#githubRefreshTimer !== undefined) {
@@ -1656,8 +1658,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
   }
 
+  #unsubscribeFromNewSessionLiveModels(): void {
+    this.#newSessionLiveUnsubscribe?.();
+    this.#newSessionLiveUnsubscribe = undefined;
+  }
+
   async #loadNewSessionOptions(workspaceId: string): Promise<void> {
     const generation = ++this.#newSessionOptionsGeneration;
+    this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionOptionsPending = true;
     this.#newSessionOptionsError = "";
     this.#newSessionOptionsWorkspaceId = "";
@@ -1697,6 +1705,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionProviders = providers;
       this.#newSessionOptionsWorkspaceId = workspaceId;
       this.#reconcileNewSessionDefaults(models);
+      this.#newSessionLiveUnsubscribe = this.#modelCatalog.subscribeLive(() => {
+        if (
+          generation !== this.#newSessionOptionsGeneration
+          || this.#newSessionOptionsWorkspaceId !== workspaceId
+        ) return;
+        this.#reconcileNewSessionDefaults(models);
+        this.requestUpdate();
+      });
       void liveModelsPending.then((liveLoaded) => {
         if (
           !liveLoaded
@@ -1810,6 +1826,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionError = "";
     this.#newSessionBranchGeneration += 1;
     this.#newSessionOptionsGeneration += 1;
+    this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionBranchesPending = false;
     this.#newSessionBranchError = "";
     this.#newSessionOptionsPending = false;
@@ -2101,6 +2118,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionOpen = false;
     this.#newSessionBranchGeneration += 1;
     this.#newSessionOptionsGeneration += 1;
+    this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionPrompt = "";
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;

@@ -30,6 +30,9 @@ export class ModelCatalogController {
   readonly #live = createSignal<readonly ProtocolModelInfo[]>(
     Object.freeze([]),
   );
+  readonly #liveListeners = new Set<
+    (models: readonly ProtocolModelInfo[]) => void
+  >();
   readonly #liveLoaded = createSignal(false);
   readonly liveLoaded: ReadonlySignal<boolean> = this.#liveLoaded;
   readonly #refreshing = createSignal(false);
@@ -86,6 +89,23 @@ export class ModelCatalogController {
     return this.staticModels().then(() => this.#refreshLive(freshness));
   }
 
+  subscribeLive(
+    listener: (models: readonly ProtocolModelInfo[]) => void,
+  ): () => void {
+    this.#liveListeners.add(listener);
+    return () => this.#liveListeners.delete(listener);
+  }
+
+  #publishLive(models: readonly ProtocolModelInfo[]): void {
+    for (const listener of this.#liveListeners) {
+      try {
+        listener(models);
+      } catch {
+        // Consumer failures must not turn successful discovery into a refresh failure.
+      }
+    }
+  }
+
   #loadStatic(): Promise<readonly ProtocolModelInfo[]> {
     if (this.#staticPending !== undefined) return this.#staticPending;
     const promise = this.#protocol.models().then((models) => {
@@ -122,6 +142,7 @@ export class ModelCatalogController {
         this.#liveLoaded.set(true);
         this.#live.set(snapshot);
         this.#current.set(snapshot);
+        this.#publishLive(snapshot);
         return snapshot;
       },
       (error: unknown) => {

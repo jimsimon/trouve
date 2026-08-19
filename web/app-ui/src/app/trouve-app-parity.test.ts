@@ -80,6 +80,8 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("readSignal(this.#modelCatalog.staticCurrent)");
     expect(source).toContain('this.#modelCatalog.liveModels("if-stale")');
     expect(source).toContain("readSignal(this.#modelCatalog.liveLoaded)");
+    expect(source).toContain("this.#modelCatalog.subscribeLive");
+    expect(source).toContain("this.#unsubscribeFromNewSessionLiveModels()");
     expect(source).toContain(
       "this.#reconcileNewSessionDefaults(this.#newSessionModels)",
     );

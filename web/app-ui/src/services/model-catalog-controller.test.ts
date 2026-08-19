@@ -207,4 +207,30 @@ describe("ModelCatalogController", () => {
       model("cursor/live"),
     ]);
   });
+
+  it("publishes every successful live refresh until the listener unsubscribes", async () => {
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => [model("cursor/static")],
+      refreshModels: async () => [model(`cursor/live-${++liveCalls}`)],
+    });
+    const published: string[][] = [];
+    const unsubscribe = controller.subscribeLive((models) => {
+      published.push(models.map(({ id }) => id));
+    });
+
+    await controller.liveModels("force");
+    await controller.liveModels("force");
+    expect(published).toEqual([
+      ["cursor/live-1"],
+      ["cursor/live-2"],
+    ]);
+
+    unsubscribe();
+    await controller.liveModels("force");
+    expect(published).toEqual([
+      ["cursor/live-1"],
+      ["cursor/live-2"],
+    ]);
+  });
 });
