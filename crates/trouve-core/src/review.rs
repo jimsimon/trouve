@@ -5873,6 +5873,7 @@ impl Engine {
                     &job.id,
                     &claim_token,
                     page,
+                    false,
                 )?;
                 return Ok(());
             }
@@ -5932,8 +5933,8 @@ impl Engine {
             .await
         }
         .await;
-        let next_page = match cleanup {
-            Ok(next_page) => next_page,
+        let (next_page, made_progress) = match cleanup {
+            Ok(progress) => progress,
             Err(error) => {
                 self.store
                     .defer_code_review_blocking_review_cleanup(&job.id, claim_token)
@@ -5946,6 +5947,7 @@ impl Engine {
                 &job.id,
                 claim_token,
                 next_page,
+                made_progress,
             )?;
             return Ok(());
         }
@@ -5967,12 +5969,13 @@ impl Engine {
         replacement_review_id: u64,
         mut page: u64,
         deadline: Instant,
-    ) -> Result<Option<u64>> {
+    ) -> Result<(Option<u64>, bool)> {
         let bot_login = self.github_app_status()?.bot_login;
+        let mut made_progress = false;
         for _ in 0..REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok(Some(page));
+                return Ok((Some(page), made_progress));
             }
             let path = format!(
                 "/repos/{}/pulls/{}/reviews?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
@@ -5987,7 +5990,7 @@ impl Engine {
             .await
             {
                 Ok(result) => result.context("listing blocking reviews")?,
-                Err(_) if budget_limited => return Ok(Some(page)),
+                Err(_) if budget_limited => return Ok((Some(page), made_progress)),
                 Err(_) => bail!("listing blocking reviews timed out"),
             };
             self.record_review_rate(rate);
@@ -6001,7 +6004,7 @@ impl Engine {
             }) {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Ok(Some(page));
+                    return Ok((Some(page), made_progress));
                 }
                 let path = format!(
                     "/repos/{}/pulls/{}/reviews/{}/dismissals",
@@ -6022,14 +6025,14 @@ impl Engine {
                 .await
                 {
                     Ok(result) => result.context("dismissing a blocking review")?,
-                    Err(_) if budget_limited => return Ok(Some(page)),
+                    Err(_) if budget_limited => return Ok((Some(page), made_progress)),
                     Err(_) => bail!("dismissing a blocking review timed out"),
                 };
                 let status = response.status();
                 self.record_review_rate(rate_info(response.headers()));
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Ok(Some(page));
+                    return Ok((Some(page), made_progress));
                 }
                 let budget_limited = remaining < REVIEW_BLOCKING_CLEANUP_REQUEST_TIMEOUT;
                 let body = match tokio::time::timeout(
@@ -6041,21 +6044,22 @@ impl Engine {
                     Ok(result) => {
                         result.context("reading a blocking-review dismissal response failed")?
                     }
-                    Err(_) if budget_limited => return Ok(Some(page)),
+                    Err(_) if budget_limited => return Ok((Some(page), made_progress)),
                     Err(_) => bail!("reading a blocking-review dismissal response timed out"),
                 };
                 if !status.is_success() {
                     bail!("GitHub API {status}: {}", compact_api_error(&body));
                 }
+                made_progress = true;
             }
             if count < REVIEW_COMMENT_PAGE_SIZE {
-                return Ok(None);
+                return Ok((None, made_progress));
             }
             page = page
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("GitHub review pagination overflowed"))?;
         }
-        Ok(Some(page))
+        Ok((Some(page), made_progress))
     }
 
     async fn sync_code_review_projection(&self, job: &trouve_protocol::CodeReviewJob) {
@@ -11945,7 +11949,7 @@ mod tests {
 
         let mut page = 1;
         loop {
-            let Some(next_page) = engine
+            let (next_page, _) = engine
                 .dismiss_prior_changes_requested_reviews(
                     &api,
                     &job,
@@ -11954,8 +11958,8 @@ mod tests {
                     Instant::now() + REVIEW_BLOCKING_CLEANUP_PASS_BUDGET,
                 )
                 .await
-                .unwrap()
-            else {
+                .unwrap();
+            let Some(next_page) = next_page else {
                 break;
             };
             assert!(next_page > page);
