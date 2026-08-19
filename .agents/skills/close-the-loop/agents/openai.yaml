@@ -1,0 +1,4 @@
+interface:
+  display_name: "Close the Loop"
+  short_description: "Drive a PR to a verified Ready to merge state"
+  default_prompt: "Use $close-the-loop to drive the current session pull request all the way to Ready to merge without merging it."
