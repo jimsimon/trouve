@@ -29,7 +29,8 @@ use crate::permissions::{
     ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
 };
 use crate::store::{
-    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance, Store,
+    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
+    SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
@@ -1769,6 +1770,11 @@ pub struct Engine {
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
     tool_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
+    /// Serializes durable PR-intent reconciliation per session. Weak entries
+    /// avoid retaining deleted sessions while still preventing duplicate
+    /// GitHub reads and association events from overlapping retry triggers.
+    session_pr_verification_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    session_pr_verification_wake: tokio::sync::Notify,
     /// Per-root delegation lanes. Providers may request multiple spawn tools
     /// in one parallel batch; serializing only the admission/create window
     /// for one tree makes the depth and active-descendant caps atomic without
@@ -2177,6 +2183,8 @@ impl Engine {
             turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
+            session_pr_verification_locks: Mutex::new(HashMap::new()),
+            session_pr_verification_wake: tokio::sync::Notify::new(),
             subagent_tree_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
@@ -5083,8 +5091,8 @@ impl Engine {
         Ok(())
     }
 
-    /// A provider may nominate a PR number, but only a local branch ref at the
-    /// fetched GitHub head SHA proves that this session repository owns it.
+    /// Branch-based discovery outside the tool-completion path still requires
+    /// the fetched head to exist locally before it can become durable evidence.
     async fn pr_has_locally_verified_head(session: &Session, pr: &trouve_protocol::PrInfo) -> bool {
         let Some(commit) = pr.head_sha.clone() else {
             return false;
@@ -5098,80 +5106,222 @@ impl Engine {
         .unwrap_or(false)
     }
 
-    /// Verify provider-reported candidates after ToolCompleted is durable, so
-    /// GitHub latency never stalls stream processing or model continuation.
-    fn schedule_session_pr_verification(
-        self: &Arc<Self>,
-        session: Session,
+    /// Snapshot branch ownership while the session's tool-mutation lane is
+    /// still held. This evidence is immutable even if another turn advances
+    /// the branch immediately after ToolCompleted.
+    async fn capture_session_pr_head(session: &Session) -> Option<(String, String)> {
+        let worktree = PathBuf::from(&session.worktree_path);
+        tokio::task::spawn_blocking(move || crate::git::checked_out_branch_head(&worktree))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    fn session_pr_verification_intents(
+        session: &Session,
         repository: (String, String, String),
-        numbers: Vec<u64>,
-        cancel: tokio_util::sync::CancellationToken,
-    ) {
-        let engine = Arc::clone(self);
-        tokio::spawn(async move {
-            let github = match engine.github_for_session(&session) {
+        numbers: impl IntoIterator<Item = u64>,
+        evidence: Option<(String, String)>,
+    ) -> Vec<SessionPrVerificationIntent> {
+        let Some((branch, head_sha)) = evidence else {
+            return Vec::new();
+        };
+        let (host, owner, repository) = repository;
+        let mut numbers = numbers
+            .into_iter()
+            .filter(|number| *number > 0)
+            .collect::<Vec<_>>();
+        numbers.sort_unstable();
+        numbers.dedup();
+        numbers
+            .into_iter()
+            .map(|number| SessionPrVerificationIntent {
+                session_id: session.id.clone(),
+                host: host.clone(),
+                owner: owner.clone(),
+                repository: repository.clone(),
+                number,
+                branch: branch.clone(),
+                head_sha: head_sha.clone(),
+                attempts: 0,
+            })
+            .collect()
+    }
+
+    fn session_pr_verification_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.session_pr_verification_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn github_for_pr_verification(
+        &self,
+        intent: &SessionPrVerificationIntent,
+    ) -> Result<crate::github::GitHub, EngineError> {
+        let token = self.github_token(&intent.host).ok_or_else(|| {
+            EngineError::BadRequest(format!(
+                "no GitHub OAuth session for {}; sign in under Settings → Integrations",
+                intent.host
+            ))
+        })?;
+        crate::github::GitHub::new(&token, &intent.host, &intent.owner, &intent.repository)
+            .map_err(EngineError::Internal)
+    }
+
+    fn pr_matches_verification_intent(
+        fetched: &crate::github::PullRequestWithHeadRepository,
+        intent: &SessionPrVerificationIntent,
+    ) -> bool {
+        let expected_repository = format!("{}/{}", intent.owner, intent.repository);
+        fetched
+            .head_repository
+            .as_deref()
+            .is_some_and(|repository| repository.eq_ignore_ascii_case(&expected_repository))
+            && fetched
+                .info
+                .repository
+                .eq_ignore_ascii_case(&expected_repository)
+            && fetched.info.head == intent.branch
+            && fetched
+                .info
+                .head_sha
+                .as_deref()
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(&intent.head_sha))
+    }
+
+    async fn reconcile_session_pr_verifications(&self, session_id: &str) {
+        let verification_lock = self.session_pr_verification_lock(session_id);
+        let _verification_guard = verification_lock.lock().await;
+
+        if self.deleting_sessions.lock().unwrap().contains(session_id) {
+            return;
+        }
+        let lifecycle = self.session_lock(session_id);
+        let _lifecycle_guard = lifecycle.read().await;
+        if self.deleting_sessions.lock().unwrap().contains(session_id) {
+            return;
+        }
+        let Ok(Some(_session)) = self.store.session(session_id) else {
+            return;
+        };
+        let intents = match self
+            .store
+            .due_session_pr_verification_intents(session_id, 100)
+        {
+            Ok(intents) => intents,
+            Err(error) => {
+                tracing::warn!(session_id, %error, "cannot load PR verification intents");
+                return;
+            }
+        };
+        let mut recorded = match self.recorded_session_pr_numbers(session_id) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                tracing::warn!(session_id, %error, "cannot load recorded pull requests");
+                return;
+            }
+        };
+        for intent in intents {
+            if recorded.contains(&intent.number) {
+                let _ = self.store.discard_session_pr_verification(&intent);
+                continue;
+            }
+            let github = match self.github_for_pr_verification(&intent) {
                 Ok(github) => github,
                 Err(error) => {
-                    tracing::warn!(
-                        session_id = session.id,
-                        error = %error,
-                        "cannot verify provider-reported pull request"
-                    );
-                    return;
+                    tracing::warn!(session_id, error = %error, "cannot authenticate PR verification");
+                    let _ = self.store.defer_session_pr_verification(&intent);
+                    continue;
                 }
             };
-            for number in numbers {
-                let fetched = tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    fetched = tokio::time::timeout(
-                        Duration::from_secs(15),
-                        github.pr(number),
-                    ) => fetched,
-                };
-                match fetched {
-                    Ok(Ok(pr)) if Self::pr_has_locally_verified_head(&session, &pr).await => {
-                        let mut recorded = match engine.recorded_session_pr_numbers(&session.id) {
-                            Ok(recorded) => recorded,
-                            Err(error) => {
-                                tracing::warn!(
-                                    session_id = session.id,
-                                    error = %error,
-                                    "cannot load recorded pull requests"
-                                );
-                                return;
-                            }
-                        };
-                        if let Err(error) = engine.record_session_pr_numbers(
-                            &session.id,
-                            &repository,
-                            [number],
-                            &mut recorded,
-                        ) {
-                            tracing::warn!(
-                                session_id = session.id,
-                                pr_number = number,
-                                error = %error,
-                                "cannot persist verified pull request association"
-                            );
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(15),
+                github.pr_with_head_repository(intent.number),
+            )
+            .await;
+            match fetched {
+                Ok(Ok(fetched)) if Self::pr_matches_verification_intent(&fetched, &intent) => {
+                    let event = Event::SessionPrOpened {
+                        number: intent.number,
+                        url: crate::github::pr_url(
+                            &intent.host,
+                            &intent.owner,
+                            &intent.repository,
+                            intent.number,
+                        ),
+                    };
+                    match self
+                        .store
+                        .complete_session_pr_verification(intent.clone(), event)
+                        .await
+                    {
+                        Ok(_) => {
+                            recorded.insert(intent.number);
                         }
+                        Err(error) => tracing::warn!(
+                            session_id,
+                            pr_number = intent.number,
+                            %error,
+                            "cannot complete verified pull request association"
+                        ),
                     }
-                    Ok(Ok(pr)) => tracing::warn!(
-                        session_id = session.id,
-                        pr_number = number,
-                        pr_head = pr.head,
-                        "ignoring pull request without a matching local branch ref"
-                    ),
-                    Ok(Err(error)) => tracing::warn!(
-                        session_id = session.id,
-                        pr_number = number,
-                        error = %error,
-                        "ignoring unavailable pull request creation result"
-                    ),
-                    Err(_) => tracing::warn!(
-                        session_id = session.id,
-                        pr_number = number,
-                        "timed out verifying pull request creation result"
-                    ),
+                }
+                Ok(Ok(fetched)) => {
+                    tracing::warn!(
+                        session_id,
+                        pr_number = intent.number,
+                        pr_head = fetched.info.head,
+                        "discarding pull request that does not match session-owned head evidence"
+                    );
+                    let _ = self.store.discard_session_pr_verification(&intent);
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        session_id,
+                        pr_number = intent.number,
+                        %error,
+                        "deferring unavailable pull request verification"
+                    );
+                    let _ = self.store.defer_session_pr_verification(&intent);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        session_id,
+                        pr_number = intent.number,
+                        "deferring timed-out pull request verification"
+                    );
+                    let _ = self.store.defer_session_pr_verification(&intent);
+                }
+            }
+        }
+    }
+
+    pub async fn retry_session_pr_verifications(&self) {
+        let sessions = match self.store.due_session_pr_verification_sessions(100) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "cannot list durable PR verification intents");
+                return;
+            }
+        };
+        for session_id in sessions {
+            self.reconcile_session_pr_verifications(&session_id).await;
+        }
+    }
+
+    pub fn start_session_pr_verification_worker(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                engine.retry_session_pr_verifications().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = engine.session_pr_verification_wake.notified() => {}
                 }
             }
         });
@@ -11875,16 +12025,12 @@ impl Engine {
                     ok,
                     result,
                 } => {
-                    // Release even for bridge calls whose duplicate vendor
-                    // lifecycle card is suppressed.
-                    backend_mutation_permits.remove(&call_id);
                     if suppressed_bridge_calls.remove(&call_id) {
+                        // The bridged execution path owns persistence and PR
+                        // evidence for this duplicate vendor lifecycle card.
+                        backend_mutation_permits.remove(&call_id);
                         continue;
                     }
-                    // The vendor has finished touching the worktree. Release
-                    // its exclusive lane before persistence/network-derived
-                    // bookkeeping so the next approved mutation can start.
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let status = if ok {
                         ToolStatus::Ok
                     } else {
@@ -11931,23 +12077,44 @@ impl Engine {
                     } else {
                         github_creation_output.remove(&call_id);
                     }
-                    persisted.push(Event::ToolCompleted {
+                    // Snapshot only while the vendor mutation permit is still
+                    // held. An unprotected read must never become ownership
+                    // evidence for a provider-nominated PR.
+                    let evidence = if verification.is_some()
+                        && backend_mutation_permits.contains_key(&call_id)
+                    {
+                        Self::capture_session_pr_head(session).await
+                    } else {
+                        None
+                    };
+                    backend_mutation_permits.remove(&call_id);
+
+                    let mut completion_events = vec![Event::ToolCompleted {
                         call_id,
                         status,
                         result,
                         execution_duration_ms,
-                    });
+                    }];
                     if let Some(todos) = todos {
-                        persisted.push(Event::TodosUpdated { todos });
+                        completion_events.push(Event::TodosUpdated { todos });
                     }
                     if let Some((repository, numbers)) = verification {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        self.schedule_session_pr_verification(
-                            session.clone(),
-                            repository,
-                            numbers,
-                            cancel.child_token(),
+                        let intents = Self::session_pr_verification_intents(
+                            session, repository, numbers, evidence,
                         );
+                        self.store
+                            .append_events_with_session_pr_verification_intents(
+                                scope.clone(),
+                                completion_events,
+                                intents.clone(),
+                            )
+                            .await?;
+                        if !intents.is_empty() {
+                            self.session_pr_verification_wake.notify_one();
+                        }
+                    } else {
+                        persisted.extend(completion_events);
                     }
                 }
                 BackendEvent::ApprovalNeeded {
@@ -12846,6 +13013,20 @@ impl Engine {
             return Ok(("Tool call denied by the user.".into(), Vec::new()));
         }
 
+        // Repository discovery and classification do not depend on the tool
+        // result. Resolve them before taking the mutation lane so completion
+        // only needs to extract returned PR numbers and snapshot HEAD.
+        let pr_creation = if could_request_pull_request_creation(&call.name, &call.arguments)
+            && let Ok(repository) = self.github_repository_for_session(session)
+        {
+            let (_, owner, repo) = &repository;
+            let request = classify_pull_request_creation(&call.name, &call.arguments, owner, repo);
+            (!matches!(request, PullRequestCreationRequest::Rejected))
+                .then_some((repository, request))
+        } else {
+            None
+        };
+
         enum ExecutionPermit {
             Read {
                 _guard: tokio::sync::OwnedRwLockReadGuard<()>,
@@ -12873,7 +13054,7 @@ impl Engine {
                 permit = execution_lock.clone().read_owned() => Some(ExecutionPermit::Read { _guard: permit }),
             }
         };
-        let (mut outcome, execution_duration_ms) = if let Some(permit) = permit {
+        let (mut outcome, execution_duration_ms, verification) = if let Some(permit) = permit {
             // Retain the lane until the executor has acknowledged cancellation
             // and cleaned up its process/protocol resources.
             let mut permit = Some(permit);
@@ -12944,10 +13125,41 @@ impl Engine {
                     }
                 }
             };
+            let verification = if matches!(outcome.status, ToolStatus::Ok)
+                && let Some((repository, request)) = pr_creation.as_ref()
+            {
+                let (host, owner, repo) = repository;
+                let result_numbers = pr_numbers_in_value(&outcome.result, host, owner, repo);
+                let accepted = matches!(request, PullRequestCreationRequest::Confirmed)
+                    || (matches!(request, PullRequestCreationRequest::Unresolved)
+                        && !result_numbers.is_empty());
+                if accepted
+                    && matches!(
+                        permit.as_ref(),
+                        Some(ExecutionPermit::Write { guard: Some(_) })
+                    )
+                {
+                    let evidence = Self::capture_session_pr_head(session).await;
+                    Some(Self::session_pr_verification_intents(
+                        session,
+                        repository.clone(),
+                        result_numbers,
+                        evidence,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             drop(permit);
-            (outcome, Some(monotonic_elapsed_ms(execution_started)))
+            (
+                outcome,
+                Some(monotonic_elapsed_ms(execution_started)),
+                verification,
+            )
         } else {
-            (ToolResult::error("tool call cancelled"), None)
+            (ToolResult::error("tool call cancelled"), None, None)
         };
         // Peel vision content ("_images") out of the result: megabytes of
         // base64 must not land in the event log or the text transcript —
@@ -12960,23 +13172,6 @@ impl Engine {
             &outcome.result,
             Some(&call.arguments),
         )?;
-        let mut verification = None;
-        if matches!(outcome.status, ToolStatus::Ok)
-            && could_request_pull_request_creation(&call.name, &call.arguments)
-            && let Ok(repository) = self.github_repository_for_session(session)
-        {
-            let (host, owner, repo) = &repository;
-            let request = classify_pull_request_creation(&call.name, &call.arguments, owner, repo);
-            if !matches!(request, PullRequestCreationRequest::Rejected) {
-                let result_numbers = pr_numbers_in_value(&outcome.result, host, owner, repo);
-                if matches!(request, PullRequestCreationRequest::Confirmed)
-                    || (matches!(request, PullRequestCreationRequest::Unresolved)
-                        && !result_numbers.is_empty())
-                {
-                    verification = Some((repository, result_numbers.into_iter().collect()));
-                }
-            }
-        }
         let model_result = outcome.result.to_string();
         let mut completion_events = vec![Event::ToolCompleted {
             call_id,
@@ -12987,16 +13182,21 @@ impl Engine {
         if let Some(todos) = todos {
             completion_events.push(Event::TodosUpdated { todos });
         }
-        self.store
-            .append_events_async(scope, completion_events)
-            .await?;
-        if let Some((repository, numbers)) = verification {
-            self.schedule_session_pr_verification(
-                session.clone(),
-                repository,
-                numbers,
-                cancel.child_token(),
-            );
+        if let Some(intents) = verification {
+            self.store
+                .append_events_with_session_pr_verification_intents(
+                    scope,
+                    completion_events,
+                    intents.clone(),
+                )
+                .await?;
+            if !intents.is_empty() {
+                self.session_pr_verification_wake.notify_one();
+            }
+        } else {
+            self.store
+                .append_events_async(scope, completion_events)
+                .await?;
         }
         Ok((model_result, images))
     }
@@ -14061,6 +14261,8 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
         "web",
         "http",
         "api",
+        "graphql",
+        "click",
     ]
     .iter()
     .any(|marker| tool_compact.contains(marker));
@@ -18512,6 +18714,33 @@ default_permission_mode = "ask"
         }
     }
 
+    #[test]
+    fn pr_verification_requires_exact_session_head_and_head_repository() {
+        let mut info = projection_pr(42, "ws", "agent/clean-pr");
+        info.head_sha = Some("1".repeat(40));
+        let intent = SessionPrVerificationIntent {
+            session_id: "se_1".into(),
+            host: "github.com".into(),
+            owner: "acme".into(),
+            repository: "widgets".into(),
+            number: 42,
+            branch: "agent/clean-pr".into(),
+            head_sha: "1".repeat(40),
+            attempts: 0,
+        };
+        let mut fetched = crate::github::PullRequestWithHeadRepository {
+            info,
+            head_repository: Some("acme/widgets".into()),
+        };
+
+        assert!(Engine::pr_matches_verification_intent(&fetched, &intent));
+        fetched.head_repository = Some("attacker/widgets".into());
+        assert!(!Engine::pr_matches_verification_intent(&fetched, &intent));
+        fetched.head_repository = Some("acme/widgets".into());
+        fetched.info.head = "other-session".into();
+        assert!(!Engine::pr_matches_verification_intent(&fetched, &intent));
+    }
+
     fn projection_detail(info: trouve_protocol::PrInfo) -> trouve_protocol::PrDetail {
         serde_json::from_value(serde_json::json!({
             "info": info,
@@ -19194,6 +19423,26 @@ default_permission_mode = "ask"
                     "query": "mutation { createPullRequest(input: $input) { pullRequest { url } } }"
                 }
             })
+        ));
+        let graphql_create = serde_json::json!({
+            "query": "mutation { createPullRequest(input: $input) { pullRequest { url } } }"
+        });
+        assert!(matches!(
+            classify_pull_request_creation("graphql", &graphql_create, "o", "r"),
+            PullRequestCreationRequest::Confirmed
+        ));
+        assert!(could_request_pull_request_creation(
+            "graphql",
+            &graphql_create
+        ));
+        let click_create = serde_json::json!({"text": "Create pull request"});
+        assert!(!matches!(
+            classify_pull_request_creation("browser_click", &click_create, "o", "r"),
+            PullRequestCreationRequest::Rejected
+        ));
+        assert!(could_request_pull_request_creation(
+            "browser_click",
+            &click_create
         ));
         assert!(matches!(
             classify_pull_request_creation(

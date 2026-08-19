@@ -62,6 +62,26 @@ CREATE TABLE IF NOT EXISTS sessions (
   archived INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+-- Provider-reported PR numbers are nominations, not authorization. Capture
+-- the session worktree's checked-out branch and exact HEAD while the tool
+-- mutation lane is still held, then reconcile that immutable evidence with
+-- GitHub asynchronously. The row survives process restarts and is deleted
+-- with its owning session.
+CREATE TABLE IF NOT EXISTS session_pr_verification_intents (
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  host TEXT NOT NULL,
+  owner TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  branch TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, host, owner, repository, pull_number)
+);
+CREATE INDEX IF NOT EXISTS session_pr_verification_due
+  ON session_pr_verification_intents (next_attempt_at, created_at);
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -2683,6 +2703,18 @@ pub(crate) struct ArtifactCleanupJob {
     pub attachment_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionPrVerificationIntent {
+    pub session_id: String,
+    pub host: String,
+    pub owner: String,
+    pub repository: String,
+    pub number: u64,
+    pub branch: String,
+    pub head_sha: String,
+    pub attempts: u32,
+}
+
 impl ArtifactCleanupJob {
     pub(crate) fn deleted_session(
         session_id: String,
@@ -2917,6 +2949,12 @@ enum StoreMutation {
     Delete {
         id: String,
         cleanup: Box<ArtifactCleanupJob>,
+    },
+    UpsertSessionPrVerificationIntents {
+        intents: Vec<SessionPrVerificationIntent>,
+    },
+    CompleteSessionPrVerificationIntent {
+        intent: Box<SessionPrVerificationIntent>,
     },
     AcceptPrompt {
         prompt: Box<trouve_protocol::QueuedPrompt>,
@@ -3321,6 +3359,10 @@ fn update_thread_row(
 
 fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
+        "DELETE FROM session_pr_verification_intents WHERE session_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
         "DELETE FROM events WHERE (scope_kind = 'session' AND scope_id = ?1)
          OR (scope_kind = 'thread' AND scope_id IN
              (SELECT id FROM threads WHERE session_id = ?1))",
@@ -3472,6 +3514,53 @@ fn apply_store_mutation(
         StoreMutation::Delete { id, cleanup } => {
             insert_artifact_cleanup_job(conn, cleanup, timestamp)?;
             delete_session_rows(conn, id)?;
+        }
+        StoreMutation::UpsertSessionPrVerificationIntents { intents } => {
+            for intent in intents {
+                conn.execute(
+                    "INSERT INTO session_pr_verification_intents
+                       (session_id, host, owner, repository, pull_number, branch,
+                        head_sha, attempts, next_attempt_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)
+                     ON CONFLICT(session_id, host, owner, repository, pull_number)
+                     DO UPDATE SET branch = excluded.branch,
+                                   head_sha = excluded.head_sha,
+                                   attempts = 0,
+                                   next_attempt_at = NULL,
+                                   created_at = excluded.created_at",
+                    params![
+                        intent.session_id,
+                        intent.host,
+                        intent.owner,
+                        intent.repository,
+                        intent.number as i64,
+                        intent.branch,
+                        intent.head_sha,
+                        timestamp.to_rfc3339(),
+                    ],
+                )?;
+            }
+        }
+        StoreMutation::CompleteSessionPrVerificationIntent { intent } => {
+            let deleted = conn.execute(
+                "DELETE FROM session_pr_verification_intents
+                 WHERE session_id = ?1 AND host = ?2 AND owner = ?3
+                   AND repository = ?4 AND pull_number = ?5
+                   AND branch = ?6 AND head_sha = ?7",
+                params![
+                    intent.session_id,
+                    intent.host,
+                    intent.owner,
+                    intent.repository,
+                    intent.number as i64,
+                    intent.branch,
+                    intent.head_sha,
+                ],
+            )?;
+            anyhow::ensure!(
+                deleted == 1,
+                "pull request verification intent changed before completion"
+            );
         }
         StoreMutation::AcceptPrompt {
             prompt,
@@ -4181,6 +4270,171 @@ impl Store {
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
+    }
+
+    /// Persist a tool completion and the PR verification intents derived from
+    /// it in one writer transaction. A crash can therefore leave neither an
+    /// untracked successful creation nor an intent without its source event.
+    pub(crate) async fn append_events_with_session_pr_verification_intents(
+        &self,
+        scope: Scope,
+        events: Vec<Event>,
+        intents: Vec<SessionPrVerificationIntent>,
+    ) -> Result<Vec<EventEnvelope>> {
+        if intents.is_empty() {
+            return self.append_events_async(scope, events).await;
+        }
+        let pending = serialize_lifecycle_events(
+            events
+                .into_iter()
+                .map(|event| (scope.clone(), event))
+                .collect(),
+            StoreMutation::UpsertSessionPrVerificationIntents { intents },
+        )?;
+        self.append_pending_events_async(pending).await
+    }
+
+    async fn append_pending_events_async(
+        &self,
+        events: Vec<PendingEvent>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        self.append_tx
+            .send(AppendRequest {
+                events,
+                code_review_outbox_ids: Vec::new(),
+                reply: AppendReply::Async(reply),
+                queued_at: std::time::Instant::now(),
+            })
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
+    }
+
+    /// Sessions with verification work whose bounded backoff has elapsed.
+    pub(crate) fn due_session_pr_verification_sessions(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id
+             FROM session_pr_verification_intents
+             WHERE next_attempt_at IS NULL OR next_attempt_at <= ?1
+             GROUP BY session_id
+             ORDER BY MIN(created_at)
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![chrono::Utc::now().to_rfc3339(), limit as i64],
+            |row| row.get(0),
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn due_session_pr_verification_intents(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionPrVerificationIntent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, host, owner, repository, pull_number, branch,
+                    head_sha, attempts
+             FROM session_pr_verification_intents
+             WHERE session_id = ?1
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
+             ORDER BY created_at, pull_number
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, chrono::Utc::now().to_rfc3339(), limit as i64],
+            |row| {
+                Ok(SessionPrVerificationIntent {
+                    session_id: row.get(0)?,
+                    host: row.get(1)?,
+                    owner: row.get(2)?,
+                    repository: row.get(3)?,
+                    number: row.get::<_, i64>(4)? as u64,
+                    branch: row.get(5)?,
+                    head_sha: row.get(6)?,
+                    attempts: row.get::<_, i64>(7)? as u32,
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Keep a transient failure durable while bounding GitHub request rate.
+    /// The delay grows exponentially and caps at five minutes.
+    pub(crate) fn defer_session_pr_verification(
+        &self,
+        intent: &SessionPrVerificationIntent,
+    ) -> Result<()> {
+        let exponent = intent.attempts.min(8);
+        let delay = (1_i64 << exponent).min(300);
+        let next_attempt_at = (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339();
+        self.conn.lock().unwrap().execute(
+            "UPDATE session_pr_verification_intents
+             SET attempts = attempts + 1, next_attempt_at = ?8
+             WHERE session_id = ?1 AND host = ?2 AND owner = ?3
+               AND repository = ?4 AND pull_number = ?5
+               AND branch = ?6 AND head_sha = ?7",
+            params![
+                intent.session_id,
+                intent.host,
+                intent.owner,
+                intent.repository,
+                intent.number as i64,
+                intent.branch,
+                intent.head_sha,
+                next_attempt_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn discard_session_pr_verification(
+        &self,
+        intent: &SessionPrVerificationIntent,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM session_pr_verification_intents
+             WHERE session_id = ?1 AND host = ?2 AND owner = ?3
+               AND repository = ?4 AND pull_number = ?5
+               AND branch = ?6 AND head_sha = ?7",
+            params![
+                intent.session_id,
+                intent.host,
+                intent.owner,
+                intent.repository,
+                intent.number as i64,
+                intent.branch,
+                intent.head_sha,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an intent and append its association event atomically. The
+    /// evidence predicates make a concurrent replacement or completion a
+    /// no-op error instead of publishing a duplicate association.
+    pub(crate) async fn complete_session_pr_verification(
+        &self,
+        intent: SessionPrVerificationIntent,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Session(intent.session_id.clone()), event)],
+            StoreMutation::CompleteSessionPrVerificationIntent {
+                intent: Box::new(intent),
+            },
+        )?;
+        Ok(self
+            .append_pending_events_async(pending)
+            .await?
+            .pop()
+            .expect("one PR association returns one envelope"))
     }
 
     /// Persist one event without blocking a Tokio worker thread, while
@@ -11918,6 +12172,134 @@ mod tests {
         let got = store.session("se_1").unwrap().unwrap();
         assert_eq!(got.title, "after");
         assert!(!got.archived);
+    }
+
+    #[tokio::test]
+    async fn pr_verification_intent_is_durable_atomic_and_session_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_pr_intent".into(),
+            name: "x".into(),
+            path: "/tmp/repo-pr-intent".into(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_pr_intent".into(),
+            workspace_id: workspace.id,
+            title: "PR intent".into(),
+            branch: "agent/session".into(),
+            worktree_path: "/tmp/wt-pr-intent".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_pr_intent".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store
+            .insert_thread(&thread, &serde_json::Map::new())
+            .unwrap();
+        let intent = SessionPrVerificationIntent {
+            session_id: session.id.clone(),
+            host: "github.com".into(),
+            owner: "o".into(),
+            repository: "r".into(),
+            number: 42,
+            branch: "agent/clean-pr".into(),
+            head_sha: "1".repeat(40),
+            attempts: 0,
+        };
+
+        store
+            .append_events_with_session_pr_verification_intents(
+                Scope::Thread(thread.id),
+                vec![Event::ToolCompleted {
+                    call_id: "call-pr".into(),
+                    status: ToolStatus::Ok,
+                    result: serde_json::json!({"number": 42}),
+                    execution_duration_ms: Some(1),
+                }],
+                vec![intent.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap(),
+            vec![intent.clone()]
+        );
+
+        store
+            .complete_session_pr_verification(
+                intent.clone(),
+                Event::SessionPrOpened {
+                    number: 42,
+                    url: "https://github.com/o/r/pull/42".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .complete_session_pr_verification(
+                    intent.clone(),
+                    Event::SessionPrOpened {
+                        number: 42,
+                        url: "https://github.com/o/r/pull/42".into(),
+                    },
+                )
+                .await
+                .is_err(),
+            "a completed intent cannot publish a duplicate association"
+        );
+        let associations = store
+            .events_after(&Scope::Session(session.id), 0)
+            .unwrap()
+            .into_iter()
+            .filter(|envelope| matches!(envelope.event, Event::SessionPrOpened { .. }))
+            .count();
+        assert_eq!(associations, 1);
+
+        store
+            .append_events_with_session_pr_verification_intents(
+                Scope::Thread("th_pr_intent".into()),
+                vec![Event::ToolCompleted {
+                    call_id: "call-pr-again".into(),
+                    status: ToolStatus::Ok,
+                    result: serde_json::json!({"number": 42}),
+                    execution_duration_ms: Some(1),
+                }],
+                vec![intent],
+            )
+            .await
+            .unwrap();
+        store.delete_session("se_pr_intent").unwrap();
+        assert!(
+            store
+                .due_session_pr_verification_sessions(10)
+                .unwrap()
+                .is_empty(),
+            "session deletion must remove pending PR verification work"
+        );
     }
 
     #[test]

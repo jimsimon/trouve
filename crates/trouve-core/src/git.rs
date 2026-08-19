@@ -1714,6 +1714,20 @@ pub fn head_ref(repo: &Path) -> Result<String> {
     }
 }
 
+/// The checked-out branch and exact commit in one session worktree. Detached
+/// HEAD is intentionally rejected: PR ownership evidence must name the branch
+/// GitHub reports, not merely an object shared by every worktree.
+pub fn checked_out_branch_head(repo: &Path) -> Result<(String, String)> {
+    let branch = git(repo, &["symbolic-ref", "--short", "HEAD"])?;
+    ensure_safe_ref(&branch)?;
+    let head = git(repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    anyhow::ensure!(
+        head.len() == 40 && head.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "HEAD did not resolve to a full commit id"
+    );
+    Ok((branch, head))
+}
+
 /// Whether a local branch currently points at `commit`. This is trusted
 /// ownership evidence for remote objects reported by a provider: both the ref
 /// and object id must already exist in the session repository.
@@ -3272,6 +3286,22 @@ mod tests {
             "agent/created-pr",
             "not-a-commit"
         ));
+    }
+
+    #[test]
+    fn checked_out_branch_head_is_worktree_specific_and_rejects_detached_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["switch", "-c", "agent/clean-pr"]);
+        let commit = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        assert_eq!(
+            checked_out_branch_head(tmp.path()).unwrap(),
+            ("agent/clean-pr".into(), commit.clone())
+        );
+
+        run(tmp.path(), &["checkout", "--detach", &commit]);
+        assert!(checked_out_branch_head(tmp.path()).is_err());
     }
 
     #[test]

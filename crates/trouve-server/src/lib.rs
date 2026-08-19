@@ -950,6 +950,7 @@ pub async fn serve_listener(
     engine.retry_artifact_cleanup_jobs().await;
     engine.retry_persona_deletions().await;
     engine.start_artifact_cleanup_worker();
+    engine.start_session_pr_verification_worker();
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.
     engine.set_base_url(&format!("http://{}", listener.local_addr()?));
