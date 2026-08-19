@@ -19,6 +19,27 @@ export type TodoItem = ProtocolComponents["schemas"]["TodoItem"];
 type Usage = ProtocolComponents["schemas"]["Usage"];
 type ThreadViewItem = ProtocolThreadViewSnapshot["items"][number];
 
+const accumulateLiveUsage = (
+  total: Usage | undefined,
+  latest: Usage,
+): Usage => {
+  if (total === undefined) return { ...latest };
+  const totalCost = total.cost_usd;
+  const latestCost = latest.cost_usd;
+  const contextInputTokens = latest.context_input_tokens ?? total.context_input_tokens;
+  const contextWindow = latest.context_window ?? total.context_window;
+  return {
+    input_tokens: total.input_tokens + latest.input_tokens,
+    output_tokens: total.output_tokens + latest.output_tokens,
+    cached_input_tokens: (total.cached_input_tokens ?? 0) + (latest.cached_input_tokens ?? 0),
+    ...(totalCost == null && latestCost == null
+      ? {}
+      : { cost_usd: (totalCost ?? 0) + (latestCost ?? 0) }),
+    ...(contextInputTokens == null ? {} : { context_input_tokens: contextInputTokens }),
+    ...(contextWindow == null ? {} : { context_window: contextWindow }),
+  };
+};
+
 /** Constant-space queue revision observation scoped to one pending request. */
 export interface QueueRevisionTracker {
   readonly queueChanged: () => boolean;
@@ -824,16 +845,22 @@ export class ThreadViewModel {
         return questions !== undefined;
       }
       case "turn.usage_updated": {
-        this.lastUsage = envelope.usage;
-        this.lastUsageCursor = envelope.cursor;
         const runningTurn = this.#findLast(
           (item) =>
             item.kind === "turn-status" &&
             item.turn === envelope.turn &&
             item.state.kind === "running",
         );
+        const usage = accumulateLiveUsage(
+          runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running"
+            ? runningTurn.state.usage
+            : undefined,
+          envelope.usage,
+        );
+        this.lastUsage = usage;
+        this.lastUsageCursor = envelope.cursor;
         if (runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running") {
-          runningTurn.state = { ...runningTurn.state, usage: envelope.usage };
+          runningTurn.state = { ...runningTurn.state, usage };
         }
         return true;
       }

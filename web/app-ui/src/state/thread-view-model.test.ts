@@ -741,7 +741,7 @@ describe("ThreadViewModel", () => {
     expect(vm.thinking).toBe(false);
   });
 
-  it("applies live context usage without completing the running turn", () => {
+  it("accumulates live turn usage while retaining the latest context measurement", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.started",
@@ -764,12 +764,31 @@ describe("ThreadViewModel", () => {
         cached_input_tokens: 80_000,
         context_input_tokens: 90_000,
         context_window: 258_400,
+        cost_usd: 0.01,
+      },
+    }));
+    vm.apply(envelope(4, {
+      type: "turn.usage_updated",
+      turn: 1,
+      usage: {
+        input_tokens: 2_000,
+        output_tokens: 250,
+        cached_input_tokens: 5_000,
+        context_input_tokens: 70_000,
+        cost_usd: 0.02,
       },
     }));
 
     expect(vm.turnRunning).toBe(true);
-    expect(vm.lastUsageCursor).toBe(3);
-    expect(vm.lastUsage?.context_input_tokens).toBe(90_000);
+    expect(vm.lastUsageCursor).toBe(4);
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      cached_input_tokens: 85_000,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+      cost_usd: 0.03,
+    });
     expect(vm.items).toMatchObject([
       {
         kind: "turn-status",
@@ -777,10 +796,66 @@ describe("ThreadViewModel", () => {
           kind: "running",
           startedAt: "2026-08-01T12:00:01Z",
           usage: {
-            input_tokens: 10_000,
-            output_tokens: 500,
-            context_input_tokens: 90_000,
+            input_tokens: 12_000,
+            output_tokens: 750,
+            cached_input_tokens: 85_000,
+            context_input_tokens: 70_000,
+            context_window: 258_400,
+            cost_usd: 0.03,
           },
+        },
+      },
+    ]);
+
+    vm.apply(envelope(5, {
+      type: "turn.completed",
+      turn: 1,
+      usage: {
+        input_tokens: 12_000,
+        output_tokens: 750,
+        cached_input_tokens: 85_000,
+        context_input_tokens: 70_000,
+        context_window: 258_400,
+        cost_usd: 0.03,
+      },
+    }));
+    vm.apply(envelope(6, {
+      type: "turn.started",
+      turn: 2,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(7, {
+      type: "turn.capacity_acquired",
+      turn: 2,
+      wait_ms: 0,
+      background: false,
+    }));
+    vm.apply(envelope(8, {
+      type: "turn.usage_updated",
+      turn: 2,
+      usage: {
+        input_tokens: 300,
+        output_tokens: 20,
+        cached_input_tokens: 1_000,
+        context_input_tokens: 1_300,
+      },
+    }));
+
+    const turnStates = vm.items.filter((item) => item.kind === "turn-status");
+    expect(turnStates).toMatchObject([
+      {
+        turn: 1,
+        state: {
+          kind: "completed",
+          usage: { input_tokens: 12_000, output_tokens: 750 },
+        },
+      },
+      {
+        turn: 2,
+        state: {
+          kind: "running",
+          usage: { input_tokens: 300, output_tokens: 20 },
         },
       },
     ]);

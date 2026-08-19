@@ -10,6 +10,27 @@ use trouve_protocol::{
     TodoItem, TodoStatus, ToolStatus, Usage,
 };
 
+fn accumulate_live_usage(total: &mut Option<Usage>, latest: &Usage) {
+    let Some(total) = total else {
+        *total = Some(latest.clone());
+        return;
+    };
+    total.input_tokens = total.input_tokens.saturating_add(latest.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(latest.output_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(latest.cached_input_tokens);
+    if let Some(cost) = latest.cost_usd {
+        total.cost_usd = Some(total.cost_usd.unwrap_or(0.0) + cost);
+    }
+    if latest.context_input_tokens.is_some() {
+        total.context_input_tokens = latest.context_input_tokens;
+    }
+    if latest.context_window.is_some() {
+        total.context_window = latest.context_window;
+    }
+}
+
 /// Per-tool retained output budget. The projection keeps the latest valid
 /// UTF-8 suffix so replaying a long-running command cannot grow client memory
 /// without bound.
@@ -237,9 +258,12 @@ pub struct ThreadViewModel {
     pub pending_approvals: Vec<String>,
     /// Question request ids currently waiting for answers (newest last).
     pub pending_questions: Vec<String>,
-    /// Usage of the most recently completed turn; its input token count is
-    /// the best available proxy for current context size.
+    /// Usage for the active or most recently completed turn. Billing counters
+    /// aggregate across the turn; context fields describe its latest request.
     pub last_usage: Option<Usage>,
+    /// Aggregate billing counters for the active turn. Context fields retain
+    /// the newest request's measurement instead of being summed.
+    running_usage: Option<Usage>,
     /// True between compaction start/complete events (UI busy indicator).
     pub compacting: bool,
     /// True while a turn is running (between turn.started and completion).
@@ -272,6 +296,10 @@ pub struct ThreadViewModel {
 
 impl From<ThreadViewSnapshot> for ThreadViewModel {
     fn from(snapshot: ThreadViewSnapshot) -> Self {
+        let running_usage = snapshot
+            .turn_running
+            .then(|| snapshot.last_usage.clone())
+            .flatten();
         Self {
             items: snapshot.items.into_iter().map(ChatItem::from).collect(),
             cursor: 0,
@@ -281,6 +309,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             pending_approvals: snapshot.pending_approvals,
             pending_questions: snapshot.pending_questions,
             last_usage: snapshot.last_usage,
+            running_usage,
             compacting: snapshot.compacting,
             turn_running: snapshot.turn_running,
             thinking: snapshot.thinking,
@@ -585,6 +614,7 @@ impl ThreadViewModel {
                 ..
             } => {
                 self.turn_running = true;
+                self.running_usage = None;
                 self.turn_models.insert(*turn, model.clone());
                 if let Some(thinking_level) = thinking_level {
                     self.turn_thinking_levels
@@ -999,7 +1029,8 @@ impl ThreadViewModel {
                 idx
             }
             Event::TurnUsageUpdated { usage, .. } => {
-                self.last_usage = Some(usage.clone());
+                accumulate_live_usage(&mut self.running_usage, usage);
+                self.last_usage.clone_from(&self.running_usage);
                 None
             }
             Event::TurnCompleted {
@@ -1009,6 +1040,7 @@ impl ThreadViewModel {
             } => {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
+                self.running_usage = None;
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1039,6 +1071,7 @@ impl ThreadViewModel {
             Event::TurnFailed { turn, error } => {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
+                self.running_usage = None;
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1067,6 +1100,7 @@ impl ThreadViewModel {
             Event::TurnCancelled { turn } => {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
+                self.running_usage = None;
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1523,8 +1557,27 @@ mod tests {
             turn: 1,
             usage: live_usage.clone(),
         }));
+        vm.apply(&env(Event::TurnUsageUpdated {
+            turn: 1,
+            usage: Usage {
+                input_tokens: 2,
+                output_tokens: 3,
+                cached_input_tokens: 4,
+                context_input_tokens: Some(70),
+                ..Default::default()
+            },
+        }));
         assert!(vm.turn_running);
-        assert_eq!(vm.last_usage, Some(live_usage));
+        assert_eq!(
+            vm.last_usage,
+            Some(Usage {
+                input_tokens: 12,
+                output_tokens: 8,
+                cached_input_tokens: 84,
+                context_input_tokens: Some(70),
+                ..Default::default()
+            })
+        );
 
         vm.apply(&env(Event::CompactionStarted { turn: 1 }));
         assert!(vm.compacting);
