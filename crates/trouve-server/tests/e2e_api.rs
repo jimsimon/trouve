@@ -2329,8 +2329,9 @@ impl trouve_agents::AgentBackend for SteerableBackend {
 
     async fn run_turn(
         &self,
-        _turn: trouve_agents::BackendTurn,
+        turn: trouve_agents::BackendTurn,
     ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        let hold_mutation_lane = turn.prompt == "Hold the mutation lane.";
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.release.lock().await = Some(release_tx);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -2344,8 +2345,38 @@ impl trouve_agents::AgentBackend for SteerableBackend {
             let _ = tx
                 .send(Ok(E::ThinkingDelta("Initial direction.".into())))
                 .await;
+            if hold_mutation_lane {
+                let (approved_tx, approved_rx) = tokio::sync::oneshot::channel();
+                let _ = tx
+                    .send(Ok(E::ApprovalNeeded {
+                        call_id: "held-mutation".into(),
+                        tool: "commandExecution".into(),
+                        args: serde_json::json!({"command": "hold mutation lane"}),
+                        responder: approved_tx,
+                    }))
+                    .await;
+                if !approved_rx.await.unwrap_or(false) {
+                    return;
+                }
+                let _ = tx
+                    .send(Ok(E::ToolStarted {
+                        call_id: "held-mutation".into(),
+                        tool: "commandExecution".into(),
+                        args: serde_json::json!({"command": "hold mutation lane"}),
+                    }))
+                    .await;
+            }
             if release_rx.await.is_err() {
                 return;
+            }
+            if hold_mutation_lane {
+                let _ = tx
+                    .send(Ok(E::ToolCompleted {
+                        call_id: "held-mutation".into(),
+                        ok: true,
+                        result: serde_json::json!({"exitCode": 0}),
+                    }))
+                    .await;
             }
             let _ = tx.send(Ok(E::ThinkingCompleted)).await;
             let _ = tx.send(Ok(E::TextDelta("Steering applied.".into()))).await;
@@ -2403,7 +2434,10 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         .unwrap();
     let thread: serde_json::Value = client
         .post(format!("{base}/threads"))
-        .json(&serde_json::json!({"session_id": session["id"]}))
+        .json(&serde_json::json!({
+            "session_id": session["id"],
+            "permission_mode": "yolo",
+        }))
         .send()
         .await
         .unwrap()
@@ -2483,12 +2517,47 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         item["kind"] == "steered" && item["content"] == "Prioritize the layout regression."
     }));
 
+    {
+        let received = backend.steers.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0, "steerable-vendor-session");
+        assert_eq!(received[0].1, "Prioritize the layout regression.");
+        assert_eq!(received[0].2.len(), 1);
+        assert!(Path::new(&received[0].2[0]).exists());
+    }
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Hold the mutation lane."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "tool.started" && event["call_id"] == "held-mutation"
+    })
+    .await;
+
+    let steered = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client
+            .post(format!("{base}/threads/{thread_id}/steer"))
+            .json(&serde_json::json!({"content": "Continue without waiting for the tool."}))
+            .send(),
+    )
+    .await
+    .expect("text-only steering waited for the session mutation lane")
+    .unwrap();
+    assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
+
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 2
+    })
+    .await;
     let received = backend.steers.lock().unwrap();
-    assert_eq!(received.len(), 1);
-    assert_eq!(received[0].0, "steerable-vendor-session");
-    assert_eq!(received[0].1, "Prioritize the layout regression.");
-    assert_eq!(received[0].2.len(), 1);
-    assert!(Path::new(&received[0].2[0]).exists());
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[1].1, "Continue without waiting for the tool.");
+    assert!(received[1].2.is_empty());
 }
 
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",
