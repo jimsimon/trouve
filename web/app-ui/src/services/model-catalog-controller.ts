@@ -40,6 +40,7 @@ export class ModelCatalogController {
 
   #staticPending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #livePending: Promise<readonly ProtocolModelInfo[]> | undefined;
+  #livePendingForced = false;
   #staticLoaded = false;
   #staticFailure: { readonly error: unknown } | undefined;
   #lastLiveCheckedAt: number | undefined;
@@ -141,7 +142,10 @@ export class ModelCatalogController {
   #refreshLive(
     freshness: ModelCatalogFreshness,
   ): Promise<readonly ProtocolModelInfo[]> {
-    if (this.#livePending !== undefined) return this.#livePending;
+    if (this.#livePending !== undefined) {
+      if (freshness === "force") this.#livePendingForced = true;
+      return this.#livePending;
+    }
     const now = this.#now();
     const fresh = this.#lastLiveCheckedAt !== undefined
       && Math.max(0, now - this.#lastLiveCheckedAt) < this.#liveTtlMs;
@@ -150,6 +154,7 @@ export class ModelCatalogController {
     }
 
     const generation = ++this.#generation;
+    this.#livePendingForced = freshness === "force";
     this.#refreshing.set(true);
     const promise = this.#protocol.refreshModels().then(
       (models) => {
@@ -164,7 +169,7 @@ export class ModelCatalogController {
       },
       (error: unknown) => {
         if (generation !== this.#generation) return this.#current.get();
-        if (freshness === "if-stale" && this.#liveLoaded.get()) {
+        if (!this.#livePendingForced && this.#liveLoaded.get()) {
           this.#lastLiveCheckedAt = this.#now();
         } else {
           this.#lastLiveCheckedAt = undefined;
@@ -176,6 +181,7 @@ export class ModelCatalogController {
     ).finally(() => {
       if (this.#livePending === promise) {
         this.#livePending = undefined;
+        this.#livePendingForced = false;
         this.#refreshing.set(false);
       }
     });

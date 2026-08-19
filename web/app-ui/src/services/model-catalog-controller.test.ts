@@ -330,6 +330,37 @@ describe("ModelCatalogController", () => {
     ]));
   });
 
+  it("applies forced fallback when a forced refresh joins background work", async () => {
+    const background = deferred<readonly ProtocolModelInfo[]>();
+    const liveError = new Error("live unavailable");
+    let now = 0;
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => [model("cursor/static")],
+      refreshModels: () => {
+        liveCalls += 1;
+        return liveCalls === 1
+          ? Promise.resolve([model("cursor/live")])
+          : background.promise;
+      },
+    }, { now: () => now, liveTtlMs: 10 });
+
+    await controller.refresh();
+    await vi.waitFor(() => expect(readSignal(controller.current)).toEqual([
+      model("cursor/live"),
+    ]));
+
+    now = 20;
+    await controller.refresh();
+    const forced = controller.liveModels("force");
+    expect(liveCalls).toBe(2);
+    background.reject(liveError);
+
+    await expect(forced).rejects.toBe(liveError);
+    expect(readSignal(controller.current)).toEqual([model("cursor/static")]);
+    expect(readSignal(controller.liveLoaded)).toBe(false);
+  });
+
   it("uses a cached static snapshot when a forced reload fails", async () => {
     const forcedStatic = deferred<readonly ProtocolModelInfo[]>();
     let staticCalls = 0;
