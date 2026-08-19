@@ -4669,30 +4669,6 @@ impl Engine {
         Ok(personas)
     }
 
-    fn sync_persisted_reviewer_profile(
-        store: &Store,
-        persona: &AgentPersona,
-    ) -> Result<(), EngineError> {
-        if persona.group != trouve_protocol::PersonaGroup::Reviewer {
-            return Ok(());
-        }
-        let built_in = store
-            .list_built_in_reviewer_defaults()?
-            .iter()
-            .any(|reviewer| reviewer.id == persona.id);
-        let persisted = built_in
-            || store
-                .list_custom_reviewer_profiles()?
-                .iter()
-                .any(|reviewer| reviewer.id == persona.id);
-        if persisted {
-            store.upsert_reviewer_profile(&crate::reviewers::persona_as_reviewer(
-                persona, built_in,
-            ))?;
-        }
-        Ok(())
-    }
-
     /// Create or update a user-level persona. Saving under a built-in id
     /// customizes that built-in; the file lands in `<config>/personas/`.
     pub async fn upsert_persona(
@@ -4853,13 +4829,11 @@ impl Engine {
                     store.release_persona_deletion_claim(&id, &claim)?;
                     return Err(EngineError::Internal(anyhow::anyhow!(error)));
                 }
-                Self::sync_persisted_reviewer_profile(&store, &persona)?;
                 Ok(())
             })
             .await
             .map_err(|error| EngineError::Internal(anyhow::anyhow!("persona replacement task failed: {error}")))??;
         } else {
-            let store = self.store.clone();
             let executor = self.executor.clone();
             let config_dir = config_dir.to_path_buf();
             tokio::spawn(async move {
@@ -4868,7 +4842,7 @@ impl Engine {
                     .upsert_persona_file(&config_dir, &persona)
                     .await
                     .map_err(|error| EngineError::Internal(anyhow::anyhow!(error)))?;
-                Self::sync_persisted_reviewer_profile(&store, &persona)
+                Ok::<(), EngineError>(())
             })
             .await
             .map_err(|error| {
@@ -11253,7 +11227,7 @@ impl Engine {
                     // persisting the user message or calling the backend.
                     if cancel.is_cancelled() {
                         let _ = response.send(Err("turn cancelled".into()));
-                        break;
+                        continue;
                     }
                     let staged = attachment_rows
                         .iter()
@@ -15091,12 +15065,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config_dir = tmp.path().join("config");
         let workspace = tmp.path().join("workspace");
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            tmp.path().join("data"),
-            &Config::default(),
-        )
-        .with_config_dir(Some(config_dir.clone()));
+        let store = Store::open_in_memory().unwrap();
+        let built_in_default = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .find(|reviewer| reviewer.id == "correctness")
+            .unwrap();
+        store.upsert_reviewer_profile(&built_in_default).unwrap();
+        let engine = Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(Some(config_dir.clone()));
 
         engine
             .upsert_persona("custom", persona_request("Custom persona"))
@@ -15110,6 +15086,15 @@ mod tests {
             .upsert_persona("correctness", persona_request("Customized Correctness"))
             .await
             .unwrap();
+        assert_eq!(
+            store
+                .list_built_in_reviewer_defaults()
+                .unwrap()
+                .into_iter()
+                .find(|reviewer| reviewer.id == "correctness")
+                .unwrap(),
+            built_in_default
+        );
         let workspace_persona = AgentPersona {
             id: "workspace-only".into(),
             display_name: "Workspace only".into(),

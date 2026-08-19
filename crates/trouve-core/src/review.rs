@@ -2524,6 +2524,11 @@ impl Engine {
             router_model.as_deref().or(model.as_deref()),
         )
         .await?;
+        // Repository updates are partial read-modify-writes, and persona-backed
+        // reviewer defaults can change concurrently. Hold the shared mutation
+        // lane from the existing-state read through catalog validation and
+        // persistence so every field is derived from one coherent snapshot.
+        let _persona_mutation = self.persona_mutations.lock().await;
         let existing = self
             .store
             .list_code_review_repositories()?
@@ -2646,15 +2651,6 @@ impl Engine {
             )
             .await?;
         }
-        // Provider validation above can be slow. Acquire the persona lane only
-        // for the catalog-dependent validation and durable policy write.
-        let _persona_mutation = self.persona_mutations.lock().await;
-        self.resolve_code_review_reviewers(&reviewer_ids)?;
-        self.resolve_code_review_reviewers(&included_reviewer_ids)?;
-        self.resolve_code_review_reviewers(&excluded_reviewer_ids)?;
-        let reviewer_catalog = self.code_review_reviewer_catalog()?;
-        let reviewer_overrides =
-            self.normalize_reviewer_overrides(&reviewer_overrides, &reviewer_catalog)?;
         let normalized = UpdateCodeReviewRepositoryRequest {
             installation_id: request.installation_id,
             repository: request.repository.clone(),
