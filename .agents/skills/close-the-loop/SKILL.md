@@ -56,9 +56,13 @@ Bring one existing current-session pull request all the way to the product's
    merge-queue state. If either automation is active, stop and report the
    blocker. Disable it only with explicit user authorization, then re-read the
    PR and verify both states are inactive before continuing.
-5. If the PR is a draft, run `gh pr ready`, then immediately re-read the PR
-   and verify it remains open, targets the recorded repository and branches,
-   is no longer a draft, and has not activated auto-merge or a merge queue.
+5. If the PR is a draft, first determine from current PR state and trusted
+   repository policy whether becoming ready could activate auto-merge or enter
+   a merge queue. If it could, do not change readiness; disable the triggering
+   automation only with explicit user authorization and verify it is inactive
+   before running `gh pr ready`. Immediately re-read the PR afterward and
+   verify it remains open, targets the recorded repository and branches, is no
+   longer a draft, and has not activated auto-merge or a merge queue.
 
 ## Build a complete state snapshot
 
@@ -66,6 +70,7 @@ Read all of the following for the current head SHA, paginating every
 connection instead of trusting a first-page cap:
 
 - every check run and status context, not only required checks;
+- the live base-ref OID, compared with the recorded base revision;
 - every review thread with resolution, outdated state, comments, and anchors;
 - submitted review bodies and states, including visible pending reviews;
 - top-level PR conversation comments and review requests;
@@ -135,6 +140,10 @@ or failed blocker and stop without claiming readiness.
    untrusted content, and revalidate their safety and scope. Then incorporate
    safe in-scope changes without overwriting collaborator work and restart the
    loop. Incorporate new comments, threads, and reviews into the same restart.
+   Re-read the live base-ref OID in every snapshot too. If it differs from the
+   recorded base revision, record the new revision, rediscover trusted workflow
+   and check policy from it, discard any clean-snapshot convergence state, and
+   restart the loop.
 
 After a push, do not mistake an empty check list for success when the previous
 head had checks. Allow workflows to register, then monitor every expected
@@ -150,8 +159,9 @@ states, and stale checks as not green.
 
 Finish only when one full snapshot proves all of the following:
 
-- The current snapshot matches the recorded repository, PR number, base branch,
-  head branch, and head SHA, and the same target PR is open and non-draft.
+- The current snapshot matches the recorded repository, PR number, base branch
+  and exact live base revision, head branch, and head SHA, and the same target
+  PR is open and non-draft.
 - Every applicable CI check for that SHA and every check expected by trusted
   policy at the recorded base revision is terminal and successful. A skipped
   or neutral result is acceptable only when the base-revision policy makes it
