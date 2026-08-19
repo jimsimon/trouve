@@ -11548,7 +11548,8 @@ impl Engine {
                     }
                     if let Some((_, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
-                        && requests_pull_request_creation(tool, args, owner, repo)
+                        && (requests_pull_request_creation(tool, args, owner, repo)
+                            || might_request_pull_request_creation(tool, args))
                     {
                         github_creation_output
                             .entry(call_id.clone())
@@ -11793,21 +11794,28 @@ impl Engine {
                     if ok
                         && let Some(repository @ (host, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
-                        && requests_pull_request_creation(tool, args, owner, repo)
                     {
                         let mut numbers = pr_numbers_in_value(args, host, owner, repo);
-                        numbers.extend(pr_numbers_in_value(&result, host, owner, repo));
-                        if let Some(output) = github_creation_output.remove(&call_id) {
-                            numbers.extend(crate::github::pr_numbers_in_text(
-                                &output, host, owner, repo,
-                            ));
+                        let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
+                        let output_numbers = github_creation_output
+                            .remove(&call_id)
+                            .map(|output| {
+                                crate::github::pr_numbers_in_text(&output, host, owner, repo)
+                            })
+                            .unwrap_or_default();
+                        if requests_pull_request_creation(tool, args, owner, repo)
+                            || !result_numbers.is_empty()
+                            || !output_numbers.is_empty()
+                        {
+                            numbers.extend(result_numbers);
+                            numbers.extend(output_numbers);
+                            self.record_session_pr_numbers(
+                                &session.id,
+                                repository,
+                                numbers,
+                                &mut recorded_prs,
+                            )?;
                         }
-                        self.record_session_pr_numbers(
-                            &session.id,
-                            repository,
-                            numbers,
-                            &mut recorded_prs,
-                        )?;
                     } else {
                         github_creation_output.remove(&call_id);
                     }
@@ -12834,18 +12842,22 @@ impl Engine {
         if matches!(outcome.status, ToolStatus::Ok)
             && might_request_pull_request_creation(&call.name, &call.arguments)
             && let Ok(repository) = self.github_repository_for_session(session)
-            && requests_pull_request_creation(
-                &call.name,
-                &call.arguments,
-                &repository.1,
-                &repository.2,
-            )
         {
             let (host, owner, repo) = &repository;
             let mut recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
             let mut numbers = pr_numbers_in_value(&call.arguments, host, owner, repo);
-            numbers.extend(pr_numbers_in_value(&outcome.result, host, owner, repo));
-            self.record_session_pr_numbers(&session.id, &repository, numbers, &mut recorded_prs)?;
+            let result_numbers = pr_numbers_in_value(&outcome.result, host, owner, repo);
+            if requests_pull_request_creation(&call.name, &call.arguments, owner, repo)
+                || !result_numbers.is_empty()
+            {
+                numbers.extend(result_numbers);
+                self.record_session_pr_numbers(
+                    &session.id,
+                    &repository,
+                    numbers,
+                    &mut recorded_prs,
+                )?;
+            }
         }
         let model_result = outcome.result.to_string();
         let mut completion_events = vec![Event::ToolCompleted {
@@ -13872,15 +13884,25 @@ fn contains_rest_mutation(
 fn effective_activity_tool_call<'a>(
     tool: &'a str,
     args: &'a serde_json::Value,
-) -> Option<(&'a str, &'a serde_json::Value)> {
+) -> Option<(&'a str, std::borrow::Cow<'a, serde_json::Value>)> {
     let normalized = compact_activity(tool);
     if !matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall") {
-        return Some((tool, args));
+        return Some((tool, std::borrow::Cow::Borrowed(args)));
     }
     let nested_tool = ["tool", "toolName", "name"]
         .iter()
         .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))?;
-    let nested_args = args.get("arguments").filter(|value| value.is_object())?;
+    let nested_args = match args.get("arguments")? {
+        value if value.is_object() => std::borrow::Cow::Borrowed(value),
+        serde_json::Value::String(encoded) => {
+            let parsed = serde_json::from_str::<serde_json::Value>(encoded).ok()?;
+            if !parsed.is_object() {
+                return None;
+            }
+            std::borrow::Cow::Owned(parsed)
+        }
+        _ => return None,
+    };
     Some((nested_tool, nested_args))
 }
 
@@ -13923,9 +13945,21 @@ fn structured_repository_matches(args: &serde_json::Value, owner: &str, repo: &s
 /// A successful tool call that actually creates a pull request. Merely
 /// listing, viewing, or mentioning a PR must not associate it with a session.
 fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
+    let normalized = compact_activity(tool);
+    if matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall")
+        && let Some(nested_tool) = ["tool", "toolName", "name"]
+            .iter()
+            .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
+    {
+        let nested_compact = compact_activity(nested_tool);
+        if nested_compact.contains("createpullrequest") || nested_compact.ends_with("createpr") {
+            return true;
+        }
+    }
     let Some((tool, args)) = effective_activity_tool_call(tool, args) else {
         return false;
     };
+    let args = args.as_ref();
     let tool_compact = compact_activity(tool);
     if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
         return true;
@@ -13980,6 +14014,7 @@ fn requests_pull_request_creation(
     let Some((tool, args)) = effective_activity_tool_call(tool, args) else {
         return false;
     };
+    let args = args.as_ref();
     if !structured_repository_matches(args, owner, repo) {
         return false;
     }
@@ -14108,18 +14143,19 @@ fn pr_evidence_from_events(
                 if matches!(status, ToolStatus::Ok)
                     && let Some((tool, args)) = request
                 {
-                    let creates_pr = requests_pull_request_creation(&tool, &args, owner, repo);
+                    let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
+                    let output_numbers =
+                        crate::github::pr_numbers_in_text(&output, host, owner, repo);
+                    let creates_pr = requests_pull_request_creation(&tool, &args, owner, repo)
+                        || (might_request_pull_request_creation(&tool, &args)
+                            && (!result_numbers.is_empty() || !output_numbers.is_empty()));
                     let mutates_ref = requests_remote_ref_mutation(&tool, &args, owner, repo);
                     if creates_pr {
                         evidence
                             .numbers
                             .extend(pr_numbers_in_value(&args, host, owner, repo));
-                        evidence
-                            .numbers
-                            .extend(pr_numbers_in_value(&result, host, owner, repo));
-                        evidence.numbers.extend(crate::github::pr_numbers_in_text(
-                            &output, host, owner, repo,
-                        ));
+                        evidence.numbers.extend(result_numbers);
+                        evidence.numbers.extend(output_numbers);
                     }
                     if creates_pr || mutates_ref {
                         evidence.commit_ids.extend(git_commit_ids_in_value(&args));
@@ -18702,6 +18738,22 @@ default_permission_mode = "ask"
             "o",
             "r"
         ));
+        assert!(might_request_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "tool": "github.create_pull_request",
+                "arguments": "{undecodable"
+            })
+        ));
+        assert!(requests_pull_request_creation(
+            "mcpToolCall",
+            &serde_json::json!({
+                "tool": "github.create_pull_request",
+                "arguments": "{\"repository_full_name\":\"o/r\",\"head_branch\":\"fix/string\"}"
+            }),
+            "o",
+            "r"
+        ));
         assert!(!requests_pull_request_creation(
             "mcpToolCall",
             &serde_json::json!({
@@ -18864,14 +18916,17 @@ default_permission_mode = "ask"
                 }),
                 requires_approval: false,
             },
+            Event::ToolOutput {
+                call_id: "create-malformed-pr".into(),
+                chunk: "Opened https://github.com/jimsimon/trouve/pull/268".into(),
+            },
             Event::ToolCompleted {
                 call_id: "create-malformed-pr".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::json!({
                     "result": {
                         "structuredContent": {
-                            "number": 43,
-                            "url": "https://github.com/other/project/pull/43"
+                            "number": 268
                         }
                     }
                 }),
@@ -18880,8 +18935,8 @@ default_permission_mode = "ask"
         ];
 
         let evidence = pr_evidence_from_events(events, "github.com", "jimsimon", "trouve");
-        assert_eq!(evidence.numbers, HashSet::from([267]));
-        assert_eq!(evidence.successful_tool_args.len(), 1);
+        assert_eq!(evidence.numbers, HashSet::from([267, 268]));
+        assert_eq!(evidence.successful_tool_args.len(), 2);
     }
 
     #[test]
