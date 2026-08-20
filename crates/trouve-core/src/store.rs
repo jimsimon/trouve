@@ -720,6 +720,14 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
+    let had_theme_observation_publication_authority = conn.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('code_review_theme_observations')
+           WHERE name = 'published'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -728,7 +736,10 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
-    migrate_code_review_theme_observation_publication_authority(conn)?;
+    migrate_code_review_theme_observation_publication_authority(
+        conn,
+        had_theme_observation_publication_authority,
+    )?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
     normalize_code_review_publication_orders(conn)?;
@@ -756,6 +767,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
 /// applied twice.
 fn migrate_code_review_theme_observation_publication_authority(
     conn: &mut Connection,
+    had_publication_authority: bool,
 ) -> Result<()> {
     const MIGRATION_ID: &str = "code-review-theme-observation-publication-authority-v1";
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -786,6 +798,40 @@ fn migrate_code_review_theme_observation_publication_authority(
             "ALTER TABLE code_review_theme_observations
                ADD COLUMN publication_managed INTEGER NOT NULL DEFAULT 0;",
         )?;
+        if had_publication_authority {
+            // Transitional databases can contain both staged
+            // authority-managed rows and rollback rows whose eager writer
+            // already applied the same transition. Preserve only the latest
+            // unapplied row per theme. Pre-authority databases are excluded
+            // using the schema fact captured before generic migrations added
+            // `published`; their aggregate already includes every row.
+            tx.execute(
+                "UPDATE code_review_theme_observations AS observation
+                 SET publication_managed = 1
+                 WHERE observation.published = 0
+                   AND NOT EXISTS (
+                     SELECT 1 FROM code_review_theme_observations AS newer
+                     WHERE newer.theme_id = observation.theme_id
+                       AND (
+                         newer.created_at > observation.created_at
+                         OR (
+                           newer.created_at = observation.created_at
+                           AND newer.rowid > observation.rowid
+                         )
+                       )
+                   )
+                   AND EXISTS (
+                     SELECT 1 FROM code_review_themes AS theme
+                     WHERE theme.id = observation.theme_id
+                       AND NOT (
+                         theme.status = 'open'
+                         AND theme.last_seen_head = observation.head_sha
+                         AND theme.resolved_head = ''
+                       )
+                   )",
+                [],
+            )?;
+        }
     }
     tx.execute(
         "UPDATE code_review_theme_observations
@@ -18447,7 +18493,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_consumes_ambiguous_transitional_observations() {
+    fn migration_preserves_staged_observations_using_aggregate_evidence() {
         let data = tempfile::tempdir().unwrap();
         let database = data
             .path()
@@ -18536,12 +18582,9 @@ mod tests {
                 |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
             )
             .unwrap();
-        // The transitional table has no per-row writer evidence. Even though
-        // this row looks authority-managed, classifying it that way would
-        // replay indistinguishable rollback writes. Consume it conservatively.
-        assert_eq!(observation, (true, false));
+        assert_eq!(observation, (true, true));
         let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
-        assert_eq!(themes[0].status, "pending");
+        assert_eq!(themes[0].status, "open");
         assert_eq!(themes[0].last_seen_head, job.head_sha);
     }
 
@@ -18636,10 +18679,10 @@ mod tests {
             .unwrap();
             conn.execute(
                 "UPDATE code_review_themes
-                 SET status = 'resolved', last_seen_head = 'rollback-applied-head',
-                     resolved_head = 'rollback-resolved-head', recurrence_count = 5
+                 SET status = 'open', last_seen_head = ?2,
+                     resolved_head = '', recurrence_count = 5
                  WHERE id = ?1",
-                [&theme_id],
+                params![theme_id, job.head_sha],
             )
             .unwrap();
         }
@@ -18658,9 +18701,9 @@ mod tests {
             .unwrap();
         assert_eq!(observation, (true, false));
         let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
-        assert_eq!(themes[0].status, "resolved");
-        assert_eq!(themes[0].last_seen_head, "rollback-applied-head");
-        assert_eq!(themes[0].resolved_head, "rollback-resolved-head");
+        assert_eq!(themes[0].status, "open");
+        assert_eq!(themes[0].last_seen_head, job.head_sha);
+        assert!(themes[0].resolved_head.is_empty());
         assert_eq!(themes[0].recurrence_count, 5);
     }
 
