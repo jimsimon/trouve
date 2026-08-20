@@ -346,6 +346,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   candidate_issue_count INTEGER NOT NULL DEFAULT 0,
   issue_count INTEGER NOT NULL DEFAULT 0,
   fixed_issue_count INTEGER NOT NULL DEFAULT 0,
+  publication_open_issue_count INTEGER,
   summary TEXT NOT NULL DEFAULT '',
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   publication_claimed INTEGER NOT NULL DEFAULT 0,
@@ -491,6 +492,7 @@ CREATE TABLE IF NOT EXISTS code_review_theme_observations (
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
   head_sha TEXT NOT NULL,
   kind TEXT NOT NULL,
+  published INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   PRIMARY KEY (theme_id, job_id)
 );
@@ -499,10 +501,18 @@ CREATE INDEX IF NOT EXISTS code_review_theme_observations_job
 CREATE TABLE IF NOT EXISTS code_review_finding_themes (
   finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+  linked_by_job_id TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (finding_id, theme_id)
 );
 CREATE INDEX IF NOT EXISTS code_review_finding_themes_theme
   ON code_review_finding_themes (theme_id, finding_id);
+CREATE TABLE IF NOT EXISTS code_review_publication_manifest (
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
+  primary_finding_id TEXT NOT NULL,
+  publication_status TEXT NOT NULL,
+  PRIMARY KEY (job_id, finding_id)
+);
 CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
   candidate_id TEXT NOT NULL,
@@ -627,6 +637,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN candidate_issue_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN issue_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN fixed_issue_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_open_issue_count INTEGER",
     "ALTER TABLE code_review_jobs ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_for_agents TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_claimed INTEGER NOT NULL DEFAULT 0",
@@ -690,6 +701,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN publication_resolution_job_id TEXT",
+    "ALTER TABLE code_review_theme_observations ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_finding_themes ADD COLUMN linked_by_job_id TEXT NOT NULL DEFAULT ''",
     "UPDATE code_review_jobs
        SET publication_order = rowid
        WHERE publication_order = 0 AND publication_claimed != 0",
@@ -2119,6 +2132,91 @@ fn scoped_code_review_theme_id(
     } else {
         format!("{repository}#{pull_number}:{theme_id}")
     }
+}
+
+fn publish_code_review_theme_observations(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    published_at: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE code_review_themes
+         SET status = 'open',
+             last_seen_head = COALESCE((
+               SELECT observation.head_sha
+               FROM code_review_theme_observations observation
+               WHERE observation.theme_id = code_review_themes.id
+                 AND observation.job_id = ?1 AND observation.published = 0
+             ), last_seen_head),
+             resolved_head = '',
+             recurrence_count = recurrence_count + CASE WHEN EXISTS (
+               SELECT 1 FROM code_review_theme_observations observation
+               WHERE observation.theme_id = code_review_themes.id
+                 AND observation.job_id = ?1 AND observation.published = 0
+                 AND observation.kind = 'recurrence'
+             ) THEN 1 ELSE 0 END,
+             updated_at = ?2
+         WHERE EXISTS (
+           SELECT 1 FROM code_review_theme_observations observation
+           WHERE observation.theme_id = code_review_themes.id
+             AND observation.job_id = ?1 AND observation.published = 0
+         )",
+        params![job_id, published_at],
+    )?;
+    tx.execute(
+        "UPDATE code_review_theme_observations SET published = 1
+         WHERE job_id = ?1 AND published = 0",
+        params![job_id],
+    )?;
+    Ok(())
+}
+
+fn resolve_code_review_themes_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    repository: &str,
+    pull_number: u64,
+    resolved_head: &str,
+    resolved_at: &str,
+) -> Result<u64> {
+    Ok(tx.execute(
+        "UPDATE code_review_themes
+         SET status = 'resolved', resolved_head = ?3, updated_at = ?4
+         WHERE repository = ?1 AND pull_number = ?2 AND status = 'open'
+           AND EXISTS (
+             SELECT 1 FROM code_review_theme_observations observation
+             WHERE observation.theme_id = code_review_themes.id
+               AND observation.published != 0
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM code_review_finding_themes ft
+             JOIN code_review_findings f ON f.id = ft.finding_id
+             JOIN code_review_jobs j ON j.id = f.job_id
+             LEFT JOIN code_review_jobs link_job ON link_job.id = ft.linked_by_job_id
+             WHERE ft.theme_id = code_review_themes.id
+               AND f.status = 'open' AND j.review_published != 0
+               AND (ft.linked_by_job_id = '' OR link_job.review_published != 0)
+           )",
+        params![repository, pull_number as i64, resolved_head, resolved_at],
+    )? as u64)
+}
+
+fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE code_review_jobs
+         SET publication_open_issue_count = (
+           SELECT COUNT(*)
+           FROM code_review_findings finding
+           JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+           WHERE finding_job.repository = code_review_jobs.repository
+             AND finding_job.pull_number = code_review_jobs.pull_number
+             AND finding_job.review_published != 0
+             AND finding.status = 'open'
+         )
+         WHERE id = ?1",
+        params![job_id],
+    )?;
+    Ok(())
 }
 
 fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -8776,12 +8874,6 @@ impl Store {
             })?
             .collect::<rusqlite::Result<HashSet<_>>>()?
         };
-        let existing_observations = {
-            let mut stmt = tx
-                .prepare("SELECT theme_id FROM code_review_theme_observations WHERE job_id = ?1")?;
-            stmt.query_map(params![job_id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
-        };
         tx.execute(
             "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
             params![job_id],
@@ -8825,26 +8917,19 @@ impl Store {
                 })
                 .clone();
             existing_theme_ids.insert(theme_id.clone());
-            let recurrence_increment = i64::from(
-                matches!(
-                    theme.observation_kind,
-                    trouve_protocol::CodeReviewThemeObservationKind::Recurrence
-                ) && !existing_observations.contains(&theme_id),
-            );
             tx.execute(
                 "INSERT INTO code_review_themes
                         (id, repository, pull_number, root_cause, recommendation, status,
                          first_seen_head, last_seen_head, resolved_head, recurrence_count,
                          created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6, '', ?7, ?8, ?8)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6, '', 0, ?7, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                      root_cause = excluded.root_cause,
-                     recommendation = excluded.recommendation,
-                     status = 'open',
-                     last_seen_head = excluded.last_seen_head,
-                     resolved_head = '',
-                     recurrence_count = code_review_themes.recurrence_count + excluded.recurrence_count,
-                     updated_at = excluded.updated_at",
+                     recommendation = excluded.recommendation
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM code_review_theme_observations existing
+                     WHERE existing.theme_id = excluded.id AND existing.published != 0
+                 )",
                 params![
                     theme_id,
                     repository,
@@ -8852,14 +8937,13 @@ impl Store {
                     theme.root_cause,
                     theme.recommendation,
                     head_sha,
-                    recurrence_increment,
                     now,
                 ],
             )?;
             tx.execute(
                 "INSERT INTO code_review_theme_observations
-                        (theme_id, job_id, head_sha, kind, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (theme_id, job_id, head_sha, kind, published, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
                 params![
                     theme_id,
                     job_id,
@@ -8870,12 +8954,21 @@ impl Store {
             )?;
             for finding_id in &theme.previous_finding_ids {
                 tx.execute(
-                    "INSERT OR IGNORE INTO code_review_finding_themes (finding_id, theme_id)
-                     SELECT f.id, ?2
+                    "INSERT INTO code_review_finding_themes
+                            (finding_id, theme_id, linked_by_job_id)
+                     SELECT f.id, ?2, ?5
                      FROM code_review_findings f
                      JOIN code_review_jobs j ON j.id = f.job_id
-                     WHERE f.id = ?1 AND j.repository = ?3 AND j.pull_number = ?4",
-                    params![finding_id, theme_id, repository, pull_number],
+                     WHERE f.id = ?1 AND j.repository = ?3 AND j.pull_number = ?4
+                     ON CONFLICT(finding_id, theme_id) DO UPDATE SET
+                       linked_by_job_id = excluded.linked_by_job_id
+                     WHERE code_review_finding_themes.linked_by_job_id = ''
+                        OR NOT EXISTS (
+                          SELECT 1 FROM code_review_jobs link_job
+                          WHERE link_job.id = code_review_finding_themes.linked_by_job_id
+                            AND link_job.review_published != 0
+                        )",
+                    params![finding_id, theme_id, repository, pull_number, job_id],
                 )?;
             }
         }
@@ -8913,9 +9006,10 @@ impl Store {
                     )
                 });
                 tx.execute(
-                    "INSERT OR IGNORE INTO code_review_finding_themes (finding_id, theme_id)
-                     VALUES (?1, ?2)",
-                    params![finding_id, theme_id],
+                    "INSERT OR IGNORE INTO code_review_finding_themes
+                            (finding_id, theme_id, linked_by_job_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![finding_id, theme_id, job_id],
                 )?;
             }
             for source in &finding.sources {
@@ -9416,33 +9510,67 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?
         };
-        let mut findings = Vec::with_capacity(base_rows.len());
-        for mut finding in base_rows {
+        let mut sources_by_finding =
+            HashMap::<String, Vec<trouve_protocol::CodeReviewFindingSource>>::new();
+        {
             let mut stmt = conn.prepare(
-                "SELECT reviewer_id, reviewer_name, candidate_id, task_id
-                 FROM code_review_finding_sources
-                 WHERE finding_id = ?1 ORDER BY reviewer_name, candidate_id",
+                "SELECT source.finding_id, source.reviewer_id, source.reviewer_name,
+                        source.candidate_id, source.task_id
+                 FROM code_review_finding_sources source
+                 JOIN code_review_findings finding ON finding.id = source.finding_id
+                 WHERE finding.job_id = ?1 AND (?2 IS NULL OR finding.status = ?2)
+                 ORDER BY source.finding_id, source.reviewer_name, source.candidate_id",
             )?;
-            finding.sources = stmt
-                .query_map(params![finding.id], |row| {
-                    Ok(trouve_protocol::CodeReviewFindingSource {
-                        reviewer_id: row.get(0)?,
-                        reviewer_name: row.get(1)?,
-                        candidate_id: row.get(2)?,
-                        task_id: row.get(3)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut stmt = conn.prepare(
-                "SELECT theme_id FROM code_review_finding_themes
-                 WHERE finding_id = ?1 ORDER BY theme_id",
-            )?;
-            finding.theme_ids = stmt
-                .query_map(params![finding.id], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            findings.push(finding);
+            let rows = stmt.query_map(params![job_id, status], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(1)?,
+                        reviewer_name: row.get(2)?,
+                        candidate_id: row.get(3)?,
+                        task_id: row.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (finding_id, source) = row?;
+                sources_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(source);
+            }
         }
-        Ok(findings)
+        let mut themes_by_finding = HashMap::<String, Vec<String>>::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT link.finding_id, link.theme_id
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings finding ON finding.id = link.finding_id
+                 LEFT JOIN code_review_jobs link_job ON link_job.id = link.linked_by_job_id
+                 WHERE finding.job_id = ?1 AND (?2 IS NULL OR finding.status = ?2)
+                   AND (link.linked_by_job_id = '' OR link_job.review_published != 0
+                        OR link.linked_by_job_id = ?1)
+                 ORDER BY link.finding_id, link.theme_id",
+            )?;
+            let rows = stmt.query_map(params![job_id, status], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (finding_id, theme_id) = row?;
+                themes_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(theme_id);
+            }
+        }
+        Ok(base_rows
+            .into_iter()
+            .map(|mut finding| {
+                finding.sources = sources_by_finding.remove(&finding.id).unwrap_or_default();
+                finding.theme_ids = themes_by_finding.remove(&finding.id).unwrap_or_default();
+                finding
+            })
+            .collect())
     }
 
     pub fn open_code_review_findings(
@@ -9459,6 +9587,35 @@ impl Store {
         pull_number: u64,
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
         self.code_review_findings_for_pull_with_status(repository, pull_number, None)
+    }
+
+    pub fn code_review_finding_history_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        let job_ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT f.job_id, MAX(j.completed_at)
+                 FROM code_review_findings f
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1
+                 GROUP BY f.job_id
+                 ORDER BY MAX(f.status = 'open') DESC,
+                          MAX(j.completed_at) DESC,
+                          f.job_id DESC
+                 LIMIT 4",
+            )?;
+            stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut findings = Vec::new();
+        for job_id in job_ids.into_iter().rev() {
+            findings.extend(self.code_review_findings(&job_id)?);
+        }
+        Ok(findings)
     }
 
     fn code_review_findings_for_pull_with_status(
@@ -9559,33 +9716,76 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?
         };
-        let mut findings = Vec::with_capacity(base_rows.len());
-        for mut state in base_rows {
+        let mut sources_by_finding =
+            HashMap::<String, Vec<trouve_protocol::CodeReviewFindingSource>>::new();
+        {
             let mut stmt = conn.prepare(
-                "SELECT reviewer_id, reviewer_name, candidate_id, task_id
-                 FROM code_review_finding_sources
-                 WHERE finding_id = ?1 ORDER BY reviewer_name, candidate_id",
+                "SELECT source.finding_id, source.reviewer_id, source.reviewer_name,
+                        source.candidate_id, source.task_id
+                 FROM code_review_finding_sources source
+                 JOIN code_review_findings finding ON finding.id = source.finding_id
+                 JOIN code_review_jobs job ON job.id = finding.job_id
+                 WHERE job.repository = ?1 AND job.pull_number = ?2
+                   AND job.review_published = 1
+                   AND finding.status IN ('open', 'fixed', 'dismissed')
+                 ORDER BY source.finding_id, source.reviewer_name, source.candidate_id",
             )?;
-            state.finding.sources = stmt
-                .query_map(params![state.finding.id], |row| {
-                    Ok(trouve_protocol::CodeReviewFindingSource {
-                        reviewer_id: row.get(0)?,
-                        reviewer_name: row.get(1)?,
-                        candidate_id: row.get(2)?,
-                        task_id: row.get(3)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut stmt = conn.prepare(
-                "SELECT theme_id FROM code_review_finding_themes
-                 WHERE finding_id = ?1 ORDER BY theme_id",
-            )?;
-            state.finding.theme_ids = stmt
-                .query_map(params![state.finding.id], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            findings.push(state);
+            let rows = stmt.query_map(params![repository, pull_number as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(1)?,
+                        reviewer_name: row.get(2)?,
+                        candidate_id: row.get(3)?,
+                        task_id: row.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (finding_id, source) = row?;
+                sources_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(source);
+            }
         }
-        Ok(findings)
+        let mut themes_by_finding = HashMap::<String, Vec<String>>::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT link.finding_id, link.theme_id
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings finding ON finding.id = link.finding_id
+                 JOIN code_review_jobs job ON job.id = finding.job_id
+                 LEFT JOIN code_review_jobs link_job ON link_job.id = link.linked_by_job_id
+                 WHERE job.repository = ?1 AND job.pull_number = ?2
+                   AND job.review_published = 1
+                   AND finding.status IN ('open', 'fixed', 'dismissed')
+                   AND (link.linked_by_job_id = '' OR link_job.review_published != 0)
+                 ORDER BY link.finding_id, link.theme_id",
+            )?;
+            let rows = stmt.query_map(params![repository, pull_number as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (finding_id, theme_id) = row?;
+                themes_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(theme_id);
+            }
+        }
+        Ok(base_rows
+            .into_iter()
+            .map(|mut state| {
+                state.finding.sources = sources_by_finding
+                    .remove(&state.finding.id)
+                    .unwrap_or_default();
+                state.finding.theme_ids = themes_by_finding
+                    .remove(&state.finding.id)
+                    .unwrap_or_default();
+                state
+            })
+            .collect())
     }
 
     pub(crate) fn record_code_review_thread_state(
@@ -9644,6 +9844,14 @@ impl Store {
                      resolved_at = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
                        ELSE resolved_at
+                     END,
+                     resolved_head = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       ELSE resolved_head
+                     END,
+                     resolved_by_job_id = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       ELSE resolved_by_job_id
                      END
                  WHERE id = ?1",
                 params![
@@ -9654,6 +9862,16 @@ impl Store {
                     recheck_pending
                 ],
             )?;
+            if reopened_closed_finding {
+                tx.execute(
+                    "UPDATE code_review_themes
+                     SET status = 'open', resolved_head = '', updated_at = ?2
+                     WHERE id IN (
+                       SELECT theme_id FROM code_review_finding_themes WHERE finding_id = ?1
+                     )",
+                    params![finding_id, chrono::Utc::now().to_rfc3339()],
+                )?;
+            }
         }
         tx.commit()?;
         Ok((state_changed || reopened_closed_finding, generation as u64))
@@ -9664,32 +9882,76 @@ impl Store {
         repository: &str,
         pull_number: u64,
     ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        self.code_review_themes_for_pull_or_job(repository, pull_number, "", i64::MAX)
+    }
+
+    pub fn code_review_theme_history_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        self.code_review_themes_for_pull_or_job(repository, pull_number, "", limit as i64)
+    }
+
+    pub fn code_review_themes_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        let (repository, pull_number) = self.conn.lock().unwrap().query_row(
+            "SELECT repository, pull_number FROM code_review_jobs WHERE id = ?1",
+            params![job_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+        )?;
+        self.code_review_themes_for_pull_or_job(&repository, pull_number, job_id, i64::MAX)
+    }
+
+    fn code_review_themes_for_pull_or_job(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        staged_job_id: &str,
+        limit: i64,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
         let conn = self.conn.lock().unwrap();
         let mut themes = {
             let mut stmt = conn.prepare(
                 "SELECT id, repository, pull_number, root_cause, recommendation, status,
                         first_seen_head, last_seen_head, resolved_head, recurrence_count
-                 FROM code_review_themes
-                 WHERE repository = ?1 AND pull_number = ?2
+                 FROM (
+                   SELECT *
+                   FROM code_review_themes
+                   WHERE repository = ?1 AND pull_number = ?2
+                     AND EXISTS (
+                       SELECT 1 FROM code_review_theme_observations visible
+                       WHERE visible.theme_id = code_review_themes.id
+                         AND (visible.published != 0 OR visible.job_id = ?3)
+                     )
+                   ORDER BY status = 'open' DESC, updated_at DESC, id
+                   LIMIT ?4
+                 )
                  ORDER BY updated_at, id",
             )?;
-            stmt.query_map(params![repository, pull_number as i64], |row| {
-                Ok(trouve_protocol::CodeReviewTheme {
-                    id: row.get(0)?,
-                    repository: row.get(1)?,
-                    pull_number: row.get::<_, i64>(2)? as u64,
-                    root_cause: row.get(3)?,
-                    recommendation: row.get(4)?,
-                    status: row.get(5)?,
-                    first_seen_head: row.get(6)?,
-                    last_seen_head: row.get(7)?,
-                    resolved_head: row.get(8)?,
-                    recurrence_count: row.get::<_, i64>(9)? as u64,
-                    affected_paths: Vec::new(),
-                    finding_ids: Vec::new(),
-                    observations: Vec::new(),
-                })
-            })?
+            stmt.query_map(
+                params![repository, pull_number as i64, staged_job_id, limit],
+                |row| {
+                    Ok(trouve_protocol::CodeReviewTheme {
+                        id: row.get(0)?,
+                        repository: row.get(1)?,
+                        pull_number: row.get::<_, i64>(2)? as u64,
+                        root_cause: row.get(3)?,
+                        recommendation: row.get(4)?,
+                        status: row.get(5)?,
+                        first_seen_head: row.get(6)?,
+                        last_seen_head: row.get(7)?,
+                        resolved_head: row.get(8)?,
+                        recurrence_count: row.get::<_, i64>(9)? as u64,
+                        affected_paths: Vec::new(),
+                        finding_ids: Vec::new(),
+                        observations: Vec::new(),
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for theme in &mut themes {
@@ -9697,10 +9959,16 @@ impl Store {
                 "SELECT f.id, f.path
                  FROM code_review_finding_themes ft
                  JOIN code_review_findings f ON f.id = ft.finding_id
-                 WHERE ft.theme_id = ?1 ORDER BY f.created_at, f.id",
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 LEFT JOIN code_review_jobs link_job ON link_job.id = ft.linked_by_job_id
+                 WHERE ft.theme_id = ?1
+                   AND (j.review_published != 0 OR f.job_id = ?2)
+                   AND (ft.linked_by_job_id = '' OR link_job.review_published != 0
+                        OR ft.linked_by_job_id = ?2)
+                 ORDER BY f.created_at, f.id",
             )?;
             let members = stmt
-                .query_map(params![theme.id], |row| {
+                .query_map(params![theme.id, staged_job_id], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -9716,11 +9984,16 @@ impl Store {
                     "SELECT f.job_id, f.id
                      FROM code_review_finding_themes ft
                      JOIN code_review_findings f ON f.id = ft.finding_id
+                     JOIN code_review_jobs j ON j.id = f.job_id
+                     LEFT JOIN code_review_jobs link_job ON link_job.id = ft.linked_by_job_id
                      WHERE ft.theme_id = ?1
+                       AND (j.review_published != 0 OR f.job_id = ?2)
+                       AND (ft.linked_by_job_id = '' OR link_job.review_published != 0
+                            OR ft.linked_by_job_id = ?2)
                      ORDER BY f.job_id, f.id",
                 )?;
                 let rows = stmt
-                    .query_map(params![theme.id], |row| {
+                    .query_map(params![theme.id, staged_job_id], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -9736,10 +10009,12 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT o.job_id, o.head_sha, o.kind, o.created_at
                  FROM code_review_theme_observations o
-                 WHERE o.theme_id = ?1 ORDER BY o.created_at, o.job_id",
+                 WHERE o.theme_id = ?1
+                   AND (o.published != 0 OR o.job_id = ?2)
+                 ORDER BY o.created_at, o.job_id",
             )?;
             theme.observations = stmt
-                .query_map(params![theme.id], |row| {
+                .query_map(params![theme.id, staged_job_id], |row| {
                     let job_id: String = row.get(0)?;
                     Ok(trouve_protocol::CodeReviewThemeObservation {
                         finding_ids: finding_ids_by_job.get(&job_id).cloned().unwrap_or_default(),
@@ -9760,24 +10035,17 @@ impl Store {
         pull_number: u64,
         resolved_head: &str,
     ) -> Result<u64> {
-        let updated = self.conn.lock().unwrap().execute(
-            "UPDATE code_review_themes
-             SET status = 'resolved', resolved_head = ?3, updated_at = ?4
-             WHERE repository = ?1 AND pull_number = ?2 AND status = 'open'
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM code_review_finding_themes ft
-                   JOIN code_review_findings f ON f.id = ft.finding_id
-                   WHERE ft.theme_id = code_review_themes.id AND f.status = 'open'
-               )",
-            params![
-                repository,
-                pull_number as i64,
-                resolved_head,
-                chrono::Utc::now().to_rfc3339(),
-            ],
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let updated = resolve_code_review_themes_in_transaction(
+            &tx,
+            repository,
+            pull_number,
+            resolved_head,
+            &chrono::Utc::now().to_rfc3339(),
         )?;
-        Ok(updated as u64)
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn code_review_job_detail(
@@ -9812,8 +10080,7 @@ impl Store {
         let personas = code_review_persona_results(&attempts);
         let tasks = attempts.into_iter().map(|attempt| attempt.task).collect();
         let findings = self.code_review_findings(id)?;
-        let themes =
-            self.code_review_themes_for_pull(&record.job.repository, record.job.pull_number)?;
+        let themes = self.code_review_themes_for_job(id)?;
         let candidate_rejections = self.code_review_candidate_rejections(id)?;
         let routing_decisions = self.code_review_routing_decisions(id)?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
@@ -10235,42 +10502,39 @@ impl Store {
                 params![repository, start_param],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let mut rounds: BTreeMap<(String, u64), Vec<u64>> = BTreeMap::new();
-            let mut stmt = conn.prepare(
-                "SELECT repository, pull_number, issue_count
-                 FROM code_review_jobs
-                 WHERE status = 'succeeded'
-                   AND (?1 IS NULL OR repository = ?1)
-                   AND (?2 IS NULL OR completed_at >= ?2)
-                 ORDER BY repository, pull_number, completed_at, created_at",
+            let (
+                pull_request_count,
+                clean_pull_request_count,
+                average_rounds_to_clean,
+                max_rounds_to_clean,
+            ): (i64, i64, f64, i64) = conn.query_row(
+                "WITH ranked AS (
+                   SELECT repository, pull_number,
+                          ROW_NUMBER() OVER (
+                            PARTITION BY repository, pull_number
+                            ORDER BY completed_at, created_at, rowid
+                          ) AS round_number,
+                          publication_open_issue_count
+                   FROM code_review_jobs
+                   WHERE status = 'succeeded'
+                     AND (?1 IS NULL OR repository = ?1)
+                     AND (?2 IS NULL OR completed_at >= ?2)
+                 ),
+                 pull_rounds AS (
+                   SELECT repository, pull_number,
+                          MIN(CASE WHEN publication_open_issue_count = 0
+                                   THEN round_number END) AS rounds_to_clean
+                   FROM ranked
+                   GROUP BY repository, pull_number
+                 )
+                 SELECT COUNT(*),
+                        COUNT(rounds_to_clean),
+                        COALESCE(AVG(rounds_to_clean), 0.0),
+                        COALESCE(MAX(rounds_to_clean), 0)
+                 FROM pull_rounds",
+                params![repository, start_param],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
-            for row in stmt.query_map(params![repository, start_param], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                ))
-            })? {
-                let (repository, pull_number, issues) = row?;
-                rounds
-                    .entry((repository, pull_number))
-                    .or_default()
-                    .push(issues);
-            }
-            let rounds_to_clean = rounds
-                .values()
-                .filter_map(|issues| {
-                    issues
-                        .iter()
-                        .position(|count| *count == 0)
-                        .map(|index| index as u64 + 1)
-                })
-                .collect::<Vec<_>>();
-            let average_rounds_to_clean = if rounds_to_clean.is_empty() {
-                0.0
-            } else {
-                rounds_to_clean.iter().sum::<u64>() as f64 / rounds_to_clean.len() as f64
-            };
             trouve_protocol::CodeReviewChurnStats {
                 recurrence_issue_count: recurrence as u64,
                 fix_regression_issue_count: fix_regression as u64,
@@ -10278,10 +10542,10 @@ impl Store {
                 grouped_issue_count: grouped as u64,
                 external_duplicate_count: external_duplicates as u64,
                 insufficient_evidence_rejection_count: insufficient_evidence as u64,
-                pull_request_count: rounds.len() as u64,
-                clean_pull_request_count: rounds_to_clean.len() as u64,
+                pull_request_count: pull_request_count as u64,
+                clean_pull_request_count: clean_pull_request_count as u64,
                 average_rounds_to_clean,
-                max_rounds_to_clean: rounds_to_clean.iter().copied().max().unwrap_or_default(),
+                max_rounds_to_clean: max_rounds_to_clean as u64,
             }
         };
         let repositories = repositories
@@ -10571,6 +10835,68 @@ impl Store {
         )? > 0)
     }
 
+    pub fn prepare_code_review_publication_manifest(
+        &self,
+        job_id: &str,
+        entries: &[(&str, &str, &str)],
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let prepared: bool = tx.query_row(
+            "SELECT publication_claimed != 0 AND publication_dispatched = 0
+                    AND publication_accepted = 0
+             FROM code_review_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        if !prepared {
+            return Ok(false);
+        }
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM code_review_publication_manifest WHERE job_id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        if existing == 0 {
+            for (finding_id, primary_finding_id, publication_status) in entries {
+                tx.execute(
+                    "INSERT INTO code_review_publication_manifest
+                            (job_id, finding_id, primary_finding_id, publication_status)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![job_id, finding_id, primary_finding_id, publication_status],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn code_review_publication_manifest(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT finding_id, primary_finding_id, publication_status
+             FROM code_review_publication_manifest WHERE job_id = ?1
+             ORDER BY finding_id",
+        )?;
+        Ok(stmt
+            .query_map(params![job_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn reset_code_review_publication_dispatch(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET publication_dispatched = 0
+             WHERE id = ?1 AND publication_claimed != 0
+               AND publication_dispatched != 0 AND publication_accepted = 0",
+            params![id],
+        )? > 0)
+    }
+
     pub fn mark_code_review_publication_accepted(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
@@ -10585,7 +10911,8 @@ impl Store {
             "UPDATE code_review_jobs
              SET publication_claimed = 0, publication_dispatched = 0,
                  publication_accepted = 0, publication_order = 0
-             WHERE id = ?1 AND publication_accepted = 0",
+             WHERE id = ?1 AND publication_accepted = 0
+               AND publication_dispatched = 0",
             params![id],
         )? > 0)
     }
@@ -10665,6 +10992,8 @@ impl Store {
             tx.execute(
                 "UPDATE code_review_findings
                  SET status = 'fixed', resolved_at = ?2,
+                     resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?1),
+                     resolved_by_job_id = ?1,
                      publication_resolution_job_id = NULL,
                      collapse_attempts = CASE
                          WHEN github_comment_id IS NOT NULL THEN 0
@@ -10690,6 +11019,20 @@ impl Store {
                 params![id, fixed as i64],
             )?;
         }
+        let (repository, pull_number, head_sha): (String, i64, String) = tx.query_row(
+            "SELECT repository, pull_number, head_sha FROM code_review_jobs WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        publish_code_review_theme_observations(&tx, id, &published_at)?;
+        resolve_code_review_themes_in_transaction(
+            &tx,
+            &repository,
+            pull_number as u64,
+            &head_sha,
+            &published_at,
+        )?;
+        record_code_review_open_issue_count(&tx, id)?;
         tx.execute(
             "INSERT INTO code_review_pr_state
                         (repository, pull_number, last_reviewed_head_sha,
@@ -10989,6 +11332,8 @@ impl Store {
             tx.execute(
                 "UPDATE code_review_findings
                  SET status = 'fixed', resolved_at = ?2,
+                     resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?1),
+                     resolved_by_job_id = ?1,
                      publication_resolution_job_id = NULL,
                      collapse_attempts = CASE
                          WHEN github_comment_id IS NOT NULL THEN 0
@@ -11026,6 +11371,15 @@ impl Store {
         if updated == 0 {
             anyhow::bail!("review job changed before GitHub publication was recorded");
         }
+        publish_code_review_theme_observations(&tx, id, &published_at)?;
+        resolve_code_review_themes_in_transaction(
+            &tx,
+            repository,
+            pull_number,
+            head_sha,
+            &published_at,
+        )?;
+        record_code_review_open_issue_count(&tx, id)?;
         tx.execute(
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
@@ -17349,12 +17703,15 @@ mod tests {
 
         let first_findings = save(&first_job.id, "shared-state");
         let second_findings = save(&second_job.id, "shared-state");
-        let mut first_themes = store
-            .code_review_themes_for_pull("acme/widgets", 42)
-            .unwrap();
-        let second_themes = store
-            .code_review_themes_for_pull("acme/widgets", 43)
-            .unwrap();
+        assert!(
+            store
+                .code_review_themes_for_pull("acme/widgets", 42)
+                .unwrap()
+                .is_empty(),
+            "an unpublished attempt must not enter authoritative PR history"
+        );
+        let mut first_themes = store.code_review_themes_for_job(&first_job.id).unwrap();
+        let second_themes = store.code_review_themes_for_job(&second_job.id).unwrap();
 
         assert_eq!(first_themes.len(), 1);
         assert_eq!(second_themes.len(), 1);
@@ -17369,9 +17726,7 @@ mod tests {
 
         let scoped_id = first_themes[0].id.clone();
         let replacement_findings = save(&first_job.id, &scoped_id);
-        first_themes = store
-            .code_review_themes_for_pull("acme/widgets", 42)
-            .unwrap();
+        first_themes = store.code_review_themes_for_job(&first_job.id).unwrap();
         assert_eq!(first_themes.len(), 1);
         assert_eq!(first_themes[0].id, scoped_id);
         assert_eq!(replacement_findings[0].theme_ids, [scoped_id]);
@@ -18459,6 +18814,18 @@ mod tests {
             .unwrap();
         store
             .finish_code_review_job(&second.id, "succeeded", "", "")
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET publication_open_issue_count =
+                   CASE WHEN id = ?1 THEN 3 WHEN id = ?2 THEN 0 END
+                 WHERE id IN (?1, ?2)",
+                params![first.id, second.id],
+            )
             .unwrap();
 
         let stats = store

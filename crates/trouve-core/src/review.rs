@@ -4801,7 +4801,7 @@ impl Engine {
         let candidates = structurally_valid_candidates(candidates, &diff_files);
         let all_previous_findings = self
             .store
-            .code_review_findings_for_pull(&job.repository, job.pull_number)?
+            .code_review_finding_history_for_pull(&job.repository, job.pull_number)?
             .into_iter()
             .filter(|finding| finding.job_id != job.id)
             .collect::<Vec<_>>();
@@ -4811,9 +4811,11 @@ impl Engine {
             .cloned()
             .collect::<Vec<_>>();
         let finding_history = prioritized_finding_history(&all_previous_findings);
-        let all_previous_themes = self
-            .store
-            .code_review_themes_for_pull(&job.repository, job.pull_number)?;
+        let all_previous_themes = self.store.code_review_theme_history_for_pull(
+            &job.repository,
+            job.pull_number,
+            REVIEW_HISTORY_MAX_THEMES,
+        )?;
         let previous_themes = prioritized_theme_history(&all_previous_themes);
         let load_external_comments = async {
             if candidates.is_empty() && previous_findings.is_empty() {
@@ -5124,12 +5126,6 @@ impl Engine {
             !published_review.blocking,
             &resolved_finding_ids,
         )?;
-        self.store
-            .resolve_code_review_themes_without_open_findings(
-                &job.repository,
-                job.pull_number,
-                &job.head_sha,
-            )?;
         // Collapsing the remote threads is cleanup detached from the round
         // entirely: it starts only after every piece of publication
         // bookkeeping, runs outside the job future with individually bounded
@@ -6017,9 +6013,7 @@ impl Engine {
         findings: &[trouve_protocol::CodeReviewFinding],
         has_unresolved_findings: bool,
     ) -> Result<PublishedReviewOutcome> {
-        let themes = self
-            .store
-            .code_review_themes_for_pull(&job.repository, job.pull_number)?;
+        let themes = self.store.code_review_themes_for_job(&job.id)?;
         let publication_groups = review_theme_publication_groups(findings, &themes);
         let grouped_ids = publication_groups
             .iter()
@@ -6029,6 +6023,17 @@ impl Engine {
         let grouped_primary = publication_groups
             .iter()
             .map(|group| (group.members[0].id.as_str(), group))
+            .collect::<HashMap<_, _>>();
+        let grouped_primary_ids = publication_groups
+            .iter()
+            .flat_map(|group| {
+                let primary = group.members[0].id.as_str();
+                group
+                    .members
+                    .iter()
+                    .skip(1)
+                    .map(move |finding| (finding.id.as_str(), primary))
+            })
             .collect::<HashMap<_, _>>();
         let mut comments = Vec::new();
         let mut eligible_findings = Vec::new();
@@ -6057,6 +6062,34 @@ impl Engine {
                 }));
                 eligible_findings.push(finding);
             }
+        }
+        let manifest = findings
+            .iter()
+            .map(|finding| {
+                let status = if !finding.has_inline_location() {
+                    "not_eligible"
+                } else if !finding.is_publishable() {
+                    "suppressed_by_policy"
+                } else if grouped_ids.contains(finding.id.as_str()) {
+                    "grouped_by_theme"
+                } else {
+                    "eligible"
+                };
+                (
+                    finding.id.as_str(),
+                    grouped_primary_ids
+                        .get(finding.id.as_str())
+                        .copied()
+                        .unwrap_or(finding.id.as_str()),
+                    status,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !self
+            .store
+            .prepare_code_review_publication_manifest(&job.id, &manifest)?
+        {
+            bail!("review changed before its publication manifest was prepared");
         }
         self.persist_publication_status_best_effort(
             &job.id,
@@ -6219,6 +6252,13 @@ impl Engine {
                     url: published.html_url,
                     blocking: event == "REQUEST_CHANGES",
                 });
+            }
+
+            // An HTTP response proves that GitHub did not accept this request.
+            // Clear the ambiguous-dispatch marker before any retry or claim
+            // release; transport errors above intentionally remain ambiguous.
+            if !self.store.reset_code_review_publication_dispatch(&job.id)? {
+                bail!("review publication changed after GitHub rejected the request");
             }
 
             let body = match response.text().await {
@@ -6647,20 +6687,23 @@ impl Engine {
             | ReviewPublicationPhase::Reconciled => {}
         }
         let findings = self.store.code_review_findings(&job.id)?;
-        let themes = self
-            .store
-            .code_review_themes_for_pull(&job.repository, job.pull_number)?;
-        let publication_groups = review_theme_publication_groups(&findings, &themes);
-        let grouped_ids = publication_groups
+        let manifest = self.store.code_review_publication_manifest(&job.id)?;
+        let status_by_finding = manifest
             .iter()
-            .flat_map(|group| group.members.iter().skip(1))
-            .map(|finding| finding.id.as_str())
-            .collect::<HashSet<_>>();
-        let grouped_finding_ids = grouped_ids.iter().copied().collect::<Vec<_>>();
+            .map(|(finding_id, _, status)| (finding_id.as_str(), status.as_str()))
+            .collect::<HashMap<_, _>>();
+        let grouped_finding_ids = manifest
+            .iter()
+            .filter(|(_, _, status)| status == "grouped_by_theme")
+            .map(|(finding_id, _, _)| finding_id.as_str())
+            .collect::<Vec<_>>();
         let mut repaired_statuses = 0;
         let ineligible_ids = findings
             .iter()
-            .filter(|finding| !finding.has_inline_location())
+            .filter(|finding| {
+                status_by_finding.get(finding.id.as_str()) == Some(&"not_eligible")
+                    || (manifest.is_empty() && !finding.has_inline_location())
+            })
             .map(|finding| finding.id.as_str())
             .collect::<Vec<_>>();
         repaired_statuses += self.store.set_code_review_findings_publication_status(
@@ -6669,7 +6712,12 @@ impl Engine {
         )?;
         let suppressed_ids = findings
             .iter()
-            .filter(|finding| finding.has_inline_location() && !finding.is_publishable())
+            .filter(|finding| {
+                status_by_finding.get(finding.id.as_str()) == Some(&"suppressed_by_policy")
+                    || (manifest.is_empty()
+                        && finding.has_inline_location()
+                        && !finding.is_publishable())
+            })
             .map(|finding| finding.id.as_str())
             .collect::<Vec<_>>();
         repaired_statuses += self.store.set_code_review_findings_publication_status(
@@ -6683,7 +6731,8 @@ impl Engine {
         let eligible = findings
             .iter()
             .filter(|finding| {
-                finding.is_publishable() && !grouped_ids.contains(finding.id.as_str())
+                status_by_finding.get(finding.id.as_str()) == Some(&"eligible")
+                    || (manifest.is_empty() && finding.is_publishable())
             })
             .collect::<Vec<_>>();
         let has_review_url = !record.job.review_url.is_empty()
@@ -8966,7 +9015,12 @@ fn render_inline_finding_with_theme(
         source_names
     };
     let evidence = &finding.evidence;
-    let evidence = if evidence.execution_path.is_empty() {
+    let evidence = if evidence.preconditions.is_empty()
+        && evidence.execution_path.is_empty()
+        && evidence.consequence.is_empty()
+        && evidence.introduction.is_empty()
+        && evidence.regression_test.is_empty()
+    {
         String::new()
     } else {
         format!(
@@ -8987,26 +9041,30 @@ fn render_inline_finding_with_theme(
         let manifestations = manifestations
             .iter()
             .map(|finding| {
-                format!(
-                    "- `{}` line {}: {}",
-                    finding.path, finding.line, finding.title
+                bounded_utf8(
+                    &format!(
+                        "- `{}` line {}: {}",
+                        finding.path, finding.line, finding.title
+                    ),
+                    512,
+                    "…",
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "\n\n**Shared root cause:** {root_cause}\n\nRecommended structural fix: \
-             {recommendation}\n\nManifestations grouped under this root cause:\n{manifestations}",
+            "\n\nManifestations grouped under this root cause:\n{manifestations}\n\n\
+             **Shared root cause:** {root_cause}\n\nRecommended structural fix: {recommendation}",
             root_cause = theme.root_cause,
             recommendation = theme.recommendation,
         )
     });
     let body = format!(
-        "**{title}**\n_Identified by: {source_names} | Severity: {severity} | Confidence: {confidence}_\n\n\
-         {body}{evidence}{theme_context}\n\n\
+        "**{title}**\n_Identified by: {source_names} | Severity: {severity} | Confidence: {confidence}_{theme_context}\n\n\
+         {body}{evidence}\n\n\
          <details><summary>Prompt for agents</summary>\n\n```text\n{prompt}\n```\n\n</details>",
-        title = finding.title,
-        source_names = source_names,
+        title = bounded_utf8(&finding.title, 512, "…"),
+        source_names = bounded_utf8(&source_names, 512, "…"),
         severity = finding.severity.to_ascii_uppercase(),
         confidence = finding.confidence.to_ascii_uppercase(),
         body = finding.body,
@@ -10216,21 +10274,31 @@ fn bounded_json_text(value: &str, max_serialized_bytes: usize, marker: &str) -> 
         return value.to_owned();
     }
 
+    fn encoded_character_len(character: char) -> usize {
+        match character {
+            '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        }
+    }
+
+    let content_budget = max_serialized_bytes.saturating_sub(2);
+    let marker_len = marker.chars().map(encoded_character_len).sum::<usize>();
+    if marker_len > content_budget {
+        return String::new();
+    }
+    let value_budget = content_budget - marker_len;
     let mut bounded = String::new();
+    let mut encoded_len = 0_usize;
     for character in value.chars() {
-        let mut candidate = bounded.clone();
-        candidate.push(character);
-        candidate.push_str(marker);
-        if serde_json::to_string(&candidate)
-            .map_or(true, |encoded| encoded.len() > max_serialized_bytes)
-        {
+        let character_len = encoded_character_len(character);
+        if encoded_len.saturating_add(character_len) > value_budget {
             break;
         }
         bounded.push(character);
+        encoded_len += character_len;
     }
-    if serde_json::to_string(marker).is_ok_and(|encoded| encoded.len() <= max_serialized_bytes) {
-        bounded.push_str(marker);
-    }
+    bounded.push_str(marker);
     bounded
 }
 
@@ -14262,7 +14330,7 @@ mod tests {
         );
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert!(record.publication_claimed);
-        assert!(record.publication_dispatched);
+        assert!(!record.publication_dispatched);
         assert!(!record.publication_accepted);
         assert_eq!(
             engine.store.code_review_findings(&job.id).unwrap()[0].github_publication_status,

@@ -392,7 +392,7 @@ export interface ReviewStats {
   coordinator_duration: DurationStats;
   publication_duration: DurationStats;
   issue_count: number;
-  churn: {
+  churn?: {
     recurrence_issue_count: number;
     fix_regression_issue_count: number;
     previously_missed_issue_count: number;

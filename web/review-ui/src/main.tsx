@@ -2583,6 +2583,18 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
   const [repository, setRepository] = useState("");
   const [stats, setStats] = useState<ReviewStats | null>(null);
   const [error, setError] = useState("");
+  const churn = stats?.churn ?? {
+    recurrence_issue_count: 0,
+    fix_regression_issue_count: 0,
+    previously_missed_issue_count: 0,
+    grouped_issue_count: 0,
+    external_duplicate_count: 0,
+    insufficient_evidence_rejection_count: 0,
+    pull_request_count: 0,
+    clean_pull_request_count: 0,
+    average_rounds_to_clean: 0,
+    max_rounds_to_clean: 0,
+  };
   useEffect(() => {
     let alive = true;
     getStats(range, repository)
@@ -2641,17 +2653,17 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
           <section class="panel">
             <PanelTitle
               title="Review churn"
-              subtitle={`${stats.churn.clean_pull_request_count} of ${stats.churn.pull_request_count} pull requests reached a clean review in this range.`}
+              subtitle={`${churn.clean_pull_request_count} of ${churn.pull_request_count} pull requests reached a clean review in this range.`}
             />
             <div class="metric-grid">
-              <Metric label="Recurrences" value={stats.churn.recurrence_issue_count} color="red" />
-              <Metric label="Fix regressions" value={stats.churn.fix_regression_issue_count} color="red" />
-              <Metric label="Previously missed" value={stats.churn.previously_missed_issue_count} color="amber" />
-              <Metric label="Grouped symptoms" value={stats.churn.grouped_issue_count} color="blue" />
-              <Metric label="External duplicates" value={stats.churn.external_duplicate_count} color="green" />
-              <Metric label="Weak evidence rejected" value={stats.churn.insufficient_evidence_rejection_count} color="green" />
-              <Metric label="Avg rounds to clean" value={Math.round(stats.churn.average_rounds_to_clean * 10) / 10} color="blue" />
-              <Metric label="Max rounds to clean" value={stats.churn.max_rounds_to_clean} color="amber" />
+              <Metric label="Recurrences" value={churn.recurrence_issue_count} color="red" />
+              <Metric label="Fix regressions" value={churn.fix_regression_issue_count} color="red" />
+              <Metric label="Previously missed" value={churn.previously_missed_issue_count} color="amber" />
+              <Metric label="Grouped symptoms" value={churn.grouped_issue_count} color="blue" />
+              <Metric label="External duplicates" value={churn.external_duplicate_count} color="green" />
+              <Metric label="Weak evidence rejected" value={churn.insufficient_evidence_rejection_count} color="green" />
+              <Metric label="Avg rounds to clean" value={Math.round(churn.average_rounds_to_clean * 10) / 10} color="blue" />
+              <Metric label="Max rounds to clean" value={churn.max_rounds_to_clean} color="amber" />
             </div>
           </section>
           <div class="chart-grid">
