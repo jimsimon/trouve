@@ -3553,11 +3553,18 @@ fn insert_artifact_cleanup_job(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreMutationOutcome {
+    AppendEvent,
+    SkipAndRollback,
+    CommitWithoutEvent,
+}
+
 fn apply_store_mutation(
     conn: &Connection,
     mutation: &StoreMutation,
     timestamp: chrono::DateTime<chrono::Utc>,
-) -> Result<bool> {
+) -> Result<StoreMutationOutcome> {
     match mutation {
         StoreMutation::Insert {
             session,
@@ -3704,7 +3711,20 @@ fn apply_store_mutation(
                 ],
             )?;
             if deleted == 0 {
-                return Ok(false);
+                return Ok(StoreMutationOutcome::SkipAndRollback);
+            }
+            let already_recorded = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM events
+                   WHERE scope_kind = 'session' AND scope_id = ?1
+                     AND json_extract(payload, '$.type') = 'session.pr_opened'
+                     AND CAST(json_extract(payload, '$.number') AS INTEGER) = ?2
+                 )",
+                params![intent.session_id, intent.number as i64],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if already_recorded {
+                return Ok(StoreMutationOutcome::CommitWithoutEvent);
             }
         }
         StoreMutation::AcceptPrompt {
@@ -3823,7 +3843,7 @@ fn apply_store_mutation(
             }
         }
     }
-    Ok(true)
+    Ok(StoreMutationOutcome::AppendEvent)
 }
 
 fn code_review_outbox_rows_exist(conn: &Connection, ids: &[i64]) -> rusqlite::Result<bool> {
@@ -3866,21 +3886,36 @@ fn insert_event_batch<'a>(
     let mut published = Vec::with_capacity(event_count.saturating_mul(2));
     let mut thread_events = Vec::new();
     for event in batch {
-        if let Some(mutation) = event.mutation.as_ref()
-            && !apply_store_mutation(&tx, mutation, event.ts)?
-        {
-            // Failed preconditions may only skip an isolated, single-event
-            // request; otherwise returning here would discard unrelated
-            // callers' events that the writer coalesced into this batch.
-            anyhow::ensure!(
-                event_count <= 1,
-                "a conditional store mutation must be committed in an isolated request"
-            );
-            return Ok(InsertedEventBatch {
-                skipped: true,
-                source_cursors: Vec::new(),
-                published: Vec::new(),
-            });
+        if let Some(mutation) = event.mutation.as_ref() {
+            match apply_store_mutation(&tx, mutation, event.ts)? {
+                StoreMutationOutcome::AppendEvent => {}
+                StoreMutationOutcome::SkipAndRollback => {
+                    // Failed preconditions may only skip an isolated,
+                    // single-event request; otherwise returning here would
+                    // discard unrelated callers' coalesced events.
+                    anyhow::ensure!(
+                        event_count <= 1,
+                        "a conditional store mutation must be committed in an isolated request"
+                    );
+                    return Ok(InsertedEventBatch {
+                        skipped: true,
+                        source_cursors: Vec::new(),
+                        published: Vec::new(),
+                    });
+                }
+                StoreMutationOutcome::CommitWithoutEvent => {
+                    anyhow::ensure!(
+                        event_count <= 1,
+                        "a suppressing store mutation must be committed in an isolated request"
+                    );
+                    tx.commit()?;
+                    return Ok(InsertedEventBatch {
+                        skipped: true,
+                        source_cursors: Vec::new(),
+                        published: Vec::new(),
+                    });
+                }
+            }
         }
         let (kind, id) = scope_cols(&event.scope);
         tx.execute(
@@ -13887,7 +13922,7 @@ mod tests {
             )
             .unwrap();
         let associations = store
-            .events_after(&Scope::Session(session.id), 0)
+            .events_after(&Scope::Session(session.id.clone()), 0)
             .unwrap()
             .into_iter()
             .filter(|envelope| matches!(envelope.event, Event::SessionPrOpened { .. }))
@@ -13899,6 +13934,48 @@ mod tests {
                 Scope::Thread("th_pr_intent".into()),
                 vec![Event::ToolCompleted {
                     call_id: "call-pr-again".into(),
+                    status: ToolStatus::Ok,
+                    result: serde_json::json!({"number": 42}),
+                    execution_duration_ms: Some(1),
+                }],
+                vec![intent.clone()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .complete_session_pr_verification(
+                    intent.clone(),
+                    Event::SessionPrOpened {
+                        number: 42,
+                        url: "https://github.com/o/r/pull/42".into(),
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a concurrently recorded association suppresses a duplicate completion event"
+        );
+        assert!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap()
+                .is_empty(),
+            "the redundant intent must still be consumed"
+        );
+        let associations = store
+            .events_after(&Scope::Session("se_pr_intent".into()), 0)
+            .unwrap()
+            .into_iter()
+            .filter(|envelope| matches!(envelope.event, Event::SessionPrOpened { .. }))
+            .count();
+        assert_eq!(associations, 1);
+
+        store
+            .append_events_with_session_pr_verification_intents(
+                Scope::Thread("th_pr_intent".into()),
+                vec![Event::ToolCompleted {
+                    call_id: "call-pr-delete-pending".into(),
                     status: ToolStatus::Ok,
                     result: serde_json::json!({"number": 42}),
                     execution_duration_ms: Some(1),

@@ -49,6 +49,9 @@ const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 /// Keep one slow repository from delaying every session while still bounding
 /// concurrent GitHub traffic from the durable PR-verification worker.
 const MAX_PARALLEL_SESSION_PR_VERIFICATIONS: usize = 4;
+/// Bound one session's sequential GitHub work so a large backlog cannot hold
+/// its verification lane for an entire global poll cycle.
+const MAX_SESSION_PR_VERIFICATIONS_PER_PASS: usize = 4;
 /// A single successful creator call cannot nominate unbounded durable work.
 const MAX_SESSION_PR_VERIFICATIONS_PER_CREATION_CALL: usize = 16;
 /// Recoverable verification work expires deliberately rather than after a
@@ -67,6 +70,7 @@ const PR_VERIFICATION_FAILURE_CONTENTION: &str = "contention";
 const PR_VERIFICATION_FAILURE_EVIDENCE: &str = "evidence";
 const PR_VERIFICATION_FAILURE_HEAD_MOVED: &str = "head_moved";
 const PR_VERIFICATION_FAILURE_NOT_FOUND: &str = "not_found";
+const PR_VERIFICATION_FAILURE_PERSISTENCE: &str = "persistence";
 const PR_VERIFICATION_FAILURE_TRANSIENT: &str = "transient";
 const MAX_ATTACHMENTS_PER_PROMPT: usize = 4;
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
@@ -1256,12 +1260,7 @@ pub enum EngineError {
 }
 
 fn github_engine_error(error: anyhow::Error) -> EngineError {
-    let authentication_required = error.chain().any(|cause| {
-        cause
-            .downcast_ref::<octocrab::Error>()
-            .is_some_and(octocrab_error_requires_reauthentication)
-    });
-    if authentication_required {
+    if github_error_requires_reauthentication(&error) {
         EngineError::AuthenticationRequired(
             "GitHub permissions are missing or expired. Re-authenticate under Settings → Integrations to grant the required repository and organization-read permissions."
                 .into(),
@@ -1269,6 +1268,14 @@ fn github_engine_error(error: anyhow::Error) -> EngineError {
     } else {
         EngineError::Internal(error)
     }
+}
+
+fn github_error_requires_reauthentication(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<octocrab::Error>()
+            .is_some_and(octocrab_error_requires_reauthentication)
+    })
 }
 
 fn octocrab_error_requires_reauthentication(error: &octocrab::Error) -> bool {
@@ -1796,7 +1803,8 @@ pub struct Engine {
     /// avoid retaining deleted sessions while still preventing duplicate
     /// GitHub reads and association events from overlapping retry triggers.
     session_pr_verification_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-    session_pr_verification_wake: tokio::sync::Notify,
+    session_pr_verification_wake: Arc<tokio::sync::Notify>,
+    session_pr_verification_worker_started: AtomicBool,
     /// Per-root delegation lanes. Providers may request multiple spawn tools
     /// in one parallel batch; serializing only the admission/create window
     /// for one tree makes the depth and active-descendant caps atomic without
@@ -2206,7 +2214,8 @@ impl Engine {
             session_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
-            session_pr_verification_wake: tokio::sync::Notify::new(),
+            session_pr_verification_wake: Arc::new(tokio::sync::Notify::new()),
+            session_pr_verification_worker_started: AtomicBool::new(false),
             subagent_tree_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
@@ -5132,14 +5141,29 @@ impl Engine {
 
     /// Branch-based discovery outside the tool-completion path still requires
     /// the fetched head to exist locally before it can become durable evidence.
-    async fn pr_has_locally_verified_head(session: &Session, pr: &trouve_protocol::PrInfo) -> bool {
+    async fn pr_has_locally_verified_head(
+        &self,
+        session_id: &str,
+        pr: &trouve_protocol::PrInfo,
+    ) -> bool {
         let Some(commit) = pr.head_sha.clone() else {
             return false;
         };
-        let branch = pr.head.clone();
+        let lifecycle = self.session_lock(session_id);
+        let _lifecycle_guard = lifecycle.read().await;
+        if self.deleting_sessions.lock().unwrap().contains(session_id) {
+            return false;
+        }
+        let Ok(Some(session)) = self.store.session(session_id) else {
+            return false;
+        };
+        if session.branch != pr.head {
+            return false;
+        }
+        let branch = session.branch.clone();
         let worktree = PathBuf::from(&session.worktree_path);
         tokio::task::spawn_blocking(move || {
-            crate::git::local_branch_matches_commit(&worktree, &branch, &commit)
+            crate::git::checked_out_branch_descends_from(&worktree, &branch, &commit, &commit)
         })
         .await
         .unwrap_or(false)
@@ -5363,10 +5387,10 @@ impl Engine {
             let Ok(Some(_)) = self.store.session(session_id) else {
                 return;
             };
-            let intents = match self
-                .store
-                .due_session_pr_verification_intents(session_id, 100)
-            {
+            let intents = match self.store.due_session_pr_verification_intents(
+                session_id,
+                MAX_SESSION_PR_VERIFICATIONS_PER_PASS,
+            ) {
                 Ok(intents) => intents,
                 Err(error) => {
                     tracing::warn!(session_id, %error, "cannot load PR verification intents");
@@ -5537,12 +5561,20 @@ impl Engine {
                             recorded.insert(intent.number);
                         }
                         Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            session_id,
-                            pr_number = intent.number,
-                            %error,
-                            "cannot complete verified pull request association"
-                        ),
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id,
+                                pr_number = intent.number,
+                                %error,
+                                "cannot complete verified pull request association"
+                            );
+                            self.defer_or_expire_session_pr_verification(
+                                &intent,
+                                PR_VERIFICATION_FAILURE_PERSISTENCE,
+                                None,
+                                false,
+                            );
+                        }
                     }
                 }
                 Ok(Ok(None)) => {
@@ -5565,12 +5597,21 @@ impl Engine {
                         %error,
                         "deferring unavailable pull request verification"
                     );
-                    self.defer_or_expire_session_pr_verification(
-                        &intent,
-                        PR_VERIFICATION_FAILURE_TRANSIENT,
-                        None,
-                        true,
-                    );
+                    if github_error_requires_reauthentication(&error) {
+                        self.defer_or_expire_session_pr_verification(
+                            &intent,
+                            PR_VERIFICATION_FAILURE_AUTH,
+                            None,
+                            false,
+                        );
+                    } else {
+                        self.defer_or_expire_session_pr_verification(
+                            &intent,
+                            PR_VERIFICATION_FAILURE_TRANSIENT,
+                            None,
+                            true,
+                        );
+                    }
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -5639,13 +5680,24 @@ impl Engine {
     }
 
     pub fn start_session_pr_verification_worker(self: &Arc<Self>) {
-        let engine = Arc::clone(self);
+        if self
+            .session_pr_verification_worker_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let engine = Arc::downgrade(self);
+        let wake = Arc::clone(&self.session_pr_verification_wake);
         tokio::spawn(async move {
             loop {
+                let Some(engine) = engine.upgrade() else {
+                    break;
+                };
                 engine.retry_session_pr_verifications().await;
+                drop(engine);
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                    _ = engine.session_pr_verification_wake.notified() => {}
+                    _ = wake.notified() => {}
                 }
             }
         });
@@ -5756,7 +5808,7 @@ impl Engine {
             .await
             .map_err(github_engine_error)?
         {
-            if !Self::pr_has_locally_verified_head(&session, &pr).await {
+            if !self.pr_has_locally_verified_head(session_id, &pr).await {
                 continue;
             }
             self.record_session_pr_numbers(
@@ -5771,14 +5823,20 @@ impl Engine {
         }
         for number in evidence.numbers {
             if seen.insert(number) {
+                let already_recorded = evidence.recorded_numbers.contains(&number);
                 match github.pr(number).await {
-                    Ok(pr) if Self::pr_has_locally_verified_head(&session, &pr).await => {
-                        self.record_session_pr_numbers(
-                            session_id,
-                            &repository,
-                            [number],
-                            &mut evidence.recorded_numbers,
-                        )?;
+                    Ok(pr)
+                        if already_recorded
+                            || self.pr_has_locally_verified_head(session_id, &pr).await =>
+                    {
+                        if !already_recorded {
+                            self.record_session_pr_numbers(
+                                session_id,
+                                &repository,
+                                [number],
+                                &mut evidence.recorded_numbers,
+                            )?;
+                        }
                         prs.push(pr);
                     }
                     Ok(pr) => tracing::warn!(
@@ -12096,7 +12154,10 @@ impl Engine {
                         if let Some((_, owner, repo)) = &github_repository {
                             creation_request =
                                 classify_pull_request_creation(&tool, &args, owner, repo);
-                        } else if let Ok(repository) = self.github_repository_for_session(session) {
+                        } else {
+                            let repository = self
+                                .github_repository_for_session(session)
+                                .context("discovering repository for pull request creator")?;
                             let (_, owner, repo) = &repository;
                             creation_request =
                                 classify_pull_request_creation(&tool, &args, owner, repo);
@@ -12104,6 +12165,18 @@ impl Engine {
                                 github_repository = Some(repository);
                             }
                         }
+                    }
+                    if !matches!(creation_request, PullRequestCreationRequest::Rejected)
+                        && !backend_mutation_permits.contains_key(&call_id)
+                        && !backend_approval_cancels.contains_key(&call_id)
+                    {
+                        let lane = self.tool_execution_lock(&session.id);
+                        let permit = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => bail!("turn cancelled"),
+                            permit = lane.write_owned() => permit,
+                        };
+                        backend_mutation_permits.insert(call_id.clone(), permit);
                     }
                     tool_calls.insert(
                         call_id.clone(),
@@ -13359,9 +13432,10 @@ impl Engine {
         // Repository discovery and classification do not depend on the tool
         // result. Resolve them before taking the mutation lane so completion
         // only needs to extract returned PR numbers and snapshot HEAD.
-        let pr_creation = if could_request_pull_request_creation(&call.name, &call.arguments)
-            && let Ok(repository) = self.github_repository_for_session(session)
-        {
+        let pr_creation = if could_request_pull_request_creation(&call.name, &call.arguments) {
+            let repository = self
+                .github_repository_for_session(session)
+                .context("discovering repository for pull request creator")?;
             let (_, owner, repo) = &repository;
             let request = classify_pull_request_creation(&call.name, &call.arguments, owner, repo);
             (!matches!(request, PullRequestCreationRequest::Rejected))
@@ -16289,6 +16363,34 @@ mod tests {
             ),
             EngineError::Internal(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn session_pr_verification_worker_is_idempotent_and_does_not_retain_engine() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let weak = Arc::downgrade(&engine);
+
+        engine.start_session_pr_verification_worker();
+        engine.start_session_pr_verification_worker();
+        assert!(
+            engine
+                .session_pr_verification_worker_started
+                .load(Ordering::Acquire)
+        );
+        drop(engine);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("verification worker retained the engine");
     }
 
     fn upload(name: &str, mime: &str, data: String) -> trouve_protocol::AttachmentUpload {

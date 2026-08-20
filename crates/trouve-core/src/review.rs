@@ -426,6 +426,22 @@ fn review_thread_listing_is_authoritative(
             .all(|comment_id| threads.contains_key(comment_id))
 }
 
+fn refreshed_review_thread_listing(
+    thread_by_comment: &HashMap<u64, (String, bool)>,
+    states: &HashMap<String, bool>,
+    listing_complete: bool,
+) -> ReviewThreadListing {
+    let refreshed = thread_by_comment
+        .iter()
+        .filter_map(|(comment_id, (thread_id, _))| {
+            states
+                .get(thread_id)
+                .map(|is_resolved| (*comment_id, (thread_id.clone(), *is_resolved)))
+        })
+        .collect();
+    (refreshed, listing_complete)
+}
+
 fn review_thread_was_reopened(previous: Option<bool>, current: bool) -> bool {
     previous == Some(true) && !current
 }
@@ -5833,9 +5849,11 @@ impl Engine {
             if status.as_u16() == 422 && include_comments && review_comments_failed_to_place(&body)
             {
                 // A model can name a line that is not commentable in GitHub's
-                // diff. Preserve the verdict while publishing the findings in
-                // the durable lifecycle comment instead of inline.
+                // diff. Without a visible blocking inline comment, publish a
+                // non-blocking review and retain the findings in the durable
+                // lifecycle comment.
                 include_comments = false;
+                event = github_review_event_without_inline_comments(event);
                 continue;
             }
             if status.is_client_error() {
@@ -7380,22 +7398,15 @@ impl Engine {
                 }
             }
         }
-        if !thread_ids
-            .iter()
-            .all(|thread_id| states.contains_key(thread_id))
-        {
-            return Ok(None);
-        }
-
-        let refreshed = thread_by_comment
-            .iter()
-            .filter_map(|(comment_id, (thread_id, _))| {
-                states
-                    .get(thread_id)
-                    .map(|is_resolved| (*comment_id, (thread_id.clone(), *is_resolved)))
-            })
-            .collect();
-        Ok(Some((refreshed, *listing_complete)))
+        // A completed cached listing can outlive a force-push or deleted
+        // conversation. Dropping missing mappings lets the caller either
+        // apply a complete absence or invalidate this partial snapshot and
+        // rediscover it on the next poll.
+        Ok(Some(refreshed_review_thread_listing(
+            thread_by_comment,
+            &states,
+            *listing_complete,
+        )))
     }
 
     async fn reconcile_user_resolved_review_findings(
@@ -7454,6 +7465,12 @@ impl Engine {
             authoritative_listing.1,
             &targets,
         ) {
+            self.clear_review_thread_listing_progress(&review_thread_listing_key(
+                &repository.repository,
+                pull.number,
+                ReviewThreadListingKind::Reconciliation,
+                &targets,
+            ));
             return Ok(ReviewThreadReconciliationOutcome::Deferred);
         }
         let Ok(publication_guard) = publication_lock.try_lock() else {
@@ -7517,6 +7534,12 @@ impl Engine {
             authoritative_listing.1,
             &targets,
         ) {
+            self.clear_review_thread_listing_progress(&review_thread_listing_key(
+                &repository.repository,
+                pull.number,
+                ReviewThreadListingKind::Reconciliation,
+                &targets,
+            ));
             return Ok(ReviewThreadReconciliationOutcome::Deferred);
         }
         let thread_by_comment = &authoritative_listing.0;
@@ -7754,7 +7777,11 @@ fn review_has_unresolved_publishable_findings(
 ) -> bool {
     let previous_finding_ids = previous_findings
         .iter()
-        .filter(|finding| finding.is_publishable())
+        .filter(|finding| {
+            finding.is_publishable()
+                && finding.github_publication_status
+                    == trouve_protocol::CodeReviewFindingPublicationStatus::Published
+        })
         .map(|finding| finding.id.as_str())
         .collect::<Vec<_>>();
     review_has_unresolved_findings(
@@ -7765,6 +7792,14 @@ fn review_has_unresolved_publishable_findings(
         &previous_finding_ids,
         resolved_finding_ids,
     )
+}
+
+fn github_review_event_without_inline_comments(event: &str) -> &str {
+    if event == "REQUEST_CHANGES" {
+        "COMMENT"
+    } else {
+        event
+    }
 }
 
 fn github_rejected_own_pull_verdict(response_body: &str) -> bool {
@@ -9957,7 +9992,13 @@ mod tests {
         .unwrap();
         let started = Instant::now();
 
-        assert!(api.get::<serde_json::Value>("/stalled").await.is_err());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            api.get::<serde_json::Value>("/stalled"),
+        )
+        .await
+        .expect("outer timeout fired before the GitHub client timeout");
+        assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
         server.abort();
     }
@@ -10024,6 +10065,24 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_thread_states_drops_missing_cached_nodes() {
+        let cached = HashMap::from([
+            (11, ("thread-11".into(), false)),
+            (12, ("thread-12".into(), false)),
+        ]);
+        let states = HashMap::from([("thread-11".into(), true)]);
+        let (refreshed, complete) = refreshed_review_thread_listing(&cached, &states, false);
+
+        assert_eq!(refreshed, HashMap::from([(11, ("thread-11".into(), true))]));
+        assert!(!complete);
+        assert!(!review_thread_listing_is_authoritative(
+            &refreshed,
+            complete,
+            &HashSet::from([11, 12]),
+        ));
+    }
+
+    #[test]
     fn only_a_durable_resolved_to_unresolved_transition_is_a_reopen() {
         assert!(review_thread_was_reopened(Some(true), false));
         assert!(!review_thread_was_reopened(None, false));
@@ -10052,6 +10111,14 @@ mod tests {
     fn github_review_verdict_matches_confirmed_findings() {
         assert_eq!(github_review_event(false), "COMMENT");
         assert_eq!(github_review_event(true), "REQUEST_CHANGES");
+        assert_eq!(
+            github_review_event_without_inline_comments("REQUEST_CHANGES"),
+            "COMMENT"
+        );
+        assert_eq!(
+            github_review_event_without_inline_comments("APPROVE"),
+            "APPROVE"
+        );
     }
 
     #[tokio::test]
@@ -11790,6 +11857,25 @@ mod tests {
         assert!(!review_has_unresolved_publishable_findings(
             &[],
             &hidden_findings,
+            &[]
+        ));
+        let mut failed_finding = findings
+            .iter()
+            .find(|finding| finding.is_publishable())
+            .unwrap()
+            .clone();
+        failed_finding.github_publication_status =
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed;
+        assert!(!review_has_unresolved_publishable_findings(
+            &[],
+            std::slice::from_ref(&failed_finding),
+            &[]
+        ));
+        failed_finding.github_publication_status =
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published;
+        assert!(review_has_unresolved_publishable_findings(
+            &[],
+            &[failed_finding],
             &[]
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
