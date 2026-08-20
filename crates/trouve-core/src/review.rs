@@ -821,6 +821,14 @@ fn classify_incremental_history(
     }
 }
 
+fn incremental_diff_can_use_watermark(
+    history: IncrementalHistory,
+    last_reviewed_base_sha: &str,
+    current_base_sha: &str,
+) -> bool {
+    history == IncrementalHistory::Linear && last_reviewed_base_sha == current_base_sha
+}
+
 #[derive(Clone, Deserialize)]
 struct GithubPullRef {
     #[serde(rename = "ref")]
@@ -4210,7 +4218,11 @@ impl Engine {
             watermark_merge_base.as_deref(),
         );
         let rewritten_history = incremental_history == IncrementalHistory::Rewritten;
-        if incremental_history == IncrementalHistory::Linear {
+        if incremental_diff_can_use_watermark(
+            incremental_history,
+            &previous_pull_state.last_reviewed_base_sha,
+            &job.base_ref,
+        ) {
             job.review_base_sha = review_watermark_sha;
         } else {
             job.review_base_sha = self
@@ -10778,6 +10790,8 @@ mod tests {
     #[test]
     fn incremental_history_requires_a_proven_ancestry_result() {
         let watermark = "1111111111111111111111111111111111111111";
+        let old_base = "2222222222222222222222222222222222222222";
+        let new_base = "3333333333333333333333333333333333333333";
         assert_eq!(
             classify_incremental_history(false, watermark, None),
             IncrementalHistory::NotApplicable
@@ -10798,6 +10812,16 @@ mod tests {
             classify_incremental_history(true, watermark, None),
             IncrementalHistory::Unknown
         );
+        assert!(incremental_diff_can_use_watermark(
+            IncrementalHistory::Linear,
+            old_base,
+            old_base
+        ));
+        assert!(!incremental_diff_can_use_watermark(
+            IncrementalHistory::Linear,
+            old_base,
+            new_base
+        ));
     }
 
     #[test]
