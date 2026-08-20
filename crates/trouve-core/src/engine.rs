@@ -15101,7 +15101,7 @@ fn shell_executable_index(tokens: &[String]) -> Option<usize> {
             return Some(index);
         };
         index = after_launch_prefix(tokens, index, prefix)?;
-        assignments_allowed = *prefix == "env";
+        assignments_allowed = matches!(*prefix, "env" | "sudo");
         if index >= tokens.len() {
             return None;
         }
@@ -20795,6 +20795,7 @@ default_permission_mode = "ask"
         for command in [
             "env -i gh api /repos/o/r/pulls -f title=test",
             "sudo -u root gh api /repos/o/r/pulls -f title=test",
+            "sudo A=B gh api /repos/o/r/pulls -f title=test",
             "command -p gh api /repos/o/r/pulls -f title=test",
             "nohup gh api /repos/o/r/pulls -f title=test",
             "exec -c gh api /repos/o/r/pulls -f title=test",
