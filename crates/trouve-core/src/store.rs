@@ -702,14 +702,6 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN publication_resolution_job_id TEXT",
     "ALTER TABLE code_review_theme_observations ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
-    "UPDATE code_review_theme_observations
-       SET published = 1
-       WHERE published = 0
-         AND EXISTS (
-           SELECT 1 FROM code_review_jobs job
-           WHERE job.id = code_review_theme_observations.job_id
-             AND job.review_published != 0
-         )",
     "ALTER TABLE code_review_finding_themes ADD COLUMN linked_by_job_id TEXT NOT NULL DEFAULT ''",
     "UPDATE code_review_jobs
        SET publication_order = rowid
@@ -766,7 +758,7 @@ fn promote_published_code_review_theme_observations(conn: &mut Connection) -> Re
              FROM code_review_jobs job
              JOIN code_review_theme_observations observation ON observation.job_id = job.id
              WHERE job.review_published != 0 AND observation.published = 0
-             ORDER BY job.created_at, job.id",
+             ORDER BY COALESCE(NULLIF(job.publication_order, 0), job.rowid), job.id",
         )?;
         stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -18190,6 +18182,30 @@ mod tests {
             .unwrap();
         drop(store);
 
+        // Recreate the pre-publication-authority table shape. On a real
+        // upgrade the published column is added during this same startup, so
+        // no earlier data migration may consume its zero sentinel first.
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "ALTER TABLE code_review_theme_observations RENAME TO legacy_theme_observations;
+                 CREATE TABLE code_review_theme_observations (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   head_sha TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, created_at)
+                 SELECT theme_id, job_id, head_sha, kind, created_at
+                 FROM legacy_theme_observations;
+                 DROP TABLE legacy_theme_observations;",
+            )
+            .unwrap();
+        drop(legacy);
+
         let reopened = Store::open(&database).unwrap();
         assert!(
             reopened
@@ -18213,6 +18229,89 @@ mod tests {
         assert_eq!(themes.len(), 1);
         assert_eq!(themes[0].status, "open");
         assert_eq!(themes[0].last_seen_head, job.head_sha);
+    }
+
+    #[test]
+    fn observation_recovery_replays_durable_publication_order() {
+        let store = Store::open_in_memory().unwrap();
+        let first_job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &first_job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Ordered symptom".into(),
+                    body: "Publication order is authoritative.".into(),
+                    prompt_for_agents: "Preserve it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["ordered-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "ordered-theme".into(),
+                    root_cause: "ordered root cause".into(),
+                    recommendation: "replay publication order".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:published-first".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second_job = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE code_review_jobs
+             SET review_published = 1,
+                 publication_order = CASE id WHEN ?1 THEN 2 ELSE 1 END
+             WHERE id IN (?1, ?2)",
+            params![first_job.id, second_job.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_review_theme_observations
+               (theme_id, job_id, head_sha, kind, published, created_at)
+             VALUES (?1, ?2, ?3, 'continuation', 0, ?4)",
+            params![
+                theme_id,
+                second_job.id,
+                second_job.head_sha,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_review_themes SET status = 'pending', last_seen_head = ''
+             WHERE id = ?1",
+            [&theme_id],
+        )
+        .unwrap();
+
+        promote_published_code_review_theme_observations(&mut conn).unwrap();
+        let state = conn
+            .query_row(
+                "SELECT status, last_seen_head FROM code_review_themes WHERE id = ?1",
+                [&theme_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("open".into(), first_job.head_sha));
     }
 
     fn backoff_test_job_request() -> NewCodeReviewJob {
