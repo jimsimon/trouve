@@ -4,6 +4,58 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-08-20
+
+This release unifies interactive modes and review profiles as reusable
+personas, gives code review durable evidence and root-cause history, and makes
+long-running agent and review workflows more reliable.
+
+### Added
+
+- **Durable review intelligence**: code reviews retain finding, root-cause,
+  resolution, recurrence, regression, and prior-fix history across revisions;
+  related symptoms are grouped while remaining individually traceable, and
+  churn metrics and evidence are visible in the review interfaces.
+- **Actionable review verdicts**: completed reviews approve pull requests with
+  no confirmed findings or request changes when findings remain, while
+  resolved and reopened threads trigger bounded, revision-safe rechecks.
+- **Close-the-loop workflow**: the new repository skill drives a session pull
+  request through CI, review feedback, approvals, and mergeability checks to a
+  verified Ready to merge handoff.
+- **Cumulative turn usage**: live token and cost counters now accumulate across
+  all model requests in a turn, survive reconnects, and preserve the last
+  completed measurement after cancellation or failure.
+
+### Changed
+
+- **Breaking persona API and configuration**: interactive modes and reviewer
+  profiles now share one persona catalog across settings, sessions, threads,
+  and code review. API clients must upgrade with the server to protocol 7.7
+  and use the persona endpoints and types; custom persona configuration now
+  lives under `personas/` or `.agents/personas/`.
+- **Deterministic session defaults**: provider, model, thinking, permission,
+  and persona defaults come from the authoritative static catalog instead of
+  refresh timing. Cursor's documented models are available offline, while
+  live discovery can still add account-specific choices.
+- **Verified pull request association**: connector-created pull requests are
+  associated with sessions only after durable repository, branch, and exact
+  head-commit verification, with bounded recovery outside the turn lifecycle.
+- **More resilient releases**: crate publication now orders first-party
+  dependencies correctly and uses Cargo-backed, retry-safe visibility checks.
+
+### Fixed
+
+- **Steering and cancellation**: text-only steering no longer waits behind the
+  session mutation lane, and cancelled steers still run normal backend cleanup
+  for streams, collaborators, approvals, and partial output.
+- **Concurrent persistence**: SQLite read-modify-write transactions now avoid
+  stale snapshot upgrades, preventing intermittent database-locked failures
+  during event logging and code-review scheduling without claiming the writer
+  slot for idle polls.
+- **Review publication recovery**: publication attempts, resolved-thread
+  reconciliation, retries, and crash recovery preserve one authoritative
+  verdict without duplicate or stale GitHub reviews.
+
 ## [3.8.0] - 2026-08-18
 
 This release moves the shipping desktop application to the shared Lit/Wry
@@ -696,6 +748,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.0.0]: https://github.com/jimsimon/trouve/compare/v3.8.0...v4.0.0
 [3.8.0]: https://github.com/jimsimon/trouve/compare/v3.7.0...v3.8.0
 [3.7.0]: https://github.com/jimsimon/trouve/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/jimsimon/trouve/compare/v3.5.0...v3.6.0
