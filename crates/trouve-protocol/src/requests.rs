@@ -526,8 +526,8 @@ pub struct ThreadViewSnapshot {
     pub pending_approvals: Vec<String>,
     #[serde(default)]
     pub pending_questions: Vec<String>,
-    /// Latest valid usage measurement, retained across turn boundaries for
-    /// context display.
+    /// Aggregate usage for the most recently completed turn. Running-turn
+    /// usage is reported separately in `active_usage`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<crate::Usage>,
     /// Cumulative usage for the active turn. Billing counters sum its model

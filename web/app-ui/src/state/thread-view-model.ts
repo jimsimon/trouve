@@ -230,6 +230,14 @@ const replaceNumericMap = <T>(
   }
 };
 
+const latestNumericMapKey = (map: ReadonlyMap<number, unknown>): number | undefined => {
+  let latest: number | undefined;
+  for (const key of map.keys()) {
+    if (latest === undefined || key > latest) latest = key;
+  }
+  return latest;
+};
+
 /** Replay-equivalent projection of one thread's durable event stream.
  * This mirrors trouve-client-core's ThreadViewModel without sharing Rust
  * process state across the protocol boundary. */
@@ -321,10 +329,13 @@ export class ThreadViewModel {
             || item.state.kind === "running"
           ),
       );
+      const activeTurnNumber = activeTurn?.kind === "turn-status"
+        ? activeTurn.turn
+        : latestNumericMapKey(this.turnStartedAt);
+      this.#activeTurnUsage = activeUsage === undefined || activeTurnNumber === undefined
+        ? undefined
+        : { turn: activeTurnNumber, usage: activeUsage };
       if (activeTurn?.kind === "turn-status") {
-        this.#activeTurnUsage = activeUsage === undefined
-          ? undefined
-          : { turn: activeTurn.turn, usage: activeUsage };
         const startedAt = this.turnStartedAt.get(activeTurn.turn);
         activeTurn.state = activeTurn.state.kind === "running"
           ? {

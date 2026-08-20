@@ -955,6 +955,56 @@ describe("ThreadViewModel", () => {
     expect(view.lastUsage).toMatchObject({ input_tokens: 40, output_tokens: 12 });
   });
 
+  it("restores active usage when the running turn row is outside the snapshot page", () => {
+    const view = ThreadViewModel.fromSnapshot(17, {
+      item_offset: 20,
+      total_items: 21,
+      items: [{
+        kind: "assistant",
+        turn: 3,
+        content: "Still running",
+        complete: true,
+      }],
+      turn_running: true,
+      last_usage: { input_tokens: 30, output_tokens: 8 },
+      active_usage: {
+        input_tokens: 40,
+        output_tokens: 12,
+        context_input_tokens: 52,
+        context_window: 1_000,
+      },
+      turn_started_at: { "3": "2026-08-01T12:00:00Z" },
+    });
+
+    view.apply(envelope(18, {
+      type: "turn.usage_updated",
+      turn: 3,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 3,
+        context_input_tokens: 65,
+      },
+    }));
+    expect(view.lastUsage).toMatchObject({
+      input_tokens: 50,
+      output_tokens: 15,
+      context_input_tokens: 65,
+      context_window: 1_000,
+    });
+
+    view.apply(envelope(19, {
+      type: "turn.completed",
+      turn: 3,
+      usage: { input_tokens: 50, output_tokens: 15 },
+    }));
+    expect(view.lastUsage).toMatchObject({
+      input_tokens: 50,
+      output_tokens: 15,
+      context_input_tokens: 65,
+      context_window: 1_000,
+    });
+  });
+
   it("retains active usage after the rendered turn row is trimmed", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
