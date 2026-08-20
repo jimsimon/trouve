@@ -1671,8 +1671,14 @@ struct SteerTurnCommand {
 struct ActiveTurnSteerer {
     turn: u64,
     sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
-    waiting_for_mutation_lane: Arc<AtomicBool>,
-    mutation_lane_state_changed: Arc<tokio::sync::Notify>,
+    mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SteerMutationLaneState {
+    Idle,
+    Waiting,
+    Ended,
 }
 
 /// Remove only the registration installed by this backend turn. A cancelled
@@ -1737,16 +1743,19 @@ fn reject_pending_steer(pending: &mut Option<SteerTurnCommand>, reason: &str) {
 impl Drop for ActiveTurnSteererGuard<'_> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
-        let state_changed = registry
+        let matching_turn = registry
             .get(&self.thread_id)
-            .filter(|active| active.turn == self.turn)
-            .map(|active| active.mutation_lane_state_changed.clone());
-        if state_changed.is_some() {
-            registry.remove(&self.thread_id);
-        }
+            .is_some_and(|active| active.turn == self.turn);
+        let removed = if matching_turn {
+            registry.remove(&self.thread_id)
+        } else {
+            None
+        };
         drop(registry);
-        if let Some(state_changed) = state_changed {
-            state_changed.notify_one();
+        if let Some(active) = removed {
+            active
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
         }
     }
 }
@@ -8665,36 +8674,24 @@ impl Engine {
     /// lifecycle tests and diagnostics; callers must treat it as transient.
     #[doc(hidden)]
     pub async fn wait_for_steer_mutation_lane(&self, thread_id: &str) -> bool {
-        let Some((turn, waiting, state_changed)) = self
+        let Some(mut state) = self
             .turn_steerers
             .lock()
             .unwrap()
             .get(thread_id)
-            .map(|active| {
-                (
-                    active.turn,
-                    active.waiting_for_mutation_lane.clone(),
-                    active.mutation_lane_state_changed.clone(),
-                )
-            })
+            .map(|active| active.mutation_lane_state.subscribe())
         else {
             return false;
         };
         loop {
-            let notified = state_changed.notified();
-            if waiting.load(std::sync::atomic::Ordering::Acquire) {
-                return true;
+            match *state.borrow_and_update() {
+                SteerMutationLaneState::Waiting => return true,
+                SteerMutationLaneState::Ended => return false,
+                SteerMutationLaneState::Idle => {}
             }
-            if !self
-                .turn_steerers
-                .lock()
-                .unwrap()
-                .get(thread_id)
-                .is_some_and(|active| active.turn == turn)
-            {
+            if state.changed().await.is_err() {
                 return false;
             }
-            notified.await;
         }
     }
 
@@ -11872,19 +11869,23 @@ impl Engine {
         };
 
         let mut steer_rx = None;
-        let steer_waiting_for_mutation_lane = Arc::new(AtomicBool::new(false));
-        let steer_mutation_lane_state_changed = Arc::new(tokio::sync::Notify::new());
+        let (steer_mutation_lane_state, _) =
+            tokio::sync::watch::channel(SteerMutationLaneState::Idle);
         let _steerer_guard = if supports_steering {
             let (sender, receiver) = tokio::sync::mpsc::channel(8);
-            self.turn_steerers.lock().unwrap().insert(
+            let replaced = self.turn_steerers.lock().unwrap().insert(
                 thread.id.clone(),
                 ActiveTurnSteerer {
                     turn,
                     sender,
-                    waiting_for_mutation_lane: steer_waiting_for_mutation_lane.clone(),
-                    mutation_lane_state_changed: steer_mutation_lane_state_changed.clone(),
+                    mutation_lane_state: steer_mutation_lane_state.clone(),
                 },
             );
+            if let Some(replaced) = replaced {
+                replaced
+                    .mutation_lane_state
+                    .send_replace(SteerMutationLaneState::Ended);
+            }
             steer_rx = Some(receiver);
             Some(ActiveTurnSteererGuard {
                 registry: &self.turn_steerers,
@@ -11957,11 +11958,8 @@ impl Engine {
                     biased;
                     _ = cancel.cancelled() => {
                         reject_pending_steer(&mut pending_steer, "turn cancelled");
-                        steer_waiting_for_mutation_lane.store(
-                            false,
-                            std::sync::atomic::Ordering::Release,
-                        );
-                        steer_mutation_lane_state_changed.notify_one();
+                        steer_mutation_lane_state
+                            .send_replace(SteerMutationLaneState::Idle);
                         drop(pending_steer_lane.take());
                         drop(pending_steer_permit.take());
                         continue;
@@ -11978,11 +11976,8 @@ impl Engine {
                             .await
                     } => {
                         pending_steer_lane = None;
-                        steer_waiting_for_mutation_lane.store(
-                            false,
-                            std::sync::atomic::Ordering::Release,
-                        );
-                        steer_mutation_lane_state_changed.notify_one();
+                        steer_mutation_lane_state
+                            .send_replace(SteerMutationLaneState::Idle);
                         pending_steer_permit = Some(permit);
                         continue;
                     }
@@ -12041,11 +12036,8 @@ impl Engine {
                                 // is pending, including the completion that
                                 // releases an in-flight vendor mutation.
                                 pending_steer = Some(command);
-                                steer_waiting_for_mutation_lane.store(
-                                    true,
-                                    std::sync::atomic::Ordering::Release,
-                                );
-                                steer_mutation_lane_state_changed.notify_one();
+                                steer_mutation_lane_state
+                                    .send_replace(SteerMutationLaneState::Waiting);
                                 let lane = self.tool_execution_lock(&session.id);
                                 pending_steer_lane = Some(
                                     async move { lane.write_owned().await }.boxed(),
@@ -12826,8 +12818,7 @@ impl Engine {
             "turn ended before steering could be applied"
         };
         reject_pending_steer(&mut pending_steer, pending_steer_reason);
-        steer_waiting_for_mutation_lane.store(false, std::sync::atomic::Ordering::Release);
-        steer_mutation_lane_state_changed.notify_one();
+        steer_mutation_lane_state.send_replace(SteerMutationLaneState::Ended);
         drop(pending_steer_lane.take());
         drop(pending_steer_permit.take());
         // Vendors may omit ToolCompleted on cancellation or protocol failure.
@@ -15061,10 +15052,13 @@ fn shell_executable_index(tokens: &[String]) -> Option<usize> {
             "nohup" => consume_options(tokens, arguments, &[], &[]),
             "exec" => consume_options(tokens, arguments, &["-c", "-l"], &["-a"]),
             "nice" => {
-                if tokens
-                    .get(arguments)
-                    .is_some_and(|token| token.len() > 1 && token[1..].parse::<i32>().is_ok())
-                {
+                let legacy_adjustment = tokens.get(arguments).is_some_and(|token| {
+                    token
+                        .strip_prefix('-')
+                        .filter(|adjustment| !adjustment.is_empty() && !adjustment.starts_with('-'))
+                        .is_some_and(|adjustment| adjustment.parse::<u32>().is_ok())
+                });
+                if legacy_adjustment {
                     return tokens.get(arguments + 1).map(|_| arguments + 1);
                 }
                 let next = consume_options(tokens, arguments, &[], &["-n", "--adjustment"])?;
@@ -15090,9 +15084,12 @@ fn shell_executable_index(tokens: &[String]) -> Option<usize> {
     }
 
     let mut index = 0;
+    let mut assignments_allowed = true;
     loop {
-        while tokens.get(index).is_some_and(|token| is_assignment(token)) {
-            index += 1;
+        if assignments_allowed {
+            while tokens.get(index).is_some_and(|token| is_assignment(token)) {
+                index += 1;
+            }
         }
         let token = tokens.get(index)?;
         let launch_prefix = [
@@ -15104,6 +15101,7 @@ fn shell_executable_index(tokens: &[String]) -> Option<usize> {
             return Some(index);
         };
         index = after_launch_prefix(tokens, index, prefix)?;
+        assignments_allowed = *prefix == "env";
         if index >= tokens.len() {
             return None;
         }
@@ -20891,6 +20889,15 @@ default_permission_mode = "ask"
             }),
             serde_json::json!({
                 "cmd": "command -v gh api /repos/o/r/pulls -f title=forged"
+            }),
+            serde_json::json!({
+                "cmd": "timeout 30 A=B gh api /repos/o/r/pulls -f title=forged"
+            }),
+            serde_json::json!({
+                "cmd": "nice 50 gh api /repos/o/r/pulls -f title=forged"
+            }),
+            serde_json::json!({
+                "cmd": "nice é gh api /repos/o/r/pulls -f title=forged"
             }),
         ] {
             assert!(!could_request_pull_request_creation(

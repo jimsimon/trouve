@@ -2636,13 +2636,15 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
             .send()
             .await
     });
-    let parked = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        engine.wait_for_steer_mutation_lane(thread_id),
-    )
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            engine.wait_for_steer_mutation_lane(thread_id),
+            engine.wait_for_steer_mutation_lane(thread_id),
+        )
+    })
     .await
     .expect("attachment steering never parked on the held mutation lane");
-    assert!(parked);
+    assert_eq!(parked, (true, true));
     assert!(!pending_steer.is_finished());
     backend.release_tool().await;
     let steered = tokio::time::timeout(std::time::Duration::from_secs(10), pending_steer)
