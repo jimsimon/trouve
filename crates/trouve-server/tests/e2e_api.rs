@@ -2331,7 +2331,19 @@ impl trouve_agents::AgentBackend for SteerableBackend {
         &self,
         turn: trouve_agents::BackendTurn,
     ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
-        let hold_mutation_lane = turn.prompt == "Hold the mutation lane.";
+        let defer_attachment_lane = turn.prompt == "Defer attachment steering.";
+        let cancel_deferred_steering = turn.prompt == "Cancel deferred steering.";
+        let hold_mutation_lane = turn.prompt == "Hold the mutation lane."
+            || defer_attachment_lane
+            || cancel_deferred_steering;
+        let held_call_id = if defer_attachment_lane {
+            "deferred-mutation"
+        } else if cancel_deferred_steering {
+            "cancelled-mutation"
+        } else {
+            "held-mutation"
+        };
+        let cancel = turn.cancel.clone();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.release.lock().await = Some(release_tx);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -2349,7 +2361,7 @@ impl trouve_agents::AgentBackend for SteerableBackend {
                 let (approved_tx, approved_rx) = tokio::sync::oneshot::channel();
                 let _ = tx
                     .send(Ok(E::ApprovalNeeded {
-                        call_id: "held-mutation".into(),
+                        call_id: held_call_id.into(),
                         tool: "commandExecution".into(),
                         args: serde_json::json!({"command": "hold mutation lane"}),
                         responder: approved_tx,
@@ -2360,19 +2372,37 @@ impl trouve_agents::AgentBackend for SteerableBackend {
                 }
                 let _ = tx
                     .send(Ok(E::ToolStarted {
-                        call_id: "held-mutation".into(),
+                        call_id: held_call_id.into(),
                         tool: "commandExecution".into(),
                         args: serde_json::json!({"command": "hold mutation lane"}),
                     }))
                     .await;
             }
-            if release_rx.await.is_err() {
-                return;
-            }
-            if hold_mutation_lane {
+            if defer_attachment_lane {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 let _ = tx
                     .send(Ok(E::ToolCompleted {
-                        call_id: "held-mutation".into(),
+                        call_id: held_call_id.into(),
+                        ok: true,
+                        result: serde_json::json!({"exitCode": 0}),
+                    }))
+                    .await;
+            }
+            let released = if cancel_deferred_steering {
+                tokio::select! {
+                    _ = cancel.cancelled() => false,
+                    released = release_rx => released.is_ok(),
+                }
+            } else {
+                release_rx.await.is_ok()
+            };
+            if !released {
+                return;
+            }
+            if hold_mutation_lane && !defer_attachment_lane {
+                let _ = tx
+                    .send(Ok(E::ToolCompleted {
+                        call_id: held_call_id.into(),
                         ok: true,
                         result: serde_json::json!({"exitCode": 0}),
                     }))
@@ -2554,10 +2584,129 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         event["type"] == "turn.completed" && event["turn"] == 2
     })
     .await;
-    let received = backend.steers.lock().unwrap();
-    assert_eq!(received.len(), 2);
-    assert_eq!(received[1].1, "Continue without waiting for the tool.");
-    assert!(received[1].2.is_empty());
+    {
+        let received = backend.steers.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[1].1, "Continue without waiting for the tool.");
+        assert!(received[1].2.is_empty());
+    }
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Defer attachment steering."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "tool.started" && event["call_id"] == "deferred-mutation"
+    })
+    .await;
+    let steered = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client
+            .post(format!("{base}/threads/{thread_id}/steer"))
+            .json(&serde_json::json!({
+                "content": "Use the deferred reference.",
+                "attachments": [{
+                    "name": "deferred.png",
+                    "mime": "image/png",
+                    "data": "iVBORw0KGgo=",
+                }],
+            }))
+            .send(),
+    )
+    .await
+    .expect("attachment steering did not resume after the mutation lane released")
+    .unwrap();
+    assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 3
+    })
+    .await;
+    {
+        let received = backend.steers.lock().unwrap();
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[2].1, "Use the deferred reference.");
+        assert_eq!(received[2].2.len(), 1);
+    }
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Cancel deferred steering."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "tool.started" && event["call_id"] == "cancelled-mutation"
+    })
+    .await;
+    let steer_client = client.clone();
+    let steer_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_steer = tokio::spawn(async move {
+        steer_client
+            .post(steer_url)
+            .json(&serde_json::json!({
+                "content": "This steer should be cancelled.",
+                "attachments": [{
+                    "name": "cancelled.png",
+                    "mime": "image/png",
+                    "data": "iVBORw0KGgo=",
+                }],
+            }))
+            .send()
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let cancelled = client
+        .post(format!("{base}/threads/{thread_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancelled.status().is_success());
+    let steer_response = tokio::time::timeout(std::time::Duration::from_secs(10), pending_steer)
+        .await
+        .expect("cancelled deferred steering request did not finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(steer_response.status(), reqwest::StatusCode::CONFLICT);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.cancelled" && event["turn"] == 4
+    })
+    .await;
+
+    // A new attachment-bearing turn must acquire the same session lane,
+    // proving cancellation dropped both the deferred waiter and any permit.
+    let restarted = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({
+            "content": "Start after cancellation.",
+            "attachments": [{
+                "name": "after-cancel.png",
+                "mime": "image/png",
+                "data": "iVBORw0KGgo=",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restarted.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.thinking" && event["turn"] == 5
+    })
+    .await;
+    let release = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({"content": "Finish the restarted turn."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(release.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 5
+    })
+    .await;
 }
 
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",

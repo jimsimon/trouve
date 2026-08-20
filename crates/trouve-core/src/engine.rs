@@ -11896,44 +11896,70 @@ impl Engine {
                     &mut pending_steer,
                     &mut consecutive_backend_events,
                 );
-            // An approval callback keeps the mutation lane until the vendor
-            // reports ToolCompleted. Attachment steering also needs that
-            // lane, so leave a reserved attachment command pending while the
-            // event branch drains the completion that can release it.
-            let steer_waits_for_mutation_lane = pending_steer_lane.is_some();
-            let steer_must_run = steer_reserved && !steer_waits_for_mutation_lane;
-            let input = tokio::select! {
-                biased;
-                // Persist vendor output that is already available before
-                // accepting simultaneously-ready steering. This preserves
-                // the causal order observed at the backend boundary.
-                event = stream.next(), if !steer_must_run => BackendLoopInput::Event(event),
-                _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
-                    persist_deadline = None;
-                    continue;
+            let input = if pending_steer_lane.is_some() {
+                // Poll lane acquisition ahead of the backend stream so a
+                // continuously-ready stream cannot starve it. If the lane is
+                // still held, the future stays pending and ToolCompleted can
+                // flow through the event branch to release it.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        reject_pending_steer(&mut pending_steer, "turn cancelled");
+                        drop(pending_steer_lane.take());
+                        drop(pending_steer_permit.take());
+                        continue;
+                    }
+                    approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                        BackendLoopInput::Approval(
+                            approval.expect("non-empty approval queue must yield an outcome")
+                        )
+                    }
+                    permit = async {
+                        pending_steer_lane
+                            .as_mut()
+                            .expect("guarded pending steering lane future")
+                            .await
+                    } => {
+                        pending_steer_lane = None;
+                        pending_steer_permit = Some(permit);
+                        continue;
+                    }
+                    event = stream.next() => BackendLoopInput::Event(event),
+                    _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        persist_deadline = None;
+                        continue;
+                    }
                 }
-                approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
-                    BackendLoopInput::Approval(
-                        approval.expect("non-empty approval queue must yield an outcome")
-                    )
-                }
-                permit = async {
-                    pending_steer_lane
-                        .as_mut()
-                        .expect("guarded pending steering lane future")
-                        .await
-                }, if pending_steer_lane.is_some() => {
-                    pending_steer_lane = None;
-                    pending_steer_permit = Some(permit);
-                    continue;
-                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if pending_steer.is_some() => {
+                        reject_pending_steer(&mut pending_steer, "turn cancelled");
+                        drop(pending_steer_permit.take());
+                        continue;
+                    }
+                    // Persist vendor output that is already available before
+                    // accepting simultaneously-ready steering. This preserves
+                    // the causal order observed at the backend boundary.
+                    event = stream.next(), if !steer_reserved => BackendLoopInput::Event(event),
+                    _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        persist_deadline = None;
+                        continue;
+                    }
+                    approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                        BackendLoopInput::Approval(
+                            approval.expect("non-empty approval queue must yield an outcome")
+                        )
+                    }
                 steer = receive_steer_command(
                     &mut steer_rx,
                     &mut pending_steer,
                     active_vendor_session.is_some(),
-                ), if !cancel.is_cancelled() && !steer_waits_for_mutation_lane => {
+                ), if !cancel.is_cancelled() => {
                     let Some(command) = steer else {
                         steer_rx = None;
                         continue;
@@ -12072,6 +12098,7 @@ impl Engine {
                     let _ = response.send(Ok(()));
                     consecutive_backend_events = 0;
                     continue;
+                }
                 }
             };
             let event = match input {
@@ -14770,30 +14797,11 @@ fn shell_requests_pull_request_collection_post(tool: &str, args: &serde_json::Va
 }
 
 fn shell_command_values(args: &serde_json::Value) -> Vec<&str> {
-    fn collect_strings<'a>(value: &'a serde_json::Value, commands: &mut Vec<&'a str>) {
-        match value {
-            serde_json::Value::String(command) => commands.push(command),
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    collect_strings(value, commands);
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn visit<'a>(value: &'a serde_json::Value, commands: &mut Vec<&'a str>) {
         match value {
             serde_json::Value::Object(fields) => {
-                for (key, value) in fields {
-                    if matches!(
-                        compact_activity(key).as_str(),
-                        "command" | "commands" | "cmd" | "script"
-                    ) {
-                        collect_strings(value, commands);
-                    } else if value.is_object() || value.is_array() {
-                        visit(value, commands);
-                    }
+                for value in fields.values() {
+                    visit(value, commands);
                 }
             }
             serde_json::Value::Array(values) => {
@@ -14869,11 +14877,15 @@ fn shell_invocations(command: &str) -> Vec<Vec<String>> {
 }
 
 fn shell_word_is_command(word: &str, expected: &str) -> bool {
-    word.rsplit('/').next().is_some_and(|name| name == expected)
+    word.trim_matches(|character| matches!(character, '(' | ')' | '{' | '}'))
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == expected)
 }
 
 fn pull_collection_path_matches(token: &str, expected_path: Option<&str>) -> bool {
     let path = token
+        .trim_matches(|character| matches!(character, '(' | ')' | '{' | '}' | ','))
         .split(['?', '#'])
         .next()
         .unwrap_or(token)
@@ -14961,27 +14973,48 @@ fn curl_invocation_is_post(tokens: &[String]) -> bool {
 }
 
 fn shell_command_posts_to_pull_collection(command: &str, expected_path: Option<&str>) -> bool {
-    shell_invocations(command).into_iter().any(|tokens| {
-        if !tokens
-            .iter()
-            .any(|token| pull_collection_path_matches(token, expected_path))
-        {
+    fn inspect(command: &str, expected_path: Option<&str>, depth: usize) -> bool {
+        if depth > 4 {
             return false;
         }
-        if let Some(index) = tokens
-            .windows(2)
-            .position(|pair| shell_word_is_command(&pair[0], "gh") && pair[1] == "api")
-        {
-            return gh_api_invocation_is_post(&tokens[index + 2..]);
-        }
-        if let Some(index) = tokens
-            .iter()
-            .position(|token| shell_word_is_command(token, "curl"))
-        {
-            return curl_invocation_is_post(&tokens[index + 1..]);
-        }
-        false
-    })
+        shell_invocations(command).into_iter().any(|tokens| {
+            for (index, token) in tokens.iter().enumerate() {
+                let shell_wrapper = ["bash", "sh", "zsh", "dash", "ksh"]
+                    .iter()
+                    .any(|expected| shell_word_is_command(token, expected));
+                if shell_wrapper
+                    && let Some(flag) = tokens.get(index + 1)
+                    && flag.starts_with('-')
+                    && flag.contains('c')
+                    && let Some(nested) = tokens.get(index + 2)
+                    && inspect(nested, expected_path, depth + 1)
+                {
+                    return true;
+                }
+            }
+            if !tokens
+                .iter()
+                .any(|token| pull_collection_path_matches(token, expected_path))
+            {
+                return false;
+            }
+            if let Some(index) = tokens
+                .windows(2)
+                .position(|pair| shell_word_is_command(&pair[0], "gh") && pair[1] == "api")
+            {
+                return gh_api_invocation_is_post(&tokens[index + 2..]);
+            }
+            if let Some(index) = tokens
+                .iter()
+                .position(|token| shell_word_is_command(token, "curl"))
+            {
+                return curl_invocation_is_post(&tokens[index + 1..]);
+            }
+            false
+        })
+    }
+
+    inspect(command, expected_path, 0)
 }
 
 fn is_activity_tool_wrapper(tool: &str) -> bool {
@@ -20559,6 +20592,29 @@ default_permission_mode = "ask"
             "o",
             "r"
         ));
+        for (tool, args) in [
+            (
+                "terminal",
+                serde_json::json!({
+                    "input": "gh api /repos/o/r/pulls --field title=test"
+                }),
+            ),
+            (
+                "functions.exec",
+                serde_json::json!({
+                    "cmd": "bash -c 'gh api /repos/o/r/pulls -f title=test'"
+                }),
+            ),
+            (
+                "functions.exec",
+                serde_json::json!({
+                    "cmd": "(gh api /repos/o/r/pulls -f title=test)"
+                }),
+            ),
+        ] {
+            assert!(could_request_pull_request_creation(tool, &args));
+            assert!(requests_pull_request_creation(tool, &args, "o", "r"));
+        }
         assert!(!requests_pull_request_creation(
             "mcpToolCall",
             &serde_json::json!({
