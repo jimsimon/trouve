@@ -4876,7 +4876,7 @@ impl Engine {
         let publication_lock = self
             .code_review
             .publication_lock(&job.repository, job.pull_number);
-        let _publication_guard =
+        let publication_guard =
             acquire_review_publication_lock(&publication_lock, superseded).await?;
         ensure_review_current(superseded)?;
         // Reviewer and coordinator work can outlive the installation token
@@ -4987,6 +4987,10 @@ impl Engine {
             .into_iter()
             .filter(|finding| parsed.resolved_finding_ids.contains(&finding.id))
             .collect::<Vec<_>>();
+        // The detached cleanup takes the same lock. Release this round's
+        // publication guard before making the task runnable so its inline
+        // attempt does not always lose a try_lock race and defer itself.
+        drop(publication_guard);
         tokio::spawn(async move {
             if let Err(error) = cleanup_engine
                 .resolve_review_threads(

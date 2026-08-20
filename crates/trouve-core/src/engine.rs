@@ -1726,6 +1726,13 @@ fn reserve_ready_steer_after_event_budget<T>(
     }
 }
 
+fn steering_attachments_wait_for_mutation_lane(
+    has_staged_attachments: bool,
+    in_flight_mutations: usize,
+) -> bool {
+    has_staged_attachments && in_flight_mutations > 0
+}
+
 impl Drop for ActiveTurnSteererGuard<'_> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
@@ -11881,13 +11888,24 @@ impl Engine {
         let mut consecutive_backend_events = 0usize;
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let steer_must_run = active_vendor_session.is_some()
+            let steer_reserved = active_vendor_session.is_some()
                 && !cancel.is_cancelled()
                 && reserve_ready_steer_after_event_budget(
                     &mut steer_rx,
                     &mut pending_steer,
                     &mut consecutive_backend_events,
                 );
+            // An approval callback keeps the mutation lane until the vendor
+            // reports ToolCompleted. Attachment steering also needs that
+            // lane, so leave a reserved attachment command pending while the
+            // event branch drains the completion that can release it.
+            let steer_waits_for_mutation_lane = pending_steer.as_ref().is_some_and(|command| {
+                steering_attachments_wait_for_mutation_lane(
+                    !command.attachment_rows.is_empty(),
+                    backend_mutation_permits.len(),
+                )
+            });
+            let steer_must_run = steer_reserved && !steer_waits_for_mutation_lane;
             let input = tokio::select! {
                 biased;
                 // Persist vendor output that is already available before
@@ -11904,11 +11922,19 @@ impl Engine {
                     &mut steer_rx,
                     &mut pending_steer,
                     active_vendor_session.is_some(),
-                ), if !cancel.is_cancelled() => {
+                ), if !cancel.is_cancelled() && !steer_waits_for_mutation_lane => {
                     let Some(command) = steer else {
                         steer_rx = None;
                         continue;
                     };
+                    if steering_attachments_wait_for_mutation_lane(
+                        !command.attachment_rows.is_empty(),
+                        backend_mutation_permits.len(),
+                    ) {
+                        pending_steer = Some(command);
+                        consecutive_backend_events = 0;
+                        continue;
+                    }
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
                     let SteerTurnCommand {
@@ -14723,6 +14749,46 @@ fn contains_pull_request_collection_post(value: &serde_json::Value) -> bool {
     }
 }
 
+fn shell_requests_pull_request_collection_post(tool: &str, args: &serde_json::Value) -> bool {
+    let tool_words = activity_words(tool);
+    let shell_like = ["shell", "bash", "command", "terminal", "exec", "gh"]
+        .iter()
+        .any(|word| tool_words.split_whitespace().any(|part| part == *word));
+    if !shell_like {
+        return false;
+    }
+
+    let args_text = args.to_string();
+    let args_words = activity_words(&args_text);
+    let post_like = format!(" {args_words} ").contains(" post ")
+        || args_text.contains(" -f ")
+        || args_text.contains(" --field ")
+        || args_text.contains(" --raw-field ");
+    post_like
+        && args_text.split_whitespace().any(|token| {
+            let token = token.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | ','
+                )
+            });
+            let path = token
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(token)
+                .trim_end_matches('/')
+                .to_ascii_lowercase();
+            let suffix = path
+                .split_once("/repos/")
+                .map(|(_, suffix)| suffix)
+                .or_else(|| path.strip_prefix("repos/"));
+            suffix.is_some_and(|suffix| {
+                let segments = suffix.split('/').collect::<Vec<_>>();
+                matches!(segments.as_slice(), [owner, repo, "pulls"] if !owner.is_empty() && !repo.is_empty())
+            })
+        })
+}
+
 fn is_activity_tool_wrapper(tool: &str) -> bool {
     matches!(
         compact_activity(tool).as_str(),
@@ -14780,6 +14846,7 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
     if (args_words.split_whitespace().any(|word| word == "mutation")
         && args_compact.contains("createpullrequest"))
         || contains_pull_request_collection_post(args)
+        || shell_requests_pull_request_collection_post(tool, args)
     {
         return true;
     }
@@ -16526,6 +16593,13 @@ mod tests {
         ));
         assert_eq!(pending, Some(7));
         assert_eq!(consecutive_events, 0);
+    }
+
+    #[test]
+    fn attachment_steering_waits_for_an_in_flight_vendor_mutation() {
+        assert!(steering_attachments_wait_for_mutation_lane(true, 1));
+        assert!(!steering_attachments_wait_for_mutation_lane(false, 1));
+        assert!(!steering_attachments_wait_for_mutation_lane(true, 0));
     }
 
     fn init_engine_test_repo(path: &Path) {
@@ -20193,6 +20267,12 @@ default_permission_mode = "ask"
             }),
             "o",
             "r"
+        ));
+        assert!(could_request_pull_request_creation(
+            "functions.exec",
+            &serde_json::json!({
+                "cmd": "gh api -X POST /repos/o/r/pulls --field title=test"
+            })
         ));
         assert!(!requests_pull_request_creation(
             "mcpToolCall",
