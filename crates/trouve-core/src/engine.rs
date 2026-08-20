@@ -1726,13 +1726,6 @@ fn reserve_ready_steer_after_event_budget<T>(
     }
 }
 
-fn steering_attachments_wait_for_mutation_lane(
-    has_staged_attachments: bool,
-    in_flight_mutations: usize,
-) -> bool {
-    has_staged_attachments && in_flight_mutations > 0
-}
-
 fn reject_pending_steer(pending: &mut Option<SteerTurnCommand>, reason: &str) {
     if let Some(SteerTurnCommand { response, .. }) = pending.take() {
         let _ = response.send(Err(reason.into()));
@@ -11891,14 +11884,11 @@ impl Engine {
         let mut backend_mutation_permits =
             HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
         let mut pending_steer = None;
+        let mut pending_steer_lane = None;
+        let mut pending_steer_permit = None;
         let mut consecutive_backend_events = 0usize;
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let in_flight_vendor_mutations = backend_mutation_permits.len()
-                + collaborators
-                    .values()
-                    .map(|collaborator| collaborator.mutation_permits.len())
-                    .sum::<usize>();
             let steer_reserved = active_vendor_session.is_some()
                 && !cancel.is_cancelled()
                 && reserve_ready_steer_after_event_budget(
@@ -11910,12 +11900,7 @@ impl Engine {
             // reports ToolCompleted. Attachment steering also needs that
             // lane, so leave a reserved attachment command pending while the
             // event branch drains the completion that can release it.
-            let steer_waits_for_mutation_lane = pending_steer.as_ref().is_some_and(|command| {
-                steering_attachments_wait_for_mutation_lane(
-                    !command.attachment_rows.is_empty(),
-                    in_flight_vendor_mutations,
-                )
-            });
+            let steer_waits_for_mutation_lane = pending_steer_lane.is_some();
             let steer_must_run = steer_reserved && !steer_waits_for_mutation_lane;
             let input = tokio::select! {
                 biased;
@@ -11934,6 +11919,16 @@ impl Engine {
                         approval.expect("non-empty approval queue must yield an outcome")
                     )
                 }
+                permit = async {
+                    pending_steer_lane
+                        .as_mut()
+                        .expect("guarded pending steering lane future")
+                        .await
+                }, if pending_steer_lane.is_some() => {
+                    pending_steer_lane = None;
+                    pending_steer_permit = Some(permit);
+                    continue;
+                }
                 steer = receive_steer_command(
                     &mut steer_rx,
                     &mut pending_steer,
@@ -11943,28 +11938,25 @@ impl Engine {
                         steer_rx = None;
                         continue;
                     };
-                    if steering_attachments_wait_for_mutation_lane(
-                        !command.attachment_rows.is_empty(),
-                        in_flight_vendor_mutations,
-                    ) {
-                        pending_steer = Some(command);
-                        consecutive_backend_events = 0;
-                        continue;
-                    }
                     let materialization_permit = if command.attachment_rows.is_empty() {
                         None
+                    } else if let Some(permit) = pending_steer_permit.take() {
+                        Some(permit)
                     } else {
                         let lane = self.tool_execution_lock(&session.id);
                         match lane.try_write_owned() {
                             Ok(permit) => Some(permit),
                             Err(_) => {
-                                // The permit may already be owned by a ready
-                                // approval outcome that has not entered
-                                // backend_mutation_permits yet. Requeue the
-                                // command without awaiting the lane; the
-                                // higher-priority approval branch will collect
-                                // that outcome on the next iteration.
+                                // Wait for actual lane availability as another
+                                // select branch. Backend events and approval
+                                // outcomes continue to flow while this future
+                                // is pending, including the completion that
+                                // releases an in-flight vendor mutation.
                                 pending_steer = Some(command);
+                                let lane = self.tool_execution_lock(&session.id);
+                                pending_steer_lane = Some(
+                                    async move { lane.write_owned().await }.boxed(),
+                                );
                                 consecutive_backend_events = 0;
                                 continue;
                             }
@@ -12740,6 +12732,8 @@ impl Engine {
             "turn ended before steering could be applied"
         };
         reject_pending_steer(&mut pending_steer, pending_steer_reason);
+        drop(pending_steer_lane.take());
+        drop(pending_steer_permit.take());
         // Vendors may omit ToolCompleted on cancellation or protocol failure.
         // Never carry their mutation lease into flush, checkpoint, or terminal
         // turn bookkeeping.
@@ -14685,24 +14679,6 @@ fn compact_activity(text: &str) -> String {
         .collect()
 }
 
-fn mentions_exact_path(text: &str, expected_path: &str) -> bool {
-    text.split_whitespace().any(|token| {
-        let token = token.trim_matches(|character: char| {
-            matches!(
-                character,
-                '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | ','
-            )
-        });
-        let path = token
-            .split(['?', '#'])
-            .next()
-            .unwrap_or(token)
-            .trim_end_matches('/')
-            .to_ascii_lowercase();
-        path == expected_path.trim_start_matches('/') || path.ends_with(expected_path)
-    })
-}
-
 /// Whether a structured HTTP request mutates the expected REST collection.
 fn contains_rest_mutation(
     value: &serde_json::Value,
@@ -14787,56 +14763,146 @@ fn shell_requests_pull_request_collection_post(tool: &str, args: &serde_json::Va
     let shell_like = ["shell", "bash", "command", "terminal", "exec", "gh"]
         .iter()
         .any(|word| tool_words.split_whitespace().any(|part| part == *word));
-    if !shell_like {
-        return false;
-    }
-
-    let args_text = args.to_string();
-    shell_rest_request_is_post(&args_text)
-        && args_text.split_whitespace().any(|token| {
-            let token = token.trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | ','
-                )
-            });
-            let path = token
-                .split(['?', '#'])
-                .next()
-                .unwrap_or(token)
-                .trim_end_matches('/')
-                .to_ascii_lowercase();
-            let suffix = path
-                .split_once("/repos/")
-                .map(|(_, suffix)| suffix)
-                .or_else(|| path.strip_prefix("repos/"));
-            suffix.is_some_and(|suffix| {
-                let segments = suffix.split('/').collect::<Vec<_>>();
-                matches!(segments.as_slice(), [owner, repo, "pulls"] if !owner.is_empty() && !repo.is_empty())
-            })
-        })
+    shell_like
+        && shell_command_values(args)
+            .into_iter()
+            .any(|command| shell_command_posts_to_pull_collection(command, None))
 }
 
-fn shell_rest_request_is_post(text: &str) -> bool {
-    let tokens = text
-        .split_whitespace()
-        .map(|token| {
-            token.trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | ','
-                )
-            })
-        })
-        .collect::<Vec<_>>();
+fn shell_command_values(args: &serde_json::Value) -> Vec<&str> {
+    fn collect_strings<'a>(value: &'a serde_json::Value, commands: &mut Vec<&'a str>) {
+        match value {
+            serde_json::Value::String(command) => commands.push(command),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect_strings(value, commands);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit<'a>(value: &'a serde_json::Value, commands: &mut Vec<&'a str>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    if matches!(
+                        compact_activity(key).as_str(),
+                        "command" | "commands" | "cmd" | "script"
+                    ) {
+                        collect_strings(value, commands);
+                    } else if value.is_object() || value.is_array() {
+                        visit(value, commands);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, commands);
+                }
+            }
+            serde_json::Value::String(command) => commands.push(command),
+            _ => {}
+        }
+    }
+
+    let mut commands = Vec::new();
+    visit(args, &mut commands);
+    commands
+}
+
+fn shell_invocations(command: &str) -> Vec<Vec<String>> {
+    fn finish_word(word: &mut String, invocation: &mut Vec<String>) {
+        if !word.is_empty() {
+            invocation.push(std::mem::take(word));
+        }
+    }
+
+    fn finish_invocation(
+        word: &mut String,
+        invocation: &mut Vec<String>,
+        invocations: &mut Vec<Vec<String>>,
+    ) {
+        finish_word(word, invocation);
+        if !invocation.is_empty() {
+            invocations.push(std::mem::take(invocation));
+        }
+    }
+
+    let mut invocations = Vec::new();
+    let mut invocation = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else if character == '\\' && active_quote == '"' {
+                escaped = true;
+            } else {
+                word.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '\'' | '"' => quote = Some(character),
+            '\n' | ';' | '|' | '&' => {
+                finish_invocation(&mut word, &mut invocation, &mut invocations);
+                if characters.peek().is_some_and(|next| *next == character) {
+                    characters.next();
+                }
+            }
+            character if character.is_whitespace() => finish_word(&mut word, &mut invocation),
+            _ => word.push(character),
+        }
+    }
+    finish_invocation(&mut word, &mut invocation, &mut invocations);
+    invocations
+}
+
+fn shell_word_is_command(word: &str, expected: &str) -> bool {
+    word.rsplit('/').next().is_some_and(|name| name == expected)
+}
+
+fn pull_collection_path_matches(token: &str, expected_path: Option<&str>) -> bool {
+    let path = token
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if let Some(expected_path) = expected_path {
+        let expected_path = expected_path.trim_start_matches('/');
+        return path == expected_path || path.ends_with(&format!("/{expected_path}"));
+    }
+    let suffix = path
+        .split_once("/repos/")
+        .map(|(_, suffix)| suffix)
+        .or_else(|| path.strip_prefix("repos/"));
+    suffix.is_some_and(|suffix| {
+        let segments = suffix.split('/').collect::<Vec<_>>();
+        matches!(segments.as_slice(), [owner, repo, "pulls"] if !owner.is_empty() && !repo.is_empty())
+    })
+}
+
+fn explicit_shell_method(tokens: &[String], long_option: &str) -> Option<bool> {
     let mut explicit_method = None;
+    let long_prefix = format!("{long_option}=");
     let mut index = 0;
     while index < tokens.len() {
-        let token = tokens[index];
-        let method = if matches!(token, "-X" | "--method") {
+        let token = &tokens[index];
+        let method = if token == "-X" || token == long_option {
             index += 1;
-            tokens.get(index).copied()
-        } else if let Some(method) = token.strip_prefix("--method=") {
+            tokens.get(index).map(String::as_str)
+        } else if let Some(method) = token.strip_prefix(&long_prefix) {
             Some(method)
         } else {
             token.strip_prefix("-X").filter(|method| !method.is_empty())
@@ -14846,28 +14912,75 @@ fn shell_rest_request_is_post(text: &str) -> bool {
         }
         index += 1;
     }
-    if let Some(is_post) = explicit_method {
+    explicit_method
+}
+
+fn gh_api_invocation_is_post(tokens: &[String]) -> bool {
+    if let Some(is_post) = explicit_shell_method(tokens, "--method") {
         return is_post;
     }
-
     tokens.iter().any(|token| {
         matches!(
-            *token,
-            "-f" | "-F"
-                | "--field"
-                | "--raw-field"
-                | "--data"
-                | "--data-raw"
-                | "--data-binary"
-                | "--json"
+            token.as_str(),
+            "-f" | "-F" | "--field" | "--raw-field" | "--input"
         ) || token.starts_with("--field=")
             || token.starts_with("--raw-field=")
-            || token.starts_with("--data=")
-            || token.starts_with("--data-raw=")
-            || token.starts_with("--data-binary=")
-            || token.starts_with("--json=")
+            || token.starts_with("--input=")
             || (token.starts_with("-f") && token.len() > 2)
             || (token.starts_with("-F") && token.len() > 2)
+    })
+}
+
+fn curl_invocation_is_post(tokens: &[String]) -> bool {
+    if let Some(is_post) = explicit_shell_method(tokens, "--request") {
+        return is_post;
+    }
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "-d" | "-F"
+                | "--data"
+                | "--data-ascii"
+                | "--data-binary"
+                | "--data-raw"
+                | "--data-urlencode"
+                | "--form"
+                | "--form-string"
+                | "--json"
+        ) || token.starts_with("--data=")
+            || token.starts_with("--data-ascii=")
+            || token.starts_with("--data-binary=")
+            || token.starts_with("--data-raw=")
+            || token.starts_with("--data-urlencode=")
+            || token.starts_with("--form=")
+            || token.starts_with("--form-string=")
+            || token.starts_with("--json=")
+            || (token.starts_with("-d") && token.len() > 2)
+            || (token.starts_with("-F") && token.len() > 2)
+    })
+}
+
+fn shell_command_posts_to_pull_collection(command: &str, expected_path: Option<&str>) -> bool {
+    shell_invocations(command).into_iter().any(|tokens| {
+        if !tokens
+            .iter()
+            .any(|token| pull_collection_path_matches(token, expected_path))
+        {
+            return false;
+        }
+        if let Some(index) = tokens
+            .windows(2)
+            .position(|pair| shell_word_is_command(&pair[0], "gh") && pair[1] == "api")
+        {
+            return gh_api_invocation_is_post(&tokens[index + 2..]);
+        }
+        if let Some(index) = tokens
+            .iter()
+            .position(|token| shell_word_is_command(token, "curl"))
+        {
+            return curl_invocation_is_post(&tokens[index + 1..]);
+        }
+        false
     })
 }
 
@@ -15092,8 +15205,9 @@ fn requests_pull_request_creation(
         && args_compact.contains("createpullrequest");
     let rest_path = format!("/repos/{owner}/{repo}/pulls").to_ascii_lowercase();
     let shell_rest_creation = shell_like
-        && mentions_exact_path(&args_text, &rest_path)
-        && shell_rest_request_is_post(&args_text);
+        && shell_command_values(args)
+            .into_iter()
+            .any(|command| shell_command_posts_to_pull_collection(command, Some(&rest_path)));
     let github_like = tool_compact == "github";
     let structured_creation_operation = github_like
         && structured_repository_identifies(args, owner, repo)
@@ -16674,11 +16788,21 @@ mod tests {
         assert_eq!(consecutive_events, 0);
     }
 
-    #[test]
-    fn attachment_steering_waits_for_an_in_flight_vendor_mutation() {
-        assert!(steering_attachments_wait_for_mutation_lane(true, 1));
-        assert!(!steering_attachments_wait_for_mutation_lane(false, 1));
-        assert!(!steering_attachments_wait_for_mutation_lane(true, 0));
+    #[tokio::test]
+    async fn deferred_attachment_lane_wait_yields_until_the_holder_releases() {
+        let lane = Arc::new(tokio::sync::RwLock::new(()));
+        let holder = lane.clone().write_owned().await;
+        let mut waiter = Box::pin(lane.write_owned());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(holder);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("lane waiter did not resume after the holder released");
     }
 
     #[tokio::test]
@@ -20379,8 +20503,10 @@ default_permission_mode = "ask"
         for command in [
             "gh api /repos/o/r/pulls --field=title=test",
             "gh api /repos/o/r/pulls -Ftitle=test",
-            "gh api /repos/o/r/pulls --data payload.json",
-            "gh api /repos/o/r/pulls --json payload.json",
+            "gh api /repos/o/r/pulls --input payload.json",
+            "gh api -X \"POST\" /repos/o/r/pulls",
+            "curl /repos/o/r/pulls --data payload.json",
+            "curl /repos/o/r/pulls --json payload.json",
         ] {
             let args = serde_json::json!({ "cmd": command });
             assert!(could_request_pull_request_creation("functions.exec", &args));
@@ -20401,6 +20527,35 @@ default_permission_mode = "ask"
         assert!(!requests_pull_request_creation(
             "functions.exec",
             &explicit_get,
+            "o",
+            "r"
+        ));
+        let independent_invocations = serde_json::json!({
+            "cmd": concat!(
+                "gh api -X POST /repos/o/r/pulls --field title=test && ",
+                "gh api -X GET /repos/o/r/pulls"
+            )
+        });
+        assert!(could_request_pull_request_creation(
+            "functions.exec",
+            &independent_invocations
+        ));
+        assert!(requests_pull_request_creation(
+            "functions.exec",
+            &independent_invocations,
+            "o",
+            "r"
+        ));
+        let curl_read = serde_json::json!({
+            "cmd": "curl -fsSL https://api.github.com/repos/o/r/pulls"
+        });
+        assert!(!could_request_pull_request_creation(
+            "functions.exec",
+            &curl_read
+        ));
+        assert!(!requests_pull_request_creation(
+            "functions.exec",
+            &curl_read,
             "o",
             "r"
         ));
