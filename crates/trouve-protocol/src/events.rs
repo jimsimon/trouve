@@ -228,8 +228,9 @@ pub enum Event {
         supports_steering: bool,
     },
     /// Live usage from the most recently completed model request in a running
-    /// turn. This replaces the thread's context-usage snapshot without
-    /// completing the turn; `turn.completed` still carries final aggregates.
+    /// turn. Thread snapshots add its billing counters to `active_usage` while
+    /// replacing only the context fields. `last_usage` remains unchanged until
+    /// `turn.completed` supplies the turn's final aggregates.
     #[serde(rename = "turn.usage_updated")]
     TurnUsageUpdated { turn: u64, usage: Usage },
     #[serde(rename = "turn.completed")]

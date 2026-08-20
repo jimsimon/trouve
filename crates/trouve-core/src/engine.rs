@@ -9904,22 +9904,24 @@ impl Engine {
             .chain(known_models.iter())
             .find(|m| m.id == thread.model)
             .cloned();
-        let mut usage_total = Usage::default();
-        let mut accumulate_usage = |usage: &Usage| {
-            let cost = usage.cost_usd.or_else(|| {
-                pricing_model.as_ref().and_then(|model| {
+        let price_usage = |usage: &mut Usage| {
+            if usage.cost_usd.is_none() {
+                usage.cost_usd = pricing_model.as_ref().and_then(|model| {
                     self.model_catalog.cost_usd(
                         model,
                         usage.input_tokens,
                         usage.cached_input_tokens,
                         usage.output_tokens,
                     )
-                })
-            });
+                });
+            }
+        };
+        let mut usage_total = Usage::default();
+        let mut accumulate_usage = |usage: &Usage| {
             usage_total.input_tokens += usage.input_tokens;
             usage_total.output_tokens += usage.output_tokens;
             usage_total.cached_input_tokens += usage.cached_input_tokens;
-            if let Some(cost) = cost {
+            if let Some(cost) = usage.cost_usd {
                 usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
             }
             if usage.context_window.is_some() {
@@ -10012,6 +10014,7 @@ impl Engine {
                             usage.input_tokens.saturating_add(usage.cached_input_tokens)
                         });
                         usage.context_input_tokens = Some(context_input_tokens);
+                        price_usage(&mut usage);
                         accumulate_usage(&usage);
                         pending_events.push(Event::TurnUsageUpdated { turn, usage });
                     }
@@ -10178,6 +10181,7 @@ impl Engine {
                                         usage.input_tokens.saturating_add(usage.cached_input_tokens)
                                     });
                                 usage.context_input_tokens = Some(context_input_tokens);
+                                price_usage(&mut usage);
                                 accumulate_usage(&usage);
                                 pending_events.push(Event::TurnUsageUpdated { turn, usage });
                             }

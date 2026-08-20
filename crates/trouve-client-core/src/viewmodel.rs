@@ -10,6 +10,35 @@ use trouve_protocol::{
     TodoItem, TodoStatus, ToolStatus, Usage,
 };
 
+fn accumulate_live_usage(total: &mut Option<Usage>, latest: &Usage) {
+    let Some(total) = total else {
+        *total = Some(latest.clone());
+        return;
+    };
+    total.input_tokens = total.input_tokens.saturating_add(latest.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(latest.output_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(latest.cached_input_tokens);
+    if let Some(cost) = latest.cost_usd {
+        total.cost_usd = Some(total.cost_usd.unwrap_or(0.0) + cost);
+    }
+    if latest.context_input_tokens.is_some() {
+        total.context_input_tokens = latest.context_input_tokens;
+    }
+    if latest.context_window.is_some() {
+        total.context_window = latest.context_window;
+    }
+}
+
+fn usage_with_live_context(mut usage: Usage, live: Option<&Usage>) -> Usage {
+    if let Some(live) = live {
+        usage.context_input_tokens = usage.context_input_tokens.or(live.context_input_tokens);
+        usage.context_window = usage.context_window.or(live.context_window);
+    }
+    usage
+}
+
 /// Per-tool retained output budget. The projection keeps the latest valid
 /// UTF-8 suffix so replaying a long-running command cannot grow client memory
 /// without bound.
@@ -237,9 +266,15 @@ pub struct ThreadViewModel {
     pub pending_approvals: Vec<String>,
     /// Question request ids currently waiting for answers (newest last).
     pub pending_questions: Vec<String>,
-    /// Usage of the most recently completed turn; its input token count is
-    /// the best available proxy for current context size.
+    /// Usage for the active or most recently completed turn. Billing counters
+    /// aggregate across the turn; context fields describe its latest request.
     pub last_usage: Option<Usage>,
+    /// Aggregate billing counters for the active turn. Context fields retain
+    /// the newest request's measurement instead of being summed.
+    running_usage: Option<Usage>,
+    /// Usage from the most recently completed turn. Live usage temporarily
+    /// replaces last_usage for display and terminal failures restore this.
+    completed_usage: Option<Usage>,
     /// True between compaction start/complete events (UI busy indicator).
     pub compacting: bool,
     /// True while a turn is running (between turn.started and completion).
@@ -272,6 +307,9 @@ pub struct ThreadViewModel {
 
 impl From<ThreadViewSnapshot> for ThreadViewModel {
     fn from(snapshot: ThreadViewSnapshot) -> Self {
+        let running_usage = snapshot.active_usage;
+        let completed_usage = snapshot.last_usage;
+        let last_usage = running_usage.clone().or_else(|| completed_usage.clone());
         Self {
             items: snapshot.items.into_iter().map(ChatItem::from).collect(),
             cursor: 0,
@@ -280,7 +318,9 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             capacity_acquired_before_start: HashSet::new(),
             pending_approvals: snapshot.pending_approvals,
             pending_questions: snapshot.pending_questions,
-            last_usage: snapshot.last_usage,
+            last_usage,
+            running_usage,
+            completed_usage,
             compacting: snapshot.compacting,
             turn_running: snapshot.turn_running,
             thinking: snapshot.thinking,
@@ -585,6 +625,7 @@ impl ThreadViewModel {
                 ..
             } => {
                 self.turn_running = true;
+                self.running_usage = None;
                 self.turn_models.insert(*turn, model.clone());
                 if let Some(thinking_level) = thinking_level {
                     self.turn_thinking_levels
@@ -999,7 +1040,8 @@ impl ThreadViewModel {
                 idx
             }
             Event::TurnUsageUpdated { usage, .. } => {
-                self.last_usage = Some(usage.clone());
+                accumulate_live_usage(&mut self.running_usage, usage);
+                self.last_usage.clone_from(&self.running_usage);
                 None
             }
             Event::TurnCompleted {
@@ -1009,11 +1051,14 @@ impl ThreadViewModel {
             } => {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
+                let usage = usage_with_live_context(usage.clone(), self.running_usage.as_ref());
+                self.running_usage = None;
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
                 let aborted_tool = self.abort_open_tools(envelope.ts);
                 self.pending_questions.clear();
+                self.completed_usage = Some(usage.clone());
                 self.last_usage = Some(usage.clone());
                 self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().rposition(|i| {
@@ -1029,7 +1074,7 @@ impl ThreadViewModel {
                     self.items[idx] = ChatItem::TurnStatus {
                         turn: *turn,
                         state: TurnState::Completed {
-                            usage: usage.clone(),
+                            usage,
                             checkpoint_id: checkpoint_id.clone(),
                         },
                     };
@@ -1039,6 +1084,8 @@ impl ThreadViewModel {
             Event::TurnFailed { turn, error } => {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
+                self.running_usage = None;
+                self.last_usage.clone_from(&self.completed_usage);
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1067,6 +1114,8 @@ impl ThreadViewModel {
             Event::TurnCancelled { turn } => {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
+                self.running_usage = None;
+                self.last_usage.clone_from(&self.completed_usage);
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1517,14 +1566,35 @@ mod tests {
             output_tokens: 5,
             cached_input_tokens: 80,
             context_input_tokens: Some(90),
+            context_window: Some(200),
             ..Default::default()
         };
         vm.apply(&env(Event::TurnUsageUpdated {
             turn: 1,
             usage: live_usage.clone(),
         }));
+        vm.apply(&env(Event::TurnUsageUpdated {
+            turn: 1,
+            usage: Usage {
+                input_tokens: 2,
+                output_tokens: 3,
+                cached_input_tokens: 4,
+                context_input_tokens: Some(70),
+                ..Default::default()
+            },
+        }));
         assert!(vm.turn_running);
-        assert_eq!(vm.last_usage, Some(live_usage));
+        assert_eq!(
+            vm.last_usage,
+            Some(Usage {
+                input_tokens: 12,
+                output_tokens: 8,
+                cached_input_tokens: 84,
+                context_input_tokens: Some(70),
+                context_window: Some(200),
+                ..Default::default()
+            })
+        );
 
         vm.apply(&env(Event::CompactionStarted { turn: 1 }));
         assert!(vm.compacting);
@@ -1554,7 +1624,64 @@ mod tests {
             checkpoint_id: None,
         }));
         assert!(!vm.turn_running);
-        assert_eq!(vm.last_usage, Some(usage));
+        let completed_usage = Usage {
+            context_input_tokens: Some(70),
+            context_window: Some(200),
+            ..usage
+        };
+        assert_eq!(vm.last_usage, Some(completed_usage.clone()));
+
+        vm.apply(&env(Event::TurnStarted {
+            turn: 2,
+            mode: "code".into(),
+            model: "m".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        assert!(vm.turn_running);
+        assert_eq!(vm.running_usage, None);
+        assert_eq!(vm.last_usage, Some(completed_usage.clone()));
+        vm.apply(&env(Event::TurnUsageUpdated {
+            turn: 2,
+            usage: Usage {
+                input_tokens: 99,
+                output_tokens: 9,
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            vm.last_usage,
+            Some(Usage {
+                input_tokens: 99,
+                output_tokens: 9,
+                ..Default::default()
+            })
+        );
+        vm.apply(&env(Event::TurnFailed {
+            turn: 2,
+            error: "provider failed".into(),
+        }));
+        assert_eq!(vm.running_usage, None);
+        assert_eq!(vm.last_usage, Some(completed_usage.clone()));
+
+        vm.apply(&env(Event::TurnStarted {
+            turn: 3,
+            mode: "code".into(),
+            model: "m".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        vm.apply(&env(Event::TurnUsageUpdated {
+            turn: 3,
+            usage: Usage {
+                input_tokens: 42,
+                output_tokens: 4,
+                ..Default::default()
+            },
+        }));
+        vm.apply(&env(Event::TurnCancelled { turn: 3 }));
+        assert_eq!(vm.running_usage, None);
+        assert_eq!(vm.last_usage, Some(completed_usage));
     }
 
     #[test]

@@ -741,7 +741,7 @@ describe("ThreadViewModel", () => {
     expect(vm.thinking).toBe(false);
   });
 
-  it("applies live context usage without completing the running turn", () => {
+  it("accumulates live turn usage while retaining the latest context measurement", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.started",
@@ -764,12 +764,31 @@ describe("ThreadViewModel", () => {
         cached_input_tokens: 80_000,
         context_input_tokens: 90_000,
         context_window: 258_400,
+        cost_usd: 0.01,
+      },
+    }));
+    vm.apply(envelope(4, {
+      type: "turn.usage_updated",
+      turn: 1,
+      usage: {
+        input_tokens: 2_000,
+        output_tokens: 250,
+        cached_input_tokens: 5_000,
+        context_input_tokens: 70_000,
+        cost_usd: 0.02,
       },
     }));
 
     expect(vm.turnRunning).toBe(true);
-    expect(vm.lastUsageCursor).toBe(3);
-    expect(vm.lastUsage?.context_input_tokens).toBe(90_000);
+    expect(vm.lastUsageCursor).toBe(4);
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      cached_input_tokens: 85_000,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
+    expect(vm.lastUsage?.cost_usd).toBeCloseTo(0.03);
     expect(vm.items).toMatchObject([
       {
         kind: "turn-status",
@@ -777,20 +796,150 @@ describe("ThreadViewModel", () => {
           kind: "running",
           startedAt: "2026-08-01T12:00:01Z",
           usage: {
-            input_tokens: 10_000,
-            output_tokens: 500,
-            context_input_tokens: 90_000,
+            input_tokens: 12_000,
+            output_tokens: 750,
+            cached_input_tokens: 85_000,
+            context_input_tokens: 70_000,
+            context_window: 258_400,
           },
         },
       },
     ]);
+    const runningTurn = vm.items.find(
+      (item) => item.kind === "turn-status" && item.state.kind === "running",
+    );
+    expect(runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running"
+      ? runningTurn.state.usage?.cost_usd
+      : undefined).toBeCloseTo(0.03);
+
+    vm.apply(envelope(5, {
+      type: "turn.completed",
+      turn: 1,
+      usage: {
+        input_tokens: 12_000,
+        output_tokens: 750,
+        cached_input_tokens: 85_000,
+        cost_usd: 0.03,
+      },
+    }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
+    vm.apply(envelope(6, {
+      type: "turn.started",
+      turn: 2,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(7, {
+      type: "turn.capacity_acquired",
+      turn: 2,
+      wait_ms: 0,
+      background: false,
+    }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
+    expect(vm.items.at(-1)).toMatchObject({
+      kind: "turn-status",
+      turn: 2,
+      state: { kind: "running" },
+    });
+    expect(vm.items.at(-1)).not.toHaveProperty("state.usage");
+    vm.apply(envelope(8, {
+      type: "turn.usage_updated",
+      turn: 2,
+      usage: {
+        input_tokens: 300,
+        output_tokens: 20,
+        cached_input_tokens: 1_000,
+        context_input_tokens: 1_300,
+      },
+    }));
+
+    const turnStates = vm.items.filter((item) => item.kind === "turn-status");
+    expect(turnStates).toMatchObject([
+      {
+        turn: 1,
+        state: {
+          kind: "completed",
+          usage: {
+            input_tokens: 12_000,
+            output_tokens: 750,
+            context_input_tokens: 70_000,
+            context_window: 258_400,
+          },
+        },
+      },
+      {
+        turn: 2,
+        state: {
+          kind: "running",
+          usage: { input_tokens: 300, output_tokens: 20 },
+        },
+      },
+    ]);
+    vm.apply(envelope(9, {
+      type: "turn.failed",
+      turn: 2,
+      error: "provider failed",
+    }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
+    expect(vm.items.at(-1)).toMatchObject({
+      kind: "turn-status",
+      turn: 2,
+      state: { kind: "failed" },
+    });
+
+    vm.apply(envelope(10, {
+      type: "turn.started",
+      turn: 3,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(11, {
+      type: "turn.capacity_acquired",
+      turn: 3,
+      wait_ms: 0,
+      background: false,
+    }));
+    vm.apply(envelope(12, {
+      type: "turn.usage_updated",
+      turn: 3,
+      usage: {
+        input_tokens: 400,
+        output_tokens: 30,
+      },
+    }));
+    vm.apply(envelope(13, {
+      type: "turn.cancelled",
+      turn: 3,
+    }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
   });
 
   it("restores live usage and start time on a running snapshot turn", () => {
     const view = ThreadViewModel.fromSnapshot(17, {
       items: [{ kind: "turn_status", turn: 3, state: { state: "running" } }],
       turn_running: true,
-      last_usage: { input_tokens: 40, output_tokens: 12 },
+      last_usage: { input_tokens: 30, output_tokens: 8 },
+      active_usage: { input_tokens: 40, output_tokens: 12 },
       turn_started_at: { "3": "2026-08-01T12:00:00Z" },
     });
 
@@ -803,6 +952,37 @@ describe("ThreadViewModel", () => {
         usage: { input_tokens: 40, output_tokens: 12 },
       },
     }]);
+    expect(view.lastUsage).toMatchObject({ input_tokens: 40, output_tokens: 12 });
+  });
+
+  it("keeps prior context off a new snapshot turn before its first usage update", () => {
+    const view = ThreadViewModel.fromSnapshot(18, {
+      items: [{ kind: "turn_status", turn: 4, state: { state: "running" } }],
+      turn_running: true,
+      last_usage: {
+        input_tokens: 30,
+        output_tokens: 8,
+        context_input_tokens: 38,
+        context_window: 100,
+      },
+      turn_started_at: { "4": "2026-08-01T12:01:00Z" },
+    });
+
+    expect(view.lastUsage).toMatchObject({
+      input_tokens: 30,
+      output_tokens: 8,
+      context_input_tokens: 38,
+      context_window: 100,
+    });
+    expect(view.items).toMatchObject([{
+      kind: "turn-status",
+      turn: 4,
+      state: {
+        kind: "running",
+        startedAt: "2026-08-01T12:01:00Z",
+      },
+    }]);
+    expect(view.items[0]).not.toHaveProperty("state.usage");
   });
 
   it("attaches bridged approvals to tool cards and keeps denials terminal", () => {
