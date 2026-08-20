@@ -957,6 +957,7 @@ pub async fn serve_listener(
     // never serves a model list it immediately retracts (no-op without a
     // configured probe).
     engine.init_connectivity().await;
+    engine.start_session_pr_verification_worker();
     engine.warm_title_model();
     engine.start_connectivity_monitor();
     engine.start_automation_scheduler();
@@ -1147,7 +1148,8 @@ async fn configure_github_review_app(
 
 #[utoipa::path(put, path = "/v1/code-review/repository",
     request_body = UpdateCodeReviewRepositoryRequest,
-    responses((status = 200, body = CodeReviewRepository), (status = 400, body = ErrorBody)))]
+    responses((status = 200, body = CodeReviewRepository), (status = 400, body = ErrorBody),
+        (status = 409, body = ErrorBody)))]
 async fn update_code_review_repository(
     State(engine): State<Arc<Engine>>,
     Json(request): Json<UpdateCodeReviewRepositoryRequest>,

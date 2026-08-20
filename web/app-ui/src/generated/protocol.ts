@@ -1738,6 +1738,7 @@ export interface components {
              */
             default_thinking_level?: string | null;
             display_name: string;
+            group?: components["schemas"]["PersonaGroup"];
             /** @description Stable identifier, e.g. "code", "plan", "review". */
             id: string;
             /**
@@ -3294,6 +3295,11 @@ export interface components {
          * @enum {string}
          */
         PermissionMode: "ask" | "allow_list" | "yolo";
+        /**
+         * @description Whether a persona is intended for general interaction or specialized review.
+         * @enum {string}
+         */
+        PersonaGroup: "general" | "reviewer";
         /** @description A persona plus where it came from, for the settings UI. */
         PersonaInfo: {
             /**
@@ -4681,6 +4687,7 @@ export interface components {
             /** @description None uses the global default thinking level. */
             default_thinking_level?: string | null;
             display_name: string;
+            group?: components["schemas"]["PersonaGroup"];
             read_only?: boolean;
             system_prompt: string;
         };
@@ -5580,6 +5587,14 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

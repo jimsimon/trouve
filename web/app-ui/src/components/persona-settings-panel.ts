@@ -106,6 +106,21 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
   #modeFormModelId: string | undefined;
   #modeFormThinkingDraft: string | undefined;
 
+  async #restorePersonaFocus(id: string): Promise<void> {
+    await this.updateComplete;
+    const button = [...this.renderRoot.querySelectorAll<HTMLButtonElement>("button")]
+      .find((candidate) => candidate.dataset["personaFocus"] === id);
+    (button ?? this.renderRoot.querySelector<HTMLElement>("[data-persona-focus-fallback]"))?.focus();
+  }
+
+  async #reloadAfterMutation(success: string): Promise<boolean> {
+    if (await this.#load()) return true;
+    this.#message = `${success} The updated persona list could not be refreshed.`;
+    this.#error = true;
+    this.requestUpdate();
+    return false;
+  }
+
   #availableModels(): readonly ProtocolModelInfo[] {
     const catalog = this.#services.value?.modelCatalog.current;
     if (catalog === undefined) return this.#models;
@@ -118,9 +133,9 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     queueMicrotask(() => void this.#load());
   }
 
-  async #load(): Promise<void> {
+  async #load(): Promise<boolean> {
     const services = this.#services.value;
-    if (services === undefined) return;
+    if (services === undefined) return false;
     const { protocol } = services;
     this.#busy = true;
     this.#message = "Loading personas and models…";
@@ -135,9 +150,11 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       this.#defaultModelDraft = this.#providers.default_model ?? "";
       this.#defaultThinkingDraft = this.#providers.default_thinking_level ?? "";
       this.#message = "";
+      return true;
     } catch {
       this.#message = "Personas and model defaults could not be loaded.";
       this.#error = true;
+      return false;
     } finally {
       this.#busy = false;
       this.requestUpdate();
@@ -152,7 +169,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const model = String(data.get("model") ?? "");
     const permission = String(data.get("permission_mode") ?? "ask") as PermissionMode;
     const thinking = String(data.get("thinking") ?? "");
-    if (model === "" || !["ask", "allow_list", "yolo"].includes(permission)) return;
+    if (!["ask", "allow_list", "yolo"].includes(permission)) return;
     this.#busy = true;
     this.#message = "Saving defaults…";
     this.#error = false;
@@ -163,10 +180,12 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
         default_thinking_level: thinking || null,
         permission_mode: permission,
       });
-      await this.#load();
-      this.#message = "Defaults saved for new threads.";
+      const success = "Defaults saved for new threads.";
+      if (!await this.#reloadAfterMutation(success)) return;
+      this.#message = success;
       this.requestUpdate();
     } catch {
+      await this.#load();
       this.#message = "Defaults could not be saved.";
       this.#error = true;
       this.#busy = false;
@@ -183,6 +202,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const id = String(data.get("id") ?? existing?.persona.id ?? "").trim();
     const displayName = String(data.get("display_name") ?? "").trim();
     const systemPrompt = String(data.get("system_prompt") ?? "").trim();
+    const group = String(data.get("group") ?? "general") as "general" | "reviewer";
     const permission = String(data.get("default_permission_mode") ?? "");
     if ((existing === undefined && !/^[a-z0-9][a-z0-9_-]*$/u.test(id)) || displayName === "") {
       this.#message = "Persona IDs use lowercase letters, digits, underscore, or dash; a display name is required.";
@@ -199,14 +219,21 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       this.requestUpdate();
       return;
     }
+    const modelValue = data.get("default_model");
+    const thinkingValue = data.get("default_thinking_level");
     const request: ProtocolUpsertPersonaRequest = {
       display_name: displayName,
+      group,
       system_prompt: systemPrompt,
       allowed_tools: splitTools(String(data.get("allowed_tools") ?? "")),
       read_only: data.get("read_only") === "on",
-      default_model: String(data.get("default_model") ?? "") || null,
+      default_model: modelValue === null
+        ? existing?.persona.default_model ?? null
+        : String(modelValue) || null,
       default_permission_mode: permission === "" ? null : permission as PermissionMode,
-      default_thinking_level: String(data.get("default_thinking_level") ?? "") || null,
+      default_thinking_level: thinkingValue === null
+        ? existing?.persona.default_thinking_level ?? null
+        : String(thinkingValue) || null,
     };
     this.#busy = true;
     this.#message = `Saving ${id}…`;
@@ -218,11 +245,18 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       this.#editingModeId = "";
       this.#modeFormModelId = undefined;
       this.#modeFormThinkingDraft = undefined;
-      await this.#load();
-      this.#message = `Saved persona ${id}.`;
+      const success = `Saved persona ${id}.`;
+      if (!await this.#reloadAfterMutation(success)) {
+        void this.#restorePersonaFocus(existing === undefined ? "__add__" : id);
+        return;
+      }
+      this.#message = success;
       this.requestUpdate();
-    } catch {
-      this.#message = `Persona ${id} could not be saved.`;
+      void this.#restorePersonaFocus(existing === undefined ? "__add__" : id);
+    } catch (error) {
+      this.#message = error instanceof Error && error.message !== ""
+        ? error.message
+        : `Persona ${id} could not be saved.`;
       this.#error = true;
       this.#busy = false;
       this.requestUpdate();
@@ -241,9 +275,17 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       const success = info.origin === "custom"
         ? `Deleted persona ${info.persona.id}.`
         : `Reset persona ${info.persona.id} to its built-in definition.`;
-      await this.#load();
+      const focusId = info.origin === "custom" ? "__add__" : info.persona.id;
+      if (info.origin === "custom") {
+        this.#modes = this.#modes.filter((candidate) => candidate.persona.id !== info.persona.id);
+      }
+      if (!await this.#reloadAfterMutation(success)) {
+        void this.#restorePersonaFocus(focusId);
+        return;
+      }
       this.#message = success;
       this.requestUpdate();
+      void this.#restorePersonaFocus(focusId);
     } catch {
       this.#message = `Persona ${info.persona.id} could not be ${info.origin === "custom" ? "deleted" : "reset"}.`;
       this.#error = true;
@@ -267,6 +309,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
           ${mode === undefined ? html`<label class="mode-id-field"><span class="visually-hidden">Persona ID</span><input name="id" required placeholder="id (e.g. docs)" /></label>` : html`<input type="hidden" name="id" .value=${mode.id} />`}
           <label><span class="visually-hidden">Display name</span><input name="display_name" required placeholder="display name" .value=${mode?.display_name ?? ""} ?disabled=${readOnly} /></label>
         </div>
+        <label><span>Persona group</span><select name="group" .value=${mode?.group ?? "general"} ?disabled=${readOnly}><option value="general">General persona</option><option value="reviewer">Reviewer persona</option></select></label>
         <label><span>System prompt (appended to the base prompt):</span><textarea name="system_prompt" .value=${mode?.system_prompt ?? ""} ?disabled=${readOnly}></textarea></label>
         <label><span class="visually-hidden">Allowed tools</span><input name="allowed_tools" placeholder="allowed tools, comma-separated (empty = all tools)" .value=${(mode?.allowed_tools ?? []).join(", ")} ?disabled=${readOnly} /></label>
         <label class="row"><input style="width:auto" type="checkbox" name="read_only" .checked=${mode?.read_only ?? false} ?disabled=${readOnly} /><span>Read-only (never mutates the worktree)</span></label>
@@ -287,7 +330,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
         </div>
         ${readOnly
           ? html`<p class="meta">Workspace personas are managed by the repository’s .agents configuration.</p>`
-          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add persona" : "Save persona"}</button><button type="button" @click=${() => { this.#editingModeId = ""; this.#modeFormModelId = undefined; this.#modeFormThinkingDraft = undefined; this.requestUpdate(); }}>Cancel</button></div>`}
+          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add persona" : "Save persona"}</button><button type="button" @click=${() => { const focusId = mode?.id ?? "__add__"; this.#editingModeId = ""; this.#modeFormModelId = undefined; this.#modeFormThinkingDraft = undefined; this.requestUpdate(); void this.#restorePersonaFocus(focusId); }}>Cancel</button></div>`}
       </form>
     `;
   }
@@ -307,6 +350,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     try {
       await protocol.upsertPersona(mode.id, {
         display_name: mode.display_name,
+        group: mode.group ?? "general",
         system_prompt: mode.system_prompt,
         allowed_tools: [...(mode.allowed_tools ?? [])],
         ...(mode.read_only === undefined ? {} : { read_only: mode.read_only }),
@@ -316,8 +360,9 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
           ? mode.default_thinking_level ?? null
           : update.thinking,
       });
-      await this.#load();
-      this.#message = `Saved persona ${mode.id}.`;
+      const success = `Saved persona ${mode.id}.`;
+      if (!await this.#reloadAfterMutation(success)) return;
+      this.#message = success;
       this.requestUpdate();
     } catch {
       this.#message = `Persona ${mode.id} could not be saved.`;
@@ -361,9 +406,9 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
               ><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select>`}
         </div>
         <div class="mode-row-actions">
-          ${readOnly ? nothing : html`<button type="button" @click=${() => { this.#editingModeId = mode.id; this.#modeFormModelId = mode.default_model ?? ""; this.#modeFormThinkingDraft = mode.default_thinking_level ?? ""; this.requestUpdate(); }}>Edit</button>`}
+          ${readOnly ? nothing : html`<button type="button" data-persona-focus=${mode.id} aria-label=${`Edit ${mode.display_name}`} @click=${() => { this.#editingModeId = mode.id; this.#modeFormModelId = mode.default_model ?? ""; this.#modeFormThinkingDraft = mode.default_thinking_level ?? ""; this.requestUpdate(); }}>Edit</button>`}
           ${info.origin === "customized" || info.origin === "custom"
-            ? html`<button class="danger" type="button" ?disabled=${this.#busy} @click=${() => void this.#resetMode(info)}>${info.origin === "custom" ? "Remove" : "Reset"}</button>`
+            ? html`<button class="danger" type="button" aria-label=${`${info.origin === "custom" ? "Remove" : "Reset"} ${mode.display_name}`} ?disabled=${this.#busy} @click=${() => void this.#resetMode(info)}>${info.origin === "custom" ? "Remove" : "Reset"}</button>`
             : nothing}
         </div>
       </article>
@@ -376,7 +421,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const thinking = thinkingOptions(selected);
     return html`
       <div class="stack">
-        <h2>Personas &amp; Models</h2>
+        <h2 tabindex="-1" data-persona-focus-fallback>Personas &amp; Models</h2>
         ${models.length === 0 && !this.#busy
           ? html`<div class="no-models"><span>No models available — configure a provider to enable the model selectors.</span><button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Configure providers</button></div>`
           : nothing}
@@ -397,11 +442,14 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
           <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
           <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Set defaults</button></div>
         </form>
-        <h3 class="section-subtitle">Personas</h3>
-        <p class="modes-copy">A persona combines a prompt, tool policy, permissions, model, and thinking defaults. Built-in personas cannot be deleted. Custom personas are also available for code review. Workspace personas are file-managed and read-only here.</p>
-        <section class="mode-list" aria-label="Personas">${this.#modes.map((info) => this.#modeRow(info))}</section>
+        <h3 class="section-subtitle">General personas</h3>
+        <p class="modes-copy">General personas are available to sessions and threads.</p>
+        <section class="mode-list" aria-label="General personas">${this.#modes.filter((info) => (info.persona.group ?? "general") === "general").map((info) => this.#modeRow(info))}</section>
+        <h3 class="section-subtitle">Reviewer personas</h3>
+        <p class="modes-copy">Reviewer personas are available to sessions and threads and may also be selected by code review.</p>
+        <section class="mode-list" aria-label="Reviewer personas">${this.#modes.filter((info) => info.persona.group === "reviewer").map((info) => this.#modeRow(info))}</section>
         ${this.#editingModeId === ""
-          ? html`<div class="row"><button type="button" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add persona</button></div>`
+          ? html`<div class="row"><button type="button" data-persona-focus="__add__" aria-label="Add persona" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add persona</button></div>`
           : this.#editingModeId === "__new__"
             ? this.#modeForm()
             : this.#modeForm(this.#modes.find((info) => info.persona.id === this.#editingModeId))}

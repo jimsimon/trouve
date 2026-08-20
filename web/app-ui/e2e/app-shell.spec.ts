@@ -133,6 +133,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
           persona: {
             id: "code",
             display_name: "Engineer",
+            group: "general",
             system_prompt: "Implement the user's request by editing files.",
           },
         },
@@ -141,6 +142,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
           persona: {
             id: "plan",
             display_name: "Planner",
+            group: "general",
             system_prompt: "Explore the workspace and produce a concrete plan.",
             read_only: true,
           },
@@ -150,7 +152,18 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
           persona: {
             id: "review",
             display_name: "Reviewer",
+            group: "general",
             system_prompt: "Review the current changes for correctness.",
+            read_only: true,
+          },
+        },
+        {
+          origin: "builtin",
+          persona: {
+            id: "maintainability",
+            display_name: "Software Architect",
+            group: "reviewer",
+            system_prompt: "Review maintainability and architectural boundaries.",
             read_only: true,
           },
         },
@@ -552,7 +565,7 @@ test("Personas & Models uses provider-qualified model labels", async ({ page }) 
   await expect(page.getByRole("heading", { name: "Personas & Models", exact: true }))
     .toBeVisible();
   await expect(page.getByRole("option", { name: "codex/gpt-5.6-sol", exact: true }))
-    .toHaveCount(4);
+    .toHaveCount(5);
   await expect(page.getByRole("option", { name: "GPT-5.6 Sol", exact: true }))
     .toHaveCount(0);
 });

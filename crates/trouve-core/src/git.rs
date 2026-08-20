@@ -1714,6 +1714,80 @@ pub fn head_ref(repo: &Path) -> Result<String> {
     }
 }
 
+/// The checked-out branch and exact commit in one session worktree. Detached
+/// HEAD is intentionally rejected: PR ownership evidence must name the branch
+/// GitHub reports, not merely an object shared by every worktree.
+pub fn checked_out_branch_head(repo: &Path) -> Result<(String, String)> {
+    let branch = git(repo, &["symbolic-ref", "--short", "HEAD"])?;
+    ensure_safe_ref(&branch)?;
+    let head = git(repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    anyhow::ensure!(
+        head.len() == 40 && head.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "HEAD did not resolve to a full commit id"
+    );
+    let branch_revision = format!("refs/heads/{branch}^{{commit}}");
+    let branch_head = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &branch_revision,
+        ],
+    )?;
+    let current_branch = git(repo, &["symbolic-ref", "--short", "HEAD"])?;
+    anyhow::ensure!(
+        current_branch == branch && branch_head.eq_ignore_ascii_case(&head),
+        "HEAD changed while collecting branch ownership evidence"
+    );
+    Ok((branch, head))
+}
+
+/// Whether a local branch currently points at `commit`. This is trusted
+/// ownership evidence for remote objects reported by a provider: both the ref
+/// and object id must already exist in the session repository.
+pub fn local_branch_matches_commit(repo: &Path, branch: &str, commit: &str) -> bool {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || commit.len() != 40
+        || !commit.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let revision = format!("refs/heads/{branch}^{{commit}}");
+    git(
+        repo,
+        &["rev-parse", "--verify", "--end-of-options", &revision],
+    )
+    .is_ok_and(|resolved| resolved.eq_ignore_ascii_case(commit))
+}
+
+/// Whether this worktree still has `branch` checked out at `head` and the
+/// completion-time `ancestor` is in that exact branch history. This permits a
+/// session branch to advance after creating a PR without trusting a remote-only
+/// commit or a different worktree's ref.
+pub fn checked_out_branch_descends_from(
+    repo: &Path,
+    branch: &str,
+    head: &str,
+    ancestor: &str,
+) -> bool {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || [head, ancestor]
+            .iter()
+            .any(|commit| commit.len() != 40 || !commit.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        return false;
+    }
+    let Ok((checked_out_branch, checked_out_head)) = checked_out_branch_head(repo) else {
+        return false;
+    };
+    checked_out_branch == branch
+        && checked_out_head.eq_ignore_ascii_case(head)
+        && git(repo, &["merge-base", "--is-ancestor", ancestor, head]).is_ok()
+}
+
 /// Local branch names, most recently committed first.
 pub fn list_branches(repo: &Path) -> Result<Vec<String>> {
     let out = git(
@@ -3228,6 +3302,84 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         run(dir, &["add", "-A"]);
         run(dir, &["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn local_branch_commit_proof_rejects_provider_forgery() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let commit = run(tmp.path(), &["rev-parse", "HEAD"]);
+        run(tmp.path(), &["branch", "agent/created-pr", &commit]);
+
+        assert!(local_branch_matches_commit(
+            tmp.path(),
+            "agent/created-pr",
+            &commit
+        ));
+        assert!(!local_branch_matches_commit(tmp.path(), "forged", &commit));
+        assert!(!local_branch_matches_commit(
+            tmp.path(),
+            "agent/created-pr",
+            "0000000000000000000000000000000000000000"
+        ));
+        assert!(!local_branch_matches_commit(
+            tmp.path(),
+            "agent/created-pr",
+            "not-a-commit"
+        ));
+    }
+
+    #[test]
+    fn checked_out_branch_head_is_worktree_specific_and_rejects_detached_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["switch", "-c", "agent/clean-pr"]);
+        let commit = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        assert_eq!(
+            checked_out_branch_head(tmp.path()).unwrap(),
+            ("agent/clean-pr".into(), commit.clone())
+        );
+
+        run(tmp.path(), &["checkout", "--detach", &commit]);
+        assert!(checked_out_branch_head(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn checked_out_branch_history_requires_the_exact_worktree_tip() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["switch", "-c", "agent/clean-pr"]);
+        let ancestor = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("next.txt"), "next\n").unwrap();
+        run(tmp.path(), &["add", "next.txt"]);
+        run(tmp.path(), &["commit", "-m", "advance session branch"]);
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        assert!(checked_out_branch_descends_from(
+            tmp.path(),
+            "agent/clean-pr",
+            &head,
+            &ancestor
+        ));
+        assert!(!checked_out_branch_descends_from(
+            tmp.path(),
+            "other",
+            &head,
+            &ancestor
+        ));
+        assert!(!checked_out_branch_descends_from(
+            tmp.path(),
+            "agent/clean-pr",
+            &ancestor,
+            &ancestor
+        ));
+        assert!(!checked_out_branch_descends_from(
+            tmp.path(),
+            "agent/clean-pr",
+            &head,
+            &"0".repeat(40)
+        ));
     }
 
     #[test]

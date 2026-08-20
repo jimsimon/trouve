@@ -1,4 +1,4 @@
-use trouve_protocol::{AgentPersona, ReviewerProfile};
+use trouve_protocol::{AgentPersona, PersonaGroup, ReviewerProfile};
 
 pub const DEFAULT_REVIEWER_IDS: &[&str] = &[
     "correctness",
@@ -25,6 +25,11 @@ fn built_in(id: &str, name: &str, prompt: &str) -> ReviewerProfile {
 /// and queued jobs persist them.
 pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
     vec![
+        built_in(
+            "maintainability",
+            "Software Architect",
+            "Look for unnecessary coupling, duplicated sources of truth, violated module boundaries, misleading abstractions, brittle control flow, unreachable or obsolete code, and complexity that is likely to cause future correctness defects.",
+        ),
         built_in(
             "correctness",
             "Correctness Analyst",
@@ -90,6 +95,7 @@ pub fn reviewer_as_persona(reviewer: &ReviewerProfile) -> AgentPersona {
     AgentPersona {
         id: reviewer.id.clone(),
         display_name: reviewer.name.clone(),
+        group: PersonaGroup::Reviewer,
         system_prompt: reviewer.prompt.clone(),
         allowed_tools: crate::personas::review_inspection_tools(),
         read_only: true,
@@ -108,28 +114,6 @@ pub fn persona_as_reviewer(persona: &AgentPersona, built_in: bool) -> ReviewerPr
         default_thinking_level: persona.default_thinking_level.clone(),
         built_in,
     }
-}
-
-pub fn merge_persona_with_reviewer(
-    persona: &AgentPersona,
-    existing: Option<&ReviewerProfile>,
-    built_in: bool,
-) -> ReviewerProfile {
-    let mut reviewer = persona_as_reviewer(persona, built_in);
-    if let Some(existing) = existing {
-        if !existing.prompt.trim().is_empty() {
-            reviewer.prompt.clone_from(&existing.prompt);
-        }
-        if existing.model.is_some() {
-            reviewer.model.clone_from(&existing.model);
-        }
-        if existing.default_thinking_level.is_some() {
-            reviewer
-                .default_thinking_level
-                .clone_from(&existing.default_thinking_level);
-        }
-    }
-    reviewer
 }
 
 pub fn default_reviewer_ids() -> Vec<String> {
@@ -176,6 +160,7 @@ mod tests {
             ("api-compatibility", "API Steward"),
             ("data-integrity", "Data Integrity Specialist"),
             ("testing", "Test Engineer"),
+            ("maintainability", "Software Architect"),
             ("dependencies", "Supply Chain Analyst"),
             ("accessibility", "Accessibility Specialist"),
             ("operations", "Site Reliability Engineer"),
@@ -207,13 +192,15 @@ mod tests {
             review.default_permission_mode
         );
         assert_eq!(persona.system_prompt, reviewer.prompt);
+        assert_eq!(persona.group, PersonaGroup::Reviewer);
     }
 
     #[test]
-    fn legacy_customized_reviewer_values_survive_persona_overlay() {
+    fn persona_conversion_preserves_canonical_values() {
         let persona = AgentPersona {
             id: "correctness".into(),
             display_name: "Correctness".into(),
+            group: PersonaGroup::Reviewer,
             system_prompt: "Canonical prompt".into(),
             allowed_tools: Vec::new(),
             read_only: true,
@@ -221,20 +208,11 @@ mod tests {
             default_model: Some("provider/default".into()),
             default_thinking_level: Some("medium".into()),
         };
-        let legacy = ReviewerProfile {
-            id: persona.id.clone(),
-            name: "Legacy label".into(),
-            prompt: "Customized prompt".into(),
-            model: Some("provider/custom".into()),
-            default_thinking_level: Some("high".into()),
-            built_in: true,
-        };
-
-        let merged = merge_persona_with_reviewer(&persona, Some(&legacy), true);
+        let merged = persona_as_reviewer(&persona, true);
         assert_eq!(merged.name, "Correctness");
-        assert_eq!(merged.prompt, "Customized prompt");
-        assert_eq!(merged.model.as_deref(), Some("provider/custom"));
-        assert_eq!(merged.default_thinking_level.as_deref(), Some("high"));
+        assert_eq!(merged.prompt, "Canonical prompt");
+        assert_eq!(merged.model.as_deref(), Some("provider/default"));
+        assert_eq!(merged.default_thinking_level.as_deref(), Some("medium"));
         assert!(merged.built_in);
     }
 }
