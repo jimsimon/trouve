@@ -736,13 +736,13 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
+    backfill_code_review_watermarks(conn)?;
+    repair_legacy_code_review_publications(conn)?;
+    normalize_code_review_publication_orders(conn)?;
     migrate_code_review_theme_observation_publication_authority(
         conn,
         had_theme_observation_publication_authority,
     )?;
-    backfill_code_review_watermarks(conn)?;
-    repair_legacy_code_review_publications(conn)?;
-    normalize_code_review_publication_orders(conn)?;
     promote_published_code_review_theme_observations(conn)?;
     backfill_code_review_publication_dispatch(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
@@ -799,38 +799,26 @@ fn migrate_code_review_theme_observation_publication_authority(
                ADD COLUMN publication_managed INTEGER NOT NULL DEFAULT 0;",
         )?;
         if had_publication_authority {
-            // Transitional databases can contain both staged
-            // authority-managed rows and rollback rows whose eager writer
-            // already applied the same transition. Preserve only the latest
-            // unapplied row per theme. Pre-authority databases are excluded
-            // using the schema fact captured before generic migrations added
-            // `published`; their aggregate already includes every row.
+            // Transitional databases can contain both staged rows and rows
+            // whose rollback writer eagerly changed the aggregate. Normalize
+            // every row to managed provenance, derive its consumed state from
+            // durable job publication evidence, then rebuild the aggregate
+            // exactly once from that canonical history. This avoids guessing
+            // provenance from mutable theme state or discarding older staged
+            // observations. Pre-authority databases are excluded using the
+            // schema fact captured before this startup added `published`;
+            // their existing aggregate remains authoritative.
             tx.execute(
                 "UPDATE code_review_theme_observations AS observation
-                 SET publication_managed = 1
-                 WHERE observation.published = 0
-                   AND NOT EXISTS (
-                     SELECT 1 FROM code_review_theme_observations AS newer
-                     WHERE newer.theme_id = observation.theme_id
-                       AND (
-                         newer.created_at > observation.created_at
-                         OR (
-                           newer.created_at = observation.created_at
-                           AND newer.rowid > observation.rowid
-                         )
-                       )
-                   )
-                   AND EXISTS (
-                     SELECT 1 FROM code_review_themes AS theme
-                     WHERE theme.id = observation.theme_id
-                       AND NOT (
-                         theme.status = 'open'
-                         AND theme.last_seen_head = observation.head_sha
-                         AND theme.resolved_head = ''
-                       )
-                   )",
+                 SET publication_managed = 1,
+                     published = EXISTS (
+                       SELECT 1 FROM code_review_jobs AS job
+                       WHERE job.id = observation.job_id
+                         AND job.review_published != 0
+                     )",
                 [],
             )?;
+            rebuild_code_review_theme_aggregates(&tx)?;
         }
     }
     tx.execute(
@@ -844,6 +832,101 @@ fn migrate_code_review_theme_observation_publication_authority(
         params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+fn rebuild_code_review_theme_aggregates(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "UPDATE code_review_themes AS theme
+         SET status = CASE
+               WHEN NOT EXISTS (
+                 SELECT 1 FROM code_review_theme_observations AS observation
+                 WHERE observation.theme_id = theme.id
+                   AND observation.published != 0
+               ) THEN 'pending'
+               WHEN EXISTS (
+                 SELECT 1
+                 FROM code_review_finding_themes AS finding_theme
+                 JOIN code_review_findings AS finding
+                   ON finding.id = finding_theme.finding_id
+                 JOIN code_review_jobs AS finding_job
+                   ON finding_job.id = finding.job_id
+                 LEFT JOIN code_review_jobs AS link_job
+                   ON link_job.id = finding_theme.linked_by_job_id
+                 WHERE finding_theme.theme_id = theme.id
+                   AND finding.status = 'open'
+                   AND finding_job.review_published != 0
+                   AND (
+                     finding_theme.linked_by_job_id = ''
+                     OR link_job.review_published != 0
+                   )
+               ) THEN 'open'
+               ELSE 'resolved'
+             END,
+             last_seen_head = COALESCE((
+               SELECT observation.head_sha
+               FROM code_review_theme_observations AS observation
+               JOIN code_review_jobs AS job ON job.id = observation.job_id
+               WHERE observation.theme_id = theme.id
+                 AND observation.published != 0
+               ORDER BY job.publication_order DESC, job.rowid DESC,
+                        observation.rowid DESC
+               LIMIT 1
+             ), theme.first_seen_head),
+             resolved_head = CASE
+               WHEN EXISTS (
+                 SELECT 1
+                 FROM code_review_finding_themes AS finding_theme
+                 JOIN code_review_findings AS finding
+                   ON finding.id = finding_theme.finding_id
+                 JOIN code_review_jobs AS finding_job
+                   ON finding_job.id = finding.job_id
+                 LEFT JOIN code_review_jobs AS link_job
+                   ON link_job.id = finding_theme.linked_by_job_id
+                 WHERE finding_theme.theme_id = theme.id
+                   AND finding.status = 'open'
+                   AND finding_job.review_published != 0
+                   AND (
+                     finding_theme.linked_by_job_id = ''
+                     OR link_job.review_published != 0
+                   )
+               ) OR NOT EXISTS (
+                 SELECT 1 FROM code_review_theme_observations AS observation
+                 WHERE observation.theme_id = theme.id
+                   AND observation.published != 0
+               ) THEN ''
+               ELSE COALESCE((
+                 SELECT resolver.head_sha
+                 FROM code_review_finding_themes AS finding_theme
+                 JOIN code_review_findings AS finding
+                   ON finding.id = finding_theme.finding_id
+                 JOIN code_review_jobs AS resolver
+                   ON resolver.id = finding.resolved_by_job_id
+                 WHERE finding_theme.theme_id = theme.id
+                   AND resolver.review_published != 0
+                 ORDER BY resolver.publication_order DESC, resolver.rowid DESC
+                 LIMIT 1
+               ), '')
+             END,
+             recurrence_count = (
+               SELECT COUNT(*)
+               FROM code_review_theme_observations AS observation
+               WHERE observation.theme_id = theme.id
+                 AND observation.published != 0
+                 AND observation.kind = 'recurrence'
+             ),
+             updated_at = COALESCE((
+               SELECT MAX(observation.created_at)
+               FROM code_review_theme_observations AS observation
+               WHERE observation.theme_id = theme.id
+                 AND observation.published != 0
+             ), theme.updated_at)
+         WHERE EXISTS (
+           SELECT 1 FROM code_review_theme_observations AS observation
+           WHERE observation.theme_id = theme.id
+         )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -18493,14 +18576,14 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_staged_observations_using_aggregate_evidence() {
+    fn migration_rebuilds_all_staged_observations() {
         let data = tempfile::tempdir().unwrap();
         let database = data
             .path()
             .join("authority-aware-theme-observation.sqlite3");
         let store = Store::open(&database).unwrap();
         let job = enqueue_backoff_test_job(&store);
-        store
+        let findings = store
             .save_code_review_result_with_themes(
                 &job.id,
                 "summary",
@@ -18531,11 +18614,17 @@ mod tests {
                 &[],
             )
             .unwrap();
-        store
-            .conn
-            .lock()
+        let theme_id = findings[0].theme_ids[0].clone();
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:second-staged".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second_job = store
+            .enqueue_code_review_job(&second_request)
             .unwrap()
-            .execute(
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
                 "UPDATE code_review_jobs
                  SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-9',
                      review_published = 0, publication_accepted = 0,
@@ -18544,6 +18633,29 @@ mod tests {
                 [&job.id],
             )
             .unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-10',
+                     review_published = 0, publication_accepted = 0,
+                     publication_claimed = 1, publication_order = 2
+                 WHERE id = ?1",
+                [&second_job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published,
+                    publication_managed, created_at)
+                 VALUES (?1, ?2, ?3, 'recurrence', 0, 1, ?4)",
+                params![
+                    theme_id,
+                    second_job.id,
+                    second_job.head_sha,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        }
         drop(store);
 
         // Recreate the immediately preceding authority-aware shape: staged
@@ -18583,13 +18695,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(observation, (true, true));
+        let second_observation = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published, publication_managed
+                 FROM code_review_theme_observations WHERE job_id = ?1",
+                [&second_job.id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(second_observation, (true, true));
         let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
         assert_eq!(themes[0].status, "open");
-        assert_eq!(themes[0].last_seen_head, job.head_sha);
+        assert_eq!(themes[0].last_seen_head, second_job.head_sha);
+        assert_eq!(themes[0].recurrence_count, 1);
     }
 
     #[test]
-    fn rollback_observations_in_transitional_schema_are_consumed() {
+    fn rollback_observations_in_transitional_schema_are_rebuilt_once() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("rollback-theme-observation.sqlite3");
         let store = Store::open(&database).unwrap();
@@ -18699,12 +18824,12 @@ mod tests {
                 |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
             )
             .unwrap();
-        assert_eq!(observation, (true, false));
+        assert_eq!(observation, (true, true));
         let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
         assert_eq!(themes[0].status, "open");
         assert_eq!(themes[0].last_seen_head, job.head_sha);
         assert!(themes[0].resolved_head.is_empty());
-        assert_eq!(themes[0].recurrence_count, 5);
+        assert_eq!(themes[0].recurrence_count, 1);
     }
 
     #[test]
