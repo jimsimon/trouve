@@ -69,6 +69,17 @@ impl Provider for ScriptedProvider {
     fn id(&self) -> &str {
         "scripted"
     }
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "scripted/test-model".into(),
+            display_name: "Scripted test model".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: Some(1.0),
+            output_price_per_mtok: Some(2.0),
+            options_schema: serde_json::json!({}),
+        }]
+    }
 
     async fn stream_chat(
         &self,
@@ -664,6 +675,7 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     let checkpoint_id = completed["checkpoint_id"].as_str().unwrap().to_string();
     assert_eq!(completed["usage"]["input_tokens"], 30);
     assert_eq!(completed["usage"]["context_input_tokens"], 20);
+    assert!((completed["usage"]["cost_usd"].as_f64().unwrap() - 0.000_044).abs() < 1e-12);
     let live_usage = events
         .iter()
         .filter(|event| event["type"] == "turn.usage_updated")
@@ -671,6 +683,8 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     assert_eq!(live_usage.len(), 2);
     assert_eq!(live_usage[0]["usage"]["context_input_tokens"], 10);
     assert_eq!(live_usage[1]["usage"]["context_input_tokens"], 20);
+    assert!((live_usage[0]["usage"]["cost_usd"].as_f64().unwrap() - 0.000_020).abs() < 1e-12);
+    assert!((live_usage[1]["usage"]["cost_usd"].as_f64().unwrap() - 0.000_024).abs() < 1e-12);
     assert!(
         events
             .iter()
