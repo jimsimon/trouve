@@ -4477,6 +4477,7 @@ export interface components {
          *     response and subscribe to the thread event stream after that cursor.
          */
         ThreadViewSnapshot: {
+            active_usage?: null | components["schemas"]["Usage"];
             commands?: components["schemas"]["CommandInfo"][];
             compacting?: boolean;
             /** @description Whether another page exists before `item_offset`. */

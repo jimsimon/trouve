@@ -277,7 +277,9 @@ pub use requests::*;
 // thinking level, and permission mode used by new threads (additive).
 // 7.2: code-review jobs expose the immutable incremental watermark separately
 // from the effective diff base selected after ancestry checks (additive).
-pub const PROTOCOL_VERSION: &str = "7.2";
+// 7.3: thread-view snapshots identify active-turn cumulative usage separately
+// from the latest valid usage measurement (additive).
+pub const PROTOCOL_VERSION: &str = "7.3";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

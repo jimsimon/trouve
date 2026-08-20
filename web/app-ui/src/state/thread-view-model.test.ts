@@ -819,11 +819,15 @@ describe("ThreadViewModel", () => {
         input_tokens: 12_000,
         output_tokens: 750,
         cached_input_tokens: 85_000,
-        context_input_tokens: 70_000,
-        context_window: 258_400,
         cost_usd: 0.03,
       },
     }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
     vm.apply(envelope(6, {
       type: "turn.started",
       turn: 2,
@@ -836,7 +840,12 @@ describe("ThreadViewModel", () => {
       wait_ms: 0,
       background: false,
     }));
-    expect(vm.lastUsage).toBeUndefined();
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
     expect(vm.items.at(-1)).toMatchObject({
       kind: "turn-status",
       turn: 2,
@@ -860,7 +869,12 @@ describe("ThreadViewModel", () => {
         turn: 1,
         state: {
           kind: "completed",
-          usage: { input_tokens: 12_000, output_tokens: 750 },
+          usage: {
+            input_tokens: 12_000,
+            output_tokens: 750,
+            context_input_tokens: 70_000,
+            context_window: 258_400,
+          },
         },
       },
       {
@@ -877,7 +891,8 @@ describe("ThreadViewModel", () => {
     const view = ThreadViewModel.fromSnapshot(17, {
       items: [{ kind: "turn_status", turn: 3, state: { state: "running" } }],
       turn_running: true,
-      last_usage: { input_tokens: 40, output_tokens: 12 },
+      last_usage: { input_tokens: 30, output_tokens: 8 },
+      active_usage: { input_tokens: 40, output_tokens: 12 },
       turn_started_at: { "3": "2026-08-01T12:00:00Z" },
     });
 
@@ -890,6 +905,7 @@ describe("ThreadViewModel", () => {
         usage: { input_tokens: 40, output_tokens: 12 },
       },
     }]);
+    expect(view.lastUsage).toMatchObject({ input_tokens: 40, output_tokens: 12 });
   });
 
   it("attaches bridged approvals to tool cards and keeps denials terminal", () => {

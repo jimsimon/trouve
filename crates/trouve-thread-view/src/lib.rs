@@ -31,6 +31,14 @@ fn accumulate_live_usage(total: &mut Option<Usage>, latest: &Usage) {
     }
 }
 
+fn usage_with_live_context(mut usage: Usage, live: Option<&Usage>) -> Usage {
+    if let Some(live) = live {
+        usage.context_input_tokens = usage.context_input_tokens.or(live.context_input_tokens);
+        usage.context_window = usage.context_window.or(live.context_window);
+    }
+    usage
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ThreadProjection {
     pub cursor: u64,
@@ -55,10 +63,6 @@ pub struct ThreadProjection {
     /// importing historical streams with the opposite ordering.
     #[serde(default)]
     capacity_acquired_before_start: HashSet<u64>,
-    /// Aggregate billing counters for the active turn. Context fields retain
-    /// the newest request's measurement instead of being summed.
-    #[serde(default)]
-    running_usage: Option<Usage>,
     #[serde(skip)]
     indexes: ProjectionIndexes,
 }
@@ -113,8 +117,7 @@ impl ThreadProjection {
                 ..
             } => {
                 self.snapshot.turn_running = true;
-                self.running_usage = None;
-                self.snapshot.last_usage = None;
+                self.snapshot.active_usage = None;
                 self.snapshot.turn_models.insert(*turn, model.clone());
                 if let Some(thinking_level) = thinking_level {
                     self.snapshot
@@ -454,8 +457,10 @@ impl ThreadProjection {
                 }
             }
             Event::TurnUsageUpdated { usage, .. } => {
-                accumulate_live_usage(&mut self.running_usage, usage);
-                self.snapshot.last_usage.clone_from(&self.running_usage);
+                accumulate_live_usage(&mut self.snapshot.active_usage, usage);
+                self.snapshot
+                    .last_usage
+                    .clone_from(&self.snapshot.active_usage);
             }
             Event::TurnCompleted {
                 turn,
@@ -463,13 +468,15 @@ impl ThreadProjection {
                 checkpoint_id,
             } => {
                 self.finish_turn(*turn, envelope.ts);
-                self.running_usage = None;
+                let usage =
+                    usage_with_live_context(usage.clone(), self.snapshot.active_usage.as_ref());
+                self.snapshot.active_usage = None;
                 self.snapshot.last_usage = Some(usage.clone());
                 if let Some(&idx) = self.indexes.turns.get(turn) {
                     self.snapshot.items[idx] = ThreadViewItem::TurnStatus {
                         turn: *turn,
                         state: ThreadTurnState::Completed {
-                            usage: usage.clone(),
+                            usage,
                             checkpoint_id: checkpoint_id.clone(),
                         },
                     };
@@ -477,7 +484,7 @@ impl ThreadProjection {
             }
             Event::TurnFailed { turn, error } => {
                 self.finish_turn(*turn, envelope.ts);
-                self.running_usage = None;
+                self.snapshot.active_usage = None;
                 if let Some(&idx) = self.indexes.turns.get(turn) {
                     self.snapshot.items[idx] = ThreadViewItem::TurnStatus {
                         turn: *turn,
@@ -489,7 +496,7 @@ impl ThreadProjection {
             }
             Event::TurnCancelled { turn } => {
                 self.finish_turn(*turn, envelope.ts);
-                self.running_usage = None;
+                self.snapshot.active_usage = None;
                 if let Some(idx) = self.indexes.turns.remove(turn) {
                     self.snapshot.items.remove(idx);
                     self.turn_starts.remove(idx);
@@ -1258,6 +1265,10 @@ mod tests {
             })
         );
         assert_eq!(
+            projection.snapshot.active_usage,
+            projection.snapshot.last_usage
+        );
+        assert_eq!(
             projection
                 .snapshot
                 .turn_thinking_levels
@@ -1273,13 +1284,17 @@ mod tests {
             })
         ));
 
-        let completed_usage = projection.snapshot.last_usage.clone().unwrap();
         projection.apply(&envelope(
             5,
             13,
             Event::TurnCompleted {
                 turn: 7,
-                usage: completed_usage,
+                usage: trouve_protocol::Usage {
+                    input_tokens: 12_000,
+                    output_tokens: 750,
+                    cached_input_tokens: 85_000,
+                    ..Default::default()
+                },
                 checkpoint_id: None,
             },
         ));
@@ -1294,7 +1309,18 @@ mod tests {
                 supports_steering: false,
             },
         ));
-        assert_eq!(projection.snapshot.last_usage, None);
+        assert_eq!(projection.snapshot.active_usage, None);
+        assert!(matches!(
+            projection.snapshot.last_usage,
+            Some(trouve_protocol::Usage {
+                input_tokens: 12_000,
+                output_tokens: 750,
+                cached_input_tokens: 85_000,
+                context_input_tokens: Some(70_000),
+                context_window: Some(258_400),
+                ..
+            })
+        ));
         let next_usage = trouve_protocol::Usage {
             input_tokens: 300,
             output_tokens: 20,
@@ -1311,6 +1337,7 @@ mod tests {
             },
         ));
 
+        assert_eq!(projection.snapshot.active_usage, Some(next_usage.clone()));
         assert_eq!(projection.snapshot.last_usage, Some(next_usage));
         assert!(matches!(
             projection.snapshot.items.first(),

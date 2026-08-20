@@ -40,6 +40,17 @@ const accumulateLiveUsage = (
   };
 };
 
+const usageWithLiveContext = (usage: Usage, live: Usage | undefined): Usage => {
+  const merged = { ...usage };
+  if (merged.context_input_tokens == null && live?.context_input_tokens != null) {
+    merged.context_input_tokens = live.context_input_tokens;
+  }
+  if (merged.context_window == null && live?.context_window != null) {
+    merged.context_window = live.context_window;
+  }
+  return merged;
+};
+
 /** Constant-space queue revision observation scoped to one pending request. */
 export interface QueueRevisionTracker {
   readonly queueChanged: () => boolean;
@@ -292,7 +303,8 @@ export class ThreadViewModel {
     );
     this.hasOlder = snapshot.has_older ?? itemOffset > 0;
     this.snapshotLoaded = true;
-    this.lastUsage = snapshot.last_usage ?? undefined;
+    const activeUsage = snapshot.active_usage ?? undefined;
+    this.lastUsage = activeUsage ?? snapshot.last_usage ?? undefined;
     this.lastUsageCursor = this.lastUsage === undefined ? 0 : cursor;
     this.compacting = snapshot.compacting ?? false;
     this.turnRunning = snapshot.turn_running ?? false;
@@ -311,7 +323,7 @@ export class ThreadViewModel {
           ? {
               kind: "running",
               ...(startedAt === undefined ? {} : { startedAt }),
-              ...(this.lastUsage === undefined ? {} : { usage: this.lastUsage }),
+              ...(activeUsage === undefined ? {} : { usage: activeUsage }),
             }
           : {
               kind: "waiting-for-capacity",
@@ -547,7 +559,6 @@ export class ThreadViewModel {
       }
       case "turn.started":
         this.turnRunning = true;
-        this.lastUsage = undefined;
         this.turnModels.set(envelope.turn, envelope.model);
         if (envelope.thinking_level == null) {
           this.turnThinkingLevels.delete(envelope.turn);
@@ -873,12 +884,24 @@ export class ThreadViewModel {
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
-        this.lastUsage = envelope.usage;
+        const runningTurn = this.#findLast(
+          (item) =>
+            item.kind === "turn-status"
+            && item.turn === envelope.turn
+            && item.state.kind === "running",
+        );
+        const usage = usageWithLiveContext(
+          envelope.usage,
+          runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running"
+            ? runningTurn.state.usage
+            : undefined,
+        );
+        this.lastUsage = usage;
         this.lastUsageCursor = envelope.cursor;
         this.recordTurnDuration(envelope.turn, envelope.ts);
         return this.replaceActiveTurn(envelope.turn, {
           kind: "completed",
-          usage: envelope.usage,
+          usage,
           ...(envelope.checkpoint_id == null
             ? {}
             : { checkpointId: envelope.checkpoint_id }),
