@@ -499,6 +499,18 @@ CREATE TABLE IF NOT EXISTS code_review_theme_observations (
 );
 CREATE INDEX IF NOT EXISTS code_review_theme_observations_job
   ON code_review_theme_observations (job_id, theme_id);
+CREATE TABLE IF NOT EXISTS code_review_theme_transitions (
+  theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  status TEXT NOT NULL,
+  last_seen_head TEXT NOT NULL,
+  resolved_head TEXT NOT NULL DEFAULT '',
+  recurrence_count INTEGER NOT NULL DEFAULT 0,
+  transitioned_at TEXT NOT NULL,
+  PRIMARY KEY (theme_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS code_review_theme_transitions_job
+  ON code_review_theme_transitions (job_id, theme_id);
 CREATE TABLE IF NOT EXISTS code_review_finding_themes (
   finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
@@ -743,6 +755,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         conn,
         had_theme_observation_publication_authority,
     )?;
+    migrate_code_review_theme_transitions(conn, had_theme_observation_publication_authority)?;
     promote_published_code_review_theme_observations(conn)?;
     backfill_code_review_publication_dispatch(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
@@ -818,7 +831,6 @@ fn migrate_code_review_theme_observation_publication_authority(
                      )",
                 [],
             )?;
-            rebuild_code_review_theme_aggregates(&tx)?;
         }
     }
     tx.execute(
@@ -835,115 +847,245 @@ fn migrate_code_review_theme_observation_publication_authority(
     Ok(())
 }
 
-fn rebuild_code_review_theme_aggregates(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+fn migrate_code_review_theme_transitions(
+    conn: &mut Connection,
+    had_publication_authority: bool,
+) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-theme-transitions-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    record_code_review_theme_transition_snapshots(&tx, "", "")?;
+    if had_publication_authority {
+        apply_code_review_theme_transition_snapshots(&tx, "")?;
+    }
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Records the final state established for each theme by one published review.
+/// An empty job filter backfills all published history during migration. The
+/// snapshot folds only publication-scoped observations, links, and closures;
+/// mutable aggregate fields never participate in reconstruction.
+fn record_code_review_theme_transition_snapshots(
+    tx: &rusqlite::Transaction<'_>,
+    job_filter: &str,
+    transitioned_at_override: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO code_review_theme_transitions
+           (theme_id, job_id, status, last_seen_head, resolved_head,
+            recurrence_count, transitioned_at)
+         WITH candidates(theme_id, job_id) AS (
+           SELECT observation.theme_id, observation.job_id
+           FROM code_review_theme_observations AS observation
+           JOIN code_review_jobs AS observation_job
+             ON observation_job.id = observation.job_id
+           WHERE observation.published != 0
+             AND observation_job.review_published != 0
+             AND (?1 = '' OR observation.job_id = ?1)
+           UNION
+           SELECT finding_theme.theme_id, resolver.id
+           FROM code_review_finding_themes AS finding_theme
+           JOIN code_review_findings AS finding
+             ON finding.id = finding_theme.finding_id
+           JOIN code_review_jobs AS finding_job
+             ON finding_job.id = finding.job_id
+           LEFT JOIN code_review_jobs AS link_job
+             ON link_job.id = finding_theme.linked_by_job_id
+           JOIN code_review_jobs AS resolver
+             ON resolver.id = finding.resolved_by_job_id
+           WHERE finding_job.review_published != 0
+             AND finding_job.publication_order <= resolver.publication_order
+             AND (
+               finding_theme.linked_by_job_id = ''
+               OR (
+                 link_job.review_published != 0
+                 AND link_job.publication_order <= resolver.publication_order
+               )
+             )
+             AND resolver.review_published != 0
+             AND (?1 = '' OR resolver.id = ?1)
+         ),
+         snapshot_inputs AS (
+           SELECT candidate.theme_id, candidate.job_id,
+                  snapshot_job.head_sha, snapshot_job.publication_order,
+                  EXISTS (
+                    SELECT 1
+                    FROM code_review_finding_themes AS finding_theme
+                    JOIN code_review_findings AS finding
+                      ON finding.id = finding_theme.finding_id
+                    JOIN code_review_jobs AS finding_job
+                      ON finding_job.id = finding.job_id
+                    LEFT JOIN code_review_jobs AS link_job
+                      ON link_job.id = finding_theme.linked_by_job_id
+                    LEFT JOIN code_review_jobs AS resolver
+                      ON resolver.id = finding.resolved_by_job_id
+                    WHERE finding_theme.theme_id = candidate.theme_id
+                      AND finding_job.review_published != 0
+                      AND finding_job.publication_order
+                          <= snapshot_job.publication_order
+                      AND (
+                        finding_theme.linked_by_job_id = ''
+                        OR (
+                          link_job.review_published != 0
+                          AND link_job.publication_order
+                              <= snapshot_job.publication_order
+                        )
+                      )
+                      AND (
+                        finding.resolved_by_job_id = ''
+                        OR resolver.id IS NULL
+                        OR resolver.review_published = 0
+                        OR resolver.publication_order
+                            > snapshot_job.publication_order
+                      )
+                  ) AS has_open_finding
+           FROM candidates AS candidate
+           JOIN code_review_jobs AS snapshot_job
+             ON snapshot_job.id = candidate.job_id
+           WHERE snapshot_job.review_published != 0
+         )
+         SELECT snapshot.theme_id, snapshot.job_id,
+                CASE WHEN snapshot.has_open_finding THEN 'open' ELSE 'resolved' END,
+                COALESCE((
+                  SELECT observation.head_sha
+                  FROM code_review_theme_observations AS observation
+                  JOIN code_review_jobs AS observation_job
+                    ON observation_job.id = observation.job_id
+                  WHERE observation.theme_id = snapshot.theme_id
+                    AND observation.published != 0
+                    AND observation_job.review_published != 0
+                    AND observation_job.publication_order
+                        <= snapshot.publication_order
+                  ORDER BY observation_job.publication_order DESC,
+                           observation_job.rowid DESC, observation.rowid DESC
+                  LIMIT 1
+                ), snapshot.head_sha),
+                CASE WHEN snapshot.has_open_finding THEN '' ELSE snapshot.head_sha END,
+                (
+                  SELECT COUNT(*)
+                  FROM code_review_theme_observations AS observation
+                  JOIN code_review_jobs AS observation_job
+                    ON observation_job.id = observation.job_id
+                  WHERE observation.theme_id = snapshot.theme_id
+                    AND observation.published != 0
+                    AND observation.kind = 'recurrence'
+                    AND observation_job.review_published != 0
+                    AND observation_job.publication_order
+                        <= snapshot.publication_order
+                ),
+                COALESCE(NULLIF(?2, ''), (
+                  SELECT NULLIF(MAX(finding.resolved_at), '')
+                  FROM code_review_finding_themes AS finding_theme
+                  JOIN code_review_findings AS finding
+                    ON finding.id = finding_theme.finding_id
+                  JOIN code_review_jobs AS finding_job
+                    ON finding_job.id = finding.job_id
+                  LEFT JOIN code_review_jobs AS link_job
+                    ON link_job.id = finding_theme.linked_by_job_id
+                  WHERE finding_theme.theme_id = snapshot.theme_id
+                    AND finding.resolved_by_job_id = snapshot.job_id
+                    AND finding_job.review_published != 0
+                    AND (
+                      finding_theme.linked_by_job_id = ''
+                      OR link_job.review_published != 0
+                    )
+                ), (
+                  SELECT COALESCE(job.completed_at, job.started_at, job.created_at)
+                  FROM code_review_jobs AS job
+                  WHERE job.id = snapshot.job_id
+                ))
+         FROM snapshot_inputs AS snapshot",
+        params![job_filter, transitioned_at_override],
+    )?;
+    Ok(())
+}
+
+fn apply_code_review_theme_transition_snapshots(
+    tx: &rusqlite::Transaction<'_>,
+    job_filter: &str,
+) -> Result<()> {
     tx.execute(
         "UPDATE code_review_themes AS theme
-         SET status = CASE
-               WHEN NOT EXISTS (
-                 SELECT 1 FROM code_review_theme_observations AS observation
-                 WHERE observation.theme_id = theme.id
-                   AND observation.published != 0
-               ) THEN 'pending'
-               WHEN EXISTS (
-                 SELECT 1
-                 FROM code_review_finding_themes AS finding_theme
-                 JOIN code_review_findings AS finding
-                   ON finding.id = finding_theme.finding_id
-                 JOIN code_review_jobs AS finding_job
-                   ON finding_job.id = finding.job_id
-                 LEFT JOIN code_review_jobs AS link_job
-                   ON link_job.id = finding_theme.linked_by_job_id
-                 WHERE finding_theme.theme_id = theme.id
-                   AND finding.status = 'open'
-                   AND finding_job.review_published != 0
-                   AND (
-                     finding_theme.linked_by_job_id = ''
-                     OR link_job.review_published != 0
-                   )
-               ) THEN 'open'
-               ELSE 'resolved'
-             END,
-             last_seen_head = COALESCE((
-               SELECT observation.head_sha
-               FROM code_review_theme_observations AS observation
-               JOIN code_review_jobs AS job ON job.id = observation.job_id
-               WHERE observation.theme_id = theme.id
-                 AND observation.published != 0
-               ORDER BY job.publication_order DESC, job.rowid DESC,
-                        observation.rowid DESC
+         SET status = (
+               SELECT transition.status
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
                LIMIT 1
-             ), theme.first_seen_head),
-             resolved_head = CASE
-               WHEN EXISTS (
-                 SELECT 1
-                 FROM code_review_finding_themes AS finding_theme
-                 JOIN code_review_findings AS finding
-                   ON finding.id = finding_theme.finding_id
-                 JOIN code_review_jobs AS finding_job
-                   ON finding_job.id = finding.job_id
-                 LEFT JOIN code_review_jobs AS link_job
-                   ON link_job.id = finding_theme.linked_by_job_id
-                 WHERE finding_theme.theme_id = theme.id
-                   AND finding.status = 'open'
-                   AND finding_job.review_published != 0
-                   AND (
-                     finding_theme.linked_by_job_id = ''
-                     OR link_job.review_published != 0
-                   )
-               ) OR NOT EXISTS (
-                 SELECT 1 FROM code_review_theme_observations AS observation
-                 WHERE observation.theme_id = theme.id
-                   AND observation.published != 0
-               ) THEN ''
-               ELSE COALESCE((
-                 SELECT resolver.head_sha
-                 FROM code_review_finding_themes AS finding_theme
-                 JOIN code_review_findings AS finding
-                   ON finding.id = finding_theme.finding_id
-                 JOIN code_review_jobs AS finding_job
-                   ON finding_job.id = finding.job_id
-                 LEFT JOIN code_review_jobs AS link_job
-                   ON link_job.id = finding_theme.linked_by_job_id
-                 JOIN code_review_jobs AS resolver
-                   ON resolver.id = finding.resolved_by_job_id
-                 WHERE finding_theme.theme_id = theme.id
-                   AND finding_job.review_published != 0
-                   AND (
-                     finding_theme.linked_by_job_id = ''
-                     OR link_job.review_published != 0
-                   )
-                   AND resolver.review_published != 0
-                 ORDER BY resolver.publication_order DESC, resolver.rowid DESC
-                 LIMIT 1
-               ), NULLIF(theme.resolved_head, ''), (
-                 SELECT observation.head_sha
-                 FROM code_review_theme_observations AS observation
-                 JOIN code_review_jobs AS job ON job.id = observation.job_id
-                 WHERE observation.theme_id = theme.id
-                   AND observation.published != 0
-                 ORDER BY job.publication_order DESC, job.rowid DESC,
-                          observation.rowid DESC
-                 LIMIT 1
-               ), '')
-             END,
-             recurrence_count = (
-               SELECT COUNT(*)
-               FROM code_review_theme_observations AS observation
-               WHERE observation.theme_id = theme.id
-                 AND observation.published != 0
-                 AND observation.kind = 'recurrence'
              ),
-             updated_at = MAX(theme.updated_at, COALESCE((
-                 SELECT MAX(observation.created_at)
-                 FROM code_review_theme_observations AS observation
-                 WHERE observation.theme_id = theme.id
-                   AND observation.published != 0
-               ), theme.updated_at))
+             last_seen_head = (
+               SELECT transition.last_seen_head
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             ),
+             resolved_head = (
+               SELECT transition.resolved_head
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             ),
+             recurrence_count = (
+               SELECT transition.recurrence_count
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             ),
+             updated_at = (
+               SELECT transition.transitioned_at
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             )
          WHERE EXISTS (
-           SELECT 1 FROM code_review_theme_observations AS observation
-           WHERE observation.theme_id = theme.id
-         )",
-        [],
+           SELECT 1 FROM code_review_theme_transitions AS transition
+           WHERE transition.theme_id = theme.id
+         )
+           AND (
+             ?1 = ''
+             OR EXISTS (
+               SELECT 1 FROM code_review_theme_transitions AS current_transition
+               WHERE current_transition.theme_id = theme.id
+                 AND current_transition.job_id = ?1
+             )
+           )",
+        params![job_filter],
     )?;
     Ok(())
 }
@@ -1083,7 +1225,7 @@ fn promote_published_code_review_theme_observations(conn: &mut Connection) -> Re
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let jobs = {
         let mut stmt = tx.prepare(
-            "SELECT DISTINCT job.id,
+            "SELECT DISTINCT job.id, job.repository, job.pull_number, job.head_sha,
                     COALESCE(job.completed_at, job.started_at, job.created_at)
              FROM code_review_jobs job
              JOIN code_review_theme_observations observation ON observation.job_id = job.id
@@ -1091,12 +1233,27 @@ fn promote_published_code_review_theme_observations(conn: &mut Connection) -> Re
              ORDER BY job.repository, job.pull_number, job.publication_order, job.id",
         )?;
         stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (job_id, published_at) in jobs {
+    for (job_id, repository, pull_number, head_sha, published_at) in jobs {
         publish_code_review_theme_observations(&tx, &job_id, &published_at)?;
+        resolve_code_review_themes_in_transaction(
+            &tx,
+            &repository,
+            pull_number as u64,
+            &head_sha,
+            &published_at,
+        )?;
+        record_code_review_theme_transition_snapshots(&tx, &job_id, &published_at)?;
+        apply_code_review_theme_transition_snapshots(&tx, &job_id)?;
     }
     tx.commit()?;
     Ok(())
@@ -11905,6 +12062,8 @@ impl Store {
             head_sha,
             &published_at,
         )?;
+        record_code_review_theme_transition_snapshots(&tx, id, &published_at)?;
+        apply_code_review_theme_transition_snapshots(&tx, id)?;
         record_code_review_open_issue_count(&tx, id)?;
         tx.execute(
             "INSERT INTO code_review_pr_state
@@ -18695,7 +18854,9 @@ mod tests {
                    (theme_id, job_id, head_sha, kind, published, created_at)
                  SELECT theme_id, job_id, head_sha, kind, published, created_at
                  FROM authority_observations;
-                 DROP TABLE authority_observations;",
+                 DROP TABLE authority_observations;
+                 DELETE FROM store_migrations
+                 WHERE id = 'code-review-theme-transitions-v1';",
             )
             .unwrap();
         drop(legacy);
@@ -18732,79 +18893,199 @@ mod tests {
     }
 
     #[test]
-    fn migration_rebuild_preserves_authoritative_resolution_state() {
-        let data = tempfile::tempdir().unwrap();
-        let database = data.path().join("resolved-theme-observation.sqlite3");
-        let store = Store::open(&database).unwrap();
-        let published_job = enqueue_backoff_test_job(&store);
-        store
+    fn publication_records_final_theme_transition_snapshots() {
+        let store = Store::open_in_memory().unwrap();
+        let first_job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first_job.id
+        );
+        let findings = store
             .save_code_review_result_with_themes(
-                &published_job.id,
-                "summary",
-                "fix the root cause",
-                0,
-                &[],
-                &[],
+                &first_job.id,
+                "one issue",
+                "fix it",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Published issue".into(),
+                    body: "The first transition stays open.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["transition-theme".into()],
+                    ..Default::default()
+                }],
                 &[NewCodeReviewTheme {
-                    id: "resolved-theme".into(),
-                    root_cause: "resolved root cause".into(),
-                    recommendation: "preserve authoritative transitions".into(),
+                    id: "transition-theme".into(),
+                    root_cause: "transition root cause".into(),
+                    recommendation: "persist final publication state".into(),
                     observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
                     previous_finding_ids: Vec::new(),
                 }],
                 &[],
             )
             .unwrap();
-        let theme_id = store
+        assert!(store.claim_code_review_publication(&first_job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &first_job.id,
+                &first_job.repository,
+                first_job.pull_number,
+                &first_job.base_ref,
+                &first_job.head_sha,
+                "https://example.test/review/transition-1",
+                false,
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+        let first_transition = store
             .conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT theme_id FROM code_review_theme_observations WHERE job_id = ?1",
-                [&published_job.id],
+                "SELECT status, resolved_head
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = ?1 AND job_id = ?2",
+                params![theme_id, first_job.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first_transition, ("open".into(), String::new()));
+
+        store
+            .finish_code_review_job(
+                &first_job.id,
+                "succeeded",
+                "https://example.test/review/transition-1",
+                "",
+            )
+            .unwrap();
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:transition-2".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second_job = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            second_job.id
+        );
+        store
+            .save_code_review_result(&second_job.id, "clean", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&second_job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &second_job.id,
+                &second_job.repository,
+                second_job.pull_number,
+                &second_job.base_ref,
+                &second_job.head_sha,
+                "https://example.test/review/transition-2",
+                false,
+                &[&findings[0].id],
+            )
+            .unwrap();
+        let second_transition = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, resolved_head, last_seen_head
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = ?1 AND job_id = ?2",
+                params![theme_id, second_job.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            second_transition,
+            ("resolved".into(), second_job.head_sha, first_job.head_sha)
+        );
+    }
+
+    #[test]
+    fn migration_rebuild_uses_only_published_theme_transitions() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("resolved-theme-observation.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let published_job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &published_job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/published.rs".into(),
+                    line: 7,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Published symptom".into(),
+                    body: "Only a published resolver can close this finding.".into(),
+                    prompt_for_agents: "Keep unpublished closures open.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["published-theme".into()],
+                    ..Default::default()
+                }],
+                &[
+                    NewCodeReviewTheme {
+                        id: "published-theme".into(),
+                        root_cause: "published root cause".into(),
+                        recommendation: "record the closure transition".into(),
+                        observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                        previous_finding_ids: Vec::new(),
+                    },
+                    NewCodeReviewTheme {
+                        id: "standalone-theme".into(),
+                        root_cause: "standalone root cause".into(),
+                        recommendation: "record the final publication state".into(),
+                        observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                        previous_finding_ids: Vec::new(),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+        let published_theme_id = findings[0].theme_ids[0].clone();
+        let standalone_theme_id = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT theme_id
+                 FROM code_review_theme_observations
+                 WHERE job_id = ?1 AND theme_id != ?2",
+                params![published_job.id, published_theme_id],
                 |row| row.get::<_, String>(0),
             )
             .unwrap();
         let mut unpublished_request = backoff_test_job_request();
-        unpublished_request.dedupe_key = "acme/widgets#42:unpublished-link".into();
+        unpublished_request.dedupe_key = "acme/widgets#42:unpublished-resolver".into();
         unpublished_request.head_sha = "3333333333333333333333333333333333333333".into();
         let unpublished_job = store
             .enqueue_code_review_job(&unpublished_request)
             .unwrap()
             .unwrap();
-        let unpublished_findings = store
-            .save_code_review_result_with_themes(
-                &unpublished_job.id,
-                "unpublished summary",
-                "do not publish",
-                1,
-                &[NewCodeReviewFinding {
-                    path: "src/unpublished.rs".into(),
-                    line: 7,
-                    side: "RIGHT".into(),
-                    severity: "medium".into(),
-                    confidence: "high".into(),
-                    title: "Unpublished symptom".into(),
-                    body: "This link never became authoritative.".into(),
-                    prompt_for_agents: "Ignore unpublished links.".into(),
-                    sources: Vec::new(),
-                }],
-                &[NewCodeReviewFindingDetails {
-                    theme_ids: vec![theme_id.clone()],
-                    ..Default::default()
-                }],
-                &[NewCodeReviewTheme {
-                    id: theme_id.clone(),
-                    root_cause: "resolved root cause".into(),
-                    recommendation: "preserve authoritative transitions".into(),
-                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::Continuation,
-                    previous_finding_ids: Vec::new(),
-                }],
-                &[],
-            )
-            .unwrap();
-        let authoritative_updated_at = "2099-01-02T03:04:05+00:00";
-        {
+        let stale_unpublished_time = "2099-01-02T03:04:05+00:00";
+        let authoritative_transition_time = {
             let conn = store.conn.lock().unwrap();
             conn.execute(
                 "UPDATE code_review_jobs
@@ -18821,22 +19102,33 @@ mod tests {
                      resolved_head = ?3, resolved_at = ?4
                  WHERE id = ?1",
                 params![
-                    unpublished_findings[0].id,
-                    published_job.id,
-                    published_job.head_sha,
-                    authoritative_updated_at
+                    findings[0].id,
+                    unpublished_job.id,
+                    unpublished_job.head_sha,
+                    stale_unpublished_time
                 ],
             )
             .unwrap();
             conn.execute(
                 "UPDATE code_review_themes
-                 SET status = 'resolved', resolved_head = 'authoritative-resolution',
+                 SET status = 'resolved', resolved_head = 'stale-resolution',
                      updated_at = ?2
-                 WHERE id = ?1",
-                params![theme_id, authoritative_updated_at],
+                 WHERE id IN (?1, ?3)",
+                params![
+                    published_theme_id,
+                    stale_unpublished_time,
+                    standalone_theme_id
+                ],
             )
             .unwrap();
-        }
+            conn.query_row(
+                "SELECT COALESCE(completed_at, started_at, created_at)
+                 FROM code_review_jobs WHERE id = ?1",
+                [&published_job.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
         drop(store);
 
         let legacy = Connection::open(&database).unwrap();
@@ -18856,7 +19148,9 @@ mod tests {
                    (theme_id, job_id, head_sha, kind, published, created_at)
                  SELECT theme_id, job_id, head_sha, kind, published, created_at
                  FROM authority_observations;
-                 DROP TABLE authority_observations;",
+                 DROP TABLE authority_observations;
+                 DELETE FROM store_migrations
+                 WHERE id = 'code-review-theme-transitions-v1';",
             )
             .unwrap();
         drop(legacy);
@@ -18865,20 +19159,34 @@ mod tests {
         let themes = reopened
             .code_review_themes_for_job(&published_job.id)
             .unwrap();
-        assert_eq!(themes.len(), 1);
-        assert_eq!(themes[0].status, "resolved");
-        assert_eq!(themes[0].resolved_head, "authoritative-resolution");
-        let updated_at = reopened
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT updated_at FROM code_review_themes WHERE id = ?1",
-                [&theme_id],
-                |row| row.get::<_, String>(0),
-            )
+        let published_theme = themes
+            .iter()
+            .find(|theme| theme.id == published_theme_id)
             .unwrap();
-        assert_eq!(updated_at, authoritative_updated_at);
+        assert_eq!(published_theme.status, "open");
+        assert!(published_theme.resolved_head.is_empty());
+        let standalone_theme = themes
+            .iter()
+            .find(|theme| theme.id == standalone_theme_id)
+            .unwrap();
+        assert_eq!(standalone_theme.status, "resolved");
+        assert_eq!(standalone_theme.resolved_head, published_job.head_sha);
+        let conn = reopened.conn.lock().unwrap();
+        for theme_id in [&published_theme_id, &standalone_theme_id] {
+            let (updated_at, transition_count) = conn
+                .query_row(
+                    "SELECT theme.updated_at, (
+                       SELECT COUNT(*) FROM code_review_theme_transitions transition
+                       WHERE transition.theme_id = theme.id
+                     )
+                     FROM code_review_themes theme WHERE theme.id = ?1",
+                    [theme_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(updated_at, authoritative_transition_time);
+            assert_eq!(transition_count, 1);
+        }
     }
 
     #[test]
@@ -18939,7 +19247,9 @@ mod tests {
                    (theme_id, job_id, head_sha, kind, published, created_at)
                  SELECT theme_id, job_id, head_sha, kind, published, created_at
                  FROM authority_observations;
-                 DROP TABLE authority_observations;",
+                 DROP TABLE authority_observations;
+                 DELETE FROM store_migrations
+                 WHERE id = 'code-review-theme-transitions-v1';",
             )
             .unwrap();
             conn.execute(
