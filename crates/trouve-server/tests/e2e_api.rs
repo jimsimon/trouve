@@ -2750,17 +2750,35 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         event["type"] == "assistant.thinking" && event["turn"] == 5
     })
     .await;
-    let release = client
-        .post(format!("{base}/threads/{thread_id}/steer"))
-        .json(&serde_json::json!({"content": "Finish the restarted turn."}))
-        .send()
-        .await
-        .unwrap();
+    let release = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client
+            .post(format!("{base}/threads/{thread_id}/steer"))
+            .json(&serde_json::json!({
+                "content": "Finish the restarted turn.",
+                "attachments": [{
+                    "name": "after-cancel-steer.png",
+                    "mime": "image/png",
+                    "data": "iVBORw0KGgo=",
+                }],
+            }))
+            .send(),
+    )
+    .await
+    .expect("attachment steering did not finish after cancellation")
+    .unwrap();
     assert_eq!(release.status(), reqwest::StatusCode::ACCEPTED);
     wait_for_event(&client, &events_url, |event| {
         event["type"] == "turn.completed" && event["turn"] == 5
     })
     .await;
+    {
+        let received = backend.steers.lock().unwrap();
+        assert_eq!(received.len(), 4);
+        assert_eq!(received[3].1, "Finish the restarted turn.");
+        assert_eq!(received[3].2.len(), 1);
+        assert!(Path::new(&received[3].2[0]).exists());
+    }
 }
 
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",
