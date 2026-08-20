@@ -1336,6 +1336,7 @@ fn looks_like_public_cursor_model(id: &str) -> bool {
     id.starts_with("claude-")
         || id.starts_with("gemini-")
         || id.starts_with("gpt-")
+        || id.starts_with("grok-")
         || id.starts_with("chatgpt-")
         || id.starts_with("codex-")
         || id.starts_with("computer-use-")
@@ -2409,7 +2410,8 @@ mod tests {
             ]},
             { "value": "gpt-future", "name": "Uncatalogued public model",
               "configOptions": [] },
-            { "value": "grok-future", "name": "New Cursor Grok", "configOptions": [] }
+            { "value": "grok-future", "name": "Uncatalogued public Grok",
+              "configOptions": [] }
         ]});
         let live = parse_acp_models("cursor", &result);
         let models: Vec<_> = live
@@ -2417,7 +2419,7 @@ mod tests {
             .filter_map(|model| canonicalize_cursor_model(&catalog, "cursor", model))
             .collect();
 
-        assert_eq!(models.len(), 3, "unknown public ids are not guessed");
+        assert_eq!(models.len(), 2, "unknown public ids are not guessed");
         let fable = &models[0];
         assert_eq!(fable.display_name, "Claude Fable 5");
         assert_eq!(fable.context_window, 1_000_000);
@@ -2440,10 +2442,6 @@ mod tests {
             composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(true))
         );
-
-        let grok = &models[2];
-        assert_eq!(grok.id, "cursor/grok-future");
-        assert_eq!(grok.display_name, "New Cursor Grok");
     }
 
     #[test]

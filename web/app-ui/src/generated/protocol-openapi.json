@@ -12751,7 +12751,7 @@
               },
               {
                 "$ref": "#/components/schemas/Usage",
-                "description": "Latest valid usage measurement, retained across turn boundaries for\ncontext display."
+                "description": "Aggregate usage for the most recently completed turn. Running-turn\nusage is reported separately in `active_usage`."
               }
             ]
           },

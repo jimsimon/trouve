@@ -49,6 +49,9 @@ const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 /// Keep one slow repository from delaying every session while still bounding
 /// concurrent GitHub traffic from the durable PR-verification worker.
 const MAX_PARALLEL_SESSION_PR_VERIFICATIONS: usize = 4;
+/// Bound one session's sequential GitHub work so a large backlog cannot hold
+/// its verification lane for an entire global poll cycle.
+const MAX_SESSION_PR_VERIFICATIONS_PER_PASS: usize = 4;
 /// A single successful creator call cannot nominate unbounded durable work.
 const MAX_SESSION_PR_VERIFICATIONS_PER_CREATION_CALL: usize = 16;
 /// Recoverable verification work expires deliberately rather than after a
@@ -67,6 +70,7 @@ const PR_VERIFICATION_FAILURE_CONTENTION: &str = "contention";
 const PR_VERIFICATION_FAILURE_EVIDENCE: &str = "evidence";
 const PR_VERIFICATION_FAILURE_HEAD_MOVED: &str = "head_moved";
 const PR_VERIFICATION_FAILURE_NOT_FOUND: &str = "not_found";
+const PR_VERIFICATION_FAILURE_PERSISTENCE: &str = "persistence";
 const PR_VERIFICATION_FAILURE_TRANSIENT: &str = "transient";
 const MAX_ATTACHMENTS_PER_PROMPT: usize = 4;
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
@@ -1256,12 +1260,7 @@ pub enum EngineError {
 }
 
 fn github_engine_error(error: anyhow::Error) -> EngineError {
-    let authentication_required = error.chain().any(|cause| {
-        cause
-            .downcast_ref::<octocrab::Error>()
-            .is_some_and(octocrab_error_requires_reauthentication)
-    });
-    if authentication_required {
+    if github_error_requires_reauthentication(&error) {
         EngineError::AuthenticationRequired(
             "GitHub permissions are missing or expired. Re-authenticate under Settings → Integrations to grant the required repository and organization-read permissions."
                 .into(),
@@ -1269,6 +1268,14 @@ fn github_engine_error(error: anyhow::Error) -> EngineError {
     } else {
         EngineError::Internal(error)
     }
+}
+
+fn github_error_requires_reauthentication(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<octocrab::Error>()
+            .is_some_and(octocrab_error_requires_reauthentication)
+    })
 }
 
 fn octocrab_error_requires_reauthentication(error: &octocrab::Error) -> bool {
@@ -1664,6 +1671,14 @@ struct SteerTurnCommand {
 struct ActiveTurnSteerer {
     turn: u64,
     sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
+    mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SteerMutationLaneState {
+    Idle,
+    Waiting,
+    Ended,
 }
 
 /// Remove only the registration installed by this backend turn. A cancelled
@@ -1719,14 +1734,28 @@ fn reserve_ready_steer_after_event_budget<T>(
     }
 }
 
+fn reject_pending_steer(pending: &mut Option<SteerTurnCommand>, reason: &str) {
+    if let Some(SteerTurnCommand { response, .. }) = pending.take() {
+        let _ = response.send(Err(reason.into()));
+    }
+}
+
 impl Drop for ActiveTurnSteererGuard<'_> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
-        if registry
+        let matching_turn = registry
             .get(&self.thread_id)
-            .is_some_and(|active| active.turn == self.turn)
-        {
-            registry.remove(&self.thread_id);
+            .is_some_and(|active| active.turn == self.turn);
+        let removed = if matching_turn {
+            registry.remove(&self.thread_id)
+        } else {
+            None
+        };
+        drop(registry);
+        if let Some(active) = removed {
+            active
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
         }
     }
 }
@@ -1796,7 +1825,8 @@ pub struct Engine {
     /// avoid retaining deleted sessions while still preventing duplicate
     /// GitHub reads and association events from overlapping retry triggers.
     session_pr_verification_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-    session_pr_verification_wake: tokio::sync::Notify,
+    session_pr_verification_wake: Arc<tokio::sync::Notify>,
+    session_pr_verification_worker_started: AtomicBool,
     /// Per-root delegation lanes. Providers may request multiple spawn tools
     /// in one parallel batch; serializing only the admission/create window
     /// for one tree makes the depth and active-descendant caps atomic without
@@ -2206,7 +2236,8 @@ impl Engine {
             session_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
-            session_pr_verification_wake: tokio::sync::Notify::new(),
+            session_pr_verification_wake: Arc::new(tokio::sync::Notify::new()),
+            session_pr_verification_worker_started: AtomicBool::new(false),
             subagent_tree_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
@@ -5132,14 +5163,29 @@ impl Engine {
 
     /// Branch-based discovery outside the tool-completion path still requires
     /// the fetched head to exist locally before it can become durable evidence.
-    async fn pr_has_locally_verified_head(session: &Session, pr: &trouve_protocol::PrInfo) -> bool {
+    async fn pr_has_locally_verified_head(
+        &self,
+        session_id: &str,
+        pr: &trouve_protocol::PrInfo,
+    ) -> bool {
         let Some(commit) = pr.head_sha.clone() else {
             return false;
         };
-        let branch = pr.head.clone();
+        let lifecycle = self.session_lock(session_id);
+        let _lifecycle_guard = lifecycle.read().await;
+        if self.deleting_sessions.lock().unwrap().contains(session_id) {
+            return false;
+        }
+        let Ok(Some(session)) = self.store.session(session_id) else {
+            return false;
+        };
+        if session.branch != pr.head {
+            return false;
+        }
+        let branch = session.branch.clone();
         let worktree = PathBuf::from(&session.worktree_path);
         tokio::task::spawn_blocking(move || {
-            crate::git::local_branch_matches_commit(&worktree, &branch, &commit)
+            crate::git::checked_out_branch_descends_from(&worktree, &branch, &commit, &commit)
         })
         .await
         .unwrap_or(false)
@@ -5156,6 +5202,7 @@ impl Engine {
                     .await
                     .ok()
                     .and_then(Result::ok)
+                    .filter(|(branch, _)| branch == &session.branch)
             {
                 return Some(evidence);
             }
@@ -5176,6 +5223,9 @@ impl Engine {
         let Some((branch, head_sha)) = evidence else {
             return Vec::new();
         };
+        if branch != session.branch {
+            return Vec::new();
+        }
         let (host, owner, repository) = repository;
         let mut numbers = Vec::new();
         let mut seen = HashSet::new();
@@ -5363,10 +5413,10 @@ impl Engine {
             let Ok(Some(_)) = self.store.session(session_id) else {
                 return;
             };
-            let intents = match self
-                .store
-                .due_session_pr_verification_intents(session_id, 100)
-            {
+            let intents = match self.store.due_session_pr_verification_intents(
+                session_id,
+                MAX_SESSION_PR_VERIFICATIONS_PER_PASS,
+            ) {
                 Ok(intents) => intents,
                 Err(error) => {
                     tracing::warn!(session_id, %error, "cannot load PR verification intents");
@@ -5384,11 +5434,17 @@ impl Engine {
         };
         for mut intent in intents {
             if recorded.contains(&intent.number) {
-                let _ = self.store.discard_session_pr_verification(&intent);
+                self.discard_session_pr_verification_with_backoff(
+                    &intent,
+                    "discarding already-recorded pull request verification",
+                );
                 continue;
             }
             if Self::session_pr_verification_expired(&intent) {
-                let _ = self.store.discard_session_pr_verification(&intent);
+                self.discard_session_pr_verification_with_backoff(
+                    &intent,
+                    "discarding expired pull request verification",
+                );
                 continue;
             }
             // Compatibility for rows written by the short-lived
@@ -5488,6 +5544,13 @@ impl Engine {
                     let Ok(Some(session)) = self.store.session(session_id) else {
                         return;
                     };
+                    if intent.branch != session.branch {
+                        self.discard_session_pr_verification_with_backoff(
+                            &intent,
+                            "discarding pull request verification for a non-session branch",
+                        );
+                        continue;
+                    }
                     let repository_and_branch_match =
                         Self::pr_repository_and_branch_match(&fetched, &intent);
                     let verified = Self::pr_matches_verification_intent(&fetched, &intent)
@@ -5515,7 +5578,10 @@ impl Engine {
                                 pr_head = fetched.info.head,
                                 "discarding pull request that does not match session-owned repository and branch evidence"
                             );
-                            let _ = self.store.discard_session_pr_verification(&intent);
+                            self.discard_session_pr_verification_with_backoff(
+                                &intent,
+                                "discarding mismatched pull request verification",
+                            );
                         }
                         continue;
                     }
@@ -5537,12 +5603,20 @@ impl Engine {
                             recorded.insert(intent.number);
                         }
                         Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            session_id,
-                            pr_number = intent.number,
-                            %error,
-                            "cannot complete verified pull request association"
-                        ),
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id,
+                                pr_number = intent.number,
+                                %error,
+                                "cannot complete verified pull request association"
+                            );
+                            self.defer_or_expire_session_pr_verification(
+                                &intent,
+                                PR_VERIFICATION_FAILURE_PERSISTENCE,
+                                None,
+                                false,
+                            );
+                        }
                     }
                 }
                 Ok(Ok(None)) => {
@@ -5565,12 +5639,21 @@ impl Engine {
                         %error,
                         "deferring unavailable pull request verification"
                     );
-                    self.defer_or_expire_session_pr_verification(
-                        &intent,
-                        PR_VERIFICATION_FAILURE_TRANSIENT,
-                        None,
-                        true,
-                    );
+                    if github_error_requires_reauthentication(&error) {
+                        self.defer_or_expire_session_pr_verification(
+                            &intent,
+                            PR_VERIFICATION_FAILURE_AUTH,
+                            None,
+                            false,
+                        );
+                    } else {
+                        self.defer_or_expire_session_pr_verification(
+                            &intent,
+                            PR_VERIFICATION_FAILURE_TRANSIENT,
+                            None,
+                            true,
+                        );
+                    }
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -5596,27 +5679,67 @@ impl Engine {
         max_consecutive_failures: Option<u32>,
         count_request: bool,
     ) {
-        let result = if Self::session_pr_verification_expired(intent)
+        if Self::session_pr_verification_expired(intent)
             || Self::session_pr_verification_retry_exhausted(
                 intent,
                 failure_class,
                 max_consecutive_failures,
                 count_request,
-            ) {
-            self.store.discard_session_pr_verification(intent)
+            )
+        {
+            self.discard_session_pr_verification_with_backoff(
+                intent,
+                "discarding exhausted pull request verification",
+            );
         } else {
             let delay =
                 Self::session_pr_verification_retry_delay(intent, failure_class, count_request);
-            self.store
-                .defer_session_pr_verification(intent, failure_class, count_request, delay)
-        };
-        if let Err(error) = result {
+            if let Err(error) = self.store.defer_session_pr_verification(
+                intent,
+                failure_class,
+                count_request,
+                delay,
+            ) {
+                tracing::warn!(
+                    session_id = intent.session_id,
+                    pr_number = intent.number,
+                    %error,
+                    "cannot update pull request verification retry state"
+                );
+            }
+        }
+    }
+
+    fn discard_session_pr_verification_with_backoff(
+        &self,
+        intent: &SessionPrVerificationIntent,
+        operation: &'static str,
+    ) {
+        if let Err(error) = self.store.discard_session_pr_verification(intent) {
             tracing::warn!(
                 session_id = intent.session_id,
                 pr_number = intent.number,
                 %error,
-                "cannot update pull request verification retry state"
+                operation,
             );
+            let delay = Self::session_pr_verification_retry_delay(
+                intent,
+                PR_VERIFICATION_FAILURE_PERSISTENCE,
+                false,
+            );
+            if let Err(defer_error) = self.store.defer_session_pr_verification(
+                intent,
+                PR_VERIFICATION_FAILURE_PERSISTENCE,
+                false,
+                delay,
+            ) {
+                tracing::warn!(
+                    session_id = intent.session_id,
+                    pr_number = intent.number,
+                    %defer_error,
+                    "cannot defer a pull request verification after discard failed"
+                );
+            }
         }
     }
 
@@ -5639,13 +5762,24 @@ impl Engine {
     }
 
     pub fn start_session_pr_verification_worker(self: &Arc<Self>) {
-        let engine = Arc::clone(self);
+        if self
+            .session_pr_verification_worker_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let engine = Arc::downgrade(self);
+        let wake = Arc::clone(&self.session_pr_verification_wake);
         tokio::spawn(async move {
             loop {
+                let Some(engine) = engine.upgrade() else {
+                    break;
+                };
                 engine.retry_session_pr_verifications().await;
+                drop(engine);
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                    _ = engine.session_pr_verification_wake.notified() => {}
+                    _ = wake.notified() => {}
                 }
             }
         });
@@ -5756,7 +5890,7 @@ impl Engine {
             .await
             .map_err(github_engine_error)?
         {
-            if !Self::pr_has_locally_verified_head(&session, &pr).await {
+            if !self.pr_has_locally_verified_head(session_id, &pr).await {
                 continue;
             }
             self.record_session_pr_numbers(
@@ -5771,14 +5905,20 @@ impl Engine {
         }
         for number in evidence.numbers {
             if seen.insert(number) {
+                let already_recorded = evidence.recorded_numbers.contains(&number);
                 match github.pr(number).await {
-                    Ok(pr) if Self::pr_has_locally_verified_head(&session, &pr).await => {
-                        self.record_session_pr_numbers(
-                            session_id,
-                            &repository,
-                            [number],
-                            &mut evidence.recorded_numbers,
-                        )?;
+                    Ok(pr)
+                        if already_recorded
+                            || self.pr_has_locally_verified_head(session_id, &pr).await =>
+                    {
+                        if !already_recorded {
+                            self.record_session_pr_numbers(
+                                session_id,
+                                &repository,
+                                [number],
+                                &mut evidence.recorded_numbers,
+                            )?;
+                        }
                         prs.push(pr);
                     }
                     Ok(pr) => tracing::warn!(
@@ -8527,6 +8667,32 @@ impl Engine {
             thread_id: thread_id.to_string(),
             turn: active.turn,
         })
+    }
+
+    /// Whether the current turn has accepted attachment-bearing steering and
+    /// is waiting for the session mutation lane. Exposed for server-level
+    /// lifecycle tests and diagnostics; callers must treat it as transient.
+    #[doc(hidden)]
+    pub async fn wait_for_steer_mutation_lane(&self, thread_id: &str) -> bool {
+        let Some(mut state) = self
+            .turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .map(|active| active.mutation_lane_state.subscribe())
+        else {
+            return false;
+        };
+        loop {
+            match *state.borrow_and_update() {
+                SteerMutationLaneState::Waiting => return true,
+                SteerMutationLaneState::Ended => return false,
+                SteerMutationLaneState::Idle => {}
+            }
+            if state.changed().await.is_err() {
+                return false;
+            }
+        }
     }
 
     fn send_message_with_tools(
@@ -11642,10 +11808,10 @@ impl Engine {
         let permission = if effective_read_only {
             BackendPermission::ReadOnly
         } else {
-            match thread.permission_mode {
-                trouve_protocol::PermissionMode::Yolo => BackendPermission::Yolo,
-                _ => BackendPermission::Ask,
-            }
+            // Always request a pre-execution callback. Trouve's gate still
+            // auto-approves Yolo calls, while the callback acquires the
+            // session mutation lane and supplies creator provenance.
+            BackendPermission::Ask
         };
 
         let mcp_bridge = tools_enabled
@@ -11707,12 +11873,23 @@ impl Engine {
         };
 
         let mut steer_rx = None;
+        let (steer_mutation_lane_state, _) =
+            tokio::sync::watch::channel(SteerMutationLaneState::Idle);
         let _steerer_guard = if supports_steering {
             let (sender, receiver) = tokio::sync::mpsc::channel(8);
-            self.turn_steerers
-                .lock()
-                .unwrap()
-                .insert(thread.id.clone(), ActiveTurnSteerer { turn, sender });
+            let replaced = self.turn_steerers.lock().unwrap().insert(
+                thread.id.clone(),
+                ActiveTurnSteerer {
+                    turn,
+                    sender,
+                    mutation_lane_state: steer_mutation_lane_state.clone(),
+                },
+            );
+            if let Some(replaced) = replaced {
+                replaced
+                    .mutation_lane_state
+                    .send_replace(SteerMutationLaneState::Ended);
+            }
             steer_rx = Some(receiver);
             Some(ActiveTurnSteererGuard {
                 registry: &self.turn_steerers,
@@ -11764,28 +11941,81 @@ impl Engine {
         let mut backend_mutation_permits =
             HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
         let mut pending_steer = None;
+        let mut pending_steer_lane = None;
+        let mut pending_steer_permit = None;
         let mut consecutive_backend_events = 0usize;
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let steer_must_run = active_vendor_session.is_some()
+            let steer_reserved = active_vendor_session.is_some()
                 && !cancel.is_cancelled()
                 && reserve_ready_steer_after_event_budget(
                     &mut steer_rx,
                     &mut pending_steer,
                     &mut consecutive_backend_events,
                 );
-            let input = tokio::select! {
-                biased;
-                // Persist vendor output that is already available before
-                // accepting simultaneously-ready steering. This preserves
-                // the causal order observed at the backend boundary.
-                event = stream.next(), if !steer_must_run => BackendLoopInput::Event(event),
-                _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
-                    persist_deadline = None;
-                    continue;
+            let input = if pending_steer_lane.is_some() {
+                // Poll lane acquisition ahead of the backend stream so a
+                // continuously-ready stream cannot starve it. If the lane is
+                // still held, the future stays pending and ToolCompleted can
+                // flow through the event branch to release it.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        reject_pending_steer(&mut pending_steer, "turn cancelled");
+                        steer_mutation_lane_state
+                            .send_replace(SteerMutationLaneState::Idle);
+                        drop(pending_steer_lane.take());
+                        drop(pending_steer_permit.take());
+                        continue;
+                    }
+                    approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                        BackendLoopInput::Approval(
+                            approval.expect("non-empty approval queue must yield an outcome")
+                        )
+                    }
+                    permit = async {
+                        pending_steer_lane
+                            .as_mut()
+                            .expect("guarded pending steering lane future")
+                            .await
+                    } => {
+                        pending_steer_lane = None;
+                        steer_mutation_lane_state
+                            .send_replace(SteerMutationLaneState::Idle);
+                        pending_steer_permit = Some(permit);
+                        continue;
+                    }
+                    event = stream.next() => BackendLoopInput::Event(event),
+                    _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        persist_deadline = None;
+                        continue;
+                    }
                 }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if pending_steer.is_some() => {
+                        reject_pending_steer(&mut pending_steer, "turn cancelled");
+                        drop(pending_steer_permit.take());
+                        continue;
+                    }
+                    // Persist vendor output that is already available before
+                    // accepting simultaneously-ready steering. This preserves
+                    // the causal order observed at the backend boundary.
+                    event = stream.next(), if !steer_reserved => BackendLoopInput::Event(event),
+                    _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        persist_deadline = None;
+                        continue;
+                    }
+                    approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                        BackendLoopInput::Approval(
+                            approval.expect("non-empty approval queue must yield an outcome")
+                        )
+                    }
                 steer = receive_steer_command(
                     &mut steer_rx,
                     &mut pending_steer,
@@ -11794,6 +12024,32 @@ impl Engine {
                     let Some(command) = steer else {
                         steer_rx = None;
                         continue;
+                    };
+                    let materialization_permit = if command.attachment_rows.is_empty() {
+                        None
+                    } else if let Some(permit) = pending_steer_permit.take() {
+                        Some(permit)
+                    } else {
+                        let lane = self.tool_execution_lock(&session.id);
+                        match lane.try_write_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                // Wait for actual lane availability as another
+                                // select branch. Backend events and approval
+                                // outcomes continue to flow while this future
+                                // is pending, including the completion that
+                                // releases an in-flight vendor mutation.
+                                pending_steer = Some(command);
+                                steer_mutation_lane_state
+                                    .send_replace(SteerMutationLaneState::Waiting);
+                                let lane = self.tool_execution_lock(&session.id);
+                                pending_steer_lane = Some(
+                                    async move { lane.write_owned().await }.boxed(),
+                                );
+                                consecutive_backend_events = 0;
+                                continue;
+                            }
+                        }
                     };
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
@@ -11824,15 +12080,8 @@ impl Engine {
                     let materialized = if staged.is_empty() {
                         Vec::new()
                     } else {
-                        let lane = self.tool_execution_lock(&session.id);
-                        let _materialization_permit = tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => {
-                                let _ = response.send(Err("turn cancelled".into()));
-                                bail!("turn cancelled");
-                            }
-                            permit = lane.write_owned() => permit,
-                        };
+                        let _materialization_permit = materialization_permit
+                            .expect("attachment steering must reserve the mutation lane");
                         match self.executor.materialize_attachments(
                             &AttachmentMaterialization {
                                 source_root: self.data_dir.join("attachments"),
@@ -11913,10 +12162,6 @@ impl Engine {
                     consecutive_backend_events = 0;
                     continue;
                 }
-                approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
-                    BackendLoopInput::Approval(
-                        approval.expect("non-empty approval queue must yield an outcome")
-                    )
                 }
             };
             let event = match input {
@@ -12012,6 +12257,10 @@ impl Engine {
                             &mut collaborators,
                         )
                         .await;
+                        reject_pending_steer(
+                            &mut pending_steer,
+                            "turn ended before steering could be applied",
+                        );
                         return Err(anyhow!("backend stream error: {error}"));
                     }
                 },
@@ -12100,7 +12349,10 @@ impl Engine {
                         if let Some((_, owner, repo)) = &github_repository {
                             creation_request =
                                 classify_pull_request_creation(&tool, &args, owner, repo);
-                        } else if let Ok(repository) = self.github_repository_for_session(session) {
+                        } else {
+                            let repository = self
+                                .github_repository_for_session(session)
+                                .context("discovering repository for pull request creator")?;
                             let (_, owner, repo) = &repository;
                             creation_request =
                                 classify_pull_request_creation(&tool, &args, owner, repo);
@@ -12564,6 +12816,15 @@ impl Engine {
         // Adapters close only after cancellation cleanup has completed. The
         // stream can now be dropped without racing a replacement vendor turn.
         drop(stream);
+        let pending_steer_reason = if cancel.is_cancelled() {
+            "turn cancelled"
+        } else {
+            "turn ended before steering could be applied"
+        };
+        reject_pending_steer(&mut pending_steer, pending_steer_reason);
+        steer_mutation_lane_state.send_replace(SteerMutationLaneState::Ended);
+        drop(pending_steer_lane.take());
+        drop(pending_steer_permit.take());
         // Vendors may omit ToolCompleted on cancellation or protocol failure.
         // Never carry their mutation lease into flush, checkpoint, or terminal
         // turn bookkeeping.
@@ -13363,9 +13624,10 @@ impl Engine {
         // Repository discovery and classification do not depend on the tool
         // result. Resolve them before taking the mutation lane so completion
         // only needs to extract returned PR numbers and snapshot HEAD.
-        let pr_creation = if could_request_pull_request_creation(&call.name, &call.arguments)
-            && let Ok(repository) = self.github_repository_for_session(session)
-        {
+        let pr_creation = if could_request_pull_request_creation(&call.name, &call.arguments) {
+            let repository = self
+                .github_repository_for_session(session)
+                .context("discovering repository for pull request creator")?;
             let (_, owner, repo) = &repository;
             let request = classify_pull_request_creation(&call.name, &call.arguments, owner, repo);
             (!matches!(request, PullRequestCreationRequest::Rejected))
@@ -14508,24 +14770,6 @@ fn compact_activity(text: &str) -> String {
         .collect()
 }
 
-fn mentions_exact_path(text: &str, expected_path: &str) -> bool {
-    text.split_whitespace().any(|token| {
-        let token = token.trim_matches(|character: char| {
-            matches!(
-                character,
-                '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | ','
-            )
-        });
-        let path = token
-            .split(['?', '#'])
-            .next()
-            .unwrap_or(token)
-            .trim_end_matches('/')
-            .to_ascii_lowercase();
-        path == expected_path.trim_start_matches('/') || path.ends_with(expected_path)
-    })
-}
-
 /// Whether a structured HTTP request mutates the expected REST collection.
 fn contains_rest_mutation(
     value: &serde_json::Value,
@@ -14605,6 +14849,420 @@ fn contains_pull_request_collection_post(value: &serde_json::Value) -> bool {
     }
 }
 
+fn shell_requests_pull_request_collection_post(tool: &str, args: &serde_json::Value) -> bool {
+    let tool_words = activity_words(tool);
+    let shell_like = ["shell", "bash", "command", "terminal", "exec", "gh"]
+        .iter()
+        .any(|word| tool_words.split_whitespace().any(|part| part == *word));
+    shell_like
+        && shell_command_values(tool, args)
+            .into_iter()
+            .any(|command| shell_command_posts_to_pull_collection(command, None))
+}
+
+fn shell_command_values<'a>(tool: &str, args: &'a serde_json::Value) -> Vec<&'a str> {
+    fn add_value<'a>(value: &'a serde_json::Value, commands: &mut Vec<&'a str>) {
+        match value {
+            serde_json::Value::String(command) => commands.push(command),
+            serde_json::Value::Array(values) => {
+                commands.extend(values.iter().filter_map(serde_json::Value::as_str))
+            }
+            _ => {}
+        }
+    }
+
+    let mut commands = Vec::new();
+    if args.is_string() {
+        add_value(args, &mut commands);
+        return commands;
+    }
+    let normalized = compact_activity(tool);
+    let fields: &[&str] = if normalized == "functionsexec" || normalized.ends_with("execcommand") {
+        &["cmd"]
+    } else if normalized.contains("terminal") {
+        &["input", "command"]
+    } else if matches!(
+        normalized.as_str(),
+        "shell" | "bash" | "execute" | "commandexecution"
+    ) || normalized.ends_with("commandexecution")
+    {
+        &["command"]
+    } else {
+        // Unknown shell-like adapters use one of these conventional command
+        // fields. Never traverse descriptive or environment metadata: only
+        // values that the adapter documents as executable input are evidence.
+        &["command", "commands", "cmd", "input", "script"]
+    };
+    for field in fields {
+        if let Some(value) = args.get(field) {
+            add_value(value, &mut commands);
+        }
+    }
+    commands
+}
+
+fn shell_invocations(command: &str) -> Vec<Vec<String>> {
+    fn finish_word(word: &mut String, invocation: &mut Vec<String>) {
+        if !word.is_empty() {
+            invocation.push(std::mem::take(word));
+        }
+    }
+
+    fn finish_invocation(
+        word: &mut String,
+        invocation: &mut Vec<String>,
+        invocations: &mut Vec<Vec<String>>,
+    ) {
+        finish_word(word, invocation);
+        if !invocation.is_empty() {
+            invocations.push(std::mem::take(invocation));
+        }
+    }
+
+    let mut invocations = Vec::new();
+    let mut invocation = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else if character == '\\' && active_quote == '"' {
+                escaped = true;
+            } else {
+                word.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '\'' | '"' => quote = Some(character),
+            '\n' | ';' | '|' | '&' => {
+                finish_invocation(&mut word, &mut invocation, &mut invocations);
+                if characters.peek().is_some_and(|next| *next == character) {
+                    characters.next();
+                }
+            }
+            character if character.is_whitespace() => finish_word(&mut word, &mut invocation),
+            _ => word.push(character),
+        }
+    }
+    finish_invocation(&mut word, &mut invocation, &mut invocations);
+    invocations
+}
+
+fn shell_word_is_command(word: &str, expected: &str) -> bool {
+    word.trim_matches(|character| matches!(character, '(' | ')' | '{' | '}'))
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == expected)
+}
+
+fn shell_executable_index(tokens: &[String]) -> Option<usize> {
+    fn is_assignment(token: &str) -> bool {
+        token.split_once('=').is_some_and(|(name, _)| {
+            let mut characters = name.chars();
+            characters
+                .next()
+                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+                && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+        })
+    }
+
+    fn consume_options(
+        tokens: &[String],
+        mut index: usize,
+        flags: &[&str],
+        value_options: &[&str],
+    ) -> Option<usize> {
+        while let Some(token) = tokens.get(index) {
+            if token == "--" {
+                return Some(index + 1);
+            }
+            if flags.contains(&token.as_str()) {
+                index += 1;
+                continue;
+            }
+            if value_options.contains(&token.as_str()) {
+                index = index.checked_add(2)?;
+                if index > tokens.len() {
+                    return None;
+                }
+                continue;
+            }
+            if value_options.iter().any(|option| {
+                option.starts_with("--") && token.starts_with(&format!("{option}="))
+                    || option.len() == 2 && token.starts_with(option) && token.len() > 2
+            }) {
+                index += 1;
+                continue;
+            }
+            return (!token.starts_with('-')).then_some(index);
+        }
+        None
+    }
+
+    fn after_launch_prefix(tokens: &[String], index: usize, prefix: &str) -> Option<usize> {
+        let arguments = index + 1;
+        match prefix {
+            "env" => consume_options(
+                tokens,
+                arguments,
+                &[
+                    "-i",
+                    "--ignore-environment",
+                    "-0",
+                    "--null",
+                    "-v",
+                    "--debug",
+                ],
+                &["-u", "--unset", "-C", "--chdir"],
+            ),
+            "sudo" => consume_options(
+                tokens,
+                arguments,
+                &["-A", "-b", "-E", "-H", "-k", "-n", "-S"],
+                &[
+                    "-C",
+                    "--close-from",
+                    "-D",
+                    "--chdir",
+                    "-g",
+                    "--group",
+                    "-h",
+                    "--host",
+                    "-p",
+                    "--prompt",
+                    "-R",
+                    "--chroot",
+                    "-r",
+                    "--role",
+                    "-t",
+                    "--type",
+                    "-T",
+                    "--command-timeout",
+                    "-u",
+                    "--user",
+                ],
+            ),
+            "command" => consume_options(tokens, arguments, &["-p"], &[]),
+            "nohup" => consume_options(tokens, arguments, &[], &[]),
+            "exec" => consume_options(tokens, arguments, &["-c", "-l"], &["-a"]),
+            "nice" => {
+                let legacy_adjustment = tokens.get(arguments).is_some_and(|token| {
+                    token
+                        .strip_prefix('-')
+                        .filter(|adjustment| !adjustment.is_empty() && !adjustment.starts_with('-'))
+                        .is_some_and(|adjustment| adjustment.parse::<u32>().is_ok())
+                });
+                if legacy_adjustment {
+                    return tokens.get(arguments + 1).map(|_| arguments + 1);
+                }
+                let next = consume_options(tokens, arguments, &[], &["-n", "--adjustment"])?;
+                Some(next)
+            }
+            "stdbuf" => consume_options(
+                tokens,
+                arguments,
+                &[],
+                &["-i", "--input", "-o", "--output", "-e", "--error"],
+            ),
+            "timeout" => {
+                let duration = consume_options(
+                    tokens,
+                    arguments,
+                    &["--foreground", "--preserve-status", "-v", "--verbose"],
+                    &["-k", "--kill-after", "-s", "--signal"],
+                )?;
+                tokens.get(duration + 1).map(|_| duration + 1)
+            }
+            _ => None,
+        }
+    }
+
+    let mut index = 0;
+    let mut assignments_allowed = true;
+    loop {
+        if assignments_allowed {
+            while tokens.get(index).is_some_and(|token| is_assignment(token)) {
+                index += 1;
+            }
+        }
+        let token = tokens.get(index)?;
+        let launch_prefix = [
+            "env", "sudo", "command", "nohup", "exec", "timeout", "nice", "stdbuf",
+        ]
+        .iter()
+        .find(|expected| shell_word_is_command(token, expected));
+        let Some(prefix) = launch_prefix else {
+            return Some(index);
+        };
+        index = after_launch_prefix(tokens, index, prefix)?;
+        assignments_allowed = matches!(*prefix, "env" | "sudo");
+        if index >= tokens.len() {
+            return None;
+        }
+    }
+}
+
+fn shell_command_string(tokens: &[String], executable_index: usize) -> Option<&str> {
+    let mut index = executable_index + 1;
+    while let Some(flag) = tokens.get(index) {
+        let letters = flag
+            .strip_prefix('-')
+            .filter(|letters| !letters.is_empty())?;
+        if !letters
+            .chars()
+            .all(|letter| matches!(letter, 'c' | 'e' | 'i' | 'l' | 'u' | 'x'))
+        {
+            return None;
+        }
+        if letters.contains('c') {
+            return tokens.get(index + 1).map(String::as_str);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn pull_collection_path_matches(token: &str, expected_path: Option<&str>) -> bool {
+    let path = token
+        .trim_matches(|character| matches!(character, '(' | ')' | '{' | '}' | ','))
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if let Some(expected_path) = expected_path {
+        let expected_path = expected_path.trim_start_matches('/');
+        return path == expected_path || path.ends_with(&format!("/{expected_path}"));
+    }
+    let suffix = path
+        .split_once("/repos/")
+        .map(|(_, suffix)| suffix)
+        .or_else(|| path.strip_prefix("repos/"));
+    suffix.is_some_and(|suffix| {
+        let segments = suffix.split('/').collect::<Vec<_>>();
+        matches!(segments.as_slice(), [owner, repo, "pulls"] if !owner.is_empty() && !repo.is_empty())
+    })
+}
+
+fn explicit_shell_method(tokens: &[String], long_option: &str) -> Option<bool> {
+    let mut explicit_method = None;
+    let long_prefix = format!("{long_option}=");
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let method = if token == "-X" || token == long_option {
+            index += 1;
+            tokens.get(index).map(String::as_str)
+        } else if let Some(method) = token.strip_prefix(&long_prefix) {
+            Some(method)
+        } else {
+            token.strip_prefix("-X").filter(|method| !method.is_empty())
+        };
+        if let Some(method) = method {
+            explicit_method = Some(method.eq_ignore_ascii_case("POST"));
+        }
+        index += 1;
+    }
+    explicit_method
+}
+
+fn gh_api_invocation_is_post(tokens: &[String]) -> bool {
+    if let Some(is_post) = explicit_shell_method(tokens, "--method") {
+        return is_post;
+    }
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "-f" | "-F" | "--field" | "--raw-field" | "--input"
+        ) || token.starts_with("--field=")
+            || token.starts_with("--raw-field=")
+            || token.starts_with("--input=")
+            || (token.starts_with("-f") && token.len() > 2)
+            || (token.starts_with("-F") && token.len() > 2)
+    })
+}
+
+fn curl_invocation_is_post(tokens: &[String]) -> bool {
+    if let Some(is_post) = explicit_shell_method(tokens, "--request") {
+        return is_post;
+    }
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "-d" | "-F"
+                | "--data"
+                | "--data-ascii"
+                | "--data-binary"
+                | "--data-raw"
+                | "--data-urlencode"
+                | "--form"
+                | "--form-string"
+                | "--json"
+        ) || token.starts_with("--data=")
+            || token.starts_with("--data-ascii=")
+            || token.starts_with("--data-binary=")
+            || token.starts_with("--data-raw=")
+            || token.starts_with("--data-urlencode=")
+            || token.starts_with("--form=")
+            || token.starts_with("--form-string=")
+            || token.starts_with("--json=")
+            || (token.starts_with("-d") && token.len() > 2)
+            || (token.starts_with("-F") && token.len() > 2)
+    })
+}
+
+fn shell_command_posts_to_pull_collection(command: &str, expected_path: Option<&str>) -> bool {
+    fn inspect(command: &str, expected_path: Option<&str>, depth: usize) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        shell_invocations(command).into_iter().any(|tokens| {
+            let Some(executable_index) = shell_executable_index(&tokens) else {
+                return false;
+            };
+            let executable = &tokens[executable_index];
+            let shell_wrapper = ["bash", "sh", "zsh", "dash", "ksh"]
+                .iter()
+                .any(|expected| shell_word_is_command(executable, expected));
+            if shell_wrapper
+                && let Some(nested) = shell_command_string(&tokens, executable_index)
+                && inspect(nested, expected_path, depth + 1)
+            {
+                return true;
+            }
+            if !tokens
+                .iter()
+                .any(|token| pull_collection_path_matches(token, expected_path))
+            {
+                return false;
+            }
+            if shell_word_is_command(executable, "gh")
+                && tokens
+                    .get(executable_index + 1)
+                    .is_some_and(|arg| arg == "api")
+            {
+                return gh_api_invocation_is_post(&tokens[executable_index + 2..]);
+            }
+            if shell_word_is_command(executable, "curl") {
+                return curl_invocation_is_post(&tokens[executable_index + 1..]);
+            }
+            false
+        })
+    }
+
+    inspect(command, expected_path, 0)
+}
+
 fn is_activity_tool_wrapper(tool: &str) -> bool {
     matches!(
         compact_activity(tool).as_str(),
@@ -14639,10 +15297,21 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
         if !trusted_activity_tool_wrapper(args) {
             return false;
         }
-        return ["tool", "toolName", "name"]
+        let Some(nested_tool) = ["tool", "toolName", "name"]
             .iter()
             .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
-            .is_some_and(trusted_activity_tool_name);
+        else {
+            return false;
+        };
+        let nested_compact = compact_activity(nested_tool);
+        if nested_compact.contains("createpullrequest") || nested_compact.ends_with("createpr") {
+            return trusted_activity_tool_name(nested_tool);
+        }
+        return effective_activity_tool_call(tool, args).is_some_and(
+            |(nested_tool, nested_args)| {
+                could_request_pull_request_creation(nested_tool, nested_args.as_ref())
+            },
+        );
     }
 
     let args_text = args.to_string();
@@ -14651,6 +15320,7 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
     if (args_words.split_whitespace().any(|word| word == "mutation")
         && args_compact.contains("createpullrequest"))
         || contains_pull_request_collection_post(args)
+        || shell_requests_pull_request_collection_post(tool, args)
     {
         return true;
     }
@@ -14659,29 +15329,9 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
     if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
         return true;
     }
-    let integration_like = [
-        "shell",
-        "bash",
-        "command",
-        "terminal",
-        "exec",
-        "gh",
-        "github",
-        "browser",
-        "playwright",
-        "web",
-        "http",
-        "api",
-        "graphql",
-        "click",
-    ]
-    .iter()
-    .any(|marker| tool_compact.contains(marker));
-    if !integration_like {
-        return false;
-    }
-    let text = args_text.to_ascii_lowercase();
-    text.contains("create") || text.contains("gh pr") || text.contains("/pulls")
+    has_structured_pull_request_creation_operation(args)
+        || args_words.contains("gh pr create")
+        || args_words.contains("create pull request")
 }
 
 /// Resolve provider-owned generic tool wrappers to the operation they carry.
@@ -14834,11 +15484,9 @@ fn requests_pull_request_creation(
         && args_compact.contains("createpullrequest");
     let rest_path = format!("/repos/{owner}/{repo}/pulls").to_ascii_lowercase();
     let shell_rest_creation = shell_like
-        && mentions_exact_path(&args_text, &rest_path)
-        && (format!(" {args_words} ").contains(" post ")
-            || args_text.contains(" -f ")
-            || args_text.contains(" --field ")
-            || args_text.contains(" --raw-field "));
+        && shell_command_values(tool, args)
+            .into_iter()
+            .any(|command| shell_command_posts_to_pull_collection(command, Some(&rest_path)));
     let github_like = tool_compact == "github";
     let structured_creation_operation = github_like
         && structured_repository_identifies(args, owner, repo)
@@ -16295,6 +16943,34 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn session_pr_verification_worker_is_idempotent_and_does_not_retain_engine() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let weak = Arc::downgrade(&engine);
+
+        engine.start_session_pr_verification_worker();
+        engine.start_session_pr_verification_worker();
+        assert!(
+            engine
+                .session_pr_verification_worker_started
+                .load(Ordering::Acquire)
+        );
+        drop(engine);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("verification worker retained the engine");
+    }
+
     fn upload(name: &str, mime: &str, data: String) -> trouve_protocol::AttachmentUpload {
         trouve_protocol::AttachmentUpload {
             name: name.into(),
@@ -16389,6 +17065,46 @@ mod tests {
         ));
         assert_eq!(pending, Some(7));
         assert_eq!(consecutive_events, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_attachment_lane_wait_yields_until_the_holder_releases() {
+        let lane = Arc::new(tokio::sync::RwLock::new(()));
+        let holder = lane.clone().write_owned().await;
+        let mut waiter = Box::pin(lane.write_owned());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(holder);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("lane waiter did not resume after the holder released");
+    }
+
+    #[tokio::test]
+    async fn rejected_deferred_steering_returns_a_defined_error() {
+        let (response, received) = tokio::sync::oneshot::channel();
+        let mut pending = Some(SteerTurnCommand {
+            content: "wait".into(),
+            attachments: Vec::new(),
+            attachment_rows: Vec::new(),
+            attachment_cleanup: PreparedAttachmentCleanup::new(
+                Store::open_in_memory().unwrap(),
+                Arc::new(LocalToolExecutor::default()),
+                PathBuf::new(),
+                Vec::new(),
+                None,
+            ),
+            response,
+        });
+
+        reject_pending_steer(&mut pending, "turn cancelled");
+
+        assert_eq!(received.await.unwrap().unwrap_err(), "turn cancelled");
+        assert!(pending.is_none());
     }
 
     fn init_engine_test_repo(path: &Path) {
@@ -19288,6 +20004,14 @@ default_permission_mode = "ask"
             None,
         );
         assert!(missing_evidence.is_empty());
+        let wrong_branch = Engine::session_pr_verification_intents(
+            &session,
+            ("github.com".into(), "acme".into(), "widgets".into()),
+            [42],
+            [],
+            Some(("agent/other-session".into(), "1".repeat(40))),
+        );
+        assert!(wrong_branch.is_empty());
     }
 
     fn projection_detail(info: trouve_protocol::PrInfo) -> trouve_protocol::PrDetail {
@@ -20006,6 +20730,14 @@ default_permission_mode = "ask"
             "browser_click",
             &click_create
         ));
+        assert!(!could_request_pull_request_creation(
+            "browser_click",
+            &serde_json::json!({"text": "Create issue"})
+        ));
+        assert!(!could_request_pull_request_creation(
+            "github_api",
+            &serde_json::json!({"method": "GET", "url": "/repos/o/r/pulls"})
+        ));
         assert!(matches!(
             classify_pull_request_creation(
                 "mcpToolCall",
@@ -20041,6 +20773,149 @@ default_permission_mode = "ask"
             "o",
             "r"
         ));
+        assert!(could_request_pull_request_creation(
+            "functions.exec",
+            &serde_json::json!({
+                "cmd": "gh api -X POST /repos/o/r/pulls --field title=test"
+            })
+        ));
+        for command in [
+            "gh api /repos/o/r/pulls --field=title=test",
+            "gh api /repos/o/r/pulls -Ftitle=test",
+            "gh api /repos/o/r/pulls --input payload.json",
+            "gh api -X \"POST\" /repos/o/r/pulls",
+            "curl /repos/o/r/pulls --data payload.json",
+            "curl /repos/o/r/pulls --json payload.json",
+        ] {
+            let args = serde_json::json!({ "cmd": command });
+            assert!(could_request_pull_request_creation("functions.exec", &args));
+            assert!(requests_pull_request_creation(
+                "functions.exec",
+                &args,
+                "o",
+                "r"
+            ));
+        }
+        for command in [
+            "env -i gh api /repos/o/r/pulls -f title=test",
+            "sudo -u root gh api /repos/o/r/pulls -f title=test",
+            "sudo A=B gh api /repos/o/r/pulls -f title=test",
+            "command -p gh api /repos/o/r/pulls -f title=test",
+            "nohup gh api /repos/o/r/pulls -f title=test",
+            "exec -c gh api /repos/o/r/pulls -f title=test",
+            "timeout --signal TERM 30 gh api /repos/o/r/pulls -f title=test",
+            "nice -n 5 gh api /repos/o/r/pulls -f title=test",
+            "stdbuf -o L gh api /repos/o/r/pulls -f title=test",
+        ] {
+            let args = serde_json::json!({ "cmd": command });
+            assert!(could_request_pull_request_creation("functions.exec", &args));
+            assert!(requests_pull_request_creation(
+                "functions.exec",
+                &args,
+                "o",
+                "r"
+            ));
+        }
+        let explicit_get = serde_json::json!({
+            "cmd": "gh api --method GET /repos/o/r/pulls -f state=open"
+        });
+        assert!(!could_request_pull_request_creation(
+            "functions.exec",
+            &explicit_get
+        ));
+        assert!(!requests_pull_request_creation(
+            "functions.exec",
+            &explicit_get,
+            "o",
+            "r"
+        ));
+        let independent_invocations = serde_json::json!({
+            "cmd": concat!(
+                "gh api -X POST /repos/o/r/pulls --field title=test && ",
+                "gh api -X GET /repos/o/r/pulls"
+            )
+        });
+        assert!(could_request_pull_request_creation(
+            "functions.exec",
+            &independent_invocations
+        ));
+        assert!(requests_pull_request_creation(
+            "functions.exec",
+            &independent_invocations,
+            "o",
+            "r"
+        ));
+        let curl_read = serde_json::json!({
+            "cmd": "curl -fsSL https://api.github.com/repos/o/r/pulls"
+        });
+        assert!(!could_request_pull_request_creation(
+            "functions.exec",
+            &curl_read
+        ));
+        assert!(!requests_pull_request_creation(
+            "functions.exec",
+            &curl_read,
+            "o",
+            "r"
+        ));
+        for (tool, args) in [
+            (
+                "terminal",
+                serde_json::json!({
+                    "input": "gh api /repos/o/r/pulls --field title=test"
+                }),
+            ),
+            (
+                "functions.exec",
+                serde_json::json!({
+                    "cmd": "bash -c 'gh api /repos/o/r/pulls -f title=test'"
+                }),
+            ),
+            (
+                "functions.exec",
+                serde_json::json!({
+                    "cmd": "(gh api /repos/o/r/pulls -f title=test)"
+                }),
+            ),
+        ] {
+            assert!(could_request_pull_request_creation(tool, &args));
+            assert!(requests_pull_request_creation(tool, &args, "o", "r"));
+        }
+        for args in [
+            serde_json::json!({
+                "cmd": "echo safe",
+                "description": "gh api /repos/o/r/pulls -f title=forged"
+            }),
+            serde_json::json!({
+                "cmd": "echo bash -c 'gh api /repos/o/r/pulls -f title=forged'"
+            }),
+            serde_json::json!({
+                "cmd": "bash --rcfile 'gh api /repos/o/r/pulls -f title=forged'"
+            }),
+            serde_json::json!({
+                "cmd": "command -v gh api /repos/o/r/pulls -f title=forged"
+            }),
+            serde_json::json!({
+                "cmd": "timeout 30 A=B gh api /repos/o/r/pulls -f title=forged"
+            }),
+            serde_json::json!({
+                "cmd": "nice 50 gh api /repos/o/r/pulls -f title=forged"
+            }),
+            serde_json::json!({
+                "cmd": "nice é gh api /repos/o/r/pulls -f title=forged"
+            }),
+        ] {
+            assert!(!could_request_pull_request_creation(
+                "functions.exec",
+                &args
+            ));
+            assert!(!requests_pull_request_creation(
+                "functions.exec",
+                &args,
+                "o",
+                "r"
+            ));
+        }
         assert!(!requests_pull_request_creation(
             "mcpToolCall",
             &serde_json::json!({

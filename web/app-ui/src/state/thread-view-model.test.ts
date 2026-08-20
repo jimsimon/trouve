@@ -955,6 +955,131 @@ describe("ThreadViewModel", () => {
     expect(view.lastUsage).toMatchObject({ input_tokens: 40, output_tokens: 12 });
   });
 
+  it("restores active usage when the running turn row is outside the snapshot page", () => {
+    const view = ThreadViewModel.fromSnapshot(17, {
+      item_offset: 20,
+      total_items: 21,
+      items: [{
+        kind: "assistant",
+        turn: 3,
+        content: "Still running",
+        complete: true,
+      }],
+      turn_running: true,
+      last_usage: { input_tokens: 30, output_tokens: 8 },
+      active_usage: {
+        input_tokens: 40,
+        output_tokens: 12,
+        context_input_tokens: 52,
+        context_window: 1_000,
+      },
+      turn_started_at: { "3": "2026-08-01T12:00:00Z" },
+    });
+
+    view.apply(envelope(18, {
+      type: "turn.usage_updated",
+      turn: 3,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 3,
+        context_input_tokens: 65,
+      },
+    }));
+    expect(view.lastUsage).toMatchObject({
+      input_tokens: 50,
+      output_tokens: 15,
+      context_input_tokens: 65,
+      context_window: 1_000,
+    });
+    expect(view.lastUsage).not.toHaveProperty("cached_input_tokens");
+
+    view.apply(envelope(19, {
+      type: "turn.completed",
+      turn: 3,
+      usage: { input_tokens: 50, output_tokens: 15 },
+    }));
+    expect(view.lastUsage).toMatchObject({
+      input_tokens: 50,
+      output_tokens: 15,
+      context_input_tokens: 65,
+      context_window: 1_000,
+    });
+  });
+
+  it("retains active usage after the rendered turn row is trimmed", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.started",
+      turn: 3,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(2, {
+      type: "turn.capacity_acquired",
+      turn: 3,
+      wait_ms: 0,
+      background: true,
+    }));
+    vm.apply(envelope(3, {
+      type: "turn.usage_updated",
+      turn: 3,
+      usage: {
+        input_tokens: 100,
+        output_tokens: 10,
+        context_input_tokens: 110,
+        context_window: 1_000,
+      },
+    }));
+    vm.apply(envelope(4, {
+      type: "assistant.message",
+      turn: 3,
+      content: "Still running",
+    }));
+    vm.trimHistory(1);
+    expect(vm.items.some((item) => item.kind === "turn-status")).toBe(false);
+
+    vm.apply(envelope(5, {
+      type: "turn.usage_updated",
+      turn: 3,
+      usage: {
+        input_tokens: 50,
+        output_tokens: 5,
+        context_input_tokens: 165,
+      },
+    }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 150,
+      output_tokens: 15,
+      context_input_tokens: 165,
+      context_window: 1_000,
+    });
+
+    vm.apply(envelope(6, {
+      type: "turn.completed",
+      turn: 3,
+      usage: { input_tokens: 150, output_tokens: 15 },
+    }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 150,
+      output_tokens: 15,
+      context_input_tokens: 165,
+      context_window: 1_000,
+    });
+
+    vm.apply(envelope(7, {
+      type: "turn.started",
+      turn: 4,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(8, {
+      type: "turn.usage_updated",
+      turn: 4,
+      usage: { input_tokens: 20, output_tokens: 2 },
+    }));
+    expect(vm.lastUsage).toEqual({ input_tokens: 20, output_tokens: 2 });
+  });
+
   it("keeps prior context off a new snapshot turn before its first usage update", () => {
     const view = ThreadViewModel.fromSnapshot(18, {
       items: [{ kind: "turn_status", turn: 4, state: { state: "running" } }],

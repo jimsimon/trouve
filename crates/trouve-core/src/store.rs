@@ -357,7 +357,16 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   semantic_routing INTEGER NOT NULL DEFAULT 1,
   included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
-  publication_accepted INTEGER NOT NULL DEFAULT 0
+  publication_accepted INTEGER NOT NULL DEFAULT 0,
+  publication_generation INTEGER NOT NULL DEFAULT 0,
+  publication_order INTEGER NOT NULL DEFAULT 0,
+  review_published INTEGER NOT NULL DEFAULT 0,
+  blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0,
+  blocking_review_cleanup_page INTEGER NOT NULL DEFAULT 1,
+  blocking_review_cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+  blocking_review_cleanup_next_attempt_at TEXT,
+  blocking_review_cleanup_claim_token TEXT,
+  blocking_review_cleanup_claim_until TEXT
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -431,10 +440,14 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   github_comment_url TEXT NOT NULL DEFAULT '',
   github_publication_status TEXT NOT NULL DEFAULT 'pending',
   github_thread_id TEXT,
+  github_thread_resolved INTEGER,
+  github_thread_generation INTEGER NOT NULL DEFAULT 0,
+  github_thread_recheck_pending INTEGER NOT NULL DEFAULT 0,
   resolved_at TEXT,
   collapse_pending INTEGER NOT NULL DEFAULT 0,
   collapse_attempts INTEGER NOT NULL DEFAULT 0,
   collapse_next_attempt_at TEXT,
+  publication_resolution_job_id TEXT,
   created_at TEXT NOT NULL
 );
 -- The partial index on collapse_pending lives in MIGRATIONS only: SCHEMA
@@ -477,9 +490,21 @@ CREATE TABLE IF NOT EXISTS code_review_pr_state (
   last_reviewed_head_sha TEXT NOT NULL DEFAULT '',
   last_reviewed_base_sha TEXT NOT NULL DEFAULT '',
   last_reviewed_at TEXT,
+  last_reviewed_publication_order INTEGER NOT NULL DEFAULT 0,
   lifecycle_comment_id INTEGER,
   lifecycle_comment_url TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (repository, pull_number)
+);
+CREATE TABLE IF NOT EXISTS code_review_thread_rechecks (
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  head_sha TEXT NOT NULL,
+  state_key TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (repository, pull_number, head_sha, state_key)
 );
 CREATE TABLE IF NOT EXISTS code_review_manual_requests (
   repository TEXT NOT NULL,
@@ -568,6 +593,15 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_for_agents TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_accepted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_generation INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_order INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_published INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_pending INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_page INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_next_attempt_at TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_claim_token TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN blocking_review_cleanup_claim_until TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
@@ -583,6 +617,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_head_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_base_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_at TEXT",
+    "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_publication_order INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_comment_id INTEGER",
     "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_comment_url TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_identities ADD COLUMN thinking_level TEXT",
@@ -601,12 +636,30 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
     "ALTER TABLE code_review_findings ADD COLUMN title TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_findings ADD COLUMN github_thread_resolved INTEGER",
+    "ALTER TABLE code_review_findings ADD COLUMN github_thread_generation INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_findings ADD COLUMN github_thread_recheck_pending INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS code_review_jobs_pull_revision_status ON code_review_jobs (repository, pull_number, head_sha, status, publication_generation)",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_pending INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
+    "ALTER TABLE code_review_findings ADD COLUMN publication_resolution_job_id TEXT",
+    "UPDATE code_review_jobs
+       SET publication_order = rowid
+       WHERE publication_order = 0 AND publication_claimed != 0",
+    "UPDATE code_review_pr_state
+       SET last_reviewed_publication_order = COALESCE((
+         SELECT MAX(job.publication_order)
+         FROM code_review_jobs AS job
+         WHERE job.repository = code_review_pr_state.repository
+           AND job.pull_number = code_review_pr_state.pull_number
+           AND job.head_sha = code_review_pr_state.last_reviewed_head_sha
+           AND job.review_published != 0
+       ), 0)
+       WHERE last_reviewed_publication_order = 0",
     "ALTER TABLE session_pr_verification_intents ADD COLUMN last_failure_class TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE session_pr_verification_intents ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
@@ -623,6 +676,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         }
     }
     backfill_code_review_watermarks(conn)?;
+    repair_legacy_code_review_publications(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
     migrate_general_persona_reviewer_references(conn)?;
@@ -784,6 +838,57 @@ fn backfill_code_review_watermarks(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Repairs publication state from conclusive evidence on every startup. This
+/// intentionally has no one-time migration marker: an older binary restored
+/// during rollback can create more legacy rows before the current version is
+/// started again. A lifecycle-comment URL is not evidence that a PR review
+/// was published.
+fn repair_legacy_code_review_publications(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE code_review_jobs
+         SET lifecycle_comment_url = (
+             SELECT state.lifecycle_comment_url
+             FROM code_review_pr_state state
+             WHERE state.repository = code_review_jobs.repository
+               AND state.pull_number = code_review_jobs.pull_number
+               AND state.lifecycle_comment_url != ''
+         )
+         WHERE lifecycle_comment_url = ''
+           AND EXISTS (
+             SELECT 1 FROM code_review_pr_state state
+             WHERE state.repository = code_review_jobs.repository
+               AND state.pull_number = code_review_jobs.pull_number
+               AND state.lifecycle_comment_url != ''
+           )",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE code_review_jobs
+         SET publication_accepted = CASE
+                 WHEN publication_accepted != 0
+                   OR review_url LIKE '%#pullrequestreview-%'
+                 THEN 1 ELSE 0
+             END,
+             review_published = CASE
+                 WHEN publication_accepted != 0
+                   OR review_url LIKE '%#pullrequestreview-%'
+                 THEN 1 ELSE 0
+             END
+         WHERE publication_accepted != CASE
+                 WHEN publication_accepted != 0
+                   OR review_url LIKE '%#pullrequestreview-%'
+                 THEN 1 ELSE 0
+             END
+            OR review_published != CASE
+                 WHEN publication_accepted != 0
+                   OR review_url LIKE '%#pullrequestreview-%'
+                 THEN 1 ELSE 0
+             END",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Releases canonical automatic-review keys held by draft-stale jobs written
 /// by an older binary. This intentionally runs on every startup so restoring a
 /// current binary after a rollback also repairs rows created during rollback.
@@ -802,7 +907,6 @@ fn normalize_draft_stale_code_review_dedupe_keys(conn: &Connection) -> Result<()
     )?;
     Ok(())
 }
-
 /// Arms the durable thread-collapse queue for findings closed before
 /// `collapse_pending` existed: without this, historical conversations with a
 /// published comment would stay uncollapsed forever. The backfill and its
@@ -2025,6 +2129,8 @@ pub struct CodeReviewJobRecord {
     pub prompt_for_agents: String,
     pub publication_claimed: bool,
     pub publication_accepted: bool,
+    pub review_published: bool,
+    pub blocking_review_cleanup_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2136,6 +2242,8 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         prompt_for_agents: r.get(37)?,
         publication_claimed: r.get(38)?,
         publication_accepted: r.get(52)?,
+        review_published: r.get(53)?,
+        blocking_review_cleanup_pending: r.get(54)?,
     })
 }
 
@@ -2147,7 +2255,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
-     coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted";
+     coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
+     review_published, blocking_review_cleanup_pending";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -2474,6 +2583,14 @@ pub struct NewCodeReviewFinding {
     pub body: String,
     pub prompt_for_agents: String,
     pub sources: Vec<trouve_protocol::CodeReviewFindingSource>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodeReviewFindingThreadState {
+    pub finding: trouve_protocol::CodeReviewFinding,
+    pub is_resolved: Option<bool>,
+    pub generation: u64,
+    pub recheck_pending: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3439,11 +3556,18 @@ fn insert_artifact_cleanup_job(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreMutationOutcome {
+    AppendEvent,
+    SkipAndRollback,
+    CommitWithoutEvent,
+}
+
 fn apply_store_mutation(
     conn: &Connection,
     mutation: &StoreMutation,
     timestamp: chrono::DateTime<chrono::Utc>,
-) -> Result<bool> {
+) -> Result<StoreMutationOutcome> {
     match mutation {
         StoreMutation::Insert {
             session,
@@ -3590,7 +3714,20 @@ fn apply_store_mutation(
                 ],
             )?;
             if deleted == 0 {
-                return Ok(false);
+                return Ok(StoreMutationOutcome::SkipAndRollback);
+            }
+            let already_recorded = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM events
+                   WHERE scope_kind = 'session' AND scope_id = ?1
+                     AND json_extract(payload, '$.type') = 'session.pr_opened'
+                     AND CAST(json_extract(payload, '$.number') AS INTEGER) = ?2
+                 )",
+                params![intent.session_id, intent.number as i64],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if already_recorded {
+                return Ok(StoreMutationOutcome::CommitWithoutEvent);
             }
         }
         StoreMutation::AcceptPrompt {
@@ -3709,7 +3846,7 @@ fn apply_store_mutation(
             }
         }
     }
-    Ok(true)
+    Ok(StoreMutationOutcome::AppendEvent)
 }
 
 fn code_review_outbox_rows_exist(conn: &Connection, ids: &[i64]) -> rusqlite::Result<bool> {
@@ -3752,21 +3889,36 @@ fn insert_event_batch<'a>(
     let mut published = Vec::with_capacity(event_count.saturating_mul(2));
     let mut thread_events = Vec::new();
     for event in batch {
-        if let Some(mutation) = event.mutation.as_ref()
-            && !apply_store_mutation(&tx, mutation, event.ts)?
-        {
-            // Failed preconditions may only skip an isolated, single-event
-            // request; otherwise returning here would discard unrelated
-            // callers' events that the writer coalesced into this batch.
-            anyhow::ensure!(
-                event_count <= 1,
-                "a conditional store mutation must be committed in an isolated request"
-            );
-            return Ok(InsertedEventBatch {
-                skipped: true,
-                source_cursors: Vec::new(),
-                published: Vec::new(),
-            });
+        if let Some(mutation) = event.mutation.as_ref() {
+            match apply_store_mutation(&tx, mutation, event.ts)? {
+                StoreMutationOutcome::AppendEvent => {}
+                StoreMutationOutcome::SkipAndRollback => {
+                    // Failed preconditions may only skip an isolated,
+                    // single-event request; otherwise returning here would
+                    // discard unrelated callers' coalesced events.
+                    anyhow::ensure!(
+                        event_count <= 1,
+                        "a conditional store mutation must be committed in an isolated request"
+                    );
+                    return Ok(InsertedEventBatch {
+                        skipped: true,
+                        source_cursors: Vec::new(),
+                        published: Vec::new(),
+                    });
+                }
+                StoreMutationOutcome::CommitWithoutEvent => {
+                    anyhow::ensure!(
+                        event_count <= 1,
+                        "a suppressing store mutation must be committed in an isolated request"
+                    );
+                    tx.commit()?;
+                    return Ok(InsertedEventBatch {
+                        skipped: true,
+                        source_cursors: Vec::new(),
+                        published: Vec::new(),
+                    });
+                }
+            }
         }
         let (kind, id) = scope_cols(&event.scope);
         tx.execute(
@@ -7069,13 +7221,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn enqueue_code_review_job(
-        &self,
+    fn enqueue_code_review_job_conn(
+        conn: &Connection,
         new_job: &NewCodeReviewJob,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let id = crate::new_id("rv");
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
         let reviewers = serde_json::to_string(&new_job.reviewers)?;
         let included_reviewer_ids = serde_json::to_string(&new_job.included_reviewer_ids)?;
         let excluded_reviewer_ids = serde_json::to_string(&new_job.excluded_reviewer_ids)?;
@@ -7084,12 +7235,16 @@ impl Store {
                     (id, dedupe_key, installation_id, repository, pull_number, pull_title,
                      pull_url, head_sha, base_ref, head_ref, trigger, status, model, prompt,
                      identities, config_hash, created_at, review_base_sha, review_scope,
-                     retry_of, total_reviewers, routing_mode, semantic_routing,
+                     retry_of, total_reviewers, publication_generation,
+                     routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
                      router_thinking_level, coordinator_thinking_level,
                      review_watermark_sha)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                     (SELECT COALESCE(MAX(publication_generation), 0) + 1
+                      FROM code_review_jobs
+                      WHERE repository = ?4 AND pull_number = ?5 AND head_sha = ?8),
                      ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17)",
             params![
                 id,
@@ -7132,6 +7287,148 @@ impl Store {
             )?
             .job,
         ))
+    }
+
+    pub fn enqueue_code_review_job(
+        &self,
+        new_job: &NewCodeReviewJob,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        let conn = self.conn.lock().unwrap();
+        Self::enqueue_code_review_job_conn(&conn, new_job)
+    }
+
+    pub(crate) fn enqueue_code_review_thread_recheck(
+        &self,
+        new_job: &NewCodeReviewJob,
+        state_key: &str,
+        finding_ids: &[&str],
+        allow_new_state: bool,
+        max_attempts: u64,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let competing_job_exists: bool = tx.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM code_review_jobs
+               WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                 AND status IN ('queued', 'running')
+                 AND trigger != 'thread-recheck'
+             )",
+            params![
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.head_sha
+            ],
+            |row| row.get(0),
+        )?;
+        if competing_job_exists {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let current: Option<(i64, String, bool)> = tx
+            .query_row(
+                "SELECT r.attempt_count, j.status, j.review_published
+                 FROM code_review_thread_rechecks r
+                 JOIN code_review_jobs j ON j.id = r.last_job_id
+                 WHERE r.repository = ?1 AND r.pull_number = ?2
+                   AND r.head_sha = ?3 AND r.state_key = ?4",
+                params![
+                    new_job.repository,
+                    new_job.pull_number as i64,
+                    new_job.head_sha,
+                    state_key
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let used_attempts: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(attempt_count), 0)
+             FROM code_review_thread_rechecks
+             WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3",
+            params![
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.head_sha
+            ],
+            |row| row.get(0),
+        )?;
+        let terminal_retry = current.as_ref().is_some_and(|(_, status, published)| {
+            !*published && matches!(status.as_str(), "failed" | "cancelled" | "stale")
+        });
+        let already_consumed = current.as_ref().is_some_and(|(_, status, published)| {
+            *published || matches!(status.as_str(), "queued" | "running" | "succeeded")
+        });
+        if current.is_none() && !allow_new_state {
+            for finding_id in finding_ids {
+                tx.execute(
+                    "UPDATE code_review_findings
+                     SET github_thread_recheck_pending = 0 WHERE id = ?1",
+                    params![finding_id],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(None);
+        }
+        if already_consumed
+            || used_attempts >= max_attempts as i64
+            || (current.is_some() && !terminal_retry)
+        {
+            for finding_id in finding_ids {
+                tx.execute(
+                    "UPDATE code_review_findings
+                     SET github_thread_recheck_pending = 0 WHERE id = ?1",
+                    params![finding_id],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let attempt = current.as_ref().map_or(1, |(count, _, _)| count + 1);
+        let mut request = new_job.clone();
+        request.dedupe_key = format!("{}:{state_key}:attempt:{attempt}", request.dedupe_key);
+        let inserted = Self::enqueue_code_review_job_conn(&tx, &request)?;
+        let job = if let Some(job) = inserted.as_ref() {
+            job.clone()
+        } else {
+            tx.query_row(
+                &format!(
+                    "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE dedupe_key = ?1"
+                ),
+                params![request.dedupe_key],
+                row_to_code_review_job,
+            )?
+            .job
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO code_review_thread_rechecks
+                    (repository, pull_number, head_sha, state_key, attempt_count,
+                     last_job_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(repository, pull_number, head_sha, state_key) DO UPDATE SET
+               attempt_count = excluded.attempt_count,
+               last_job_id = excluded.last_job_id,
+               updated_at = excluded.updated_at",
+            params![
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.head_sha,
+                state_key,
+                attempt,
+                job.id,
+                now
+            ],
+        )?;
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET github_thread_recheck_pending = 0 WHERE id = ?1",
+                params![finding_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some(job))
     }
 
     pub fn supersede_code_review_jobs(
@@ -7228,6 +7525,24 @@ impl Store {
         }
         tx.commit()?;
         Ok(ids)
+    }
+
+    pub fn code_review_pull_has_active_job(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        head_sha: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND status IN ('queued', 'running')
+                 LIMIT 1
+             )",
+            params![repository, pull_number as i64, head_sha],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn list_code_review_jobs(
@@ -8489,6 +8804,40 @@ impl Store {
         Ok(updated)
     }
 
+    /// Durably records that the next GitHub review attempt will omit inline
+    /// comments. This must commit before the POST so reconciliation after an
+    /// accepted response cannot mistake those findings for published comments.
+    pub fn prepare_code_review_commentless_publication(
+        &self,
+        job_id: &str,
+        finding_ids: &[&str],
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs
+               WHERE id = ?1 AND publication_claimed != 0
+                 AND publication_accepted = 0
+             )",
+            params![job_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !current {
+            return Ok(false);
+        }
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET github_publication_status = 'failed'
+                 WHERE id = ?1 AND job_id = ?2",
+                params![finding_id, job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Closes an open finding and, in the same committed write, arms its
     /// thread collapse when the row currently has a published comment. The
     /// row's own github_comment_id decides — not a caller snapshot, which
@@ -8515,8 +8864,9 @@ impl Store {
         )? > 0)
     }
 
-    /// Marks a finding's thread collapse as done; retry state resets with
-    /// it. The clear only applies while the row still carries
+    /// Marks a finding's thread collapse as done, records the successfully
+    /// resolved thread state when one was present, and resets retry state.
+    /// The clear only applies while the row still carries
     /// `expected_comment_id`: if concurrent publication re-armed the row
     /// with a different comment after the caller's snapshot, the newly armed
     /// work survives instead of being wiped by a stale pass.
@@ -8524,12 +8874,23 @@ impl Store {
         &self,
         id: &str,
         expected_comment_id: Option<u64>,
+        resolved_thread_id: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
-             SET collapse_pending = 0, collapse_attempts = 0, collapse_next_attempt_at = NULL
+             SET collapse_pending = 0, collapse_attempts = 0, collapse_next_attempt_at = NULL,
+                 github_thread_id = CASE
+                     WHEN ?3 IS NOT NULL THEN ?3 ELSE github_thread_id
+                 END,
+                 github_thread_resolved = CASE
+                     WHEN ?3 IS NOT NULL THEN 1 ELSE github_thread_resolved
+                 END
              WHERE id = ?1 AND github_comment_id IS ?2",
-            params![id, expected_comment_id.map(|value| value as i64)],
+            params![
+                id,
+                expected_comment_id.map(|value| value as i64),
+                resolved_thread_id
+            ],
         )?;
         Ok(())
     }
@@ -8744,7 +9105,8 @@ impl Store {
                 "SELECT DISTINCT f.job_id
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
-                 WHERE j.repository = ?1 AND j.pull_number = ?2 AND f.status = 'open'
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1 AND f.status = 'open'
                  ORDER BY j.completed_at, f.job_id",
             )?;
             stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?
@@ -8759,6 +9121,151 @@ impl Store {
             );
         }
         Ok(findings)
+    }
+
+    pub(crate) fn reconcilable_code_review_findings(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<CodeReviewFindingThreadState>> {
+        let conn = self.conn.lock().unwrap();
+        let base_rows: Vec<CodeReviewFindingThreadState> = {
+            let mut stmt = conn.prepare(
+                "SELECT f.id, f.job_id, f.path, f.line, f.side, f.severity,
+                        f.confidence, f.title, f.body,
+                        f.prompt_for_agents, f.status, f.github_comment_id,
+                        f.github_comment_url, f.github_publication_status,
+                        f.github_thread_id, f.resolved_at,
+                        f.github_thread_resolved, f.github_thread_generation,
+                        f.github_thread_recheck_pending
+                 FROM code_review_findings f
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1
+                   AND f.status IN ('open', 'fixed', 'dismissed')
+                 ORDER BY j.completed_at, f.job_id, f.path, f.line, f.id",
+            )?;
+            stmt.query_map(params![repository, pull_number as i64], |row| {
+                Ok(CodeReviewFindingThreadState {
+                    finding: trouve_protocol::CodeReviewFinding {
+                        id: row.get(0)?,
+                        job_id: row.get(1)?,
+                        path: row.get(2)?,
+                        line: row.get::<_, i64>(3)? as u64,
+                        side: row.get(4)?,
+                        severity: row.get(5)?,
+                        confidence: row.get(6)?,
+                        title: row.get(7)?,
+                        body: row.get(8)?,
+                        prompt_for_agents: row.get(9)?,
+                        status: row.get(10)?,
+                        sources: Vec::new(),
+                        github_comment_id: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+                        github_comment_url: row.get(12)?,
+                        github_publication_status: code_review_publication_status(
+                            &row.get::<_, String>(13)?,
+                        ),
+                        github_thread_id: row.get(14)?,
+                        resolved_at: parse_optional_datetime(row.get(15)?),
+                    },
+                    is_resolved: row.get(16)?,
+                    generation: row.get::<_, i64>(17)? as u64,
+                    recheck_pending: row.get(18)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let mut findings = Vec::with_capacity(base_rows.len());
+        for mut state in base_rows {
+            let mut stmt = conn.prepare(
+                "SELECT reviewer_id, reviewer_name, candidate_id, task_id
+                 FROM code_review_finding_sources
+                 WHERE finding_id = ?1 ORDER BY reviewer_name, candidate_id",
+            )?;
+            state.finding.sources = stmt
+                .query_map(params![state.finding.id], |row| {
+                    Ok(trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(0)?,
+                        reviewer_name: row.get(1)?,
+                        candidate_id: row.get(2)?,
+                        task_id: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            findings.push(state);
+        }
+        Ok(findings)
+    }
+
+    pub(crate) fn record_code_review_thread_state(
+        &self,
+        finding_id: &str,
+        thread_id: &str,
+        is_resolved: bool,
+    ) -> Result<(bool, u64)> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let previous: Option<(Option<bool>, i64, String, Option<String>)> = tx
+            .query_row(
+                "SELECT github_thread_resolved, github_thread_generation, status,
+                        github_thread_id
+                 FROM code_review_findings WHERE id = ?1",
+                params![finding_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((previous_resolved, generation, status, previous_thread_id)) = previous else {
+            tx.commit()?;
+            return Ok((false, 0));
+        };
+        let state_changed = previous_resolved != Some(is_resolved);
+        let reopened_closed_finding = matches!(status.as_str(), "fixed" | "dismissed")
+            && previous_resolved == Some(true)
+            && !is_resolved;
+        let recheck_pending = previous_resolved == Some(true) && !is_resolved;
+        let changed = state_changed
+            || reopened_closed_finding
+            || previous_thread_id.as_deref() != Some(thread_id);
+        let generation = generation + i64::from(state_changed || reopened_closed_finding);
+        if changed {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET github_thread_id = ?2, github_thread_resolved = ?3,
+                     github_thread_generation = ?4,
+                     github_thread_recheck_pending =
+                       CASE WHEN ?5 THEN 1 ELSE github_thread_recheck_pending END,
+                     collapse_pending = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 0
+                       ELSE collapse_pending
+                     END,
+                     collapse_attempts = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 0
+                       ELSE collapse_attempts
+                     END,
+                     collapse_next_attempt_at = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
+                       ELSE collapse_next_attempt_at
+                     END,
+                     status = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 'open'
+                       ELSE status
+                     END,
+                     resolved_at = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
+                       ELSE resolved_at
+                     END
+                 WHERE id = ?1",
+                params![
+                    finding_id,
+                    thread_id,
+                    is_resolved,
+                    generation,
+                    recheck_pending
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok((state_changed || reopened_closed_finding, generation as u64))
     }
 
     pub fn code_review_job_detail(
@@ -9227,14 +9734,23 @@ impl Store {
     ) -> Result<bool> {
         let updated = self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET status = ?2,
+             SET status = CASE
+                     WHEN publication_accepted != 0 AND review_published != 0
+                     THEN 'succeeded'
+                     ELSE ?2
+                 END,
                  review_url = CASE
+                     WHEN publication_accepted != 0 AND review_published != 0
+                          AND review_url != '' THEN review_url
                      WHEN ?3 != '' THEN ?3
                      WHEN lifecycle_comment_url != '' THEN lifecycle_comment_url
                      ELSE review_url
                  END,
-                 error = ?4,
-                    completed_at = ?5
+                 error = CASE
+                     WHEN publication_accepted != 0 AND review_published != 0 THEN ''
+                     ELSE ?4
+                 END,
+                 completed_at = ?5
              WHERE id = ?1 AND status = 'running'",
             params![
                 id,
@@ -9346,6 +9862,7 @@ impl Store {
                      pull_title, pull_url, head_sha, base_ref, head_ref, trigger,
                      status, model, prompt, identities, config_hash, created_at,
                      review_base_sha, review_scope, retry_of, total_reviewers,
+                     publication_generation,
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
                      coordinator_thinking_level, review_watermark_sha)
@@ -9353,10 +9870,15 @@ impl Store {
                     pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
                     'queued', model, prompt, identities, config_hash, ?4,
                     review_base_sha, review_scope, id, total_reviewers,
+                    (SELECT COALESCE(MAX(generation.publication_generation), 0) + 1
+                     FROM code_review_jobs AS generation
+                     WHERE generation.repository = source.repository
+                       AND generation.pull_number = source.pull_number
+                       AND generation.head_sha = source.head_sha),
                     routing_mode, semantic_routing, included_reviewer_ids,
                     excluded_reviewer_ids, router_model, router_thinking_level,
                     coordinator_thinking_level, review_watermark_sha
-             FROM code_review_jobs WHERE id = ?1",
+             FROM code_review_jobs AS source WHERE source.id = ?1",
             params![id, new_id, format!("retry:{id}:{new_id}"), now],
         )?;
         tx.execute(
@@ -9411,9 +9933,33 @@ impl Store {
 
     pub fn claim_code_review_publication(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET publication_claimed = 1
+            "UPDATE code_review_jobs
+             SET publication_claimed = 1,
+                 publication_order = CASE
+                   WHEN publication_order != 0 THEN publication_order
+                   ELSE (
+                     SELECT COALESCE(MAX(existing.publication_order), 0) + 1
+                     FROM code_review_jobs AS existing
+                     WHERE existing.repository = code_review_jobs.repository
+                       AND existing.pull_number = code_review_jobs.pull_number
+                   )
+                 END
              WHERE id = ?1 AND status = 'running'
-               AND cancel_requested = 0 AND publication_claimed = 0",
+               AND cancel_requested = 0 AND publication_claimed = 0
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )",
             params![id],
         )? > 0)
     }
@@ -9429,7 +9975,8 @@ impl Store {
     pub fn release_code_review_publication_claim(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET publication_claimed = 0, publication_accepted = 0
+             SET publication_claimed = 0, publication_accepted = 0,
+                 publication_order = 0
              WHERE id = ?1 AND publication_accepted = 0",
             params![id],
         )? > 0)
@@ -9443,6 +9990,32 @@ impl Store {
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        let published_at = chrono::Utc::now().to_rfc3339();
+        let current_publication = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs AS current_job
+               WHERE current_job.id = ?1
+                 AND current_job.cancel_requested = 0
+                 AND current_job.publication_claimed != 0
+                 AND current_job.status IN ('running', 'failed', 'succeeded')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM code_review_jobs AS newer
+                   WHERE newer.repository = current_job.repository
+                     AND newer.pull_number = current_job.pull_number
+                     AND newer.head_sha = current_job.head_sha
+                     AND (
+                       newer.publication_generation > current_job.publication_generation
+                       OR (
+                         newer.publication_generation = current_job.publication_generation
+                         AND newer.rowid > current_job.rowid
+                       )
+                     )
+                     AND newer.status IN ('queued', 'running', 'succeeded')
+                 )
+             )",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )?;
         for finding_id in finding_ids {
             tx.execute(
                 "UPDATE code_review_findings
@@ -9462,12 +10035,72 @@ impl Store {
                      ELSE error
                  END,
                  review_url = ?2,
-                 publication_accepted = 1
+                 publication_accepted = 1,
+                 review_published = 1,
+                 blocking_review_cleanup_pending = CASE
+                     WHEN ?3 THEN blocking_review_cleanup_pending ELSE 0
+                 END,
+                 blocking_review_cleanup_claim_token = CASE
+                     WHEN ?3 THEN blocking_review_cleanup_claim_token ELSE NULL
+                 END,
+                 blocking_review_cleanup_claim_until = CASE
+                     WHEN ?3 THEN blocking_review_cleanup_claim_until ELSE NULL
+                 END
              WHERE id = ?1 AND publication_claimed != 0",
-            params![id, review_url],
+            params![id, review_url, current_publication],
+        )?;
+        if updated == 0 {
+            return Ok(false);
+        }
+        let fixed = if current_publication {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', resolved_at = ?2,
+                     publication_resolution_job_id = NULL,
+                     collapse_attempts = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 0
+                         ELSE collapse_attempts
+                     END,
+                     collapse_next_attempt_at = CASE
+                         WHEN github_comment_id IS NOT NULL THEN NULL
+                         ELSE collapse_next_attempt_at
+                     END,
+                     collapse_pending = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 1
+                         ELSE 0
+                     END
+                 WHERE publication_resolution_job_id = ?1 AND status = 'open'",
+                params![id, published_at],
+            )?
+        } else {
+            0
+        };
+        if fixed > 0 {
+            tx.execute(
+                "UPDATE code_review_jobs SET fixed_issue_count = ?2 WHERE id = ?1",
+                params![id, fixed as i64],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO code_review_pr_state
+                        (repository, pull_number, last_reviewed_head_sha,
+                         last_reviewed_base_sha, last_reviewed_at,
+                         last_reviewed_publication_order)
+                 SELECT repository, pull_number, head_sha, base_ref, ?3,
+                        publication_order
+                 FROM code_review_jobs
+                 WHERE id = ?1 AND ?2
+                 ON CONFLICT(repository, pull_number) DO UPDATE SET
+                   last_reviewed_head_sha = excluded.last_reviewed_head_sha,
+                   last_reviewed_base_sha = excluded.last_reviewed_base_sha,
+                   last_reviewed_at = excluded.last_reviewed_at,
+                   last_reviewed_publication_order = excluded.last_reviewed_publication_order
+                 WHERE code_review_pr_state.last_reviewed_publication_order
+                       <= excluded.last_reviewed_publication_order",
+            params![id, current_publication, published_at],
         )?;
         tx.commit()?;
-        Ok(updated > 0)
+        Ok(true)
     }
 
     pub fn set_code_review_job_check_run(
@@ -9619,12 +10252,15 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
-                     last_reviewed_base_sha, last_reviewed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                     last_reviewed_base_sha, last_reviewed_at,
+                     last_reviewed_publication_order)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)
              ON CONFLICT(repository, pull_number) DO UPDATE SET
                last_reviewed_head_sha = excluded.last_reviewed_head_sha,
                last_reviewed_base_sha = excluded.last_reviewed_base_sha,
-               last_reviewed_at = excluded.last_reviewed_at",
+               last_reviewed_at = excluded.last_reviewed_at,
+               last_reviewed_publication_order =
+                 code_review_pr_state.last_reviewed_publication_order + 1",
             params![
                 repository,
                 pull_number as i64,
@@ -9634,6 +10270,412 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn prepare_code_review_finding_resolutions(
+        &self,
+        job_id: &str,
+        finding_ids: &[&str],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET publication_resolution_job_id = ?2
+                 WHERE id = ?1 AND status = 'open'",
+                params![finding_id, job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // The PR identity fields intentionally stay explicit: they are written
+    // atomically with both publication and cleanup state in this transaction.
+    pub fn prepare_code_review_blocking_review_cleanup(
+        &self,
+        id: &str,
+        required: bool,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_pending = ?2,
+                 blocking_review_cleanup_page = 1,
+                 blocking_review_cleanup_attempts = 0,
+                 blocking_review_cleanup_next_attempt_at = NULL,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND publication_claimed != 0
+               AND status = 'running' AND cancel_requested = 0
+               AND review_published = 0
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )",
+            params![id, required],
+        )? > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_code_review_publication(
+        &self,
+        id: &str,
+        repository: &str,
+        pull_number: u64,
+        base_sha: &str,
+        head_sha: &str,
+        review_url: &str,
+        blocking_review_cleanup_pending: bool,
+        resolved_finding_ids: &[&str],
+    ) -> Result<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current_publication = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs AS current_job
+               WHERE current_job.id = ?1 AND current_job.status = 'running'
+                 AND current_job.cancel_requested = 0
+                 AND current_job.publication_claimed != 0
+                 AND NOT EXISTS (
+                   SELECT 1 FROM code_review_jobs AS newer
+                   WHERE newer.repository = current_job.repository
+                     AND newer.pull_number = current_job.pull_number
+                     AND newer.head_sha = current_job.head_sha
+                     AND (
+                       newer.publication_generation > current_job.publication_generation
+                       OR (
+                         newer.publication_generation = current_job.publication_generation
+                         AND newer.rowid > current_job.rowid
+                       )
+                     )
+                     AND newer.status IN ('queued', 'running', 'succeeded')
+                 )
+             )",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let published_at = chrono::Utc::now().to_rfc3339();
+        if current_publication {
+            for finding_id in resolved_finding_ids {
+                tx.execute(
+                    "UPDATE code_review_findings
+                     SET publication_resolution_job_id = ?2
+                     WHERE id = ?1 AND status = 'open'",
+                    params![finding_id, id],
+                )?;
+            }
+        }
+        let fixed = if current_publication {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', resolved_at = ?2,
+                     publication_resolution_job_id = NULL,
+                     collapse_attempts = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 0
+                         ELSE collapse_attempts
+                     END,
+                     collapse_next_attempt_at = CASE
+                         WHEN github_comment_id IS NOT NULL THEN NULL
+                         ELSE collapse_next_attempt_at
+                     END,
+                     collapse_pending = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 1
+                         ELSE 0
+                     END
+                 WHERE publication_resolution_job_id = ?1 AND status = 'open'",
+                params![id, published_at],
+            )? as u64
+        } else {
+            0
+        };
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET publication_accepted = 1,
+                 review_published = 1,
+                 review_url = CASE WHEN ?2 = '' THEN review_url ELSE ?2 END,
+                 blocking_review_cleanup_pending = ?3,
+                 fixed_issue_count = ?4
+             WHERE id = ?1 AND publication_claimed != 0",
+            params![
+                id,
+                review_url,
+                current_publication && blocking_review_cleanup_pending,
+                fixed as i64
+            ],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("review job changed before GitHub publication was recorded");
+        }
+        tx.execute(
+            "INSERT INTO code_review_pr_state
+                    (repository, pull_number, last_reviewed_head_sha,
+                     last_reviewed_base_sha, last_reviewed_at,
+                     last_reviewed_publication_order)
+             SELECT repository, pull_number, head_sha, base_ref, ?7,
+                    publication_order
+             FROM code_review_jobs
+             WHERE id = ?1 AND status = 'running'
+               AND repository = ?2 AND pull_number = ?3
+               AND base_ref = ?4 AND head_sha = ?5
+               AND ?6
+             ON CONFLICT(repository, pull_number) DO UPDATE SET
+               last_reviewed_head_sha = excluded.last_reviewed_head_sha,
+               last_reviewed_base_sha = excluded.last_reviewed_base_sha,
+               last_reviewed_at = excluded.last_reviewed_at,
+               last_reviewed_publication_order = excluded.last_reviewed_publication_order
+             WHERE code_review_pr_state.last_reviewed_publication_order
+                   <= excluded.last_reviewed_publication_order",
+            params![
+                id,
+                repository,
+                pull_number as i64,
+                base_sha,
+                head_sha,
+                current_publication,
+                published_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(fixed)
+    }
+
+    pub fn claim_code_review_blocking_review_cleanup(&self, id: &str) -> Result<Option<String>> {
+        let token = format!("brc_{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        let claim_until = now + chrono::Duration::minutes(2);
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_claim_token = ?2,
+                 blocking_review_cleanup_claim_until = ?3
+             WHERE id = ?1 AND review_published != 0
+               AND blocking_review_cleanup_pending != 0
+               AND (blocking_review_cleanup_next_attempt_at IS NULL
+                    OR blocking_review_cleanup_next_attempt_at <= ?4)
+               AND (blocking_review_cleanup_claim_until IS NULL
+                    OR blocking_review_cleanup_claim_until <= ?4)
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )",
+            params![id, token, claim_until.to_rfc3339(), now.to_rfc3339()],
+        )?;
+        Ok((updated > 0).then_some(token))
+    }
+
+    pub fn code_review_blocking_review_cleanup_claim_is_current(
+        &self,
+        id: &str,
+        claim_token: &str,
+    ) -> Result<bool> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs AS current_job
+               WHERE current_job.id = ?1
+                 AND current_job.review_published != 0
+                 AND current_job.blocking_review_cleanup_pending != 0
+                 AND current_job.blocking_review_cleanup_claim_token = ?2
+                 AND NOT EXISTS (
+                   SELECT 1 FROM code_review_jobs AS newer
+                   WHERE newer.repository = current_job.repository
+                     AND newer.pull_number = current_job.pull_number
+                     AND newer.head_sha = current_job.head_sha
+                     AND (
+                       newer.publication_generation > current_job.publication_generation
+                       OR (
+                         newer.publication_generation = current_job.publication_generation
+                         AND newer.rowid > current_job.rowid
+                       )
+                     )
+                     AND newer.status IN ('queued', 'running', 'succeeded')
+                 )
+             )",
+                params![id, claim_token],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn clear_code_review_blocking_review_cleanup(
+        &self,
+        id: &str,
+        claim_token: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_pending = 0,
+                 blocking_review_cleanup_page = 1,
+                 blocking_review_cleanup_attempts = 0,
+                 blocking_review_cleanup_next_attempt_at = NULL,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND review_published != 0
+               AND blocking_review_cleanup_pending != 0
+               AND blocking_review_cleanup_claim_token = ?2",
+            params![id, claim_token],
+        )? > 0)
+    }
+
+    pub fn code_review_blocking_review_cleanup_page(&self, id: &str) -> Result<u64> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT blocking_review_cleanup_page
+                 FROM code_review_jobs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(1) as u64)
+    }
+
+    /// Continue a healthy but incomplete cleanup on a later poll. Keeping its
+    /// page durable bounds each pass without restarting a large review list.
+    pub fn requeue_code_review_blocking_review_cleanup(
+        &self,
+        id: &str,
+        claim_token: &str,
+        page: u64,
+        useful_work: bool,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some((current_page, attempts)) = tx
+            .query_row(
+                "SELECT blocking_review_cleanup_page,
+                        blocking_review_cleanup_attempts
+                 FROM code_review_jobs
+                 WHERE id = ?1 AND blocking_review_cleanup_pending != 0
+                   AND blocking_review_cleanup_claim_token = ?2",
+                params![id, claim_token],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let page = page.max(1) as i64;
+        let progressed = page > current_page.max(1) || useful_work;
+        let delay_seconds = if progressed {
+            60
+        } else {
+            (60_i64 << attempts.clamp(0, 6)).min(3600)
+        };
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_page = ?2,
+                 blocking_review_cleanup_attempts = CASE
+                     WHEN ?3 THEN 0
+                     ELSE blocking_review_cleanup_attempts + 1
+                 END,
+                 blocking_review_cleanup_next_attempt_at = ?4,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND blocking_review_cleanup_pending != 0
+               AND blocking_review_cleanup_claim_token = ?5",
+            params![id, page, progressed, next_attempt.to_rfc3339(), claim_token],
+        )?;
+        tx.commit()?;
+        Ok(updated > 0)
+    }
+
+    /// Back off a cleanup that made an API attempt and failed, so an old
+    /// poison row cannot occupy every fixed-size repair batch forever.
+    pub fn defer_code_review_blocking_review_cleanup(
+        &self,
+        id: &str,
+        claim_token: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let attempts: i64 = tx
+            .query_row(
+                "SELECT blocking_review_cleanup_attempts
+                 FROM code_review_jobs
+                 WHERE id = ?1 AND blocking_review_cleanup_claim_token = ?2",
+                params![id, claim_token],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let delay_seconds = (60_i64 << attempts.clamp(0, 6)).min(3600);
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_attempts =
+                   blocking_review_cleanup_attempts + 1,
+                 blocking_review_cleanup_next_attempt_at = ?2,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND blocking_review_cleanup_pending != 0
+               AND blocking_review_cleanup_claim_token = ?3",
+            params![id, next_attempt.to_rfc3339(), claim_token],
+        )?;
+        tx.commit()?;
+        Ok(updated > 0)
+    }
+
+    pub fn code_review_jobs_pending_blocking_review_cleanup(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CODE_REVIEW_JOB_COLUMNS}
+             FROM code_review_jobs
+             WHERE review_published != 0 AND blocking_review_cleanup_pending != 0
+               AND (blocking_review_cleanup_next_attempt_at IS NULL
+                    OR blocking_review_cleanup_next_attempt_at <= ?2)
+               AND (blocking_review_cleanup_claim_until IS NULL
+                    OR blocking_review_cleanup_claim_until <= ?2)
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )
+             ORDER BY COALESCE(blocking_review_cleanup_next_attempt_at, created_at), id
+             LIMIT ?1"
+        ))?;
+        Ok(stmt
+            .query_map(
+                params![limit as i64, chrono::Utc::now().to_rfc3339()],
+                |row| row_to_code_review_job(row).map(|record| record.job),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn set_code_review_job_fixed_issue_count(&self, id: &str, count: u64) -> Result<()> {
@@ -11062,6 +12104,87 @@ mod tests {
     }
 
     #[test]
+    fn code_review_publication_queries_have_a_revision_status_index() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'code_review_jobs_pull_revision_status'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized
+                .contains("(repository, pull_number, head_sha, status, publication_generation)")
+        );
+    }
+
+    #[test]
+    fn existing_review_database_adds_publication_columns_before_revision_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO code_review_jobs
+                        (id, dedupe_key, installation_id, repository, pull_number,
+                         pull_title, pull_url, head_sha, base_ref, head_ref, trigger,
+                         status, created_at, review_url)
+                 VALUES ('review-1', 'dedupe-1', 7, 'acme/widgets', 42,
+                         'Widgets', 'https://example.test/pull/42', 'head', 'base',
+                         'branch', 'automatic', 'succeeded', '2026-01-01T00:00:00Z',
+                         'https://example.test/pull/42#pullrequestreview-1'),
+                        ('review-2', 'dedupe-2', 7, 'acme/widgets', 43,
+                         'Widgets clean', 'https://example.test/pull/43', 'head-2', 'base',
+                         'branch-2', 'automatic', 'succeeded', '2026-01-01T00:00:00Z', '')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE code_review_jobs DROP COLUMN review_published;
+                 ALTER TABLE code_review_jobs DROP COLUMN publication_generation;",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('code_review_jobs')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "publication_generation")
+        );
+        assert!(columns.iter().any(|column| column == "review_published"));
+        let published: bool = conn
+            .query_row(
+                "SELECT review_published FROM code_review_jobs WHERE id = 'review-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(published);
+        let clean_without_review: bool = conn
+            .query_row(
+                "SELECT review_published FROM code_review_jobs WHERE id = 'review-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!clean_without_review);
+    }
+
+    #[test]
     fn migration_backfills_terminal_code_review_task_lifecycle_once() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
@@ -11161,6 +12284,83 @@ mod tests {
             ),
             15_000
         );
+    }
+
+    #[test]
+    fn legacy_review_publication_repair_is_evidence_based_and_repeatable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE code_review_jobs (
+                id TEXT PRIMARY KEY,
+                repository TEXT NOT NULL,
+                pull_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                publication_accepted INTEGER NOT NULL DEFAULT 0,
+                review_published INTEGER NOT NULL DEFAULT 0,
+                review_url TEXT NOT NULL DEFAULT '',
+                lifecycle_comment_url TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE code_review_pr_state (
+                repository TEXT NOT NULL,
+                pull_number INTEGER NOT NULL,
+                lifecycle_comment_url TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (repository, pull_number)
+             );
+             INSERT INTO code_review_jobs
+               (id, repository, pull_number, status, publication_accepted,
+                review_published, review_url, lifecycle_comment_url)
+             VALUES
+               ('published', 'acme/widgets', 1, 'succeeded', 0, 0,
+                'https://github.com/acme/widgets/pull/1#pullrequestreview-1', ''),
+               ('accepted', 'acme/widgets', 2, 'running', 1, 0, '', ''),
+               ('lifecycle-only', 'acme/widgets', 3, 'succeeded', 0, 1,
+                'https://github.com/acme/widgets/issues/3#issuecomment-1', ''),
+               ('false-positive', 'acme/widgets', 4, 'succeeded', 0, 1, '', ''),
+               ('clean', 'acme/widgets', 5, 'succeeded', 0, 0, '', '');
+             INSERT INTO code_review_pr_state
+               (repository, pull_number, lifecycle_comment_url)
+             VALUES ('acme/widgets', 3,
+                     'https://github.com/acme/widgets/issues/3#issuecomment-1');",
+        )
+        .unwrap();
+
+        repair_legacy_code_review_publications(&conn).unwrap();
+        let state = |id: &str| {
+            conn.query_row(
+                "SELECT publication_accepted, review_published
+                 FROM code_review_jobs WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(state("published"), (1, 1));
+        assert_eq!(state("accepted"), (1, 1));
+        assert_eq!(state("lifecycle-only"), (0, 0));
+        assert_eq!(state("false-positive"), (0, 0));
+        assert_eq!(state("clean"), (0, 0));
+        assert_eq!(
+            conn.query_row(
+                "SELECT lifecycle_comment_url FROM code_review_jobs WHERE id = 'lifecycle-only'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "https://github.com/acme/widgets/issues/3#issuecomment-1"
+        );
+
+        conn.execute(
+            "INSERT INTO code_review_jobs (id, repository, pull_number, status, review_url)
+             VALUES ('rollback-review', 'acme/widgets', 6, 'succeeded',
+                     'https://github.com/acme/widgets/pull/6#pullrequestreview-2')",
+            [],
+        )
+        .unwrap();
+        repair_legacy_code_review_publications(&conn).unwrap();
+        assert_eq!(state("rollback-review"), (1, 1));
+        let changes = conn.total_changes();
+        repair_legacy_code_review_publications(&conn).unwrap();
+        assert_eq!(conn.total_changes(), changes);
     }
 
     #[test]
@@ -12725,7 +13925,7 @@ mod tests {
             )
             .unwrap();
         let associations = store
-            .events_after(&Scope::Session(session.id), 0)
+            .events_after(&Scope::Session(session.id.clone()), 0)
             .unwrap()
             .into_iter()
             .filter(|envelope| matches!(envelope.event, Event::SessionPrOpened { .. }))
@@ -12737,6 +13937,48 @@ mod tests {
                 Scope::Thread("th_pr_intent".into()),
                 vec![Event::ToolCompleted {
                     call_id: "call-pr-again".into(),
+                    status: ToolStatus::Ok,
+                    result: serde_json::json!({"number": 42}),
+                    execution_duration_ms: Some(1),
+                }],
+                vec![intent.clone()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .complete_session_pr_verification(
+                    intent.clone(),
+                    Event::SessionPrOpened {
+                        number: 42,
+                        url: "https://github.com/o/r/pull/42".into(),
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a concurrently recorded association suppresses a duplicate completion event"
+        );
+        assert!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap()
+                .is_empty(),
+            "the redundant intent must still be consumed"
+        );
+        let associations = store
+            .events_after(&Scope::Session("se_pr_intent".into()), 0)
+            .unwrap()
+            .into_iter()
+            .filter(|envelope| matches!(envelope.event, Event::SessionPrOpened { .. }))
+            .count();
+        assert_eq!(associations, 1);
+
+        store
+            .append_events_with_session_pr_verification_intents(
+                Scope::Thread("th_pr_intent".into()),
+                vec![Event::ToolCompleted {
+                    call_id: "call-pr-delete-pending".into(),
                     status: ToolStatus::Ok,
                     result: serde_json::json!({"number": 42}),
                     execution_duration_ms: Some(1),
@@ -14325,7 +15567,9 @@ mod tests {
 
         // A clear guarded on a stale comment id is a no-op: the re-armed
         // work survives a pass that snapshotted the row before publication.
-        store.clear_code_review_thread_collapse(&id, None).unwrap();
+        store
+            .clear_code_review_thread_collapse(&id, None, None)
+            .unwrap();
         assert_eq!(
             store
                 .pending_code_review_thread_collapses(due, 16, &[])
@@ -14334,7 +15578,7 @@ mod tests {
             1
         );
         store
-            .clear_code_review_thread_collapse(&id, Some(9001))
+            .clear_code_review_thread_collapse(&id, Some(9001), Some("thread-9001"))
             .unwrap();
         assert!(
             store
@@ -14427,37 +15671,1049 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixed_findings_are_monitored_without_reopening_resolved_threads() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "medium".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .update_code_review_finding_publication(
+                &finding.id,
+                Some(9001),
+                "https://example/comment",
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .resolve_code_review_finding(&finding.id, "fixed")
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .record_code_review_thread_state(&finding.id, "thread-1", false)
+                .unwrap()
+                .0
+        );
+        let first_unresolved = store
+            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert_eq!(first_unresolved[0].finding.status, "fixed");
+        assert_eq!(first_unresolved[0].is_resolved, Some(false));
+        assert!(!first_unresolved[0].recheck_pending);
+
+        store
+            .clear_code_review_thread_collapse(&finding.id, Some(9001), Some("thread-1"))
+            .unwrap();
+        let resolved = store
+            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].finding.status, "fixed");
+        assert_eq!(resolved[0].is_resolved, Some(true));
+        assert!(!resolved[0].recheck_pending);
+        store
+            .defer_code_review_thread_collapse(&finding.id)
+            .unwrap();
+        store
+            .defer_code_review_thread_collapse(&finding.id)
+            .unwrap();
+
+        assert!(
+            store
+                .record_code_review_thread_state(&finding.id, "thread-1", false)
+                .unwrap()
+                .0
+        );
+        let reopened = store
+            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].finding.status, "open");
+        assert_eq!(reopened[0].is_resolved, Some(false));
+        assert!(reopened[0].recheck_pending);
+        assert!(
+            store
+                .pending_code_review_thread_collapses(
+                    chrono::Utc::now() + chrono::Duration::hours(2),
+                    16,
+                    &[],
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let collapse_state: (bool, i64, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT collapse_pending, collapse_attempts, collapse_next_attempt_at
+                 FROM code_review_findings WHERE id = ?1",
+                [&finding.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(collapse_state, (false, 0, None));
+    }
+
+    #[test]
+    fn retry_job_receives_the_next_publication_generation() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET publication_generation = 9 WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        let retry = store.retry_code_review_job(&job.id).unwrap().unwrap();
+        let generation = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT publication_generation FROM code_review_jobs WHERE id = ?1",
+                params![retry.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 10);
+    }
+
+    #[test]
+    fn blocking_review_cleanup_backoff_rotates_the_repair_batch() {
+        let store = Store::open_in_memory().unwrap();
+        let oldest = enqueue_backoff_test_job(&store);
+        let mut newer_request = backoff_test_job_request();
+        newer_request.dedupe_key = "acme/widgets#43:backoff".into();
+        newer_request.pull_number = 43;
+        let newer = store
+            .enqueue_code_review_job(&newer_request)
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'succeeded', review_published = 1,
+                     blocking_review_cleanup_pending = 1,
+                     completed_at = created_at
+                 WHERE id IN (?1, ?2)",
+                params![oldest.id, newer.id],
+            )
+            .unwrap();
+
+        let oldest_claim = store
+            .claim_code_review_blocking_review_cleanup(&oldest.id)
+            .unwrap()
+            .unwrap();
+        store
+            .defer_code_review_blocking_review_cleanup(&oldest.id, &oldest_claim)
+            .unwrap();
+        let due = store
+            .code_review_jobs_pending_blocking_review_cleanup(1)
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, newer.id);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_attempts = 3
+                 WHERE id = ?1",
+                params![newer.id],
+            )
+            .unwrap();
+        let newer_claim = store
+            .claim_code_review_blocking_review_cleanup(&newer.id)
+            .unwrap()
+            .unwrap();
+        store
+            .requeue_code_review_blocking_review_cleanup(&newer.id, &newer_claim, 4, false)
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_blocking_review_cleanup_page(&newer.id)
+                .unwrap(),
+            4
+        );
+        let attempts: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT blocking_review_cleanup_attempts
+                 FROM code_review_jobs WHERE id = ?1",
+                params![newer.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+        assert!(
+            store
+                .code_review_jobs_pending_blocking_review_cleanup(1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_attempts = 3,
+                     blocking_review_cleanup_next_attempt_at = NULL
+                 WHERE id = ?1",
+                params![newer.id],
+            )
+            .unwrap();
+        let no_progress_claim = store
+            .claim_code_review_blocking_review_cleanup(&newer.id)
+            .unwrap()
+            .unwrap();
+        store
+            .requeue_code_review_blocking_review_cleanup(&newer.id, &no_progress_claim, 4, false)
+            .unwrap();
+        let (attempts, next_attempt): (i64, String) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT blocking_review_cleanup_attempts,
+                        blocking_review_cleanup_next_attempt_at
+                 FROM code_review_jobs WHERE id = ?1",
+                params![newer.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 4);
+        let next_attempt = chrono::DateTime::parse_from_rfc3339(&next_attempt)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(next_attempt - chrono::Utc::now() > chrono::Duration::minutes(7));
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_attempts = 3,
+                     blocking_review_cleanup_next_attempt_at = NULL
+                 WHERE id = ?1",
+                params![newer.id],
+            )
+            .unwrap();
+        let useful_work_claim = store
+            .claim_code_review_blocking_review_cleanup(&newer.id)
+            .unwrap()
+            .unwrap();
+        store
+            .requeue_code_review_blocking_review_cleanup(&newer.id, &useful_work_claim, 4, true)
+            .unwrap();
+        let attempts: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT blocking_review_cleanup_attempts
+                 FROM code_review_jobs WHERE id = ?1",
+                params![newer.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn blocking_review_cleanup_claims_fence_stale_workers() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'succeeded', review_published = 1,
+                     blocking_review_cleanup_pending = 1
+                 WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        let first = store
+            .claim_code_review_blocking_review_cleanup(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .claim_code_review_blocking_review_cleanup(&job.id)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_claim_until = ?2
+                 WHERE id = ?1",
+                params![
+                    job.id,
+                    (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+        let replacement = store
+            .claim_code_review_blocking_review_cleanup(&job.id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, replacement);
+        assert!(
+            !store
+                .clear_code_review_blocking_review_cleanup(&job.id, &first)
+                .unwrap()
+        );
+        assert!(
+            store
+                .clear_code_review_blocking_review_cleanup(&job.id, &replacement)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn newer_publication_generation_invalidates_cleanup_claim() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'succeeded', review_published = 1,
+                     blocking_review_cleanup_pending = 1
+                 WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+        let claim = store
+            .claim_code_review_blocking_review_cleanup(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .code_review_blocking_review_cleanup_claim_is_current(&job.id, &claim)
+                .unwrap()
+        );
+
+        let mut replacement = backoff_test_job_request();
+        replacement.dedupe_key = "acme/widgets#42:cleanup-replacement".into();
+        store
+            .enqueue_code_review_job(&replacement)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !store
+                .code_review_blocking_review_cleanup_claim_is_current(&job.id, &claim)
+                .unwrap()
+        );
+        assert!(
+            store
+                .code_review_jobs_pending_blocking_review_cleanup(1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovered_clean_publication_closes_intended_findings_and_arms_cleanup() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let created_at = "2000-01-01T00:00:00Z";
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET created_at = ?2 WHERE id = ?1",
+                params![job.id, created_at],
+            )
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_blocking_review_cleanup(&job.id, true)
+                .unwrap()
+        );
+        store
+            .prepare_code_review_finding_resolutions(&job.id, &[&finding.id])
+            .unwrap();
+
+        assert!(
+            store
+                .reconcile_code_review_publication(
+                    &job.id,
+                    "https://example/recovered-review",
+                    &[],
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .reconcile_code_review_publication(
+                    &job.id,
+                    "https://example/recovered-review",
+                    &[],
+                )
+                .unwrap()
+        );
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.review_published);
+        assert!(record.blocking_review_cleanup_pending);
+        assert_eq!(record.job.fixed_issue_count, 1);
+        assert_eq!(
+            store.code_review_findings(&job.id).unwrap()[0].status,
+            "fixed"
+        );
+        let state = store
+            .code_review_pull_state(&job.repository, job.pull_number)
+            .unwrap();
+        assert!(
+            state.last_reviewed_at.unwrap()
+                > chrono::DateTime::parse_from_rfc3339(created_at).unwrap()
+        );
+    }
+
+    #[test]
+    fn accepted_publication_atomically_wins_terminal_failure() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let created_at = "2000-01-01T00:00:00Z";
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET created_at = ?2 WHERE id = ?1",
+                params![job.id, created_at],
+            )
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/accepted-review",
+                false,
+                &[],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .finish_code_review_job(&job.id, "failed", "", "late timeout")
+                .unwrap()
+        );
+
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert_eq!(record.job.status, "succeeded");
+        assert_eq!(record.job.review_url, "https://example/accepted-review");
+        assert!(record.job.error.is_empty());
+        let state = store
+            .code_review_pull_state(&job.repository, job.pull_number)
+            .unwrap();
+        assert!(
+            state.last_reviewed_at.unwrap()
+                > chrono::DateTime::parse_from_rfc3339(created_at).unwrap()
+        );
+    }
+
+    #[test]
+    fn commentless_publication_mode_is_durable_before_acceptance() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_commentless_publication(&job.id, &[&finding.id])
+                .unwrap()
+        );
+        assert_eq!(
+            store.code_review_findings(&job.id).unwrap()[0].github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+        );
+
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&job.id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .prepare_code_review_commentless_publication(&job.id, &[&finding.id])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn superseded_publication_cannot_arm_cleanup_or_close_findings() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_blocking_review_cleanup(&job.id, true)
+                .unwrap()
+        );
+        store
+            .prepare_code_review_finding_resolutions(&job.id, &[&finding.id])
+            .unwrap();
+
+        let mut replacement = backoff_test_job_request();
+        replacement.dedupe_key = "acme/widgets#42:replacement".into();
+        store
+            .enqueue_code_review_job(&replacement)
+            .unwrap()
+            .unwrap();
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/stale-review",
+                true,
+                &[&finding.id],
+            )
+            .unwrap();
+
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.review_published);
+        assert!(!record.blocking_review_cleanup_pending);
+        assert_eq!(record.job.fixed_issue_count, 0);
+        assert_eq!(
+            store.code_review_findings(&job.id).unwrap()[0].status,
+            "open"
+        );
+        let resolution_job: Option<String> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT publication_resolution_job_id
+                 FROM code_review_findings WHERE id = ?1",
+                params![finding.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolution_job.as_deref(), Some(job.id.as_str()));
+    }
+
+    #[test]
+    fn superseded_publication_reconciliation_suppresses_cleanup_and_resolutions() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_blocking_review_cleanup(&job.id, true)
+                .unwrap()
+        );
+        store
+            .prepare_code_review_finding_resolutions(&job.id, &[&finding.id])
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "failed", "", "lost response")
+            .unwrap();
+
+        let mut replacement = backoff_test_job_request();
+        replacement.dedupe_key = "acme/widgets#42:reconciliation-replacement".into();
+        store
+            .enqueue_code_review_job(&replacement)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .reconcile_code_review_publication(
+                    &job.id,
+                    "https://example/recovered-stale-review",
+                    &[],
+                )
+                .unwrap()
+        );
+
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.review_published);
+        assert!(!record.blocking_review_cleanup_pending);
+        assert_eq!(record.job.fixed_issue_count, 0);
+        assert_eq!(
+            store.code_review_findings(&job.id).unwrap()[0].status,
+            "open"
+        );
+        let resolution_job: Option<String> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT publication_resolution_job_id
+                 FROM code_review_findings WHERE id = ?1",
+                params![finding.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolution_job.as_deref(), Some(job.id.as_str()));
+    }
+
+    #[test]
+    fn ineligible_thread_recheck_still_consumes_reconciled_markers() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', github_thread_recheck_pending = 1
+                 WHERE id = ?1",
+                params![finding.id],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+        let mut request = backoff_test_job_request();
+        request.dedupe_key = "acme/widgets#42:ineligible-thread-recheck".into();
+        request.trigger = "thread-recheck".into();
+
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(
+                    &request,
+                    "empty-state",
+                    &[&finding.id],
+                    false,
+                    3,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let states = store
+            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert!(!states[0].recheck_pending);
+    }
+
+    #[test]
+    fn late_publication_repair_does_not_regress_the_pull_watermark() {
+        let store = Store::open_in_memory().unwrap();
+        let older = enqueue_backoff_test_job(&store);
+        let newer = store.retry_code_review_job(&older.id).unwrap().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'running', publication_claimed = 0, cancel_requested = 0,
+                     head_sha = CASE WHEN id = ?1 THEN 'older-head' ELSE 'newer-head' END,
+                     created_at = CASE
+                         WHEN id = ?1 THEN '2026-01-01T00:00:00Z'
+                         ELSE '2026-01-02T00:00:00Z'
+                     END
+                 WHERE id IN (?1, ?2)",
+                params![older.id, newer.id],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&older.id).unwrap());
+        assert!(store.claim_code_review_publication(&newer.id).unwrap());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'failed' WHERE id IN (?1, ?2)",
+                params![older.id, newer.id],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .reconcile_code_review_publication(&newer.id, "https://example/newer-review", &[],)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reconcile_code_review_publication(&older.id, "https://example/older-review", &[],)
+                .unwrap()
+        );
+        let state = store
+            .code_review_pull_state(&older.repository, older.pull_number)
+            .unwrap();
+        assert_eq!(state.last_reviewed_head_sha, "newer-head");
+    }
+
+    #[test]
+    fn superseded_direct_publication_does_not_regress_the_pull_watermark() {
+        let store = Store::open_in_memory().unwrap();
+        let older = enqueue_backoff_test_job(&store);
+        let newer = store.retry_code_review_job(&older.id).unwrap().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET status = 'running', publication_claimed = 0, cancel_requested = 0,
+                     head_sha = CASE WHEN id = ?1 THEN 'older-head' ELSE 'newer-head' END,
+                     created_at = CASE
+                         WHEN id = ?1 THEN '2026-01-01T00:00:00Z'
+                         ELSE '2026-01-02T00:00:00Z'
+                     END
+                 WHERE id IN (?1, ?2)",
+                params![older.id, newer.id],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&older.id).unwrap());
+        assert!(store.claim_code_review_publication(&newer.id).unwrap());
+
+        let orders: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT older.publication_order, newer.publication_order
+                 FROM code_review_jobs AS older, code_review_jobs AS newer
+                 WHERE older.id = ?1 AND newer.id = ?2",
+                params![older.id, newer.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(orders.0 < orders.1);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO code_review_pr_state
+                        (repository, pull_number, last_reviewed_head_sha,
+                         last_reviewed_base_sha, last_reviewed_at,
+                         last_reviewed_publication_order)
+                 VALUES (?1, ?2, 'legacy-head', 'legacy-base',
+                         '2030-01-01T00:00:00Z', 0)",
+                params![older.repository, older.pull_number as i64],
+            )
+            .unwrap();
+
+        store
+            .record_code_review_publication(
+                &newer.id,
+                &newer.repository,
+                newer.pull_number,
+                &newer.base_ref,
+                "newer-head",
+                "https://example/newer-review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .record_code_review_publication(
+                &older.id,
+                &older.repository,
+                older.pull_number,
+                &older.base_ref,
+                "older-head",
+                "https://example/older-review",
+                false,
+                &[],
+            )
+            .unwrap();
+
+        let state = store
+            .code_review_pull_state(&older.repository, older.pull_number)
+            .unwrap();
+        assert_eq!(state.last_reviewed_head_sha, "newer-head");
+    }
+
+    #[test]
+    fn stale_job_still_records_an_accepted_publication_without_advancing_pull_state() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&job.id)
+                .unwrap()
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'stale' WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.review_published);
+        assert_eq!(record.job.review_url, "https://example/review");
+        let pull_state = store
+            .code_review_pull_state(&job.repository, job.pull_number)
+            .unwrap();
+        assert!(pull_state.last_reviewed_head_sha.is_empty());
+    }
+
+    fn backoff_test_job_request() -> NewCodeReviewJob {
+        NewCodeReviewJob {
+            dedupe_key: "acme/widgets#42:backoff".into(),
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            pull_title: "Ship widgets".into(),
+            pull_url: "https://github.com/acme/widgets/pull/42".into(),
+            head_sha: "2222222222222222222222222222222222222222".into(),
+            review_base_sha: "1111111111111111111111111111111111111111".into(),
+            base_ref: "main".into(),
+            head_ref: "ship".into(),
+            scope: trouve_protocol::CodeReviewJobScope::Incremental,
+            trigger: "automatic".into(),
+            retry_of: None,
+            model: Some("provider/default".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: "Review it".into(),
+            reviewers: crate::reviewers::built_in_reviewers()
+                .into_iter()
+                .take(1)
+                .collect(),
+            routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+            semantic_routing: false,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            config_hash: "config".into(),
+        }
+    }
+
     fn enqueue_backoff_test_job(store: &Store) -> trouve_protocol::CodeReviewJob {
         store
-            .enqueue_code_review_job(&NewCodeReviewJob {
-                dedupe_key: "acme/widgets#42:backoff".into(),
-                installation_id: 7,
-                repository: "acme/widgets".into(),
-                pull_number: 42,
-                pull_title: "Ship widgets".into(),
-                pull_url: "https://github.com/acme/widgets/pull/42".into(),
-                head_sha: "2222222222222222222222222222222222222222".into(),
-                review_base_sha: "1111111111111111111111111111111111111111".into(),
-                base_ref: "main".into(),
-                head_ref: "ship".into(),
-                scope: trouve_protocol::CodeReviewJobScope::Incremental,
-                trigger: "automatic".into(),
-                retry_of: None,
-                model: Some("provider/default".into()),
-                coordinator_thinking_level: None,
-                router_model: None,
-                router_thinking_level: None,
-                prompt: "Review it".into(),
-                reviewers: crate::reviewers::built_in_reviewers()
-                    .into_iter()
-                    .take(1)
-                    .collect(),
-                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
-                semantic_routing: false,
-                included_reviewer_ids: Vec::new(),
-                excluded_reviewer_ids: Vec::new(),
-                config_hash: "config".into(),
-            })
+            .enqueue_code_review_job(&backoff_test_job_request())
             .unwrap()
             .unwrap()
     }

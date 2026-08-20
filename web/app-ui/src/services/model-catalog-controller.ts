@@ -40,8 +40,10 @@ export class ModelCatalogController {
 
   #staticPending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #livePending: Promise<readonly ProtocolModelInfo[]> | undefined;
+  #livePendingForced = false;
   #staticLoaded = false;
-  #lastLiveResolvedAt: number | undefined;
+  #staticFailure: { readonly error: unknown } | undefined;
+  #lastLiveCheckedAt: number | undefined;
   #generation = 0;
 
   constructor(
@@ -61,6 +63,7 @@ export class ModelCatalogController {
       freshness === "if-stale"
       && (current.length > 0 || this.#liveLoaded.get())
     ) {
+      if (!this.#staticLoaded) void this.#loadStatic().catch(() => undefined);
       void this.#refreshLive(freshness).catch(() => undefined);
       return Promise.resolve(current);
     }
@@ -86,7 +89,15 @@ export class ModelCatalogController {
   liveModels(
     freshness: ModelCatalogFreshness = "if-stale",
   ): Promise<readonly ProtocolModelInfo[]> {
-    return this.staticModels().then(() => this.#refreshLive(freshness));
+    const knownStaticFailure = this.#staticFailure;
+    void this.staticModels().catch(() => undefined);
+    return this.#refreshLive(freshness).catch((liveError: unknown) => {
+      if (!this.#staticLoaded && this.#staticPending === undefined) {
+        const failure = this.#staticFailure ?? knownStaticFailure;
+        if (failure !== undefined) throw failure.error;
+      }
+      throw liveError;
+    });
   }
 
   subscribeLive(
@@ -108,13 +119,20 @@ export class ModelCatalogController {
 
   #loadStatic(): Promise<readonly ProtocolModelInfo[]> {
     if (this.#staticPending !== undefined) return this.#staticPending;
-    const promise = this.#protocol.models().then((models) => {
-      const snapshot = Object.freeze([...models]);
-      this.#staticLoaded = true;
-      this.#static.set(snapshot);
-      this.#current.set(this.#liveLoaded.get() ? this.#live.get() : snapshot);
-      return snapshot;
-    }).finally(() => {
+    const promise = this.#protocol.models().then(
+      (models) => {
+        const snapshot = Object.freeze([...models]);
+        this.#staticLoaded = true;
+        this.#staticFailure = undefined;
+        this.#static.set(snapshot);
+        this.#current.set(this.#liveLoaded.get() ? this.#live.get() : snapshot);
+        return snapshot;
+      },
+      (error: unknown) => {
+        this.#staticFailure = { error };
+        throw error;
+      },
+    ).finally(() => {
       if (this.#staticPending === promise) this.#staticPending = undefined;
     });
     this.#staticPending = promise;
@@ -124,38 +142,69 @@ export class ModelCatalogController {
   #refreshLive(
     freshness: ModelCatalogFreshness,
   ): Promise<readonly ProtocolModelInfo[]> {
-    if (this.#livePending !== undefined) return this.#livePending;
+    if (this.#livePending !== undefined) {
+      if (freshness === "force") this.#livePendingForced = true;
+      return this.#livePending;
+    }
     const now = this.#now();
-    const fresh = this.#lastLiveResolvedAt !== undefined
-      && Math.max(0, now - this.#lastLiveResolvedAt) < this.#liveTtlMs;
+    const fresh = this.#lastLiveCheckedAt !== undefined
+      && Math.max(0, now - this.#lastLiveCheckedAt) < this.#liveTtlMs;
     if (freshness === "if-stale" && fresh) {
       return Promise.resolve(this.#current.get());
     }
 
     const generation = ++this.#generation;
-    this.#refreshing.set(true);
-    const promise = this.#protocol.refreshModels().then(
-      (models) => {
-        if (generation !== this.#generation) return this.#current.get();
-        const snapshot = Object.freeze([...models]);
-        this.#lastLiveResolvedAt = this.#now();
-        this.#liveLoaded.set(true);
-        this.#live.set(snapshot);
-        this.#current.set(snapshot);
-        this.#publishLive(snapshot);
-        return snapshot;
-      },
-      (error: unknown) => {
-        if (generation !== this.#generation) return this.#current.get();
-        throw error;
-      },
-    ).finally(() => {
-      if (this.#livePending === promise) {
-        this.#livePending = undefined;
-        this.#refreshing.set(false);
-      }
+    this.#livePendingForced = freshness === "force";
+    let resolvePending!: (models: readonly ProtocolModelInfo[]) => void;
+    let rejectPending!: (error: unknown) => void;
+    const promise = new Promise<readonly ProtocolModelInfo[]>((resolve, reject) => {
+      resolvePending = resolve;
+      rejectPending = reject;
     });
+    const finish = (): boolean => {
+      if (this.#livePending !== promise) return false;
+      this.#livePending = undefined;
+      this.#livePendingForced = false;
+      this.#refreshing.set(false);
+      return true;
+    };
     this.#livePending = promise;
+    this.#refreshing.set(true);
+    let request: Promise<readonly ProtocolModelInfo[]>;
+    try {
+      request = this.#protocol.refreshModels();
+    } catch (error: unknown) {
+      request = Promise.reject(error);
+    }
+    void request.then(
+        (models) => {
+          if (!finish() || generation !== this.#generation) {
+            return this.#current.get();
+          }
+          const snapshot = Object.freeze([...models]);
+          this.#lastLiveCheckedAt = this.#now();
+          this.#liveLoaded.set(true);
+          this.#live.set(snapshot);
+          this.#current.set(snapshot);
+          this.#publishLive(snapshot);
+          return snapshot;
+        },
+        (error: unknown) => {
+          const forced = this.#livePendingForced;
+          if (!finish() || generation !== this.#generation) {
+            return this.#current.get();
+          }
+          if (!forced && this.#liveLoaded.get()) {
+            this.#lastLiveCheckedAt = this.#now();
+          } else {
+            this.#lastLiveCheckedAt = undefined;
+            this.#liveLoaded.set(false);
+            if (this.#staticLoaded) this.#current.set(this.#static.get());
+          }
+          throw error;
+        },
+      )
+      .then(resolvePending, rejectPending);
     return promise;
   }
 }
