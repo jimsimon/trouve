@@ -10242,6 +10242,65 @@ mod tests {
     }
 
     #[test]
+    fn failed_conditional_mutation_rejects_a_multi_event_batch() {
+        let store = Store::open_in_memory().unwrap();
+        let intent = SessionPrVerificationIntent {
+            session_id: "se_missing".into(),
+            host: "github.com".into(),
+            owner: "o".into(),
+            repository: "r".into(),
+            number: 42,
+            branch: "agent/pr".into(),
+            head_sha: "1".repeat(40),
+            attempts: 0,
+            last_failure_class: String::new(),
+            consecutive_failures: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let events = serialize_lifecycle_events(
+            vec![
+                (
+                    Scope::Session(intent.session_id.clone()),
+                    Event::ToolCompleted {
+                        call_id: "conditional".into(),
+                        status: ToolStatus::Ok,
+                        result: serde_json::json!({}),
+                        execution_duration_ms: Some(1),
+                    },
+                ),
+                (
+                    Scope::Server,
+                    Event::ToolCompleted {
+                        call_id: "unrelated".into(),
+                        status: ToolStatus::Ok,
+                        result: serde_json::json!({}),
+                        execution_duration_ms: Some(1),
+                    },
+                ),
+            ],
+            StoreMutation::CompleteSessionPrVerificationIntent {
+                intent: Box::new(intent),
+            },
+        )
+        .unwrap();
+
+        let error = match insert_event_batch(
+            &store.conn.lock().unwrap(),
+            events.iter(),
+            events.len(),
+            Vec::<i64>::new(),
+        ) {
+            Ok(_) => panic!("a failed conditional mutation must reject a multi-event batch"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("conditional store mutation must be committed in an isolated request")
+        );
+    }
+
+    #[test]
     fn code_review_claim_waits_for_a_concurrent_writer_before_reading() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
