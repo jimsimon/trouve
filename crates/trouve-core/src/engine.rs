@@ -1733,6 +1733,12 @@ fn steering_attachments_wait_for_mutation_lane(
     has_staged_attachments && in_flight_mutations > 0
 }
 
+fn reject_pending_steer(pending: &mut Option<SteerTurnCommand>, reason: &str) {
+    if let Some(SteerTurnCommand { response, .. }) = pending.take() {
+        let _ = response.send(Err(reason.into()));
+    }
+}
+
 impl Drop for ActiveTurnSteererGuard<'_> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
@@ -11888,6 +11894,11 @@ impl Engine {
         let mut consecutive_backend_events = 0usize;
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
+            let in_flight_vendor_mutations = backend_mutation_permits.len()
+                + collaborators
+                    .values()
+                    .map(|collaborator| collaborator.mutation_permits.len())
+                    .sum::<usize>();
             let steer_reserved = active_vendor_session.is_some()
                 && !cancel.is_cancelled()
                 && reserve_ready_steer_after_event_budget(
@@ -11902,7 +11913,7 @@ impl Engine {
             let steer_waits_for_mutation_lane = pending_steer.as_ref().is_some_and(|command| {
                 steering_attachments_wait_for_mutation_lane(
                     !command.attachment_rows.is_empty(),
-                    backend_mutation_permits.len(),
+                    in_flight_vendor_mutations,
                 )
             });
             let steer_must_run = steer_reserved && !steer_waits_for_mutation_lane;
@@ -11918,6 +11929,11 @@ impl Engine {
                     persist_deadline = None;
                     continue;
                 }
+                approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                    BackendLoopInput::Approval(
+                        approval.expect("non-empty approval queue must yield an outcome")
+                    )
+                }
                 steer = receive_steer_command(
                     &mut steer_rx,
                     &mut pending_steer,
@@ -11929,12 +11945,31 @@ impl Engine {
                     };
                     if steering_attachments_wait_for_mutation_lane(
                         !command.attachment_rows.is_empty(),
-                        backend_mutation_permits.len(),
+                        in_flight_vendor_mutations,
                     ) {
                         pending_steer = Some(command);
                         consecutive_backend_events = 0;
                         continue;
                     }
+                    let materialization_permit = if command.attachment_rows.is_empty() {
+                        None
+                    } else {
+                        let lane = self.tool_execution_lock(&session.id);
+                        match lane.try_write_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                // The permit may already be owned by a ready
+                                // approval outcome that has not entered
+                                // backend_mutation_permits yet. Requeue the
+                                // command without awaiting the lane; the
+                                // higher-priority approval branch will collect
+                                // that outcome on the next iteration.
+                                pending_steer = Some(command);
+                                consecutive_backend_events = 0;
+                                continue;
+                            }
+                        }
+                    };
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
                     let SteerTurnCommand {
@@ -11964,15 +11999,8 @@ impl Engine {
                     let materialized = if staged.is_empty() {
                         Vec::new()
                     } else {
-                        let lane = self.tool_execution_lock(&session.id);
-                        let _materialization_permit = tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => {
-                                let _ = response.send(Err("turn cancelled".into()));
-                                bail!("turn cancelled");
-                            }
-                            permit = lane.write_owned() => permit,
-                        };
+                        let _materialization_permit = materialization_permit
+                            .expect("attachment steering must reserve the mutation lane");
                         match self.executor.materialize_attachments(
                             &AttachmentMaterialization {
                                 source_root: self.data_dir.join("attachments"),
@@ -12052,11 +12080,6 @@ impl Engine {
                     let _ = response.send(Ok(()));
                     consecutive_backend_events = 0;
                     continue;
-                }
-                approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
-                    BackendLoopInput::Approval(
-                        approval.expect("non-empty approval queue must yield an outcome")
-                    )
                 }
             };
             let event = match input {
@@ -12152,6 +12175,10 @@ impl Engine {
                             &mut collaborators,
                         )
                         .await;
+                        reject_pending_steer(
+                            &mut pending_steer,
+                            "turn ended before steering could be applied",
+                        );
                         return Err(anyhow!("backend stream error: {error}"));
                     }
                 },
@@ -12707,6 +12734,12 @@ impl Engine {
         // Adapters close only after cancellation cleanup has completed. The
         // stream can now be dropped without racing a replacement vendor turn.
         drop(stream);
+        let pending_steer_reason = if cancel.is_cancelled() {
+            "turn cancelled"
+        } else {
+            "turn ended before steering could be applied"
+        };
+        reject_pending_steer(&mut pending_steer, pending_steer_reason);
         // Vendors may omit ToolCompleted on cancellation or protocol failure.
         // Never carry their mutation lease into flush, checkpoint, or terminal
         // turn bookkeeping.
@@ -14759,12 +14792,7 @@ fn shell_requests_pull_request_collection_post(tool: &str, args: &serde_json::Va
     }
 
     let args_text = args.to_string();
-    let args_words = activity_words(&args_text);
-    let post_like = format!(" {args_words} ").contains(" post ")
-        || args_text.contains(" -f ")
-        || args_text.contains(" --field ")
-        || args_text.contains(" --raw-field ");
-    post_like
+    shell_rest_request_is_post(&args_text)
         && args_text.split_whitespace().any(|token| {
             let token = token.trim_matches(|character: char| {
                 matches!(
@@ -14787,6 +14815,60 @@ fn shell_requests_pull_request_collection_post(tool: &str, args: &serde_json::Va
                 matches!(segments.as_slice(), [owner, repo, "pulls"] if !owner.is_empty() && !repo.is_empty())
             })
         })
+}
+
+fn shell_rest_request_is_post(text: &str) -> bool {
+    let tokens = text
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | ','
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut explicit_method = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        let method = if matches!(token, "-X" | "--method") {
+            index += 1;
+            tokens.get(index).copied()
+        } else if let Some(method) = token.strip_prefix("--method=") {
+            Some(method)
+        } else {
+            token.strip_prefix("-X").filter(|method| !method.is_empty())
+        };
+        if let Some(method) = method {
+            explicit_method = Some(method.eq_ignore_ascii_case("POST"));
+        }
+        index += 1;
+    }
+    if let Some(is_post) = explicit_method {
+        return is_post;
+    }
+
+    tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "-f" | "-F"
+                | "--field"
+                | "--raw-field"
+                | "--data"
+                | "--data-raw"
+                | "--data-binary"
+                | "--json"
+        ) || token.starts_with("--field=")
+            || token.starts_with("--raw-field=")
+            || token.starts_with("--data=")
+            || token.starts_with("--data-raw=")
+            || token.starts_with("--data-binary=")
+            || token.starts_with("--json=")
+            || (token.starts_with("-f") && token.len() > 2)
+            || (token.starts_with("-F") && token.len() > 2)
+    })
 }
 
 fn is_activity_tool_wrapper(tool: &str) -> bool {
@@ -15011,10 +15093,7 @@ fn requests_pull_request_creation(
     let rest_path = format!("/repos/{owner}/{repo}/pulls").to_ascii_lowercase();
     let shell_rest_creation = shell_like
         && mentions_exact_path(&args_text, &rest_path)
-        && (format!(" {args_words} ").contains(" post ")
-            || args_text.contains(" -f ")
-            || args_text.contains(" --field ")
-            || args_text.contains(" --raw-field "));
+        && shell_rest_request_is_post(&args_text);
     let github_like = tool_compact == "github";
     let structured_creation_operation = github_like
         && structured_repository_identifies(args, owner, repo)
@@ -16600,6 +16679,29 @@ mod tests {
         assert!(steering_attachments_wait_for_mutation_lane(true, 1));
         assert!(!steering_attachments_wait_for_mutation_lane(false, 1));
         assert!(!steering_attachments_wait_for_mutation_lane(true, 0));
+    }
+
+    #[tokio::test]
+    async fn rejected_deferred_steering_returns_a_defined_error() {
+        let (response, received) = tokio::sync::oneshot::channel();
+        let mut pending = Some(SteerTurnCommand {
+            content: "wait".into(),
+            attachments: Vec::new(),
+            attachment_rows: Vec::new(),
+            attachment_cleanup: PreparedAttachmentCleanup::new(
+                Store::open_in_memory().unwrap(),
+                Arc::new(LocalToolExecutor::default()),
+                PathBuf::new(),
+                Vec::new(),
+                None,
+            ),
+            response,
+        });
+
+        reject_pending_steer(&mut pending, "turn cancelled");
+
+        assert_eq!(received.await.unwrap().unwrap_err(), "turn cancelled");
+        assert!(pending.is_none());
     }
 
     fn init_engine_test_repo(path: &Path) {
@@ -20273,6 +20375,34 @@ default_permission_mode = "ask"
             &serde_json::json!({
                 "cmd": "gh api -X POST /repos/o/r/pulls --field title=test"
             })
+        ));
+        for command in [
+            "gh api /repos/o/r/pulls --field=title=test",
+            "gh api /repos/o/r/pulls -Ftitle=test",
+            "gh api /repos/o/r/pulls --data payload.json",
+            "gh api /repos/o/r/pulls --json payload.json",
+        ] {
+            let args = serde_json::json!({ "cmd": command });
+            assert!(could_request_pull_request_creation("functions.exec", &args));
+            assert!(requests_pull_request_creation(
+                "functions.exec",
+                &args,
+                "o",
+                "r"
+            ));
+        }
+        let explicit_get = serde_json::json!({
+            "cmd": "gh api --method GET /repos/o/r/pulls -f state=open"
+        });
+        assert!(!could_request_pull_request_creation(
+            "functions.exec",
+            &explicit_get
+        ));
+        assert!(!requests_pull_request_creation(
+            "functions.exec",
+            &explicit_get,
+            "o",
+            "r"
         ));
         assert!(!requests_pull_request_creation(
             "mcpToolCall",
