@@ -513,9 +513,6 @@ CREATE TABLE IF NOT EXISTS code_review_theme_transitions (
 );
 CREATE INDEX IF NOT EXISTS code_review_theme_transitions_job
   ON code_review_theme_transitions (job_id, theme_id);
-CREATE INDEX IF NOT EXISTS code_review_theme_transitions_legacy_writer
-  ON code_review_theme_transitions (writer_version, theme_id)
-  WHERE writer_version = 0;
 CREATE TABLE IF NOT EXISTS code_review_finding_themes (
   finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
@@ -750,6 +747,14 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         [],
         |row| row.get::<_, bool>(0),
     )?;
+    let had_theme_transition_writer_version = conn.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('code_review_theme_transitions')
+           WHERE name = 'writer_version'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -758,6 +763,11 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
+    preserve_pre_authority_code_review_theme_transitions(
+        conn,
+        had_theme_transition_writer_version,
+        had_theme_observation_publication_authority,
+    )?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
     migrate_code_review_theme_observation_publication_authority(
@@ -786,6 +796,27 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+/// Existing snapshots from before publication authority were historical
+/// evidence only: their mutable theme aggregates remained authoritative. When
+/// writer provenance is first added, reserve a negative version for those rows
+/// so rollback repair never projects them. Databases that already had
+/// publication authority retain the zero default and are repaired once.
+fn preserve_pre_authority_code_review_theme_transitions(
+    conn: &Connection,
+    had_writer_version: bool,
+    had_publication_authority: bool,
+) -> Result<()> {
+    if !had_writer_version && !had_publication_authority {
+        conn.execute(
+            "UPDATE code_review_theme_transitions
+             SET writer_version = -1
+             WHERE writer_version = 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -18984,6 +19015,16 @@ mod tests {
                 [&findings[0].id],
             )
             .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO code_review_theme_transitions
+                   (theme_id, job_id, status, last_seen_head, resolved_head,
+                    recurrence_count, transitioned_at, writer_version)
+                 VALUES ('acme/widgets#42:legacy-theme', ?1, 'open',
+                         'transition-only-head', '', 1,
+                         '2000-01-01T00:00:00Z', 1)",
+                [&job.id],
+            )
+            .unwrap();
         }
         drop(store);
 
@@ -19007,6 +19048,25 @@ mod tests {
                  SELECT theme_id, job_id, head_sha, kind, created_at
                  FROM legacy_theme_observations;
                  DROP TABLE legacy_theme_observations;
+                 ALTER TABLE code_review_theme_transitions
+                   RENAME TO legacy_theme_transitions;
+                 CREATE TABLE code_review_theme_transitions (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   status TEXT NOT NULL,
+                   last_seen_head TEXT NOT NULL,
+                   resolved_head TEXT NOT NULL DEFAULT '',
+                   recurrence_count INTEGER NOT NULL DEFAULT 0,
+                   transitioned_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_transitions
+                   (theme_id, job_id, status, last_seen_head, resolved_head,
+                    recurrence_count, transitioned_at)
+                 SELECT theme_id, job_id, status, last_seen_head, resolved_head,
+                        recurrence_count, transitioned_at
+                 FROM legacy_theme_transitions;
+                 DROP TABLE legacy_theme_transitions;
                  DELETE FROM store_migrations
                  WHERE id = 'code-review-theme-observation-publication-authority-v1';",
             )
@@ -19032,6 +19092,19 @@ mod tests {
             )
             .unwrap();
         assert!(published);
+        let preserved_writer_version = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT writer_version
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = 'acme/widgets#42:legacy-theme'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_writer_version, -1);
         let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
         assert_eq!(themes.len(), 1);
         assert_eq!(themes[0].status, "resolved");
