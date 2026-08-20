@@ -1004,6 +1004,19 @@ struct PublishedReview {
     user: Option<GithubUser>,
 }
 
+#[derive(Debug)]
+struct PublishedReviewOutcome {
+    url: String,
+    blocking: bool,
+}
+
+#[cfg(test)]
+impl PartialEq<&str> for PublishedReviewOutcome {
+    fn eq(&self, other: &&str) -> bool {
+        self.url == *other
+    }
+}
+
 #[derive(Deserialize)]
 struct PublishedIssueComment {
     id: u64,
@@ -4947,7 +4960,7 @@ impl Engine {
         }
         self.store
             .prepare_code_review_finding_resolutions(&job.id, &resolved_finding_ids)?;
-        let review_url = self
+        let published_review = self
             .publish_review(&api, &job, &persisted, has_unresolved_findings)
             .await
             .context("publishing GitHub pull request review")?;
@@ -4957,8 +4970,8 @@ impl Engine {
             job.pull_number,
             &job.base_ref,
             &job.head_sha,
-            &review_url,
-            !has_unresolved_findings,
+            &published_review.url,
+            !published_review.blocking,
             &resolved_finding_ids,
         )?;
         // Collapsing the remote threads is cleanup detached from the round
@@ -4999,7 +5012,7 @@ impl Engine {
             CodeReviewJobPhase::Publication,
             elapsed_since_ms(publication_started),
         )?;
-        Ok(review_url)
+        Ok(published_review.url)
     }
 
     async fn run_tracked_code_review_turn(
@@ -5680,7 +5693,7 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         findings: &[trouve_protocol::CodeReviewFinding],
         has_unresolved_findings: bool,
-    ) -> Result<String> {
+    ) -> Result<PublishedReviewOutcome> {
         let mut comments = Vec::new();
         let mut eligible_findings = Vec::new();
         let mut ineligible_ids = Vec::new();
@@ -5721,6 +5734,14 @@ impl Engine {
         let mut event = github_review_event(has_unresolved_findings);
         let mut include_comments = !comments.is_empty();
         loop {
+            if event == "COMMENT"
+                && has_unresolved_findings
+                && !self
+                    .store
+                    .prepare_code_review_blocking_review_cleanup(&job.id, true)?
+            {
+                bail!("review changed before non-blocking publication was prepared");
+            }
             if !include_comments
                 && !self
                     .store
@@ -5778,7 +5799,10 @@ impl Engine {
                                     )
                                     .await;
                                 }
-                                Ok(published.html_url)
+                                Ok(PublishedReviewOutcome {
+                                    url: published.html_url,
+                                    blocking: event == "REQUEST_CHANGES",
+                                })
                             }
                             Err(error) => {
                                 tracing::warn!(
@@ -5786,7 +5810,10 @@ impl Engine {
                                     %error,
                                     "accepted GitHub review remains pending reconciliation"
                                 );
-                                Ok(String::new())
+                                Ok(PublishedReviewOutcome {
+                                    url: String::new(),
+                                    blocking: event == "REQUEST_CHANGES",
+                                })
                             }
                         };
                     }
@@ -5807,7 +5834,10 @@ impl Engine {
                                     %error,
                                     "accepted GitHub review remains pending reconciliation"
                                 );
-                                return Ok(String::new());
+                                return Ok(PublishedReviewOutcome {
+                                    url: String::new(),
+                                    blocking: event == "REQUEST_CHANGES",
+                                });
                             }
                         }
                     }
@@ -5816,7 +5846,10 @@ impl Engine {
                     self.capture_published_review_comments(api, job, published.id, findings)
                         .await;
                 }
-                return Ok(published.html_url);
+                return Ok(PublishedReviewOutcome {
+                    url: published.html_url,
+                    blocking: event == "REQUEST_CHANGES",
+                });
             }
 
             let body = match response.text().await {
@@ -6588,13 +6621,14 @@ impl Engine {
         if claim.findings.is_empty() {
             return Ok(());
         }
-        let deadline = Instant::now() + REVIEW_COLLAPSE_GROUP_TIMEOUT;
         let publication_lock = self.code_review.publication_lock(repository, pull_number);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let Ok(_publication_guard) = tokio::time::timeout(remaining, publication_lock.lock()).await
-        else {
+        let Ok(_publication_guard) = publication_lock.try_lock() else {
+            for finding in &claim.findings {
+                self.requeue_thread_collapse_logged(finding);
+            }
             return Ok(());
         };
+        let deadline = Instant::now() + REVIEW_COLLAPSE_GROUP_TIMEOUT;
         self.resolve_claimed_review_threads(api, repository, pull_number, &claim.findings, deadline)
             .await
     }
@@ -12748,7 +12782,7 @@ mod tests {
                 job.pull_number,
                 &job.base_ref,
                 &job.head_sha,
-                &review_url,
+                &review_url.url,
                 true,
                 &[],
             )

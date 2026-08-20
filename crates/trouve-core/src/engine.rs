@@ -5180,6 +5180,7 @@ impl Engine {
                     .await
                     .ok()
                     .and_then(Result::ok)
+                    .filter(|(branch, _)| branch == &session.branch)
             {
                 return Some(evidence);
             }
@@ -5200,6 +5201,9 @@ impl Engine {
         let Some((branch, head_sha)) = evidence else {
             return Vec::new();
         };
+        if branch != session.branch {
+            return Vec::new();
+        }
         let (host, owner, repository) = repository;
         let mut numbers = Vec::new();
         let mut seen = HashSet::new();
@@ -5408,11 +5412,17 @@ impl Engine {
         };
         for mut intent in intents {
             if recorded.contains(&intent.number) {
-                let _ = self.store.discard_session_pr_verification(&intent);
+                self.discard_session_pr_verification_with_backoff(
+                    &intent,
+                    "discarding already-recorded pull request verification",
+                );
                 continue;
             }
             if Self::session_pr_verification_expired(&intent) {
-                let _ = self.store.discard_session_pr_verification(&intent);
+                self.discard_session_pr_verification_with_backoff(
+                    &intent,
+                    "discarding expired pull request verification",
+                );
                 continue;
             }
             // Compatibility for rows written by the short-lived
@@ -5512,6 +5522,13 @@ impl Engine {
                     let Ok(Some(session)) = self.store.session(session_id) else {
                         return;
                     };
+                    if intent.branch != session.branch {
+                        self.discard_session_pr_verification_with_backoff(
+                            &intent,
+                            "discarding pull request verification for a non-session branch",
+                        );
+                        continue;
+                    }
                     let repository_and_branch_match =
                         Self::pr_repository_and_branch_match(&fetched, &intent);
                     let verified = Self::pr_matches_verification_intent(&fetched, &intent)
@@ -5539,7 +5556,10 @@ impl Engine {
                                 pr_head = fetched.info.head,
                                 "discarding pull request that does not match session-owned repository and branch evidence"
                             );
-                            let _ = self.store.discard_session_pr_verification(&intent);
+                            self.discard_session_pr_verification_with_backoff(
+                                &intent,
+                                "discarding mismatched pull request verification",
+                            );
                         }
                         continue;
                     }
@@ -5637,27 +5657,67 @@ impl Engine {
         max_consecutive_failures: Option<u32>,
         count_request: bool,
     ) {
-        let result = if Self::session_pr_verification_expired(intent)
+        if Self::session_pr_verification_expired(intent)
             || Self::session_pr_verification_retry_exhausted(
                 intent,
                 failure_class,
                 max_consecutive_failures,
                 count_request,
-            ) {
-            self.store.discard_session_pr_verification(intent)
+            )
+        {
+            self.discard_session_pr_verification_with_backoff(
+                intent,
+                "discarding exhausted pull request verification",
+            );
         } else {
             let delay =
                 Self::session_pr_verification_retry_delay(intent, failure_class, count_request);
-            self.store
-                .defer_session_pr_verification(intent, failure_class, count_request, delay)
-        };
-        if let Err(error) = result {
+            if let Err(error) = self.store.defer_session_pr_verification(
+                intent,
+                failure_class,
+                count_request,
+                delay,
+            ) {
+                tracing::warn!(
+                    session_id = intent.session_id,
+                    pr_number = intent.number,
+                    %error,
+                    "cannot update pull request verification retry state"
+                );
+            }
+        }
+    }
+
+    fn discard_session_pr_verification_with_backoff(
+        &self,
+        intent: &SessionPrVerificationIntent,
+        operation: &'static str,
+    ) {
+        if let Err(error) = self.store.discard_session_pr_verification(intent) {
             tracing::warn!(
                 session_id = intent.session_id,
                 pr_number = intent.number,
                 %error,
-                "cannot update pull request verification retry state"
+                operation,
             );
+            let delay = Self::session_pr_verification_retry_delay(
+                intent,
+                PR_VERIFICATION_FAILURE_PERSISTENCE,
+                false,
+            );
+            if let Err(defer_error) = self.store.defer_session_pr_verification(
+                intent,
+                PR_VERIFICATION_FAILURE_PERSISTENCE,
+                false,
+                delay,
+            ) {
+                tracing::warn!(
+                    session_id = intent.session_id,
+                    pr_number = intent.number,
+                    %defer_error,
+                    "cannot defer a pull request verification after discard failed"
+                );
+            }
         }
     }
 
@@ -11696,10 +11756,10 @@ impl Engine {
         let permission = if effective_read_only {
             BackendPermission::ReadOnly
         } else {
-            match thread.permission_mode {
-                trouve_protocol::PermissionMode::Yolo => BackendPermission::Yolo,
-                _ => BackendPermission::Ask,
-            }
+            // Always request a pre-execution callback. Trouve's gate still
+            // auto-approves Yolo calls, while the callback acquires the
+            // session mutation lane and supplies creator provenance.
+            BackendPermission::Ask
         };
 
         let mcp_bridge = tools_enabled
@@ -12165,18 +12225,6 @@ impl Engine {
                                 github_repository = Some(repository);
                             }
                         }
-                    }
-                    if !matches!(creation_request, PullRequestCreationRequest::Rejected)
-                        && !backend_mutation_permits.contains_key(&call_id)
-                        && !backend_approval_cancels.contains_key(&call_id)
-                    {
-                        let lane = self.tool_execution_lock(&session.id);
-                        let permit = tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => bail!("turn cancelled"),
-                            permit = lane.write_owned() => permit,
-                        };
-                        backend_mutation_permits.insert(call_id.clone(), permit);
                     }
                     tool_calls.insert(
                         call_id.clone(),
@@ -14709,10 +14757,21 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
         if !trusted_activity_tool_wrapper(args) {
             return false;
         }
-        return ["tool", "toolName", "name"]
+        let Some(nested_tool) = ["tool", "toolName", "name"]
             .iter()
             .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
-            .is_some_and(trusted_activity_tool_name);
+        else {
+            return false;
+        };
+        let nested_compact = compact_activity(nested_tool);
+        if nested_compact.contains("createpullrequest") || nested_compact.ends_with("createpr") {
+            return trusted_activity_tool_name(nested_tool);
+        }
+        return effective_activity_tool_call(tool, args).is_some_and(
+            |(nested_tool, nested_args)| {
+                could_request_pull_request_creation(nested_tool, nested_args.as_ref())
+            },
+        );
     }
 
     let args_text = args.to_string();
@@ -14729,29 +14788,9 @@ fn could_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> 
     if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
         return true;
     }
-    let integration_like = [
-        "shell",
-        "bash",
-        "command",
-        "terminal",
-        "exec",
-        "gh",
-        "github",
-        "browser",
-        "playwright",
-        "web",
-        "http",
-        "api",
-        "graphql",
-        "click",
-    ]
-    .iter()
-    .any(|marker| tool_compact.contains(marker));
-    if !integration_like {
-        return false;
-    }
-    let text = args_text.to_ascii_lowercase();
-    text.contains("create") || text.contains("gh pr") || text.contains("/pulls")
+    has_structured_pull_request_creation_operation(args)
+        || args_words.contains("gh pr create")
+        || args_words.contains("create pull request")
 }
 
 /// Resolve provider-owned generic tool wrappers to the operation they carry.
@@ -19386,6 +19425,14 @@ default_permission_mode = "ask"
             None,
         );
         assert!(missing_evidence.is_empty());
+        let wrong_branch = Engine::session_pr_verification_intents(
+            &session,
+            ("github.com".into(), "acme".into(), "widgets".into()),
+            [42],
+            [],
+            Some(("agent/other-session".into(), "1".repeat(40))),
+        );
+        assert!(wrong_branch.is_empty());
     }
 
     fn projection_detail(info: trouve_protocol::PrInfo) -> trouve_protocol::PrDetail {
@@ -20103,6 +20150,14 @@ default_permission_mode = "ask"
         assert!(could_request_pull_request_creation(
             "browser_click",
             &click_create
+        ));
+        assert!(!could_request_pull_request_creation(
+            "browser_click",
+            &serde_json::json!({"text": "Create issue"})
+        ));
+        assert!(!could_request_pull_request_creation(
+            "github_api",
+            &serde_json::json!({"method": "GET", "url": "/repos/o/r/pulls"})
         ));
         assert!(matches!(
             classify_pull_request_creation(
