@@ -3752,6 +3752,13 @@ fn insert_event_batch<'a>(
         if let Some(mutation) = event.mutation.as_ref()
             && !apply_store_mutation(&tx, mutation, event.ts)?
         {
+            // Failed preconditions may only skip an isolated, single-event
+            // request; otherwise returning here would discard unrelated
+            // callers' events that the writer coalesced into this batch.
+            anyhow::ensure!(
+                event_count <= 1,
+                "a conditional store mutation must be committed in an isolated request"
+            );
             return Ok(InsertedEventBatch {
                 skipped: true,
                 source_cursors: Vec::new(),
