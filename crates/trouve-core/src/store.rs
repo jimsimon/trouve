@@ -63,10 +63,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at TEXT NOT NULL
 );
 -- Provider-reported PR numbers are nominations, not authorization. Capture
--- the session worktree's checked-out branch and exact HEAD while the tool
--- mutation lane is still held, then reconcile that immutable evidence with
--- GitHub asynchronously. The row survives process restarts and is deleted
--- with its owning session.
+-- the session worktree's coherent checked-out branch and exact HEAD when the
+-- creator completes, then reconcile that immutable evidence with GitHub
+-- asynchronously. The row survives process restarts and is deleted with its
+-- owning session.
 CREATE TABLE IF NOT EXISTS session_pr_verification_intents (
   session_id TEXT NOT NULL REFERENCES sessions(id),
   host TEXT NOT NULL,
@@ -3522,6 +3522,10 @@ fn apply_store_mutation(
         }
         StoreMutation::UpsertSessionPrVerificationIntents { intents } => {
             for intent in intents {
+                anyhow::ensure!(
+                    !intent.branch.is_empty() && !intent.head_sha.is_empty(),
+                    "pull request verification intent requires immutable branch and head evidence"
+                );
                 conn.execute(
                     "INSERT INTO session_pr_verification_intents
                        (session_id, host, owner, repository, pull_number, branch,
@@ -3530,21 +3534,16 @@ fn apply_store_mutation(
                      ON CONFLICT(session_id, host, owner, repository, pull_number)
                      DO UPDATE SET
                        attempts = CASE
-                         WHEN excluded.branch = '' OR excluded.head_sha = ''
-                           OR (branch = excluded.branch AND head_sha = excluded.head_sha)
+                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
                            THEN attempts ELSE 0 END,
                        next_attempt_at = CASE
-                         WHEN excluded.branch = '' OR excluded.head_sha = ''
-                           OR (branch = excluded.branch AND head_sha = excluded.head_sha)
+                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
                            THEN next_attempt_at ELSE NULL END,
                        created_at = CASE
-                         WHEN excluded.branch = '' OR excluded.head_sha = ''
-                           OR (branch = excluded.branch AND head_sha = excluded.head_sha)
+                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
                            THEN created_at ELSE excluded.created_at END,
-                       branch = CASE WHEN excluded.branch = '' OR excluded.head_sha = ''
-                         THEN branch ELSE excluded.branch END,
-                       head_sha = CASE WHEN excluded.branch = '' OR excluded.head_sha = ''
-                         THEN head_sha ELSE excluded.head_sha END",
+                       branch = excluded.branch,
+                       head_sha = excluded.head_sha",
                     params![
                         intent.session_id,
                         intent.host,
@@ -4398,40 +4397,12 @@ impl Store {
     }
 
     fn session_pr_verification_retry_delay(attempts: u32) -> i64 {
-        (1_i64 << attempts.min(9)).min(300)
-    }
-
-    /// Fill ownership evidence for a durable nomination that could not safely
-    /// acquire the session mutation lane in the backend event loop.
-    pub(crate) fn set_session_pr_verification_evidence(
-        &self,
-        intent: &SessionPrVerificationIntent,
-        branch: &str,
-        head_sha: &str,
-    ) -> Result<bool> {
-        let updated = self.conn.lock().unwrap().execute(
-            "UPDATE session_pr_verification_intents
-             SET branch = ?8, head_sha = ?9, attempts = 0, next_attempt_at = NULL
-             WHERE session_id = ?1 AND host = ?2 AND owner = ?3
-               AND repository = ?4 AND pull_number = ?5
-               AND branch = ?6 AND head_sha = ?7",
-            params![
-                intent.session_id,
-                intent.host,
-                intent.owner,
-                intent.repository,
-                intent.number as i64,
-                intent.branch,
-                intent.head_sha,
-                branch,
-                head_sha,
-            ],
-        )?;
-        Ok(updated == 1)
+        (1_i64 << attempts.min(15)).min(6 * 60 * 60)
     }
 
     /// Keep a transient failure durable while bounding GitHub request rate.
-    /// The delay grows exponentially and caps at five minutes.
+    /// The delay grows exponentially and caps at six hours so long outages do
+    /// not turn durable nominations into sustained GitHub traffic.
     pub(crate) fn defer_session_pr_verification(
         &self,
         intent: &SessionPrVerificationIntent,
@@ -12284,6 +12255,30 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
+        let invalid_evidence = SessionPrVerificationIntent {
+            branch: String::new(),
+            head_sha: String::new(),
+            ..intent.clone()
+        };
+        let error = store
+            .append_events_with_session_pr_verification_intents(
+                Scope::Thread(thread.id.clone()),
+                vec![Event::ToolCompleted {
+                    call_id: "call-pr-without-evidence".into(),
+                    status: ToolStatus::Ok,
+                    result: serde_json::json!({"number": 42}),
+                    execution_duration_ms: Some(1),
+                }],
+                vec![invalid_evidence],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("immutable branch and head evidence")
+        );
+
         store
             .append_events_with_session_pr_verification_intents(
                 Scope::Thread(thread.id),
@@ -12418,69 +12413,6 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 0);
 
-        let pending_evidence = SessionPrVerificationIntent {
-            number: 43,
-            branch: String::new(),
-            head_sha: String::new(),
-            attempts: 0,
-            ..intent.clone()
-        };
-        store
-            .append_events_with_session_pr_verification_intents(
-                Scope::Thread("th_pr_intent".into()),
-                vec![Event::ToolCompleted {
-                    call_id: "call-pr-pending-evidence".into(),
-                    status: ToolStatus::Ok,
-                    result: serde_json::json!({"number": 43}),
-                    execution_duration_ms: Some(1),
-                }],
-                vec![pending_evidence.clone()],
-            )
-            .await
-            .unwrap();
-        store
-            .defer_session_pr_verification(&pending_evidence)
-            .unwrap();
-        assert!(
-            store
-                .set_session_pr_verification_evidence(
-                    &pending_evidence,
-                    "agent/captured",
-                    &"3".repeat(40),
-                )
-                .unwrap()
-        );
-        let captured = store
-            .due_session_pr_verification_intents(&session.id, 10)
-            .unwrap();
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].branch, "agent/captured");
-        assert_eq!(captured[0].head_sha, "3".repeat(40));
-        assert_eq!(captured[0].attempts, 0);
-        store
-            .append_events_with_session_pr_verification_intents(
-                Scope::Thread("th_pr_intent".into()),
-                vec![Event::ToolCompleted {
-                    call_id: "call-pr-pending-evidence-repeat".into(),
-                    status: ToolStatus::Ok,
-                    result: serde_json::json!({"number": 43}),
-                    execution_duration_ms: Some(1),
-                }],
-                vec![pending_evidence.clone()],
-            )
-            .await
-            .unwrap();
-        let captured_after_repeat = store
-            .due_session_pr_verification_intents(&session.id, 10)
-            .unwrap();
-        assert_eq!(captured_after_repeat.len(), 1);
-        assert_eq!(captured_after_repeat[0].branch, "agent/captured");
-        assert_eq!(captured_after_repeat[0].head_sha, "3".repeat(40));
-        assert_eq!(captured_after_repeat[0].attempts, 0);
-        store
-            .discard_session_pr_verification(&captured_after_repeat[0])
-            .unwrap();
-
         store
             .append_events_with_session_pr_verification_intents(
                 Scope::Thread("th_pr_intent".into()),
@@ -12569,10 +12501,11 @@ mod tests {
     }
 
     #[test]
-    fn pr_verification_retry_delay_reaches_five_minute_cap() {
+    fn pr_verification_retry_delay_reaches_six_hour_cap() {
         assert_eq!(Store::session_pr_verification_retry_delay(8), 256);
-        assert_eq!(Store::session_pr_verification_retry_delay(9), 300);
-        assert_eq!(Store::session_pr_verification_retry_delay(u32::MAX), 300);
+        assert_eq!(Store::session_pr_verification_retry_delay(14), 16_384);
+        assert_eq!(Store::session_pr_verification_retry_delay(15), 21_600);
+        assert_eq!(Store::session_pr_verification_retry_delay(u32::MAX), 21_600);
     }
 
     #[test]
