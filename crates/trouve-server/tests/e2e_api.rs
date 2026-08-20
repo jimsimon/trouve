@@ -2636,13 +2636,13 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
             .send()
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !engine.steer_waiting_for_mutation_lane(thread_id) {
-            tokio::task::yield_now().await;
-        }
-    })
+    let parked = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.wait_for_steer_mutation_lane(thread_id),
+    )
     .await
     .expect("attachment steering never parked on the held mutation lane");
+    assert!(parked);
     assert!(!pending_steer.is_finished());
     backend.release_tool().await;
     let steered = tokio::time::timeout(std::time::Duration::from_secs(10), pending_steer)
@@ -2689,13 +2689,13 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
             .send()
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !engine.steer_waiting_for_mutation_lane(thread_id) {
-            tokio::task::yield_now().await;
-        }
-    })
+    let parked = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.wait_for_steer_mutation_lane(thread_id),
+    )
     .await
     .expect("cancelled attachment steering never parked on the mutation lane");
+    assert!(parked);
     assert!(!pending_steer.is_finished());
     let cancelled = client
         .post(format!("{base}/threads/{thread_id}/cancel"))

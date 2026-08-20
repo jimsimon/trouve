@@ -1672,6 +1672,7 @@ struct ActiveTurnSteerer {
     turn: u64,
     sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
     waiting_for_mutation_lane: Arc<AtomicBool>,
+    mutation_lane_state_changed: Arc<tokio::sync::Notify>,
 }
 
 /// Remove only the registration installed by this backend turn. A cancelled
@@ -1736,11 +1737,16 @@ fn reject_pending_steer(pending: &mut Option<SteerTurnCommand>, reason: &str) {
 impl Drop for ActiveTurnSteererGuard<'_> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
-        if registry
+        let state_changed = registry
             .get(&self.thread_id)
-            .is_some_and(|active| active.turn == self.turn)
-        {
+            .filter(|active| active.turn == self.turn)
+            .map(|active| active.mutation_lane_state_changed.clone());
+        if state_changed.is_some() {
             registry.remove(&self.thread_id);
+        }
+        drop(registry);
+        if let Some(state_changed) = state_changed {
+            state_changed.notify_one();
         }
     }
 }
@@ -8658,16 +8664,38 @@ impl Engine {
     /// is waiting for the session mutation lane. Exposed for server-level
     /// lifecycle tests and diagnostics; callers must treat it as transient.
     #[doc(hidden)]
-    pub fn steer_waiting_for_mutation_lane(&self, thread_id: &str) -> bool {
-        self.turn_steerers
+    pub async fn wait_for_steer_mutation_lane(&self, thread_id: &str) -> bool {
+        let Some((turn, waiting, state_changed)) = self
+            .turn_steerers
             .lock()
             .unwrap()
             .get(thread_id)
-            .is_some_and(|active| {
-                active
-                    .waiting_for_mutation_lane
-                    .load(std::sync::atomic::Ordering::Acquire)
+            .map(|active| {
+                (
+                    active.turn,
+                    active.waiting_for_mutation_lane.clone(),
+                    active.mutation_lane_state_changed.clone(),
+                )
             })
+        else {
+            return false;
+        };
+        loop {
+            let notified = state_changed.notified();
+            if waiting.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+            if !self
+                .turn_steerers
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .is_some_and(|active| active.turn == turn)
+            {
+                return false;
+            }
+            notified.await;
+        }
     }
 
     fn send_message_with_tools(
@@ -11845,6 +11873,7 @@ impl Engine {
 
         let mut steer_rx = None;
         let steer_waiting_for_mutation_lane = Arc::new(AtomicBool::new(false));
+        let steer_mutation_lane_state_changed = Arc::new(tokio::sync::Notify::new());
         let _steerer_guard = if supports_steering {
             let (sender, receiver) = tokio::sync::mpsc::channel(8);
             self.turn_steerers.lock().unwrap().insert(
@@ -11853,6 +11882,7 @@ impl Engine {
                     turn,
                     sender,
                     waiting_for_mutation_lane: steer_waiting_for_mutation_lane.clone(),
+                    mutation_lane_state_changed: steer_mutation_lane_state_changed.clone(),
                 },
             );
             steer_rx = Some(receiver);
@@ -11931,6 +11961,7 @@ impl Engine {
                             false,
                             std::sync::atomic::Ordering::Release,
                         );
+                        steer_mutation_lane_state_changed.notify_one();
                         drop(pending_steer_lane.take());
                         drop(pending_steer_permit.take());
                         continue;
@@ -11951,6 +11982,7 @@ impl Engine {
                             false,
                             std::sync::atomic::Ordering::Release,
                         );
+                        steer_mutation_lane_state_changed.notify_one();
                         pending_steer_permit = Some(permit);
                         continue;
                     }
@@ -12013,6 +12045,7 @@ impl Engine {
                                     true,
                                     std::sync::atomic::Ordering::Release,
                                 );
+                                steer_mutation_lane_state_changed.notify_one();
                                 let lane = self.tool_execution_lock(&session.id);
                                 pending_steer_lane = Some(
                                     async move { lane.write_owned().await }.boxed(),
@@ -12793,6 +12826,8 @@ impl Engine {
             "turn ended before steering could be applied"
         };
         reject_pending_steer(&mut pending_steer, pending_steer_reason);
+        steer_waiting_for_mutation_lane.store(false, std::sync::atomic::Ordering::Release);
+        steer_mutation_lane_state_changed.notify_one();
         drop(pending_steer_lane.take());
         drop(pending_steer_permit.take());
         // Vendors may omit ToolCompleted on cancellation or protocol failure.
@@ -14946,26 +14981,130 @@ fn shell_executable_index(tokens: &[String]) -> Option<usize> {
         })
     }
 
+    fn consume_options(
+        tokens: &[String],
+        mut index: usize,
+        flags: &[&str],
+        value_options: &[&str],
+    ) -> Option<usize> {
+        while let Some(token) = tokens.get(index) {
+            if token == "--" {
+                return Some(index + 1);
+            }
+            if flags.contains(&token.as_str()) {
+                index += 1;
+                continue;
+            }
+            if value_options.contains(&token.as_str()) {
+                index = index.checked_add(2)?;
+                if index > tokens.len() {
+                    return None;
+                }
+                continue;
+            }
+            if value_options.iter().any(|option| {
+                option.starts_with("--") && token.starts_with(&format!("{option}="))
+                    || option.len() == 2 && token.starts_with(option) && token.len() > 2
+            }) {
+                index += 1;
+                continue;
+            }
+            return (!token.starts_with('-')).then_some(index);
+        }
+        None
+    }
+
+    fn after_launch_prefix(tokens: &[String], index: usize, prefix: &str) -> Option<usize> {
+        let arguments = index + 1;
+        match prefix {
+            "env" => consume_options(
+                tokens,
+                arguments,
+                &[
+                    "-i",
+                    "--ignore-environment",
+                    "-0",
+                    "--null",
+                    "-v",
+                    "--debug",
+                ],
+                &["-u", "--unset", "-C", "--chdir"],
+            ),
+            "sudo" => consume_options(
+                tokens,
+                arguments,
+                &["-A", "-b", "-E", "-H", "-k", "-n", "-S"],
+                &[
+                    "-C",
+                    "--close-from",
+                    "-D",
+                    "--chdir",
+                    "-g",
+                    "--group",
+                    "-h",
+                    "--host",
+                    "-p",
+                    "--prompt",
+                    "-R",
+                    "--chroot",
+                    "-r",
+                    "--role",
+                    "-t",
+                    "--type",
+                    "-T",
+                    "--command-timeout",
+                    "-u",
+                    "--user",
+                ],
+            ),
+            "command" => consume_options(tokens, arguments, &["-p"], &[]),
+            "nohup" => consume_options(tokens, arguments, &[], &[]),
+            "exec" => consume_options(tokens, arguments, &["-c", "-l"], &["-a"]),
+            "nice" => {
+                if tokens
+                    .get(arguments)
+                    .is_some_and(|token| token.len() > 1 && token[1..].parse::<i32>().is_ok())
+                {
+                    return tokens.get(arguments + 1).map(|_| arguments + 1);
+                }
+                let next = consume_options(tokens, arguments, &[], &["-n", "--adjustment"])?;
+                Some(next)
+            }
+            "stdbuf" => consume_options(
+                tokens,
+                arguments,
+                &[],
+                &["-i", "--input", "-o", "--output", "-e", "--error"],
+            ),
+            "timeout" => {
+                let duration = consume_options(
+                    tokens,
+                    arguments,
+                    &["--foreground", "--preserve-status", "-v", "--verbose"],
+                    &["-k", "--kill-after", "-s", "--signal"],
+                )?;
+                tokens.get(duration + 1).map(|_| duration + 1)
+            }
+            _ => None,
+        }
+    }
+
     let mut index = 0;
     loop {
         while tokens.get(index).is_some_and(|token| is_assignment(token)) {
             index += 1;
         }
         let token = tokens.get(index)?;
-        let launch_prefix = ["env", "sudo", "command", "nohup"]
-            .iter()
-            .any(|expected| shell_word_is_command(token, expected));
-        if !launch_prefix {
+        let launch_prefix = [
+            "env", "sudo", "command", "nohup", "exec", "timeout", "nice", "stdbuf",
+        ]
+        .iter()
+        .find(|expected| shell_word_is_command(token, expected));
+        let Some(prefix) = launch_prefix else {
             return Some(index);
-        }
-        index += 1;
-        // Prefix options can consume following arguments and are deliberately
-        // not guessed here. Rejecting these uncommon forms avoids treating an
-        // option value as the executable that supplied authorization evidence.
-        if tokens
-            .get(index)
-            .is_some_and(|token| token.starts_with('-'))
-        {
+        };
+        index = after_launch_prefix(tokens, index, prefix)?;
+        if index >= tokens.len() {
             return None;
         }
     }
@@ -20655,6 +20794,25 @@ default_permission_mode = "ask"
                 "r"
             ));
         }
+        for command in [
+            "env -i gh api /repos/o/r/pulls -f title=test",
+            "sudo -u root gh api /repos/o/r/pulls -f title=test",
+            "command -p gh api /repos/o/r/pulls -f title=test",
+            "nohup gh api /repos/o/r/pulls -f title=test",
+            "exec -c gh api /repos/o/r/pulls -f title=test",
+            "timeout --signal TERM 30 gh api /repos/o/r/pulls -f title=test",
+            "nice -n 5 gh api /repos/o/r/pulls -f title=test",
+            "stdbuf -o L gh api /repos/o/r/pulls -f title=test",
+        ] {
+            let args = serde_json::json!({ "cmd": command });
+            assert!(could_request_pull_request_creation("functions.exec", &args));
+            assert!(requests_pull_request_creation(
+                "functions.exec",
+                &args,
+                "o",
+                "r"
+            ));
+        }
         let explicit_get = serde_json::json!({
             "cmd": "gh api --method GET /repos/o/r/pulls -f state=open"
         });
@@ -20730,6 +20888,9 @@ default_permission_mode = "ask"
             }),
             serde_json::json!({
                 "cmd": "bash --rcfile 'gh api /repos/o/r/pulls -f title=forged'"
+            }),
+            serde_json::json!({
+                "cmd": "command -v gh api /repos/o/r/pulls -f title=forged"
             }),
         ] {
             assert!(!could_request_pull_request_creation(
