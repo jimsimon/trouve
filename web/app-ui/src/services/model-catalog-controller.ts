@@ -92,7 +92,7 @@ export class ModelCatalogController {
     const knownStaticFailure = this.#staticFailure;
     void this.staticModels().catch(() => undefined);
     return this.#refreshLive(freshness).catch((liveError: unknown) => {
-      if (!this.#staticLoaded) {
+      if (!this.#staticLoaded && this.#staticPending === undefined) {
         const failure = this.#staticFailure ?? knownStaticFailure;
         if (failure !== undefined) throw failure.error;
       }
@@ -155,43 +155,56 @@ export class ModelCatalogController {
 
     const generation = ++this.#generation;
     this.#livePendingForced = freshness === "force";
-    this.#refreshing.set(true);
-    const finish = (promise: Promise<readonly ProtocolModelInfo[]>): boolean => {
+    let resolvePending!: (models: readonly ProtocolModelInfo[]) => void;
+    let rejectPending!: (error: unknown) => void;
+    const promise = new Promise<readonly ProtocolModelInfo[]>((resolve, reject) => {
+      resolvePending = resolve;
+      rejectPending = reject;
+    });
+    const finish = (): boolean => {
       if (this.#livePending !== promise) return false;
       this.#livePending = undefined;
       this.#livePendingForced = false;
       this.#refreshing.set(false);
       return true;
     };
-    const promise = this.#protocol.refreshModels().then(
-      (models) => {
-        if (!finish(promise) || generation !== this.#generation) {
-          return this.#current.get();
-        }
-        const snapshot = Object.freeze([...models]);
-        this.#lastLiveCheckedAt = this.#now();
-        this.#liveLoaded.set(true);
-        this.#live.set(snapshot);
-        this.#current.set(snapshot);
-        this.#publishLive(snapshot);
-        return snapshot;
-      },
-      (error: unknown) => {
-        const forced = this.#livePendingForced;
-        if (!finish(promise) || generation !== this.#generation) {
-          return this.#current.get();
-        }
-        if (!forced && this.#liveLoaded.get()) {
-          this.#lastLiveCheckedAt = this.#now();
-        } else {
-          this.#lastLiveCheckedAt = undefined;
-          this.#liveLoaded.set(false);
-          if (this.#staticLoaded) this.#current.set(this.#static.get());
-        }
-        throw error;
-      },
-    );
     this.#livePending = promise;
+    this.#refreshing.set(true);
+    let request: Promise<readonly ProtocolModelInfo[]>;
+    try {
+      request = this.#protocol.refreshModels();
+    } catch (error: unknown) {
+      request = Promise.reject(error);
+    }
+    void request.then(
+        (models) => {
+          if (!finish() || generation !== this.#generation) {
+            return this.#current.get();
+          }
+          const snapshot = Object.freeze([...models]);
+          this.#lastLiveCheckedAt = this.#now();
+          this.#liveLoaded.set(true);
+          this.#live.set(snapshot);
+          this.#current.set(snapshot);
+          this.#publishLive(snapshot);
+          return snapshot;
+        },
+        (error: unknown) => {
+          const forced = this.#livePendingForced;
+          if (!finish() || generation !== this.#generation) {
+            return this.#current.get();
+          }
+          if (!forced && this.#liveLoaded.get()) {
+            this.#lastLiveCheckedAt = this.#now();
+          } else {
+            this.#lastLiveCheckedAt = undefined;
+            this.#liveLoaded.set(false);
+            if (this.#staticLoaded) this.#current.set(this.#static.get());
+          }
+          throw error;
+        },
+      )
+      .then(resolvePending, rejectPending);
     return promise;
   }
 }

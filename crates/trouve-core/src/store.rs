@@ -9581,6 +9581,7 @@ impl Store {
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        let published_at = chrono::Utc::now().to_rfc3339();
         let current_publication = tx.query_row(
             "SELECT EXISTS (
                SELECT 1 FROM code_review_jobs AS current_job
@@ -9643,7 +9644,6 @@ impl Store {
             return Ok(false);
         }
         let fixed = if current_publication {
-            let resolved_at = chrono::Utc::now().to_rfc3339();
             tx.execute(
                 "UPDATE code_review_findings
                  SET status = 'fixed', resolved_at = ?2,
@@ -9661,7 +9661,7 @@ impl Store {
                          ELSE 0
                      END
                  WHERE publication_resolution_job_id = ?1 AND status = 'open'",
-                params![id, resolved_at],
+                params![id, published_at],
             )?
         } else {
             0
@@ -9677,7 +9677,7 @@ impl Store {
                         (repository, pull_number, last_reviewed_head_sha,
                          last_reviewed_base_sha, last_reviewed_at,
                          last_reviewed_publication_order)
-                 SELECT repository, pull_number, head_sha, base_ref, created_at,
+                 SELECT repository, pull_number, head_sha, base_ref, ?3,
                         publication_order
                  FROM code_review_jobs
                  WHERE id = ?1 AND ?2
@@ -9688,7 +9688,7 @@ impl Store {
                    last_reviewed_publication_order = excluded.last_reviewed_publication_order
                  WHERE code_review_pr_state.last_reviewed_publication_order
                        <= excluded.last_reviewed_publication_order",
-            params![id, current_publication],
+            params![id, current_publication, published_at],
         )?;
         tx.commit()?;
         Ok(true)
@@ -9956,7 +9956,7 @@ impl Store {
             params![id],
             |row| row.get::<_, bool>(0),
         )?;
-        let resolved_at = chrono::Utc::now().to_rfc3339();
+        let published_at = chrono::Utc::now().to_rfc3339();
         if current_publication {
             for finding_id in resolved_finding_ids {
                 tx.execute(
@@ -9985,7 +9985,7 @@ impl Store {
                          ELSE 0
                      END
                  WHERE publication_resolution_job_id = ?1 AND status = 'open'",
-                params![id, resolved_at],
+                params![id, published_at],
             )? as u64
         } else {
             0
@@ -10013,7 +10013,7 @@ impl Store {
                     (repository, pull_number, last_reviewed_head_sha,
                      last_reviewed_base_sha, last_reviewed_at,
                      last_reviewed_publication_order)
-             SELECT repository, pull_number, head_sha, base_ref, created_at,
+             SELECT repository, pull_number, head_sha, base_ref, ?7,
                     publication_order
              FROM code_review_jobs
              WHERE id = ?1 AND status = 'running'
@@ -10033,7 +10033,8 @@ impl Store {
                 pull_number as i64,
                 base_sha,
                 head_sha,
-                current_publication
+                current_publication,
+                published_at
             ],
         )?;
         tx.commit()?;
@@ -15160,6 +15161,16 @@ mod tests {
     fn recovered_clean_publication_closes_intended_findings_and_arms_cleanup() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
+        let created_at = "2000-01-01T00:00:00Z";
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET created_at = ?2 WHERE id = ?1",
+                params![job.id, created_at],
+            )
+            .unwrap();
         assert_eq!(
             store.claim_code_review_job().unwrap().unwrap().job.id,
             job.id
@@ -15221,12 +15232,29 @@ mod tests {
             store.code_review_findings(&job.id).unwrap()[0].status,
             "fixed"
         );
+        let state = store
+            .code_review_pull_state(&job.repository, job.pull_number)
+            .unwrap();
+        assert!(
+            state.last_reviewed_at.unwrap()
+                > chrono::DateTime::parse_from_rfc3339(created_at).unwrap()
+        );
     }
 
     #[test]
     fn accepted_publication_atomically_wins_terminal_failure() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
+        let created_at = "2000-01-01T00:00:00Z";
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET created_at = ?2 WHERE id = ?1",
+                params![job.id, created_at],
+            )
+            .unwrap();
         assert_eq!(
             store.claim_code_review_job().unwrap().unwrap().job.id,
             job.id
@@ -15255,6 +15283,13 @@ mod tests {
         assert_eq!(record.job.status, "succeeded");
         assert_eq!(record.job.review_url, "https://example/accepted-review");
         assert!(record.job.error.is_empty());
+        let state = store
+            .code_review_pull_state(&job.repository, job.pull_number)
+            .unwrap();
+        assert!(
+            state.last_reviewed_at.unwrap()
+                > chrono::DateTime::parse_from_rfc3339(created_at).unwrap()
+        );
     }
 
     #[test]

@@ -61,6 +61,11 @@ const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60)
 /// cleanup runs outside the job future, and any finding it leaves pending is
 /// retried by the dedicated collapse-retry task.
 const REVIEW_THREAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Total per-request deadline for GitHub review traffic, including response
+/// bodies. Publication and collapse retain a per-PR mutation lock across
+/// remote calls, so no transport operation may inherit reqwest's unbounded
+/// default.
+const REVIEW_GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
 const REVIEW_PUBLICATION_LOOKUP_MAX_PAGES: u64 = 100;
 const REVIEW_PUBLICATION_LOOKUP_BUDGET: Duration = Duration::from_secs(60);
@@ -1424,9 +1429,25 @@ impl GithubApi {
         base_url: impl Into<String>,
         cache_scope: String,
     ) -> Result<Self> {
+        Self::with_base_url_and_timeout(
+            authorization,
+            base_url,
+            cache_scope,
+            REVIEW_GITHUB_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn with_base_url_and_timeout(
+        authorization: String,
+        base_url: impl Into<String>,
+        cache_scope: String,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent("trouve-code-review")
+                .connect_timeout(request_timeout)
+                .timeout(request_timeout)
                 .build()?,
             authorization,
             base_url: base_url.into(),
@@ -4888,18 +4909,18 @@ impl Engine {
         ensure_review_current(superseded)?;
         self.revalidate_code_review_publication(&api, &job).await?;
         ensure_review_current(superseded)?;
-        let previous_finding_ids = previous_findings
-            .iter()
-            .map(|finding| finding.id.as_str())
-            .collect::<Vec<_>>();
+        // Only findings that can produce a visible inline comment may make
+        // the GitHub verdict blocking. Suppressed or unplaceable findings
+        // remain available in the durable report without creating an
+        // unexplained REQUEST_CHANGES review.
         let resolved_finding_ids = parsed
             .resolved_finding_ids
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        let has_unresolved_findings = review_has_unresolved_findings(
-            persisted.len(),
-            &previous_finding_ids,
+        let has_unresolved_findings = review_has_unresolved_publishable_findings(
+            &persisted,
+            &previous_findings,
             &resolved_finding_ids,
         );
         if !self
@@ -6550,6 +6571,12 @@ impl Engine {
             return Ok(());
         }
         let deadline = Instant::now() + REVIEW_COLLAPSE_GROUP_TIMEOUT;
+        let publication_lock = self.code_review.publication_lock(repository, pull_number);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(_publication_guard) = tokio::time::timeout(remaining, publication_lock.lock()).await
+        else {
+            return Ok(());
+        };
         self.resolve_claimed_review_threads(api, repository, pull_number, &claim.findings, deadline)
             .await
     }
@@ -6628,6 +6655,12 @@ impl Engine {
                         .await
                     {
                         Ok(ReviewThreadListingOutcome::Authoritative(loaded)) => {
+                            self.clear_review_thread_listing_progress(&review_thread_listing_key(
+                                repository,
+                                pull_number,
+                                ReviewThreadListingKind::Collapse,
+                                &targets,
+                            ));
                             listing = Some(loaded);
                         }
                         Ok(ReviewThreadListingOutcome::Incomplete) => {
@@ -6936,6 +6969,14 @@ impl Engine {
             progress,
             Instant::now(),
         );
+    }
+
+    fn clear_review_thread_listing_progress(&self, key: &ReviewThreadListingKey) {
+        self.code_review
+            .thread_listing_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
     }
 
     /// Loads the PR's review threads keyed by comment id, following
@@ -7265,15 +7306,96 @@ impl Engine {
             self.save_review_thread_listing_progress(progress_key, progress);
             return Ok(ReviewThreadListingOutcome::Incomplete);
         }
-        self.code_review
-            .thread_listing_progress
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&progress_key);
+        let listing_complete = progress.listing_complete;
+        // Keep the completed, freshly verified snapshot until its caller
+        // applies it. A contended publication lock or concurrent local-state
+        // change can then defer without repeating the complete paginated walk.
+        self.save_review_thread_listing_progress(progress_key, progress);
         Ok(ReviewThreadListingOutcome::Authoritative((
             fresh_threads,
-            progress.listing_complete,
+            listing_complete,
         )))
+    }
+
+    /// Refreshes a completed listing while the per-PR publication lock is
+    /// held. The cached pagination result is retained when the scheduler
+    /// budget expires, but no durable state is applied from values observed
+    /// before the mutation boundary.
+    async fn refresh_review_thread_listing_states(
+        &self,
+        api: &GithubApi,
+        listing: &ReviewThreadListing,
+        deadline: Instant,
+    ) -> Result<Option<ReviewThreadListing>> {
+        let (thread_by_comment, listing_complete) = listing;
+        let mut thread_ids = thread_by_comment
+            .values()
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect::<Vec<_>>();
+        thread_ids.sort();
+        thread_ids.dedup();
+        if thread_ids.is_empty() {
+            return Ok(Some((thread_by_comment.clone(), *listing_complete)));
+        }
+
+        let state_query = r#"
+          query ReviewThreadStates($ids: [ID!]!) {
+            nodes(ids: $ids) {
+              ... on PullRequestReviewThread { id isResolved }
+            }
+          }
+        "#;
+        let mut states = HashMap::new();
+        for ids in thread_ids.chunks(100) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let payload = serde_json::json!({
+                "query": state_query,
+                "variables": {"ids": ids},
+            });
+            let request = api.post("/graphql", &payload);
+            let budget_limited = remaining < REVIEW_THREAD_REQUEST_TIMEOUT;
+            let request_timeout = REVIEW_THREAD_REQUEST_TIMEOUT.min(remaining);
+            let (response, rate): (serde_json::Value, _) =
+                match tokio::time::timeout(request_timeout, request).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        return Err(error)
+                            .context("reverifying review thread states under publication lock");
+                    }
+                    Err(_) if budget_limited => return Ok(None),
+                    Err(_) => bail!("reverifying review thread states timed out"),
+                };
+            self.record_review_rate(rate);
+            if response["errors"].is_array() {
+                bail!("GitHub GraphQL error while reverifying review thread states");
+            }
+            for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
+                if let (Some(thread_id), Some(is_resolved)) =
+                    (thread["id"].as_str(), thread["isResolved"].as_bool())
+                {
+                    states.insert(thread_id.to_owned(), is_resolved);
+                }
+            }
+        }
+        if !thread_ids
+            .iter()
+            .all(|thread_id| states.contains_key(thread_id))
+        {
+            return Ok(None);
+        }
+
+        let refreshed = thread_by_comment
+            .iter()
+            .filter_map(|(comment_id, (thread_id, _))| {
+                states
+                    .get(thread_id)
+                    .map(|is_resolved| (*comment_id, (thread_id.clone(), *is_resolved)))
+            })
+            .collect();
+        Ok(Some((refreshed, *listing_complete)))
     }
 
     async fn reconcile_user_resolved_review_findings(
@@ -7324,12 +7446,14 @@ impl Engine {
                 deadline,
             )
             .await?;
-        let ReviewThreadListingOutcome::Authoritative((thread_by_comment, listing_complete)) =
-            listing
-        else {
+        let ReviewThreadListingOutcome::Authoritative(mut authoritative_listing) = listing else {
             return Ok(ReviewThreadReconciliationOutcome::Deferred);
         };
-        if !review_thread_listing_is_authoritative(&thread_by_comment, listing_complete, &targets) {
+        if !review_thread_listing_is_authoritative(
+            &authoritative_listing.0,
+            authoritative_listing.1,
+            &targets,
+        ) {
             return Ok(ReviewThreadReconciliationOutcome::Deferred);
         }
         let Ok(publication_guard) = publication_lock.try_lock() else {
@@ -7380,6 +7504,22 @@ impl Engine {
         if initial_ids != current_ids {
             return Ok(ReviewThreadReconciliationOutcome::Deferred);
         }
+
+        let Some(refreshed_listing) = self
+            .refresh_review_thread_listing_states(api, &authoritative_listing, deadline)
+            .await?
+        else {
+            return Ok(ReviewThreadReconciliationOutcome::Deferred);
+        };
+        authoritative_listing = refreshed_listing;
+        if !review_thread_listing_is_authoritative(
+            &authoritative_listing.0,
+            authoritative_listing.1,
+            &targets,
+        ) {
+            return Ok(ReviewThreadReconciliationOutcome::Deferred);
+        }
+        let thread_by_comment = &authoritative_listing.0;
 
         let mut changed_jobs = HashSet::new();
         let mut reopened = false;
@@ -7467,6 +7607,12 @@ impl Engine {
             (!state_key.is_empty() && all_resolved) || reopened,
             MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION,
         )?;
+        self.clear_review_thread_listing_progress(&review_thread_listing_key(
+            &repository.repository,
+            pull.number,
+            ReviewThreadListingKind::Reconciliation,
+            &targets,
+        ));
         drop(publication_guard);
         if let Some(job) = job {
             self.emit_code_review_updated(Some(job.id.clone()))?;
@@ -7599,6 +7745,26 @@ fn review_has_unresolved_findings(
         || previous_finding_ids
             .iter()
             .any(|id| !resolved_finding_ids.contains(id))
+}
+
+fn review_has_unresolved_publishable_findings(
+    current_findings: &[trouve_protocol::CodeReviewFinding],
+    previous_findings: &[trouve_protocol::CodeReviewFinding],
+    resolved_finding_ids: &[&str],
+) -> bool {
+    let previous_finding_ids = previous_findings
+        .iter()
+        .filter(|finding| finding.is_publishable())
+        .map(|finding| finding.id.as_str())
+        .collect::<Vec<_>>();
+    review_has_unresolved_findings(
+        current_findings
+            .iter()
+            .filter(|finding| finding.is_publishable())
+            .count(),
+        &previous_finding_ids,
+        resolved_finding_ids,
+    )
 }
 
 fn github_rejected_own_pull_verdict(response_body: &str) -> bool {
@@ -9758,6 +9924,44 @@ mod tests {
             .expect("mock server task failed");
     }
 
+    #[tokio::test]
+    async fn github_api_timeout_covers_a_stalled_response_body() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                      content-length: 100\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let api = GithubApi::with_base_url_and_timeout(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let started = Instant::now();
+
+        assert!(api.get::<serde_json::Value>("/stalled").await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.abort();
+    }
+
     #[test]
     fn review_outbox_retry_delay_is_bounded_and_exponential() {
         assert_eq!(review_outbox_retry_delay(1), Duration::from_secs(5));
@@ -11573,6 +11777,21 @@ mod tests {
                 &[],
             )
             .unwrap();
+        let hidden_findings = findings
+            .iter()
+            .filter(|finding| !finding.is_publishable())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!review_has_unresolved_publishable_findings(
+            &hidden_findings,
+            &[],
+            &[]
+        ));
+        assert!(!review_has_unresolved_publishable_findings(
+            &[],
+            &hidden_findings,
+            &[]
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -14033,6 +14252,15 @@ mod tests {
         assert_eq!(threads.len(), 2);
         assert_eq!(threads.get(&9000), Some(&("thread-9000".into(), true)));
         assert_eq!(threads.get(&9001), Some(&("thread-9001".into(), false)));
+        assert!(
+            engine
+                .code_review
+                .thread_listing_progress
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        );
+        engine.clear_review_thread_listing_progress(&key);
         assert!(
             !engine
                 .code_review

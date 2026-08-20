@@ -176,6 +176,60 @@ describe("ModelCatalogController", () => {
     await vi.waitFor(() => expect(rejection).toBe(liveError));
   });
 
+  it("reports the live failure while a static retry is pending", async () => {
+    const staticRetry = deferred<readonly ProtocolModelInfo[]>();
+    const initialStaticError = new Error("initial static unavailable");
+    const liveError = new Error("live unavailable");
+    let staticCalls = 0;
+    const controller = new ModelCatalogController({
+      models: () => {
+        staticCalls += 1;
+        return staticCalls === 1
+          ? Promise.reject(initialStaticError)
+          : staticRetry.promise;
+      },
+      refreshModels: async () => {
+        throw liveError;
+      },
+    });
+
+    await expect(controller.staticModels()).rejects.toBe(initialStaticError);
+    const liveResult = controller.liveModels("force");
+
+    await vi.waitFor(() => expect(staticCalls).toBe(2));
+    await expect(liveResult).rejects.toBe(liveError);
+    staticRetry.resolve([model("cursor/static")]);
+    await expect(controller.staticModels()).resolves.toEqual([
+      model("cursor/static"),
+    ]);
+  });
+
+  it("installs pending live work before synchronous refresh re-entry", async () => {
+    const liveResult = deferred<readonly ProtocolModelInfo[]>();
+    let liveCalls = 0;
+    let reentrant: Promise<readonly ProtocolModelInfo[]> | undefined;
+    let controller!: ModelCatalogController;
+    controller = new ModelCatalogController({
+      models: async () => [model("cursor/static")],
+      refreshModels: () => {
+        liveCalls += 1;
+        if (liveCalls === 1) reentrant = controller.liveModels("force");
+        return liveResult.promise;
+      },
+    });
+
+    const first = controller.liveModels();
+    await vi.waitFor(() => expect(liveCalls).toBe(1));
+    expect(reentrant).toBeDefined();
+
+    liveResult.resolve([model("cursor/live")]);
+    await expect(Promise.all([first, reentrant])).resolves.toEqual([
+      [model("cursor/live")],
+      [model("cursor/live")],
+    ]);
+    expect(liveCalls).toBe(1);
+  });
+
   it("coalesces concurrent static and live discovery", async () => {
     const staticResult = deferred<readonly ProtocolModelInfo[]>();
     const liveResult = deferred<readonly ProtocolModelInfo[]>();
