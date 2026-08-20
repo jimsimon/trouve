@@ -701,11 +701,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN publication_resolution_job_id TEXT",
-    "ALTER TABLE code_review_theme_observations ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_finding_themes ADD COLUMN linked_by_job_id TEXT NOT NULL DEFAULT ''",
-    "UPDATE code_review_jobs
-       SET publication_order = rowid
-       WHERE publication_order = 0 AND publication_claimed != 0",
     "UPDATE code_review_pr_state
        SET last_reviewed_publication_order = COALESCE((
          SELECT MAX(job.publication_order)
@@ -731,8 +727,10 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
+    migrate_code_review_theme_observation_publication_authority(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
+    normalize_code_review_publication_orders(conn)?;
     promote_published_code_review_theme_observations(conn)?;
     backfill_code_review_publication_dispatch(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
@@ -749,6 +747,119 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Observations created before publication authority was introduced already
+/// changed their aggregate theme when the review result was saved. Add the
+/// authority column and classify those legacy rows as consumed atomically so
+/// startup recovery cannot apply their effects a second time. Fresh databases
+/// already have the column and only need the marker.
+fn migrate_code_review_theme_observation_publication_authority(
+    conn: &mut Connection,
+) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-theme-observation-publication-authority-v1";
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    let has_published_column = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('code_review_theme_observations')
+           WHERE name = 'published'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_published_column {
+        tx.execute_batch(
+            "ALTER TABLE code_review_theme_observations
+               ADD COLUMN published INTEGER NOT NULL DEFAULT 0;
+             UPDATE code_review_theme_observations SET published = 1;",
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Publication orders are counters scoped to one pull request. Legacy or
+/// rollback-created rows can have a zero order, so comparing their global
+/// rowid directly with modern per-pull counters is invalid. Whenever such a
+/// row is recovered, renumber all authoritative jobs for that pull from their
+/// common durable legacy order before any observation replay.
+fn normalize_code_review_publication_orders(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let affected_pulls = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT repository, pull_number
+             FROM code_review_jobs
+             WHERE publication_order = 0
+               AND (publication_claimed != 0 OR review_published != 0)",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if affected_pulls.is_empty() {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    tx.execute_batch(
+        "WITH affected_pulls AS (
+           SELECT DISTINCT repository, pull_number
+           FROM code_review_jobs
+           WHERE publication_order = 0
+             AND (publication_claimed != 0 OR review_published != 0)
+         ), ordered_jobs AS (
+           SELECT job.id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY job.repository, job.pull_number
+                    ORDER BY job.rowid
+                  ) AS normalized_order
+           FROM code_review_jobs AS job
+           JOIN affected_pulls AS affected
+             ON affected.repository = job.repository
+            AND affected.pull_number = job.pull_number
+           WHERE job.publication_claimed != 0 OR job.review_published != 0
+         )
+         UPDATE code_review_jobs
+         SET publication_order = (
+           SELECT normalized_order FROM ordered_jobs WHERE ordered_jobs.id = code_review_jobs.id
+         )
+         WHERE id IN (SELECT id FROM ordered_jobs);",
+    )?;
+    for (repository, pull_number) in affected_pulls {
+        tx.execute(
+            "UPDATE code_review_pr_state
+             SET last_reviewed_publication_order = COALESCE((
+               SELECT MAX(job.publication_order)
+               FROM code_review_jobs AS job
+               WHERE job.repository = code_review_pr_state.repository
+                 AND job.pull_number = code_review_pr_state.pull_number
+                 AND job.head_sha = code_review_pr_state.last_reviewed_head_sha
+                 AND job.review_published != 0
+             ), 0)
+             WHERE repository = ?1 AND pull_number = ?2",
+            params![repository, pull_number],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn promote_published_code_review_theme_observations(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let jobs = {
@@ -758,7 +869,7 @@ fn promote_published_code_review_theme_observations(conn: &mut Connection) -> Re
              FROM code_review_jobs job
              JOIN code_review_theme_observations observation ON observation.job_id = job.id
              WHERE job.review_published != 0 AND observation.published = 0
-             ORDER BY COALESCE(NULLIF(job.publication_order, 0), job.rowid), job.id",
+             ORDER BY job.repository, job.pull_number, job.publication_order, job.id",
         )?;
         stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -18132,7 +18243,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_promotes_observations_repaired_as_published_on_the_same_startup() {
+    fn migration_marks_pre_authority_observations_consumed_without_replay() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("legacy-theme-observation.sqlite3");
         let store = Store::open(&database).unwrap();
@@ -18168,11 +18279,9 @@ mod tests {
                 &[],
             )
             .unwrap();
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
                 "UPDATE code_review_jobs
                  SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-7',
                      review_published = 0, publication_accepted = 0
@@ -18180,6 +18289,21 @@ mod tests {
                 [&job.id],
             )
             .unwrap();
+            conn.execute(
+                "UPDATE code_review_theme_observations SET kind = 'recurrence'
+                 WHERE job_id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_themes
+                 SET status = 'resolved', last_seen_head = 'legacy-applied-head',
+                     resolved_head = 'legacy-resolved-head', recurrence_count = 7
+                 WHERE id = 'acme/widgets#42:legacy-theme'",
+                [],
+            )
+            .unwrap();
+        }
         drop(store);
 
         // Recreate the pre-publication-authority table shape. On a real
@@ -18201,7 +18325,9 @@ mod tests {
                    (theme_id, job_id, head_sha, kind, created_at)
                  SELECT theme_id, job_id, head_sha, kind, created_at
                  FROM legacy_theme_observations;
-                 DROP TABLE legacy_theme_observations;",
+                 DROP TABLE legacy_theme_observations;
+                 DELETE FROM store_migrations
+                 WHERE id = 'code-review-theme-observation-publication-authority-v1';",
             )
             .unwrap();
         drop(legacy);
@@ -18227,8 +18353,24 @@ mod tests {
         assert!(published);
         let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
         assert_eq!(themes.len(), 1);
-        assert_eq!(themes[0].status, "open");
-        assert_eq!(themes[0].last_seen_head, job.head_sha);
+        assert_eq!(themes[0].status, "resolved");
+        assert_eq!(themes[0].last_seen_head, "legacy-applied-head");
+        assert_eq!(themes[0].resolved_head, "legacy-resolved-head");
+        assert_eq!(themes[0].recurrence_count, 7);
+        let migration_recorded = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS (
+                   SELECT 1 FROM store_migrations
+                   WHERE id = 'code-review-theme-observation-publication-authority-v1'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(migration_recorded);
     }
 
     #[test]
@@ -18312,6 +18454,111 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("open".into(), first_job.head_sha));
+    }
+
+    #[test]
+    fn observation_recovery_normalizes_mixed_legacy_and_modern_orders() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..4 {
+            let mut request = backoff_test_job_request();
+            request.dedupe_key = format!("acme/widgets#{}:rowid-padding", 100 + index);
+            request.pull_number = 100 + index;
+            store.enqueue_code_review_job(&request).unwrap().unwrap();
+        }
+
+        let legacy_job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &legacy_job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Mixed-order symptom".into(),
+                    body: "Publication order domains must not be mixed.".into(),
+                    prompt_for_agents: "Normalize the sequence.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["mixed-order-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "mixed-order-theme".into(),
+                    root_cause: "mixed publication order".into(),
+                    recommendation: "use one per-pull sequence".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+        let mut modern_request = backoff_test_job_request();
+        modern_request.dedupe_key = "acme/widgets#42:modern-publication".into();
+        modern_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let modern_job = store
+            .enqueue_code_review_job(&modern_request)
+            .unwrap()
+            .unwrap();
+
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE code_review_jobs
+             SET review_published = 1,
+                 publication_order = CASE id WHEN ?1 THEN 0 ELSE 1 END
+             WHERE id IN (?1, ?2)",
+            params![legacy_job.id, modern_job.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_review_theme_observations
+               (theme_id, job_id, head_sha, kind, published, created_at)
+             VALUES (?1, ?2, ?3, 'continuation', 0, ?4)",
+            params![
+                theme_id,
+                modern_job.id,
+                modern_job.head_sha,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_review_themes SET status = 'pending', last_seen_head = ''
+             WHERE id = ?1",
+            [&theme_id],
+        )
+        .unwrap();
+
+        normalize_code_review_publication_orders(&mut conn).unwrap();
+        let orders = conn
+            .prepare(
+                "SELECT publication_order FROM code_review_jobs
+                 WHERE id IN (?1, ?2) ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map(params![legacy_job.id, modern_job.id], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(orders, vec![1, 2]);
+
+        promote_published_code_review_theme_observations(&mut conn).unwrap();
+        let state = conn
+            .query_row(
+                "SELECT status, last_seen_head FROM code_review_themes WHERE id = ?1",
+                [&theme_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("open".into(), modern_job.head_sha));
     }
 
     fn backoff_test_job_request() -> NewCodeReviewJob {
