@@ -757,18 +757,26 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-fn promote_published_code_review_theme_observations(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "UPDATE code_review_theme_observations
-         SET published = 1
-         WHERE published = 0
-           AND EXISTS (
-             SELECT 1 FROM code_review_jobs job
-             WHERE job.id = code_review_theme_observations.job_id
-               AND job.review_published != 0
-           )",
-        [],
-    )?;
+fn promote_published_code_review_theme_observations(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let jobs = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT job.id,
+                    COALESCE(job.completed_at, job.started_at, job.created_at)
+             FROM code_review_jobs job
+             JOIN code_review_theme_observations observation ON observation.job_id = job.id
+             WHERE job.review_published != 0 AND observation.published = 0
+             ORDER BY job.created_at, job.id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (job_id, published_at) in jobs {
+        publish_code_review_theme_observations(&tx, &job_id, &published_at)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -18201,6 +18209,10 @@ mod tests {
             )
             .unwrap();
         assert!(published);
+        let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].status, "open");
+        assert_eq!(themes[0].last_seen_head, job.head_sha);
     }
 
     fn backoff_test_job_request() -> NewCodeReviewJob {

@@ -6717,11 +6717,7 @@ impl Engine {
             let themes = self
                 .store
                 .code_review_themes_for_legacy_publication_job(&job.id)?;
-            review_theme_publication_groups(&findings, &themes)
-                .iter()
-                .flat_map(|group| group.members.iter().skip(1))
-                .map(|finding| finding.id.clone())
-                .collect::<HashSet<_>>()
+            legacy_review_theme_grouped_finding_ids(&findings, &themes)
         } else {
             HashSet::new()
         };
@@ -10909,6 +10905,36 @@ fn review_theme_publication_groups<'a>(
                 members,
             })
         })
+        .collect()
+}
+
+fn legacy_review_theme_grouped_finding_ids(
+    findings: &[trouve_protocol::CodeReviewFinding],
+    themes: &[trouve_protocol::CodeReviewTheme],
+) -> HashSet<String> {
+    let memberships = themes
+        .iter()
+        .flat_map(|theme| {
+            theme
+                .finding_ids
+                .iter()
+                .map(move |finding_id| (finding_id.as_str(), theme.id.as_str()))
+        })
+        .collect::<HashSet<_>>();
+    let legacy_findings = findings
+        .iter()
+        .cloned()
+        .map(|mut finding| {
+            finding
+                .theme_ids
+                .retain(|theme_id| memberships.contains(&(finding.id.as_str(), theme_id.as_str())));
+            finding
+        })
+        .collect::<Vec<_>>();
+    review_theme_publication_groups(&legacy_findings, themes)
+        .iter()
+        .flat_map(|group| group.members.iter().skip(1))
+        .map(|finding| finding.id.clone())
         .collect()
 }
 
@@ -15564,12 +15590,14 @@ mod tests {
             "recommendation": "centralize it",
             "status": "open",
             "first_seen_head": "1".repeat(40),
-            "last_seen_head": "1".repeat(40)
+            "last_seen_head": "1".repeat(40),
+            "finding_ids": ["rvf-primary", "rvf-child"]
         }))
         .unwrap();
         let findings = vec![
             finding("rvf-primary", vec!["rvth-publication"], "published"),
             finding("rvf-child", vec!["rvth-publication"], "pending"),
+            finding("rvf-later-link", vec!["rvth-publication"], "pending"),
             finding("rvf-independent", Vec::new(), "pending"),
         ];
 
@@ -15578,6 +15606,10 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members[0].id, "rvf-primary");
         assert_eq!(groups[0].members[1].id, "rvf-child");
+        assert_eq!(
+            legacy_review_theme_grouped_finding_ids(&findings, &themes),
+            HashSet::from(["rvf-child".to_owned()])
+        );
     }
 
     #[test]
