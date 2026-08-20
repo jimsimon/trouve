@@ -698,10 +698,31 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                       @click=${() => this.#fix(row, finding.prompt)}
                     >Fix</button>
                   </div>
-                  <small>Identified at ${finding.location} · Severity: ${finding.severity} · Confidence: ${finding.confidence}</small>
+                  <small>Identified at ${finding.location} · Severity: ${finding.severity} · Confidence: ${finding.confidence}${finding.origin === "new_change" ? nothing : ` · ${finding.origin.replaceAll("_", " ")}`}</small>
                   <p>${finding.body}</p>
+                  ${finding.themes.map((theme) => html`
+                    <p><strong>Shared root cause:</strong> ${theme.rootCause}</p>
+                    <p><strong>Structural fix:</strong> ${theme.recommendation}</p>
+                  `)}
+                  ${finding.preconditions === "" &&
+                    finding.executionPath === "" &&
+                    finding.consequence === "" &&
+                    finding.introduction === "" &&
+                    finding.regressionTest === ""
+                    ? nothing
+                    : html`<details>
+                    <summary>Verification evidence</summary>
+                    ${finding.preconditions === "" ? nothing : html`<p><strong>Preconditions:</strong> ${finding.preconditions}</p>`}
+                    ${finding.executionPath === "" ? nothing : html`<p><strong>Execution path:</strong> ${finding.executionPath}</p>`}
+                    ${finding.consequence === "" ? nothing : html`<p><strong>Consequence:</strong> ${finding.consequence}</p>`}
+                    ${finding.introduction === "" ? nothing : html`<p><strong>Introduced by:</strong> ${finding.introduction}</p>`}
+                    ${finding.regressionTest === "" ? nothing : html`<p><strong>Regression test:</strong> ${finding.regressionTest}</p>`}
+                  </details>`}
                   ${finding.publicationStatus === "suppressed_by_policy"
                     ? html`<small>Retained in Trouve · Not posted to GitHub by confidence policy</small>`
+                    : nothing}
+                  ${finding.publicationStatus === "grouped_by_theme"
+                    ? html`<small>Retained in Trouve · Represented by the shared root-cause comment on GitHub</small>`
                     : nothing}
                 </article>`)}
               </section>`}

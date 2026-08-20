@@ -1929,6 +1929,29 @@ export interface components {
             /** @description Concise, generated one-line summary of the candidate issue. */
             title: string;
         };
+        /** @description Signals that measure repeated review work rather than raw issue volume. */
+        CodeReviewChurnStats: {
+            /** Format: double */
+            average_rounds_to_clean?: number;
+            /** Format: int64 */
+            clean_pull_request_count?: number;
+            /** Format: int64 */
+            external_duplicate_count?: number;
+            /** Format: int64 */
+            fix_regression_issue_count?: number;
+            /** Format: int64 */
+            grouped_issue_count?: number;
+            /** Format: int64 */
+            insufficient_evidence_rejection_count?: number;
+            /** Format: int64 */
+            max_rounds_to_clean?: number;
+            /** Format: int64 */
+            previously_missed_issue_count?: number;
+            /** Format: int64 */
+            pull_request_count?: number;
+            /** Format: int64 */
+            recurrence_issue_count?: number;
+        };
         CodeReviewDashboard: {
             app: components["schemas"]["GithubAppStatus"];
             jobs: components["schemas"]["CodeReviewJob"][];
@@ -1958,6 +1981,7 @@ export interface components {
              *     `high`, `medium`, or `low`; legacy records default to `medium`.
              */
             confidence?: string;
+            evidence?: components["schemas"]["CodeReviewFindingEvidence"];
             /** Format: int64 */
             github_comment_id?: number | null;
             github_comment_url?: string;
@@ -1967,23 +1991,44 @@ export interface components {
             job_id: string;
             /** Format: int64 */
             line: number;
+            /** @description Immutable PR head on which this finding was first observed. */
+            observed_head?: string;
+            origin?: components["schemas"]["CodeReviewFindingOrigin"];
             path: string;
             prompt_for_agents?: string;
             /** Format: date-time */
             resolved_at?: string | null;
+            /** @description Review job that demonstrated the fix, for exact fix-diff reconstruction. */
+            resolved_by_job_id?: string;
+            /** @description Immutable PR head whose review demonstrated that the finding was fixed. */
+            resolved_head?: string;
             severity: string;
             side: string;
             sources?: components["schemas"]["CodeReviewFindingSource"][];
             /** @description `open`, `fixed`, or `dismissed`. */
             status: string;
+            theme_ids?: string[];
             /** @description Concise, generated one-line summary of the issue. */
             title: string;
         };
+        /** @description Concrete evidence that makes a confirmed finding independently verifiable. */
+        CodeReviewFindingEvidence: {
+            consequence?: string;
+            execution_path?: string;
+            introduction?: string;
+            preconditions?: string;
+            regression_test?: string;
+        };
+        /**
+         * @description How a finding relates to earlier review rounds on the pull request.
+         * @enum {string}
+         */
+        CodeReviewFindingOrigin: "new_change" | "recurrence" | "fix_regression" | "previously_missed";
         /**
          * @description The outcome of attempting to publish a finding as an inline GitHub comment.
          * @enum {string}
          */
-        CodeReviewFindingPublicationStatus: "pending" | "published" | "not_eligible" | "suppressed_by_policy" | "failed";
+        CodeReviewFindingPublicationStatus: "pending" | "published" | "not_eligible" | "suppressed_by_policy" | "grouped_by_theme" | "failed";
         /** @description A persona/candidate that contributed to a confirmed finding. */
         CodeReviewFindingSource: {
             candidate_id: string;
@@ -2099,6 +2144,7 @@ export interface components {
             routing_decisions?: components["schemas"]["CodeReviewRoutingDecision"][];
             summary?: string;
             tasks?: components["schemas"]["CodeReviewTask"][];
+            themes?: components["schemas"]["CodeReviewTheme"][];
         };
         CodeReviewJobList: {
             jobs: components["schemas"]["CodeReviewJob"][];
@@ -2303,6 +2349,7 @@ export interface components {
         };
         CodeReviewStats: {
             buckets?: components["schemas"]["CodeReviewStatsBucket"][];
+            churn?: components["schemas"]["CodeReviewChurnStats"];
             coordinator_duration?: components["schemas"]["CodeReviewDurationStats"];
             /** Format: date-time */
             generated_at: string;
@@ -2449,6 +2496,41 @@ export interface components {
         };
         /** @enum {string} */
         CodeReviewTaskRole: "router" | "reviewer" | "coordinator";
+        /** @description A root cause tracked across all review rounds for one pull request. */
+        CodeReviewTheme: {
+            affected_paths?: string[];
+            finding_ids?: string[];
+            first_seen_head: string;
+            id: string;
+            last_seen_head: string;
+            observations?: components["schemas"]["CodeReviewThemeObservation"][];
+            /** Format: int64 */
+            pull_number: number;
+            recommendation: string;
+            /** Format: int64 */
+            recurrence_count?: number;
+            repository: string;
+            resolved_head?: string;
+            root_cause: string;
+            /**
+             * @description `pending` while the producing review is unpublished, `open` while at
+             *     least one authoritative linked finding is open, otherwise `resolved`.
+             */
+            status: string;
+        };
+        CodeReviewThemeObservation: {
+            /** Format: date-time */
+            created_at: string;
+            finding_ids: string[];
+            head_sha: string;
+            job_id: string;
+            kind: components["schemas"]["CodeReviewThemeObservationKind"];
+        };
+        /**
+         * @description How a durable root-cause theme appeared in one review round.
+         * @enum {string}
+         */
+        CodeReviewThemeObservationKind: "new" | "continuation" | "recurrence";
         /**
          * @description One slash command / skill the vendor harness accepts in prompts (e.g.
          *     "/simplify"), surfaced by clients as prompt-box completions.
@@ -2915,6 +2997,7 @@ export interface components {
             review_url: string;
             status: string;
             summary: string;
+            themes?: components["schemas"]["CodeReviewTheme"][];
         };
         /**
          * @description A new session and its initial thread, both created from an existing

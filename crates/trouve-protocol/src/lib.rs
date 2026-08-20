@@ -283,7 +283,11 @@ pub use requests::*;
 // from the latest valid usage measurement (additive).
 // 7.6: thread-view snapshot last_usage is the last completed turn, while
 // active_usage exclusively carries cumulative usage for a running turn.
-pub const PROTOCOL_VERSION: &str = "7.6";
+// 7.7: code-review findings expose structured evidence, revision origin,
+// durable root-cause theme membership, and immutable resolution provenance;
+// review details, PR projections, and statistics expose recurrence and churn
+// controls (additive).
+pub const PROTOCOL_VERSION: &str = "7.7";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -531,16 +531,22 @@ fn decode_f32s(tensor: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>>
     let raw = tensor.data();
     Ok(match tensor.dtype() {
         Dtype::F32 => raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect(),
         Dtype::F64 => raw
-            .chunks_exact(8)
-            .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b) as f32)
             .collect(),
         Dtype::F16 => raw
-            .chunks_exact(2)
-            .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::f16::from_le_bytes(*b).to_f32())
             .collect(),
         Dtype::I8 => raw.iter().map(|&b| f32::from(b as i8)).collect(),
         other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
@@ -563,12 +569,16 @@ fn decode_mapping(tensor: &safetensors::tensor::TensorView<'_>, rows: usize) -> 
     };
     match tensor.dtype() {
         Dtype::I64 => raw
-            .chunks_exact(8)
-            .map(|b| validated(i64::from_le_bytes(b.try_into().unwrap())))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| validated(i64::from_le_bytes(*b)))
             .collect(),
         Dtype::I32 => raw
-            .chunks_exact(4)
-            .map(|b| validated(i64::from(i32::from_le_bytes(b.try_into().unwrap()))))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| validated(i64::from(i32::from_le_bytes(*b))))
             .collect(),
         other => Err(anyhow!("unsupported mapping dtype: {other:?}")),
     }

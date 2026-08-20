@@ -1483,6 +1483,24 @@ function JobDetailPane({
           )}
         </div>
         {detail.summary && <p class="summary">{detail.summary}</p>}
+        {(detail.themes ?? []).length > 0 && (
+          <div class="theme-list">
+            {(detail.themes ?? []).map((theme) => (
+              <article class="finding medium" key={theme.id}>
+                <header>
+                  <strong>Shared root cause</strong>
+                  <StatusPill status={theme.status} />
+                </header>
+                <p>{theme.root_cause}</p>
+                <p><b>Structural fix:</b> {theme.recommendation}</p>
+                <small>
+                  {theme.finding_ids?.length ?? 0} manifestations across {theme.observations?.length ?? 0} review rounds
+                  {theme.recurrence_count > 0 ? ` · Recurred ${theme.recurrence_count} time${theme.recurrence_count === 1 ? "" : "s"}` : ""}
+                </small>
+              </article>
+            ))}
+          </div>
+        )}
         {detail.findings.map((finding) => (
           <article class={`finding ${finding.severity}`} key={finding.id}>
             <header>
@@ -1491,10 +1509,31 @@ function JobDetailPane({
             </header>
             <small>
               {finding.path}:{finding.line} · Severity: {finding.severity.toUpperCase()} · Confidence: {(finding.confidence ?? "medium").toUpperCase()}
+              {finding.origin && finding.origin !== "new_change" ? ` · ${finding.origin.replaceAll("_", " ").toUpperCase()}` : ""}
             </small>
             <p>{finding.body}</p>
+            {finding.resolved_head && (
+              <small>
+                Fixed at {finding.resolved_head.slice(0, 12)} by review {finding.resolved_by_job_id?.slice(0, 12) || "unknown"}
+              </small>
+            )}
             {finding.github_publication_status === "suppressed_by_policy" && (
               <small>Retained in Trouve · Not posted to GitHub by confidence policy</small>
+            )}
+            {finding.github_publication_status === "grouped_by_theme" && (
+              <small>Retained in Trouve · Represented by the shared root-cause comment on GitHub</small>
+            )}
+            {finding.evidence?.execution_path && (
+              <details>
+                <summary>Verification evidence</summary>
+                <dl>
+                  <dt>Preconditions</dt><dd>{finding.evidence.preconditions}</dd>
+                  <dt>Execution path</dt><dd>{finding.evidence.execution_path}</dd>
+                  <dt>Consequence</dt><dd>{finding.evidence.consequence}</dd>
+                  <dt>Introduced by</dt><dd>{finding.evidence.introduction}</dd>
+                  <dt>Regression test</dt><dd>{finding.evidence.regression_test}</dd>
+                </dl>
+              </details>
             )}
             <small>
               Found by {finding.sources.map((source) => source.reviewer_name).join(", ") || "legacy review"}
@@ -2544,6 +2583,18 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
   const [repository, setRepository] = useState("");
   const [stats, setStats] = useState<ReviewStats | null>(null);
   const [error, setError] = useState("");
+  const churn = stats?.churn ?? {
+    recurrence_issue_count: 0,
+    fix_regression_issue_count: 0,
+    previously_missed_issue_count: 0,
+    grouped_issue_count: 0,
+    external_duplicate_count: 0,
+    insufficient_evidence_rejection_count: 0,
+    pull_request_count: 0,
+    clean_pull_request_count: 0,
+    average_rounds_to_clean: 0,
+    max_rounds_to_clean: 0,
+  };
   useEffect(() => {
     let alive = true;
     getStats(range, repository)
@@ -2599,6 +2650,22 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
             <Metric label="Failed" value={stats.status.failed} color="red" />
             <Metric label="Issues found" value={stats.issue_count} color="amber" />
           </div>
+          <section class="panel">
+            <PanelTitle
+              title="Review churn"
+              subtitle={`${churn.clean_pull_request_count} of ${churn.pull_request_count} pull requests reached a clean review in this range.`}
+            />
+            <div class="metric-grid">
+              <Metric label="Recurrences" value={churn.recurrence_issue_count} color="red" />
+              <Metric label="Fix regressions" value={churn.fix_regression_issue_count} color="red" />
+              <Metric label="Previously missed" value={churn.previously_missed_issue_count} color="amber" />
+              <Metric label="Grouped symptoms" value={churn.grouped_issue_count} color="blue" />
+              <Metric label="External duplicates" value={churn.external_duplicate_count} color="green" />
+              <Metric label="Weak evidence rejected" value={churn.insufficient_evidence_rejection_count} color="green" />
+              <Metric label="Avg rounds to clean" value={Math.round(churn.average_rounds_to_clean * 10) / 10} color="blue" />
+              <Metric label="Max rounds to clean" value={churn.max_rounds_to_clean} color="amber" />
+            </div>
+          </section>
           <div class="chart-grid">
             <StatsChart
               title="Review outcomes"

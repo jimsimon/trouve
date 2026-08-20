@@ -327,6 +327,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   created_at TEXT NOT NULL,
   started_at TEXT,
   completed_at TEXT,
+  published_at TEXT,
   review_base_sha TEXT NOT NULL DEFAULT '',
   review_watermark_sha TEXT NOT NULL DEFAULT '',
   review_batch_digest TEXT NOT NULL DEFAULT '',
@@ -346,9 +347,11 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   candidate_issue_count INTEGER NOT NULL DEFAULT 0,
   issue_count INTEGER NOT NULL DEFAULT 0,
   fixed_issue_count INTEGER NOT NULL DEFAULT 0,
+  publication_open_issue_count INTEGER,
   summary TEXT NOT NULL DEFAULT '',
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   publication_claimed INTEGER NOT NULL DEFAULT 0,
+  publication_dispatched INTEGER NOT NULL DEFAULT 0,
   preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0,
   reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0,
   coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0,
@@ -434,6 +437,8 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   confidence TEXT NOT NULL DEFAULT 'medium',
   title TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL,
+  evidence TEXT NOT NULL DEFAULT '{}',
+  origin TEXT NOT NULL DEFAULT 'new_change',
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'open',
   github_comment_id INTEGER,
@@ -444,6 +449,8 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   github_thread_generation INTEGER NOT NULL DEFAULT 0,
   github_thread_recheck_pending INTEGER NOT NULL DEFAULT 0,
   resolved_at TEXT,
+  resolved_head TEXT NOT NULL DEFAULT '',
+  resolved_by_job_id TEXT NOT NULL DEFAULT '',
   collapse_pending INTEGER NOT NULL DEFAULT 0,
   collapse_attempts INTEGER NOT NULL DEFAULT 0,
   collapse_next_attempt_at TEXT,
@@ -464,6 +471,62 @@ CREATE TABLE IF NOT EXISTS code_review_finding_sources (
   reviewer_id TEXT NOT NULL,
   reviewer_name TEXT NOT NULL,
   PRIMARY KEY (finding_id, candidate_id)
+);
+CREATE TABLE IF NOT EXISTS code_review_themes (
+  id TEXT PRIMARY KEY,
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  root_cause TEXT NOT NULL,
+  recommendation TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open',
+  first_seen_head TEXT NOT NULL,
+  last_seen_head TEXT NOT NULL,
+  resolved_head TEXT NOT NULL DEFAULT '',
+  recurrence_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_review_themes_pr
+  ON code_review_themes (repository, pull_number, status, updated_at);
+CREATE TABLE IF NOT EXISTS code_review_theme_observations (
+  theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  head_sha TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  published INTEGER NOT NULL DEFAULT 0,
+  publication_managed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (theme_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS code_review_theme_observations_job
+  ON code_review_theme_observations (job_id, theme_id);
+CREATE TABLE IF NOT EXISTS code_review_theme_transitions (
+  theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  status TEXT NOT NULL,
+  last_seen_head TEXT NOT NULL,
+  resolved_head TEXT NOT NULL DEFAULT '',
+  recurrence_count INTEGER NOT NULL DEFAULT 0,
+  transitioned_at TEXT NOT NULL,
+  writer_version INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (theme_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS code_review_theme_transitions_job
+  ON code_review_theme_transitions (job_id, theme_id);
+CREATE TABLE IF NOT EXISTS code_review_finding_themes (
+  finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
+  theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+  linked_by_job_id TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (finding_id, theme_id)
+);
+CREATE INDEX IF NOT EXISTS code_review_finding_themes_theme
+  ON code_review_finding_themes (theme_id, finding_id);
+CREATE TABLE IF NOT EXISTS code_review_publication_manifest (
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
+  primary_finding_id TEXT NOT NULL,
+  publication_status TEXT NOT NULL,
+  PRIMARY KEY (job_id, finding_id)
 );
 CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
@@ -589,9 +652,11 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN candidate_issue_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN issue_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN fixed_issue_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_open_issue_count INTEGER",
     "ALTER TABLE code_review_jobs ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_for_agents TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_dispatched INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_accepted INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_generation INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_order INTEGER NOT NULL DEFAULT 0",
@@ -633,6 +698,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_tasks ADD COLUMN last_progress_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN github_publication_status TEXT NOT NULL DEFAULT 'pending'",
     "ALTER TABLE code_review_findings ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
+    "ALTER TABLE code_review_findings ADD COLUMN evidence TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE code_review_findings ADD COLUMN origin TEXT NOT NULL DEFAULT 'new_change'",
+    "ALTER TABLE code_review_findings ADD COLUMN resolved_head TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_findings ADD COLUMN resolved_by_job_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
     "ALTER TABLE code_review_findings ADD COLUMN title TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN title TEXT NOT NULL DEFAULT ''",
@@ -647,9 +716,12 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN publication_resolution_job_id TEXT",
-    "UPDATE code_review_jobs
-       SET publication_order = rowid
-       WHERE publication_order = 0 AND publication_claimed != 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN published_at TEXT",
+    "ALTER TABLE code_review_theme_transitions ADD COLUMN writer_version INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS code_review_theme_transitions_legacy_writer
+       ON code_review_theme_transitions (writer_version, theme_id)
+       WHERE writer_version = 0",
+    "ALTER TABLE code_review_finding_themes ADD COLUMN linked_by_job_id TEXT NOT NULL DEFAULT ''",
     "UPDATE code_review_pr_state
        SET last_reviewed_publication_order = COALESCE((
          SELECT MAX(job.publication_order)
@@ -667,6 +739,14 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
+    let had_theme_observation_publication_authority = conn.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('code_review_theme_observations')
+           WHERE name = 'published'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -675,8 +755,24 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
+    preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
+    migrate_code_review_theme_observation_publication_authority(
+        conn,
+        had_theme_observation_publication_authority,
+    )?;
+    backfill_code_review_published_at(conn)?;
+    normalize_code_review_publication_orders(conn)?;
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS code_review_theme_transition_repair_targets (
+           theme_id TEXT PRIMARY KEY
+         ) WITHOUT ROWID",
+    )?;
+    migrate_code_review_theme_transitions(conn, had_theme_observation_publication_authority)?;
+    repair_legacy_code_review_theme_transitions(conn)?;
+    promote_published_code_review_theme_observations(conn)?;
+    backfill_code_review_publication_dispatch(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
     migrate_general_persona_reviewer_references(conn)?;
@@ -688,6 +784,701 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+/// Existing snapshots from before publication authority were historical
+/// evidence only: their mutable theme aggregates remained authoritative. When
+/// writer provenance is first added, reserve a negative version for those rows
+/// so rollback repair never projects them. The durable publication-authority
+/// migration record, rather than column presence observed at startup, makes
+/// this safely resumable if a process stops after adding `writer_version` but
+/// before classifying its existing rows. The update is one atomic statement:
+/// its embedded authority check cannot become stale between a read and the
+/// write, and before it commits the missing authority record causes a retry.
+/// Afterward a retry is a no-op. Rollback writers run after authority was
+/// recorded and therefore retain the zero default for repair.
+fn preserve_pre_authority_code_review_theme_transitions(conn: &Connection) -> Result<()> {
+    const PUBLICATION_AUTHORITY_MIGRATION_ID: &str =
+        "code-review-theme-observation-publication-authority-v1";
+    conn.execute(
+        "UPDATE code_review_theme_transitions
+         SET writer_version = -1
+         WHERE writer_version = 0
+           AND NOT EXISTS (
+             SELECT 1 FROM store_migrations WHERE id = ?1
+           )",
+        [PUBLICATION_AUTHORITY_MIGRATION_ID],
+    )?;
+    Ok(())
+}
+
+/// Observations created without publication authority already changed their
+/// aggregate theme when the review result was saved. `publication_managed` is
+/// durable per-row provenance: new binaries write one, while pre-authority or
+/// rollback binaries omit it and receive the zero default. Classify every such
+/// row as consumed on every startup so rollback-created observations cannot be
+/// applied twice.
+fn migrate_code_review_theme_observation_publication_authority(
+    conn: &mut Connection,
+    had_publication_authority: bool,
+) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-theme-observation-publication-authority-v1";
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let has_published_column = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('code_review_theme_observations')
+           WHERE name = 'published'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_published_column {
+        tx.execute_batch(
+            "ALTER TABLE code_review_theme_observations
+               ADD COLUMN published INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let has_publication_managed_column = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('code_review_theme_observations')
+           WHERE name = 'publication_managed'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_publication_managed_column {
+        tx.execute_batch(
+            "ALTER TABLE code_review_theme_observations
+               ADD COLUMN publication_managed INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        if had_publication_authority {
+            // Transitional databases can contain both staged rows and rows
+            // whose rollback writer eagerly changed the aggregate. Normalize
+            // every row to managed provenance, derive its consumed state from
+            // durable job publication evidence, then rebuild the aggregate
+            // exactly once from that canonical history. This avoids guessing
+            // provenance from mutable theme state or discarding older staged
+            // observations. Pre-authority databases are excluded using the
+            // schema fact captured before this startup added `published`;
+            // their existing aggregate remains authoritative.
+            tx.execute(
+                "UPDATE code_review_theme_observations AS observation
+                 SET publication_managed = 1,
+                     published = EXISTS (
+                       SELECT 1 FROM code_review_jobs AS job
+                       WHERE job.id = observation.job_id
+                         AND job.review_published != 0
+                     )",
+                [],
+            )?;
+        }
+    }
+    tx.execute(
+        "UPDATE code_review_theme_observations
+         SET published = 1
+         WHERE publication_managed = 0 AND published = 0",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_code_review_theme_transitions(
+    conn: &mut Connection,
+    had_publication_authority: bool,
+) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-theme-transitions-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    record_code_review_theme_transition_snapshots(&tx, "", "", false)?;
+    if had_publication_authority {
+        apply_code_review_theme_transition_snapshots(&tx, "", false)?;
+    }
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Reconcile transition snapshots written by rollback binaries. Writer
+/// provenance lives on each snapshot rather than on observations: binaries
+/// predating the transition fold produce no rows, while rollback binaries that
+/// know the table omit writer_version and therefore leave its zero default.
+/// Rebuilt snapshots carry the current version, making this repair both
+/// repeatable after a rollback and a no-op on ordinary startups.
+fn repair_legacy_code_review_theme_transitions(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-theme-transitions-v2";
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "DELETE FROM code_review_theme_transition_repair_targets",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO code_review_theme_transition_repair_targets (theme_id)
+         SELECT DISTINCT theme_id
+         FROM code_review_theme_transitions
+         WHERE writer_version = 0",
+        [],
+    )?;
+    let has_targets = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM code_review_theme_transition_repair_targets
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if has_targets {
+        tx.execute(
+            "DELETE FROM code_review_theme_transitions
+             WHERE theme_id IN (
+               SELECT theme_id FROM code_review_theme_transition_repair_targets
+             )",
+            [],
+        )?;
+        record_code_review_theme_transition_snapshots(&tx, "", "", true)?;
+        apply_code_review_theme_transition_snapshots(&tx, "", true)?;
+    }
+    tx.execute(
+        "DELETE FROM code_review_theme_transition_repair_targets",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Records the final state established for each theme by one published review.
+/// An empty job filter backfills all published history during migration. The
+/// snapshot folds only publication-scoped observations, links, and closures;
+/// mutable theme aggregates never participate in reconstruction. Fixed or
+/// dismissed rows that predate resolver provenance close at their recorded
+/// resolution time, or only at the latest known snapshot when that time is
+/// absent. Provenance-aware closures require a published resolver job.
+fn record_code_review_theme_transition_snapshots(
+    tx: &rusqlite::Transaction<'_>,
+    job_filter: &str,
+    transitioned_at_override: &str,
+    repair_targets_only: bool,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO code_review_theme_transitions
+           (theme_id, job_id, status, last_seen_head, resolved_head,
+            recurrence_count, transitioned_at, writer_version)
+         WITH all_candidates(theme_id, job_id) AS (
+           SELECT observation.theme_id, observation.job_id
+           FROM code_review_theme_observations AS observation
+           JOIN code_review_jobs AS observation_job
+             ON observation_job.id = observation.job_id
+           WHERE observation.published != 0
+             AND observation_job.review_published != 0
+             AND (
+               NOT ?3
+               OR EXISTS (
+                 SELECT 1
+                 FROM code_review_theme_transition_repair_targets AS target
+                 WHERE target.theme_id = observation.theme_id
+               )
+             )
+           UNION
+           SELECT finding_theme.theme_id, resolver.id
+           FROM code_review_finding_themes AS finding_theme
+           JOIN code_review_findings AS finding
+             ON finding.id = finding_theme.finding_id
+           JOIN code_review_jobs AS finding_job
+             ON finding_job.id = finding.job_id
+           LEFT JOIN code_review_jobs AS link_job
+             ON link_job.id = finding_theme.linked_by_job_id
+           JOIN code_review_jobs AS resolver
+             ON resolver.id = finding.resolved_by_job_id
+           WHERE finding_job.review_published != 0
+             AND finding_job.publication_order <= resolver.publication_order
+             AND (
+               finding_theme.linked_by_job_id = ''
+               OR (
+                 link_job.review_published != 0
+                 AND link_job.publication_order <= resolver.publication_order
+               )
+             )
+             AND resolver.review_published != 0
+             AND (
+               NOT ?3
+               OR EXISTS (
+                 SELECT 1
+                 FROM code_review_theme_transition_repair_targets AS target
+                 WHERE target.theme_id = finding_theme.theme_id
+               )
+             )
+           UNION
+           SELECT finding_theme.theme_id, legacy_resolver.id
+           FROM code_review_finding_themes AS finding_theme
+           JOIN code_review_findings AS finding
+             ON finding.id = finding_theme.finding_id
+           JOIN code_review_jobs AS finding_job
+             ON finding_job.id = finding.job_id
+           JOIN code_review_jobs AS legacy_resolver
+             ON legacy_resolver.repository = finding_job.repository
+            AND legacy_resolver.pull_number = finding_job.pull_number
+            AND legacy_resolver.head_sha = finding.resolved_head
+           WHERE finding.resolved_by_job_id = ''
+             AND finding.status IN ('fixed', 'dismissed')
+             AND finding.resolved_head != ''
+             AND finding_job.review_published != 0
+             AND legacy_resolver.review_published != 0
+             AND finding_job.publication_order
+                 <= legacy_resolver.publication_order
+             AND (
+               NOT ?3
+               OR EXISTS (
+                 SELECT 1
+                 FROM code_review_theme_transition_repair_targets AS target
+                 WHERE target.theme_id = finding_theme.theme_id
+               )
+             )
+         ),
+         candidates(theme_id, job_id) AS (
+           SELECT theme_id, job_id
+           FROM all_candidates
+           WHERE ?1 = '' OR job_id = ?1
+         ),
+         candidate_snapshots AS (
+           SELECT candidate.theme_id, candidate.job_id,
+                  snapshot_job.head_sha, snapshot_job.publication_order
+           FROM candidates AS candidate
+           JOIN code_review_jobs AS snapshot_job
+             ON snapshot_job.id = candidate.job_id
+           WHERE snapshot_job.review_published != 0
+         ),
+         snapshot_inputs AS (
+           SELECT snapshot.theme_id, snapshot.job_id,
+                  snapshot.head_sha, snapshot.publication_order,
+                  EXISTS (
+                    SELECT 1
+                    FROM code_review_finding_themes AS finding_theme
+                    JOIN code_review_findings AS finding
+                      ON finding.id = finding_theme.finding_id
+                    JOIN code_review_jobs AS finding_job
+                      ON finding_job.id = finding.job_id
+                    LEFT JOIN code_review_jobs AS link_job
+                      ON link_job.id = finding_theme.linked_by_job_id
+                    LEFT JOIN code_review_jobs AS resolver
+                      ON resolver.id = finding.resolved_by_job_id
+                    WHERE finding_theme.theme_id = snapshot.theme_id
+                      AND finding_job.review_published != 0
+                      AND finding_job.publication_order
+                          <= snapshot.publication_order
+                      AND (
+                        finding_theme.linked_by_job_id = ''
+                        OR (
+                          link_job.review_published != 0
+                          AND link_job.publication_order
+                              <= snapshot.publication_order
+                        )
+                      )
+                      AND (
+                        (
+                          finding.resolved_by_job_id = ''
+                          AND (
+                            finding.status NOT IN ('fixed', 'dismissed')
+                            OR snapshot.publication_order < COALESCE((
+                              SELECT MIN(legacy_resolver.publication_order)
+                              FROM code_review_jobs AS legacy_resolver
+                              WHERE legacy_resolver.repository
+                                      = finding_job.repository
+                                AND legacy_resolver.pull_number
+                                      = finding_job.pull_number
+                                AND legacy_resolver.head_sha
+                                      = finding.resolved_head
+                                AND legacy_resolver.review_published != 0
+                                AND julianday(finding.resolved_at) IS NOT NULL
+                                AND julianday(legacy_resolver.published_at)
+                                      >= julianday(finding.resolved_at)
+                            ), CASE
+                              WHEN julianday(finding.resolved_at) IS NULL THEN (
+                                SELECT MAX(legacy_resolver.publication_order)
+                                FROM code_review_jobs AS legacy_resolver
+                                WHERE legacy_resolver.repository
+                                        = finding_job.repository
+                                  AND legacy_resolver.pull_number
+                                        = finding_job.pull_number
+                                  AND legacy_resolver.head_sha
+                                        = finding.resolved_head
+                                  AND finding.resolved_head != ''
+                                  AND legacy_resolver.review_published != 0
+                              )
+                            END, CASE
+                              WHEN julianday(finding.resolved_at) IS NULL THEN (
+                                SELECT MAX(candidate_job.publication_order)
+                                FROM all_candidates AS all_candidate
+                                JOIN code_review_jobs AS candidate_job
+                                  ON candidate_job.id = all_candidate.job_id
+                                WHERE all_candidate.theme_id = snapshot.theme_id
+                              )
+                            END, 9223372036854775807)
+                          )
+                        )
+                        OR (
+                          finding.resolved_by_job_id != ''
+                          AND (
+                            resolver.id IS NULL
+                            OR resolver.review_published = 0
+                            OR resolver.publication_order
+                                > snapshot.publication_order
+                          )
+                        )
+                      )
+                  ) AS has_open_finding
+           FROM candidate_snapshots AS snapshot
+         )
+         SELECT snapshot.theme_id, snapshot.job_id,
+                CASE WHEN snapshot.has_open_finding THEN 'open' ELSE 'resolved' END,
+                COALESCE((
+                  SELECT observation.head_sha
+                  FROM code_review_theme_observations AS observation
+                  JOIN code_review_jobs AS observation_job
+                    ON observation_job.id = observation.job_id
+                  WHERE observation.theme_id = snapshot.theme_id
+                    AND observation.published != 0
+                    AND observation_job.review_published != 0
+                    AND observation_job.publication_order
+                        <= snapshot.publication_order
+                  ORDER BY observation_job.publication_order DESC,
+                           observation_job.rowid DESC, observation.rowid DESC
+                  LIMIT 1
+                ), snapshot.head_sha),
+                CASE WHEN snapshot.has_open_finding THEN '' ELSE snapshot.head_sha END,
+                (
+                  SELECT COUNT(*)
+                  FROM code_review_theme_observations AS observation
+                  JOIN code_review_jobs AS observation_job
+                    ON observation_job.id = observation.job_id
+                  WHERE observation.theme_id = snapshot.theme_id
+                    AND observation.published != 0
+                    AND observation.kind = 'recurrence'
+                    AND observation_job.review_published != 0
+                    AND observation_job.publication_order
+                        <= snapshot.publication_order
+                ),
+                COALESCE(NULLIF(?2, ''), (
+                  SELECT NULLIF(MAX(finding.resolved_at), '')
+                  FROM code_review_finding_themes AS finding_theme
+                  JOIN code_review_findings AS finding
+                    ON finding.id = finding_theme.finding_id
+                  JOIN code_review_jobs AS finding_job
+                    ON finding_job.id = finding.job_id
+                  LEFT JOIN code_review_jobs AS link_job
+                    ON link_job.id = finding_theme.linked_by_job_id
+                  WHERE finding_theme.theme_id = snapshot.theme_id
+                    AND finding.resolved_by_job_id = snapshot.job_id
+                    AND finding_job.review_published != 0
+                    AND (
+                      finding_theme.linked_by_job_id = ''
+                      OR link_job.review_published != 0
+                    )
+                ), (
+                  SELECT COALESCE(
+                    job.published_at, job.completed_at, job.started_at, job.created_at
+                  )
+                  FROM code_review_jobs AS job
+                  WHERE job.id = snapshot.job_id
+                )), 1
+         FROM snapshot_inputs AS snapshot",
+        params![job_filter, transitioned_at_override, repair_targets_only],
+    )?;
+    Ok(())
+}
+
+fn apply_code_review_theme_transition_snapshots(
+    tx: &rusqlite::Transaction<'_>,
+    job_filter: &str,
+    repair_targets_only: bool,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE code_review_themes AS theme
+         SET status = (
+               SELECT transition.status
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             ),
+             last_seen_head = (
+               SELECT transition.last_seen_head
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             ),
+             resolved_head = (
+               SELECT transition.resolved_head
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             ),
+             recurrence_count = (
+               SELECT transition.recurrence_count
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             ),
+             updated_at = (
+               SELECT transition.transitioned_at
+               FROM code_review_theme_transitions AS transition
+               JOIN code_review_jobs AS job ON job.id = transition.job_id
+               WHERE transition.theme_id = theme.id
+               ORDER BY job.publication_order DESC, job.rowid DESC
+               LIMIT 1
+             )
+         WHERE EXISTS (
+           SELECT 1 FROM code_review_theme_transitions AS transition
+           WHERE transition.theme_id = theme.id
+         )
+           AND (
+             ?1 = ''
+             OR EXISTS (
+               SELECT 1 FROM code_review_theme_transitions AS current_transition
+               WHERE current_transition.theme_id = theme.id
+                 AND current_transition.job_id = ?1
+             )
+           )
+           AND (
+             NOT ?2
+             OR EXISTS (
+               SELECT 1
+               FROM code_review_theme_transition_repair_targets AS target
+               WHERE target.theme_id = theme.id
+             )
+           )",
+        params![job_filter, repair_targets_only],
+    )?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CodeReviewPublicationOrderRecoveryJob {
+    id: String,
+    publication_order: i64,
+    review_id: Option<u64>,
+    published_at: String,
+    rowid: i64,
+}
+
+fn code_review_id_from_url(url: &str) -> Option<u64> {
+    let suffix = url.rsplit_once("#pullrequestreview-")?.1;
+    let digits = suffix
+        .split(|character: char| !character.is_ascii_digit())
+        .next()?;
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn compare_code_review_publication_evidence(
+    left: &CodeReviewPublicationOrderRecoveryJob,
+    right: &CodeReviewPublicationOrderRecoveryJob,
+) -> std::cmp::Ordering {
+    left.review_id
+        .is_none()
+        .cmp(&right.review_id.is_none())
+        .then_with(|| left.review_id.cmp(&right.review_id))
+        .then_with(|| left.published_at.cmp(&right.published_at))
+        .then_with(|| left.rowid.cmp(&right.rowid))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+/// Retain the publication instant independently from job completion. Exact
+/// resolver timestamps are strongest for existing rows; published theme
+/// observations and lifecycle timestamps provide bounded legacy fallbacks.
+fn backfill_code_review_published_at(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE code_review_jobs AS job
+         SET published_at = COALESCE((
+               SELECT MAX(finding.resolved_at)
+               FROM code_review_findings AS finding
+               WHERE finding.resolved_by_job_id = job.id
+                 AND NULLIF(finding.resolved_at, '') IS NOT NULL
+             ), job.completed_at, (
+               SELECT MAX(observation.created_at)
+               FROM code_review_theme_observations AS observation
+               WHERE observation.job_id = job.id
+                 AND observation.published != 0
+             ), job.started_at, job.created_at)
+         WHERE job.review_published != 0
+           AND job.published_at IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Publication orders are counters scoped to one pull request. Legacy or
+/// rollback-created rows can have a zero order, so comparing their global
+/// rowid directly with modern per-pull counters is invalid. Merge those rows
+/// into the established sequence using one transitive durable key. GitHub
+/// review ids are canonical publication evidence when present; rows without
+/// one form a separate fallback group ordered by persisted lifecycle time,
+/// rowid, then id. This never changes the relative order of jobs that already
+/// have authoritative nonzero values.
+fn normalize_code_review_publication_orders(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let affected_pulls = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT repository, pull_number
+             FROM code_review_jobs
+             WHERE publication_order = 0
+               AND (publication_claimed != 0 OR review_published != 0)",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if affected_pulls.is_empty() {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    for (repository, pull_number) in affected_pulls {
+        let mut jobs = {
+            let mut stmt = tx.prepare(
+                "SELECT id, publication_order, review_url,
+                        COALESCE(published_at, completed_at, started_at, created_at), rowid
+                 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2
+                   AND (publication_claimed != 0 OR review_published != 0)",
+            )?;
+            stmt.query_map(params![repository, pull_number], |row| {
+                let review_url = row.get::<_, String>(2)?;
+                Ok(CodeReviewPublicationOrderRecoveryJob {
+                    id: row.get(0)?,
+                    publication_order: row.get(1)?,
+                    review_id: code_review_id_from_url(&review_url),
+                    published_at: row.get(3)?,
+                    rowid: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let (mut established, mut missing): (Vec<_>, Vec<_>) =
+            jobs.drain(..).partition(|job| job.publication_order != 0);
+        established.sort_by(|left, right| {
+            left.publication_order
+                .cmp(&right.publication_order)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        missing.sort_by(compare_code_review_publication_evidence);
+
+        let mut insertion_buckets: Vec<Vec<_>> =
+            (0..=established.len()).map(|_| Vec::new()).collect();
+        for job in missing {
+            let insertion_index = established
+                .iter()
+                .filter(|established_job| {
+                    compare_code_review_publication_evidence(established_job, &job)
+                        != std::cmp::Ordering::Greater
+                })
+                .count();
+            insertion_buckets[insertion_index].push(job);
+        }
+        let mut normalized = Vec::new();
+        let mut established = established.into_iter();
+        for bucket in insertion_buckets {
+            normalized.extend(bucket);
+            if let Some(job) = established.next() {
+                normalized.push(job);
+            }
+        }
+        for (index, job) in normalized.into_iter().enumerate() {
+            tx.execute(
+                "UPDATE code_review_jobs SET publication_order = ?2 WHERE id = ?1",
+                params![job.id, index as i64 + 1],
+            )?;
+        }
+        tx.execute(
+            "UPDATE code_review_pr_state
+             SET last_reviewed_publication_order = COALESCE((
+               SELECT MAX(job.publication_order)
+               FROM code_review_jobs AS job
+               WHERE job.repository = code_review_pr_state.repository
+                 AND job.pull_number = code_review_pr_state.pull_number
+                 AND job.head_sha = code_review_pr_state.last_reviewed_head_sha
+                 AND job.review_published != 0
+             ), 0)
+             WHERE repository = ?1 AND pull_number = ?2",
+            params![repository, pull_number],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn promote_published_code_review_theme_observations(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let jobs = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT job.id, job.repository, job.pull_number, job.head_sha,
+                    COALESCE(job.completed_at, job.started_at, job.created_at)
+             FROM code_review_jobs job
+             JOIN code_review_theme_observations observation ON observation.job_id = job.id
+             WHERE job.review_published != 0 AND observation.published = 0
+             ORDER BY job.repository, job.pull_number, job.publication_order, job.id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (job_id, repository, pull_number, head_sha, published_at) in jobs {
+        finalize_code_review_theme_publication(
+            &tx,
+            &job_id,
+            &repository,
+            pull_number as u64,
+            &head_sha,
+            &published_at,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -760,6 +1551,37 @@ fn migrate_general_persona_reviewer_references(conn: &mut Connection) -> Result<
         "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
         params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
     )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Older databases recorded only `publication_claimed`. A claimed row may
+/// have crossed the GitHub boundary before the old process stopped, so the
+/// one-time upgrade must classify it conservatively as dispatched. New
+/// databases record the boundary directly and never rerun this backfill.
+fn backfill_code_review_publication_dispatch(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-publication-dispatch-backfill-v1";
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !applied {
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET publication_dispatched = 1
+             WHERE publication_claimed != 0",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+            params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1989,9 +2811,161 @@ fn code_review_publication_status(
         "suppressed_by_policy" => {
             trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
         }
+        "grouped_by_theme" => trouve_protocol::CodeReviewFindingPublicationStatus::GroupedByTheme,
         "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
         _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
     }
+}
+
+fn code_review_finding_origin(value: &str) -> trouve_protocol::CodeReviewFindingOrigin {
+    match value {
+        "recurrence" => trouve_protocol::CodeReviewFindingOrigin::Recurrence,
+        "fix_regression" => trouve_protocol::CodeReviewFindingOrigin::FixRegression,
+        "previously_missed" => trouve_protocol::CodeReviewFindingOrigin::PreviouslyMissed,
+        _ => trouve_protocol::CodeReviewFindingOrigin::NewChange,
+    }
+}
+
+fn code_review_finding_origin_str(value: trouve_protocol::CodeReviewFindingOrigin) -> &'static str {
+    match value {
+        trouve_protocol::CodeReviewFindingOrigin::NewChange => "new_change",
+        trouve_protocol::CodeReviewFindingOrigin::Recurrence => "recurrence",
+        trouve_protocol::CodeReviewFindingOrigin::FixRegression => "fix_regression",
+        trouve_protocol::CodeReviewFindingOrigin::PreviouslyMissed => "previously_missed",
+    }
+}
+
+fn code_review_theme_observation_kind(
+    value: &str,
+) -> trouve_protocol::CodeReviewThemeObservationKind {
+    match value {
+        "continuation" => trouve_protocol::CodeReviewThemeObservationKind::Continuation,
+        "recurrence" => trouve_protocol::CodeReviewThemeObservationKind::Recurrence,
+        _ => trouve_protocol::CodeReviewThemeObservationKind::New,
+    }
+}
+
+fn code_review_theme_observation_kind_str(
+    value: trouve_protocol::CodeReviewThemeObservationKind,
+) -> &'static str {
+    match value {
+        trouve_protocol::CodeReviewThemeObservationKind::New => "new",
+        trouve_protocol::CodeReviewThemeObservationKind::Continuation => "continuation",
+        trouve_protocol::CodeReviewThemeObservationKind::Recurrence => "recurrence",
+    }
+}
+
+fn scoped_code_review_theme_id(
+    repository: &str,
+    pull_number: i64,
+    theme_id: &str,
+    existing_theme_ids: &HashSet<String>,
+) -> String {
+    if existing_theme_ids.contains(theme_id) {
+        theme_id.to_owned()
+    } else {
+        format!("{repository}#{pull_number}:{theme_id}")
+    }
+}
+
+fn publish_code_review_theme_observations(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    published_at: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE code_review_themes
+         SET status = 'open',
+             last_seen_head = COALESCE((
+               SELECT observation.head_sha
+               FROM code_review_theme_observations observation
+               WHERE observation.theme_id = code_review_themes.id
+                 AND observation.job_id = ?1 AND observation.published = 0
+             ), last_seen_head),
+             resolved_head = '',
+             recurrence_count = recurrence_count + CASE WHEN EXISTS (
+               SELECT 1 FROM code_review_theme_observations observation
+               WHERE observation.theme_id = code_review_themes.id
+                 AND observation.job_id = ?1 AND observation.published = 0
+                 AND observation.kind = 'recurrence'
+             ) THEN 1 ELSE 0 END,
+             updated_at = ?2
+         WHERE EXISTS (
+           SELECT 1 FROM code_review_theme_observations observation
+           WHERE observation.theme_id = code_review_themes.id
+             AND observation.job_id = ?1 AND observation.published = 0
+         )",
+        params![job_id, published_at],
+    )?;
+    tx.execute(
+        "UPDATE code_review_theme_observations SET published = 1
+         WHERE job_id = ?1 AND published = 0",
+        params![job_id],
+    )?;
+    Ok(())
+}
+
+fn resolve_code_review_themes_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    repository: &str,
+    pull_number: u64,
+    resolved_head: &str,
+    resolved_at: &str,
+) -> Result<u64> {
+    Ok(tx.execute(
+        "UPDATE code_review_themes
+         SET status = 'resolved', resolved_head = ?3, updated_at = ?4
+         WHERE repository = ?1 AND pull_number = ?2 AND status = 'open'
+           AND EXISTS (
+             SELECT 1 FROM code_review_theme_observations observation
+             WHERE observation.theme_id = code_review_themes.id
+               AND observation.published != 0
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM code_review_finding_themes ft
+             JOIN code_review_findings f ON f.id = ft.finding_id
+             JOIN code_review_jobs j ON j.id = f.job_id
+             LEFT JOIN code_review_jobs link_job ON link_job.id = ft.linked_by_job_id
+             WHERE ft.theme_id = code_review_themes.id
+               AND f.status = 'open' AND j.review_published != 0
+               AND (ft.linked_by_job_id = '' OR link_job.review_published != 0)
+           )",
+        params![repository, pull_number as i64, resolved_head, resolved_at],
+    )? as u64)
+}
+
+fn finalize_code_review_theme_publication(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    repository: &str,
+    pull_number: u64,
+    head_sha: &str,
+    published_at: &str,
+) -> Result<()> {
+    publish_code_review_theme_observations(tx, job_id, published_at)?;
+    resolve_code_review_themes_in_transaction(tx, repository, pull_number, head_sha, published_at)?;
+    record_code_review_theme_transition_snapshots(tx, job_id, published_at, false)?;
+    apply_code_review_theme_transition_snapshots(tx, job_id, false)?;
+    Ok(())
+}
+
+fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE code_review_jobs
+         SET publication_open_issue_count = (
+           SELECT COUNT(*)
+           FROM code_review_findings finding
+           JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+           WHERE finding_job.repository = code_review_jobs.repository
+             AND finding_job.pull_number = code_review_jobs.pull_number
+             AND finding_job.review_published != 0
+             AND finding.status = 'open'
+         )
+         WHERE id = ?1",
+        params![job_id],
+    )?;
+    Ok(())
 }
 
 fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -2128,6 +3102,9 @@ pub struct CodeReviewJobRecord {
     pub summary: String,
     pub prompt_for_agents: String,
     pub publication_claimed: bool,
+    /// The GitHub POST may have crossed the process boundary. Once set, a
+    /// retry must reconcile by the stable marker instead of posting again.
+    pub publication_dispatched: bool,
     pub publication_accepted: bool,
     pub review_published: bool,
     pub blocking_review_cleanup_pending: bool,
@@ -2244,6 +3221,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         publication_accepted: r.get(52)?,
         review_published: r.get(53)?,
         blocking_review_cleanup_pending: r.get(54)?,
+        publication_dispatched: r.get(55)?,
     })
 }
 
@@ -2256,7 +3234,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
-     review_published, blocking_review_cleanup_pending";
+     review_published, blocking_review_cleanup_pending, publication_dispatched";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -2591,6 +3569,22 @@ pub(crate) struct CodeReviewFindingThreadState {
     pub is_resolved: Option<bool>,
     pub generation: u64,
     pub recheck_pending: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NewCodeReviewFindingDetails {
+    pub evidence: trouve_protocol::CodeReviewFindingEvidence,
+    pub origin: trouve_protocol::CodeReviewFindingOrigin,
+    pub theme_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewCodeReviewTheme {
+    pub id: String,
+    pub root_cause: String,
+    pub recommendation: String,
+    pub observation_kind: trouve_protocol::CodeReviewThemeObservationKind,
+    pub previous_finding_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7305,8 +8299,8 @@ impl Store {
         allow_new_state: bool,
         max_attempts: u64,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let competing_job_exists: bool = tx.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM code_review_jobs
@@ -7682,14 +8676,17 @@ impl Store {
                  completed_at = ?1,
                  error = CASE
                      WHEN publication_accepted != 0 THEN ''
-                     ELSE 'server restarted before review publication was accepted; retry required'
+                     WHEN publication_dispatched != 0
+                         THEN 'server restarted while GitHub review publication was in flight; reconciling before retry'
+                     ELSE 'server restarted before GitHub review publication was dispatched; retry required'
                  END,
                  publication_claimed = CASE
-                     WHEN publication_accepted != 0 THEN publication_claimed
+                     WHEN publication_accepted != 0 OR publication_dispatched != 0
+                         THEN publication_claimed
                      ELSE 0
                  END,
                  check_sync_error = CASE
-                     WHEN publication_accepted != 0
+                     WHEN publication_accepted != 0 OR publication_dispatched != 0
                          THEN 'review publication requires reconciliation'
                      ELSE ''
                  END,
@@ -7738,7 +8735,7 @@ impl Store {
             "UPDATE code_review_jobs
              SET status = 'running', started_at = ?2, completed_at = NULL,
                  cancel_requested = 0, publication_claimed = 0,
-                 publication_accepted = 0, error = ''
+                 publication_dispatched = 0, publication_accepted = 0, error = ''
              WHERE id = ?1 AND status = 'queued'",
             params![id, chrono::Utc::now().to_rfc3339()],
         )?;
@@ -8556,7 +9553,7 @@ impl Store {
             "UPDATE code_review_jobs
              SET status = 'queued', started_at = NULL, completed_at = NULL,
                  error = '', cancel_requested = 0, publication_claimed = 0,
-                 publication_accepted = 0,
+                 publication_dispatched = 0, publication_accepted = 0,
                  completed_reviewers = MAX(completed_reviewers - 1, 0)
              WHERE id = ?1 AND status = 'failed'",
             params![id],
@@ -8582,8 +9579,59 @@ impl Store {
         findings: &[NewCodeReviewFinding],
         candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.save_code_review_result_with_themes(
+            job_id,
+            summary,
+            prompt_for_agents,
+            candidate_issue_count,
+            findings,
+            &[],
+            &[],
+            candidate_rejections,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_code_review_result_with_themes(
+        &self,
+        job_id: &str,
+        summary: &str,
+        prompt_for_agents: &str,
+        candidate_issue_count: u64,
+        findings: &[NewCodeReviewFinding],
+        finding_details: &[NewCodeReviewFindingDetails],
+        themes: &[NewCodeReviewTheme],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        if !finding_details.is_empty() && finding_details.len() != findings.len() {
+            anyhow::bail!("review finding details must align with findings");
+        }
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        let (repository, pull_number, head_sha): (String, i64, String) = tx.query_row(
+            "SELECT repository, pull_number, head_sha FROM code_review_jobs WHERE id = ?1",
+            params![job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let mut existing_theme_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM code_review_themes
+                 WHERE repository = ?1 AND pull_number = ?2",
+            )?;
+            stmt.query_map(params![repository, pull_number], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<HashSet<_>>>()?
+        };
+        tx.execute(
+            "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_finding_themes
+             WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
+            params![job_id],
+        )?;
         tx.execute(
             "DELETE FROM code_review_finding_sources
              WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
@@ -8604,13 +9652,84 @@ impl Store {
             params![job_id],
         )?;
         let now = chrono::Utc::now().to_rfc3339();
-        for finding in findings {
+        let mut scoped_theme_ids = HashMap::<String, String>::new();
+        for theme in themes {
+            let theme_id = scoped_theme_ids
+                .entry(theme.id.clone())
+                .or_insert_with(|| {
+                    scoped_code_review_theme_id(
+                        &repository,
+                        pull_number,
+                        &theme.id,
+                        &existing_theme_ids,
+                    )
+                })
+                .clone();
+            existing_theme_ids.insert(theme_id.clone());
+            tx.execute(
+                "INSERT INTO code_review_themes
+                        (id, repository, pull_number, root_cause, recommendation, status,
+                         first_seen_head, last_seen_head, resolved_head, recurrence_count,
+                         created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6, '', 0, ?7, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     root_cause = excluded.root_cause,
+                     recommendation = excluded.recommendation
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM code_review_theme_observations existing
+                     WHERE existing.theme_id = excluded.id AND existing.published != 0
+                 )",
+                params![
+                    theme_id,
+                    repository,
+                    pull_number,
+                    theme.root_cause,
+                    theme.recommendation,
+                    head_sha,
+                    now,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO code_review_theme_observations
+                        (theme_id, job_id, head_sha, kind, published,
+                         publication_managed, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)",
+                params![
+                    theme_id,
+                    job_id,
+                    head_sha,
+                    code_review_theme_observation_kind_str(theme.observation_kind),
+                    now,
+                ],
+            )?;
+            for finding_id in &theme.previous_finding_ids {
+                tx.execute(
+                    "INSERT INTO code_review_finding_themes
+                            (finding_id, theme_id, linked_by_job_id)
+                     SELECT f.id, ?2, ?5
+                     FROM code_review_findings f
+                     JOIN code_review_jobs j ON j.id = f.job_id
+                     WHERE f.id = ?1 AND j.repository = ?3 AND j.pull_number = ?4
+                     ON CONFLICT(finding_id, theme_id) DO UPDATE SET
+                       linked_by_job_id = excluded.linked_by_job_id
+                     WHERE code_review_finding_themes.linked_by_job_id != ''
+                       AND NOT EXISTS (
+                          SELECT 1 FROM code_review_jobs link_job
+                          WHERE link_job.id = code_review_finding_themes.linked_by_job_id
+                            AND link_job.review_published != 0
+                        )",
+                    params![finding_id, theme_id, repository, pull_number, job_id],
+                )?;
+            }
+        }
+        for (index, finding) in findings.iter().enumerate() {
+            let details = finding_details.get(index).cloned().unwrap_or_default();
             let finding_id = crate::new_id("rvf");
             tx.execute(
                 "INSERT INTO code_review_findings
                         (id, job_id, path, line, side, severity, confidence, title, body,
-                         prompt_for_agents, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'open', ?11)",
+                         evidence, origin, prompt_for_agents, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open', ?13)",
                 params![
                     finding_id,
                     job_id,
@@ -8621,10 +9740,28 @@ impl Store {
                     finding.confidence,
                     finding.title,
                     finding.body,
+                    serde_json::to_string(&details.evidence)?,
+                    code_review_finding_origin_str(details.origin),
                     finding.prompt_for_agents,
                     now,
                 ],
             )?;
+            for theme_id in &details.theme_ids {
+                let theme_id = scoped_theme_ids.get(theme_id).cloned().unwrap_or_else(|| {
+                    scoped_code_review_theme_id(
+                        &repository,
+                        pull_number,
+                        theme_id,
+                        &existing_theme_ids,
+                    )
+                });
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_finding_themes
+                            (finding_id, theme_id, linked_by_job_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![finding_id, theme_id, job_id],
+                )?;
+            }
             for source in &finding.sources {
                 tx.execute(
                     "INSERT INTO code_review_finding_sources
@@ -8789,6 +9926,9 @@ impl Store {
             trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy => {
                 "suppressed_by_policy"
             }
+            trouve_protocol::CodeReviewFindingPublicationStatus::GroupedByTheme => {
+                "grouped_by_theme"
+            }
             trouve_protocol::CodeReviewFindingPublicationStatus::Failed => "failed",
         };
         let conn = self.conn.lock().unwrap();
@@ -8796,7 +9936,9 @@ impl Store {
         let mut updated = 0;
         for id in ids {
             updated += tx.execute(
-                "UPDATE code_review_findings SET github_publication_status = ?2 WHERE id = ?1",
+                "UPDATE code_review_findings
+                 SET github_publication_status = ?2
+                 WHERE id = ?1 AND github_publication_status != ?2",
                 params![id, status],
             )?;
         }
@@ -8812,8 +9954,8 @@ impl Store {
         job_id: &str,
         finding_ids: &[&str],
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let current = tx.query_row(
             "SELECT EXISTS (
                SELECT 1 FROM code_review_jobs
@@ -8843,10 +9985,17 @@ impl Store {
     /// row's own github_comment_id decides — not a caller snapshot, which
     /// may predate the comment's publication by a concurrent round. Arming
     /// resets retry metadata: an open row cannot carry meaningful backoff.
-    pub fn resolve_code_review_finding(&self, id: &str, status: &str) -> Result<bool> {
+    pub fn resolve_code_review_finding(
+        &self,
+        id: &str,
+        status: &str,
+        resolved_head: &str,
+        resolved_by_job_id: &str,
+    ) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
              SET status = ?2, resolved_at = ?3,
+                 resolved_head = ?4, resolved_by_job_id = ?5,
                  collapse_attempts = CASE
                      WHEN github_comment_id IS NOT NULL THEN 0
                      ELSE collapse_attempts
@@ -8860,7 +10009,13 @@ impl Store {
                      ELSE 0
                  END
              WHERE id = ?1 AND status = 'open'",
-            params![id, status, chrono::Utc::now().to_rfc3339()],
+            params![
+                id,
+                status,
+                chrono::Utc::now().to_rfc3339(),
+                resolved_head,
+                resolved_by_job_id
+            ],
         )? > 0)
     }
 
@@ -8980,9 +10135,10 @@ impl Store {
         let mut stmt = conn.prepare(&format!(
             "SELECT j.installation_id, j.repository, j.pull_number,
                     f.id, f.job_id, f.path, f.line, f.side, f.severity, f.confidence, f.title, f.body,
-                    f.prompt_for_agents, f.status, f.github_comment_id,
+                    f.evidence, f.origin, f.prompt_for_agents, f.status, f.github_comment_id,
                     f.github_comment_url, f.github_publication_status,
-                    f.github_thread_id, f.resolved_at
+                    f.github_thread_id, f.resolved_at,
+                    j.head_sha, f.resolved_head, f.resolved_by_job_id
              FROM code_review_findings f
              JOIN code_review_jobs j ON j.id = f.job_id
              WHERE f.collapse_pending = 1
@@ -9016,16 +10172,23 @@ impl Store {
                         confidence: row.get(9)?,
                         title: row.get(10)?,
                         body: row.get(11)?,
-                        prompt_for_agents: row.get(12)?,
-                        status: row.get(13)?,
+                        evidence: serde_json::from_str(&row.get::<_, String>(12)?)
+                            .unwrap_or_default(),
+                        origin: code_review_finding_origin(&row.get::<_, String>(13)?),
+                        theme_ids: Vec::new(),
+                        prompt_for_agents: row.get(14)?,
+                        status: row.get(15)?,
                         sources: Vec::new(),
-                        github_comment_id: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
-                        github_comment_url: row.get(15)?,
+                        github_comment_id: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
+                        github_comment_url: row.get(17)?,
                         github_publication_status: code_review_publication_status(
-                            &row.get::<_, String>(16)?,
+                            &row.get::<_, String>(18)?,
                         ),
-                        github_thread_id: row.get(17)?,
-                        resolved_at: parse_optional_datetime(row.get(18)?),
+                        github_thread_id: row.get(19)?,
+                        resolved_at: parse_optional_datetime(row.get(20)?),
+                        observed_head: row.get(21)?,
+                        resolved_head: row.get(22)?,
+                        resolved_by_job_id: row.get(23)?,
                     },
                 ))
             })?
@@ -9037,17 +10200,36 @@ impl Store {
         &self,
         job_id: &str,
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.code_review_findings_with_status(job_id, None)
+    }
+
+    fn code_review_findings_with_status(
+        &self,
+        job_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
         let conn = self.conn.lock().unwrap();
         let base_rows: Vec<trouve_protocol::CodeReviewFinding> = {
-            let mut stmt = conn.prepare(
+            let status_filter = if status.is_some() {
+                " AND status = ?2"
+            } else {
+                ""
+            };
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, job_id, path, line, side, severity, confidence, title, body,
-                        prompt_for_agents, status, github_comment_id,
+                        evidence, origin, prompt_for_agents, status, github_comment_id,
                         github_comment_url, github_publication_status,
-                        github_thread_id, resolved_at
+                        github_thread_id, resolved_at,
+                        (SELECT head_sha FROM code_review_jobs WHERE id = code_review_findings.job_id),
+                        resolved_head, resolved_by_job_id
                  FROM code_review_findings
-                 WHERE job_id = ?1 ORDER BY path, line, id",
-            )?;
-            stmt.query_map(params![job_id], |row| {
+                 WHERE job_id = ?1{status_filter} ORDER BY path, line, id"
+            ))?;
+            let mut query_params = vec![rusqlite::types::Value::from(job_id.to_owned())];
+            if let Some(status) = status {
+                query_params.push(rusqlite::types::Value::from(status.to_owned()));
+            }
+            stmt.query_map(rusqlite::params_from_iter(query_params), |row| {
                 Ok(trouve_protocol::CodeReviewFinding {
                     id: row.get(0)?,
                     job_id: row.get(1)?,
@@ -9058,40 +10240,87 @@ impl Store {
                     confidence: row.get(6)?,
                     title: row.get(7)?,
                     body: row.get(8)?,
-                    prompt_for_agents: row.get(9)?,
-                    status: row.get(10)?,
+                    evidence: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                    origin: code_review_finding_origin(&row.get::<_, String>(10)?),
+                    theme_ids: Vec::new(),
+                    prompt_for_agents: row.get(11)?,
+                    status: row.get(12)?,
                     sources: Vec::new(),
-                    github_comment_id: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
-                    github_comment_url: row.get(12)?,
+                    github_comment_id: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
+                    github_comment_url: row.get(14)?,
                     github_publication_status: code_review_publication_status(
-                        &row.get::<_, String>(13)?,
+                        &row.get::<_, String>(15)?,
                     ),
-                    github_thread_id: row.get(14)?,
-                    resolved_at: parse_optional_datetime(row.get(15)?),
+                    github_thread_id: row.get(16)?,
+                    resolved_at: parse_optional_datetime(row.get(17)?),
+                    observed_head: row.get(18)?,
+                    resolved_head: row.get(19)?,
+                    resolved_by_job_id: row.get(20)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
         };
-        let mut findings = Vec::with_capacity(base_rows.len());
-        for mut finding in base_rows {
+        let mut sources_by_finding =
+            HashMap::<String, Vec<trouve_protocol::CodeReviewFindingSource>>::new();
+        {
             let mut stmt = conn.prepare(
-                "SELECT reviewer_id, reviewer_name, candidate_id, task_id
-                 FROM code_review_finding_sources
-                 WHERE finding_id = ?1 ORDER BY reviewer_name, candidate_id",
+                "SELECT source.finding_id, source.reviewer_id, source.reviewer_name,
+                        source.candidate_id, source.task_id
+                 FROM code_review_finding_sources source
+                 JOIN code_review_findings finding ON finding.id = source.finding_id
+                 WHERE finding.job_id = ?1 AND (?2 IS NULL OR finding.status = ?2)
+                 ORDER BY source.finding_id, source.reviewer_name, source.candidate_id",
             )?;
-            finding.sources = stmt
-                .query_map(params![finding.id], |row| {
-                    Ok(trouve_protocol::CodeReviewFindingSource {
-                        reviewer_id: row.get(0)?,
-                        reviewer_name: row.get(1)?,
-                        candidate_id: row.get(2)?,
-                        task_id: row.get(3)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            findings.push(finding);
+            let rows = stmt.query_map(params![job_id, status], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(1)?,
+                        reviewer_name: row.get(2)?,
+                        candidate_id: row.get(3)?,
+                        task_id: row.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (finding_id, source) = row?;
+                sources_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(source);
+            }
         }
-        Ok(findings)
+        let mut themes_by_finding = HashMap::<String, Vec<String>>::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT link.finding_id, link.theme_id
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings finding ON finding.id = link.finding_id
+                 LEFT JOIN code_review_jobs link_job ON link_job.id = link.linked_by_job_id
+                 WHERE finding.job_id = ?1 AND (?2 IS NULL OR finding.status = ?2)
+                   AND (link.linked_by_job_id = '' OR link_job.review_published != 0
+                        OR link.linked_by_job_id = ?1)
+                 ORDER BY link.finding_id, link.theme_id",
+            )?;
+            let rows = stmt.query_map(params![job_id, status], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (finding_id, theme_id) = row?;
+                themes_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(theme_id);
+            }
+        }
+        Ok(base_rows
+            .into_iter()
+            .map(|mut finding| {
+                finding.sources = sources_by_finding.remove(&finding.id).unwrap_or_default();
+                finding.theme_ids = themes_by_finding.remove(&finding.id).unwrap_or_default();
+                finding
+            })
+            .collect())
     }
 
     pub fn open_code_review_findings(
@@ -9099,27 +10328,183 @@ impl Store {
         repository: &str,
         pull_number: u64,
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.code_review_findings_for_pull_with_status(repository, pull_number, Some("open"))
+    }
+
+    pub fn code_review_findings_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.code_review_findings_for_pull_with_status(repository, pull_number, None)
+    }
+
+    pub fn code_review_finding_history_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        max_closed_rounds: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
         let job_ids: Vec<String> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT f.job_id
+                "SELECT f.job_id, MAX(j.completed_at)
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
-                   AND j.review_published = 1 AND f.status = 'open'
-                 ORDER BY j.completed_at, f.job_id",
+                   AND j.review_published = 1
+                   AND f.status != 'open'
+                 GROUP BY f.job_id
+                 ORDER BY MAX(j.completed_at) DESC,
+                          f.job_id DESC
+                 LIMIT ?3",
             )?;
-            stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
+            stmt.query_map(
+                params![repository, pull_number as i64, max_closed_rounds as i64],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?
         };
         let mut findings = Vec::new();
-        for job_id in job_ids {
+        for job_id in job_ids.into_iter().rev() {
             findings.extend(
                 self.code_review_findings(&job_id)?
                     .into_iter()
-                    .filter(|finding| finding.status == "open"),
+                    .filter(|finding| finding.status != "open"),
             );
         }
+        Ok(findings)
+    }
+
+    fn code_review_findings_for_pull_with_status(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        status: Option<&str>,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let status_filter = if status.is_some() {
+            " AND f.status = ?3"
+        } else {
+            ""
+        };
+        let query_params = || {
+            let mut values = vec![
+                rusqlite::types::Value::from(repository.to_owned()),
+                rusqlite::types::Value::from(pull_number as i64),
+            ];
+            if let Some(status) = status {
+                values.push(rusqlite::types::Value::from(status.to_owned()));
+            }
+            values
+        };
+        let mut findings = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT f.id, f.job_id, f.path, f.line, f.side, f.severity,
+                        f.confidence, f.title, f.body, f.evidence, f.origin,
+                        f.prompt_for_agents, f.status, f.github_comment_id,
+                        f.github_comment_url, f.github_publication_status,
+                        f.github_thread_id, f.resolved_at, j.head_sha,
+                        f.resolved_head, f.resolved_by_job_id
+                 FROM code_review_findings f
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1{status_filter}
+                 ORDER BY j.completed_at, f.job_id, f.path, f.line, f.id"
+            ))?;
+            stmt.query_map(rusqlite::params_from_iter(query_params()), |row| {
+                Ok(trouve_protocol::CodeReviewFinding {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    path: row.get(2)?,
+                    line: row.get::<_, i64>(3)? as u64,
+                    side: row.get(4)?,
+                    severity: row.get(5)?,
+                    confidence: row.get(6)?,
+                    title: row.get(7)?,
+                    body: row.get(8)?,
+                    evidence: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                    origin: code_review_finding_origin(&row.get::<_, String>(10)?),
+                    theme_ids: Vec::new(),
+                    prompt_for_agents: row.get(11)?,
+                    status: row.get(12)?,
+                    sources: Vec::new(),
+                    github_comment_id: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
+                    github_comment_url: row.get(14)?,
+                    github_publication_status: code_review_publication_status(
+                        &row.get::<_, String>(15)?,
+                    ),
+                    github_thread_id: row.get(16)?,
+                    resolved_at: parse_optional_datetime(row.get(17)?),
+                    observed_head: row.get(18)?,
+                    resolved_head: row.get(19)?,
+                    resolved_by_job_id: row.get(20)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut sources_by_finding =
+            HashMap::<String, Vec<trouve_protocol::CodeReviewFindingSource>>::new();
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT source.finding_id, source.reviewer_id, source.reviewer_name,
+                        source.candidate_id, source.task_id
+                 FROM code_review_finding_sources source
+                 JOIN code_review_findings f ON f.id = source.finding_id
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1{status_filter}
+                 ORDER BY source.finding_id, source.reviewer_name, source.candidate_id"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(query_params()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(1)?,
+                        reviewer_name: row.get(2)?,
+                        candidate_id: row.get(3)?,
+                        task_id: row.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (finding_id, source) = row?;
+                sources_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(source);
+            }
+        }
+        let mut themes_by_finding = HashMap::<String, Vec<String>>::new();
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT link.finding_id, link.theme_id
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings f ON f.id = link.finding_id
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 LEFT JOIN code_review_jobs link_job ON link_job.id = link.linked_by_job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1{status_filter}
+                   AND (link.linked_by_job_id = '' OR link_job.review_published != 0)
+                 ORDER BY link.finding_id, link.theme_id"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(query_params()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (finding_id, theme_id) = row?;
+                themes_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(theme_id);
+            }
+        }
+        for finding in &mut findings {
+            finding.sources = sources_by_finding.remove(&finding.id).unwrap_or_default();
+            finding.theme_ids = themes_by_finding.remove(&finding.id).unwrap_or_default();
+        }
+        tx.commit()?;
         Ok(findings)
     }
 
@@ -9137,7 +10522,8 @@ impl Store {
                         f.github_comment_url, f.github_publication_status,
                         f.github_thread_id, f.resolved_at,
                         f.github_thread_resolved, f.github_thread_generation,
-                        f.github_thread_recheck_pending
+                        f.github_thread_recheck_pending, f.evidence, f.origin,
+                        j.head_sha, f.resolved_head, f.resolved_by_job_id
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -9167,6 +10553,13 @@ impl Store {
                         ),
                         github_thread_id: row.get(14)?,
                         resolved_at: parse_optional_datetime(row.get(15)?),
+                        evidence: serde_json::from_str(&row.get::<_, String>(19)?)
+                            .unwrap_or_default(),
+                        origin: code_review_finding_origin(&row.get::<_, String>(20)?),
+                        theme_ids: Vec::new(),
+                        observed_head: row.get(21)?,
+                        resolved_head: row.get(22)?,
+                        resolved_by_job_id: row.get(23)?,
                     },
                     is_resolved: row.get(16)?,
                     generation: row.get::<_, i64>(17)? as u64,
@@ -9175,26 +10568,76 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?
         };
-        let mut findings = Vec::with_capacity(base_rows.len());
-        for mut state in base_rows {
+        let mut sources_by_finding =
+            HashMap::<String, Vec<trouve_protocol::CodeReviewFindingSource>>::new();
+        {
             let mut stmt = conn.prepare(
-                "SELECT reviewer_id, reviewer_name, candidate_id, task_id
-                 FROM code_review_finding_sources
-                 WHERE finding_id = ?1 ORDER BY reviewer_name, candidate_id",
+                "SELECT source.finding_id, source.reviewer_id, source.reviewer_name,
+                        source.candidate_id, source.task_id
+                 FROM code_review_finding_sources source
+                 JOIN code_review_findings finding ON finding.id = source.finding_id
+                 JOIN code_review_jobs job ON job.id = finding.job_id
+                 WHERE job.repository = ?1 AND job.pull_number = ?2
+                   AND job.review_published = 1
+                   AND finding.status IN ('open', 'fixed', 'dismissed')
+                 ORDER BY source.finding_id, source.reviewer_name, source.candidate_id",
             )?;
-            state.finding.sources = stmt
-                .query_map(params![state.finding.id], |row| {
-                    Ok(trouve_protocol::CodeReviewFindingSource {
-                        reviewer_id: row.get(0)?,
-                        reviewer_name: row.get(1)?,
-                        candidate_id: row.get(2)?,
-                        task_id: row.get(3)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            findings.push(state);
+            let rows = stmt.query_map(params![repository, pull_number as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(1)?,
+                        reviewer_name: row.get(2)?,
+                        candidate_id: row.get(3)?,
+                        task_id: row.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (finding_id, source) = row?;
+                sources_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(source);
+            }
         }
-        Ok(findings)
+        let mut themes_by_finding = HashMap::<String, Vec<String>>::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT link.finding_id, link.theme_id
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings finding ON finding.id = link.finding_id
+                 JOIN code_review_jobs job ON job.id = finding.job_id
+                 LEFT JOIN code_review_jobs link_job ON link_job.id = link.linked_by_job_id
+                 WHERE job.repository = ?1 AND job.pull_number = ?2
+                   AND job.review_published = 1
+                   AND finding.status IN ('open', 'fixed', 'dismissed')
+                   AND (link.linked_by_job_id = '' OR link_job.review_published != 0)
+                 ORDER BY link.finding_id, link.theme_id",
+            )?;
+            let rows = stmt.query_map(params![repository, pull_number as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (finding_id, theme_id) = row?;
+                themes_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(theme_id);
+            }
+        }
+        Ok(base_rows
+            .into_iter()
+            .map(|mut state| {
+                state.finding.sources = sources_by_finding
+                    .remove(&state.finding.id)
+                    .unwrap_or_default();
+                state.finding.theme_ids = themes_by_finding
+                    .remove(&state.finding.id)
+                    .unwrap_or_default();
+                state
+            })
+            .collect())
     }
 
     pub(crate) fn record_code_review_thread_state(
@@ -9203,8 +10646,8 @@ impl Store {
         thread_id: &str,
         is_resolved: bool,
     ) -> Result<(bool, u64)> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let previous: Option<(Option<bool>, i64, String, Option<String>)> = tx
             .query_row(
                 "SELECT github_thread_resolved, github_thread_generation, status,
@@ -9253,6 +10696,14 @@ impl Store {
                      resolved_at = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
                        ELSE resolved_at
+                     END,
+                     resolved_head = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       ELSE resolved_head
+                     END,
+                     resolved_by_job_id = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       ELSE resolved_by_job_id
                      END
                  WHERE id = ?1",
                 params![
@@ -9263,9 +10714,255 @@ impl Store {
                     recheck_pending
                 ],
             )?;
+            if reopened_closed_finding {
+                tx.execute(
+                    "UPDATE code_review_themes
+                     SET status = 'open', resolved_head = '', updated_at = ?2
+                     WHERE id IN (
+                       SELECT theme_id FROM code_review_finding_themes WHERE finding_id = ?1
+                     )",
+                    params![finding_id, chrono::Utc::now().to_rfc3339()],
+                )?;
+            }
         }
         tx.commit()?;
         Ok((state_changed || reopened_closed_finding, generation as u64))
+    }
+
+    pub fn code_review_themes_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        self.code_review_themes_for_pull_or_job(repository, pull_number, "", i64::MAX)
+    }
+
+    pub fn code_review_theme_history_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        self.code_review_themes_for_pull_or_job(repository, pull_number, "", limit as i64)
+    }
+
+    pub fn code_review_themes_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        let (repository, pull_number) = self.conn.lock().unwrap().query_row(
+            "SELECT repository, pull_number FROM code_review_jobs WHERE id = ?1",
+            params![job_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+        )?;
+        self.code_review_themes_for_pull_or_job(&repository, pull_number, job_id, i64::MAX)
+    }
+
+    /// Reconstructs only theme membership that could have belonged to a
+    /// manifestless job's own publication. Later published jobs may add links
+    /// to these findings, but their explicit ownership must not rewrite the
+    /// immutable publication outcome being recovered.
+    pub fn code_review_themes_for_legacy_publication_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        let conn = self.conn.lock().unwrap();
+        let mut themes = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT theme.id, theme.repository, theme.pull_number,
+                        theme.root_cause, theme.recommendation, theme.status,
+                        theme.first_seen_head, theme.last_seen_head,
+                        theme.resolved_head, theme.recurrence_count
+                 FROM code_review_themes theme
+                 JOIN code_review_theme_observations observation
+                   ON observation.theme_id = theme.id
+                 WHERE observation.job_id = ?1
+                 ORDER BY theme.created_at, theme.id",
+            )?;
+            stmt.query_map([job_id], |row| {
+                Ok(trouve_protocol::CodeReviewTheme {
+                    id: row.get(0)?,
+                    repository: row.get(1)?,
+                    pull_number: row.get::<_, i64>(2)? as u64,
+                    root_cause: row.get(3)?,
+                    recommendation: row.get(4)?,
+                    status: row.get(5)?,
+                    first_seen_head: row.get(6)?,
+                    last_seen_head: row.get(7)?,
+                    resolved_head: row.get(8)?,
+                    recurrence_count: row.get::<_, i64>(9)? as u64,
+                    affected_paths: Vec::new(),
+                    finding_ids: Vec::new(),
+                    observations: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for theme in &mut themes {
+            let mut stmt = conn.prepare(
+                "SELECT finding.id, finding.path
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings finding ON finding.id = link.finding_id
+                 WHERE link.theme_id = ?1 AND finding.job_id = ?2
+                   AND (link.linked_by_job_id = '' OR link.linked_by_job_id = ?2)
+                 ORDER BY finding.created_at, finding.id",
+            )?;
+            let members = stmt
+                .query_map(params![theme.id, job_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            theme.finding_ids = members.iter().map(|(id, _)| id.clone()).collect();
+            theme.affected_paths = members
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+        Ok(themes)
+    }
+
+    fn code_review_themes_for_pull_or_job(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        staged_job_id: &str,
+        limit: i64,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        let conn = self.conn.lock().unwrap();
+        let mut themes = {
+            let mut stmt = conn.prepare(
+                "SELECT id, repository, pull_number, root_cause, recommendation, status,
+                        first_seen_head, last_seen_head, resolved_head, recurrence_count
+                 FROM (
+                   SELECT *
+                   FROM code_review_themes
+                   WHERE repository = ?1 AND pull_number = ?2
+                     AND EXISTS (
+                       SELECT 1 FROM code_review_theme_observations visible
+                       WHERE visible.theme_id = code_review_themes.id
+                         AND (visible.published != 0 OR visible.job_id = ?3)
+                     )
+                   ORDER BY status = 'open' DESC, updated_at DESC, id
+                   LIMIT ?4
+                 )
+                 ORDER BY updated_at, id",
+            )?;
+            stmt.query_map(
+                params![repository, pull_number as i64, staged_job_id, limit],
+                |row| {
+                    Ok(trouve_protocol::CodeReviewTheme {
+                        id: row.get(0)?,
+                        repository: row.get(1)?,
+                        pull_number: row.get::<_, i64>(2)? as u64,
+                        root_cause: row.get(3)?,
+                        recommendation: row.get(4)?,
+                        status: row.get(5)?,
+                        first_seen_head: row.get(6)?,
+                        last_seen_head: row.get(7)?,
+                        resolved_head: row.get(8)?,
+                        recurrence_count: row.get::<_, i64>(9)? as u64,
+                        affected_paths: Vec::new(),
+                        finding_ids: Vec::new(),
+                        observations: Vec::new(),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for theme in &mut themes {
+            let mut stmt = conn.prepare(
+                "SELECT f.id, f.path
+                 FROM code_review_finding_themes ft
+                 JOIN code_review_findings f ON f.id = ft.finding_id
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 LEFT JOIN code_review_jobs link_job ON link_job.id = ft.linked_by_job_id
+                 WHERE ft.theme_id = ?1
+                   AND (j.review_published != 0 OR f.job_id = ?2)
+                   AND (ft.linked_by_job_id = '' OR link_job.review_published != 0
+                        OR ft.linked_by_job_id = ?2)
+                 ORDER BY f.created_at, f.id",
+            )?;
+            let members = stmt
+                .query_map(params![theme.id, staged_job_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            theme.finding_ids = members.iter().map(|(id, _)| id.clone()).collect();
+            theme.affected_paths = members
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let finding_ids_by_job = {
+                let mut stmt = conn.prepare(
+                    "SELECT f.job_id, f.id
+                     FROM code_review_finding_themes ft
+                     JOIN code_review_findings f ON f.id = ft.finding_id
+                     JOIN code_review_jobs j ON j.id = f.job_id
+                     LEFT JOIN code_review_jobs link_job ON link_job.id = ft.linked_by_job_id
+                     WHERE ft.theme_id = ?1
+                       AND (j.review_published != 0 OR f.job_id = ?2)
+                       AND (ft.linked_by_job_id = '' OR link_job.review_published != 0
+                            OR ft.linked_by_job_id = ?2)
+                     ORDER BY f.job_id, f.id",
+                )?;
+                let rows = stmt
+                    .query_map(params![theme.id, staged_job_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut finding_ids_by_job = BTreeMap::<String, Vec<String>>::new();
+                for (job_id, finding_id) in rows {
+                    finding_ids_by_job
+                        .entry(job_id)
+                        .or_default()
+                        .push(finding_id);
+                }
+                finding_ids_by_job
+            };
+            let mut stmt = conn.prepare(
+                "SELECT o.job_id, o.head_sha, o.kind, o.created_at
+                 FROM code_review_theme_observations o
+                 WHERE o.theme_id = ?1
+                   AND (o.published != 0 OR o.job_id = ?2)
+                 ORDER BY o.created_at, o.job_id",
+            )?;
+            theme.observations = stmt
+                .query_map(params![theme.id, staged_job_id], |row| {
+                    let job_id: String = row.get(0)?;
+                    Ok(trouve_protocol::CodeReviewThemeObservation {
+                        finding_ids: finding_ids_by_job.get(&job_id).cloned().unwrap_or_default(),
+                        job_id,
+                        head_sha: row.get(1)?,
+                        kind: code_review_theme_observation_kind(&row.get::<_, String>(2)?),
+                        created_at: parse_datetime(row.get(3)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        Ok(themes)
+    }
+
+    pub fn resolve_code_review_themes_without_open_findings(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        resolved_head: &str,
+    ) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let updated = resolve_code_review_themes_in_transaction(
+            &tx,
+            repository,
+            pull_number,
+            resolved_head,
+            &chrono::Utc::now().to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn code_review_job_detail(
@@ -9300,6 +10997,7 @@ impl Store {
         let personas = code_review_persona_results(&attempts);
         let tasks = attempts.into_iter().map(|attempt| attempt.task).collect();
         let findings = self.code_review_findings(id)?;
+        let themes = self.code_review_themes_for_job(id)?;
         let candidate_rejections = self.code_review_candidate_rejections(id)?;
         let routing_decisions = self.code_review_routing_decisions(id)?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
@@ -9308,6 +11006,7 @@ impl Store {
             tasks,
             personas,
             findings,
+            themes,
             candidate_rejections,
             routing_decisions,
             summary: record.summary,
@@ -9350,6 +11049,7 @@ impl Store {
             prompt_for_agents: detail.prompt_for_agents,
             review_url: detail.job.review_url,
             findings: detail.findings,
+            themes: detail.themes,
         }))
     }
 
@@ -9690,6 +11390,82 @@ impl Store {
                 },
             )
             .collect();
+        let churn = {
+            let conn = self.conn.lock().unwrap();
+            let (recurrence, fix_regression, previously_missed, grouped): (i64, i64, i64, i64) =
+                conn.query_row(
+                    "SELECT
+                       COALESCE(SUM(CASE WHEN f.origin = 'recurrence' THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN f.origin = 'fix_regression' THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN f.origin = 'previously_missed' THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN f.github_publication_status = 'grouped_by_theme' THEN 1 ELSE 0 END), 0)
+                     FROM code_review_findings f
+                     JOIN code_review_jobs j ON j.id = f.job_id
+                     WHERE j.status = 'succeeded'
+                       AND (?1 IS NULL OR j.repository = ?1)
+                       AND (?2 IS NULL OR j.completed_at >= ?2)",
+                    params![repository, start_param],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+            let (external_duplicates, insufficient_evidence): (i64, i64) = conn.query_row(
+                "SELECT
+                   COALESCE(SUM(CASE WHEN r.reason LIKE 'external_duplicate:%' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN r.reason LIKE 'insufficient_evidence:%' THEN 1 ELSE 0 END), 0)
+                 FROM code_review_candidate_rejections r
+                 JOIN code_review_jobs j ON j.id = r.job_id
+                 WHERE j.status = 'succeeded'
+                   AND (?1 IS NULL OR j.repository = ?1)
+                   AND (?2 IS NULL OR j.completed_at >= ?2)",
+                params![repository, start_param],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let (
+                pull_request_count,
+                clean_pull_request_count,
+                average_rounds_to_clean,
+                max_rounds_to_clean,
+            ): (i64, i64, f64, i64) = conn.query_row(
+                "WITH ranked AS (
+                   SELECT repository, pull_number,
+                          ROW_NUMBER() OVER (
+                            PARTITION BY repository, pull_number
+                            ORDER BY completed_at, created_at, rowid
+                          ) AS round_number,
+                          publication_open_issue_count
+                   FROM code_review_jobs
+                   WHERE status = 'succeeded'
+                     AND publication_open_issue_count IS NOT NULL
+                     AND (?1 IS NULL OR repository = ?1)
+                     AND (?2 IS NULL OR completed_at >= ?2)
+                 ),
+                 pull_rounds AS (
+                   SELECT repository, pull_number,
+                          MIN(CASE WHEN publication_open_issue_count = 0
+                                   THEN round_number END) AS rounds_to_clean
+                   FROM ranked
+                   GROUP BY repository, pull_number
+                 )
+                 SELECT COUNT(*),
+                        COUNT(rounds_to_clean),
+                        COALESCE(AVG(rounds_to_clean), 0.0),
+                        COALESCE(MAX(rounds_to_clean), 0)
+                 FROM pull_rounds",
+                params![repository, start_param],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            trouve_protocol::CodeReviewChurnStats {
+                recurrence_issue_count: recurrence as u64,
+                fix_regression_issue_count: fix_regression as u64,
+                previously_missed_issue_count: previously_missed as u64,
+                grouped_issue_count: grouped as u64,
+                external_duplicate_count: external_duplicates as u64,
+                insufficient_evidence_rejection_count: insufficient_evidence as u64,
+                pull_request_count: pull_request_count as u64,
+                clean_pull_request_count: clean_pull_request_count as u64,
+                average_rounds_to_clean,
+                max_rounds_to_clean: max_rounds_to_clean as u64,
+            }
+        };
         let repositories = repositories
             .into_iter()
             .map(
@@ -9719,6 +11495,7 @@ impl Store {
             coordinator_duration: code_review_duration_stats(overall_coordinator),
             publication_duration: code_review_duration_stats(overall_publication),
             issue_count: overall_issues,
+            churn,
             buckets,
             personas,
             repositories,
@@ -9934,7 +11711,7 @@ impl Store {
     pub fn claim_code_review_publication(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET publication_claimed = 1,
+             SET publication_claimed = 1, publication_dispatched = 0,
                  publication_order = CASE
                    WHEN publication_order != 0 THEN publication_order
                    ELSE (
@@ -9964,9 +11741,87 @@ impl Store {
         )? > 0)
     }
 
+    /// Crosses the last durable boundary before the GitHub review POST. A
+    /// crash after this write has an ambiguous remote outcome, so recovery
+    /// must reconcile by marker and must not publish again.
+    pub fn mark_code_review_publication_dispatched(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET publication_dispatched = 1
+             WHERE id = ?1 AND publication_claimed != 0
+               AND publication_accepted = 0",
+            params![id],
+        )? > 0)
+    }
+
+    pub fn prepare_code_review_publication_manifest(
+        &self,
+        job_id: &str,
+        entries: &[(&str, &str, &str)],
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let prepared: bool = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs
+               WHERE id = ?1 AND publication_claimed != 0
+                 AND publication_dispatched = 0
+                 AND publication_accepted = 0
+             )",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        if !prepared {
+            return Ok(false);
+        }
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM code_review_publication_manifest WHERE job_id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        if existing == 0 {
+            for (finding_id, primary_finding_id, publication_status) in entries {
+                tx.execute(
+                    "INSERT INTO code_review_publication_manifest
+                            (job_id, finding_id, primary_finding_id, publication_status)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![job_id, finding_id, primary_finding_id, publication_status],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn code_review_publication_manifest(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT finding_id, primary_finding_id, publication_status
+             FROM code_review_publication_manifest WHERE job_id = ?1
+             ORDER BY finding_id",
+        )?;
+        Ok(stmt
+            .query_map(params![job_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn reset_code_review_publication_dispatch(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET publication_dispatched = 0
+             WHERE id = ?1 AND publication_claimed != 0
+               AND publication_dispatched != 0 AND publication_accepted = 0",
+            params![id],
+        )? > 0)
+    }
+
     pub fn mark_code_review_publication_accepted(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET publication_accepted = 1
+            "UPDATE code_review_jobs
+             SET publication_dispatched = 1, publication_accepted = 1
              WHERE id = ?1 AND publication_claimed != 0",
             params![id],
         )? > 0)
@@ -9975,9 +11830,10 @@ impl Store {
     pub fn release_code_review_publication_claim(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET publication_claimed = 0, publication_accepted = 0,
-                 publication_order = 0
-             WHERE id = ?1 AND publication_accepted = 0",
+             SET publication_claimed = 0, publication_dispatched = 0,
+                 publication_accepted = 0, publication_order = 0
+             WHERE id = ?1 AND publication_accepted = 0
+               AND publication_dispatched = 0",
             params![id],
         )? > 0)
     }
@@ -9990,7 +11846,7 @@ impl Store {
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        let published_at = chrono::Utc::now().to_rfc3339();
+        let publication_attempted_at = chrono::Utc::now().to_rfc3339();
         let current_publication = tx.query_row(
             "SELECT EXISTS (
                SELECT 1 FROM code_review_jobs AS current_job
@@ -10035,8 +11891,10 @@ impl Store {
                      ELSE error
                  END,
                  review_url = ?2,
+                 publication_dispatched = 1,
                  publication_accepted = 1,
                  review_published = 1,
+                 published_at = COALESCE(published_at, ?4),
                  blocking_review_cleanup_pending = CASE
                      WHEN ?3 THEN blocking_review_cleanup_pending ELSE 0
                  END,
@@ -10047,15 +11905,27 @@ impl Store {
                      WHEN ?3 THEN blocking_review_cleanup_claim_until ELSE NULL
                  END
              WHERE id = ?1 AND publication_claimed != 0",
-            params![id, review_url, current_publication],
+            params![
+                id,
+                review_url,
+                current_publication,
+                publication_attempted_at
+            ],
         )?;
         if updated == 0 {
             return Ok(false);
         }
+        let published_at = tx.query_row(
+            "SELECT published_at FROM code_review_jobs WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )?;
         let fixed = if current_publication {
             tx.execute(
                 "UPDATE code_review_findings
                  SET status = 'fixed', resolved_at = ?2,
+                     resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?1),
+                     resolved_by_job_id = ?1,
                      publication_resolution_job_id = NULL,
                      collapse_attempts = CASE
                          WHEN github_comment_id IS NOT NULL THEN 0
@@ -10081,6 +11951,20 @@ impl Store {
                 params![id, fixed as i64],
             )?;
         }
+        let (repository, pull_number, head_sha): (String, i64, String) = tx.query_row(
+            "SELECT repository, pull_number, head_sha FROM code_review_jobs WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        finalize_code_review_theme_publication(
+            &tx,
+            id,
+            &repository,
+            pull_number as u64,
+            &head_sha,
+            &published_at,
+        )?;
+        record_code_review_open_issue_count(&tx, id)?;
         tx.execute(
             "INSERT INTO code_review_pr_state
                         (repository, pull_number, last_reviewed_head_sha,
@@ -10339,8 +12223,8 @@ impl Store {
         blocking_review_cleanup_pending: bool,
         resolved_finding_ids: &[&str],
     ) -> Result<u64> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let current_publication = tx.query_row(
             "SELECT EXISTS (
                SELECT 1 FROM code_review_jobs AS current_job
@@ -10365,7 +12249,14 @@ impl Store {
             params![id],
             |row| row.get::<_, bool>(0),
         )?;
-        let published_at = chrono::Utc::now().to_rfc3339();
+        let publication_attempted_at = chrono::Utc::now().to_rfc3339();
+        let published_at = tx.query_row(
+            "SELECT COALESCE(published_at, ?2)
+             FROM code_review_jobs
+             WHERE id = ?1",
+            params![id, publication_attempted_at],
+            |row| row.get::<_, String>(0),
+        )?;
         if current_publication {
             for finding_id in resolved_finding_ids {
                 tx.execute(
@@ -10380,6 +12271,8 @@ impl Store {
             tx.execute(
                 "UPDATE code_review_findings
                  SET status = 'fixed', resolved_at = ?2,
+                     resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?1),
+                     resolved_by_job_id = ?1,
                      publication_resolution_job_id = NULL,
                      collapse_attempts = CASE
                          WHEN github_comment_id IS NOT NULL THEN 0
@@ -10403,6 +12296,7 @@ impl Store {
             "UPDATE code_review_jobs
              SET publication_accepted = 1,
                  review_published = 1,
+                 published_at = COALESCE(published_at, ?5),
                  review_url = CASE WHEN ?2 = '' THEN review_url ELSE ?2 END,
                  blocking_review_cleanup_pending = ?3,
                  fixed_issue_count = ?4
@@ -10411,12 +12305,22 @@ impl Store {
                 id,
                 review_url,
                 current_publication && blocking_review_cleanup_pending,
-                fixed as i64
+                fixed as i64,
+                published_at
             ],
         )?;
         if updated == 0 {
             anyhow::bail!("review job changed before GitHub publication was recorded");
         }
+        finalize_code_review_theme_publication(
+            &tx,
+            id,
+            repository,
+            pull_number,
+            head_sha,
+            &published_at,
+        )?;
+        record_code_review_open_issue_count(&tx, id)?;
         tx.execute(
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
@@ -10562,8 +12466,8 @@ impl Store {
         page: u64,
         useful_work: bool,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let Some((current_page, attempts)) = tx
             .query_row(
                 "SELECT blocking_review_cleanup_page,
@@ -10611,8 +12515,8 @@ impl Store {
         id: &str,
         claim_token: &str,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let attempts: i64 = tx
             .query_row(
                 "SELECT blocking_review_cleanup_attempts
@@ -15539,7 +17443,15 @@ mod tests {
         let due = chrono::Utc::now() + chrono::Duration::hours(2);
 
         // Closed before any comment was published: nothing to collapse yet.
-        assert!(store.resolve_code_review_finding(&id, "fixed").unwrap());
+        assert!(
+            store
+                .resolve_code_review_finding(&id, "fixed", "resolved-head", "resolver-job")
+                .unwrap()
+        );
+        let resolved = &store.code_review_findings(&job.id).unwrap()[0];
+        assert_eq!(resolved.observed_head, job.head_sha);
+        assert_eq!(resolved.resolved_head, "resolved-head");
+        assert_eq!(resolved.resolved_by_job_id, "resolver-job");
         assert!(
             store
                 .pending_code_review_thread_collapses(due, 16, &[])
@@ -15616,7 +17528,11 @@ mod tests {
         store
             .update_code_review_finding_publication(&id, Some(9001), "https://example", None)
             .unwrap();
-        assert!(store.resolve_code_review_finding(&id, "fixed").unwrap());
+        assert!(
+            store
+                .resolve_code_review_finding(&id, "fixed", "resolved-head", "resolver-job")
+                .unwrap()
+        );
 
         let next_attempt = |store: &Store| -> chrono::DateTime<chrono::Utc> {
             store
@@ -15723,7 +17639,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .resolve_code_review_finding(&finding.id, "fixed")
+                .resolve_code_review_finding(&finding.id, "fixed", &job.head_sha, &job.id)
                 .unwrap()
         );
 
@@ -16096,7 +18012,7 @@ mod tests {
             job.id
         );
         let finding = store
-            .save_code_review_result(
+            .save_code_review_result_with_themes(
                 &job.id,
                 "summary",
                 "prompt",
@@ -16112,10 +18028,22 @@ mod tests {
                     prompt_for_agents: "fix".into(),
                     sources: Vec::new(),
                 }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["reconciled-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "reconciled-theme".into(),
+                    root_cause: "reconciled publication root cause".into(),
+                    recommendation: "persist the final transition".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
                 &[],
             )
             .unwrap()
             .remove(0);
+        let theme_id = finding.theme_ids[0].clone();
         assert!(store.claim_code_review_publication(&job.id).unwrap());
         assert!(
             store
@@ -16135,6 +18063,16 @@ mod tests {
                 )
                 .unwrap()
         );
+        let first_published_at = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published_at FROM code_review_jobs WHERE id = ?1",
+                [&job.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
         assert!(
             store
                 .reconcile_code_review_publication(
@@ -16144,6 +18082,17 @@ mod tests {
                 )
                 .unwrap()
         );
+        let retried_published_at = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published_at FROM code_review_jobs WHERE id = ?1",
+                [&job.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(retried_published_at, first_published_at);
         let record = store.code_review_job(&job.id).unwrap().unwrap();
         assert!(record.review_published);
         assert!(record.blocking_review_cleanup_pending);
@@ -16151,6 +18100,34 @@ mod tests {
         assert_eq!(
             store.code_review_findings(&job.id).unwrap()[0].status,
             "fixed"
+        );
+        let transition = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, resolved_head, transitioned_at, writer_version
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = ?1 AND job_id = ?2",
+                params![theme_id, job.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            transition,
+            (
+                "resolved".into(),
+                job.head_sha.clone(),
+                first_published_at,
+                1
+            )
         );
         let state = store
             .code_review_pull_state(&job.repository, job.pull_number)
@@ -16677,6 +18654,1573 @@ mod tests {
             .code_review_pull_state(&job.repository, job.pull_number)
             .unwrap();
         assert!(pull_state.last_reviewed_head_sha.is_empty());
+    }
+
+    #[test]
+    fn code_review_theme_ids_are_scoped_to_the_pull_request() {
+        let store = Store::open_in_memory().unwrap();
+        let first_job = enqueue_backoff_test_job(&store);
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#43:theme-scope".into();
+        second_request.pull_number = 43;
+        second_request.pull_url = "https://github.com/acme/widgets/pull/43".into();
+        let second_job = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+
+        let save = |job_id: &str, theme_id: &str| {
+            store
+                .save_code_review_result_with_themes(
+                    job_id,
+                    "summary",
+                    "fix the root cause",
+                    1,
+                    &[NewCodeReviewFinding {
+                        path: "src/lib.rs".into(),
+                        line: 7,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Shared symptom".into(),
+                        body: "The shared state leaks.".into(),
+                        prompt_for_agents: "Scope the shared state.".into(),
+                        sources: Vec::new(),
+                    }],
+                    &[NewCodeReviewFindingDetails {
+                        theme_ids: vec![theme_id.into(), theme_id.into()],
+                        ..Default::default()
+                    }],
+                    &[NewCodeReviewTheme {
+                        id: theme_id.into(),
+                        root_cause: "shared state is not scoped".into(),
+                        recommendation: "scope the shared state".into(),
+                        observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                        previous_finding_ids: Vec::new(),
+                    }],
+                    &[],
+                )
+                .unwrap()
+        };
+
+        let first_findings = save(&first_job.id, "shared-state");
+        let second_findings = save(&second_job.id, "shared-state");
+        assert!(
+            store
+                .code_review_themes_for_pull("acme/widgets", 42)
+                .unwrap()
+                .is_empty(),
+            "an unpublished attempt must not enter authoritative PR history"
+        );
+        let mut first_themes = store.code_review_themes_for_job(&first_job.id).unwrap();
+        let second_themes = store.code_review_themes_for_job(&second_job.id).unwrap();
+
+        assert_eq!(first_themes.len(), 1);
+        assert_eq!(second_themes.len(), 1);
+        assert_ne!(first_themes[0].id, second_themes[0].id);
+        assert_eq!(first_findings[0].theme_ids, [first_themes[0].id.clone()]);
+        assert_eq!(second_findings[0].theme_ids, [second_themes[0].id.clone()]);
+        assert_eq!(first_themes[0].observations[0].job_id, first_job.id);
+        assert_eq!(
+            first_themes[0].observations[0].finding_ids,
+            [first_findings[0].id.clone()]
+        );
+
+        let scoped_id = first_themes[0].id.clone();
+        let replacement_findings = save(&first_job.id, &scoped_id);
+        first_themes = store.code_review_themes_for_job(&first_job.id).unwrap();
+        assert_eq!(first_themes.len(), 1);
+        assert_eq!(first_themes[0].id, scoped_id);
+        assert_eq!(replacement_findings[0].theme_ids, [scoped_id]);
+    }
+
+    #[test]
+    fn open_code_review_findings_retains_only_open_enriched_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "summary",
+                "fix the root cause",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/fixed.rs".into(),
+                        line: 3,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Fixed symptom".into(),
+                        body: "Already fixed.".into(),
+                        prompt_for_agents: "Keep it fixed.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/open.rs".into(),
+                        line: 5,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Open symptom".into(),
+                        body: "Still open.".into(),
+                        prompt_for_agents: "Fix it.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["shared-state".into()],
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["shared-state".into()],
+                        ..Default::default()
+                    },
+                ],
+                &[NewCodeReviewTheme {
+                    id: "shared-state".into(),
+                    root_cause: "shared state is not scoped".into(),
+                    recommendation: "scope the shared state".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET review_published = 1 WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+        store
+            .resolve_code_review_finding(&findings[0].id, "fixed", &job.head_sha, &job.id)
+            .unwrap();
+
+        let open = store
+            .open_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, findings[1].id);
+        assert_eq!(open[0].status, "open");
+        assert_eq!(open[0].theme_ids.len(), 1);
+        assert_eq!(
+            store
+                .code_review_findings_for_pull(&job.repository, job.pull_number)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_publication_grouping_ignores_links_owned_by_later_jobs() {
+        let store = Store::open_in_memory().unwrap();
+        let original_job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &original_job.id,
+                "summary",
+                "fix the root cause",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/first.rs".into(),
+                        line: 3,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Original symptom".into(),
+                        body: "The original review grouped this symptom.".into(),
+                        prompt_for_agents: "Fix the shared cause.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/later.rs".into(),
+                        line: 5,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Later symptom".into(),
+                        body: "A later review linked this symptom.".into(),
+                        prompt_for_agents: "Fix the shared cause.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["legacy-group".into()],
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["legacy-group".into()],
+                        ..Default::default()
+                    },
+                ],
+                &[NewCodeReviewTheme {
+                    id: "legacy-group".into(),
+                    root_cause: "shared legacy cause".into(),
+                    recommendation: "repair the cause once".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+
+        let mut later_request = backoff_test_job_request();
+        later_request.dedupe_key = "acme/widgets#42:later-link".into();
+        later_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let later_job = store
+            .enqueue_code_review_job(&later_request)
+            .unwrap()
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE code_review_jobs SET review_published = 1 WHERE id = ?1",
+            [&later_job.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_review_finding_themes SET linked_by_job_id = ''
+             WHERE finding_id = ?1 AND theme_id = ?2",
+            params![findings[0].id, theme_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_review_finding_themes SET linked_by_job_id = ?1
+             WHERE finding_id = ?2 AND theme_id = ?3",
+            params![later_job.id, findings[1].id, theme_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let themes = store
+            .code_review_themes_for_legacy_publication_job(&original_job.id)
+            .unwrap();
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].finding_ids, [findings[0].id.clone()]);
+        assert_eq!(themes[0].affected_paths, ["src/first.rs"]);
+    }
+
+    #[test]
+    fn theme_reverse_lookup_indexes_exist() {
+        let store = Store::open_in_memory().unwrap();
+        let indexes = store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'index'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<HashSet<_>>>()
+            .unwrap();
+        assert!(indexes.contains("code_review_theme_observations_job"));
+        assert!(indexes.contains("code_review_finding_themes_theme"));
+    }
+
+    #[test]
+    fn publication_manifest_returns_false_for_a_missing_job() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            !store
+                .prepare_code_review_publication_manifest(
+                    "rvj-missing",
+                    &[("rvf-missing", "rvf-missing", "eligible")],
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_marks_pre_authority_observations_consumed_without_replay() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("legacy-theme-observation.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Legacy symptom".into(),
+                    body: "The invariant is broken.".into(),
+                    prompt_for_agents: "Restore it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["legacy-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "legacy-theme".into(),
+                    root_cause: "legacy root cause".into(),
+                    recommendation: "preserve legacy authority".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-7',
+                     review_published = 0, publication_accepted = 0
+                 WHERE id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_theme_observations SET kind = 'recurrence'
+                 WHERE job_id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_themes
+                 SET status = 'resolved', last_seen_head = 'legacy-applied-head',
+                     resolved_head = 'legacy-resolved-head', recurrence_count = 7
+                 WHERE id = 'acme/widgets#42:legacy-theme'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', resolved_at = '2000-01-01T00:00:00Z',
+                     resolved_head = 'legacy-resolved-head',
+                     resolved_by_job_id = ''
+                 WHERE id = ?1",
+                [&findings[0].id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO code_review_theme_transitions
+                   (theme_id, job_id, status, last_seen_head, resolved_head,
+                    recurrence_count, transitioned_at, writer_version)
+                 VALUES ('acme/widgets#42:legacy-theme', ?1, 'open',
+                         'transition-only-head', '', 1,
+                         '2000-01-01T00:00:00Z', 1)",
+                [&job.id],
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        // Recreate the pre-publication-authority table shape, then simulate an
+        // interrupted migration that already added writer_version and
+        // committed its zero defaults but stopped before classifying them.
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "ALTER TABLE code_review_theme_observations RENAME TO legacy_theme_observations;
+                 CREATE TABLE code_review_theme_observations (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   head_sha TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, created_at)
+                 SELECT theme_id, job_id, head_sha, kind, created_at
+                 FROM legacy_theme_observations;
+                 DROP TABLE legacy_theme_observations;
+                 ALTER TABLE code_review_theme_transitions
+                   RENAME TO legacy_theme_transitions;
+                 CREATE TABLE code_review_theme_transitions (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   status TEXT NOT NULL,
+                   last_seen_head TEXT NOT NULL,
+                   resolved_head TEXT NOT NULL DEFAULT '',
+                   recurrence_count INTEGER NOT NULL DEFAULT 0,
+                   transitioned_at TEXT NOT NULL,
+                   writer_version INTEGER NOT NULL DEFAULT 0,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_transitions
+                   (theme_id, job_id, status, last_seen_head, resolved_head,
+                    recurrence_count, transitioned_at, writer_version)
+                 SELECT theme_id, job_id, status, last_seen_head, resolved_head,
+                        recurrence_count, transitioned_at, 0
+                 FROM legacy_theme_transitions;
+                 DROP TABLE legacy_theme_transitions;
+                 DELETE FROM store_migrations
+                 WHERE id = 'code-review-theme-observation-publication-authority-v1';",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let reopened = Store::open(&database).unwrap();
+        assert!(
+            reopened
+                .code_review_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .review_published
+        );
+        let published = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published FROM code_review_theme_observations WHERE job_id = ?1",
+                [&job.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(published);
+        let preserved_writer_version = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT writer_version
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = 'acme/widgets#42:legacy-theme'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_writer_version, -1);
+        let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].status, "resolved");
+        assert_eq!(themes[0].last_seen_head, "legacy-applied-head");
+        assert_eq!(themes[0].resolved_head, "legacy-resolved-head");
+        assert_eq!(themes[0].recurrence_count, 7);
+        let migration_recorded = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS (
+                   SELECT 1 FROM store_migrations
+                   WHERE id = 'code-review-theme-observation-publication-authority-v1'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(migration_recorded);
+    }
+
+    #[test]
+    fn migration_rebuilds_all_staged_observations() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data
+            .path()
+            .join("authority-aware-theme-observation.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Staged symptom".into(),
+                    body: "The staged transition must survive schema upgrade.".into(),
+                    prompt_for_agents: "Preserve publication authority.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["staged-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "staged-theme".into(),
+                    root_cause: "staged root cause".into(),
+                    recommendation: "promote after publication repair".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:second-staged".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second_job = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-9',
+                     review_published = 0, publication_accepted = 0,
+                     publication_claimed = 1, publication_order = 1
+                 WHERE id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-10',
+                     review_published = 0, publication_accepted = 0,
+                     publication_claimed = 1, publication_order = 2
+                 WHERE id = ?1",
+                [&second_job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published,
+                    publication_managed, created_at)
+                 VALUES (?1, ?2, ?3, 'recurrence', 0, 1, ?4)",
+                params![
+                    theme_id,
+                    second_job.id,
+                    second_job.head_sha,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        // Recreate the immediately preceding authority-aware shape: staged
+        // publication state exists, but per-row provenance does not yet.
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "ALTER TABLE code_review_theme_observations RENAME TO authority_observations;
+                 CREATE TABLE code_review_theme_observations (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   head_sha TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   published INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published, created_at)
+                 SELECT theme_id, job_id, head_sha, kind, published, created_at
+                 FROM authority_observations;
+                 DROP TABLE authority_observations;
+                 DELETE FROM store_migrations
+                 WHERE id = 'code-review-theme-transitions-v1';",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let reopened = Store::open(&database).unwrap();
+        let observation = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published, publication_managed
+                 FROM code_review_theme_observations WHERE job_id = ?1",
+                [&job.id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(observation, (true, true));
+        let second_observation = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published, publication_managed
+                 FROM code_review_theme_observations WHERE job_id = ?1",
+                [&second_job.id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(second_observation, (true, true));
+        let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
+        assert_eq!(themes[0].status, "open");
+        assert_eq!(themes[0].last_seen_head, second_job.head_sha);
+        assert_eq!(themes[0].recurrence_count, 1);
+    }
+
+    #[test]
+    fn publication_records_final_theme_transition_snapshots() {
+        let store = Store::open_in_memory().unwrap();
+        let first_job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first_job.id
+        );
+        let findings = store
+            .save_code_review_result_with_themes(
+                &first_job.id,
+                "one issue",
+                "fix it",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Published issue".into(),
+                    body: "The first transition stays open.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["transition-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "transition-theme".into(),
+                    root_cause: "transition root cause".into(),
+                    recommendation: "persist final publication state".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&first_job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &first_job.id,
+                &first_job.repository,
+                first_job.pull_number,
+                &first_job.base_ref,
+                &first_job.head_sha,
+                "https://example.test/review/transition-1",
+                false,
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+        let first_transition = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, resolved_head
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = ?1 AND job_id = ?2",
+                params![theme_id, first_job.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first_transition, ("open".into(), String::new()));
+
+        store
+            .finish_code_review_job(
+                &first_job.id,
+                "succeeded",
+                "https://example.test/review/transition-1",
+                "",
+            )
+            .unwrap();
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:transition-2".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second_job = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            second_job.id
+        );
+        store
+            .save_code_review_result(&second_job.id, "clean", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&second_job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &second_job.id,
+                &second_job.repository,
+                second_job.pull_number,
+                &second_job.base_ref,
+                &second_job.head_sha,
+                "https://example.test/review/transition-2",
+                false,
+                &[&findings[0].id],
+            )
+            .unwrap();
+        let second_transition = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, resolved_head, last_seen_head
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = ?1 AND job_id = ?2",
+                params![theme_id, second_job.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            second_transition,
+            ("resolved".into(), second_job.head_sha, first_job.head_sha)
+        );
+    }
+
+    #[test]
+    fn startup_repair_preserves_legacy_closure_timing() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("legacy-theme-transition-v2.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let first_job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first_job.id
+        );
+        let finding = store
+            .save_code_review_result_with_themes(
+                &first_job.id,
+                "one issue",
+                "fix it",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Legacy issue".into(),
+                    body: "The closure must not apply to the earlier snapshot.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["legacy-transition-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "legacy-transition-theme".into(),
+                    root_cause: "legacy transition root cause".into(),
+                    recommendation: "retain temporal ordering".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&first_job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &first_job.id,
+                &first_job.repository,
+                first_job.pull_number,
+                &first_job.base_ref,
+                &first_job.head_sha,
+                "https://example.test/review/legacy-transition-1",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &first_job.id,
+                "succeeded",
+                "https://example.test/review/legacy-transition-1",
+                "",
+            )
+            .unwrap();
+
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:legacy-transition-2".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second_job = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            second_job.id
+        );
+        store
+            .save_code_review_result(&second_job.id, "clean", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&second_job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &second_job.id,
+                &second_job.repository,
+                second_job.pull_number,
+                &second_job.base_ref,
+                &second_job.head_sha,
+                "https://example.test/review/legacy-transition-2",
+                false,
+                &[&finding.id],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &second_job.id,
+                "succeeded",
+                "https://example.test/review/legacy-transition-2",
+                "",
+            )
+            .unwrap();
+        let theme_id = finding.theme_ids[0].clone();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_findings
+                 SET resolved_by_job_id = ''
+                 WHERE id = ?1",
+                [&finding.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_theme_transitions
+                 SET status = 'open', resolved_head = '', writer_version = 0
+                 WHERE theme_id = ?1",
+                [&theme_id],
+            )
+            .unwrap();
+            let repair_marker_exists = conn
+                .query_row(
+                    "SELECT EXISTS (
+                       SELECT 1 FROM store_migrations
+                       WHERE id = 'code-review-theme-transitions-v2'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap();
+            assert!(repair_marker_exists);
+            conn.execute(
+                "INSERT OR REPLACE INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published,
+                    publication_managed, created_at)
+                 VALUES (?1, ?2, ?3, 'recurrence', 1, 0,
+                         '1999-01-01T00:00:00Z')",
+                params![theme_id, second_job.id, second_job.head_sha],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs SET completed_at = NULL WHERE id = ?1",
+                [&second_job.id],
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = Store::open(&database).unwrap();
+        let transitions = {
+            let conn = reopened.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT transition.status, transition.resolved_head,
+                            transition.writer_version
+                     FROM code_review_theme_transitions AS transition
+                     JOIN code_review_jobs AS job ON job.id = transition.job_id
+                     WHERE transition.theme_id = ?1
+                     ORDER BY job.publication_order",
+                )
+                .unwrap();
+            stmt.query_map([&theme_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        assert_eq!(
+            transitions,
+            vec![
+                ("open".into(), String::new(), 1),
+                ("resolved".into(), second_job.head_sha.clone(), 1),
+            ]
+        );
+        let theme = reopened
+            .code_review_themes_for_job(&first_job.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(theme.status, "resolved");
+        assert_eq!(theme.resolved_head, second_job.head_sha);
+
+        {
+            let conn = reopened.conn.lock().unwrap();
+            let tx = write_transaction(&conn).unwrap();
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET resolved_at = NULL, resolved_head = ''
+                 WHERE id = ?1",
+                [&finding.id],
+            )
+            .unwrap();
+            tx.execute(
+                "DELETE FROM code_review_theme_transitions WHERE theme_id = ?1",
+                [&theme_id],
+            )
+            .unwrap();
+            record_code_review_theme_transition_snapshots(&tx, &first_job.id, "", false).unwrap();
+            tx.commit().unwrap();
+        }
+        let filtered_first_status = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = ?1 AND job_id = ?2",
+                params![theme_id, first_job.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(filtered_first_status, "open");
+
+        {
+            let conn = reopened.conn.lock().unwrap();
+            let tx = write_transaction(&conn).unwrap();
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET resolved_at = '2999-01-01T00:00:00Z',
+                     resolved_head = ?2
+                 WHERE id = ?1",
+                params![finding.id, second_job.head_sha],
+            )
+            .unwrap();
+            tx.execute(
+                "DELETE FROM code_review_theme_transitions WHERE theme_id = ?1",
+                [&theme_id],
+            )
+            .unwrap();
+            record_code_review_theme_transition_snapshots(&tx, "", "", false).unwrap();
+            tx.execute(
+                "UPDATE code_review_theme_transitions
+                 SET status = 'resolved', resolved_head = ?2, writer_version = 0
+                 WHERE theme_id = ?1",
+                params![theme_id, second_job.head_sha],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(reopened);
+
+        let reopened = Store::open(&database).unwrap();
+        let repaired_statuses = {
+            let conn = reopened.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT transition.status, transition.writer_version
+                     FROM code_review_theme_transitions AS transition
+                     JOIN code_review_jobs AS job ON job.id = transition.job_id
+                     WHERE transition.theme_id = ?1
+                     ORDER BY job.publication_order",
+                )
+                .unwrap();
+            stmt.query_map([&theme_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        assert_eq!(
+            repaired_statuses,
+            vec![("open".into(), 1), ("open".into(), 1)]
+        );
+        let theme = reopened
+            .code_review_themes_for_job(&first_job.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(theme.status, "open");
+        assert!(theme.resolved_head.is_empty());
+    }
+
+    #[test]
+    fn migration_rebuild_uses_only_published_theme_transitions() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("resolved-theme-observation.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let published_job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &published_job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/published.rs".into(),
+                        line: 7,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Published symptom".into(),
+                        body: "Only a published resolver can close this finding.".into(),
+                        prompt_for_agents: "Keep unpublished closures open.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/legacy.rs".into(),
+                        line: 11,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Legacy fixed symptom".into(),
+                        body: "Legacy closures have no resolver provenance.".into(),
+                        prompt_for_agents: "Preserve the legacy closure.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["published-theme".into()],
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["legacy-theme".into()],
+                        ..Default::default()
+                    },
+                ],
+                &[
+                    NewCodeReviewTheme {
+                        id: "published-theme".into(),
+                        root_cause: "published root cause".into(),
+                        recommendation: "record the closure transition".into(),
+                        observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                        previous_finding_ids: Vec::new(),
+                    },
+                    NewCodeReviewTheme {
+                        id: "legacy-theme".into(),
+                        root_cause: "legacy root cause".into(),
+                        recommendation: "preserve provenance-free closures".into(),
+                        observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                        previous_finding_ids: Vec::new(),
+                    },
+                    NewCodeReviewTheme {
+                        id: "standalone-theme".into(),
+                        root_cause: "standalone root cause".into(),
+                        recommendation: "record the final publication state".into(),
+                        observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                        previous_finding_ids: Vec::new(),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+        let published_theme_id = findings[0].theme_ids[0].clone();
+        let legacy_theme_id = findings[1].theme_ids[0].clone();
+        let standalone_theme_id = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT theme_id
+                 FROM code_review_theme_observations
+                 WHERE job_id = ?1 AND theme_id NOT IN (?2, ?3)",
+                params![published_job.id, published_theme_id, legacy_theme_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let mut unpublished_request = backoff_test_job_request();
+        unpublished_request.dedupe_key = "acme/widgets#42:unpublished-resolver".into();
+        unpublished_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let unpublished_job = store
+            .enqueue_code_review_job(&unpublished_request)
+            .unwrap()
+            .unwrap();
+        let stale_unpublished_time = "2099-01-02T03:04:05+00:00";
+        let legacy_resolution_time = "1999-01-02T03:04:05+00:00";
+        let authoritative_transition_time = {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-12',
+                     review_published = 1, publication_accepted = 1,
+                     publication_order = 1
+                 WHERE id = ?1",
+                [&published_job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', resolved_by_job_id = ?2,
+                     resolved_head = ?3, resolved_at = ?4
+                 WHERE id = ?1",
+                params![
+                    findings[0].id,
+                    unpublished_job.id,
+                    unpublished_job.head_sha,
+                    stale_unpublished_time
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', resolved_by_job_id = '',
+                     resolved_head = ?2, resolved_at = ?3
+                 WHERE id = ?1",
+                params![
+                    findings[1].id,
+                    published_job.head_sha,
+                    legacy_resolution_time
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_themes
+                 SET status = 'resolved', resolved_head = 'stale-resolution',
+                     updated_at = ?2
+                 WHERE id IN (?1, ?3)",
+                params![
+                    published_theme_id,
+                    stale_unpublished_time,
+                    standalone_theme_id
+                ],
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT MAX(created_at)
+                 FROM code_review_theme_observations WHERE job_id = ?1",
+                [&published_job.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        drop(store);
+
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "ALTER TABLE code_review_theme_observations RENAME TO authority_observations;
+                 CREATE TABLE code_review_theme_observations (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   head_sha TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   published INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published, created_at)
+                 SELECT theme_id, job_id, head_sha, kind, published, created_at
+                 FROM authority_observations;
+                 DROP TABLE authority_observations;
+                 DELETE FROM store_migrations
+                 WHERE id = 'code-review-theme-transitions-v1';",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let reopened = Store::open(&database).unwrap();
+        let themes = reopened
+            .code_review_themes_for_job(&published_job.id)
+            .unwrap();
+        let published_theme = themes
+            .iter()
+            .find(|theme| theme.id == published_theme_id)
+            .unwrap();
+        assert_eq!(published_theme.status, "open");
+        assert!(published_theme.resolved_head.is_empty());
+        let standalone_theme = themes
+            .iter()
+            .find(|theme| theme.id == standalone_theme_id)
+            .unwrap();
+        assert_eq!(standalone_theme.status, "resolved");
+        assert_eq!(standalone_theme.resolved_head, published_job.head_sha);
+        let legacy_theme = themes
+            .iter()
+            .find(|theme| theme.id == legacy_theme_id)
+            .unwrap();
+        assert_eq!(legacy_theme.status, "resolved");
+        assert_eq!(legacy_theme.resolved_head, published_job.head_sha);
+        let conn = reopened.conn.lock().unwrap();
+        for theme_id in [&published_theme_id, &legacy_theme_id, &standalone_theme_id] {
+            let (updated_at, transition_count) = conn
+                .query_row(
+                    "SELECT theme.updated_at, (
+                       SELECT COUNT(*) FROM code_review_theme_transitions transition
+                       WHERE transition.theme_id = theme.id
+                     )
+                     FROM code_review_themes theme WHERE theme.id = ?1",
+                    [theme_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(updated_at, authoritative_transition_time);
+            assert_eq!(transition_count, 1);
+        }
+    }
+
+    #[test]
+    fn rollback_observations_in_transitional_schema_are_rebuilt_once() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("rollback-theme-observation.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Rollback symptom".into(),
+                    body: "Rollback rows already changed their aggregate.".into(),
+                    prompt_for_agents: "Preserve the aggregate.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["rollback-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "rollback-theme".into(),
+                    root_cause: "rollback root cause".into(),
+                    recommendation: "record authority per observation".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+        drop(store);
+        {
+            let conn = Connection::open(&database).unwrap();
+            // Simulate a rollback writer running after the authority migration
+            // added `published` but before per-row provenance was available.
+            conn.execute_batch(
+                "ALTER TABLE code_review_theme_observations RENAME TO authority_observations;
+                 CREATE TABLE code_review_theme_observations (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   head_sha TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   published INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published, created_at)
+                 SELECT theme_id, job_id, head_sha, kind, published, created_at
+                 FROM authority_observations;
+                 DROP TABLE authority_observations;
+                 DELETE FROM store_migrations
+                 WHERE id = 'code-review-theme-transitions-v1';",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET review_published = 1, publication_claimed = 0,
+                     publication_order = 0,
+                     review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-11'
+                 WHERE id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+            // The rollback writer omits provenance and eagerly updates the
+            // aggregate theme, while SQLite supplies `published = 0`.
+            conn.execute(
+                "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, created_at)
+                 VALUES (?1, ?2, ?3, 'recurrence', ?4)",
+                params![
+                    theme_id,
+                    job.id,
+                    job.head_sha,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_themes
+                 SET status = 'open', last_seen_head = ?2,
+                     resolved_head = '', recurrence_count = 5
+                 WHERE id = ?1",
+                params![theme_id, job.head_sha],
+            )
+            .unwrap();
+        }
+
+        let reopened = Store::open(&database).unwrap();
+        let observation = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published, publication_managed
+                 FROM code_review_theme_observations WHERE job_id = ?1",
+                [&job.id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(observation, (true, true));
+        let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
+        assert_eq!(themes[0].status, "open");
+        assert_eq!(themes[0].last_seen_head, job.head_sha);
+        assert!(themes[0].resolved_head.is_empty());
+        assert_eq!(themes[0].recurrence_count, 1);
+    }
+
+    #[test]
+    fn observation_recovery_replays_durable_publication_order() {
+        let store = Store::open_in_memory().unwrap();
+        let first_job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &first_job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Ordered symptom".into(),
+                    body: "Publication order is authoritative.".into(),
+                    prompt_for_agents: "Preserve it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["ordered-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "ordered-theme".into(),
+                    root_cause: "ordered root cause".into(),
+                    recommendation: "replay publication order".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:published-first".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second_job = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE code_review_jobs
+             SET review_published = 1,
+                 publication_order = CASE id WHEN ?1 THEN 2 ELSE 1 END
+             WHERE id IN (?1, ?2)",
+            params![first_job.id, second_job.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_review_theme_observations
+               (theme_id, job_id, head_sha, kind, published,
+                publication_managed, created_at)
+             VALUES (?1, ?2, ?3, 'continuation', 0, 1, ?4)",
+            params![
+                theme_id,
+                second_job.id,
+                second_job.head_sha,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_review_themes SET status = 'pending', last_seen_head = ''
+             WHERE id = ?1",
+            [&theme_id],
+        )
+        .unwrap();
+
+        promote_published_code_review_theme_observations(&mut conn).unwrap();
+        let state = conn
+            .query_row(
+                "SELECT status, last_seen_head FROM code_review_themes WHERE id = ?1",
+                [&theme_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("open".into(), first_job.head_sha));
+    }
+
+    #[test]
+    fn observation_recovery_normalizes_mixed_legacy_and_modern_orders() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..4 {
+            let mut request = backoff_test_job_request();
+            request.dedupe_key = format!("acme/widgets#{}:rowid-padding", 100 + index);
+            request.pull_number = 100 + index;
+            store.enqueue_code_review_job(&request).unwrap().unwrap();
+        }
+
+        let legacy_job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &legacy_job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Mixed-order symptom".into(),
+                    body: "Publication order domains must not be mixed.".into(),
+                    prompt_for_agents: "Normalize the sequence.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["mixed-order-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "mixed-order-theme".into(),
+                    root_cause: "mixed publication order".into(),
+                    recommendation: "use one per-pull sequence".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+        let mut modern_request = backoff_test_job_request();
+        modern_request.dedupe_key = "acme/widgets#42:modern-publication".into();
+        modern_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let modern_job = store
+            .enqueue_code_review_job(&modern_request)
+            .unwrap()
+            .unwrap();
+        let mut earlier_request = backoff_test_job_request();
+        earlier_request.dedupe_key = "acme/widgets#42:earlier-publication".into();
+        earlier_request.head_sha = "4444444444444444444444444444444444444444".into();
+        let earlier_job = store
+            .enqueue_code_review_job(&earlier_request)
+            .unwrap()
+            .unwrap();
+        let mut mixed_evidence_request = backoff_test_job_request();
+        mixed_evidence_request.dedupe_key = "acme/widgets#42:mixed-evidence".into();
+        mixed_evidence_request.head_sha = "5555555555555555555555555555555555555555".into();
+        let mixed_evidence_job = store
+            .enqueue_code_review_job(&mixed_evidence_request)
+            .unwrap()
+            .unwrap();
+
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE code_review_jobs
+             SET review_published = 1,
+                 publication_order = CASE id
+                   WHEN ?1 THEN 0 WHEN ?2 THEN 2 WHEN ?3 THEN 1 ELSE 0 END,
+                 review_url = CASE id
+                   WHEN ?1 THEN 'https://github.com/acme/widgets/pull/42#pullrequestreview-20'
+                   WHEN ?2 THEN 'https://github.com/acme/widgets/pull/42#pullrequestreview-30'
+                   WHEN ?3 THEN 'https://github.com/acme/widgets/pull/42#pullrequestreview-10'
+                   ELSE '' END,
+                 completed_at = CASE id
+                   WHEN ?1 THEN '2026-08-20T00:00:40Z'
+                   WHEN ?2 THEN '2026-08-20T00:00:10Z'
+                   WHEN ?3 THEN '2026-08-20T00:00:30Z'
+                   ELSE '2026-08-20T00:00:05Z' END
+             WHERE id IN (?1, ?2, ?3, ?4)",
+            params![
+                legacy_job.id,
+                modern_job.id,
+                earlier_job.id,
+                mixed_evidence_job.id
+            ],
+        )
+        .unwrap();
+        for job in [&modern_job, &earlier_job] {
+            conn.execute(
+                "INSERT INTO code_review_theme_observations
+               (theme_id, job_id, head_sha, kind, published,
+                publication_managed, created_at)
+             VALUES (?1, ?2, ?3, 'continuation', 0, 1, ?4)",
+                params![
+                    theme_id,
+                    job.id,
+                    job.head_sha,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE code_review_themes SET status = 'pending', last_seen_head = ''
+             WHERE id = ?1",
+            [&theme_id],
+        )
+        .unwrap();
+
+        normalize_code_review_publication_orders(&mut conn).unwrap();
+        let publication_order = |job_id: &str| {
+            conn.query_row(
+                "SELECT publication_order FROM code_review_jobs WHERE id = ?1",
+                [job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        // The two established orders disagree with creation rowid and their
+        // lifecycle timestamps run opposite to GitHub review-id order. Their
+        // relative order survives, review id 20 is placed between ids 10 and
+        // 30, and the no-id fallback remains deterministic and transitive.
+        assert_eq!(publication_order(&earlier_job.id), 1);
+        assert_eq!(publication_order(&legacy_job.id), 2);
+        assert_eq!(publication_order(&modern_job.id), 3);
+        assert_eq!(publication_order(&mixed_evidence_job.id), 4);
+
+        promote_published_code_review_theme_observations(&mut conn).unwrap();
+        let state = conn
+            .query_row(
+                "SELECT status, last_seen_head FROM code_review_themes WHERE id = ?1",
+                [&theme_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("open".into(), modern_job.head_sha));
     }
 
     fn backoff_test_job_request() -> NewCodeReviewJob {
@@ -17303,7 +20847,7 @@ mod tests {
                 .unwrap()
         );
         let findings = store
-            .save_code_review_result(
+            .save_code_review_result_with_themes(
                 &queued.id,
                 "One issue",
                 "Fix every confirmed issue.",
@@ -17323,6 +20867,24 @@ mod tests {
                         candidate_id: "candidate-1".into(),
                         task_id: task.id.clone(),
                     }],
+                }],
+                &[NewCodeReviewFindingDetails {
+                    evidence: trouve_protocol::CodeReviewFindingEvidence {
+                        preconditions: "request reaches the changed branch".into(),
+                        execution_path: "handler calls the fallible operation".into(),
+                        consequence: "the failure is silently ignored".into(),
+                        introduction: "the new handler drops the result".into(),
+                        regression_test: "assert that the failure is returned".into(),
+                    },
+                    origin: trouve_protocol::CodeReviewFindingOrigin::NewChange,
+                    theme_ids: vec!["rvth-test".into()],
+                }],
+                &[NewCodeReviewTheme {
+                    id: "rvth-test".into(),
+                    root_cause: "fallible operations lack an error boundary".into(),
+                    recommendation: "propagate the result through the handler".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
                 }],
                 &[trouve_protocol::CodeReviewCandidateRejection {
                     candidate_id: "candidate-2".into(),
@@ -17356,6 +20918,13 @@ mod tests {
         assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
         assert_eq!(detail.findings[0].confidence, "high");
+        assert_eq!(
+            detail.findings[0].evidence.consequence,
+            "the failure is silently ignored"
+        );
+        assert_eq!(detail.findings[0].theme_ids, ["acme/widgets#42:rvth-test"]);
+        assert_eq!(detail.themes.len(), 1);
+        assert_eq!(detail.themes[0].observations.len(), 1);
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
         assert_eq!(detail.routing_decisions, routing_decisions);
 
@@ -17497,6 +21066,232 @@ mod tests {
             1
         );
         assert_eq!(stats.personas[0].not_applicable, 0);
+        assert_eq!(stats.churn.pull_request_count, 0);
+        assert_eq!(stats.churn.recurrence_issue_count, 0);
+        assert_eq!(stats.churn.external_duplicate_count, 0);
+    }
+
+    #[test]
+    fn review_churn_stats_aggregate_classifications_and_rounds_to_clean() {
+        let store = Store::open_in_memory().unwrap();
+        let enqueue = |dedupe_key: &str, head_sha: &str| {
+            store
+                .enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key: dedupe_key.into(),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number: 42,
+                    pull_title: "Ship widgets".into(),
+                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                    head_sha: head_sha.into(),
+                    review_base_sha: "1111111111111111111111111111111111111111".into(),
+                    base_ref: "main".into(),
+                    head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                    trigger: "automatic".into(),
+                    retry_of: None,
+                    model: Some("provider/default".into()),
+                    coordinator_thinking_level: None,
+                    router_model: None,
+                    router_thinking_level: None,
+                    prompt: "Review it".into(),
+                    reviewers: Vec::new(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                    semantic_routing: false,
+                    included_reviewer_ids: Vec::new(),
+                    excluded_reviewer_ids: Vec::new(),
+                    config_hash: "config".into(),
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let legacy = enqueue(
+            "acme/widgets#42:legacy-unmeasured-round",
+            "1212121212121212121212121212121212121212",
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            legacy.id
+        );
+        store
+            .save_code_review_result(&legacy.id, "Legacy clean result.", "", 0, &[], &[])
+            .unwrap();
+        store
+            .finish_code_review_job(&legacy.id, "succeeded", "", "")
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET publication_open_issue_count = NULL
+                 WHERE id = ?1",
+                [&legacy.id],
+            )
+            .unwrap();
+        let first = enqueue(
+            "acme/widgets#42:churn-round-1",
+            "2222222222222222222222222222222222222222",
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        let finding = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 12,
+            side: "RIGHT".into(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            title: "Repeated defect".into(),
+            body: "The lifecycle invariant is violated.".into(),
+            prompt_for_agents: "Restore the invariant.".into(),
+            sources: Vec::new(),
+        };
+        let findings = store
+            .save_code_review_result_with_themes(
+                &first.id,
+                "Three churn findings.",
+                "Fix all three.",
+                3,
+                &[
+                    finding("src/recurrence.rs"),
+                    finding("src/regression.rs"),
+                    finding("src/missed.rs"),
+                ],
+                &[
+                    NewCodeReviewFindingDetails {
+                        origin: trouve_protocol::CodeReviewFindingOrigin::Recurrence,
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        origin: trouve_protocol::CodeReviewFindingOrigin::FixRegression,
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        origin: trouve_protocol::CodeReviewFindingOrigin::PreviouslyMissed,
+                        ..Default::default()
+                    },
+                ],
+                &[],
+                &[
+                    trouve_protocol::CodeReviewCandidateRejection {
+                        candidate_id: "external".into(),
+                        task_id: "task".into(),
+                        reviewer_id: "correctness".into(),
+                        reviewer_name: "Correctness".into(),
+                        path: "src/lib.rs".into(),
+                        line: 3,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Duplicate".into(),
+                        body: "Already reported.".into(),
+                        reason: "external_duplicate: already reported by a human".into(),
+                    },
+                    trouve_protocol::CodeReviewCandidateRejection {
+                        candidate_id: "weak".into(),
+                        task_id: "task".into(),
+                        reviewer_id: "correctness".into(),
+                        reviewer_name: "Correctness".into(),
+                        path: "src/lib.rs".into(),
+                        line: 4,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "low".into(),
+                        title: "Unproven".into(),
+                        body: "Missing a reachable sequence.".into(),
+                        reason: "insufficient_evidence: no reachable sequence".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .set_code_review_finding_publication_status(
+                &findings[0].id,
+                trouve_protocol::CodeReviewFindingPublicationStatus::GroupedByTheme,
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
+        store
+            .record_code_review_publication(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.base_ref,
+                &first.head_sha,
+                "https://example.test/review/1",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&first.id, "succeeded", "https://example.test/review/1", "")
+            .unwrap();
+
+        let second = enqueue(
+            "acme/widgets#42:churn-round-2",
+            "3333333333333333333333333333333333333333",
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            second.id
+        );
+        store
+            .save_code_review_result(&second.id, "Clean.", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&second.id).unwrap());
+        let resolved_finding_ids = findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
+        store
+            .record_code_review_publication(
+                &second.id,
+                &second.repository,
+                second.pull_number,
+                &second.base_ref,
+                &second.head_sha,
+                "https://example.test/review/2",
+                false,
+                &resolved_finding_ids,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&second.id, "succeeded", "https://example.test/review/2", "")
+            .unwrap();
+        let publication_open_issue_count = |job_id: &str| {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT publication_open_issue_count FROM code_review_jobs WHERE id = ?1",
+                    [job_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(publication_open_issue_count(&first.id), Some(3));
+        assert_eq!(publication_open_issue_count(&second.id), Some(0));
+
+        let stats = store
+            .code_review_stats(
+                trouve_protocol::CodeReviewStatsRange::All,
+                Some("acme/widgets"),
+            )
+            .unwrap();
+        assert_eq!(stats.churn.recurrence_issue_count, 1);
+        assert_eq!(stats.churn.fix_regression_issue_count, 1);
+        assert_eq!(stats.churn.previously_missed_issue_count, 1);
+        assert_eq!(stats.churn.grouped_issue_count, 1);
+        assert_eq!(stats.churn.external_duplicate_count, 1);
+        assert_eq!(stats.churn.insufficient_evidence_rejection_count, 1);
+        assert_eq!(stats.churn.pull_request_count, 1);
+        assert_eq!(stats.churn.clean_pull_request_count, 1);
+        assert_eq!(stats.churn.average_rounds_to_clean, 2.0);
+        assert_eq!(stats.churn.max_rounds_to_clean, 2);
     }
 
     #[test]
@@ -18134,65 +21929,128 @@ mod tests {
     }
 
     #[test]
-    fn review_publication_claim_blocks_cancellation_and_recovers_for_retry() {
+    fn review_publication_restart_matrix_preserves_ambiguous_dispatches() {
         let store = Store::open_in_memory().unwrap();
-        let job = store
-            .enqueue_code_review_job(&NewCodeReviewJob {
-                dedupe_key: "acme/widgets#42:publishing".into(),
-                installation_id: 7,
-                repository: "acme/widgets".into(),
-                pull_number: 42,
-                pull_title: "Ship widgets".into(),
-                pull_url: "https://github.com/acme/widgets/pull/42".into(),
-                head_sha: "2222222222222222222222222222222222222222".into(),
-                review_base_sha: "1111111111111111111111111111111111111111".into(),
-                base_ref: "main".into(),
-                head_ref: "ship".into(),
-                scope: trouve_protocol::CodeReviewJobScope::Incremental,
-                trigger: "automatic".into(),
-                retry_of: None,
-                model: None,
-                coordinator_thinking_level: None,
-                router_model: None,
-                router_thinking_level: None,
-                prompt: String::new(),
-                reviewers: Vec::new(),
-                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
-                semantic_routing: false,
-                included_reviewer_ids: Vec::new(),
-                excluded_reviewer_ids: Vec::new(),
-                config_hash: "config".into(),
-            })
-            .unwrap()
-            .unwrap();
+        let enqueue = |boundary: &str| {
+            let pull_number = match boundary {
+                "legacy-claimed" => 42,
+                "before-claim" => 43,
+                "prepared" => 44,
+                "dispatched" => 45,
+                "accepted" => 46,
+                _ => unreachable!("unknown publication boundary"),
+            };
+            store
+                .enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key: format!("acme/widgets#{pull_number}:publishing:{boundary}"),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number,
+                    pull_title: "Ship widgets".into(),
+                    pull_url: format!("https://github.com/acme/widgets/pull/{pull_number}"),
+                    head_sha: "2222222222222222222222222222222222222222".into(),
+                    review_base_sha: "1111111111111111111111111111111111111111".into(),
+                    base_ref: "main".into(),
+                    head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                    trigger: "automatic".into(),
+                    retry_of: None,
+                    model: None,
+                    coordinator_thinking_level: None,
+                    router_model: None,
+                    router_thinking_level: None,
+                    prompt: String::new(),
+                    reviewers: Vec::new(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                    semantic_routing: false,
+                    included_reviewer_ids: Vec::new(),
+                    excluded_reviewer_ids: Vec::new(),
+                    config_hash: "config".into(),
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let legacy_claimed = enqueue("legacy-claimed");
         store.claim_code_review_job().unwrap().unwrap();
-        assert!(store.claim_code_review_publication(&job.id).unwrap());
-
-        let error = store.request_code_review_job_cancel(&job.id).unwrap_err();
-        assert!(error.to_string().contains("before cancelling"));
-
-        store.recover_code_review_jobs().unwrap();
-        let recovered = store.code_review_job(&job.id).unwrap().unwrap();
-        assert_eq!(recovered.job.status, "failed");
-        assert!(!recovered.publication_claimed);
-        assert!(!recovered.publication_accepted);
-        let retry = store.retry_code_review_job(&job.id).unwrap().unwrap();
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            retry.id
-        );
-        assert!(store.claim_code_review_publication(&retry.id).unwrap());
         assert!(
             store
-                .mark_code_review_publication_accepted(&retry.id)
+                .claim_code_review_publication(&legacy_claimed.id)
+                .unwrap()
+        );
+        {
+            let mut conn = store.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM store_migrations WHERE id = ?1",
+                ["code-review-publication-dispatch-backfill-v1"],
+            )
+            .unwrap();
+            backfill_code_review_publication_dispatch(&mut conn).unwrap();
+        }
+        assert!(
+            store
+                .code_review_job(&legacy_claimed.id)
+                .unwrap()
+                .unwrap()
+                .publication_dispatched
+        );
+        let before_claim = enqueue("before-claim");
+        let prepared = enqueue("prepared");
+        let dispatched = enqueue("dispatched");
+        let accepted = enqueue("accepted");
+        for expected in [&before_claim, &prepared, &dispatched, &accepted] {
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                expected.id
+            );
+            if expected.id != before_claim.id {
+                assert!(store.claim_code_review_publication(&expected.id).unwrap());
+                let error = store
+                    .request_code_review_job_cancel(&expected.id)
+                    .unwrap_err();
+                assert!(error.to_string().contains("before cancelling"));
+            }
+        }
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&dispatched.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&accepted.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&accepted.id)
                 .unwrap()
         );
 
         store.recover_code_review_jobs().unwrap();
-        let accepted = store.code_review_job(&retry.id).unwrap().unwrap();
-        assert_eq!(accepted.job.status, "succeeded");
-        assert!(accepted.publication_claimed);
-        assert!(accepted.publication_accepted);
+        let cases = [
+            (&legacy_claimed, "failed", true, true, false),
+            (&before_claim, "queued", false, false, false),
+            (&prepared, "failed", false, false, false),
+            (&dispatched, "failed", true, true, false),
+            (&accepted, "succeeded", true, true, true),
+        ];
+        for (job, status, claimed, was_dispatched, was_accepted) in cases {
+            let recovered = store.code_review_job(&job.id).unwrap().unwrap();
+            assert_eq!(recovered.job.status, status, "{}", job.id);
+            assert_eq!(recovered.publication_claimed, claimed, "{}", job.id);
+            assert_eq!(
+                recovered.publication_dispatched, was_dispatched,
+                "{}",
+                job.id
+            );
+            assert_eq!(recovered.publication_accepted, was_accepted, "{}", job.id);
+        }
+
+        assert!(store.retry_code_review_job(&prepared.id).unwrap().is_some());
+        let error = store.retry_code_review_job(&dispatched.id).unwrap_err();
+        assert!(error.to_string().contains("reconcile it"));
+        let error = store.retry_code_review_job(&accepted.id).unwrap_err();
+        assert!(error.to_string().contains("reconcile it"));
     }
 
     #[test]

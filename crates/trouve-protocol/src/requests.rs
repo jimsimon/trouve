@@ -849,6 +849,8 @@ pub struct FirstPartyCodeReview {
     pub review_url: String,
     #[serde(default)]
     pub findings: Vec<CodeReviewFinding>,
+    #[serde(default)]
+    pub themes: Vec<CodeReviewTheme>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2056,6 +2058,76 @@ pub struct CodeReviewCandidateRejection {
     pub reason: String,
 }
 
+/// Concrete evidence that makes a confirmed finding independently verifiable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewFindingEvidence {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preconditions: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub execution_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub consequence: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub introduction: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub regression_test: String,
+}
+
+/// How a finding relates to earlier review rounds on the pull request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewFindingOrigin {
+    #[default]
+    NewChange,
+    Recurrence,
+    FixRegression,
+    PreviouslyMissed,
+}
+
+/// How a durable root-cause theme appeared in one review round.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewThemeObservationKind {
+    #[default]
+    New,
+    Continuation,
+    Recurrence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewThemeObservation {
+    pub job_id: String,
+    pub head_sha: String,
+    pub kind: CodeReviewThemeObservationKind,
+    pub finding_ids: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A root cause tracked across all review rounds for one pull request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewTheme {
+    pub id: String,
+    pub repository: String,
+    pub pull_number: u64,
+    pub root_cause: String,
+    pub recommendation: String,
+    /// `pending` while the producing review is unpublished, `open` while at
+    /// least one authoritative linked finding is open, otherwise `resolved`.
+    pub status: String,
+    pub first_seen_head: String,
+    pub last_seen_head: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolved_head: String,
+    #[serde(default)]
+    pub recurrence_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<CodeReviewThemeObservation>,
+}
+
 /// The outcome of attempting to publish a finding as an inline GitHub comment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -2070,6 +2142,9 @@ pub enum CodeReviewFindingPublicationStatus {
     /// The finding was retained internally but did not meet the automatic
     /// publication threshold for its severity and confidence.
     SuppressedByPolicy,
+    /// The symptom is retained in Trouve but represented on GitHub by the
+    /// primary comment for its shared root-cause theme.
+    GroupedByTheme,
     /// GitHub did not publish the inline comment.
     Failed,
 }
@@ -2103,10 +2178,25 @@ pub struct CodeReviewFinding {
     pub github_comment_url: String,
     #[serde(default)]
     pub github_publication_status: CodeReviewFindingPublicationStatus,
+    #[serde(default)]
+    pub evidence: CodeReviewFindingEvidence,
+    #[serde(default)]
+    pub origin: CodeReviewFindingOrigin,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub theme_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Immutable PR head on which this finding was first observed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub observed_head: String,
+    /// Immutable PR head whose review demonstrated that the finding was fixed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolved_head: String,
+    /// Review job that demonstrated the fix, for exact fix-diff reconstruction.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolved_by_job_id: String,
 }
 
 fn default_code_review_confidence() -> String {
@@ -2232,6 +2322,8 @@ pub struct CodeReviewJobDetail {
     #[serde(default)]
     pub findings: Vec<CodeReviewFinding>,
     #[serde(default)]
+    pub themes: Vec<CodeReviewTheme>,
+    #[serde(default)]
     pub candidate_rejections: Vec<CodeReviewCandidateRejection>,
     #[serde(default)]
     pub routing_decisions: Vec<CodeReviewRoutingDecision>,
@@ -2352,6 +2444,31 @@ pub struct CodeReviewRepositoryStats {
     pub publication_duration: CodeReviewDurationStats,
 }
 
+/// Signals that measure repeated review work rather than raw issue volume.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewChurnStats {
+    #[serde(default)]
+    pub recurrence_issue_count: u64,
+    #[serde(default)]
+    pub fix_regression_issue_count: u64,
+    #[serde(default)]
+    pub previously_missed_issue_count: u64,
+    #[serde(default)]
+    pub grouped_issue_count: u64,
+    #[serde(default)]
+    pub external_duplicate_count: u64,
+    #[serde(default)]
+    pub insufficient_evidence_rejection_count: u64,
+    #[serde(default)]
+    pub pull_request_count: u64,
+    #[serde(default)]
+    pub clean_pull_request_count: u64,
+    #[serde(default)]
+    pub average_rounds_to_clean: f64,
+    #[serde(default)]
+    pub max_rounds_to_clean: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewStats {
     pub range: CodeReviewStatsRange,
@@ -2374,6 +2491,8 @@ pub struct CodeReviewStats {
     #[serde(default)]
     pub publication_duration: CodeReviewDurationStats,
     pub issue_count: u64,
+    #[serde(default)]
+    pub churn: CodeReviewChurnStats,
     #[serde(default)]
     pub buckets: Vec<CodeReviewStatsBucket>,
     #[serde(default)]
