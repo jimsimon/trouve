@@ -272,6 +272,9 @@ pub struct ThreadViewModel {
     /// Aggregate billing counters for the active turn. Context fields retain
     /// the newest request's measurement instead of being summed.
     running_usage: Option<Usage>,
+    /// Usage from the most recently completed turn. Live usage temporarily
+    /// replaces last_usage for display and terminal failures restore this.
+    completed_usage: Option<Usage>,
     /// True between compaction start/complete events (UI busy indicator).
     pub compacting: bool,
     /// True while a turn is running (between turn.started and completion).
@@ -305,6 +308,8 @@ pub struct ThreadViewModel {
 impl From<ThreadViewSnapshot> for ThreadViewModel {
     fn from(snapshot: ThreadViewSnapshot) -> Self {
         let running_usage = snapshot.active_usage;
+        let completed_usage = snapshot.last_usage;
+        let last_usage = running_usage.clone().or_else(|| completed_usage.clone());
         Self {
             items: snapshot.items.into_iter().map(ChatItem::from).collect(),
             cursor: 0,
@@ -313,8 +318,9 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             capacity_acquired_before_start: HashSet::new(),
             pending_approvals: snapshot.pending_approvals,
             pending_questions: snapshot.pending_questions,
-            last_usage: snapshot.last_usage,
+            last_usage,
             running_usage,
+            completed_usage,
             compacting: snapshot.compacting,
             turn_running: snapshot.turn_running,
             thinking: snapshot.thinking,
@@ -1052,6 +1058,7 @@ impl ThreadViewModel {
                 self.finish_thinking();
                 let aborted_tool = self.abort_open_tools(envelope.ts);
                 self.pending_questions.clear();
+                self.completed_usage = Some(usage.clone());
                 self.last_usage = Some(usage.clone());
                 self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().rposition(|i| {
@@ -1078,6 +1085,7 @@ impl ThreadViewModel {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.running_usage = None;
+                self.last_usage.clone_from(&self.completed_usage);
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1107,6 +1115,7 @@ impl ThreadViewModel {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.running_usage = None;
+                self.last_usage.clone_from(&self.completed_usage);
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1630,6 +1639,47 @@ mod tests {
             supports_steering: false,
         }));
         assert!(vm.turn_running);
+        assert_eq!(vm.running_usage, None);
+        assert_eq!(vm.last_usage, Some(completed_usage.clone()));
+        vm.apply(&env(Event::TurnUsageUpdated {
+            turn: 2,
+            usage: Usage {
+                input_tokens: 99,
+                output_tokens: 9,
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            vm.last_usage,
+            Some(Usage {
+                input_tokens: 99,
+                output_tokens: 9,
+                ..Default::default()
+            })
+        );
+        vm.apply(&env(Event::TurnFailed {
+            turn: 2,
+            error: "provider failed".into(),
+        }));
+        assert_eq!(vm.running_usage, None);
+        assert_eq!(vm.last_usage, Some(completed_usage.clone()));
+
+        vm.apply(&env(Event::TurnStarted {
+            turn: 3,
+            mode: "code".into(),
+            model: "m".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        vm.apply(&env(Event::TurnUsageUpdated {
+            turn: 3,
+            usage: Usage {
+                input_tokens: 42,
+                output_tokens: 4,
+                ..Default::default()
+            },
+        }));
+        vm.apply(&env(Event::TurnCancelled { turn: 3 }));
         assert_eq!(vm.running_usage, None);
         assert_eq!(vm.last_usage, Some(completed_usage));
     }

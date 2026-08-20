@@ -244,6 +244,7 @@ export class ThreadViewModel {
   readonly turnDurationMs = new Map<number, number>();
   readonly #capacityAcquiredBeforeStart = new Set<number>();
   #queueRevision = 0;
+  #completedUsage: Usage | undefined;
 
   cursor = 0;
   /** Absolute folded-item position of `items[0]`. */
@@ -304,7 +305,8 @@ export class ThreadViewModel {
     this.hasOlder = snapshot.has_older ?? itemOffset > 0;
     this.snapshotLoaded = true;
     const activeUsage = snapshot.active_usage ?? undefined;
-    this.lastUsage = activeUsage ?? snapshot.last_usage ?? undefined;
+    this.#completedUsage = snapshot.last_usage ?? undefined;
+    this.lastUsage = activeUsage ?? this.#completedUsage;
     this.lastUsageCursor = this.lastUsage === undefined ? 0 : cursor;
     this.compacting = snapshot.compacting ?? false;
     this.turnRunning = snapshot.turn_running ?? false;
@@ -896,6 +898,7 @@ export class ThreadViewModel {
             ? runningTurn.state.usage
             : undefined,
         );
+        this.#completedUsage = usage;
         this.lastUsage = usage;
         this.lastUsageCursor = envelope.cursor;
         this.recordTurnDuration(envelope.turn, envelope.ts);
@@ -915,6 +918,8 @@ export class ThreadViewModel {
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
+        this.lastUsage = this.#completedUsage;
+        this.lastUsageCursor = this.lastUsage === undefined ? 0 : envelope.cursor;
         this.recordTurnDuration(envelope.turn, envelope.ts);
         return this.replaceActiveTurn(envelope.turn, {
           kind: "failed",
@@ -929,6 +934,8 @@ export class ThreadViewModel {
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
+        this.lastUsage = this.#completedUsage;
+        this.lastUsageCursor = this.lastUsage === undefined ? 0 : envelope.cursor;
         this.recordTurnDuration(envelope.turn, envelope.ts);
         const index = this.items.findIndex((item) =>
           item.kind === "turn-status" && item.turn === envelope.turn);

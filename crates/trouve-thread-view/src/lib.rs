@@ -458,9 +458,6 @@ impl ThreadProjection {
             }
             Event::TurnUsageUpdated { usage, .. } => {
                 accumulate_live_usage(&mut self.snapshot.active_usage, usage);
-                self.snapshot
-                    .last_usage
-                    .clone_from(&self.snapshot.active_usage);
             }
             Event::TurnCompleted {
                 turn,
@@ -1253,8 +1250,9 @@ mod tests {
         ));
 
         assert!(projection.snapshot.turn_running);
+        assert_eq!(projection.snapshot.last_usage, None);
         assert_eq!(
-            projection.snapshot.last_usage,
+            projection.snapshot.active_usage,
             Some(trouve_protocol::Usage {
                 input_tokens: 12_000,
                 output_tokens: 750,
@@ -1263,10 +1261,6 @@ mod tests {
                 context_window: Some(258_400),
                 ..Default::default()
             })
-        );
-        assert_eq!(
-            projection.snapshot.active_usage,
-            projection.snapshot.last_usage
         );
         assert_eq!(
             projection
@@ -1337,14 +1331,41 @@ mod tests {
             },
         ));
 
-        assert_eq!(projection.snapshot.active_usage, Some(next_usage.clone()));
-        assert_eq!(projection.snapshot.last_usage, Some(next_usage));
+        assert_eq!(projection.snapshot.active_usage, Some(next_usage));
+        assert!(matches!(
+            projection.snapshot.last_usage,
+            Some(trouve_protocol::Usage {
+                input_tokens: 12_000,
+                output_tokens: 750,
+                cached_input_tokens: 85_000,
+                context_input_tokens: Some(70_000),
+                context_window: Some(258_400),
+                ..
+            })
+        ));
         assert!(matches!(
             projection.snapshot.items.first(),
             Some(ThreadViewItem::TurnStatus {
                 turn: 7,
                 state: ThreadTurnState::Completed { usage, .. },
             }) if usage.input_tokens == 12_000 && usage.output_tokens == 750
+        ));
+        projection.apply(&envelope(
+            8,
+            16,
+            Event::TurnFailed {
+                turn: 8,
+                error: "provider failed".into(),
+            },
+        ));
+        assert_eq!(projection.snapshot.active_usage, None);
+        assert!(matches!(
+            projection.snapshot.last_usage,
+            Some(trouve_protocol::Usage {
+                input_tokens: 12_000,
+                output_tokens: 750,
+                ..
+            })
         ));
     }
 

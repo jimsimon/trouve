@@ -885,6 +885,53 @@ describe("ThreadViewModel", () => {
         },
       },
     ]);
+    vm.apply(envelope(9, {
+      type: "turn.failed",
+      turn: 2,
+      error: "provider failed",
+    }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
+    expect(vm.items.at(-1)).toMatchObject({
+      kind: "turn-status",
+      turn: 2,
+      state: { kind: "failed" },
+    });
+
+    vm.apply(envelope(10, {
+      type: "turn.started",
+      turn: 3,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(11, {
+      type: "turn.capacity_acquired",
+      turn: 3,
+      wait_ms: 0,
+      background: false,
+    }));
+    vm.apply(envelope(12, {
+      type: "turn.usage_updated",
+      turn: 3,
+      usage: {
+        input_tokens: 400,
+        output_tokens: 30,
+      },
+    }));
+    vm.apply(envelope(13, {
+      type: "turn.cancelled",
+      turn: 3,
+    }));
+    expect(vm.lastUsage).toMatchObject({
+      input_tokens: 12_000,
+      output_tokens: 750,
+      context_input_tokens: 70_000,
+      context_window: 258_400,
+    });
   });
 
   it("restores live usage and start time on a running snapshot turn", () => {
