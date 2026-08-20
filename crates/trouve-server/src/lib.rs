@@ -950,7 +950,6 @@ pub async fn serve_listener(
     engine.retry_artifact_cleanup_jobs().await;
     engine.retry_persona_deletions().await;
     engine.start_artifact_cleanup_worker();
-    engine.start_session_pr_verification_worker();
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.
     engine.set_base_url(&format!("http://{}", listener.local_addr()?));
@@ -958,6 +957,7 @@ pub async fn serve_listener(
     // never serves a model list it immediately retracts (no-op without a
     // configured probe).
     engine.init_connectivity().await;
+    engine.start_session_pr_verification_worker();
     engine.warm_title_model();
     engine.start_connectivity_monitor();
     engine.start_automation_scheduler();
