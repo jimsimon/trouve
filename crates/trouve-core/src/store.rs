@@ -786,6 +786,17 @@ fn migrate_code_review_theme_observation_publication_authority(
             "ALTER TABLE code_review_theme_observations
                ADD COLUMN publication_managed INTEGER NOT NULL DEFAULT 0;",
         )?;
+        if has_published_column {
+            // The immediately preceding authority-aware schema staged rows
+            // with `published = 0` but had no provenance column yet. Preserve
+            // those rows as managed; a true pre-authority upgrade lacked both
+            // columns, while rollback writes after this migration receive the
+            // durable zero default.
+            tx.execute(
+                "UPDATE code_review_theme_observations SET publication_managed = 1",
+                [],
+            )?;
+        }
     }
     tx.execute(
         "UPDATE code_review_theme_observations
@@ -822,22 +833,20 @@ fn compare_code_review_publication_evidence(
     left: &CodeReviewPublicationOrderRecoveryJob,
     right: &CodeReviewPublicationOrderRecoveryJob,
 ) -> std::cmp::Ordering {
-    match (left.review_id, right.review_id) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left
-            .published_at
-            .cmp(&right.published_at)
-            .then_with(|| left.rowid.cmp(&right.rowid))
-            .then_with(|| left.id.cmp(&right.id)),
-    }
+    left.published_at
+        .cmp(&right.published_at)
+        .then_with(|| left.review_id.cmp(&right.review_id))
+        .then_with(|| left.rowid.cmp(&right.rowid))
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 /// Publication orders are counters scoped to one pull request. Legacy or
 /// rollback-created rows can have a zero order, so comparing their global
 /// rowid directly with modern per-pull counters is invalid. Merge those rows
-/// into the established sequence using the durable GitHub review id (falling
-/// back to persisted timestamps and rowid), without changing the relative
-/// order of jobs that already have authoritative nonzero values.
+/// into the established sequence using one transitive durable key: persisted
+/// publication timestamp, optional GitHub review id, rowid, then id. This
+/// never changes the relative order of jobs that already have authoritative
+/// nonzero values.
 fn normalize_code_review_publication_orders(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let affected_pulls = {
@@ -18446,6 +18455,101 @@ mod tests {
     }
 
     #[test]
+    fn migration_preserves_pending_authority_managed_observations() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data
+            .path()
+            .join("authority-aware-theme-observation.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Staged symptom".into(),
+                    body: "The staged transition must survive schema upgrade.".into(),
+                    prompt_for_agents: "Preserve publication authority.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["staged-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "staged-theme".into(),
+                    root_cause: "staged root cause".into(),
+                    recommendation: "promote after publication repair".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-9',
+                     review_published = 0, publication_accepted = 0
+                 WHERE id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+        drop(store);
+
+        // Recreate the immediately preceding authority-aware shape: staged
+        // publication state exists, but per-row provenance does not yet.
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "ALTER TABLE code_review_theme_observations RENAME TO authority_observations;
+                 CREATE TABLE code_review_theme_observations (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   head_sha TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   published INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published, created_at)
+                 SELECT theme_id, job_id, head_sha, kind, published, created_at
+                 FROM authority_observations;
+                 DROP TABLE authority_observations;",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let reopened = Store::open(&database).unwrap();
+        let observation = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published, publication_managed
+                 FROM code_review_theme_observations WHERE job_id = ?1",
+                [&job.id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(observation, (true, true));
+        let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
+        assert_eq!(themes[0].status, "open");
+        assert_eq!(themes[0].last_seen_head, job.head_sha);
+    }
+
+    #[test]
     fn rollback_observations_are_classified_after_migration_marker() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("rollback-theme-observation.sqlite3");
@@ -18684,19 +18788,37 @@ mod tests {
             .enqueue_code_review_job(&earlier_request)
             .unwrap()
             .unwrap();
+        let mut mixed_evidence_request = backoff_test_job_request();
+        mixed_evidence_request.dedupe_key = "acme/widgets#42:mixed-evidence".into();
+        mixed_evidence_request.head_sha = "5555555555555555555555555555555555555555".into();
+        let mixed_evidence_job = store
+            .enqueue_code_review_job(&mixed_evidence_request)
+            .unwrap()
+            .unwrap();
 
         let mut conn = store.conn.lock().unwrap();
         conn.execute(
             "UPDATE code_review_jobs
              SET review_published = 1,
                  publication_order = CASE id
-                   WHEN ?1 THEN 0 WHEN ?2 THEN 2 ELSE 1 END,
+                   WHEN ?1 THEN 0 WHEN ?2 THEN 2 WHEN ?3 THEN 1 ELSE 0 END,
                  review_url = CASE id
                    WHEN ?1 THEN 'https://github.com/acme/widgets/pull/42#pullrequestreview-20'
                    WHEN ?2 THEN 'https://github.com/acme/widgets/pull/42#pullrequestreview-30'
-                   ELSE 'https://github.com/acme/widgets/pull/42#pullrequestreview-10' END
-             WHERE id IN (?1, ?2, ?3)",
-            params![legacy_job.id, modern_job.id, earlier_job.id],
+                   WHEN ?3 THEN 'https://github.com/acme/widgets/pull/42#pullrequestreview-10'
+                   ELSE '' END,
+                 completed_at = CASE id
+                   WHEN ?1 THEN '2026-08-20T00:00:20Z'
+                   WHEN ?2 THEN '2026-08-20T00:00:30Z'
+                   WHEN ?3 THEN '2026-08-20T00:00:10Z'
+                   ELSE '2026-08-20T00:00:25Z' END
+             WHERE id IN (?1, ?2, ?3, ?4)",
+            params![
+                legacy_job.id,
+                modern_job.id,
+                earlier_job.id,
+                mixed_evidence_job.id
+            ],
         )
         .unwrap();
         for job in [&modern_job, &earlier_job] {
@@ -18731,11 +18853,12 @@ mod tests {
             .unwrap()
         };
         // The two established orders disagree with creation rowid. Their
-        // relative order survives while review id 20 places the legacy job
-        // between established review ids 10 and 30.
+        // relative order survives while one legacy review-id row and one row
+        // without a review id are merged by the same transitive timestamp key.
         assert_eq!(publication_order(&earlier_job.id), 1);
         assert_eq!(publication_order(&legacy_job.id), 2);
-        assert_eq!(publication_order(&modern_job.id), 3);
+        assert_eq!(publication_order(&mixed_evidence_job.id), 3);
+        assert_eq!(publication_order(&modern_job.id), 4);
 
         promote_published_code_review_theme_observations(&mut conn).unwrap();
         let state = conn
