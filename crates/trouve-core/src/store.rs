@@ -38,8 +38,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // v9 terminalizes unmatched provider control-plane tool rows when their turn
 // ends, so interrupted collaboration waits cannot replay as active forever.
 // v10 retains active-turn usage aggregates so reconnecting clients receive
-// the same monotonic token totals as live event folds.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 11;
+// the same monotonic token totals as live event folds. v11 separates active
+// usage from the latest measurement. v12 keeps last_usage completed-only.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 12;
 // A snapshot folds events without holding the SQLite connection. A terminal
 // event can therefore advance the materialized cache before the snapshot
 // reacquires the connection. Rebuild from that newer cache instead of mixing

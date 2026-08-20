@@ -281,7 +281,9 @@ pub use requests::*;
 // 7.4: repository review updates document retryable 409 conflicts (additive).
 // 7.5: thread-view snapshots identify active-turn cumulative usage separately
 // from the latest valid usage measurement (additive).
-pub const PROTOCOL_VERSION: &str = "7.5";
+// 7.6: thread-view snapshot last_usage is the last completed turn, while
+// active_usage exclusively carries cumulative usage for a running turn.
+pub const PROTOCOL_VERSION: &str = "7.6";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";
