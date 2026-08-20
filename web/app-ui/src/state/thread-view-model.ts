@@ -26,12 +26,16 @@ const accumulateLiveUsage = (
   if (total === undefined) return { ...latest };
   const totalCost = total.cost_usd;
   const latestCost = latest.cost_usd;
+  const totalCachedInputTokens = total.cached_input_tokens;
+  const latestCachedInputTokens = latest.cached_input_tokens;
   const contextInputTokens = latest.context_input_tokens ?? total.context_input_tokens;
   const contextWindow = latest.context_window ?? total.context_window;
   return {
     input_tokens: total.input_tokens + latest.input_tokens,
     output_tokens: total.output_tokens + latest.output_tokens,
-    cached_input_tokens: (total.cached_input_tokens ?? 0) + (latest.cached_input_tokens ?? 0),
+    ...(totalCachedInputTokens == null && latestCachedInputTokens == null
+      ? {}
+      : { cached_input_tokens: (totalCachedInputTokens ?? 0) + (latestCachedInputTokens ?? 0) }),
     ...(totalCost == null && latestCost == null
       ? {}
       : { cost_usd: (totalCost ?? 0) + (latestCost ?? 0) }),

@@ -991,6 +991,7 @@ describe("ThreadViewModel", () => {
       context_input_tokens: 65,
       context_window: 1_000,
     });
+    expect(view.lastUsage).not.toHaveProperty("cached_input_tokens");
 
     view.apply(envelope(19, {
       type: "turn.completed",
