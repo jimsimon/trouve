@@ -1147,7 +1147,8 @@ async fn configure_github_review_app(
 
 #[utoipa::path(put, path = "/v1/code-review/repository",
     request_body = UpdateCodeReviewRepositoryRequest,
-    responses((status = 200, body = CodeReviewRepository), (status = 400, body = ErrorBody)))]
+    responses((status = 200, body = CodeReviewRepository), (status = 400, body = ErrorBody),
+        (status = 409, body = ErrorBody)))]
 async fn update_code_review_repository(
     State(engine): State<Arc<Engine>>,
     Json(request): Json<UpdateCodeReviewRepositoryRequest>,

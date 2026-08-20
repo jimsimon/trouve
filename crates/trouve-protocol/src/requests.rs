@@ -18,6 +18,15 @@ pub enum PermissionMode {
     Yolo,
 }
 
+/// Whether a persona is intended for general interaction or specialized review.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaGroup {
+    #[default]
+    General,
+    Reviewer,
+}
+
 /// A data-driven agent persona: prompt + tool policy + model/permission defaults.
 /// Adding a persona is configuration, not code (AGENTS.md invariant 6).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -25,6 +34,8 @@ pub struct AgentPersona {
     /// Stable identifier, e.g. "code", "plan", "review".
     pub id: String,
     pub display_name: String,
+    #[serde(default)]
+    pub group: PersonaGroup,
     /// Appended to the base system prompt.
     pub system_prompt: String,
     /// Tool names this persona may use; empty means all registered tools.
@@ -65,6 +76,8 @@ pub struct PersonaInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpsertPersonaRequest {
     pub display_name: String,
+    #[serde(default)]
+    pub group: PersonaGroup,
     pub system_prompt: String,
     #[serde(default)]
     pub allowed_tools: Vec<String>,

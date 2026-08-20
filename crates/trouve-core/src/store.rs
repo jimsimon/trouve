@@ -492,6 +492,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_token TEXT",
     "CREATE TABLE IF NOT EXISTS persona_cleanup_intents (
        persona_id TEXT PRIMARY KEY,
+       claim_until TEXT,
+       claim_token TEXT,
        created_at TEXT NOT NULL
      )",
     "ALTER TABLE persona_cleanup_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
@@ -596,6 +598,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     backfill_code_review_watermarks(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
+    migrate_general_persona_reviewer_references(conn)?;
     backfill_code_review_collapse_pending(conn)?;
     backfill_code_review_titles(conn)?;
     normalize_draft_stale_code_review_dedupe_keys(conn)?;
@@ -604,6 +607,79 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+fn migrate_general_persona_reviewer_references(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "general-persona-reviewer-references-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute_batch(
+        "UPDATE code_review_repositories SET
+           identity_ids = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM json_each(identity_ids)
+               WHERE value IN ('code', 'plan', 'review')
+             ) THEN CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM json_each(identity_ids)
+                 WHERE value NOT IN ('code', 'plan', 'review')
+               ) THEN (
+                 SELECT json_group_array(value) FROM json_each(identity_ids)
+                 WHERE value NOT IN ('code', 'plan', 'review')
+               )
+               ELSE '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'
+             END
+             ELSE identity_ids
+           END,
+           included_reviewer_ids = (
+             SELECT json_group_array(value) FROM json_each(included_reviewer_ids)
+             WHERE value NOT IN ('code', 'plan', 'review')
+           ),
+           excluded_reviewer_ids = (
+             SELECT json_group_array(value) FROM json_each(excluded_reviewer_ids)
+             WHERE value NOT IN ('code', 'plan', 'review')
+           ),
+           reviewer_overrides = (
+             SELECT json_group_array(value) FROM json_each(reviewer_overrides)
+             WHERE json_extract(value, '$.reviewer_id') NOT IN ('code', 'plan', 'review')
+           )
+         WHERE EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value IN ('code', 'plan', 'review'))
+            OR EXISTS (SELECT 1 FROM json_each(included_reviewer_ids) WHERE value IN ('code', 'plan', 'review'))
+            OR EXISTS (SELECT 1 FROM json_each(excluded_reviewer_ids) WHERE value IN ('code', 'plan', 'review'))
+            OR EXISTS (
+              SELECT 1 FROM json_each(reviewer_overrides)
+              WHERE json_extract(value, '$.reviewer_id') IN ('code', 'plan', 'review')
+            );",
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -6110,6 +6186,46 @@ impl Store {
         Ok(())
     }
 
+    pub fn replace_claimed_reviewer_profile(
+        &self,
+        reviewer: &trouve_protocol::ReviewerProfile,
+        claim_token: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO code_review_identities
+                    (id, name, prompt, model, thinking_level, built_in, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name, prompt = excluded.prompt, model = excluded.model,
+               thinking_level = excluded.thinking_level, built_in = excluded.built_in,
+               updated_at = excluded.updated_at",
+            params![
+                reviewer.id,
+                reviewer.name,
+                reviewer.prompt,
+                reviewer.model,
+                reviewer.default_thinking_level,
+                reviewer.built_in,
+                now,
+            ],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM persona_cleanup_intents
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![reviewer.id, claim_token],
+        )?;
+        anyhow::ensure!(
+            deleted == 1,
+            "persona deletion claim for {} was lost",
+            reviewer.id
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_custom_reviewer_profile(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
@@ -6348,6 +6464,70 @@ impl Store {
             .is_some())
     }
 
+    pub fn claim_persona_deletion(&self, id: &str) -> Result<Option<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now();
+        let token = uuid::Uuid::new_v4().to_string();
+        let claimed = tx.execute(
+            "UPDATE persona_cleanup_intents
+             SET claim_until = ?2, claim_token = ?3
+             WHERE persona_id = ?1
+               AND (claim_token IS NULL OR claim_until IS NULL OR claim_until <= ?4)",
+            params![
+                id,
+                (now + chrono::Duration::minutes(5)).to_rfc3339(),
+                token,
+                now.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok((claimed == 1).then_some(token))
+    }
+
+    pub fn release_persona_deletion_claim(&self, id: &str, token: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE persona_cleanup_intents
+             SET claim_until = NULL, claim_token = NULL
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![id, token],
+        )?;
+        Ok(())
+    }
+
+    pub fn renew_persona_deletion_claim(&self, id: &str, token: &str) -> Result<()> {
+        let claim_until = (chrono::Utc::now()
+            + chrono::Duration::minutes(PERSONA_DELETION_CLAIM_MINUTES))
+        .to_rfc3339();
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE persona_cleanup_intents SET claim_until = ?3
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![id, token, claim_until],
+        )?;
+        anyhow::ensure!(updated == 1, "persona deletion claim for {id} was lost");
+        Ok(())
+    }
+
+    /// Consume a pending deletion because the persona was recreated. Unlike
+    /// deletion completion, repository selections and overrides are retained.
+    pub fn cancel_persona_deletion(&self, id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM persona_cleanup_intents WHERE persona_id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_claimed_persona_deletion(&self, id: &str, token: &str) -> Result<()> {
+        let deleted = self.conn.lock().unwrap().execute(
+            "DELETE FROM persona_cleanup_intents
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![id, token],
+        )?;
+        anyhow::ensure!(deleted == 1, "persona deletion claim for {id} was lost");
+        Ok(())
+    }
+
     pub fn pending_persona_deletions(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
@@ -6438,6 +6618,14 @@ impl Store {
         claim: &PersonaDeletionClaim,
     ) -> Result<()> {
         self.complete_persona_deletion_with_claim(&claim.id, Some(&claim.token))
+    }
+
+    pub(crate) fn complete_claimed_persona_deletion_token(
+        &self,
+        id: &str,
+        token: &str,
+    ) -> Result<()> {
+        self.complete_persona_deletion_with_claim(id, Some(token))
     }
 
     fn complete_persona_deletion_with_claim(

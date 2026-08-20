@@ -151,20 +151,24 @@ export const saveReviewer = async (
   if (!id) {
     throw new Error("Persona name must include at least one ASCII letter or digit.");
   }
-  const existing = (await api<PersonaInfo[]>("/persona-infos"))
-    .find((info) => info.persona.id === id)
-    ?.persona;
+  const personas = await api<PersonaInfo[]>("/persona-infos");
+  const existing = personas.find((info) => info.persona.id === id)?.persona;
   if (reviewer.id === "" && existing !== undefined) {
-    throw new Error(`A persona with id "${id}" already exists.`);
+    throw new Error(`A persona with the ID "${id}" already exists.`);
+  }
+  const policy = existing ?? personas.find((info) => info.persona.id === "review")?.persona;
+  if (policy === undefined) {
+    throw new Error("The built-in Reviewer persona is unavailable.");
   }
   await api(`/personas/${encodeURIComponent(id)}`, {
     method: "PUT",
     body: JSON.stringify({
       display_name: reviewer.name,
+      group: "reviewer",
       system_prompt: reviewer.prompt,
-      allowed_tools: existing?.allowed_tools ?? [],
-      read_only: existing?.read_only ?? false,
-      default_permission_mode: existing?.default_permission_mode ?? null,
+      allowed_tools: policy.allowed_tools,
+      read_only: policy.read_only,
+      default_permission_mode: policy.default_permission_mode ?? null,
       default_model: reviewer.model || null,
       default_thinking_level: reviewer.default_thinking_level || null,
     }),
@@ -186,6 +190,7 @@ export const savePersona = (persona: PersonaInfo["persona"]): Promise<void> =>
     method: "PUT",
     body: JSON.stringify({
       display_name: persona.display_name,
+      group: persona.group ?? "general",
       system_prompt: persona.system_prompt,
       allowed_tools: persona.allowed_tools,
       read_only: persona.read_only,

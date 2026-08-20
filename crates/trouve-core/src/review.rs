@@ -2180,6 +2180,16 @@ impl Engine {
     }
 
     pub(crate) fn code_review_reviewer_catalog(&self) -> Result<Vec<ReviewerProfile>, EngineError> {
+        self.code_review_reviewer_catalog_with_personas(crate::personas::resolve_personas(
+            self.config_dir.as_deref(),
+            None,
+        ))
+    }
+
+    pub(crate) fn code_review_reviewer_catalog_with_personas(
+        &self,
+        personas: Vec<trouve_protocol::AgentPersona>,
+    ) -> Result<Vec<ReviewerProfile>, EngineError> {
         let mut reviewers = crate::reviewers::built_in_reviewers();
         // Pre-unification reviewer records are retained as system personas. They
         // can be customized through the persona catalog, but never deleted.
@@ -2194,23 +2204,32 @@ impl Engine {
             reviewers.push(reviewer);
         }
         // Code review consumes the canonical persona catalog directly.
-        for persona in crate::personas::resolve_personas(self.config_dir.as_deref(), None) {
+        let builtin_ids: HashSet<_> = crate::personas::builtin_personas()
+            .into_iter()
+            .map(|persona| persona.id)
+            .collect();
+        for persona in personas {
             let existing = reviewers
                 .iter()
                 .find(|candidate| candidate.id == persona.id)
                 .cloned();
+            reviewers.retain(|reviewer| reviewer.id != persona.id);
+            if persona.group != trouve_protocol::PersonaGroup::Reviewer {
+                continue;
+            }
             let built_in = existing
                 .as_ref()
                 .is_some_and(|candidate| candidate.built_in)
-                || crate::personas::builtin_personas()
-                    .iter()
-                    .any(|candidate| candidate.id == persona.id);
-            reviewers.retain(|reviewer| reviewer.id != persona.id);
-            reviewers.push(crate::reviewers::merge_persona_with_reviewer(
-                &persona,
-                existing.as_ref(),
-                built_in,
-            ));
+                || builtin_ids.contains(&persona.id);
+            let mut reviewer = crate::reviewers::persona_as_reviewer(&persona, built_in);
+            if let Some(existing) = existing {
+                reviewer.model = persona.default_model.clone().or(existing.model);
+                reviewer.default_thinking_level = persona
+                    .default_thinking_level
+                    .clone()
+                    .or(existing.default_thinking_level);
+            }
+            reviewers.push(reviewer);
         }
         Ok(reviewers)
     }
@@ -2425,6 +2444,19 @@ impl Engine {
         )))
     }
 
+    fn code_review_snapshots_changed(
+        previous_repository: &Option<CodeReviewRepository>,
+        current_repository: &Option<CodeReviewRepository>,
+        previous_catalog: &[ReviewerProfile],
+        current_catalog: &[ReviewerProfile],
+    ) -> Result<bool, EngineError> {
+        let repository_changed = serde_json::to_vec(previous_repository)
+            .map_err(|error| EngineError::Internal(error.into()))?
+            != serde_json::to_vec(current_repository)
+                .map_err(|error| EngineError::Internal(error.into()))?;
+        Ok(repository_changed || previous_catalog != current_catalog)
+    }
+
     pub async fn update_code_review_repository(
         &self,
         request: &UpdateCodeReviewRepositoryRequest,
@@ -2435,6 +2467,7 @@ impl Engine {
         // invalid enabled policies. Persist the dormant configuration as-is;
         // it will be normalized and validated before a later re-enable.
         if request.mode == CodeReviewMode::Off {
+            let _persona_mutation = self.persona_mutations.lock().await;
             self.store.update_code_review_repository(request)?;
             let repository = self
                 .store
@@ -2570,10 +2603,29 @@ impl Engine {
                 "an enabled Manual repository must select at least one reviewer".into(),
             ));
         }
-        self.resolve_code_review_reviewers(&reviewer_ids)?;
-        self.resolve_code_review_reviewers(&included_reviewer_ids)?;
-        self.resolve_code_review_reviewers(&excluded_reviewer_ids)?;
         let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        for reviewer_ids in [
+            &reviewer_ids,
+            &included_reviewer_ids,
+            &excluded_reviewer_ids,
+        ] {
+            let mut seen = HashSet::new();
+            for reviewer_id in reviewer_ids {
+                if !seen.insert(reviewer_id) {
+                    return Err(EngineError::BadRequest(format!(
+                        "duplicate reviewer id {reviewer_id:?}"
+                    )));
+                }
+                if !reviewer_catalog
+                    .iter()
+                    .any(|reviewer| reviewer.id == *reviewer_id)
+                {
+                    return Err(EngineError::BadRequest(format!(
+                        "unknown reviewer id {reviewer_id:?}"
+                    )));
+                }
+            }
+        }
         let excluded = excluded_reviewer_ids.iter().collect::<HashSet<_>>();
         if let Some(overlap) = included_reviewer_ids
             .iter()
@@ -2625,6 +2677,28 @@ impl Engine {
                     .or(model.as_deref()),
             )
             .await?;
+        }
+        // Provider catalog lookups above may involve network I/O. Serialize only
+        // the final optimistic check and write: if either snapshot changed while
+        // validation was in flight, reject this partial update so the client can
+        // retry without overwriting newer repository or persona state.
+        let _persona_mutation = self.persona_mutations.lock().await;
+        let current = self
+            .store
+            .list_code_review_repositories()?
+            .into_iter()
+            .find(|repository| repository.repository == request.repository);
+        let current_catalog = self.code_review_reviewer_catalog()?;
+        if Self::code_review_snapshots_changed(
+            &existing,
+            &current,
+            &reviewer_catalog,
+            &current_catalog,
+        )? {
+            return Err(EngineError::Conflict(
+                "code review configuration changed while the update was validated; retry the request"
+                    .into(),
+            ));
         }
         let normalized = UpdateCodeReviewRepositoryRequest {
             installation_id: request.installation_id,
@@ -12716,6 +12790,65 @@ mod tests {
         assert_ne!(
             Engine::code_review_config_hash(&repository, &reviewers).unwrap(),
             initial
+        );
+    }
+
+    #[test]
+    fn optimistic_review_update_detects_repository_and_catalog_drift() {
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let repository = CodeReviewRepository {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            private: false,
+            mode: CodeReviewMode::Automatic,
+            model: Some("provider/review".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: String::new(),
+            reviewer_ids: crate::reviewers::default_reviewer_ids(),
+            routing_mode: CodeReviewRoutingMode::Automatic,
+            semantic_routing: true,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            reviewer_overrides: Vec::new(),
+        };
+        let previous = Some(repository.clone());
+        assert!(
+            !Engine::code_review_snapshots_changed(
+                &previous,
+                &Some(repository.clone()),
+                &reviewers,
+                &reviewers,
+            )
+            .unwrap()
+        );
+
+        let mut changed_repository = repository;
+        changed_repository.prompt = "newer update".into();
+        assert!(
+            Engine::code_review_snapshots_changed(
+                &previous,
+                &Some(changed_repository),
+                &reviewers,
+                &reviewers,
+            )
+            .unwrap()
+        );
+
+        let mut changed_catalog = reviewers.clone();
+        changed_catalog[0].model = Some("provider/newer".into());
+        assert!(
+            Engine::code_review_snapshots_changed(
+                &previous,
+                &previous,
+                &reviewers,
+                &changed_catalog,
+            )
+            .unwrap()
         );
     }
 

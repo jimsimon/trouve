@@ -397,6 +397,7 @@ export interface Model {
 export interface AgentPersona {
   id: string;
   display_name: string;
+  group?: "general" | "reviewer";
   system_prompt: string;
   allowed_tools: string[];
   read_only: boolean;

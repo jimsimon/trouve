@@ -51,7 +51,7 @@ license review deliberately change that policy.
 | @napi-rs/wasm-runtime | 1.2.2 | MIT | development |
 | @oxc-project/types | 0.142.0 | MIT | development |
 | @parse5/tools | 0.3.0 | MIT | runtime/transitive |
-| @playwright/test | 1.62.1 | Apache-2.0 | development |
+| @playwright/test | 1.62.0 | Apache-2.0 | development |
 | @redocly/ajv | 8.11.2 | MIT | development |
 | @redocly/config | 0.22.0 | MIT | development |
 | @redocly/openapi-core | 1.34.19 | MIT | development |
@@ -226,7 +226,8 @@ license review deliberately change that policy.
 | pathe | 2.0.3 | MIT | development |
 | picocolors | 1.1.1 | ISC | development |
 | picomatch | 4.0.5 | MIT | development |
-| playwright | 1.62.1 | Apache-2.0 | development |
+| playwright | 1.62.0 | Apache-2.0 | development |
+| playwright-core | 1.62.0 | Apache-2.0 | development |
 | playwright-core | 1.62.1 | Apache-2.0 | development |
 | pluralize | 8.0.0 | MIT | development |
 | postcss | 8.5.25 | MIT | development |
