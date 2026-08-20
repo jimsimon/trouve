@@ -786,17 +786,6 @@ fn migrate_code_review_theme_observation_publication_authority(
             "ALTER TABLE code_review_theme_observations
                ADD COLUMN publication_managed INTEGER NOT NULL DEFAULT 0;",
         )?;
-        if has_published_column {
-            // The immediately preceding authority-aware schema staged rows
-            // with `published = 0` but had no provenance column yet. Preserve
-            // those rows as managed; a true pre-authority upgrade lacked both
-            // columns, while rollback writes after this migration receive the
-            // durable zero default.
-            tx.execute(
-                "UPDATE code_review_theme_observations SET publication_managed = 1",
-                [],
-            )?;
-        }
     }
     tx.execute(
         "UPDATE code_review_theme_observations
@@ -833,9 +822,11 @@ fn compare_code_review_publication_evidence(
     left: &CodeReviewPublicationOrderRecoveryJob,
     right: &CodeReviewPublicationOrderRecoveryJob,
 ) -> std::cmp::Ordering {
-    left.published_at
-        .cmp(&right.published_at)
+    left.review_id
+        .is_none()
+        .cmp(&right.review_id.is_none())
         .then_with(|| left.review_id.cmp(&right.review_id))
+        .then_with(|| left.published_at.cmp(&right.published_at))
         .then_with(|| left.rowid.cmp(&right.rowid))
         .then_with(|| left.id.cmp(&right.id))
 }
@@ -843,10 +834,11 @@ fn compare_code_review_publication_evidence(
 /// Publication orders are counters scoped to one pull request. Legacy or
 /// rollback-created rows can have a zero order, so comparing their global
 /// rowid directly with modern per-pull counters is invalid. Merge those rows
-/// into the established sequence using one transitive durable key: persisted
-/// publication timestamp, optional GitHub review id, rowid, then id. This
-/// never changes the relative order of jobs that already have authoritative
-/// nonzero values.
+/// into the established sequence using one transitive durable key. GitHub
+/// review ids are canonical publication evidence when present; rows without
+/// one form a separate fallback group ordered by persisted lifecycle time,
+/// rowid, then id. This never changes the relative order of jobs that already
+/// have authoritative nonzero values.
 fn normalize_code_review_publication_orders(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let affected_pulls = {
@@ -18455,7 +18447,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_pending_authority_managed_observations() {
+    fn migration_consumes_ambiguous_transitional_observations() {
         let data = tempfile::tempdir().unwrap();
         let database = data
             .path()
@@ -18500,7 +18492,8 @@ mod tests {
             .execute(
                 "UPDATE code_review_jobs
                  SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-9',
-                     review_published = 0, publication_accepted = 0
+                     review_published = 0, publication_accepted = 0,
+                     publication_claimed = 1, publication_order = 1
                  WHERE id = ?1",
                 [&job.id],
             )
@@ -18543,14 +18536,17 @@ mod tests {
                 |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
             )
             .unwrap();
-        assert_eq!(observation, (true, true));
+        // The transitional table has no per-row writer evidence. Even though
+        // this row looks authority-managed, classifying it that way would
+        // replay indistinguishable rollback writes. Consume it conservatively.
+        assert_eq!(observation, (true, false));
         let themes = reopened.code_review_themes_for_job(&job.id).unwrap();
-        assert_eq!(themes[0].status, "open");
+        assert_eq!(themes[0].status, "pending");
         assert_eq!(themes[0].last_seen_head, job.head_sha);
     }
 
     #[test]
-    fn rollback_observations_are_classified_after_migration_marker() {
+    fn rollback_observations_in_transitional_schema_are_consumed() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("rollback-theme-observation.sqlite3");
         let store = Store::open(&database).unwrap();
@@ -18587,18 +18583,40 @@ mod tests {
             )
             .unwrap();
         let theme_id = findings[0].theme_ids[0].clone();
+        drop(store);
         {
-            let conn = store.conn.lock().unwrap();
+            let conn = Connection::open(&database).unwrap();
+            // Simulate a rollback writer running after the authority migration
+            // added `published` but before per-row provenance was available.
+            conn.execute_batch(
+                "ALTER TABLE code_review_theme_observations RENAME TO authority_observations;
+                 CREATE TABLE code_review_theme_observations (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   head_sha TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   published INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published, created_at)
+                 SELECT theme_id, job_id, head_sha, kind, published, created_at
+                 FROM authority_observations;
+                 DROP TABLE authority_observations;",
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE code_review_jobs
-                 SET review_published = 1, publication_order = 1,
+                 SET review_published = 1, publication_claimed = 0,
+                     publication_order = 0,
                      review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-11'
                  WHERE id = ?1",
                 [&job.id],
             )
             .unwrap();
-            // A pre-authority binary restored after the migration omits the
-            // provenance column and eagerly updates the aggregate theme.
+            // The rollback writer omits provenance and eagerly updates the
+            // aggregate theme, while SQLite supplies `published = 0`.
             conn.execute(
                 "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
                 [&job.id],
@@ -18625,7 +18643,6 @@ mod tests {
             )
             .unwrap();
         }
-        drop(store);
 
         let reopened = Store::open(&database).unwrap();
         let observation = reopened
@@ -18808,10 +18825,10 @@ mod tests {
                    WHEN ?3 THEN 'https://github.com/acme/widgets/pull/42#pullrequestreview-10'
                    ELSE '' END,
                  completed_at = CASE id
-                   WHEN ?1 THEN '2026-08-20T00:00:20Z'
-                   WHEN ?2 THEN '2026-08-20T00:00:30Z'
-                   WHEN ?3 THEN '2026-08-20T00:00:10Z'
-                   ELSE '2026-08-20T00:00:25Z' END
+                   WHEN ?1 THEN '2026-08-20T00:00:40Z'
+                   WHEN ?2 THEN '2026-08-20T00:00:10Z'
+                   WHEN ?3 THEN '2026-08-20T00:00:30Z'
+                   ELSE '2026-08-20T00:00:05Z' END
              WHERE id IN (?1, ?2, ?3, ?4)",
             params![
                 legacy_job.id,
@@ -18852,13 +18869,14 @@ mod tests {
             )
             .unwrap()
         };
-        // The two established orders disagree with creation rowid. Their
-        // relative order survives while one legacy review-id row and one row
-        // without a review id are merged by the same transitive timestamp key.
+        // The two established orders disagree with creation rowid and their
+        // lifecycle timestamps run opposite to GitHub review-id order. Their
+        // relative order survives, review id 20 is placed between ids 10 and
+        // 30, and the no-id fallback remains deterministic and transitive.
         assert_eq!(publication_order(&earlier_job.id), 1);
         assert_eq!(publication_order(&legacy_job.id), 2);
-        assert_eq!(publication_order(&mixed_evidence_job.id), 3);
-        assert_eq!(publication_order(&modern_job.id), 4);
+        assert_eq!(publication_order(&modern_job.id), 3);
+        assert_eq!(publication_order(&mixed_evidence_job.id), 4);
 
         promote_published_code_review_theme_observations(&mut conn).unwrap();
         let state = conn
