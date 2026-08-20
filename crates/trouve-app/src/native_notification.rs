@@ -11,9 +11,11 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::time::Duration;
 
 const MAX_PENDING_ACTION_LISTENERS: usize = 4;
+#[cfg(all(unix, not(target_os = "macos")))]
 const ACTION_LISTENER_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
@@ -57,6 +59,7 @@ fn action_listener_budget() -> &'static ActionListenerBudget {
     BUDGET.get_or_init(|| ActionListenerBudget::new(MAX_PENDING_ACTION_LISTENERS))
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn escape_freedesktop_markup(body: &str) -> String {
     body.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -215,6 +218,7 @@ mod tests {
         assert_eq!(budget.active.load(Ordering::Acquire), 0);
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn notification_body_cannot_inject_freedesktop_markup() {
         assert_eq!(
