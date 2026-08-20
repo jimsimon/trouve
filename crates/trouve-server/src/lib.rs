@@ -957,6 +957,7 @@ pub async fn serve_listener(
     // never serves a model list it immediately retracts (no-op without a
     // configured probe).
     engine.init_connectivity().await;
+    engine.start_session_pr_verification_worker();
     engine.warm_title_model();
     engine.start_connectivity_monitor();
     engine.start_automation_scheduler();

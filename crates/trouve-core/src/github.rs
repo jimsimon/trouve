@@ -808,6 +808,11 @@ pub struct GitHub {
     repo: String,
 }
 
+pub(crate) struct PullRequestWithHeadRepository {
+    pub info: PrInfo,
+    pub head_repository: Option<String>,
+}
+
 /// A GitHub client scoped to an authenticated account rather than a repo.
 pub struct GitHubAccount {
     graphql: GitHubGraphql,
@@ -1948,7 +1953,7 @@ impl GitHubGraphql {
         owner: &str,
         repository: &str,
         number: u64,
-    ) -> Result<Option<PrInfo>> {
+    ) -> Result<Option<PullRequestWithHeadRepository>> {
         let query = operation_with_pr_fields(PULL_REQUEST_QUERY);
         let response: GraphqlPullRequestData = self
             .client
@@ -1966,7 +1971,13 @@ impl GitHubGraphql {
         Ok(response
             .repository
             .and_then(|repository| repository.pull_request)
-            .map(|pr| pr.into_pr_info(&self.host)))
+            .map(|pr| PullRequestWithHeadRepository {
+                head_repository: pr
+                    .head_repository
+                    .as_ref()
+                    .map(|repository| repository.name_with_owner.clone()),
+                info: pr.into_pr_info(&self.host),
+            }))
     }
 
     async fn pull_request_detail(
@@ -3186,10 +3197,21 @@ impl GitHub {
 
     /// A PR by repository-local number, regardless of its head branch.
     pub async fn pr(&self, number: u64) -> Result<PrInfo> {
-        self.graphql
+        Ok(self
+            .graphql
             .pull_request(&self.owner, &self.repo, number)
             .await?
-            .with_context(|| format!("pull request #{number} not found"))
+            .with_context(|| format!("pull request #{number} not found"))?
+            .info)
+    }
+
+    pub(crate) async fn pr_with_head_repository(
+        &self,
+        number: u64,
+    ) -> Result<Option<PullRequestWithHeadRepository>> {
+        self.graphql
+            .pull_request(&self.owner, &self.repo, number)
+            .await
     }
 
     /// Full, lazily loaded PR-page state for one selected pull request.
