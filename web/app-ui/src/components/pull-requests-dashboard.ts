@@ -704,11 +704,15 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                     <p><strong>Shared root cause:</strong> ${finding.rootCause}</p>
                     <p><strong>Structural fix:</strong> ${finding.recommendation}</p>
                   `}
-                  ${finding.executionPath === "" ? nothing : html`<details>
+                  ${finding.executionPath === "" &&
+                    finding.consequence === "" &&
+                    finding.regressionTest === ""
+                    ? nothing
+                    : html`<details>
                     <summary>Verification evidence</summary>
-                    <p><strong>Execution path:</strong> ${finding.executionPath}</p>
-                    <p><strong>Consequence:</strong> ${finding.consequence}</p>
-                    <p><strong>Regression test:</strong> ${finding.regressionTest}</p>
+                    ${finding.executionPath === "" ? nothing : html`<p><strong>Execution path:</strong> ${finding.executionPath}</p>`}
+                    ${finding.consequence === "" ? nothing : html`<p><strong>Consequence:</strong> ${finding.consequence}</p>`}
+                    ${finding.regressionTest === "" ? nothing : html`<p><strong>Regression test:</strong> ${finding.regressionTest}</p>`}
                   </details>`}
                   ${finding.publicationStatus === "suppressed_by_policy"
                     ? html`<small>Retained in Trouve · Not posted to GitHub by confidence policy</small>`

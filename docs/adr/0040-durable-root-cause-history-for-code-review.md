@@ -60,7 +60,7 @@ stronger, testable evidence, which may reject plausible but underspecified
 findings.
 
 The protocol gains additive review fields and enum values and therefore moves
-to version 7.3 under exact-version compatibility. Storage gains theme,
+to version 7.7 under exact-version compatibility. Storage gains theme,
 observation, and finding-theme tables plus evidence and origin columns.
 Fetching external inline comments adds one bounded GitHub API request before
 coordination, but does not add model latency.
