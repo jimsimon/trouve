@@ -908,6 +908,36 @@ describe("ThreadViewModel", () => {
     expect(view.lastUsage).toMatchObject({ input_tokens: 40, output_tokens: 12 });
   });
 
+  it("keeps prior context off a new snapshot turn before its first usage update", () => {
+    const view = ThreadViewModel.fromSnapshot(18, {
+      items: [{ kind: "turn_status", turn: 4, state: { state: "running" } }],
+      turn_running: true,
+      last_usage: {
+        input_tokens: 30,
+        output_tokens: 8,
+        context_input_tokens: 38,
+        context_window: 100,
+      },
+      turn_started_at: { "4": "2026-08-01T12:01:00Z" },
+    });
+
+    expect(view.lastUsage).toMatchObject({
+      input_tokens: 30,
+      output_tokens: 8,
+      context_input_tokens: 38,
+      context_window: 100,
+    });
+    expect(view.items).toMatchObject([{
+      kind: "turn-status",
+      turn: 4,
+      state: {
+        kind: "running",
+        startedAt: "2026-08-01T12:01:00Z",
+      },
+    }]);
+    expect(view.items[0]).not.toHaveProperty("state.usage");
+  });
+
   it("attaches bridged approvals to tool cards and keeps denials terminal", () => {
     const vm = new ThreadViewModel();
     vm.apply(
