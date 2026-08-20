@@ -794,28 +794,22 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
 /// migration record, rather than column presence observed at startup, makes
 /// this safely resumable if a process stops after adding `writer_version` but
 /// before classifying its existing rows. The update is one atomic statement:
-/// before it commits the missing authority record causes a retry; afterward a
-/// retry is a no-op. Rollback writers run after authority was recorded and
-/// therefore retain the zero default for repair.
+/// its embedded authority check cannot become stale between a read and the
+/// write, and before it commits the missing authority record causes a retry.
+/// Afterward a retry is a no-op. Rollback writers run after authority was
+/// recorded and therefore retain the zero default for repair.
 fn preserve_pre_authority_code_review_theme_transitions(conn: &Connection) -> Result<()> {
     const PUBLICATION_AUTHORITY_MIGRATION_ID: &str =
         "code-review-theme-observation-publication-authority-v1";
-    let publication_authority_recorded = conn
-        .query_row(
-            "SELECT 1 FROM store_migrations WHERE id = ?1",
-            [PUBLICATION_AUTHORITY_MIGRATION_ID],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !publication_authority_recorded {
-        conn.execute(
-            "UPDATE code_review_theme_transitions
-             SET writer_version = -1
-             WHERE writer_version = 0",
-            [],
-        )?;
-    }
+    conn.execute(
+        "UPDATE code_review_theme_transitions
+         SET writer_version = -1
+         WHERE writer_version = 0
+           AND NOT EXISTS (
+             SELECT 1 FROM store_migrations WHERE id = ?1
+           )",
+        [PUBLICATION_AUTHORITY_MIGRATION_ID],
+    )?;
     Ok(())
 }
 
