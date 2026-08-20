@@ -1671,6 +1671,7 @@ struct SteerTurnCommand {
 struct ActiveTurnSteerer {
     turn: u64,
     sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
+    waiting_for_mutation_lane: Arc<AtomicBool>,
 }
 
 /// Remove only the registration installed by this backend turn. A cancelled
@@ -8653,6 +8654,22 @@ impl Engine {
         })
     }
 
+    /// Whether the current turn has accepted attachment-bearing steering and
+    /// is waiting for the session mutation lane. Exposed for server-level
+    /// lifecycle tests and diagnostics; callers must treat it as transient.
+    #[doc(hidden)]
+    pub fn steer_waiting_for_mutation_lane(&self, thread_id: &str) -> bool {
+        self.turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_some_and(|active| {
+                active
+                    .waiting_for_mutation_lane
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
+    }
+
     fn send_message_with_tools(
         self: &Arc<Self>,
         thread_id: &str,
@@ -11827,12 +11844,17 @@ impl Engine {
         };
 
         let mut steer_rx = None;
+        let steer_waiting_for_mutation_lane = Arc::new(AtomicBool::new(false));
         let _steerer_guard = if supports_steering {
             let (sender, receiver) = tokio::sync::mpsc::channel(8);
-            self.turn_steerers
-                .lock()
-                .unwrap()
-                .insert(thread.id.clone(), ActiveTurnSteerer { turn, sender });
+            self.turn_steerers.lock().unwrap().insert(
+                thread.id.clone(),
+                ActiveTurnSteerer {
+                    turn,
+                    sender,
+                    waiting_for_mutation_lane: steer_waiting_for_mutation_lane.clone(),
+                },
+            );
             steer_rx = Some(receiver);
             Some(ActiveTurnSteererGuard {
                 registry: &self.turn_steerers,
@@ -11905,6 +11927,10 @@ impl Engine {
                     biased;
                     _ = cancel.cancelled() => {
                         reject_pending_steer(&mut pending_steer, "turn cancelled");
+                        steer_waiting_for_mutation_lane.store(
+                            false,
+                            std::sync::atomic::Ordering::Release,
+                        );
                         drop(pending_steer_lane.take());
                         drop(pending_steer_permit.take());
                         continue;
@@ -11921,6 +11947,10 @@ impl Engine {
                             .await
                     } => {
                         pending_steer_lane = None;
+                        steer_waiting_for_mutation_lane.store(
+                            false,
+                            std::sync::atomic::Ordering::Release,
+                        );
                         pending_steer_permit = Some(permit);
                         continue;
                     }
@@ -11979,6 +12009,10 @@ impl Engine {
                                 // is pending, including the completion that
                                 // releases an in-flight vendor mutation.
                                 pending_steer = Some(command);
+                                steer_waiting_for_mutation_lane.store(
+                                    true,
+                                    std::sync::atomic::Ordering::Release,
+                                );
                                 let lane = self.tool_execution_lock(&session.id);
                                 pending_steer_lane = Some(
                                     async move { lane.write_owned().await }.boxed(),
@@ -14791,31 +14825,49 @@ fn shell_requests_pull_request_collection_post(tool: &str, args: &serde_json::Va
         .iter()
         .any(|word| tool_words.split_whitespace().any(|part| part == *word));
     shell_like
-        && shell_command_values(args)
+        && shell_command_values(tool, args)
             .into_iter()
             .any(|command| shell_command_posts_to_pull_collection(command, None))
 }
 
-fn shell_command_values(args: &serde_json::Value) -> Vec<&str> {
-    fn visit<'a>(value: &'a serde_json::Value, commands: &mut Vec<&'a str>) {
+fn shell_command_values<'a>(tool: &str, args: &'a serde_json::Value) -> Vec<&'a str> {
+    fn add_value<'a>(value: &'a serde_json::Value, commands: &mut Vec<&'a str>) {
         match value {
-            serde_json::Value::Object(fields) => {
-                for value in fields.values() {
-                    visit(value, commands);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    visit(value, commands);
-                }
-            }
             serde_json::Value::String(command) => commands.push(command),
+            serde_json::Value::Array(values) => {
+                commands.extend(values.iter().filter_map(serde_json::Value::as_str))
+            }
             _ => {}
         }
     }
 
     let mut commands = Vec::new();
-    visit(args, &mut commands);
+    if args.is_string() {
+        add_value(args, &mut commands);
+        return commands;
+    }
+    let normalized = compact_activity(tool);
+    let fields: &[&str] = if normalized == "functionsexec" || normalized.ends_with("execcommand") {
+        &["cmd"]
+    } else if normalized.contains("terminal") {
+        &["input", "command"]
+    } else if matches!(
+        normalized.as_str(),
+        "shell" | "bash" | "execute" | "commandexecution"
+    ) || normalized.ends_with("commandexecution")
+    {
+        &["command"]
+    } else {
+        // Unknown shell-like adapters use one of these conventional command
+        // fields. Never traverse descriptive or environment metadata: only
+        // values that the adapter documents as executable input are evidence.
+        &["command", "commands", "cmd", "input", "script"]
+    };
+    for field in fields {
+        if let Some(value) = args.get(field) {
+            add_value(value, &mut commands);
+        }
+    }
     commands
 }
 
@@ -14881,6 +14933,62 @@ fn shell_word_is_command(word: &str, expected: &str) -> bool {
         .rsplit('/')
         .next()
         .is_some_and(|name| name == expected)
+}
+
+fn shell_executable_index(tokens: &[String]) -> Option<usize> {
+    fn is_assignment(token: &str) -> bool {
+        token.split_once('=').is_some_and(|(name, _)| {
+            let mut characters = name.chars();
+            characters
+                .next()
+                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+                && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+        })
+    }
+
+    let mut index = 0;
+    loop {
+        while tokens.get(index).is_some_and(|token| is_assignment(token)) {
+            index += 1;
+        }
+        let token = tokens.get(index)?;
+        let launch_prefix = ["env", "sudo", "command", "nohup"]
+            .iter()
+            .any(|expected| shell_word_is_command(token, expected));
+        if !launch_prefix {
+            return Some(index);
+        }
+        index += 1;
+        // Prefix options can consume following arguments and are deliberately
+        // not guessed here. Rejecting these uncommon forms avoids treating an
+        // option value as the executable that supplied authorization evidence.
+        if tokens
+            .get(index)
+            .is_some_and(|token| token.starts_with('-'))
+        {
+            return None;
+        }
+    }
+}
+
+fn shell_command_string(tokens: &[String], executable_index: usize) -> Option<&str> {
+    let mut index = executable_index + 1;
+    while let Some(flag) = tokens.get(index) {
+        let letters = flag
+            .strip_prefix('-')
+            .filter(|letters| !letters.is_empty())?;
+        if !letters
+            .chars()
+            .all(|letter| matches!(letter, 'c' | 'e' | 'i' | 'l' | 'u' | 'x'))
+        {
+            return None;
+        }
+        if letters.contains('c') {
+            return tokens.get(index + 1).map(String::as_str);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn pull_collection_path_matches(token: &str, expected_path: Option<&str>) -> bool {
@@ -14978,19 +15086,18 @@ fn shell_command_posts_to_pull_collection(command: &str, expected_path: Option<&
             return false;
         }
         shell_invocations(command).into_iter().any(|tokens| {
-            for (index, token) in tokens.iter().enumerate() {
-                let shell_wrapper = ["bash", "sh", "zsh", "dash", "ksh"]
-                    .iter()
-                    .any(|expected| shell_word_is_command(token, expected));
-                if shell_wrapper
-                    && let Some(flag) = tokens.get(index + 1)
-                    && flag.starts_with('-')
-                    && flag.contains('c')
-                    && let Some(nested) = tokens.get(index + 2)
-                    && inspect(nested, expected_path, depth + 1)
-                {
-                    return true;
-                }
+            let Some(executable_index) = shell_executable_index(&tokens) else {
+                return false;
+            };
+            let executable = &tokens[executable_index];
+            let shell_wrapper = ["bash", "sh", "zsh", "dash", "ksh"]
+                .iter()
+                .any(|expected| shell_word_is_command(executable, expected));
+            if shell_wrapper
+                && let Some(nested) = shell_command_string(&tokens, executable_index)
+                && inspect(nested, expected_path, depth + 1)
+            {
+                return true;
             }
             if !tokens
                 .iter()
@@ -14998,17 +15105,15 @@ fn shell_command_posts_to_pull_collection(command: &str, expected_path: Option<&
             {
                 return false;
             }
-            if let Some(index) = tokens
-                .windows(2)
-                .position(|pair| shell_word_is_command(&pair[0], "gh") && pair[1] == "api")
+            if shell_word_is_command(executable, "gh")
+                && tokens
+                    .get(executable_index + 1)
+                    .is_some_and(|arg| arg == "api")
             {
-                return gh_api_invocation_is_post(&tokens[index + 2..]);
+                return gh_api_invocation_is_post(&tokens[executable_index + 2..]);
             }
-            if let Some(index) = tokens
-                .iter()
-                .position(|token| shell_word_is_command(token, "curl"))
-            {
-                return curl_invocation_is_post(&tokens[index + 1..]);
+            if shell_word_is_command(executable, "curl") {
+                return curl_invocation_is_post(&tokens[executable_index + 1..]);
             }
             false
         })
@@ -15238,7 +15343,7 @@ fn requests_pull_request_creation(
         && args_compact.contains("createpullrequest");
     let rest_path = format!("/repos/{owner}/{repo}/pulls").to_ascii_lowercase();
     let shell_rest_creation = shell_like
-        && shell_command_values(args)
+        && shell_command_values(tool, args)
             .into_iter()
             .any(|command| shell_command_posts_to_pull_collection(command, Some(&rest_path)));
     let github_like = tool_compact == "github";
@@ -20614,6 +20719,29 @@ default_permission_mode = "ask"
         ] {
             assert!(could_request_pull_request_creation(tool, &args));
             assert!(requests_pull_request_creation(tool, &args, "o", "r"));
+        }
+        for args in [
+            serde_json::json!({
+                "cmd": "echo safe",
+                "description": "gh api /repos/o/r/pulls -f title=forged"
+            }),
+            serde_json::json!({
+                "cmd": "echo bash -c 'gh api /repos/o/r/pulls -f title=forged'"
+            }),
+            serde_json::json!({
+                "cmd": "bash --rcfile 'gh api /repos/o/r/pulls -f title=forged'"
+            }),
+        ] {
+            assert!(!could_request_pull_request_creation(
+                "functions.exec",
+                &args
+            ));
+            assert!(!requests_pull_request_creation(
+                "functions.exec",
+                &args,
+                "o",
+                "r"
+            ));
         }
         assert!(!requests_pull_request_creation(
             "mcpToolCall",

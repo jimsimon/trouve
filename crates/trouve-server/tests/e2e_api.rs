@@ -2254,6 +2254,7 @@ async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
 struct SteerableBackend {
     steers: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
     release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    tool_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl SteerableBackend {
@@ -2261,7 +2262,18 @@ impl SteerableBackend {
         Self {
             steers: std::sync::Mutex::new(Vec::new()),
             release: tokio::sync::Mutex::new(None),
+            tool_release: tokio::sync::Mutex::new(None),
         }
+    }
+
+    async fn release_tool(&self) {
+        let release = self
+            .tool_release
+            .lock()
+            .await
+            .take()
+            .expect("deferred fake tool has a release signal");
+        let _ = release.send(());
     }
 }
 
@@ -2346,6 +2358,10 @@ impl trouve_agents::AgentBackend for SteerableBackend {
         let cancel = turn.cancel.clone();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.release.lock().await = Some(release_tx);
+        let (tool_release_tx, tool_release_rx) = tokio::sync::oneshot::channel();
+        if defer_attachment_lane {
+            *self.tool_release.lock().await = Some(tool_release_tx);
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             use trouve_agents::BackendEvent as E;
@@ -2379,7 +2395,9 @@ impl trouve_agents::AgentBackend for SteerableBackend {
                     .await;
             }
             if defer_attachment_lane {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if tool_release_rx.await.is_err() {
+                    return;
+                }
                 let _ = tx
                     .send(Ok(E::ToolCompleted {
                         call_id: held_call_id.into(),
@@ -2439,7 +2457,7 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = trouve_server::build_router(engine);
+    let router = trouve_server::build_router(engine.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let base = format!("http://{addr}/v1");
     let client = reqwest::Client::new();
@@ -2602,10 +2620,11 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         event["type"] == "tool.started" && event["call_id"] == "deferred-mutation"
     })
     .await;
-    let steered = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        client
-            .post(format!("{base}/threads/{thread_id}/steer"))
+    let steer_client = client.clone();
+    let steer_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_steer = tokio::spawn(async move {
+        steer_client
+            .post(steer_url)
             .json(&serde_json::json!({
                 "content": "Use the deferred reference.",
                 "attachments": [{
@@ -2614,11 +2633,23 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
                     "data": "iVBORw0KGgo=",
                 }],
             }))
-            .send(),
-    )
+            .send()
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !engine.steer_waiting_for_mutation_lane(thread_id) {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("attachment steering did not resume after the mutation lane released")
-    .unwrap();
+    .expect("attachment steering never parked on the held mutation lane");
+    assert!(!pending_steer.is_finished());
+    backend.release_tool().await;
+    let steered = tokio::time::timeout(std::time::Duration::from_secs(10), pending_steer)
+        .await
+        .expect("attachment steering did not resume after the mutation lane released")
+        .unwrap()
+        .unwrap();
     assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
     wait_for_event(&client, &events_url, |event| {
         event["type"] == "turn.completed" && event["turn"] == 3
@@ -2658,7 +2689,14 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
             .send()
             .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !engine.steer_waiting_for_mutation_lane(thread_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled attachment steering never parked on the mutation lane");
+    assert!(!pending_steer.is_finished());
     let cancelled = client
         .post(format!("{base}/threads/{thread_id}/cancel"))
         .send()
