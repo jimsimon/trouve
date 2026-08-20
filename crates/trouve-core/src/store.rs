@@ -747,14 +747,6 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         [],
         |row| row.get::<_, bool>(0),
     )?;
-    let had_theme_transition_writer_version = conn.query_row(
-        "SELECT EXISTS (
-           SELECT 1 FROM pragma_table_info('code_review_theme_transitions')
-           WHERE name = 'writer_version'
-         )",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -763,11 +755,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
-    preserve_pre_authority_code_review_theme_transitions(
-        conn,
-        had_theme_transition_writer_version,
-        had_theme_observation_publication_authority,
-    )?;
+    preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
     migrate_code_review_theme_observation_publication_authority(
@@ -802,14 +790,25 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
 /// Existing snapshots from before publication authority were historical
 /// evidence only: their mutable theme aggregates remained authoritative. When
 /// writer provenance is first added, reserve a negative version for those rows
-/// so rollback repair never projects them. Databases that already had
-/// publication authority retain the zero default and are repaired once.
-fn preserve_pre_authority_code_review_theme_transitions(
-    conn: &Connection,
-    had_writer_version: bool,
-    had_publication_authority: bool,
-) -> Result<()> {
-    if !had_writer_version && !had_publication_authority {
+/// so rollback repair never projects them. The durable publication-authority
+/// migration record, rather than column presence observed at startup, makes
+/// this safely resumable if a process stops after adding `writer_version` but
+/// before classifying its existing rows. The update is one atomic statement:
+/// before it commits the missing authority record causes a retry; afterward a
+/// retry is a no-op. Rollback writers run after authority was recorded and
+/// therefore retain the zero default for repair.
+fn preserve_pre_authority_code_review_theme_transitions(conn: &Connection) -> Result<()> {
+    const PUBLICATION_AUTHORITY_MIGRATION_ID: &str =
+        "code-review-theme-observation-publication-authority-v1";
+    let publication_authority_recorded = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [PUBLICATION_AUTHORITY_MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !publication_authority_recorded {
         conn.execute(
             "UPDATE code_review_theme_transitions
              SET writer_version = -1
@@ -19028,9 +19027,9 @@ mod tests {
         }
         drop(store);
 
-        // Recreate the pre-publication-authority table shape. On a real
-        // upgrade the published column is added during this same startup, so
-        // no earlier data migration may consume its zero sentinel first.
+        // Recreate the pre-publication-authority table shape, then simulate an
+        // interrupted migration that already added writer_version and
+        // committed its zero defaults but stopped before classifying them.
         let legacy = Connection::open(&database).unwrap();
         legacy
             .execute_batch(
@@ -19058,13 +19057,14 @@ mod tests {
                    resolved_head TEXT NOT NULL DEFAULT '',
                    recurrence_count INTEGER NOT NULL DEFAULT 0,
                    transitioned_at TEXT NOT NULL,
+                   writer_version INTEGER NOT NULL DEFAULT 0,
                    PRIMARY KEY (theme_id, job_id)
                  );
                  INSERT INTO code_review_theme_transitions
                    (theme_id, job_id, status, last_seen_head, resolved_head,
-                    recurrence_count, transitioned_at)
+                    recurrence_count, transitioned_at, writer_version)
                  SELECT theme_id, job_id, status, last_seen_head, resolved_head,
-                        recurrence_count, transitioned_at
+                        recurrence_count, transitioned_at, 0
                  FROM legacy_theme_transitions;
                  DROP TABLE legacy_theme_transitions;
                  DELETE FROM store_migrations
