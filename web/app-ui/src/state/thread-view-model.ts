@@ -547,6 +547,7 @@ export class ThreadViewModel {
       }
       case "turn.started":
         this.turnRunning = true;
+        this.lastUsage = undefined;
         this.turnModels.set(envelope.turn, envelope.model);
         if (envelope.thinking_level == null) {
           this.turnThinkingLevels.delete(envelope.turn);

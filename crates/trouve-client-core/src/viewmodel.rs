@@ -615,6 +615,7 @@ impl ThreadViewModel {
             } => {
                 self.turn_running = true;
                 self.running_usage = None;
+                self.last_usage = None;
                 self.turn_models.insert(*turn, model.clone());
                 if let Some(thinking_level) = thinking_level {
                     self.turn_thinking_levels
@@ -1608,6 +1609,16 @@ mod tests {
         }));
         assert!(!vm.turn_running);
         assert_eq!(vm.last_usage, Some(usage));
+
+        vm.apply(&env(Event::TurnStarted {
+            turn: 2,
+            mode: "code".into(),
+            model: "m".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        assert!(vm.turn_running);
+        assert_eq!(vm.last_usage, None);
     }
 
     #[test]

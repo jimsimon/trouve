@@ -114,6 +114,7 @@ impl ThreadProjection {
             } => {
                 self.snapshot.turn_running = true;
                 self.running_usage = None;
+                self.snapshot.last_usage = None;
                 self.snapshot.turn_models.insert(*turn, model.clone());
                 if let Some(thinking_level) = thinking_level {
                     self.snapshot
@@ -1293,6 +1294,7 @@ mod tests {
                 supports_steering: false,
             },
         ));
+        assert_eq!(projection.snapshot.last_usage, None);
         let next_usage = trouve_protocol::Usage {
             input_tokens: 300,
             output_tokens: 20,

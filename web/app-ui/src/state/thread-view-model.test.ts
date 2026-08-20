@@ -787,8 +787,8 @@ describe("ThreadViewModel", () => {
       cached_input_tokens: 85_000,
       context_input_tokens: 70_000,
       context_window: 258_400,
-      cost_usd: 0.03,
     });
+    expect(vm.lastUsage?.cost_usd).toBeCloseTo(0.03);
     expect(vm.items).toMatchObject([
       {
         kind: "turn-status",
@@ -801,11 +801,16 @@ describe("ThreadViewModel", () => {
             cached_input_tokens: 85_000,
             context_input_tokens: 70_000,
             context_window: 258_400,
-            cost_usd: 0.03,
           },
         },
       },
     ]);
+    const runningTurn = vm.items.find(
+      (item) => item.kind === "turn-status" && item.state.kind === "running",
+    );
+    expect(runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running"
+      ? runningTurn.state.usage?.cost_usd
+      : undefined).toBeCloseTo(0.03);
 
     vm.apply(envelope(5, {
       type: "turn.completed",
@@ -831,6 +836,13 @@ describe("ThreadViewModel", () => {
       wait_ms: 0,
       background: false,
     }));
+    expect(vm.lastUsage).toBeUndefined();
+    expect(vm.items.at(-1)).toMatchObject({
+      kind: "turn-status",
+      turn: 2,
+      state: { kind: "running" },
+    });
+    expect(vm.items.at(-1)).not.toHaveProperty("state.usage");
     vm.apply(envelope(8, {
       type: "turn.usage_updated",
       turn: 2,
