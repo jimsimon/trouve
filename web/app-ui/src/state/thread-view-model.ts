@@ -245,6 +245,7 @@ export class ThreadViewModel {
   readonly #capacityAcquiredBeforeStart = new Set<number>();
   #queueRevision = 0;
   #completedUsage: Usage | undefined;
+  #activeTurnUsage: { readonly turn: number; readonly usage: Usage } | undefined;
 
   cursor = 0;
   /** Absolute folded-item position of `items[0]`. */
@@ -306,6 +307,7 @@ export class ThreadViewModel {
     this.snapshotLoaded = true;
     const activeUsage = snapshot.active_usage ?? undefined;
     this.#completedUsage = snapshot.last_usage ?? undefined;
+    this.#activeTurnUsage = undefined;
     this.lastUsage = activeUsage ?? this.#completedUsage;
     this.lastUsageCursor = this.lastUsage === undefined ? 0 : cursor;
     this.compacting = snapshot.compacting ?? false;
@@ -320,6 +322,9 @@ export class ThreadViewModel {
           ),
       );
       if (activeTurn?.kind === "turn-status") {
+        this.#activeTurnUsage = activeUsage === undefined
+          ? undefined
+          : { turn: activeTurn.turn, usage: activeUsage };
         const startedAt = this.turnStartedAt.get(activeTurn.turn);
         activeTurn.state = activeTurn.state.kind === "running"
           ? {
@@ -561,6 +566,7 @@ export class ThreadViewModel {
       }
       case "turn.started":
         this.turnRunning = true;
+        this.#activeTurnUsage = undefined;
         this.turnModels.set(envelope.turn, envelope.model);
         if (envelope.thinking_level == null) {
           this.turnThinkingLevels.delete(envelope.turn);
@@ -866,11 +872,12 @@ export class ThreadViewModel {
             item.state.kind === "running",
         );
         const usage = accumulateLiveUsage(
-          runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running"
-            ? runningTurn.state.usage
+          this.#activeTurnUsage?.turn === envelope.turn
+            ? this.#activeTurnUsage.usage
             : undefined,
           envelope.usage,
         );
+        this.#activeTurnUsage = { turn: envelope.turn, usage };
         this.lastUsage = usage;
         this.lastUsageCursor = envelope.cursor;
         if (runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running") {
@@ -886,18 +893,13 @@ export class ThreadViewModel {
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
-        const runningTurn = this.#findLast(
-          (item) =>
-            item.kind === "turn-status"
-            && item.turn === envelope.turn
-            && item.state.kind === "running",
-        );
         const usage = usageWithLiveContext(
           envelope.usage,
-          runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running"
-            ? runningTurn.state.usage
+          this.#activeTurnUsage?.turn === envelope.turn
+            ? this.#activeTurnUsage.usage
             : undefined,
         );
+        this.#activeTurnUsage = undefined;
         this.#completedUsage = usage;
         this.lastUsage = usage;
         this.lastUsageCursor = envelope.cursor;
@@ -918,6 +920,7 @@ export class ThreadViewModel {
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
+        this.#activeTurnUsage = undefined;
         this.lastUsage = this.#completedUsage;
         this.lastUsageCursor = this.lastUsage === undefined ? 0 : envelope.cursor;
         this.recordTurnDuration(envelope.turn, envelope.ts);
@@ -934,6 +937,7 @@ export class ThreadViewModel {
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
+        this.#activeTurnUsage = undefined;
         this.lastUsage = this.#completedUsage;
         this.lastUsageCursor = this.lastUsage === undefined ? 0 : envelope.cursor;
         this.recordTurnDuration(envelope.turn, envelope.ts);
