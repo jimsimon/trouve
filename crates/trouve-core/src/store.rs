@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS session_pr_verification_intents (
   branch TEXT NOT NULL,
   head_sha TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
+  last_failure_class TEXT NOT NULL DEFAULT '',
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
   next_attempt_at TEXT,
   created_at TEXT NOT NULL,
   PRIMARY KEY (session_id, host, owner, repository, pull_number)
@@ -602,6 +604,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_pending INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
+    "ALTER TABLE session_pr_verification_intents ADD COLUMN last_failure_class TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE session_pr_verification_intents ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
 ];
@@ -2713,6 +2717,8 @@ pub(crate) struct SessionPrVerificationIntent {
     pub branch: String,
     pub head_sha: String,
     pub attempts: u32,
+    pub last_failure_class: String,
+    pub consecutive_failures: u32,
     pub created_at: String,
 }
 
@@ -3529,13 +3535,20 @@ fn apply_store_mutation(
                 conn.execute(
                     "INSERT INTO session_pr_verification_intents
                        (session_id, host, owner, repository, pull_number, branch,
-                        head_sha, attempts, next_attempt_at, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)
+                        head_sha, attempts, last_failure_class, consecutive_failures,
+                        next_attempt_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, '', 0, NULL, ?8)
                      ON CONFLICT(session_id, host, owner, repository, pull_number)
                      DO UPDATE SET
                        attempts = CASE
                          WHEN branch = excluded.branch AND head_sha = excluded.head_sha
                            THEN attempts ELSE 0 END,
+                       last_failure_class = CASE
+                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                           THEN last_failure_class ELSE '' END,
+                       consecutive_failures = CASE
+                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                           THEN consecutive_failures ELSE 0 END,
                        next_attempt_at = CASE
                          WHEN branch = excluded.branch AND head_sha = excluded.head_sha
                            THEN next_attempt_at ELSE NULL END,
@@ -4369,7 +4382,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT session_id, host, owner, repository, pull_number, branch,
-                    head_sha, attempts, created_at
+                    head_sha, attempts, last_failure_class, consecutive_failures, created_at
              FROM session_pr_verification_intents
              WHERE session_id = ?1
                AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
@@ -4388,7 +4401,9 @@ impl Store {
                     branch: row.get(5)?,
                     head_sha: row.get(6)?,
                     attempts: row.get::<_, i64>(7)? as u32,
-                    created_at: row.get(8)?,
+                    last_failure_class: row.get(8)?,
+                    consecutive_failures: row.get::<_, i64>(9)? as u32,
+                    created_at: row.get(10)?,
                 })
             },
         )?;
@@ -4396,22 +4411,23 @@ impl Store {
             .map_err(Into::into)
     }
 
-    fn session_pr_verification_retry_delay(attempts: u32) -> i64 {
+    pub(crate) fn session_pr_verification_retry_delay(attempts: u32) -> i64 {
         (1_i64 << attempts.min(15)).min(6 * 60 * 60)
     }
 
-    /// Keep a transient failure durable while bounding GitHub request rate.
-    /// The delay grows exponentially and caps at six hours so long outages do
-    /// not turn durable nominations into sustained GitHub traffic.
-    pub(crate) fn defer_session_pr_verification(
+    /// Upgrade an intent written by the short-lived pending-evidence format.
+    /// Matching the original empty tuple makes concurrent cleanup idempotent.
+    pub(crate) fn set_session_pr_verification_evidence(
         &self,
         intent: &SessionPrVerificationIntent,
-    ) -> Result<()> {
-        let delay = Self::session_pr_verification_retry_delay(intent.attempts);
-        let next_attempt_at = (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339();
-        self.conn.lock().unwrap().execute(
+        branch: &str,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
             "UPDATE session_pr_verification_intents
-             SET attempts = attempts + 1, next_attempt_at = ?8
+             SET branch = ?8, head_sha = ?9, attempts = 0,
+                 last_failure_class = '', consecutive_failures = 0,
+                 next_attempt_at = NULL
              WHERE session_id = ?1 AND host = ?2 AND owner = ?3
                AND repository = ?4 AND pull_number = ?5
                AND branch = ?6 AND head_sha = ?7",
@@ -4423,6 +4439,53 @@ impl Store {
                 intent.number as i64,
                 intent.branch,
                 intent.head_sha,
+                branch,
+                head_sha,
+            ],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Keep a transient failure durable while bounding GitHub request rate.
+    /// The delay grows exponentially and caps at six hours so long outages do
+    /// not turn durable nominations into sustained GitHub traffic.
+    pub(crate) fn defer_session_pr_verification(
+        &self,
+        intent: &SessionPrVerificationIntent,
+        failure_class: &str,
+        count_request: bool,
+        delay_seconds: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !failure_class.is_empty(),
+            "verification failure class is empty"
+        );
+        anyhow::ensure!(
+            delay_seconds > 0,
+            "verification retry delay is not positive"
+        );
+        let next_attempt_at =
+            (chrono::Utc::now() + chrono::Duration::seconds(delay_seconds)).to_rfc3339();
+        self.conn.lock().unwrap().execute(
+            "UPDATE session_pr_verification_intents
+             SET attempts = attempts + ?8,
+                 consecutive_failures = CASE
+                   WHEN last_failure_class = ?9 THEN consecutive_failures + 1 ELSE 1 END,
+                 last_failure_class = ?9,
+                 next_attempt_at = ?10
+             WHERE session_id = ?1 AND host = ?2 AND owner = ?3
+               AND repository = ?4 AND pull_number = ?5
+               AND branch = ?6 AND head_sha = ?7",
+            params![
+                intent.session_id,
+                intent.host,
+                intent.owner,
+                intent.repository,
+                intent.number as i64,
+                intent.branch,
+                intent.head_sha,
+                i64::from(count_request),
+                failure_class,
                 next_attempt_at,
             ],
         )?;
@@ -12252,6 +12315,8 @@ mod tests {
             branch: "agent/clean-pr".into(),
             head_sha: "1".repeat(40),
             attempts: 0,
+            last_failure_class: String::new(),
+            consecutive_failures: 0,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -12299,11 +12364,18 @@ mod tests {
             vec![intent.clone()]
         );
 
-        store.defer_session_pr_verification(&intent).unwrap();
-        let (attempts, next_attempt_at): (i64, String) = {
+        store
+            .defer_session_pr_verification(&intent, "transient", true, 1)
+            .unwrap();
+        let (attempts, failure_class, consecutive_failures, next_attempt_at): (
+            i64,
+            String,
+            i64,
+            String,
+        ) = {
             let conn = store.conn.lock().unwrap();
             conn.query_row(
-                "SELECT attempts, next_attempt_at
+                "SELECT attempts, last_failure_class, consecutive_failures, next_attempt_at
                  FROM session_pr_verification_intents
                  WHERE session_id = ?1 AND host = ?2 AND owner = ?3
                    AND repository = ?4 AND pull_number = ?5
@@ -12317,11 +12389,13 @@ mod tests {
                     intent.branch,
                     intent.head_sha,
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap()
         };
         assert_eq!(attempts, 1);
+        assert_eq!(failure_class, "transient");
+        assert_eq!(consecutive_failures, 1);
         assert!(
             chrono::DateTime::parse_from_rfc3339(&next_attempt_at).unwrap() > chrono::Utc::now()
         );
@@ -12332,6 +12406,32 @@ mod tests {
                 .is_empty(),
             "deferred intent must not remain immediately due"
         );
+        store
+            .defer_session_pr_verification(&intent, "transient", true, 2)
+            .unwrap();
+        store
+            .defer_session_pr_verification(&intent, "authentication", false, 30)
+            .unwrap();
+        let switched_failure: (i64, String, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT attempts, last_failure_class, consecutive_failures
+                 FROM session_pr_verification_intents
+                 WHERE session_id = ?1 AND host = ?2 AND owner = ?3
+                   AND repository = ?4 AND pull_number = ?5",
+                params![
+                    intent.session_id,
+                    intent.host,
+                    intent.owner,
+                    intent.repository,
+                    intent.number as i64,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(switched_failure, (2, "authentication".into(), 1));
 
         store
             .append_events_with_session_pr_verification_intents(
@@ -12364,7 +12464,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(attempts_after_duplicate, 1);
+        assert_eq!(attempts_after_duplicate, 2);
         assert!(
             store
                 .due_session_pr_verification_intents(&session.id, 10)
@@ -12412,6 +12512,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 0);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO session_pr_verification_intents
+                   (session_id, host, owner, repository, pull_number, branch,
+                    head_sha, attempts, next_attempt_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 43, '', '', 2, NULL, ?5)",
+                params![
+                    intent.session_id,
+                    intent.host,
+                    intent.owner,
+                    intent.repository,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        let legacy = store
+            .due_session_pr_verification_intents(&session.id, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(legacy.branch.is_empty());
+        assert!(legacy.head_sha.is_empty());
+        assert!(
+            store
+                .set_session_pr_verification_evidence(
+                    &legacy,
+                    "agent/legacy-captured",
+                    &"3".repeat(40),
+                )
+                .unwrap()
+        );
+        let upgraded = store
+            .due_session_pr_verification_intents(&session.id, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(upgraded.branch, "agent/legacy-captured");
+        assert_eq!(upgraded.head_sha, "3".repeat(40));
+        assert_eq!(upgraded.attempts, 0);
+        assert!(upgraded.last_failure_class.is_empty());
+        assert_eq!(upgraded.consecutive_failures, 0);
+        store.discard_session_pr_verification(&upgraded).unwrap();
 
         store
             .append_events_with_session_pr_verification_intents(

@@ -59,7 +59,14 @@ const SESSION_PR_VERIFICATION_RETENTION_DAYS: i64 = 7;
 /// retention window but still have a hard request ceiling.
 const MAX_SESSION_PR_NOT_FOUND_ATTEMPTS: u32 = 8;
 const MAX_SESSION_PR_HEAD_MOVED_ATTEMPTS: u32 = 12;
-const MAX_SESSION_PR_TRANSIENT_ATTEMPTS: u32 = 48;
+const MAX_SESSION_PR_REQUEST_ATTEMPTS: u32 = 48;
+const SESSION_PR_AUTH_RETRY_SECONDS: i64 = 30;
+const SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+const PR_VERIFICATION_FAILURE_AUTH: &str = "authentication";
+const PR_VERIFICATION_FAILURE_EVIDENCE: &str = "evidence";
+const PR_VERIFICATION_FAILURE_HEAD_MOVED: &str = "head_moved";
+const PR_VERIFICATION_FAILURE_NOT_FOUND: &str = "not_found";
+const PR_VERIFICATION_FAILURE_TRANSIENT: &str = "transient";
 const MAX_ATTACHMENTS_PER_PROMPT: usize = 4;
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_ATTACHMENT_TOTAL_BYTES: usize = 20 * 1024 * 1024;
@@ -5120,15 +5127,25 @@ impl Engine {
         .unwrap_or(false)
     }
 
-    /// Snapshot a coherent branch/HEAD ownership pair when a creator
-    /// completes. This evidence is immutable even if another turn advances
-    /// the branch immediately afterward.
+    /// Snapshot a coherent branch/HEAD ownership pair for a creator
+    /// attestation. Callers capture before execution when possible and retain
+    /// the immutable pair even if another turn later advances the branch.
     async fn capture_session_pr_head(session: &Session) -> Option<(String, String)> {
-        let worktree = PathBuf::from(&session.worktree_path);
-        tokio::task::spawn_blocking(move || crate::git::checked_out_branch_head(&worktree))
-            .await
-            .ok()
-            .and_then(Result::ok)
+        for attempt in 0..3 {
+            let worktree = PathBuf::from(&session.worktree_path);
+            if let Some(evidence) =
+                tokio::task::spawn_blocking(move || crate::git::checked_out_branch_head(&worktree))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            {
+                return Some(evidence);
+            }
+            if attempt < 2 {
+                tokio::task::yield_now().await;
+            }
+        }
+        None
     }
 
     fn session_pr_verification_intents(
@@ -5178,6 +5195,8 @@ impl Engine {
                 branch: branch.clone(),
                 head_sha: head_sha.clone(),
                 attempts: 0,
+                last_failure_class: String::new(),
+                consecutive_failures: 0,
                 created_at: created_at.clone(),
             })
             .collect()
@@ -5189,6 +5208,24 @@ impl Engine {
         };
         chrono::Utc::now().signed_duration_since(created_at)
             >= chrono::Duration::days(SESSION_PR_VERIFICATION_RETENTION_DAYS)
+    }
+
+    fn session_pr_verification_retry_exhausted(
+        intent: &SessionPrVerificationIntent,
+        failure_class: &str,
+        max_consecutive_failures: Option<u32>,
+        count_request: bool,
+    ) -> bool {
+        let next_requests = intent
+            .attempts
+            .saturating_add(if count_request { 1 } else { 0 });
+        let next_consecutive_failures = if intent.last_failure_class == failure_class {
+            intent.consecutive_failures.saturating_add(1)
+        } else {
+            1
+        };
+        next_requests >= MAX_SESSION_PR_REQUEST_ATTEMPTS
+            || max_consecutive_failures.is_some_and(|maximum| next_consecutive_failures >= maximum)
     }
 
     fn session_pr_verification_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -5274,12 +5311,12 @@ impl Engine {
             return;
         }
         let lifecycle = self.session_lock(session_id);
-        let (intents, mut recorded) = {
+        let (session, intents, mut recorded) = {
             let _lifecycle_guard = lifecycle.read().await;
             if self.deleting_sessions.lock().unwrap().contains(session_id) {
                 return;
             }
-            let Ok(Some(_)) = self.store.session(session_id) else {
+            let Ok(Some(session)) = self.store.session(session_id) else {
                 return;
             };
             let intents = match self
@@ -5299,9 +5336,9 @@ impl Engine {
                     return;
                 }
             };
-            (intents, recorded)
+            (session, intents, recorded)
         };
-        for intent in intents {
+        for mut intent in intents {
             if recorded.contains(&intent.number) {
                 let _ = self.store.discard_session_pr_verification(&intent);
                 continue;
@@ -5310,13 +5347,79 @@ impl Engine {
                 let _ = self.store.discard_session_pr_verification(&intent);
                 continue;
             }
+            // Compatibility for rows written by the short-lived
+            // pending-evidence format. Bound the legacy migration wait and
+            // hold the lifecycle guard so restore/deletion cannot tear down
+            // the worktree while its evidence is upgraded.
+            if intent.branch.is_empty() || intent.head_sha.is_empty() {
+                let _lifecycle_guard = lifecycle.read().await;
+                if self.deleting_sessions.lock().unwrap().contains(session_id) {
+                    return;
+                }
+                let lane = self.tool_execution_lock(session_id);
+                let Ok(permit) = tokio::time::timeout(
+                    SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT,
+                    lane.write_owned(),
+                )
+                .await
+                else {
+                    self.defer_or_expire_session_pr_verification(
+                        &intent,
+                        PR_VERIFICATION_FAILURE_EVIDENCE,
+                        Some(MAX_SESSION_PR_NOT_FOUND_ATTEMPTS),
+                        false,
+                    );
+                    continue;
+                };
+                let evidence = Self::capture_session_pr_head(&session).await;
+                drop(permit);
+                let Some((branch, head_sha)) = evidence else {
+                    self.defer_or_expire_session_pr_verification(
+                        &intent,
+                        PR_VERIFICATION_FAILURE_EVIDENCE,
+                        Some(MAX_SESSION_PR_NOT_FOUND_ATTEMPTS),
+                        false,
+                    );
+                    continue;
+                };
+                match self
+                    .store
+                    .set_session_pr_verification_evidence(&intent, &branch, &head_sha)
+                {
+                    Ok(true) => {
+                        intent.branch = branch;
+                        intent.head_sha = head_sha;
+                        intent.attempts = 0;
+                        intent.last_failure_class.clear();
+                        intent.consecutive_failures = 0;
+                    }
+                    Ok(false) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id,
+                            pr_number = intent.number,
+                            %error,
+                            "cannot upgrade legacy pull request ownership evidence"
+                        );
+                        self.defer_or_expire_session_pr_verification(
+                            &intent,
+                            PR_VERIFICATION_FAILURE_EVIDENCE,
+                            Some(MAX_SESSION_PR_NOT_FOUND_ATTEMPTS),
+                            false,
+                        );
+                        continue;
+                    }
+                }
+            }
             let github = match self.github_for_pr_verification(&intent) {
                 Ok(github) => github,
                 Err(error) => {
                     tracing::warn!(session_id, error = %error, "cannot authenticate PR verification");
                     self.defer_or_expire_session_pr_verification(
                         &intent,
-                        MAX_SESSION_PR_TRANSIENT_ATTEMPTS,
+                        PR_VERIFICATION_FAILURE_AUTH,
+                        None,
+                        false,
                     );
                     continue;
                 }
@@ -5354,7 +5457,9 @@ impl Engine {
                             );
                             self.defer_or_expire_session_pr_verification(
                                 &intent,
-                                MAX_SESSION_PR_HEAD_MOVED_ATTEMPTS,
+                                PR_VERIFICATION_FAILURE_HEAD_MOVED,
+                                Some(MAX_SESSION_PR_HEAD_MOVED_ATTEMPTS),
+                                true,
                             );
                         } else {
                             tracing::warn!(
@@ -5401,7 +5506,9 @@ impl Engine {
                     );
                     self.defer_or_expire_session_pr_verification(
                         &intent,
-                        MAX_SESSION_PR_NOT_FOUND_ATTEMPTS,
+                        PR_VERIFICATION_FAILURE_NOT_FOUND,
+                        Some(MAX_SESSION_PR_NOT_FOUND_ATTEMPTS),
+                        true,
                     );
                 }
                 Ok(Err(error)) => {
@@ -5413,7 +5520,9 @@ impl Engine {
                     );
                     self.defer_or_expire_session_pr_verification(
                         &intent,
-                        MAX_SESSION_PR_TRANSIENT_ATTEMPTS,
+                        PR_VERIFICATION_FAILURE_TRANSIENT,
+                        None,
+                        true,
                     );
                 }
                 Err(_) => {
@@ -5424,7 +5533,9 @@ impl Engine {
                     );
                     self.defer_or_expire_session_pr_verification(
                         &intent,
-                        MAX_SESSION_PR_TRANSIENT_ATTEMPTS,
+                        PR_VERIFICATION_FAILURE_TRANSIENT,
+                        None,
+                        true,
                     );
                 }
             }
@@ -5434,14 +5545,33 @@ impl Engine {
     fn defer_or_expire_session_pr_verification(
         &self,
         intent: &SessionPrVerificationIntent,
-        max_attempts: u32,
+        failure_class: &str,
+        max_consecutive_failures: Option<u32>,
+        count_request: bool,
     ) {
+        let next_consecutive_failures = if intent.last_failure_class == failure_class {
+            intent.consecutive_failures.saturating_add(1)
+        } else {
+            1
+        };
         let result = if Self::session_pr_verification_expired(intent)
-            || intent.attempts.saturating_add(1) >= max_attempts
-        {
+            || Self::session_pr_verification_retry_exhausted(
+                intent,
+                failure_class,
+                max_consecutive_failures,
+                count_request,
+            ) {
             self.store.discard_session_pr_verification(intent)
         } else {
-            self.store.defer_session_pr_verification(intent)
+            let delay = if failure_class == PR_VERIFICATION_FAILURE_AUTH {
+                SESSION_PR_AUTH_RETRY_SECONDS
+            } else {
+                Store::session_pr_verification_retry_delay(
+                    next_consecutive_failures.saturating_sub(1),
+                )
+            };
+            self.store
+                .defer_session_pr_verification(intent, failure_class, count_request, delay)
         };
         if let Err(error) = result {
             tracing::warn!(
@@ -11562,8 +11692,15 @@ impl Engine {
         // Vendor-native todo tools are reported as ordinary tool events.
         // Remember their names until completion so their result can update
         // the same persisted snapshot as trouve's bridged/native tool.
-        let mut tool_calls =
-            HashMap::<String, (String, serde_json::Value, PullRequestCreationRequest)>::new();
+        let mut tool_calls = HashMap::<
+            String,
+            (
+                String,
+                serde_json::Value,
+                PullRequestCreationRequest,
+                Option<(String, String)>,
+            ),
+        >::new();
         let mut tool_started_at = HashMap::<String, Instant>::new();
         // Creation tools sometimes stream their final PR URL before the
         // completion payload. Buffer output only for calls whose request is
@@ -11937,9 +12074,20 @@ impl Engine {
                             }
                         }
                     }
+                    let creation_evidence =
+                        if !matches!(creation_request, PullRequestCreationRequest::Rejected) {
+                            Self::capture_session_pr_head(session).await
+                        } else {
+                            None
+                        };
                     tool_calls.insert(
                         call_id.clone(),
-                        (tool.clone(), args.clone(), creation_request),
+                        (
+                            tool.clone(),
+                            args.clone(),
+                            creation_request,
+                            creation_evidence,
+                        ),
                     );
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
@@ -11969,7 +12117,7 @@ impl Engine {
                         continue;
                     }
                     if github_repository.is_some()
-                        && let Some((_, _, request)) = tool_calls.get(&call_id)
+                        && let Some((_, _, request, _)) = tool_calls.get(&call_id)
                         && !matches!(request, PullRequestCreationRequest::Rejected)
                     {
                         github_creation_output
@@ -12199,7 +12347,7 @@ impl Engine {
                     let execution_duration_ms =
                         tool_started_at.remove(&call_id).map(monotonic_elapsed_ms);
                     let todos = match tool_calls.get(&call_id) {
-                        Some((tool, args, _)) => self.persist_todos_from_result(
+                        Some((tool, args, _, _)) => self.persist_todos_from_result(
                             &thread.id,
                             tool,
                             status,
@@ -12211,7 +12359,7 @@ impl Engine {
                     let mut verification = None;
                     if ok
                         && let Some(repository @ (host, owner, repo)) = &github_repository
-                        && let Some((_, _, request)) = tool_calls.get(&call_id)
+                        && let Some((_, _, request, _)) = tool_calls.get(&call_id)
                     {
                         if !matches!(request, PullRequestCreationRequest::Rejected) {
                             let result_numbers = pr_numbers_in_value(&result, host, owner, repo);
@@ -12235,12 +12383,17 @@ impl Engine {
                     } else {
                         github_creation_output.remove(&call_id);
                     }
-                    // Snapshot immutable ownership at completion for every
-                    // accepted creator path. The git helper validates a
-                    // coherent checked-out branch/HEAD pair, so evidence is
-                    // never reconstructed from an unrelated later mutation.
+                    // Prefer the immutable pre-execution attestation captured
+                    // when the backend announced the creator. Completion-time
+                    // capture is only a retry for a transient git-read failure.
                     let evidence = if verification.is_some() {
-                        let evidence = Self::capture_session_pr_head(session).await;
+                        let evidence = tool_calls
+                            .get(&call_id)
+                            .and_then(|(_, _, _, evidence)| evidence.clone());
+                        let evidence = match evidence {
+                            Some(evidence) => Some(evidence),
+                            None => Self::capture_session_pr_head(session).await,
+                        };
                         if evidence.is_none() {
                             tracing::warn!(
                                 session_id = session.id,
@@ -13230,6 +13383,11 @@ impl Engine {
             // Retain the lane until the executor has acknowledged cancellation
             // and cleaned up its process/protocol resources.
             let mut permit = Some(permit);
+            let creation_evidence = if pr_creation.is_some() {
+                Self::capture_session_pr_head(session).await
+            } else {
+                None
+            };
             self.store
                 .append_event_async(
                     scope.clone(),
@@ -13306,7 +13464,10 @@ impl Engine {
                     || (matches!(request, PullRequestCreationRequest::Unresolved)
                         && !result_numbers.is_empty());
                 if accepted {
-                    let evidence = Self::capture_session_pr_head(session).await;
+                    let evidence = match creation_evidence {
+                        Some(evidence) => Some(evidence),
+                        None => Self::capture_session_pr_head(session).await,
+                    };
                     if evidence.is_none() {
                         tracing::warn!(
                             session_id = session.id,
@@ -18949,6 +19110,8 @@ default_permission_mode = "ask"
             branch: "agent/clean-pr".into(),
             head_sha: "1".repeat(40),
             attempts: 0,
+            last_failure_class: String::new(),
+            consecutive_failures: 0,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         let mut fetched = crate::github::PullRequestWithHeadRepository {
@@ -18975,9 +19138,49 @@ default_permission_mode = "ask"
         assert!(Engine::session_pr_verification_expired(&expired));
         let malformed = SessionPrVerificationIntent {
             created_at: "not-a-timestamp".into(),
-            ..intent
+            ..intent.clone()
         };
         assert!(Engine::session_pr_verification_expired(&malformed));
+
+        let accumulated_transient = SessionPrVerificationIntent {
+            attempts: 7,
+            last_failure_class: PR_VERIFICATION_FAILURE_TRANSIENT.into(),
+            consecutive_failures: 7,
+            ..intent.clone()
+        };
+        assert!(!Engine::session_pr_verification_retry_exhausted(
+            &accumulated_transient,
+            PR_VERIFICATION_FAILURE_NOT_FOUND,
+            Some(MAX_SESSION_PR_NOT_FOUND_ATTEMPTS),
+            true,
+        ));
+        let consecutive_missing = SessionPrVerificationIntent {
+            last_failure_class: PR_VERIFICATION_FAILURE_NOT_FOUND.into(),
+            consecutive_failures: MAX_SESSION_PR_NOT_FOUND_ATTEMPTS - 1,
+            ..accumulated_transient.clone()
+        };
+        assert!(Engine::session_pr_verification_retry_exhausted(
+            &consecutive_missing,
+            PR_VERIFICATION_FAILURE_NOT_FOUND,
+            Some(MAX_SESSION_PR_NOT_FOUND_ATTEMPTS),
+            true,
+        ));
+        let request_ceiling = SessionPrVerificationIntent {
+            attempts: MAX_SESSION_PR_REQUEST_ATTEMPTS - 1,
+            ..accumulated_transient
+        };
+        assert!(Engine::session_pr_verification_retry_exhausted(
+            &request_ceiling,
+            PR_VERIFICATION_FAILURE_TRANSIENT,
+            None,
+            true,
+        ));
+        assert!(!Engine::session_pr_verification_retry_exhausted(
+            &request_ceiling,
+            PR_VERIFICATION_FAILURE_AUTH,
+            None,
+            false,
+        ));
     }
 
     #[test]
