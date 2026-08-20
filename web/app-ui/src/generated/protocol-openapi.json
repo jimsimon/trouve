@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.6"
+    "version": "7.7"
   },
   "paths": {
     "/v1/approvals": {
@@ -5407,6 +5407,61 @@
           }
         }
       },
+      "CodeReviewChurnStats": {
+        "type": "object",
+        "description": "Signals that measure repeated review work rather than raw issue volume.",
+        "properties": {
+          "average_rounds_to_clean": {
+            "type": "number",
+            "format": "double"
+          },
+          "clean_pull_request_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "external_duplicate_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "fix_regression_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "grouped_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "insufficient_evidence_rejection_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_rounds_to_clean": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "previously_missed_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pull_request_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "recurrence_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "CodeReviewDashboard": {
         "type": "object",
         "required": [
@@ -5498,6 +5553,9 @@
             "type": "string",
             "description": "Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."
           },
+          "evidence": {
+            "$ref": "#/components/schemas/CodeReviewFindingEvidence"
+          },
           "github_comment_id": {
             "type": [
               "integer",
@@ -5529,6 +5587,13 @@
             "format": "int64",
             "minimum": 0
           },
+          "observed_head": {
+            "type": "string",
+            "description": "Immutable PR head on which this finding was first observed."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/CodeReviewFindingOrigin"
+          },
           "path": {
             "type": "string"
           },
@@ -5541,6 +5606,14 @@
               "null"
             ],
             "format": "date-time"
+          },
+          "resolved_by_job_id": {
+            "type": "string",
+            "description": "Review job that demonstrated the fix, for exact fix-diff reconstruction."
+          },
+          "resolved_head": {
+            "type": "string",
+            "description": "Immutable PR head whose review demonstrated that the finding was fixed."
           },
           "severity": {
             "type": "string"
@@ -5558,11 +5631,48 @@
             "type": "string",
             "description": "`open`, `fixed`, or `dismissed`."
           },
+          "theme_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "title": {
             "type": "string",
             "description": "Concise, generated one-line summary of the issue."
           }
         }
+      },
+      "CodeReviewFindingEvidence": {
+        "type": "object",
+        "description": "Concrete evidence that makes a confirmed finding independently verifiable.",
+        "properties": {
+          "consequence": {
+            "type": "string"
+          },
+          "execution_path": {
+            "type": "string"
+          },
+          "introduction": {
+            "type": "string"
+          },
+          "preconditions": {
+            "type": "string"
+          },
+          "regression_test": {
+            "type": "string"
+          }
+        }
+      },
+      "CodeReviewFindingOrigin": {
+        "type": "string",
+        "description": "How a finding relates to earlier review rounds on the pull request.",
+        "enum": [
+          "new_change",
+          "recurrence",
+          "fix_regression",
+          "previously_missed"
+        ]
       },
       "CodeReviewFindingPublicationStatus": {
         "type": "string",
@@ -5572,6 +5682,7 @@
           "published",
           "not_eligible",
           "suppressed_by_policy",
+          "grouped_by_theme",
           "failed"
         ]
       },
@@ -5886,6 +5997,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/CodeReviewTask"
+            }
+          },
+          "themes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewTheme"
             }
           }
         }
@@ -6387,6 +6504,9 @@
               "$ref": "#/components/schemas/CodeReviewStatsBucket"
             }
           },
+          "churn": {
+            "$ref": "#/components/schemas/CodeReviewChurnStats"
+          },
           "coordinator_duration": {
             "$ref": "#/components/schemas/CodeReviewDurationStats"
           },
@@ -6773,6 +6893,115 @@
           "router",
           "reviewer",
           "coordinator"
+        ]
+      },
+      "CodeReviewTheme": {
+        "type": "object",
+        "description": "A root cause tracked across all review rounds for one pull request.",
+        "required": [
+          "id",
+          "repository",
+          "pull_number",
+          "root_cause",
+          "recommendation",
+          "status",
+          "first_seen_head",
+          "last_seen_head"
+        ],
+        "properties": {
+          "affected_paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "finding_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "first_seen_head": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_seen_head": {
+            "type": "string"
+          },
+          "observations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewThemeObservation"
+            }
+          },
+          "pull_number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "recommendation": {
+            "type": "string"
+          },
+          "recurrence_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "repository": {
+            "type": "string"
+          },
+          "resolved_head": {
+            "type": "string"
+          },
+          "root_cause": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "`open` while at least one linked finding is open, otherwise `resolved`."
+          }
+        }
+      },
+      "CodeReviewThemeObservation": {
+        "type": "object",
+        "required": [
+          "job_id",
+          "head_sha",
+          "kind",
+          "finding_ids",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finding_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "head_sha": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CodeReviewThemeObservationKind"
+          }
+        }
+      },
+      "CodeReviewThemeObservationKind": {
+        "type": "string",
+        "description": "How a durable root-cause theme appeared in one review round.",
+        "enum": [
+          "new",
+          "continuation",
+          "recurrence"
         ]
       },
       "CommandInfo": {
@@ -8522,6 +8751,12 @@
           },
           "summary": {
             "type": "string"
+          },
+          "themes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewTheme"
+            }
           }
         }
       },

@@ -232,9 +232,44 @@ export interface Finding {
     | "published"
     | "not_eligible"
     | "suppressed_by_policy"
+    | "grouped_by_theme"
     | "failed";
+  evidence?: {
+    preconditions?: string;
+    execution_path?: string;
+    consequence?: string;
+    introduction?: string;
+    regression_test?: string;
+  };
+  origin?: "new_change" | "recurrence" | "fix_regression" | "previously_missed";
+  theme_ids?: string[];
   github_thread_id?: string;
   resolved_at?: string;
+  observed_head?: string;
+  resolved_head?: string;
+  resolved_by_job_id?: string;
+}
+
+export interface ReviewTheme {
+  id: string;
+  repository: string;
+  pull_number: number;
+  root_cause: string;
+  recommendation: string;
+  status: string;
+  first_seen_head: string;
+  last_seen_head: string;
+  resolved_head?: string;
+  recurrence_count: number;
+  affected_paths?: string[];
+  finding_ids?: string[];
+  observations?: Array<{
+    job_id: string;
+    head_sha: string;
+    kind: "new" | "continuation" | "recurrence";
+    finding_ids: string[];
+    created_at: string;
+  }>;
 }
 
 export interface CandidateRejection {
@@ -271,6 +306,7 @@ export interface JobDetail {
   tasks: ReviewTask[];
   personas: PersonaResult[];
   findings: Finding[];
+  themes?: ReviewTheme[];
   candidate_rejections?: CandidateRejection[];
   routing_decisions?: RoutingDecision[];
   summary: string;
@@ -356,6 +392,18 @@ export interface ReviewStats {
   coordinator_duration: DurationStats;
   publication_duration: DurationStats;
   issue_count: number;
+  churn: {
+    recurrence_issue_count: number;
+    fix_regression_issue_count: number;
+    previously_missed_issue_count: number;
+    grouped_issue_count: number;
+    external_duplicate_count: number;
+    insufficient_evidence_rejection_count: number;
+    pull_request_count: number;
+    clean_pull_request_count: number;
+    average_rounds_to_clean: number;
+    max_rounds_to_clean: number;
+  };
   buckets: StatsBucket[];
   personas: PersonaStats[];
   repositories: RepositoryStats[];

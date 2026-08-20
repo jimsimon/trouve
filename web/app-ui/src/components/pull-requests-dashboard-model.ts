@@ -30,6 +30,12 @@ export interface PullRequestReviewFinding {
   readonly prompt: string;
   readonly status: string;
   readonly publicationStatus: string;
+  readonly origin: string;
+  readonly rootCause: string;
+  readonly recommendation: string;
+  readonly executionPath: string;
+  readonly consequence: string;
+  readonly regressionTest: string;
 }
 
 export interface PullRequestRow {
@@ -340,9 +346,12 @@ const rowFromPullRequest = (
   const repository = pr.repository?.trim() || "Repository";
   const workspaceId = pr.workspace_id ?? "";
   const review = pr.trouve_review ?? undefined;
+  const themes = new Map((review?.themes ?? []).map((theme) => [theme.id, theme]));
   const findings = (review?.findings ?? [])
     .filter((finding) => finding.status === "open")
-    .map((finding) => Object.freeze({
+    .map((finding) => {
+      const theme = (finding.theme_ids ?? []).map((id) => themes.get(id)).find(Boolean);
+      return Object.freeze({
       location: `${finding.path}:${finding.line}`,
       title: finding.title,
       severity: finding.severity,
@@ -351,7 +360,14 @@ const rowFromPullRequest = (
       prompt: finding.prompt_for_agents ?? "",
       status: finding.status,
       publicationStatus: finding.github_publication_status ?? "pending",
-    }));
+      origin: finding.origin ?? "new_change",
+      rootCause: theme?.root_cause ?? "",
+      recommendation: theme?.recommendation ?? "",
+      executionPath: finding.evidence?.execution_path ?? "",
+      consequence: finding.evidence?.consequence ?? "",
+      regressionTest: finding.evidence?.regression_test ?? "",
+    });
+    });
   const comments = pr.comments ?? 0;
   const lastComment = pr.last_comment_at === null || pr.last_comment_at === undefined
     ? comments === 0 ? "no comments yet" : "last comment time unavailable"

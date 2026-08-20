@@ -698,10 +698,23 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                       @click=${() => this.#fix(row, finding.prompt)}
                     >Fix</button>
                   </div>
-                  <small>Identified at ${finding.location} · Severity: ${finding.severity} · Confidence: ${finding.confidence}</small>
+                  <small>Identified at ${finding.location} · Severity: ${finding.severity} · Confidence: ${finding.confidence}${finding.origin === "new_change" ? nothing : ` · ${finding.origin.replaceAll("_", " ")}`}</small>
                   <p>${finding.body}</p>
+                  ${finding.rootCause === "" ? nothing : html`
+                    <p><strong>Shared root cause:</strong> ${finding.rootCause}</p>
+                    <p><strong>Structural fix:</strong> ${finding.recommendation}</p>
+                  `}
+                  ${finding.executionPath === "" ? nothing : html`<details>
+                    <summary>Verification evidence</summary>
+                    <p><strong>Execution path:</strong> ${finding.executionPath}</p>
+                    <p><strong>Consequence:</strong> ${finding.consequence}</p>
+                    <p><strong>Regression test:</strong> ${finding.regressionTest}</p>
+                  </details>`}
                   ${finding.publicationStatus === "suppressed_by_policy"
                     ? html`<small>Retained in Trouve · Not posted to GitHub by confidence policy</small>`
+                    : nothing}
+                  ${finding.publicationStatus === "grouped_by_theme"
+                    ? html`<small>Retained in Trouve · Represented by the shared root-cause comment on GitHub</small>`
                     : nothing}
                 </article>`)}
               </section>`}
