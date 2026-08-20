@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.4"
+    "version": "7.6"
   },
   "paths": {
     "/v1/approvals": {
@@ -7041,7 +7041,7 @@
           },
           {
             "type": "object",
-            "description": "Live usage from the most recently completed model request in a running\nturn. This replaces the thread's context-usage snapshot without\ncompleting the turn; `turn.completed` still carries final aggregates.",
+            "description": "Live usage from the most recently completed model request in a running\nturn. Thread snapshots add its billing counters to `active_usage` while\nreplacing only the context fields. `last_usage` remains unchanged until\n`turn.completed` supplies the turn's final aggregates.",
             "required": [
               "turn",
               "usage",
@@ -12708,6 +12708,17 @@
           "items"
         ],
         "properties": {
+          "active_usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage",
+                "description": "Cumulative usage for the active turn. Billing counters sum its model\nrequests while context fields describe the latest request."
+              }
+            ]
+          },
           "commands": {
             "type": "array",
             "items": {
@@ -12739,7 +12750,8 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/Usage"
+                "$ref": "#/components/schemas/Usage",
+                "description": "Latest valid usage measurement, retained across turn boundaries for\ncontext display."
               }
             ]
           },
