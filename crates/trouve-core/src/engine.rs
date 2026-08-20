@@ -4,7 +4,7 @@
 //! reported exclusively through the event log. Worktree mutations are
 //! serialized per session (threads share the session worktree, ADR 0003).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -991,12 +991,6 @@ async fn deny_pending_backend_approvals(
 enum BackendLoopInput {
     Event(Option<Result<BackendEvent, BackendError>>),
     Approval(BackendApprovalOutcome),
-    CreatorReservation(BackendCreatorReservationOutcome),
-}
-
-struct BackendCreatorReservationOutcome {
-    call_id: String,
-    permit: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
 /// Native collaborators are real, navigable threads while the vendor owns
@@ -4324,7 +4318,24 @@ impl Engine {
             },
             Err(e) => LoginState::Failed(e.to_string()),
         };
+        let authenticated = matches!(state, LoginState::Success);
         self.logins.lock().unwrap().insert(id.to_string(), state);
+        let github_host = if id == "github" {
+            Some(crate::github::GITHUB_COM)
+        } else {
+            id.strip_prefix("github:")
+        };
+        if authenticated && let Some(host) = github_host {
+            match self.store.wake_authenticated_session_pr_verifications(host) {
+                Ok(woken) if woken > 0 => self.session_pr_verification_wake.notify_one(),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %host,
+                    %error,
+                    "failed to wake pull request verification after GitHub login"
+                ),
+            }
+        }
     }
 
     /// Set the default model for new threads (provider-qualified).
@@ -5240,9 +5251,6 @@ impl Engine {
         failure_class: &str,
         count_request: bool,
     ) -> i64 {
-        if failure_class == PR_VERIFICATION_FAILURE_AUTH {
-            return SESSION_PR_AUTH_RETRY_SECONDS;
-        }
         if count_request {
             // Preserve monotonic request pacing even when GitHub alternates
             // between not-found, moved-head, and transport outcomes.
@@ -5253,7 +5261,15 @@ impl Engine {
         } else {
             1
         };
-        Store::session_pr_verification_retry_delay(next_consecutive_failures.saturating_sub(1))
+        let delay =
+            Store::session_pr_verification_retry_delay(next_consecutive_failures.saturating_sub(1));
+        if failure_class == PR_VERIFICATION_FAILURE_AUTH {
+            delay
+                .saturating_mul(SESSION_PR_AUTH_RETRY_SECONDS)
+                .min(6 * 60 * 60)
+        } else {
+            delay
+        }
     }
 
     fn session_pr_verification_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -11743,12 +11759,6 @@ impl Engine {
             HashMap::<String, tokio_util::sync::CancellationToken>::new();
         let mut backend_mutation_permits =
             HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
-        let mut pending_backend_creator_reservations = futures::stream::FuturesUnordered::new();
-        let mut backend_creator_reservation_cancels =
-            HashMap::<String, tokio_util::sync::CancellationToken>::new();
-        let mut backend_creator_reservation_ids = HashSet::<String>::new();
-        let mut deferred_creator_completions = HashMap::<String, BackendEvent>::new();
-        let mut ready_backend_events = VecDeque::<BackendEvent>::new();
         let mut pending_steer = None;
         let mut consecutive_backend_events = 0usize;
         loop {
@@ -11762,18 +11772,6 @@ impl Engine {
                 );
             let input = tokio::select! {
                 biased;
-                event = async {
-                    ready_backend_events
-                        .pop_front()
-                        .expect("non-empty ready backend event queue must yield an event")
-                }, if !ready_backend_events.is_empty() => {
-                    BackendLoopInput::Event(Some(Ok(event)))
-                }
-                reservation = pending_backend_creator_reservations.next(), if !pending_backend_creator_reservations.is_empty() => {
-                    BackendLoopInput::CreatorReservation(
-                        reservation.expect("non-empty creator reservation queue must yield an outcome")
-                    )
-                }
                 // Persist vendor output that is already available before
                 // accepting simultaneously-ready steering. This preserves
                 // the causal order observed at the backend boundary.
@@ -11919,22 +11917,6 @@ impl Engine {
             };
             let event = match input {
                 BackendLoopInput::Event(None) => break,
-                BackendLoopInput::CreatorReservation(outcome) => {
-                    consecutive_backend_events = 0;
-                    backend_creator_reservation_cancels.remove(&outcome.call_id);
-                    backend_creator_reservation_ids.remove(&outcome.call_id);
-                    if let Some(permit) = outcome.permit
-                        && !backend_approval_cancels.contains_key(&outcome.call_id)
-                        && !backend_mutation_permits.contains_key(&outcome.call_id)
-                    {
-                        backend_mutation_permits.insert(outcome.call_id.clone(), permit);
-                    }
-                    if let Some(completion) = deferred_creator_completions.remove(&outcome.call_id)
-                    {
-                        ready_backend_events.push_back(completion);
-                    }
-                    continue;
-                }
                 BackendLoopInput::Approval(outcome) => {
                     consecutive_backend_events = 0;
                     let BackendApprovalOutcome {
@@ -11992,14 +11974,9 @@ impl Engine {
                         }
                         if responder.send(true).is_err() {
                             backend_mutation_permits.remove(&call_id);
-                        } else if backend_mutation_permits.contains_key(&call_id)
-                            && let Some(completion) = deferred_creator_completions.remove(&call_id)
-                        {
-                            ready_backend_events.push_back(completion);
                         }
                     } else {
                         backend_mutation_permits.remove(&call_id);
-                        deferred_creator_completions.remove(&call_id);
                         let _ = responder.send(false);
                     }
                     continue;
@@ -12127,33 +12104,6 @@ impl Engine {
                                 github_repository = Some(repository);
                             }
                         }
-                    }
-                    // Vendor connectors that do not request a mutation permit
-                    // still need an ordered creator boundary. Hold the session
-                    // write lane from creator announcement through successful
-                    // completion so post-execution branch/HEAD evidence cannot
-                    // be sampled from a later turn.
-                    if !matches!(creation_request, PullRequestCreationRequest::Rejected)
-                        && !backend_mutation_permits.contains_key(&call_id)
-                        && !backend_approval_cancels.contains_key(&call_id)
-                        && backend_creator_reservation_ids.insert(call_id.clone())
-                    {
-                        let lane = self.tool_execution_lock(&session.id);
-                        let reservation_cancel = cancel.child_token();
-                        backend_creator_reservation_cancels
-                            .insert(call_id.clone(), reservation_cancel.clone());
-                        let reservation_call_id = call_id.clone();
-                        pending_backend_creator_reservations.push(async move {
-                            let permit = tokio::select! {
-                                biased;
-                                _ = reservation_cancel.cancelled() => None,
-                                permit = lane.write_owned() => Some(permit),
-                            };
-                            BackendCreatorReservationOutcome {
-                                call_id: reservation_call_id,
-                                permit,
-                            }
-                        });
                     }
                     tool_calls.insert(
                         call_id.clone(),
@@ -12409,23 +12359,6 @@ impl Engine {
                         backend_mutation_permits.remove(&call_id);
                         continue;
                     }
-                    let waits_for_creator_lane =
-                        tool_calls.get(&call_id).is_some_and(|(_, _, request)| {
-                            !matches!(request, PullRequestCreationRequest::Rejected)
-                        }) && !backend_mutation_permits.contains_key(&call_id)
-                            && (backend_creator_reservation_ids.contains(&call_id)
-                                || backend_approval_cancels.contains_key(&call_id));
-                    if waits_for_creator_lane {
-                        deferred_creator_completions.insert(
-                            call_id.clone(),
-                            BackendEvent::ToolCompleted {
-                                call_id,
-                                ok,
-                                result,
-                            },
-                        );
-                        continue;
-                    }
                     let status = if ok {
                         ToolStatus::Ok
                     } else {
@@ -12470,9 +12403,12 @@ impl Engine {
                     } else {
                         github_creation_output.remove(&call_id);
                     }
-                    // Creator calls retain the session write lane until this
-                    // post-execution attestation is captured. This records HEAD
-                    // changes made by the creator while excluding later turns.
+                    // Approval-gated vendor creators retain the session write
+                    // lane until this post-execution attestation is captured.
+                    // A provider-owned call that executed without that gate is
+                    // completed normally but cannot authorize a session PR:
+                    // acquiring a speculative permit after ToolStarted cannot
+                    // serialize execution that has already begun.
                     let evidence = if verification.is_some() {
                         let evidence = if backend_mutation_permits.contains_key(&call_id) {
                             Self::capture_session_pr_head(session).await
@@ -12541,15 +12477,6 @@ impl Engine {
                         });
                     }
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    if let Some(reservation_cancel) =
-                        backend_creator_reservation_cancels.remove(&call_id)
-                    {
-                        // Let the approval workflow own the same call's lane
-                        // reservation. Its future remains polled to completion
-                        // but cannot install a second permit after cancellation.
-                        reservation_cancel.cancel();
-                    }
-                    let creator_permit_reserved = backend_mutation_permits.contains_key(&call_id);
                     let approval_cancel = cancel.child_token();
                     backend_approval_cancels.insert(call_id.clone(), approval_cancel.clone());
                     pending_backend_approvals.push(self.pending_backend_approval(
@@ -12566,7 +12493,7 @@ impl Engine {
                         // handle_tool_call; pre-acquiring here would make the
                         // vendor wait on its own permit. Native Codex tools
                         // are read-only under the full-bridge sandbox.
-                        !full_tool_bridge && !creator_permit_reserved,
+                        !full_tool_bridge,
                         None,
                     ));
                     continue;
@@ -19294,6 +19221,20 @@ default_permission_mode = "ask"
                 false,
             ),
             SESSION_PR_AUTH_RETRY_SECONDS,
+        );
+        let repeated_auth = SessionPrVerificationIntent {
+            last_failure_class: PR_VERIFICATION_FAILURE_AUTH.into(),
+            consecutive_failures: 10,
+            ..request_ceiling.clone()
+        };
+        assert_eq!(
+            Engine::session_pr_verification_retry_delay(
+                &repeated_auth,
+                PR_VERIFICATION_FAILURE_AUTH,
+                false,
+            ),
+            21_600,
+            "authentication backoff must grow and cap at six hours",
         );
         assert!(!Engine::session_pr_verification_retry_exhausted(
             &accumulated_transient,

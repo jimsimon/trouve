@@ -4415,6 +4415,21 @@ impl Store {
         (1_i64 << attempts.min(15)).min(6 * 60 * 60)
     }
 
+    /// Make authentication-deferred verification work immediately eligible
+    /// after a successful login for the same GitHub host.
+    pub(crate) fn wake_authenticated_session_pr_verifications(&self, host: &str) -> Result<usize> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE session_pr_verification_intents
+                 SET next_attempt_at = NULL
+                 WHERE host = ?1 AND last_failure_class = 'authentication'",
+                params![host],
+            )
+            .map_err(Into::into)
+    }
+
     /// Upgrade an intent written by the short-lived pending-evidence format.
     /// Matching the original empty tuple makes concurrent cleanup idempotent.
     pub(crate) fn set_session_pr_verification_evidence(
@@ -12432,6 +12447,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(switched_failure, (2, "authentication".into(), 1));
+        assert!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap()
+                .is_empty()
+        );
 
         store
             .append_events_with_session_pr_verification_intents(
@@ -12471,6 +12492,25 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "identical evidence must preserve accumulated backoff"
+        );
+        assert_eq!(
+            store
+                .wake_authenticated_session_pr_verifications("github.example")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .wake_authenticated_session_pr_verifications("github.com")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .due_session_pr_verification_intents(&session.id, 10)
+                .unwrap()
+                .len(),
+            1
         );
 
         let replacement = SessionPrVerificationIntent {
