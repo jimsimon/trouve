@@ -891,7 +891,10 @@ fn migrate_code_review_theme_transitions(
 /// Records the final state established for each theme by one published review.
 /// An empty job filter backfills all published history during migration. The
 /// snapshot folds only publication-scoped observations, links, and closures;
-/// mutable aggregate fields never participate in reconstruction.
+/// mutable aggregate fields never participate in reconstruction. Fixed or
+/// dismissed rows that predate resolver provenance remain closed only when
+/// their resolver id is empty; provenance-aware closures require a published
+/// resolver job.
 fn record_code_review_theme_transition_snapshots(
     tx: &rusqlite::Transaction<'_>,
     job_filter: &str,
@@ -959,11 +962,19 @@ fn record_code_review_theme_transition_snapshots(
                         )
                       )
                       AND (
-                        finding.resolved_by_job_id = ''
-                        OR resolver.id IS NULL
-                        OR resolver.review_published = 0
-                        OR resolver.publication_order
-                            > snapshot_job.publication_order
+                        (
+                          finding.resolved_by_job_id = ''
+                          AND finding.status NOT IN ('fixed', 'dismissed')
+                        )
+                        OR (
+                          finding.resolved_by_job_id != ''
+                          AND (
+                            resolver.id IS NULL
+                            OR resolver.review_published = 0
+                            OR resolver.publication_order
+                                > snapshot_job.publication_order
+                          )
+                        )
                       )
                   ) AS has_open_finding
            FROM candidates AS candidate
@@ -1244,16 +1255,14 @@ fn promote_published_code_review_theme_observations(conn: &mut Connection) -> Re
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (job_id, repository, pull_number, head_sha, published_at) in jobs {
-        publish_code_review_theme_observations(&tx, &job_id, &published_at)?;
-        resolve_code_review_themes_in_transaction(
+        finalize_code_review_theme_publication(
             &tx,
+            &job_id,
             &repository,
             pull_number as u64,
             &head_sha,
             &published_at,
         )?;
-        record_code_review_theme_transition_snapshots(&tx, &job_id, &published_at)?;
-        apply_code_review_theme_transition_snapshots(&tx, &job_id)?;
     }
     tx.commit()?;
     Ok(())
@@ -2710,6 +2719,21 @@ fn resolve_code_review_themes_in_transaction(
            )",
         params![repository, pull_number as i64, resolved_head, resolved_at],
     )? as u64)
+}
+
+fn finalize_code_review_theme_publication(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    repository: &str,
+    pull_number: u64,
+    head_sha: &str,
+    published_at: &str,
+) -> Result<()> {
+    publish_code_review_theme_observations(tx, job_id, published_at)?;
+    resolve_code_review_themes_in_transaction(tx, repository, pull_number, head_sha, published_at)?;
+    record_code_review_theme_transition_snapshots(tx, job_id, published_at)?;
+    apply_code_review_theme_transition_snapshots(tx, job_id)?;
+    Ok(())
 }
 
 fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &str) -> Result<()> {
@@ -11707,9 +11731,9 @@ impl Store {
             params![id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        publish_code_review_theme_observations(&tx, id, &published_at)?;
-        resolve_code_review_themes_in_transaction(
+        finalize_code_review_theme_publication(
             &tx,
+            id,
             &repository,
             pull_number as u64,
             &head_sha,
@@ -12054,16 +12078,14 @@ impl Store {
         if updated == 0 {
             anyhow::bail!("review job changed before GitHub publication was recorded");
         }
-        publish_code_review_theme_observations(&tx, id, &published_at)?;
-        resolve_code_review_themes_in_transaction(
+        finalize_code_review_theme_publication(
             &tx,
+            id,
             repository,
             pull_number,
             head_sha,
             &published_at,
         )?;
-        record_code_review_theme_transition_snapshots(&tx, id, &published_at)?;
-        apply_code_review_theme_transition_snapshots(&tx, id)?;
         record_code_review_open_issue_count(&tx, id)?;
         tx.execute(
             "INSERT INTO code_review_pr_state
@@ -17756,7 +17778,7 @@ mod tests {
             job.id
         );
         let finding = store
-            .save_code_review_result(
+            .save_code_review_result_with_themes(
                 &job.id,
                 "summary",
                 "prompt",
@@ -17772,10 +17794,22 @@ mod tests {
                     prompt_for_agents: "fix".into(),
                     sources: Vec::new(),
                 }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["reconciled-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "reconciled-theme".into(),
+                    root_cause: "reconciled publication root cause".into(),
+                    recommendation: "persist the final transition".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
                 &[],
             )
             .unwrap()
             .remove(0);
+        let theme_id = finding.theme_ids[0].clone();
         assert!(store.claim_code_review_publication(&job.id).unwrap());
         assert!(
             store
@@ -17812,6 +17846,19 @@ mod tests {
             store.code_review_findings(&job.id).unwrap()[0].status,
             "fixed"
         );
+        let transition = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, resolved_head
+                 FROM code_review_theme_transitions
+                 WHERE theme_id = ?1 AND job_id = ?2",
+                params![theme_id, job.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(transition, ("resolved".into(), job.head_sha.clone()));
         let state = store
             .code_review_pull_state(&job.repository, job.pull_number)
             .unwrap();
@@ -19030,26 +19077,52 @@ mod tests {
                 "summary",
                 "fix the root cause",
                 1,
-                &[NewCodeReviewFinding {
-                    path: "src/published.rs".into(),
-                    line: 7,
-                    side: "RIGHT".into(),
-                    severity: "medium".into(),
-                    confidence: "high".into(),
-                    title: "Published symptom".into(),
-                    body: "Only a published resolver can close this finding.".into(),
-                    prompt_for_agents: "Keep unpublished closures open.".into(),
-                    sources: Vec::new(),
-                }],
-                &[NewCodeReviewFindingDetails {
-                    theme_ids: vec!["published-theme".into()],
-                    ..Default::default()
-                }],
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/published.rs".into(),
+                        line: 7,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Published symptom".into(),
+                        body: "Only a published resolver can close this finding.".into(),
+                        prompt_for_agents: "Keep unpublished closures open.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/legacy.rs".into(),
+                        line: 11,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Legacy fixed symptom".into(),
+                        body: "Legacy closures have no resolver provenance.".into(),
+                        prompt_for_agents: "Preserve the legacy closure.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["published-theme".into()],
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["legacy-theme".into()],
+                        ..Default::default()
+                    },
+                ],
                 &[
                     NewCodeReviewTheme {
                         id: "published-theme".into(),
                         root_cause: "published root cause".into(),
                         recommendation: "record the closure transition".into(),
+                        observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                        previous_finding_ids: Vec::new(),
+                    },
+                    NewCodeReviewTheme {
+                        id: "legacy-theme".into(),
+                        root_cause: "legacy root cause".into(),
+                        recommendation: "preserve provenance-free closures".into(),
                         observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
                         previous_finding_ids: Vec::new(),
                     },
@@ -19065,6 +19138,7 @@ mod tests {
             )
             .unwrap();
         let published_theme_id = findings[0].theme_ids[0].clone();
+        let legacy_theme_id = findings[1].theme_ids[0].clone();
         let standalone_theme_id = store
             .conn
             .lock()
@@ -19072,8 +19146,8 @@ mod tests {
             .query_row(
                 "SELECT theme_id
                  FROM code_review_theme_observations
-                 WHERE job_id = ?1 AND theme_id != ?2",
-                params![published_job.id, published_theme_id],
+                 WHERE job_id = ?1 AND theme_id NOT IN (?2, ?3)",
+                params![published_job.id, published_theme_id, legacy_theme_id],
                 |row| row.get::<_, String>(0),
             )
             .unwrap();
@@ -19105,6 +19179,18 @@ mod tests {
                     findings[0].id,
                     unpublished_job.id,
                     unpublished_job.head_sha,
+                    stale_unpublished_time
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', resolved_by_job_id = '',
+                     resolved_head = ?2, resolved_at = ?3
+                 WHERE id = ?1",
+                params![
+                    findings[1].id,
+                    published_job.head_sha,
                     stale_unpublished_time
                 ],
             )
@@ -19171,8 +19257,14 @@ mod tests {
             .unwrap();
         assert_eq!(standalone_theme.status, "resolved");
         assert_eq!(standalone_theme.resolved_head, published_job.head_sha);
+        let legacy_theme = themes
+            .iter()
+            .find(|theme| theme.id == legacy_theme_id)
+            .unwrap();
+        assert_eq!(legacy_theme.status, "resolved");
+        assert_eq!(legacy_theme.resolved_head, published_job.head_sha);
         let conn = reopened.conn.lock().unwrap();
-        for theme_id in [&published_theme_id, &standalone_theme_id] {
+        for theme_id in [&published_theme_id, &legacy_theme_id, &standalone_theme_id] {
             let (updated_at, transition_count) = conn
                 .query_row(
                     "SELECT theme.updated_at, (
