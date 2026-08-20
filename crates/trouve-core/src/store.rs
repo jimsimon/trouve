@@ -900,11 +900,29 @@ fn rebuild_code_review_theme_aggregates(tx: &rusqlite::Transaction<'_>) -> Resul
                  FROM code_review_finding_themes AS finding_theme
                  JOIN code_review_findings AS finding
                    ON finding.id = finding_theme.finding_id
+                 JOIN code_review_jobs AS finding_job
+                   ON finding_job.id = finding.job_id
+                 LEFT JOIN code_review_jobs AS link_job
+                   ON link_job.id = finding_theme.linked_by_job_id
                  JOIN code_review_jobs AS resolver
                    ON resolver.id = finding.resolved_by_job_id
                  WHERE finding_theme.theme_id = theme.id
+                   AND finding_job.review_published != 0
+                   AND (
+                     finding_theme.linked_by_job_id = ''
+                     OR link_job.review_published != 0
+                   )
                    AND resolver.review_published != 0
                  ORDER BY resolver.publication_order DESC, resolver.rowid DESC
+                 LIMIT 1
+               ), NULLIF(theme.resolved_head, ''), (
+                 SELECT observation.head_sha
+                 FROM code_review_theme_observations AS observation
+                 JOIN code_review_jobs AS job ON job.id = observation.job_id
+                 WHERE observation.theme_id = theme.id
+                   AND observation.published != 0
+                 ORDER BY job.publication_order DESC, job.rowid DESC,
+                          observation.rowid DESC
                  LIMIT 1
                ), '')
              END,
@@ -915,12 +933,12 @@ fn rebuild_code_review_theme_aggregates(tx: &rusqlite::Transaction<'_>) -> Resul
                  AND observation.published != 0
                  AND observation.kind = 'recurrence'
              ),
-             updated_at = COALESCE((
-               SELECT MAX(observation.created_at)
-               FROM code_review_theme_observations AS observation
-               WHERE observation.theme_id = theme.id
-                 AND observation.published != 0
-             ), theme.updated_at)
+             updated_at = MAX(theme.updated_at, COALESCE((
+                 SELECT MAX(observation.created_at)
+                 FROM code_review_theme_observations AS observation
+                 WHERE observation.theme_id = theme.id
+                   AND observation.published != 0
+               ), theme.updated_at))
          WHERE EXISTS (
            SELECT 1 FROM code_review_theme_observations AS observation
            WHERE observation.theme_id = theme.id
@@ -18711,6 +18729,156 @@ mod tests {
         assert_eq!(themes[0].status, "open");
         assert_eq!(themes[0].last_seen_head, second_job.head_sha);
         assert_eq!(themes[0].recurrence_count, 1);
+    }
+
+    #[test]
+    fn migration_rebuild_preserves_authoritative_resolution_state() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("resolved-theme-observation.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let published_job = enqueue_backoff_test_job(&store);
+        store
+            .save_code_review_result_with_themes(
+                &published_job.id,
+                "summary",
+                "fix the root cause",
+                0,
+                &[],
+                &[],
+                &[NewCodeReviewTheme {
+                    id: "resolved-theme".into(),
+                    root_cause: "resolved root cause".into(),
+                    recommendation: "preserve authoritative transitions".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT theme_id FROM code_review_theme_observations WHERE job_id = ?1",
+                [&published_job.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let mut unpublished_request = backoff_test_job_request();
+        unpublished_request.dedupe_key = "acme/widgets#42:unpublished-link".into();
+        unpublished_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let unpublished_job = store
+            .enqueue_code_review_job(&unpublished_request)
+            .unwrap()
+            .unwrap();
+        let unpublished_findings = store
+            .save_code_review_result_with_themes(
+                &unpublished_job.id,
+                "unpublished summary",
+                "do not publish",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/unpublished.rs".into(),
+                    line: 7,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Unpublished symptom".into(),
+                    body: "This link never became authoritative.".into(),
+                    prompt_for_agents: "Ignore unpublished links.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec![theme_id.clone()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: theme_id.clone(),
+                    root_cause: "resolved root cause".into(),
+                    recommendation: "preserve authoritative transitions".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::Continuation,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let authoritative_updated_at = "2099-01-02T03:04:05+00:00";
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-12',
+                     review_published = 1, publication_accepted = 1,
+                     publication_order = 1
+                 WHERE id = ?1",
+                [&published_job.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_findings
+                 SET status = 'fixed', resolved_by_job_id = ?2,
+                     resolved_head = ?3, resolved_at = ?4
+                 WHERE id = ?1",
+                params![
+                    unpublished_findings[0].id,
+                    published_job.id,
+                    published_job.head_sha,
+                    authoritative_updated_at
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_themes
+                 SET status = 'resolved', resolved_head = 'authoritative-resolution',
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![theme_id, authoritative_updated_at],
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "ALTER TABLE code_review_theme_observations RENAME TO authority_observations;
+                 CREATE TABLE code_review_theme_observations (
+                   theme_id TEXT NOT NULL REFERENCES code_review_themes(id),
+                   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+                   head_sha TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   published INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL,
+                   PRIMARY KEY (theme_id, job_id)
+                 );
+                 INSERT INTO code_review_theme_observations
+                   (theme_id, job_id, head_sha, kind, published, created_at)
+                 SELECT theme_id, job_id, head_sha, kind, published, created_at
+                 FROM authority_observations;
+                 DROP TABLE authority_observations;",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let reopened = Store::open(&database).unwrap();
+        let themes = reopened
+            .code_review_themes_for_job(&published_job.id)
+            .unwrap();
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].status, "resolved");
+        assert_eq!(themes[0].resolved_head, "authoritative-resolution");
+        let updated_at = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT updated_at FROM code_review_themes WHERE id = ?1",
+                [&theme_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(updated_at, authoritative_updated_at);
     }
 
     #[test]
