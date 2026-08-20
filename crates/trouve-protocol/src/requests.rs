@@ -2111,7 +2111,8 @@ pub struct CodeReviewTheme {
     pub pull_number: u64,
     pub root_cause: String,
     pub recommendation: String,
-    /// `open` while at least one linked finding is open, otherwise `resolved`.
+    /// `pending` while the producing review is unpublished, `open` while at
+    /// least one authoritative linked finding is open, otherwise `resolved`.
     pub status: String,
     pub first_seen_head: String,
     pub last_seen_head: String,

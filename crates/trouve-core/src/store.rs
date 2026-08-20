@@ -702,6 +702,14 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN publication_resolution_job_id TEXT",
     "ALTER TABLE code_review_theme_observations ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
+    "UPDATE code_review_theme_observations
+       SET published = 1
+       WHERE published = 0
+         AND EXISTS (
+           SELECT 1 FROM code_review_jobs job
+           WHERE job.id = code_review_theme_observations.job_id
+             AND job.review_published != 0
+         )",
     "ALTER TABLE code_review_finding_themes ADD COLUMN linked_by_job_id TEXT NOT NULL DEFAULT ''",
     "UPDATE code_review_jobs
        SET publication_order = rowid
@@ -7550,8 +7558,8 @@ impl Store {
         allow_new_state: bool,
         max_attempts: u64,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let competing_job_exists: bool = tx.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM code_review_jobs
@@ -8962,8 +8970,8 @@ impl Store {
                      WHERE f.id = ?1 AND j.repository = ?3 AND j.pull_number = ?4
                      ON CONFLICT(finding_id, theme_id) DO UPDATE SET
                        linked_by_job_id = excluded.linked_by_job_id
-                     WHERE code_review_finding_themes.linked_by_job_id = ''
-                        OR NOT EXISTS (
+                     WHERE code_review_finding_themes.linked_by_job_id != ''
+                       AND NOT EXISTS (
                           SELECT 1 FROM code_review_jobs link_job
                           WHERE link_job.id = code_review_finding_themes.linked_by_job_id
                             AND link_job.review_published != 0
@@ -9204,8 +9212,8 @@ impl Store {
         job_id: &str,
         finding_ids: &[&str],
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let current = tx.query_row(
             "SELECT EXISTS (
                SELECT 1 FROM code_review_jobs
@@ -9593,6 +9601,7 @@ impl Store {
         &self,
         repository: &str,
         pull_number: u64,
+        max_closed_rounds: usize,
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
         let job_ids: Vec<String> = {
             let conn = self.conn.lock().unwrap();
@@ -9602,18 +9611,25 @@ impl Store {
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
                    AND j.review_published = 1
+                   AND f.status != 'open'
                  GROUP BY f.job_id
-                 ORDER BY MAX(f.status = 'open') DESC,
-                          MAX(j.completed_at) DESC,
+                 ORDER BY MAX(j.completed_at) DESC,
                           f.job_id DESC
-                 LIMIT 4",
+                 LIMIT ?3",
             )?;
-            stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
+            stmt.query_map(
+                params![repository, pull_number as i64, max_closed_rounds as i64],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?
         };
         let mut findings = Vec::new();
         for job_id in job_ids.into_iter().rev() {
-            findings.extend(self.code_review_findings(&job_id)?);
+            findings.extend(
+                self.code_review_findings(&job_id)?
+                    .into_iter()
+                    .filter(|finding| finding.status != "open"),
+            );
         }
         Ok(findings)
     }
@@ -9794,8 +9810,8 @@ impl Store {
         thread_id: &str,
         is_resolved: bool,
     ) -> Result<(bool, u64)> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let previous: Option<(Option<bool>, i64, String, Option<String>)> = tx
             .query_row(
                 "SELECT github_thread_resolved, github_thread_generation, status,
@@ -10035,8 +10051,8 @@ impl Store {
         pull_number: u64,
         resolved_head: &str,
     ) -> Result<u64> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let updated = resolve_code_review_themes_in_transaction(
             &tx,
             repository,
@@ -10517,6 +10533,7 @@ impl Store {
                           publication_open_issue_count
                    FROM code_review_jobs
                    WHERE status = 'succeeded'
+                     AND publication_open_issue_count IS NOT NULL
                      AND (?1 IS NULL OR repository = ?1)
                      AND (?2 IS NULL OR completed_at >= ?2)
                  ),
@@ -10840,12 +10857,15 @@ impl Store {
         job_id: &str,
         entries: &[(&str, &str, &str)],
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let prepared: bool = tx.query_row(
-            "SELECT publication_claimed != 0 AND publication_dispatched = 0
-                    AND publication_accepted = 0
-             FROM code_review_jobs WHERE id = ?1",
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs
+               WHERE id = ?1 AND publication_claimed != 0
+                 AND publication_dispatched = 0
+                 AND publication_accepted = 0
+             )",
             params![job_id],
             |row| row.get(0),
         )?;
@@ -11291,8 +11311,8 @@ impl Store {
         blocking_review_cleanup_pending: bool,
         resolved_finding_ids: &[&str],
     ) -> Result<u64> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let current_publication = tx.query_row(
             "SELECT EXISTS (
                SELECT 1 FROM code_review_jobs AS current_job
@@ -11525,8 +11545,8 @@ impl Store {
         page: u64,
         useful_work: bool,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let Some((current_page, attempts)) = tx
             .query_row(
                 "SELECT blocking_review_cleanup_page,
@@ -11574,8 +11594,8 @@ impl Store {
         id: &str,
         claim_token: &str,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let attempts: i64 = tx
             .query_row(
                 "SELECT blocking_review_cleanup_attempts
@@ -17832,6 +17852,81 @@ mod tests {
         assert!(indexes.contains("code_review_finding_themes_theme"));
     }
 
+    #[test]
+    fn publication_manifest_returns_false_for_a_missing_job() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            !store
+                .prepare_code_review_publication_manifest(
+                    "rvj-missing",
+                    &[("rvf-missing", "rvf-missing", "eligible")],
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_promotes_observations_from_legacy_published_jobs() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("legacy-theme-observation.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Legacy symptom".into(),
+                    body: "The invariant is broken.".into(),
+                    prompt_for_agents: "Restore it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    theme_ids: vec!["legacy-theme".into()],
+                    ..Default::default()
+                }],
+                &[NewCodeReviewTheme {
+                    id: "legacy-theme".into(),
+                    root_cause: "legacy root cause".into(),
+                    recommendation: "preserve legacy authority".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET review_published = 1 WHERE id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&database).unwrap();
+        let published = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT published FROM code_review_theme_observations WHERE job_id = ?1",
+                [&job.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(published);
+    }
+
     fn backoff_test_job_request() -> NewCodeReviewJob {
         NewCodeReviewJob {
             dedupe_key: "acme/widgets#42:backoff".into(),
@@ -18714,6 +18809,31 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
+        let legacy = enqueue(
+            "acme/widgets#42:legacy-unmeasured-round",
+            "1212121212121212121212121212121212121212",
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            legacy.id
+        );
+        store
+            .save_code_review_result(&legacy.id, "Legacy clean result.", "", 0, &[], &[])
+            .unwrap();
+        store
+            .finish_code_review_job(&legacy.id, "succeeded", "", "")
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs
+                 SET publication_open_issue_count = NULL
+                 WHERE id = ?1",
+                [&legacy.id],
+            )
+            .unwrap();
         let first = enqueue(
             "acme/widgets#42:churn-round-1",
             "2222222222222222222222222222222222222222",
@@ -18797,8 +18917,21 @@ mod tests {
                 trouve_protocol::CodeReviewFindingPublicationStatus::GroupedByTheme,
             )
             .unwrap();
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
         store
-            .finish_code_review_job(&first.id, "succeeded", "https://example.test/review", "")
+            .record_code_review_publication(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.base_ref,
+                &first.head_sha,
+                "https://example.test/review/1",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&first.id, "succeeded", "https://example.test/review/1", "")
             .unwrap();
 
         let second = enqueue(
@@ -18812,21 +18945,40 @@ mod tests {
         store
             .save_code_review_result(&second.id, "Clean.", "", 0, &[], &[])
             .unwrap();
+        assert!(store.claim_code_review_publication(&second.id).unwrap());
+        let resolved_finding_ids = findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
         store
-            .finish_code_review_job(&second.id, "succeeded", "", "")
-            .unwrap();
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE code_review_jobs
-                 SET publication_open_issue_count =
-                   CASE WHEN id = ?1 THEN 3 WHEN id = ?2 THEN 0 END
-                 WHERE id IN (?1, ?2)",
-                params![first.id, second.id],
+            .record_code_review_publication(
+                &second.id,
+                &second.repository,
+                second.pull_number,
+                &second.base_ref,
+                &second.head_sha,
+                "https://example.test/review/2",
+                false,
+                &resolved_finding_ids,
             )
             .unwrap();
+        store
+            .finish_code_review_job(&second.id, "succeeded", "https://example.test/review/2", "")
+            .unwrap();
+        let publication_open_issue_count = |job_id: &str| {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT publication_open_issue_count FROM code_review_jobs WHERE id = ?1",
+                    [job_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(publication_open_issue_count(&first.id), Some(3));
+        assert_eq!(publication_open_issue_count(&second.id), Some(0));
 
         let stats = store
             .code_review_stats(

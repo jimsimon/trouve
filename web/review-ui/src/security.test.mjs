@@ -27,6 +27,7 @@ test("API-derived class values are allowlisted", () => {
   assert.equal(normalizedReviewMode("manual"), "manual");
   assert.equal(normalizedReviewMode("automatic"), "automatic");
   assert.equal(normalizedReviewMode('off\" onmouseover=\"alert(1)'), "off");
+  assert.equal(jobStatusClass("pending"), "pending");
   assert.equal(jobStatusClass("running"), "running");
   assert.equal(jobStatusClass('failed\" onmouseover=\"alert(1)'), "unknown");
 });

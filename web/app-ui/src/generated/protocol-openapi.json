@@ -6960,7 +6960,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`open` while at least one linked finding is open, otherwise `resolved`."
+            "description": "`pending` while the producing review is unpublished, `open` while at\nleast one authoritative linked finding is open, otherwise `resolved`."
           }
         }
       },

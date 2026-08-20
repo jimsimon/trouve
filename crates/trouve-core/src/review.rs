@@ -105,6 +105,7 @@ const REVIEW_BATCH_FORMAT_VERSION: &str = "2";
 const REVIEW_BATCH_MAX_PATH_BYTES: usize = 16 * 1024;
 const REVIEW_COORDINATOR_CONTEXT_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_HISTORY_MAX_FINDINGS: usize = 100;
+const REVIEW_HISTORY_MAX_CLOSED_ROUNDS: usize = 4;
 const REVIEW_HISTORY_MAX_THEMES: usize = 50;
 const REVIEW_HISTORY_FINDINGS_MAX_BYTES: usize = 64 * 1024;
 const REVIEW_HISTORY_THEMES_MAX_BYTES: usize = 32 * 1024;
@@ -4799,17 +4800,23 @@ impl Engine {
             bail!("reviewers returned more than {MAX_CANDIDATE_FINDINGS} candidate findings");
         }
         let candidates = structurally_valid_candidates(candidates, &diff_files);
-        let all_previous_findings = self
+        let previous_findings = self
             .store
-            .code_review_finding_history_for_pull(&job.repository, job.pull_number)?
+            .open_code_review_findings(&job.repository, job.pull_number)?
             .into_iter()
             .filter(|finding| finding.job_id != job.id)
             .collect::<Vec<_>>();
-        let previous_findings = all_previous_findings
-            .iter()
-            .filter(|finding| finding.status == "open")
-            .cloned()
+        let mut all_previous_findings = self
+            .store
+            .code_review_finding_history_for_pull(
+                &job.repository,
+                job.pull_number,
+                REVIEW_HISTORY_MAX_CLOSED_ROUNDS,
+            )?
+            .into_iter()
+            .filter(|finding| finding.job_id != job.id)
             .collect::<Vec<_>>();
+        all_previous_findings.extend(previous_findings.iter().cloned());
         let finding_history = prioritized_finding_history(&all_previous_findings);
         let all_previous_themes = self.store.code_review_theme_history_for_pull(
             &job.repository,
@@ -6254,17 +6261,13 @@ impl Engine {
                 });
             }
 
-            // An HTTP response proves that GitHub did not accept this request.
-            // Clear the ambiguous-dispatch marker before any retry or claim
-            // release; transport errors above intentionally remain ambiguous.
-            if !self.store.reset_code_review_publication_dispatch(&job.id)? {
-                bail!("review publication changed after GitHub rejected the request");
-            }
-
             let body = match response.text().await {
                 Ok(body) => body,
                 Err(error) => {
                     if status.is_client_error() {
+                        if !self.store.reset_code_review_publication_dispatch(&job.id)? {
+                            bail!("review publication changed after GitHub rejected the request");
+                        }
                         if let Err(release_error) =
                             self.store.release_code_review_publication_claim(&job.id)
                         {
@@ -6290,6 +6293,9 @@ impl Engine {
                 }
             };
             if status.as_u16() == 422 && github_review_should_fallback_to_comment(event, &body) {
+                if !self.store.reset_code_review_publication_dispatch(&job.id)? {
+                    bail!("review publication changed before its fallback retry");
+                }
                 event = "COMMENT";
                 continue;
             }
@@ -6299,11 +6305,17 @@ impl Engine {
                 // diff. Without a visible blocking inline comment, publish a
                 // non-blocking review and retain the findings in the durable
                 // lifecycle comment.
+                if !self.store.reset_code_review_publication_dispatch(&job.id)? {
+                    bail!("review publication changed before its commentless retry");
+                }
                 include_comments = false;
                 event = github_review_event_without_inline_comments(event);
                 continue;
             }
             if status.is_client_error() {
+                if !self.store.reset_code_review_publication_dispatch(&job.id)? {
+                    bail!("review publication changed after GitHub rejected the request");
+                }
                 if let Err(error) = self.store.release_code_review_publication_claim(&job.id) {
                     tracing::warn!(
                         job_id = %job.id,
@@ -6692,10 +6704,30 @@ impl Engine {
             .iter()
             .map(|(finding_id, _, status)| (finding_id.as_str(), status.as_str()))
             .collect::<HashMap<_, _>>();
-        let grouped_finding_ids = manifest
+        let manifest_grouped_ids = manifest
             .iter()
             .filter(|(_, _, status)| status == "grouped_by_theme")
             .map(|(finding_id, _, _)| finding_id.as_str())
+            .collect::<HashSet<_>>();
+        // Jobs created before publication manifests were introduced still need
+        // to recover the exact grouping policy used by their original publish.
+        let legacy_grouped_ids = if manifest.is_empty() {
+            let themes = self.store.code_review_themes_for_job(&job.id)?;
+            review_theme_publication_groups(&findings, &themes)
+                .iter()
+                .flat_map(|group| group.members.iter().skip(1))
+                .map(|finding| finding.id.clone())
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let grouped_finding_ids = findings
+            .iter()
+            .filter(|finding| {
+                manifest_grouped_ids.contains(finding.id.as_str())
+                    || legacy_grouped_ids.contains(&finding.id)
+            })
+            .map(|finding| finding.id.as_str())
             .collect::<Vec<_>>();
         let mut repaired_statuses = 0;
         let ineligible_ids = findings
@@ -6732,7 +6764,9 @@ impl Engine {
             .iter()
             .filter(|finding| {
                 status_by_finding.get(finding.id.as_str()) == Some(&"eligible")
-                    || (manifest.is_empty() && finding.is_publishable())
+                    || (manifest.is_empty()
+                        && finding.is_publishable()
+                        && !legacy_grouped_ids.contains(&finding.id))
             })
             .collect::<Vec<_>>();
         let has_review_url = !record.job.review_url.is_empty()
@@ -10174,16 +10208,14 @@ fn prioritized_finding_history(
         .iter()
         .rev()
         .filter(|finding| finding.status == "open")
-        .take(REVIEW_HISTORY_MAX_FINDINGS)
         .cloned()
         .collect::<Vec<_>>();
-    let remaining = REVIEW_HISTORY_MAX_FINDINGS.saturating_sub(selected.len());
     selected.extend(
         findings
             .iter()
             .rev()
             .filter(|finding| finding.status != "open")
-            .take(remaining)
+            .take(REVIEW_HISTORY_MAX_FINDINGS)
             .cloned(),
     );
     // compact_finding_history and prior_fix_diff_context iterate in reverse,
@@ -14330,7 +14362,7 @@ mod tests {
         );
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert!(record.publication_claimed);
-        assert!(!record.publication_dispatched);
+        assert!(record.publication_dispatched);
         assert!(!record.publication_accepted);
         assert_eq!(
             engine.store.code_review_findings(&job.id).unwrap()[0].github_publication_status,
@@ -15151,14 +15183,26 @@ mod tests {
             }))
             .unwrap()
         };
-        let mut findings = vec![finding("open-oldest".into(), "open")];
-        findings.extend((0..100).map(|index| finding(format!("fixed-{index}"), "fixed")));
+        let mut findings = (0..REVIEW_HISTORY_MAX_FINDINGS + 5)
+            .map(|index| finding(format!("open-{index}"), "open"))
+            .collect::<Vec<_>>();
+        findings.extend(
+            (0..REVIEW_HISTORY_MAX_FINDINGS + 50)
+                .map(|index| finding(format!("fixed-{index}"), "fixed")),
+        );
 
         let selected = prioritized_finding_history(&findings);
-        assert_eq!(selected.len(), REVIEW_HISTORY_MAX_FINDINGS);
-        assert!(selected.iter().any(|finding| finding.id == "open-oldest"));
+        assert_eq!(selected.len(), REVIEW_HISTORY_MAX_FINDINGS * 2 + 5);
+        assert!(selected.iter().any(|finding| finding.id == "open-0"));
+        assert!(
+            selected.iter().any(|finding| {
+                finding.id == format!("open-{}", REVIEW_HISTORY_MAX_FINDINGS + 4)
+            })
+        );
         assert!(!selected.iter().any(|finding| finding.id == "fixed-0"));
-        assert!(selected.iter().any(|finding| finding.id == "fixed-99"));
+        assert!(selected.iter().any(|finding| {
+            finding.id == format!("fixed-{}", REVIEW_HISTORY_MAX_FINDINGS + 49)
+        }));
     }
 
     #[test]

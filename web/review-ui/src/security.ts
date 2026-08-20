@@ -1,4 +1,11 @@
-const JOB_STATUS_CLASSES = new Set(["queued", "running", "succeeded", "failed", "stale"]);
+const JOB_STATUS_CLASSES = new Set([
+  "queued",
+  "pending",
+  "running",
+  "succeeded",
+  "failed",
+  "stale",
+]);
 
 /** Return a canonical browser URL only for non-executable HTTP(S) links. */
 export function safeExternalUrl(value: unknown): string {

@@ -2512,7 +2512,10 @@ export interface components {
             repository: string;
             resolved_head?: string;
             root_cause: string;
-            /** @description `open` while at least one linked finding is open, otherwise `resolved`. */
+            /**
+             * @description `pending` while the producing review is unpublished, `open` while at
+             *     least one authoritative linked finding is open, otherwise `resolved`.
+             */
             status: string;
         };
         CodeReviewThemeObservation: {
