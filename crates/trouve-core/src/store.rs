@@ -741,6 +741,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     }
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
+    promote_published_code_review_theme_observations(conn)?;
     backfill_code_review_publication_dispatch(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
@@ -753,6 +754,21 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+fn promote_published_code_review_theme_observations(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE code_review_theme_observations
+         SET published = 1
+         WHERE published = 0
+           AND EXISTS (
+             SELECT 1 FROM code_review_jobs job
+             WHERE job.id = code_review_theme_observations.job_id
+               AND job.review_published != 0
+           )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -9640,35 +9656,129 @@ impl Store {
         pull_number: u64,
         status: Option<&str>,
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
-        let job_ids: Vec<String> = {
-            let conn = self.conn.lock().unwrap();
-            let status_filter = if status.is_some() {
-                " AND f.status = ?3"
-            } else {
-                ""
-            };
-            let mut stmt = conn.prepare(&format!(
-                "SELECT DISTINCT f.job_id
-                 FROM code_review_findings f
-                 JOIN code_review_jobs j ON j.id = f.job_id
-                 WHERE j.repository = ?1 AND j.pull_number = ?2
-                   AND j.review_published = 1{status_filter}
-                 ORDER BY j.completed_at, f.job_id"
-            ))?;
-            let mut query_params = vec![
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let status_filter = if status.is_some() {
+            " AND f.status = ?3"
+        } else {
+            ""
+        };
+        let query_params = || {
+            let mut values = vec![
                 rusqlite::types::Value::from(repository.to_owned()),
                 rusqlite::types::Value::from(pull_number as i64),
             ];
             if let Some(status) = status {
-                query_params.push(rusqlite::types::Value::from(status.to_owned()));
+                values.push(rusqlite::types::Value::from(status.to_owned()));
             }
-            stmt.query_map(rusqlite::params_from_iter(query_params), |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
+            values
         };
-        let mut findings = Vec::new();
-        for job_id in job_ids {
-            findings.extend(self.code_review_findings_with_status(&job_id, status)?);
+        let mut findings = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT f.id, f.job_id, f.path, f.line, f.side, f.severity,
+                        f.confidence, f.title, f.body, f.evidence, f.origin,
+                        f.prompt_for_agents, f.status, f.github_comment_id,
+                        f.github_comment_url, f.github_publication_status,
+                        f.github_thread_id, f.resolved_at, j.head_sha,
+                        f.resolved_head, f.resolved_by_job_id
+                 FROM code_review_findings f
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1{status_filter}
+                 ORDER BY j.completed_at, f.job_id, f.path, f.line, f.id"
+            ))?;
+            stmt.query_map(rusqlite::params_from_iter(query_params()), |row| {
+                Ok(trouve_protocol::CodeReviewFinding {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    path: row.get(2)?,
+                    line: row.get::<_, i64>(3)? as u64,
+                    side: row.get(4)?,
+                    severity: row.get(5)?,
+                    confidence: row.get(6)?,
+                    title: row.get(7)?,
+                    body: row.get(8)?,
+                    evidence: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                    origin: code_review_finding_origin(&row.get::<_, String>(10)?),
+                    theme_ids: Vec::new(),
+                    prompt_for_agents: row.get(11)?,
+                    status: row.get(12)?,
+                    sources: Vec::new(),
+                    github_comment_id: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
+                    github_comment_url: row.get(14)?,
+                    github_publication_status: code_review_publication_status(
+                        &row.get::<_, String>(15)?,
+                    ),
+                    github_thread_id: row.get(16)?,
+                    resolved_at: parse_optional_datetime(row.get(17)?),
+                    observed_head: row.get(18)?,
+                    resolved_head: row.get(19)?,
+                    resolved_by_job_id: row.get(20)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut sources_by_finding =
+            HashMap::<String, Vec<trouve_protocol::CodeReviewFindingSource>>::new();
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT source.finding_id, source.reviewer_id, source.reviewer_name,
+                        source.candidate_id, source.task_id
+                 FROM code_review_finding_sources source
+                 JOIN code_review_findings f ON f.id = source.finding_id
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1{status_filter}
+                 ORDER BY source.finding_id, source.reviewer_name, source.candidate_id"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(query_params()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(1)?,
+                        reviewer_name: row.get(2)?,
+                        candidate_id: row.get(3)?,
+                        task_id: row.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (finding_id, source) = row?;
+                sources_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(source);
+            }
         }
+        let mut themes_by_finding = HashMap::<String, Vec<String>>::new();
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT link.finding_id, link.theme_id
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings f ON f.id = link.finding_id
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 LEFT JOIN code_review_jobs link_job ON link_job.id = link.linked_by_job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1{status_filter}
+                   AND (link.linked_by_job_id = '' OR link_job.review_published != 0)
+                 ORDER BY link.finding_id, link.theme_id"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(query_params()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (finding_id, theme_id) = row?;
+                themes_by_finding
+                    .entry(finding_id)
+                    .or_default()
+                    .push(theme_id);
+            }
+        }
+        for finding in &mut findings {
+            finding.sources = sources_by_finding.remove(&finding.id).unwrap_or_default();
+            finding.theme_ids = themes_by_finding.remove(&finding.id).unwrap_or_default();
+        }
+        tx.commit()?;
         Ok(findings)
     }
 
@@ -9920,6 +10030,71 @@ impl Store {
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
         )?;
         self.code_review_themes_for_pull_or_job(&repository, pull_number, job_id, i64::MAX)
+    }
+
+    /// Reconstructs only theme membership that could have belonged to a
+    /// manifestless job's own publication. Later published jobs may add links
+    /// to these findings, but their explicit ownership must not rewrite the
+    /// immutable publication outcome being recovered.
+    pub fn code_review_themes_for_legacy_publication_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTheme>> {
+        let conn = self.conn.lock().unwrap();
+        let mut themes = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT theme.id, theme.repository, theme.pull_number,
+                        theme.root_cause, theme.recommendation, theme.status,
+                        theme.first_seen_head, theme.last_seen_head,
+                        theme.resolved_head, theme.recurrence_count
+                 FROM code_review_themes theme
+                 JOIN code_review_theme_observations observation
+                   ON observation.theme_id = theme.id
+                 WHERE observation.job_id = ?1
+                 ORDER BY theme.created_at, theme.id",
+            )?;
+            stmt.query_map([job_id], |row| {
+                Ok(trouve_protocol::CodeReviewTheme {
+                    id: row.get(0)?,
+                    repository: row.get(1)?,
+                    pull_number: row.get::<_, i64>(2)? as u64,
+                    root_cause: row.get(3)?,
+                    recommendation: row.get(4)?,
+                    status: row.get(5)?,
+                    first_seen_head: row.get(6)?,
+                    last_seen_head: row.get(7)?,
+                    resolved_head: row.get(8)?,
+                    recurrence_count: row.get::<_, i64>(9)? as u64,
+                    affected_paths: Vec::new(),
+                    finding_ids: Vec::new(),
+                    observations: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for theme in &mut themes {
+            let mut stmt = conn.prepare(
+                "SELECT finding.id, finding.path
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings finding ON finding.id = link.finding_id
+                 WHERE link.theme_id = ?1 AND finding.job_id = ?2
+                   AND (link.linked_by_job_id = '' OR link.linked_by_job_id = ?2)
+                 ORDER BY finding.created_at, finding.id",
+            )?;
+            let members = stmt
+                .query_map(params![theme.id, job_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            theme.finding_ids = members.iter().map(|(id, _)| id.clone()).collect();
+            theme.affected_paths = members
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+        Ok(themes)
     }
 
     fn code_review_themes_for_pull_or_job(
@@ -17836,6 +18011,97 @@ mod tests {
     }
 
     #[test]
+    fn legacy_publication_grouping_ignores_links_owned_by_later_jobs() {
+        let store = Store::open_in_memory().unwrap();
+        let original_job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result_with_themes(
+                &original_job.id,
+                "summary",
+                "fix the root cause",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/first.rs".into(),
+                        line: 3,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Original symptom".into(),
+                        body: "The original review grouped this symptom.".into(),
+                        prompt_for_agents: "Fix the shared cause.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/later.rs".into(),
+                        line: 5,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Later symptom".into(),
+                        body: "A later review linked this symptom.".into(),
+                        prompt_for_agents: "Fix the shared cause.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["legacy-group".into()],
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["legacy-group".into()],
+                        ..Default::default()
+                    },
+                ],
+                &[NewCodeReviewTheme {
+                    id: "legacy-group".into(),
+                    root_cause: "shared legacy cause".into(),
+                    recommendation: "repair the cause once".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let theme_id = findings[0].theme_ids[0].clone();
+
+        let mut later_request = backoff_test_job_request();
+        later_request.dedupe_key = "acme/widgets#42:later-link".into();
+        later_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let later_job = store
+            .enqueue_code_review_job(&later_request)
+            .unwrap()
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE code_review_jobs SET review_published = 1 WHERE id = ?1",
+            [&later_job.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_review_finding_themes SET linked_by_job_id = ''
+             WHERE finding_id = ?1 AND theme_id = ?2",
+            params![findings[0].id, theme_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_review_finding_themes SET linked_by_job_id = ?1
+             WHERE finding_id = ?2 AND theme_id = ?3",
+            params![later_job.id, findings[1].id, theme_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let themes = store
+            .code_review_themes_for_legacy_publication_job(&original_job.id)
+            .unwrap();
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].finding_ids, [findings[0].id.clone()]);
+        assert_eq!(themes[0].affected_paths, ["src/first.rs"]);
+    }
+
+    #[test]
     fn theme_reverse_lookup_indexes_exist() {
         let store = Store::open_in_memory().unwrap();
         let indexes = store
@@ -17866,7 +18132,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_promotes_observations_from_legacy_published_jobs() {
+    fn migration_promotes_observations_repaired_as_published_on_the_same_startup() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("legacy-theme-observation.sqlite3");
         let store = Store::open(&database).unwrap();
@@ -17907,13 +18173,23 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE code_review_jobs SET review_published = 1 WHERE id = ?1",
+                "UPDATE code_review_jobs
+                 SET review_url = 'https://github.com/acme/widgets/pull/42#pullrequestreview-7',
+                     review_published = 0, publication_accepted = 0
+                 WHERE id = ?1",
                 [&job.id],
             )
             .unwrap();
         drop(store);
 
         let reopened = Store::open(&database).unwrap();
+        assert!(
+            reopened
+                .code_review_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .review_published
+        );
         let published = reopened
             .conn
             .lock()

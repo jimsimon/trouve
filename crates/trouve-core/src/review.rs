@@ -4816,6 +4816,14 @@ impl Engine {
             .into_iter()
             .filter(|finding| finding.job_id != job.id)
             .collect::<Vec<_>>();
+        // These partitions are intentionally read separately: if publication
+        // closes a finding between snapshots, preserve the open observation
+        // conservatively and discard the contradictory closed copy.
+        let open_finding_ids = previous_findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<HashSet<_>>();
+        all_previous_findings.retain(|finding| !open_finding_ids.contains(finding.id.as_str()));
         all_previous_findings.extend(previous_findings.iter().cloned());
         let finding_history = prioritized_finding_history(&all_previous_findings);
         let all_previous_themes = self.store.code_review_theme_history_for_pull(
@@ -6261,13 +6269,16 @@ impl Engine {
                 });
             }
 
+            let definitive_rejection = status.is_client_error();
+            if definitive_rejection
+                && !self.store.reset_code_review_publication_dispatch(&job.id)?
+            {
+                bail!("review publication changed after GitHub rejected the request");
+            }
             let body = match response.text().await {
                 Ok(body) => body,
                 Err(error) => {
-                    if status.is_client_error() {
-                        if !self.store.reset_code_review_publication_dispatch(&job.id)? {
-                            bail!("review publication changed after GitHub rejected the request");
-                        }
+                    if definitive_rejection {
                         if let Err(release_error) =
                             self.store.release_code_review_publication_claim(&job.id)
                         {
@@ -6293,9 +6304,6 @@ impl Engine {
                 }
             };
             if status.as_u16() == 422 && github_review_should_fallback_to_comment(event, &body) {
-                if !self.store.reset_code_review_publication_dispatch(&job.id)? {
-                    bail!("review publication changed before its fallback retry");
-                }
                 event = "COMMENT";
                 continue;
             }
@@ -6305,17 +6313,11 @@ impl Engine {
                 // diff. Without a visible blocking inline comment, publish a
                 // non-blocking review and retain the findings in the durable
                 // lifecycle comment.
-                if !self.store.reset_code_review_publication_dispatch(&job.id)? {
-                    bail!("review publication changed before its commentless retry");
-                }
                 include_comments = false;
                 event = github_review_event_without_inline_comments(event);
                 continue;
             }
-            if status.is_client_error() {
-                if !self.store.reset_code_review_publication_dispatch(&job.id)? {
-                    bail!("review publication changed after GitHub rejected the request");
-                }
+            if definitive_rejection {
                 if let Err(error) = self.store.release_code_review_publication_claim(&job.id) {
                     tracing::warn!(
                         job_id = %job.id,
@@ -6712,7 +6714,9 @@ impl Engine {
         // Jobs created before publication manifests were introduced still need
         // to recover the exact grouping policy used by their original publish.
         let legacy_grouped_ids = if manifest.is_empty() {
-            let themes = self.store.code_review_themes_for_job(&job.id)?;
+            let themes = self
+                .store
+                .code_review_themes_for_legacy_publication_job(&job.id)?;
             review_theme_publication_groups(&findings, &themes)
                 .iter()
                 .flat_map(|group| group.members.iter().skip(1))
