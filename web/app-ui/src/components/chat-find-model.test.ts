@@ -61,7 +61,7 @@ describe("chat find model", () => {
         args: { path: "src/parser.rs" },
         status: "ok",
         result: { summary: "Nested fence recovered", exit_code: 11, success: false },
-        output: { text: "line output", bytes: 11, omitted: false },
+        output: { text: "line output", bytes: 11, omitted: true },
       },
       {
         id: "questions:1",
@@ -69,13 +69,19 @@ describe("chat find model", () => {
         requestId: "request-1",
         title: "Choose branch",
         questions: [{ id: "branch", prompt: "Which branch?", options: [] }],
-        answers: undefined,
+        answers: null,
       },
     ];
     expect(chatFindUnitIds(structured, "parser.rs", false)).toEqual(["turn:0:tool:1"]);
     expect(chatFindUnitIds(structured, "11", false)).toEqual(["turn:0:tool:1"]);
     expect(chatFindUnitIds(structured, "false", false)).toEqual(["turn:0:tool:1"]);
     expect(chatFindUnitIds(structured, "which branch", false)).toEqual([
+      "turn:0:tool:1",
+    ]);
+    expect(chatFindUnitIds(structured, "earlier tool output omitted", false)).toEqual([
+      "turn:0:tool:1",
+    ]);
+    expect(chatFindUnitIds(structured, "the questions were skipped", false)).toEqual([
       "turn:0:tool:1",
     ]);
   });
@@ -142,6 +148,45 @@ describe("chat find model", () => {
     expect(revisionReads - coldRevisionReads).toBe(2);
     tool.args = { needle: "Updated projection" };
     expect(chatFindUnitIds(structured, "updated", false)).toEqual(["turn:0:tool:cached"]);
+  });
+
+  it("evicts old projections when the aggregate cache budget is reached", () => {
+    let reads = 0;
+    const tools: ThreadChatItem[] = [];
+    for (let index = 0; index < 48; index += 1) {
+      const args: Record<string, unknown> = {};
+      Object.defineProperty(args, "payload", {
+        enumerable: true,
+        get: () => {
+          reads += 1;
+          return `${index}:${"x".repeat(48 * 1024)}`;
+        },
+      });
+      tools.push(
+        {
+          id: `user:cache-${index}`,
+          kind: "user",
+          turn: index + 1,
+          content: `Cache turn ${index}`,
+          attachments: [],
+        },
+        {
+          id: `tool:cache-${index}`,
+          kind: "tool",
+          callId: `call-cache-${index}`,
+          tool: "read_file",
+          args,
+          status: "ok",
+          result: null,
+          output: { text: "", bytes: 0, omitted: false },
+        },
+      );
+    }
+
+    expect(chatFindUnitIds(tools, "not present", false)).toEqual([]);
+    expect(reads).toBe(48);
+    expect(chatFindUnitIds(tools.slice(0, 2), "0:", false)).toEqual(["turn:1"]);
+    expect(reads).toBe(49);
   });
 
   it("shares one fair traversal budget across all uncached transcript items", () => {

@@ -5153,6 +5153,59 @@ test("find waits for a query and stops paging when it is cleared", async ({ page
   expect(olderRequests).toBe(1);
 });
 
+test("find reconciles once after automatic history paging completes", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis, "IntersectionObserver", {
+      configurable: true,
+      value: class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    });
+  });
+  const historyPage = (start: number, content: string, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 3,
+    has_older: hasOlder,
+    items: [{
+      kind: "user",
+      turn: 1_000 + start,
+      content,
+      attachments: [],
+    }],
+  });
+  let olderRequests = 0;
+  let releaseOldestPage = (): void => {};
+  const oldestPageReleased = new Promise<void>((resolve) => {
+    releaseOldestPage = resolve;
+  });
+  await installProtocolFixtures(page, { threadViewFixture: async (before) => {
+    if (before === undefined) return { snapshot: historyPage(2, "Recent prompt", true) };
+    olderRequests += 1;
+    if (before === 2) {
+      return { snapshot: historyPage(1, "Intermediate needle", true) };
+    }
+    if (before === 1) {
+      await oldestPageReleased;
+      return { snapshot: historyPage(0, "Oldest prompt", false) };
+    }
+    throw new Error(`unexpected history boundary ${before}`);
+  } });
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.getByRole("button", { name: "Find in chat" }).click();
+  const find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("intermediate needle");
+  await expect.poll(() => olderRequests).toBe(2);
+  await expect(find.getByRole("status")).toHaveText("Searching history…");
+  await page.waitForTimeout(250);
+  await expect(find.getByRole("status")).toHaveText("Searching history…");
+
+  releaseOldestPage();
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+});
+
 test("find retries a failed history page and discovers its older match", async ({ page }) => {
   const historyPage = (start: number, content: string, hasOlder: boolean) => ({
     item_offset: start,

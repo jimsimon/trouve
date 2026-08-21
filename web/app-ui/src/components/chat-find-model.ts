@@ -1,5 +1,10 @@
 import type { ThreadChatItem } from "../state/thread-view-model.js";
+import { TOOL_OUTPUT_OMITTED_MESSAGE } from "../state/tool-output.js";
 import { buildChatLayout } from "./chat-layout.js";
+import {
+  QUESTION_SKIPPED_MESSAGE,
+  QUESTION_SKIPPED_STATUS,
+} from "./question-wizard.js";
 
 export interface ChatFindResult {
   readonly unitIds: readonly string[];
@@ -9,6 +14,8 @@ export interface ChatFindResult {
 const SEARCH_TEXT_LIMIT = 512 * 1024;
 const SEARCH_NODE_LIMIT = 20_000;
 const SEARCH_OPERATION_NODE_LIMIT = 20_000;
+const SEARCH_CACHE_ENTRY_LIMIT = 256;
+const SEARCH_CACHE_TEXT_BYTE_LIMIT = 2 * 1024 * 1024;
 
 interface SearchBudget {
   remainingNodes: number;
@@ -28,6 +35,7 @@ export interface ChatFindMatches {
 interface CachedSearchableItem {
   readonly revision: readonly unknown[];
   readonly text: string;
+  readonly textBytes: number;
 }
 
 interface SearchableItemState {
@@ -35,7 +43,38 @@ interface SearchableItemState {
   readonly cachedText: string | undefined;
 }
 
-const searchableItemCache = new WeakMap<object, CachedSearchableItem>();
+const searchableItemCache = new Map<object, CachedSearchableItem>();
+let searchableItemCacheTextBytes = 0;
+
+const removeCachedSearchableItem = (item: object): void => {
+  const cached = searchableItemCache.get(item);
+  if (cached === undefined) return;
+  searchableItemCache.delete(item);
+  searchableItemCacheTextBytes -= cached.textBytes;
+};
+
+const cacheSearchableItem = (
+  item: object,
+  revision: readonly unknown[],
+  text: string,
+): void => {
+  removeCachedSearchableItem(item);
+  // JavaScript strings retain at most two bytes per code unit. Counting that
+  // upper bound keeps both the cached text and its strongly held item keys
+  // under explicit aggregate limits.
+  const textBytes = text.length * 2;
+  if (textBytes > SEARCH_CACHE_TEXT_BYTE_LIMIT) return;
+  while (
+    searchableItemCache.size >= SEARCH_CACHE_ENTRY_LIMIT
+    || searchableItemCacheTextBytes + textBytes > SEARCH_CACHE_TEXT_BYTE_LIMIT
+  ) {
+    const oldest = searchableItemCache.keys().next().value as object | undefined;
+    if (oldest === undefined) break;
+    removeCachedSearchableItem(oldest);
+  }
+  searchableItemCache.set(item, { revision, text, textBytes });
+  searchableItemCacheTextBytes += textBytes;
+};
 
 const searchableText = (
   value: unknown,
@@ -140,6 +179,7 @@ const searchableItemContent = (item: ThreadChatItem): unknown => {
         item.tool,
         item.args,
         item.result,
+        item.output.omitted ? TOOL_OUTPUT_OMITTED_MESSAGE : undefined,
         item.output.text,
         item.status,
         item.durationMs,
@@ -165,11 +205,14 @@ const searchableItemContent = (item: ThreadChatItem): unknown => {
     }
     case "questions":
       return [
-        item.title,
+        item.title ?? "Questions",
         item.questions.map((question) => [
           question.prompt,
           question.options.map((option) => option.label),
         ]),
+        item.answers === null
+          ? [QUESTION_SKIPPED_STATUS, QUESTION_SKIPPED_MESSAGE]
+          : item.answers === undefined ? [] : ["Answered"],
         item.answers?.map((answer) => answer.other_text) ?? [],
       ];
   }
@@ -192,7 +235,15 @@ const searchableItemRevision = (item: ThreadChatItem): readonly unknown[] => {
     case "todo":
       return [item.content, item.state];
     case "tool":
-      return [item.tool, item.args, item.result, item.output.text, item.status, item.durationMs];
+      return [
+        item.tool,
+        item.args,
+        item.result,
+        item.output.text,
+        item.output.omitted,
+        item.status,
+        item.durationMs,
+      ];
     case "questions":
       return [item.title, item.questions, item.answers];
   }
@@ -204,6 +255,13 @@ const sameRevision = (left: readonly unknown[], right: readonly unknown[]): bool
 const searchableItemState = (item: ThreadChatItem): SearchableItemState => {
   const revision = searchableItemRevision(item);
   const cached = searchableItemCache.get(item);
+  if (cached !== undefined && !sameRevision(cached.revision, revision)) {
+    removeCachedSearchableItem(item);
+  } else if (cached !== undefined) {
+    // Refresh the insertion order so eviction is least-recently-used.
+    searchableItemCache.delete(item);
+    searchableItemCache.set(item, cached);
+  }
   return {
     revision,
     cachedText: cached !== undefined && sameRevision(cached.revision, revision)
@@ -228,7 +286,7 @@ const searchableItemText = (
   const itemBudget = { remainingNodes: allowance };
   const { text, complete } = searchableText(searchableItemContent(item), itemBudget);
   budget.remainingNodes -= allowance - itemBudget.remainingNodes;
-  if (complete) searchableItemCache.set(item, { revision: state.revision, text });
+  if (complete) cacheSearchableItem(item, state.revision, text);
   return { text, complete };
 };
 

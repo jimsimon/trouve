@@ -140,6 +140,8 @@ import {
   normalizeQuestionWizard,
   OTHER_OPTION_ID,
   pendingQuestionSummary,
+  QUESTION_SKIPPED_MESSAGE,
+  QUESTION_SKIPPED_STATUS,
   questionWizardAnswers,
   resolvedQuestionSummary,
   retreatQuestionWizard,
@@ -1133,6 +1135,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #scheduleChatFindRefresh(resetActive: boolean, reveal: boolean): void {
     if (!this.#chatFindOpen || this.threadId === "") return;
+    // Find owns the complete-history paging loop. Reconcile once after it
+    // finishes instead of rescanning the growing transcript after every page.
+    if (this.#chatFindHistoryLoading) return;
     const key = this.#chatFindRevisionKey();
     if (!resetActive && key === this.#chatFindRefreshKey) return;
     this.#chatFindRefreshKey = key;
@@ -1147,6 +1152,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         || this.threadId !== threadId
         || this.#chatFindRevisionKey() !== key
       ) return;
+      if (this.#chatFindHistoryLoading) {
+        this.#chatFindRefreshKey = "";
+        return;
+      }
       const view = this.#store.value?.threadView(threadId);
       if (view?.snapshotLoaded !== true) {
         // Keep the restored active unit until the folded snapshot is ready.
@@ -1787,6 +1796,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               <span class="chat-find-count" role="status" aria-live="polite">${
                 this.#chatFindQuery === ""
                   ? ""
+                  : this.#chatFindHistoryLoading
+                    ? "Searching history…"
                   : this.#chatFindUnitIds.length === 0
                     ? this.#chatFindIncomplete ? "No matches (partial search)" : "No matches"
                     : `${this.#chatFindActiveIndex + 1} of ${this.#chatFindUnitIds.length}${
@@ -4854,10 +4865,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             >
               <header>
                 <strong>${item.title ?? "Questions"}</strong>
-                <span>${item.answers === null ? "Skipped" : "Answered"}</span>
+                <span>${item.answers === null ? QUESTION_SKIPPED_STATUS : "Answered"}</span>
               </header>
               ${item.answers === null
-                ? html`<p class="resolved-label">The questions were skipped.</p>`
+                ? html`<p class="resolved-label">${QUESTION_SKIPPED_MESSAGE}</p>`
                 : this.#renderQuestionSummary(summary)}
             </section>
           `;
