@@ -1573,15 +1573,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           ?disabled=${this.sessionId === "" || newThreadSetupOpen || this.#newThreadBusy}
           @click=${this.openNewThreadSetup}
         >${fontAwesomeIcon("plus")}</button>
-        <button
-          class="chat-find-toggle"
-          type="button"
-          aria-label="Find in chat"
-          title="Find in chat (Ctrl+F)"
-          aria-expanded=${this.#chatFindOpen ? "true" : "false"}
-          ?disabled=${this.threadId === "" || newThreadSetupOpen}
-          @click=${this.#openChatFind}
-        >${fontAwesomeIcon("magnifying-glass")}</button>
         <div class="thread-switcher">
           <button
             class="thread-switcher-toggle"
@@ -1686,6 +1677,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               `
             : nothing}
         </div>
+        <button
+          class="chat-find-toggle"
+          type="button"
+          aria-label="Find in chat"
+          title="Find in chat (Ctrl+F)"
+          aria-expanded=${this.#chatFindOpen ? "true" : "false"}
+          ?disabled=${this.threadId === "" || newThreadSetupOpen}
+          @click=${this.#openChatFind}
+        >${fontAwesomeIcon("magnifying-glass")}</button>
         ${this.#chatFindOpen
           ? html`<div class="chat-find-bar" role="search" aria-label="Find in chat">
               ${fontAwesomeIcon("magnifying-glass", { className: "chat-find-icon" })}

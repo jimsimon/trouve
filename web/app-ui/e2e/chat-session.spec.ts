@@ -4790,6 +4790,48 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   expect(olderBoundaries).toHaveLength(requestedBoundaries.length);
 });
 
+test("find defaults to insensitive matching and restores separate thread state", async ({ page }) => {
+  await installProtocolFixtures(page, { additionalThreads: [{
+    id: "th_find_second",
+    session_id: "se_1",
+    title: "Second find thread",
+    mode: "code",
+    model: "test/second",
+    model_options: {},
+    permission_mode: "ask",
+    created_at: "2026-08-05T08:00:00Z",
+  }] });
+  await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture");
+  await replayHistory(page);
+
+  await page.keyboard.press("Control+f");
+  let find = page.getByRole("search", { name: "Find in chat" });
+  const matchCase = find.getByRole("button", { name: "Match case" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" })).toBeFocused();
+  await expect(matchCase).toHaveAttribute("aria-pressed", "false");
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("build");
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+  await matchCase.click();
+  await expect(find.getByRole("status")).toHaveText("No matches");
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("Build");
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+  await expect(page.locator(".chat-find-active")).toHaveCount(1);
+
+  await page.getByRole("tab", { name: "Second find thread", exact: true }).click();
+  await expect(find).toHaveCount(0);
+  await page.keyboard.press("Control+f");
+  find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("second-only");
+  await expect(find.getByRole("status")).toHaveText("No matches");
+
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
+  find = page.getByRole("search", { name: "Find in chat" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" })).toHaveValue("Build");
+  await expect(find.getByRole("button", { name: "Match case" }))
+    .toHaveAttribute("aria-pressed", "true");
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+});
+
 test("find retries a failed history page and discovers its older match", async ({ page }) => {
   const historyPage = (start: number, content: string, hasOlder: boolean) => ({
     item_offset: start,
