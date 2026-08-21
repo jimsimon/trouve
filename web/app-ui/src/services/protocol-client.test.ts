@@ -303,6 +303,7 @@ describe("ProtocolClient", () => {
 
   it("loads a bounded folded thread view with its exact stream cursor", async () => {
     const requests: Request[] = [];
+    const abort = new AbortController();
     const snapshot = {
       item_offset: 256,
       total_items: 512,
@@ -326,7 +327,7 @@ describe("ProtocolClient", () => {
       }),
     });
 
-    await expect(client.threadView("th/folded", 512)).resolves.toEqual({
+    await expect(client.threadView("th/folded", 512, { signal: abort.signal })).resolves.toEqual({
       cursor: 91,
       value: snapshot,
     });
@@ -335,6 +336,8 @@ describe("ProtocolClient", () => {
     expect(url.searchParams.get("limit")).toBe("256");
     expect(url.searchParams.get("turn_aligned")).toBe("true");
     expect(url.searchParams.get("before")).toBe("512");
+    abort.abort();
+    expect(requests[0]!.signal.aborted).toBe(true);
   });
 
   it("loads full details for one deferred historical tool call", async () => {

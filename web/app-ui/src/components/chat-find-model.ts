@@ -9,6 +9,13 @@ export interface ChatFindResult {
 const SEARCH_TEXT_LIMIT = 512 * 1024;
 const SEARCH_NODE_LIMIT = 20_000;
 
+interface CachedSearchableItem {
+  readonly revision: readonly unknown[];
+  readonly text: string;
+}
+
+const searchableItemCache = new WeakMap<object, CachedSearchableItem>();
+
 const searchableText = (value: unknown): string => {
   const parts: string[] = [];
   const seen = new Set<object>();
@@ -124,6 +131,60 @@ const searchableItemContent = (item: ThreadChatItem): unknown => {
   }
 };
 
+const searchableItemRevision = (item: ThreadChatItem): readonly unknown[] => {
+  switch (item.kind) {
+    case "user":
+    case "steered":
+      return [item.content, item.attachments];
+    case "assistant":
+    case "progress":
+    case "thinking":
+      return [item.content];
+    case "subagent":
+      return [item.prompt, item.model];
+    case "compaction":
+    case "turn-status":
+      return [item.state];
+    case "todo":
+      return [item.content, item.state];
+    case "tool":
+      return [item.tool, item.args, item.result, item.output.text, item.status, item.durationMs];
+    case "questions":
+      return [item.title, item.questions, item.answers];
+  }
+};
+
+const sameRevision = (left: readonly unknown[], right: readonly unknown[]): boolean =>
+  left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
+
+const searchableItemText = (item: ThreadChatItem): string => {
+  const revision = searchableItemRevision(item);
+  const cached = searchableItemCache.get(item);
+  if (cached !== undefined && sameRevision(cached.revision, revision)) return cached.text;
+  const text = searchableText(searchableItemContent(item));
+  searchableItemCache.set(item, { revision, text });
+  return text;
+};
+
+const searchableUnitText = (
+  prompt: ThreadChatItem | undefined,
+  items: readonly ThreadChatItem[],
+  status: ThreadChatItem | undefined,
+): string => {
+  const parts: string[] = [];
+  let length = 0;
+  const append = (item: ThreadChatItem | undefined): void => {
+    if (item === undefined || length >= SEARCH_TEXT_LIMIT) return;
+    const text = searchableItemText(item).slice(0, SEARCH_TEXT_LIMIT - length);
+    parts.push(text);
+    length += text.length + 1;
+  };
+  append(prompt);
+  for (const item of items) append(item);
+  append(status);
+  return parts.join("\n");
+};
+
 /** Literal, per-turn transcript matches in display order. */
 export const chatFindUnitIds = (
   items: readonly ThreadChatItem[],
@@ -136,11 +197,7 @@ export const chatFindUnitIds = (
   return Object.freeze(
     buildChatLayout(items).units
       .filter((unit) => {
-        const text = searchableText([
-          unit.prompt === undefined ? undefined : searchableItemContent(unit.prompt),
-          ...unit.items.map(searchableItemContent),
-          unit.status === undefined ? undefined : searchableItemContent(unit.status),
-        ]);
+        const text = searchableUnitText(unit.prompt, unit.items, unit.status);
         return (caseSensitive ? text : text.toLowerCase()).includes(expected);
       })
       .map((unit) => unit.id),

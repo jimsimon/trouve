@@ -4821,6 +4821,13 @@ test("find defaults to insensitive matching and restores separate thread state",
   await page.keyboard.press("Control+f");
   let find = page.getByRole("search", { name: "Find in chat" });
   const matchCase = find.getByRole("button", { name: "Match case" });
+  if ((page.viewportSize()?.width ?? 1_280) <= 760) {
+    for (const label of ["Match case", "Previous match", "Next match", "Close find"]) {
+      const bounds = await find.getByRole("button", { name: label }).boundingBox();
+      expect(bounds?.width ?? 0).toBeGreaterThanOrEqual(44);
+      expect(bounds?.height ?? 0).toBeGreaterThanOrEqual(44);
+    }
+  }
   await expect(find.getByRole("searchbox", { name: "Search this chat" })).toBeFocused();
   await expect(matchCase).toHaveAttribute("aria-pressed", "false");
   await find.getByRole("searchbox", { name: "Search this chat" }).fill("build");
@@ -5019,7 +5026,7 @@ test("find cancels history paging and resumes it when restored", async ({ page }
   });
   let olderRequests = 0;
   let olderResponses = 0;
-  const olderBoundaries: number[] = [];
+  const requestsByBoundary = new Map<number, number>();
   let releaseFirstPage = (): void => {};
   let releaseSecondPage = (): void => {};
   const firstPageReleased = new Promise<void>((resolve) => {
@@ -5044,14 +5051,15 @@ test("find cancels history paging and resumes it when restored", async ({ page }
         return { snapshot: historyPage(3, "Recent prompt", true) };
       }
       olderRequests += 1;
-      olderBoundaries.push(before);
+      const boundaryAttempt = (requestsByBoundary.get(before) ?? 0) + 1;
+      requestsByBoundary.set(before, boundaryAttempt);
       if (before === 3) {
-        if (olderRequests === 1) await firstPageReleased;
+        if (boundaryAttempt === 1) await firstPageReleased;
         olderResponses += 1;
         return { snapshot: historyPage(2, "Later middle prompt", true) };
       }
       if (before === 2) {
-        if (olderRequests === 2) await secondPageReleased;
+        if (boundaryAttempt === 1) await secondPageReleased;
         olderResponses += 1;
         return { snapshot: historyPage(1, "Earlier middle prompt", true) };
       }
@@ -5070,24 +5078,79 @@ test("find cancels history paging and resumes it when restored", async ({ page }
   await find.getByRole("searchbox", { name: "Search this chat" }).fill("restored-only needle");
   await expect.poll(() => olderRequests).toBe(1);
   await find.getByRole("button", { name: "Close find" }).click();
-  releaseFirstPage();
-  await expect.poll(() => olderResponses).toBe(1);
-  await page.waitForTimeout(200);
-  expect(olderBoundaries).toEqual([3]);
-
   await page.keyboard.press("Control+f");
-  await expect.poll(() => olderRequests).toBe(2);
+  await expect.poll(() => requestsByBoundary.get(3)).toBe(2);
+  await expect.poll(() => requestsByBoundary.get(2)).toBe(1);
+  releaseFirstPage();
+  await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(2);
   await page.getByRole("tab", { name: "Restore second thread", exact: true }).click();
   await expect(find).toHaveCount(0);
   releaseSecondPage();
-  await expect.poll(() => olderResponses).toBe(2);
+  await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(3);
+  expect(requestsByBoundary.get(1) ?? 0).toBe(0);
 
   await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
   find = page.getByRole("search", { name: "Find in chat" });
   await expect(find.getByRole("searchbox", { name: "Search this chat" }))
     .toHaveValue("restored-only needle");
-  await expect.poll(() => olderRequests).toBe(4);
+  await expect.poll(() => requestsByBoundary.get(2)).toBe(2);
+  await expect.poll(() => requestsByBoundary.get(1)).toBe(1);
   await expect(find.getByRole("status")).toHaveText("1 of 1");
+});
+
+test("find waits for a query and stops paging when it is cleared", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis, "IntersectionObserver", {
+      configurable: true,
+      value: class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    });
+  });
+  const historyPage = (start: number, content: string, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 3,
+    has_older: hasOlder,
+    items: [{
+      kind: "user",
+      turn: 1_000 + start,
+      content,
+      attachments: [],
+    }],
+  });
+  let olderRequests = 0;
+  let olderResponses = 0;
+  let releaseOlderPage = (): void => {};
+  const olderPageReleased = new Promise<void>((resolve) => {
+    releaseOlderPage = resolve;
+  });
+  await installProtocolFixtures(page, { threadViewFixture: async (before) => {
+    if (before === undefined) return { snapshot: historyPage(2, "Recent prompt", true) };
+    olderRequests += 1;
+    if (before === 2) {
+      await olderPageReleased;
+      olderResponses += 1;
+      return { snapshot: historyPage(1, "Middle prompt", true) };
+    }
+    if (before === 1) return { snapshot: historyPage(0, "Oldest needle", false) };
+    throw new Error(`unexpected history boundary ${before}`);
+  } });
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.getByRole("button", { name: "Find in chat" }).click();
+  const find = page.getByRole("search", { name: "Find in chat" });
+  await page.waitForTimeout(200);
+  expect(olderRequests).toBe(0);
+  const input = find.getByRole("searchbox", { name: "Search this chat" });
+  await input.fill("oldest needle");
+  await expect.poll(() => olderRequests).toBe(1);
+  await input.fill("");
+  releaseOlderPage();
+  await expect.poll(() => olderResponses).toBe(1);
+  await page.waitForTimeout(200);
+  expect(olderRequests).toBe(1);
 });
 
 test("find retries a failed history page and discovers its older match", async ({ page }) => {

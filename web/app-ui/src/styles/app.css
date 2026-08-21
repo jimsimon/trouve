@@ -1172,6 +1172,11 @@ trouve-command-palette { display: contents; }
   .thread-tab-item { height: 42px; }
   .thread-tab-item > .thread-tab-close { inset-block: 10px; }
   .thread-tab-header > .new-thread-tab, .thread-tab-header > .chat-find-toggle, .thread-switcher-toggle { height: 42px; }
+  .chat-find-bar { gap: 2px; }
+  .chat-find-icon { display: none; }
+  .chat-find-input { height: 44px; min-width: 0; }
+  .chat-find-bar button, .chat-find-bar .chat-find-case { width: 44px; height: 44px; }
+  .chat-find-count { min-width: 34px; }
   .thread-switcher-toggle { width: 30px; justify-content: center; padding-inline: 0; }
   .thread-switcher-toggle-label { display: none; }
   .thread-switcher-total { display: none; }

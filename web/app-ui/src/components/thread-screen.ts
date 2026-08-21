@@ -517,6 +517,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #chatFindRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #chatFindLoadGeneration = 0;
   #chatFindHistoryLoading = false;
+  #chatFindHistoryAbort: AbortController | undefined;
   readonly #chatFindByThread = new Map<string, StoredChatFindState>();
 
   readonly #services = new ContextConsumer(this, {
@@ -941,8 +942,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#clearHistoryStatusTimer();
     this.#clearHistoryRetryTimer();
     this.#clearChatFindRefresh();
-    this.#chatFindLoadGeneration += 1;
-    this.#chatFindHistoryLoading = false;
+    this.#cancelChatFindHistoryLoading();
     this.#cancelHistoryAnchorCorrection();
     this.#parkedLayoutAnchor = undefined;
     this.#scrollIndicatorMetrics = undefined;
@@ -972,10 +972,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #activeChatFindUnitId(): string | undefined {
-    return (this.#chatFindActiveIndex < 0
+    return this.#chatFindRestoredActiveUnitId ?? (this.#chatFindActiveIndex < 0
       ? undefined
-      : this.#chatFindUnitIds[this.#chatFindActiveIndex])
-      ?? this.#chatFindRestoredActiveUnitId;
+      : this.#chatFindUnitIds[this.#chatFindActiveIndex]);
   }
 
   #saveChatFindState(threadId = this.threadId, clearActive = false): void {
@@ -990,8 +989,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #restoreChatFindState(threadId: string): void {
     this.#clearChatFindRefresh();
-    this.#chatFindLoadGeneration += 1;
-    this.#chatFindHistoryLoading = false;
+    this.#cancelChatFindHistoryLoading();
     const state = this.#chatFindByThread.get(threadId);
     this.#chatFindOpen = state?.open ?? false;
     this.#chatFindQuery = state?.query ?? "";
@@ -1006,6 +1004,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (this.#chatFindRefreshTimer === undefined) return;
     clearTimeout(this.#chatFindRefreshTimer);
     this.#chatFindRefreshTimer = undefined;
+  }
+
+  #cancelChatFindHistoryLoading(): void {
+    this.#chatFindLoadGeneration += 1;
+    this.#chatFindHistoryAbort?.abort();
+    this.#chatFindHistoryAbort = undefined;
+    this.#chatFindHistoryLoading = false;
   }
 
   readonly #chatFindGlobalKeydown = (event: KeyboardEvent): void => {
@@ -1052,13 +1057,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       input?.focus();
       input?.select();
     });
-    void this.#loadAllHistoryForFind();
+    this.#ensureChatFindHistoryLoading();
   };
 
   #closeChatFind(): void {
     this.#chatFindOpen = false;
-    this.#chatFindLoadGeneration += 1;
-    this.#chatFindHistoryLoading = false;
+    this.#cancelChatFindHistoryLoading();
     this.#clearChatFindRefresh();
     this.#saveChatFindState();
     this.requestUpdate();
@@ -1069,6 +1073,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   readonly #chatFindChanged = (event: InputEvent): void => {
     this.#chatFindQuery = (event.currentTarget as HTMLInputElement).value;
+    if (this.#chatFindQuery.trim() === "") {
+      this.#cancelChatFindHistoryLoading();
+    }
     this.#chatFindUnitIds = [];
     this.#chatFindActiveIndex = -1;
     this.#chatFindRestoredActiveUnitId = undefined;
@@ -1076,6 +1083,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#scheduleChatFindRefresh(true, true);
     this.#saveChatFindState(this.threadId, true);
     this.requestUpdate();
+    this.#ensureChatFindHistoryLoading();
   };
 
   readonly #toggleChatFindCase = (): void => {
@@ -1096,6 +1104,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   };
 
   #stepChatFind(delta: number): void {
+    this.#chatFindRestoredActiveUnitId = undefined;
     this.#chatFindActiveIndex = stepChatFindIndex(
       this.#chatFindUnitIds.length,
       this.#chatFindActiveIndex,
@@ -1148,7 +1157,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       );
       this.#chatFindUnitIds = reconciled.unitIds;
       this.#chatFindActiveIndex = reconciled.activeIndex;
-      this.#chatFindRestoredActiveUnitId = undefined;
+      const restoredActiveUnitId = this.#chatFindRestoredActiveUnitId;
+      const restorationPending = restoredActiveUnitId !== undefined
+        && !reconciled.unitIds.includes(restoredActiveUnitId)
+        && view.hasOlder
+        && view.itemOffset > 0
+        && this.#chatFindQuery.trim() !== "";
+      this.#chatFindRestoredActiveUnitId = restorationPending
+        ? restoredActiveUnitId
+        : undefined;
       this.#saveChatFindState(threadId);
       this.requestUpdate();
       if (reveal) void this.updateComplete.then(() => this.#revealActiveChatFind());
@@ -1174,6 +1191,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (
       !this.#chatFindOpen
       || this.#chatFindHistoryLoading
+      || this.#chatFindQuery.trim() === ""
       || this.threadId === ""
       || this.#historyError !== ""
     ) return;
@@ -1184,14 +1202,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   async #loadAllHistoryForFind(): Promise<void> {
-    if (this.#chatFindHistoryLoading) return;
+    if (this.#chatFindHistoryLoading || this.#chatFindQuery.trim() === "") return;
     const generation = ++this.#chatFindLoadGeneration;
     const threadId = this.threadId;
+    const abort = new AbortController();
+    this.#chatFindHistoryAbort = abort;
     this.#chatFindHistoryLoading = true;
     try {
       while (
         this.isConnected
         && this.#chatFindOpen
+        && this.#chatFindQuery.trim() !== ""
+        && !abort.signal.aborted
         && this.threadId === threadId
         && generation === this.#chatFindLoadGeneration
       ) {
@@ -1202,12 +1224,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           continue;
         }
         const before = view.itemOffset;
-        await this.#loadOlderHistory(false);
+        await this.#loadOlderHistory(false, abort.signal);
         const after = this.#store.value?.threadView(threadId)?.itemOffset ?? before;
         if (after >= before) break;
       }
     } finally {
       if (generation === this.#chatFindLoadGeneration) {
+        this.#chatFindHistoryAbort = undefined;
         this.#chatFindHistoryLoading = false;
         if (this.#chatFindOpen && this.threadId === threadId) {
           this.#chatFindRefreshKey = "";
@@ -4482,7 +4505,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       if (generation !== this.#historyGeneration || !this.isConnected) return;
       this.#historyError = "";
       this.requestUpdate();
-      if (this.#chatFindOpen) void this.#loadAllHistoryForFind();
+      this.#ensureChatFindHistoryLoading();
     }, CHAT_HISTORY_RETRY_DELAY_MS);
   }
 
@@ -4505,7 +4528,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }));
   }
 
-  async #loadOlderHistory(loadAll: boolean): Promise<void> {
+  async #loadOlderHistory(loadAll: boolean, signal?: AbortSignal): Promise<void> {
     if (this.#historyLoading || this.threadId === "") return;
     const store = this.#store.value;
     const services = this.#services.value;
@@ -4527,7 +4550,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       do {
         const view = store.threadView(threadId);
         if (!view.hasOlder || view.itemOffset === 0) break;
-        const page = await services.protocol.threadView(threadId, view.itemOffset);
+        const page = await services.protocol.threadView(
+          threadId,
+          view.itemOffset,
+          signal === undefined ? {} : { signal },
+        );
         if (!this.#isCurrentHistoryRequest(sessionId, threadId, generation)) return;
         const virtualWindow = this.#virtualizer.window();
         const viewport = this.querySelector<HTMLElement>(".chat-stream");
@@ -4542,7 +4569,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
       } while (loadAll);
     } catch {
-      if (this.#isCurrentHistoryRequest(sessionId, threadId, generation)) {
+      if (!signal?.aborted && this.#isCurrentHistoryRequest(sessionId, threadId, generation)) {
         this.#historyError = "Earlier messages could not be loaded.";
         this.#scheduleHistoryRetry();
       }
