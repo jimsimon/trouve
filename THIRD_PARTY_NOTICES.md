@@ -524,6 +524,7 @@ The Lit frontend's npm inventory is generated separately in
 | security-framework | 3.7.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | security-framework-sys | 2.17.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | selectors | 0.38.0 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| self-replace | 1.5.0 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | semver | 1.0.28 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde | 1.0.229 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -678,6 +679,7 @@ The Lit frontend's npm inventory is generated separately in
 | tree_magic_mini | 3.2.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | try-lock | 0.2.5 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | ttf-parser | 0.25.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| typed-path | 0.12.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | uds_windows | 1.2.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | unarray | 0.1.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -821,6 +823,7 @@ The Lit frontend's npm inventory is generated separately in
 | zerotrie | 0.2.4 | Unicode-3.0 | registry+https://github.com/rust-lang/crates.io-index |
 | zerovec | 0.11.6 | Unicode-3.0 | registry+https://github.com/rust-lang/crates.io-index |
 | zerovec-derive | 0.11.3 | Unicode-3.0 | registry+https://github.com/rust-lang/crates.io-index |
+| zip | 8.6.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | zmij | 1.0.23 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | zune-core | 0.5.1 | MIT OR Apache-2.0 OR Zlib | registry+https://github.com/rust-lang/crates.io-index |
 | zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | registry+https://github.com/rust-lang/crates.io-index |
