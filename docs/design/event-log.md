@@ -152,6 +152,9 @@ Thread scope:
   (live current-context replacement without ending the turn) /
   `turn.completed` `{turn, usage, checkpoint_id?}` / `turn.failed`
   `{turn, error}`
+- `turn.phase_changed` `{turn, phase}` — replaces the transient activity
+  label for the running turn (for example, `connecting_tools`); it does not
+  add a transcript or tool-rail item
 - `user.message` `{turn, content}`
 - `subagent.spawned` `{turn, thread_id, session_id, prompt, model, call_id?}` —
   a separately navigable child-agent transcript was attached to the parent

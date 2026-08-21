@@ -224,6 +224,22 @@ describe("ProtocolClient", () => {
     expect(String(error)).toContain("Re-authenticate GitHub");
   });
 
+  it("bounds structured pull-request error fields", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () => Response.json({
+      code: "c".repeat(700),
+      message: `  ${"m".repeat(700)}  `,
+    }, { status: 400 }));
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+    const error = await client.sessionPrDetail("se_1", 42).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect((error as ProtocolClientError).status).toBe(400);
+    expect((error as ProtocolClientError).code).toHaveLength(512);
+    expect((error as ProtocolClientError).message).toHaveLength(512);
+  });
+
   it("rejects malformed lazy pull-request file content without exposing it", async () => {
     const fakeFetch = vi.fn<typeof fetch>(async () => Response.json({
       path: "secret.txt",
@@ -1019,11 +1035,11 @@ describe("ProtocolClient", () => {
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.7")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.8")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.8", "7.7.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.9", "7.8.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

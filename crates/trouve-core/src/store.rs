@@ -2147,6 +2147,7 @@ fn project_session_summary(
             thread_id,
         } => (session_id.clone(), Some(thread_id.clone())),
         Event::TurnStarted { .. }
+        | Event::TurnPhaseChanged { .. }
         | Event::TurnCompleted { .. }
         | Event::TurnFailed { .. }
         | Event::TurnCancelled { .. }
@@ -2437,6 +2438,7 @@ fn project_thread_status(
     let thread_id = match event {
         Event::ThreadCreated { thread_id, .. } => thread_id.clone(),
         Event::TurnStarted { .. }
+        | Event::TurnPhaseChanged { .. }
         | Event::TurnCompleted { .. }
         | Event::TurnFailed { .. }
         | Event::TurnCancelled { .. }
@@ -4054,6 +4056,7 @@ enum StoreMutation {
         id: String,
         title: Option<String>,
         archived: Option<bool>,
+        expected_title: Option<String>,
     },
     UpdateThread {
         id: String,
@@ -4448,14 +4451,18 @@ fn update_session_row(
     id: &str,
     title: Option<&str>,
     archived: Option<bool>,
+    expected_title: Option<&str>,
 ) -> Result<()> {
     let updated = conn.execute(
         "UPDATE sessions
          SET title = COALESCE(?2, title), archived = COALESCE(?3, archived)
-         WHERE id = ?1",
-        params![id, title, archived],
+         WHERE id = ?1 AND (?4 IS NULL OR title = ?4)",
+        params![id, title, archived, expected_title],
     )?;
-    anyhow::ensure!(updated == 1, "session {id} no longer exists");
+    anyhow::ensure!(
+        updated == 1,
+        "session {id} no longer exists or its title no longer matches"
+    );
     Ok(())
 }
 
@@ -4574,7 +4581,14 @@ fn apply_store_mutation(
             id,
             title,
             archived,
-        } => update_session_row(conn, id, title.as_deref(), *archived)?,
+            expected_title,
+        } => update_session_row(
+            conn,
+            id,
+            title.as_deref(),
+            *archived,
+            expected_title.as_deref(),
+        )?,
         StoreMutation::UpdateThread {
             id,
             mode,
@@ -6331,14 +6345,14 @@ impl Store {
         Ok(out)
     }
 
-    /// Rename and/or (un)archive a session. `None` fields are unchanged.
+    /// Rename and/or (un)archive a session. None fields are unchanged.
     pub fn update_session(
         &self,
         id: &str,
         title: Option<&str>,
         archived: Option<bool>,
     ) -> Result<()> {
-        update_session_row(&self.conn.lock().unwrap(), id, title, archived)
+        update_session_row(&self.conn.lock().unwrap(), id, title, archived, None)
     }
 
     /// Rename/archive and append the lifecycle source event atomically.
@@ -6347,6 +6361,7 @@ impl Store {
         id: &str,
         title: Option<&str>,
         archived: Option<bool>,
+        expected_title: Option<&str>,
         event: Event,
     ) -> Result<EventEnvelope> {
         let pending = serialize_lifecycle_events(
@@ -6355,6 +6370,7 @@ impl Store {
                 id: id.to_string(),
                 title: title.map(str::to_owned),
                 archived,
+                expected_title: expected_title.map(str::to_owned),
             },
         )?;
         Ok(self
@@ -14597,6 +14613,7 @@ mod tests {
                 "se_q",
                 None,
                 Some(true),
+                None,
                 Event::SessionUpdated {
                     session_id: "se_q".into(),
                     workspace_id: "ws_q".into(),

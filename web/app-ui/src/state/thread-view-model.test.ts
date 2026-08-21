@@ -17,6 +17,32 @@ const envelope = (
   ({ cursor, scope: { thread: "th_1" }, ts, ...event }) as ProtocolEventEnvelope;
 
 describe("ThreadViewModel", () => {
+  it("updates a running turn phase without adding transcript items", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.started",
+      turn: 4,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    expect(vm.turnPhase).toBe("processing");
+    expect(vm.items).toHaveLength(1);
+
+    vm.apply(envelope(2, {
+      type: "turn.phase_changed",
+      turn: 4,
+      phase: "connecting_tools",
+    }));
+    expect(vm.turnPhase).toBe("connecting_tools");
+    expect(vm.items).toHaveLength(1);
+
+    vm.apply(envelope(3, {
+      type: "turn.cancelled",
+      turn: 4,
+    }));
+    expect(vm.turnPhase).toBeUndefined();
+  });
+
   it("distinguishes scheduler waiting from an actively running provider turn", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
@@ -476,6 +502,34 @@ describe("ThreadViewModel", () => {
       text: "The streams have different semantics.",
     }));
     view.apply(envelope(4, { type: "assistant.thinking_completed", turn: 2 }));
+
+    expect(view.items).toEqual([
+      expect.objectContaining({
+        kind: "progress",
+        content: "Checking the adapter.",
+        complete: true,
+      }),
+      expect.objectContaining({
+        kind: "thinking",
+        content: "The streams have different semantics.",
+        complete: true,
+      }),
+    ]);
+  });
+
+  it("closes authored progress automatically when reasoning starts", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "assistant.progress",
+      turn: 2,
+      text: "Checking the adapter.",
+    }));
+    view.apply(envelope(2, {
+      type: "assistant.thinking",
+      turn: 2,
+      text: "The streams have different semantics.",
+    }));
+    view.apply(envelope(3, { type: "assistant.thinking_completed", turn: 2 }));
 
     expect(view.items).toEqual([
       expect.objectContaining({

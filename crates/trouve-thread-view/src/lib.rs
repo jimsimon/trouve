@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use trouve_protocol::{
     ApprovalDecision, Event, EventEnvelope, ThreadCompactionState, ThreadTodoState,
     ThreadToolStatus, ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, TodoItem, TodoStatus,
-    ToolStatus, Usage,
+    ToolStatus, TurnPhase, Usage,
 };
 
 fn accumulate_live_usage(total: &mut Option<Usage>, latest: &Usage) {
@@ -118,6 +118,7 @@ impl ThreadProjection {
             } => {
                 self.snapshot.turn_running = true;
                 self.snapshot.active_usage = None;
+                self.snapshot.turn_phase = Some(TurnPhase::Processing);
                 self.snapshot.turn_models.insert(*turn, model.clone());
                 if let Some(thinking_level) = thinking_level {
                     self.snapshot
@@ -135,6 +136,9 @@ impl ThreadProjection {
                 };
                 let idx = self.push_turn_start(ThreadViewItem::TurnStatus { turn: *turn, state });
                 self.indexes.turns.insert(*turn, idx);
+            }
+            Event::TurnPhaseChanged { phase, .. } => {
+                self.snapshot.turn_phase = Some(*phase);
             }
             Event::CompactionStarted { turn } => {
                 self.snapshot.compacting = true;
@@ -631,6 +635,7 @@ impl ThreadProjection {
     fn finish_turn(&mut self, turn: u64, ended: chrono::DateTime<chrono::Utc>) {
         self.capacity_acquired_before_start.remove(&turn);
         self.snapshot.turn_running = false;
+        self.snapshot.turn_phase = None;
         self.fail_open_compaction(turn);
         self.finish_progress(turn);
         self.finish_thinking();
@@ -869,6 +874,39 @@ mod tests {
                 state: ThreadTurnState::Running,
             })
         ));
+    }
+
+    #[test]
+    fn turn_phase_tracks_start_update_and_cancellation() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "m".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        assert_eq!(projection.snapshot.turn_phase, Some(TurnPhase::Processing));
+
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::TurnPhaseChanged {
+                turn: 1,
+                phase: TurnPhase::ConnectingTools,
+            },
+        ));
+        assert_eq!(
+            projection.snapshot.turn_phase,
+            Some(TurnPhase::ConnectingTools)
+        );
+
+        projection.apply(&envelope(3, 2, Event::TurnCancelled { turn: 1 }));
+        assert_eq!(projection.snapshot.turn_phase, None);
     }
 
     #[test]

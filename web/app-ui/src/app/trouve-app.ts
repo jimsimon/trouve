@@ -1889,6 +1889,30 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
   }
 
+  /** Upgrade a prompt-derived title without delaying session creation or the
+   * first turn. A manual rename made while generation is in flight wins. */
+  #upgradeSessionTitleInBackground(
+    sessionId: string,
+    provisionalTitle: string,
+    prompt: string,
+  ): void {
+    void (async () => {
+      try {
+        const generated = await this.#generateSessionTitle(prompt);
+        const title = generated.title.trim();
+        if (title === "" || title === provisionalTitle) return;
+        if (this.#store.sessionMetadata(sessionId)?.title !== provisionalTitle) return;
+        const session = await this.#protocolClient.updateSession(sessionId, {
+          title,
+          expected_title: provisionalTitle,
+        });
+        this.#store.upsertSessionMetadata(session);
+      } catch {
+        // Naming is cosmetic; the deterministic provisional title remains.
+      }
+    })();
+  }
+
   readonly #selectNewSessionWorkspace = (event: Event): void => {
     const workspaceId = (event.currentTarget as HTMLSelectElement).value;
     this.#newSessionWorkspaceId = workspaceId;
@@ -2136,13 +2160,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionError = "";
     this.requestUpdate();
 
-    let title = sessionTitleFallback(prompt);
-    try {
-      const generated = await this.#generateSessionTitle(prompt);
-      if (generated.title.trim() !== "") title = generated.title.trim();
-    } catch {
-      this.#shellNotice = "The session title service was unavailable; a prompt-based title was used.";
-    }
+    const title = sessionTitleFallback(prompt);
 
     let session;
     try {
@@ -2160,6 +2178,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
 
     this.#store.upsertSessionMetadata(session);
+    this.#upgradeSessionTitleInBackground(session.id, title, prompt);
     let threadId: string | undefined;
     try {
       const thread = await this.#protocolClient.createThread(
@@ -2260,13 +2279,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     let createdSession: Awaited<ReturnType<ProtocolClient["createSession"]>> | undefined;
     try {
       if (sessionId === undefined) {
-        let title = sessionTitleFallback(detail.prompt);
-        try {
-          const generated = await this.#generateSessionTitle(detail.prompt);
-          if (generated.title.trim() !== "") title = generated.title.trim();
-        } catch {
-          // A bounded prompt-based title is already available.
-        }
+        const title = sessionTitleFallback(detail.prompt);
         createdSession = await this.#protocolClient.createSession({
           workspace_id: detail.workspaceId,
           title,
@@ -2274,6 +2287,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           fetch_latest: true,
         });
         this.#store.upsertSessionMetadata(createdSession);
+        this.#upgradeSessionTitleInBackground(createdSession.id, title, detail.prompt);
         sessionId = createdSession.id;
       }
 

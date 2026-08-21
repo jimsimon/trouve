@@ -33,8 +33,8 @@ use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 use crate::process_env::{ProcessTreeChild, spawn_process_tree};
 use crate::{
     AgentBackend, BackendCollaboratorAccess, BackendCollaboratorEvent, BackendError, BackendEvent,
-    BackendEventStream, BackendLogin, BackendPermission, BackendStatus, BackendSteer, BackendTurn,
-    async_stream, binary_on_path, format_reset,
+    BackendEventStream, BackendLogin, BackendPermission, BackendStartupActivity, BackendStatus,
+    BackendSteer, BackendTurn, async_stream, binary_on_path, format_reset,
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
@@ -177,7 +177,13 @@ impl CodexBackend {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return Err(BackendError::Cancelled);
         }
+        let spawn_started = std::time::Instant::now();
         let s = Arc::new(AppServer::spawn(&self.command).await?);
+        tracing::info!(
+            elapsed_ms = spawn_started.elapsed().as_millis(),
+            "codex startup timing: app-server process spawned"
+        );
+        let handshake_started = std::time::Instant::now();
         let handshake = match cancel {
             Some(cancel) => tokio::select! {
                 biased;
@@ -199,6 +205,10 @@ impl CodexBackend {
             }
             return Err(error);
         }
+        tracing::info!(
+            elapsed_ms = handshake_started.elapsed().as_millis(),
+            "codex startup timing: app-server handshake completed"
+        );
         *guard = Some(s.clone());
         Ok(s)
     }
@@ -254,6 +264,23 @@ impl AgentBackend for CodexBackend {
         true
     }
 
+    async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
+        let mcp_config = thread_mcp_config(&codex_config_override(turn));
+        if mcp_config.is_null() {
+            return None;
+        }
+        let cached = self.server.lock().await.clone();
+        let needs_load = match (cached.as_ref(), turn.session.as_deref()) {
+            (Some(server), Some(thread_id)) if !server.is_closed() => {
+                !server
+                    .thread_settings_match(thread_id, &mcp_config, turn.instructions.as_deref())
+                    .await
+            }
+            _ => true,
+        };
+        (needs_load && !mcp_config.is_null()).then_some(BackendStartupActivity::ConnectingTools)
+    }
+
     async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
         let cancel = steer.cancel.clone();
         let server = self.server_cancellable(&cancel).await?;
@@ -278,6 +305,7 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        let trouve_thread_id = turn.thread_id.clone();
         let cancel = turn.cancel.clone();
         let mut server = self.server_cancellable(&cancel).await?;
 
@@ -312,6 +340,7 @@ impl AgentBackend for CodexBackend {
         // importantly, the ToolExecutor bridge guidance after an app restart
         // or vendor-side compaction.
         let config_override = codex_config_override(&turn);
+        let mcp_config = thread_mcp_config(&config_override);
         let with_thread_settings = |mut params: Value| {
             params["config"] = config_override.clone();
             if let Some(instructions) = &turn.instructions {
@@ -330,9 +359,19 @@ impl AgentBackend for CodexBackend {
         if !model_name.is_empty() {
             start_params["model"] = json!(model_name);
         }
+        let needs_load = match turn.session.as_deref() {
+            Some(thread_id) => {
+                !server
+                    .thread_settings_match(thread_id, &mcp_config, turn.instructions.as_deref())
+                    .await
+            }
+            None => true,
+        };
         let mut fresh_session = false;
-        let codex_thread_id = match &turn.session {
-            Some(sid) => {
+        let thread_request_started = std::time::Instant::now();
+        let codex_thread_id = match (&turn.session, needs_load) {
+            (Some(sid), false) => sid.clone(),
+            (Some(sid), true) => {
                 let resumed = server
                     .request_effect_cancellable(
                         "thread/resume",
@@ -364,7 +403,7 @@ impl AgentBackend for CodexBackend {
                     }
                 }
             }
-            None => {
+            (None, _) => {
                 fresh_session = true;
                 let v = server
                     .request_effect_cancellable("thread/start", start_params.clone(), &cancel)
@@ -372,6 +411,18 @@ impl AgentBackend for CodexBackend {
                 server.validated_thread_id("thread/start", &v, None).await?
             }
         };
+        if needs_load {
+            server
+                .mark_thread_loaded(&codex_thread_id, mcp_config, turn.instructions.clone())
+                .await;
+        }
+        tracing::info!(
+            thread_id = %trouve_thread_id,
+            fresh_session,
+            loaded_thread = needs_load,
+            elapsed_ms = thread_request_started.elapsed().as_millis(),
+            "codex startup timing: thread ready"
+        );
 
         // A cancelled trouve stream may still have a live vendor turn if the
         // app-server was blocked in a model or tool request when its consumer
@@ -449,6 +500,7 @@ impl AgentBackend for CodexBackend {
             turn_params["model"] = json!(model_name);
         }
         apply_reasoning_options(&mut turn_params, effort);
+        let turn_request_started = std::time::Instant::now();
         let (codex_turn_id, cleanup) = match server
             .start_turn(&codex_thread_id, &route.tx, turn_params, lifecycle, &cancel)
             .await
@@ -461,6 +513,12 @@ impl AgentBackend for CodexBackend {
         if let Some(instructions) = &turn.instructions {
             server.remember_thread_instructions(&codex_thread_id, instructions);
         }
+        tracing::info!(
+            thread_id = %trouve_thread_id,
+            codex_thread_id = %codex_thread_id,
+            elapsed_ms = turn_request_started.elapsed().as_millis(),
+            "codex startup timing: turn/start accepted"
+        );
 
         let stream = turn_stream(
             server.clone(),
@@ -505,6 +563,22 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
         config["mcp_servers"] = Value::Object(servers);
     }
     config
+}
+
+fn thread_mcp_config(config: &Value) -> Value {
+    config.get("mcp_servers").cloned().unwrap_or(Value::Null)
+}
+
+fn loaded_thread_settings_match(
+    loaded_threads: &HashMap<String, LoadedThreadSettings>,
+    thread_id: &str,
+    mcp_config: &Value,
+    developer_instructions: Option<&str>,
+) -> bool {
+    loaded_threads.get(thread_id).is_some_and(|loaded| {
+        loaded.mcp_config == *mcp_config
+            && loaded.developer_instructions.as_deref() == developer_instructions
+    })
 }
 
 /// Split a `<model>@<effort>` id into its parts. Threads created before the
@@ -3290,8 +3364,44 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     }
 }
 
-const THREAD_INSTRUCTION_CACHE_CAP: usize = 256;
+const THREAD_CACHE_CAP: usize = 256;
 
+#[derive(Debug, PartialEq)]
+struct LoadedThreadSettings {
+    mcp_config: Value,
+    developer_instructions: Option<String>,
+}
+
+#[derive(Default)]
+struct LoadedThreadCache {
+    settings: HashMap<String, LoadedThreadSettings>,
+    order: VecDeque<String>,
+}
+
+impl LoadedThreadCache {
+    fn remember(
+        &mut self,
+        thread_id: &str,
+        mcp_config: Value,
+        developer_instructions: Option<String>,
+    ) {
+        if !self.settings.contains_key(thread_id) {
+            if self.settings.len() >= THREAD_CACHE_CAP
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.settings.remove(&evicted);
+            }
+            self.order.push_back(thread_id.to_string());
+        }
+        self.settings.insert(
+            thread_id.to_string(),
+            LoadedThreadSettings {
+                mcp_config,
+                developer_instructions,
+            },
+        );
+    }
+}
 struct AppServer {
     stdin: SharedStdin,
     next_id: AtomicI64,
@@ -3307,6 +3417,9 @@ struct AppServer {
     /// Per-thread guards serializing interruption through replacement
     /// registration.
     turn_lifecycles: TurnLifecycles,
+    /// Thread-level settings attached to each thread loaded in this app-server
+    /// process. A newly spawned process starts empty.
+    loaded_threads: Mutex<LoadedThreadCache>,
     /// Instruction set known to have reached at least one turn in this
     /// app-server process. This is intentionally process-local: an empty map
     /// after restart is what activates the cold-resume prompt fallback.
@@ -3368,6 +3481,7 @@ impl AppServer {
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             completed_turns: Arc::new(Mutex::new(CompletedTurnState::default())),
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            loaded_threads: Mutex::new(LoadedThreadCache::default()),
             thread_instructions: std::sync::Mutex::new(HashMap::new()),
             child: Arc::new(std::sync::Mutex::new(child)),
             retired_response_tx,
@@ -3383,6 +3497,33 @@ impl AppServer {
         self.closed.load(Ordering::Relaxed)
     }
 
+    async fn thread_settings_match(
+        &self,
+        thread_id: &str,
+        mcp_config: &Value,
+        developer_instructions: Option<&str>,
+    ) -> bool {
+        let loaded_threads = self.loaded_threads.lock().await;
+        loaded_thread_settings_match(
+            &loaded_threads.settings,
+            thread_id,
+            mcp_config,
+            developer_instructions,
+        )
+    }
+
+    async fn mark_thread_loaded(
+        &self,
+        thread_id: &str,
+        mcp_config: Value,
+        developer_instructions: Option<String>,
+    ) {
+        self.loaded_threads
+            .lock()
+            .await
+            .remember(thread_id, mcp_config, developer_instructions);
+    }
+
     fn instructions_need_prompt_fallback(&self, thread_id: &str, instructions: &str) -> bool {
         self.thread_instructions
             .lock()
@@ -3393,7 +3534,7 @@ impl AppServer {
 
     fn remember_thread_instructions(&self, thread_id: &str, instructions: &str) {
         let mut known = self.thread_instructions.lock().unwrap();
-        if known.len() >= THREAD_INSTRUCTION_CACHE_CAP
+        if known.len() >= THREAD_CACHE_CAP
             && !known.contains_key(thread_id)
             && let Some(evicted) = known.keys().next().cloned()
         {
@@ -7281,6 +7422,65 @@ cat > /dev/null
         let config = codex_config_override(&turn);
         assert!(config["mcp_servers"]["jira"].is_object());
         assert!(config["mcp_servers"]["trouve"].is_null());
+    }
+
+    #[test]
+    fn loaded_threads_are_reused_until_their_thread_settings_change() {
+        let first = json!({ "trouve": { "url": "http://127.0.0.1/thread-1" } });
+        let changed = json!({ "trouve": { "url": "http://127.0.0.1/thread-1?tools=1" } });
+        let loaded = HashMap::from([(
+            "thread-1".to_string(),
+            LoadedThreadSettings {
+                mcp_config: first.clone(),
+                developer_instructions: Some("mode prompt".into()),
+            },
+        )]);
+
+        assert!(loaded_thread_settings_match(
+            &loaded,
+            "thread-1",
+            &first,
+            Some("mode prompt")
+        ));
+        assert!(!loaded_thread_settings_match(
+            &loaded,
+            "thread-1",
+            &changed,
+            Some("mode prompt")
+        ));
+        assert!(!loaded_thread_settings_match(
+            &loaded,
+            "thread-1",
+            &first,
+            Some("updated mode prompt")
+        ));
+        assert!(!loaded_thread_settings_match(
+            &loaded,
+            "thread-2",
+            &first,
+            Some("mode prompt")
+        ));
+    }
+
+    #[test]
+    fn loaded_thread_cache_evicts_the_oldest_entry_at_capacity() {
+        let mut loaded = LoadedThreadCache::default();
+        for index in 0..=THREAD_CACHE_CAP {
+            loaded.remember(
+                &format!("thread-{index}"),
+                json!({ "index": index }),
+                Some(format!("instructions-{index}")),
+            );
+        }
+
+        assert_eq!(loaded.settings.len(), THREAD_CACHE_CAP);
+        assert!(!loaded.settings.contains_key("thread-0"));
+        assert!(loaded.settings.contains_key("thread-1"));
+        assert!(
+            loaded
+                .settings
+                .contains_key(&format!("thread-{THREAD_CACHE_CAP}"))
+        );
     }
 
     #[test]

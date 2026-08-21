@@ -3,7 +3,7 @@
 "use strict";
 export const threadView = validate52;
 const schema19 = {"$id":"urn:trouve:thread-view-validator:threadView","$ref":"urn:trouve:thread-view-openapi#/components/schemas/ThreadViewSnapshot"};
-const schema21 = {"type":"object","description":"Folded current thread state and one transcript item page at the cursor\nreturned in `x-trouve-event-cursor`. Clients seed their view from this\nresponse and subscribe to the thread event stream after that cursor.","required":["items"],"properties":{"active_usage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/Usage","description":"Cumulative usage for the active turn. Billing counters sum its model\nrequests while context fields describe the latest request."}]},"commands":{"type":"array","items":{"$ref":"#/components/schemas/CommandInfo"}},"compacting":{"type":"boolean"},"has_older":{"type":"boolean","description":"Whether another page exists before `item_offset`."},"item_offset":{"type":"integer","format":"int64","description":"Zero-based index of `items[0]` in the complete folded transcript.","minimum":0},"items":{"type":"array","items":{"$ref":"#/components/schemas/ThreadViewItem"}},"last_usage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/Usage","description":"Aggregate usage for the most recently completed turn. Running-turn\nusage is reported separately in `active_usage`."}]},"pending_approvals":{"type":"array","items":{"type":"string"}},"pending_questions":{"type":"array","items":{"type":"string"}},"queue":{"type":"array","items":{"$ref":"#/components/schemas/QueuedPrompt"}},"thinking":{"type":"boolean"},"todos":{"type":"array","items":{"$ref":"#/components/schemas/TodoItem"}},"total_items":{"type":"integer","format":"int64","description":"Number of folded items in the complete transcript at this snapshot.","minimum":0},"turn_duration_ms":{"type":"object","additionalProperties":{"type":"integer","format":"int64","minimum":0},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_models":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_running":{"type":"boolean"},"turn_started_at":{"type":"object","additionalProperties":{"type":"string","format":"date-time"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_steerable":{"type":"object","description":"Per-turn native steering capability. False/absent is authoritative;\nclients must not infer capability from provider or model names.","additionalProperties":{"type":"boolean"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_thinking_levels":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}};
+const schema21 = {"type":"object","description":"Folded current thread state and one transcript item page at the cursor\nreturned in `x-trouve-event-cursor`. Clients seed their view from this\nresponse and subscribe to the thread event stream after that cursor.","required":["items"],"properties":{"active_usage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/Usage","description":"Cumulative usage for the active turn. Billing counters sum its model\nrequests while context fields describe the latest request."}]},"commands":{"type":"array","items":{"$ref":"#/components/schemas/CommandInfo"}},"compacting":{"type":"boolean"},"has_older":{"type":"boolean","description":"Whether another page exists before `item_offset`."},"item_offset":{"type":"integer","format":"int64","description":"Zero-based index of `items[0]` in the complete folded transcript.","minimum":0},"items":{"type":"array","items":{"$ref":"#/components/schemas/ThreadViewItem"}},"last_usage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/Usage","description":"Aggregate usage for the most recently completed turn. Running-turn\nusage is reported separately in `active_usage`."}]},"pending_approvals":{"type":"array","items":{"type":"string"}},"pending_questions":{"type":"array","items":{"type":"string"}},"queue":{"type":"array","items":{"$ref":"#/components/schemas/QueuedPrompt"}},"thinking":{"type":"boolean"},"todos":{"type":"array","items":{"$ref":"#/components/schemas/TodoItem"}},"total_items":{"type":"integer","format":"int64","description":"Number of folded items in the complete transcript at this snapshot.","minimum":0},"turn_duration_ms":{"type":"object","additionalProperties":{"type":"integer","format":"int64","minimum":0},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_models":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_phase":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/TurnPhase","description":"Current transient activity for the running turn."}]},"turn_running":{"type":"boolean"},"turn_started_at":{"type":"object","additionalProperties":{"type":"string","format":"date-time"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_steerable":{"type":"object","description":"Per-turn native steering capability. False/absent is authoritative;\nclients must not infer capability from provider or model names.","additionalProperties":{"type":"boolean"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_thinking_levels":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}};
 const schema22 = {"type":"object","description":"Token/cost usage for a turn.","required":["input_tokens","output_tokens"],"properties":{"cached_input_tokens":{"type":"integer","format":"int64","description":"Cached/read tokens where the provider reports them.","minimum":0},"context_input_tokens":{"type":["integer","null"],"format":"int64","description":"Provider-authoritative model-visible tokens for the most recent\nrequest. Unlike the aggregate turn counters above, this is the current\ncontext-size measurement used for context-window presentation and\ncompaction decisions.","minimum":0},"context_window":{"type":["integer","null"],"format":"int64","description":"The model's context window as reported live by the provider during\nthe turn. Authoritative over any static catalog value.","minimum":0},"cost_usd":{"type":["number","null"],"format":"double","description":"Estimated cost in USD, when list pricing for the model is known."},"input_tokens":{"type":"integer","format":"int64","description":"Non-cached input tokens. This counter is mutually exclusive with\n`cached_input_tokens`, even when the upstream provider reports an\ninclusive input total.","minimum":0},"output_tokens":{"type":"integer","format":"int64","minimum":0}}};
 
 function validate55(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -3367,6 +3367,31 @@ return errors === 0;
 }
 validate89.evaluated = {"props":{"content":true,"id":true,"status":true},"dynamicProps":false,"dynamicItems":false};
 
+const schema37 = {"type":"string","description":"Current user-visible startup activity for a running turn.","enum":["processing","connecting_tools"]};
+
+function validate93(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
+let vErrors = null;
+let errors = 0;
+const evaluated0 = validate93.evaluated;
+if(evaluated0.dynamicProps){
+evaluated0.props = undefined;
+}
+if(evaluated0.dynamicItems){
+evaluated0.items = undefined;
+}
+if(typeof data !== "string"){
+validate93.errors = [{instancePath,schemaPath:"#/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+if(!((data === "processing") || (data === "connecting_tools"))){
+validate93.errors = [{instancePath,schemaPath:"#/enum",keyword:"enum",params:{allowedValues: schema37.enum},message:"must be equal to one of the allowed values"}];
+return false;
+}
+validate93.errors = vErrors;
+return errors === 0;
+}
+validate93.evaluated = {"dynamicProps":false,"dynamicItems":false};
+
 const pattern3 = new RegExp("^(0|[1-9][0-9]*)$", "u");
 
 function validate54(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -3944,29 +3969,15 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.turn_running !== undefined){
+if(data.turn_phase !== undefined){
+let data23 = data.turn_phase;
 const _errs55 = errors;
-if(typeof data.turn_running !== "boolean"){
-validate54.errors = [{instancePath:instancePath+"/turn_running",schemaPath:"#/properties/turn_running/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
-return false;
-}
-var valid0 = _errs55 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.turn_started_at !== undefined){
-let data24 = data.turn_started_at;
+const _errs56 = errors;
+let valid13 = false;
+let passing2 = null;
 const _errs57 = errors;
-if(errors === _errs57){
-if(data24 && typeof data24 == "object" && !Array.isArray(data24)){
-for(const key4 in data24){
-const _errs59 = errors;
-if(errors === _errs59){
-if(typeof key4 === "string"){
-if(!pattern3.test(key4)){
-const err10 = {instancePath:instancePath+"/turn_started_at",schemaPath:"#/properties/turn_started_at/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key4};
+if(data23 !== null){
+const err10 = {instancePath:instancePath+"/turn_phase",schemaPath:"#/properties/turn_phase/oneOf/0/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err10];
 }
@@ -3975,9 +3986,29 @@ vErrors.push(err10);
 }
 errors++;
 }
+var _valid2 = _errs57 === errors;
+if(_valid2){
+valid13 = true;
+passing2 = 0;
+}
+const _errs59 = errors;
+if(!(validate93(data23, {instancePath:instancePath+"/turn_phase",parentData:data,parentDataProperty:"turn_phase",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate93.errors : vErrors.concat(validate93.errors);
+errors = vErrors.length;
+}
+var _valid2 = _errs59 === errors;
+if(_valid2 && valid13){
+valid13 = false;
+passing2 = [passing2, 1];
 }
 else {
-const err11 = {instancePath:instancePath+"/turn_started_at",schemaPath:"#/properties/turn_started_at/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key4};
+if(_valid2){
+valid13 = true;
+passing2 = 1;
+}
+}
+if(!valid13){
+const err11 = {instancePath:instancePath+"/turn_phase",schemaPath:"#/properties/turn_phase/oneOf",keyword:"oneOf",params:{passingSchemas: passing2},message:"must match exactly one schema in oneOf"};
 if(vErrors === null){
 vErrors = [err11];
 }
@@ -3985,11 +4016,49 @@ else {
 vErrors.push(err11);
 }
 errors++;
+validate54.errors = vErrors;
+return false;
+}
+else {
+errors = _errs56;
+if(vErrors !== null){
+if(_errs56){
+vErrors.length = _errs56;
+}
+else {
+vErrors = null;
 }
 }
-var valid13 = _errs59 === errors;
-if(!valid13){
-const err12 = {instancePath:instancePath+"/turn_started_at",schemaPath:"#/properties/turn_started_at/propertyNames",keyword:"propertyNames",params:{propertyName: key4},message:"property name must be valid"};
+}
+var valid0 = _errs55 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.turn_running !== undefined){
+const _errs60 = errors;
+if(typeof data.turn_running !== "boolean"){
+validate54.errors = [{instancePath:instancePath+"/turn_running",schemaPath:"#/properties/turn_running/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs60 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.turn_started_at !== undefined){
+let data25 = data.turn_started_at;
+const _errs62 = errors;
+if(errors === _errs62){
+if(data25 && typeof data25 == "object" && !Array.isArray(data25)){
+for(const key4 in data25){
+const _errs64 = errors;
+if(errors === _errs64){
+if(typeof key4 === "string"){
+if(!pattern3.test(key4)){
+const err12 = {instancePath:instancePath+"/turn_started_at",schemaPath:"#/properties/turn_started_at/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key4};
 if(vErrors === null){
 vErrors = [err12];
 }
@@ -3997,24 +4066,47 @@ else {
 vErrors.push(err12);
 }
 errors++;
+}
+}
+else {
+const err13 = {instancePath:instancePath+"/turn_started_at",schemaPath:"#/properties/turn_started_at/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key4};
+if(vErrors === null){
+vErrors = [err13];
+}
+else {
+vErrors.push(err13);
+}
+errors++;
+}
+}
+var valid14 = _errs64 === errors;
+if(!valid14){
+const err14 = {instancePath:instancePath+"/turn_started_at",schemaPath:"#/properties/turn_started_at/propertyNames",keyword:"propertyNames",params:{propertyName: key4},message:"property name must be valid"};
+if(vErrors === null){
+vErrors = [err14];
+}
+else {
+vErrors.push(err14);
+}
+errors++;
 validate54.errors = vErrors;
 return false;
 break;
 }
 }
-if(valid13){
-for(const key5 in data24){
-const _errs62 = errors;
-if(errors === _errs62){
-if(errors === _errs62){
-if(!(typeof data24[key5] === "string")){
+if(valid14){
+for(const key5 in data25){
+const _errs67 = errors;
+if(errors === _errs67){
+if(errors === _errs67){
+if(!(typeof data25[key5] === "string")){
 validate54.errors = [{instancePath:instancePath+"/turn_started_at/" + key5.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_started_at/additionalProperties/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 }
 }
-var valid14 = _errs62 === errors;
-if(!valid14){
+var valid15 = _errs67 === errors;
+if(!valid15){
 break;
 }
 }
@@ -4025,46 +4117,23 @@ validate54.errors = [{instancePath:instancePath+"/turn_started_at",schemaPath:"#
 return false;
 }
 }
-var valid0 = _errs57 === errors;
+var valid0 = _errs62 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_steerable !== undefined){
-let data26 = data.turn_steerable;
-const _errs64 = errors;
-if(errors === _errs64){
-if(data26 && typeof data26 == "object" && !Array.isArray(data26)){
-for(const key6 in data26){
-const _errs66 = errors;
-if(errors === _errs66){
+let data27 = data.turn_steerable;
+const _errs69 = errors;
+if(errors === _errs69){
+if(data27 && typeof data27 == "object" && !Array.isArray(data27)){
+for(const key6 in data27){
+const _errs71 = errors;
+if(errors === _errs71){
 if(typeof key6 === "string"){
 if(!pattern3.test(key6)){
-const err13 = {instancePath:instancePath+"/turn_steerable",schemaPath:"#/properties/turn_steerable/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key6};
-if(vErrors === null){
-vErrors = [err13];
-}
-else {
-vErrors.push(err13);
-}
-errors++;
-}
-}
-else {
-const err14 = {instancePath:instancePath+"/turn_steerable",schemaPath:"#/properties/turn_steerable/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key6};
-if(vErrors === null){
-vErrors = [err14];
-}
-else {
-vErrors.push(err14);
-}
-errors++;
-}
-}
-var valid15 = _errs66 === errors;
-if(!valid15){
-const err15 = {instancePath:instancePath+"/turn_steerable",schemaPath:"#/properties/turn_steerable/propertyNames",keyword:"propertyNames",params:{propertyName: key6},message:"property name must be valid"};
+const err15 = {instancePath:instancePath+"/turn_steerable",schemaPath:"#/properties/turn_steerable/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key6};
 if(vErrors === null){
 vErrors = [err15];
 }
@@ -4072,20 +4141,43 @@ else {
 vErrors.push(err15);
 }
 errors++;
+}
+}
+else {
+const err16 = {instancePath:instancePath+"/turn_steerable",schemaPath:"#/properties/turn_steerable/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key6};
+if(vErrors === null){
+vErrors = [err16];
+}
+else {
+vErrors.push(err16);
+}
+errors++;
+}
+}
+var valid16 = _errs71 === errors;
+if(!valid16){
+const err17 = {instancePath:instancePath+"/turn_steerable",schemaPath:"#/properties/turn_steerable/propertyNames",keyword:"propertyNames",params:{propertyName: key6},message:"property name must be valid"};
+if(vErrors === null){
+vErrors = [err17];
+}
+else {
+vErrors.push(err17);
+}
+errors++;
 validate54.errors = vErrors;
 return false;
 break;
 }
 }
-if(valid15){
-for(const key7 in data26){
-const _errs69 = errors;
-if(typeof data26[key7] !== "boolean"){
+if(valid16){
+for(const key7 in data27){
+const _errs74 = errors;
+if(typeof data27[key7] !== "boolean"){
 validate54.errors = [{instancePath:instancePath+"/turn_steerable/" + key7.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_steerable/additionalProperties/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid16 = _errs69 === errors;
-if(!valid16){
+var valid17 = _errs74 === errors;
+if(!valid17){
 break;
 }
 }
@@ -4096,46 +4188,23 @@ validate54.errors = [{instancePath:instancePath+"/turn_steerable",schemaPath:"#/
 return false;
 }
 }
-var valid0 = _errs64 === errors;
+var valid0 = _errs69 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_thinking_levels !== undefined){
-let data28 = data.turn_thinking_levels;
-const _errs71 = errors;
-if(errors === _errs71){
-if(data28 && typeof data28 == "object" && !Array.isArray(data28)){
-for(const key8 in data28){
-const _errs73 = errors;
-if(errors === _errs73){
+let data29 = data.turn_thinking_levels;
+const _errs76 = errors;
+if(errors === _errs76){
+if(data29 && typeof data29 == "object" && !Array.isArray(data29)){
+for(const key8 in data29){
+const _errs78 = errors;
+if(errors === _errs78){
 if(typeof key8 === "string"){
 if(!pattern3.test(key8)){
-const err16 = {instancePath:instancePath+"/turn_thinking_levels",schemaPath:"#/properties/turn_thinking_levels/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key8};
-if(vErrors === null){
-vErrors = [err16];
-}
-else {
-vErrors.push(err16);
-}
-errors++;
-}
-}
-else {
-const err17 = {instancePath:instancePath+"/turn_thinking_levels",schemaPath:"#/properties/turn_thinking_levels/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key8};
-if(vErrors === null){
-vErrors = [err17];
-}
-else {
-vErrors.push(err17);
-}
-errors++;
-}
-}
-var valid17 = _errs73 === errors;
-if(!valid17){
-const err18 = {instancePath:instancePath+"/turn_thinking_levels",schemaPath:"#/properties/turn_thinking_levels/propertyNames",keyword:"propertyNames",params:{propertyName: key8},message:"property name must be valid"};
+const err18 = {instancePath:instancePath+"/turn_thinking_levels",schemaPath:"#/properties/turn_thinking_levels/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key8};
 if(vErrors === null){
 vErrors = [err18];
 }
@@ -4143,20 +4212,43 @@ else {
 vErrors.push(err18);
 }
 errors++;
+}
+}
+else {
+const err19 = {instancePath:instancePath+"/turn_thinking_levels",schemaPath:"#/properties/turn_thinking_levels/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key8};
+if(vErrors === null){
+vErrors = [err19];
+}
+else {
+vErrors.push(err19);
+}
+errors++;
+}
+}
+var valid18 = _errs78 === errors;
+if(!valid18){
+const err20 = {instancePath:instancePath+"/turn_thinking_levels",schemaPath:"#/properties/turn_thinking_levels/propertyNames",keyword:"propertyNames",params:{propertyName: key8},message:"property name must be valid"};
+if(vErrors === null){
+vErrors = [err20];
+}
+else {
+vErrors.push(err20);
+}
+errors++;
 validate54.errors = vErrors;
 return false;
 break;
 }
 }
-if(valid17){
-for(const key9 in data28){
-const _errs76 = errors;
-if(typeof data28[key9] !== "string"){
+if(valid18){
+for(const key9 in data29){
+const _errs81 = errors;
+if(typeof data29[key9] !== "string"){
 validate54.errors = [{instancePath:instancePath+"/turn_thinking_levels/" + key9.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_thinking_levels/additionalProperties/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid18 = _errs76 === errors;
-if(!valid18){
+var valid19 = _errs81 === errors;
+if(!valid19){
 break;
 }
 }
@@ -4167,10 +4259,11 @@ validate54.errors = [{instancePath:instancePath+"/turn_thinking_levels",schemaPa
 return false;
 }
 }
-var valid0 = _errs71 === errors;
+var valid0 = _errs76 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -4200,7 +4293,7 @@ return false;
 validate54.errors = vErrors;
 return errors === 0;
 }
-validate54.evaluated = {"props":{"active_usage":true,"commands":true,"compacting":true,"has_older":true,"item_offset":true,"items":true,"last_usage":true,"pending_approvals":true,"pending_questions":true,"queue":true,"thinking":true,"todos":true,"total_items":true,"turn_duration_ms":true,"turn_models":true,"turn_running":true,"turn_started_at":true,"turn_steerable":true,"turn_thinking_levels":true},"dynamicProps":false,"dynamicItems":false};
+validate54.evaluated = {"props":{"active_usage":true,"commands":true,"compacting":true,"has_older":true,"item_offset":true,"items":true,"last_usage":true,"pending_approvals":true,"pending_questions":true,"queue":true,"thinking":true,"todos":true,"total_items":true,"turn_duration_ms":true,"turn_models":true,"turn_phase":true,"turn_running":true,"turn_started_at":true,"turn_steerable":true,"turn_thinking_levels":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate52(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -4221,4 +4314,4 @@ errors = vErrors.length;
 validate52.errors = vErrors;
 return errors === 0;
 }
-validate52.evaluated = {"props":{"active_usage":true,"commands":true,"compacting":true,"has_older":true,"item_offset":true,"items":true,"last_usage":true,"pending_approvals":true,"pending_questions":true,"queue":true,"thinking":true,"todos":true,"total_items":true,"turn_duration_ms":true,"turn_models":true,"turn_running":true,"turn_started_at":true,"turn_steerable":true,"turn_thinking_levels":true},"dynamicProps":false,"dynamicItems":false};
+validate52.evaluated = {"props":{"active_usage":true,"commands":true,"compacting":true,"has_older":true,"item_offset":true,"items":true,"last_usage":true,"pending_approvals":true,"pending_questions":true,"queue":true,"thinking":true,"todos":true,"total_items":true,"turn_duration_ms":true,"turn_models":true,"turn_phase":true,"turn_running":true,"turn_started_at":true,"turn_steerable":true,"turn_thinking_levels":true},"dynamicProps":false,"dynamicItems":false};
