@@ -139,14 +139,6 @@ jobs:
             projects+=("--project=mobile-${BROWSER_ENGINE}")
           fi
           npm run test:browser -- "${projects[@]}"
-      - name: Upload browser failure evidence
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: browser-failure-${{ matrix.engine }}
-          path: web/app-ui/test-results
-          if-no-files-found: error
-          retention-days: 1
 
   repository-checks:
     runs-on: ubuntu-latest
