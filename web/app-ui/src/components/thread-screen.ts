@@ -1009,7 +1009,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   readonly #chatFindGlobalKeydown = (event: KeyboardEvent): void => {
-    if (event.key === "Escape" && this.#threadSwitcherOpen) return;
+    if (event.key === "Escape" && this.#threadSwitcherOpen) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.#closeThreadSwitcherAndRestoreFocus();
+      return;
+    }
     if (event.key === "Escape" && this.#chatFindOpen) {
       event.preventDefault();
       event.stopPropagation();
@@ -5733,6 +5738,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     });
   };
 
+  #closeThreadSwitcherAndRestoreFocus(): void {
+    this.#threadSwitcherOpen = false;
+    this.#threadSwitcherQuery = "";
+    this.requestUpdate();
+    void this.updateComplete.then(() => {
+      this.querySelector<HTMLButtonElement>(".thread-switcher-toggle")?.focus();
+    });
+  }
+
   readonly #dismissThreadSwitcherFromPointer = (event: PointerEvent): void => {
     if (!this.#threadSwitcherOpen) return;
     const target = event.target;
@@ -5768,12 +5782,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     )];
     if (event.key === "Escape") {
       event.preventDefault();
-      this.#threadSwitcherOpen = false;
-      this.#threadSwitcherQuery = "";
-      this.requestUpdate();
-      void this.updateComplete.then(() => {
-        this.querySelector<HTMLButtonElement>(".thread-switcher-toggle")?.focus();
-      });
+      this.#closeThreadSwitcherAndRestoreFocus();
       return;
     }
     const target = event.target;
