@@ -1,6 +1,11 @@
 import { ContextConsumer } from "@lit/context";
 import { css, html, LitElement, nothing } from "lit";
 
+import {
+  canonicalThinkingSelection,
+  resolvePersonaThinkingSubmission,
+  thinkingOption,
+} from "../app/new-session-model.js";
 import { appServicesContext } from "../contexts/app-contexts.js";
 import type {
   ProtocolPersonaInfo,
@@ -16,22 +21,6 @@ import {
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 type PermissionMode = "ask" | "allow_list" | "yolo";
-
-const asRecord = (value: unknown): Record<string, unknown> | undefined =>
-  typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
-
-const thinkingOptions = (model: ProtocolModelInfo | undefined): readonly string[] => {
-  const schema = asRecord(model?.options_schema);
-  const properties = asRecord(schema?.["properties"]);
-  for (const key of ["thinking_level", "effort"]) {
-    const property = asRecord(properties?.[key]);
-    const values = property?.["enum"];
-    if (Array.isArray(values) && values.every((value) => typeof value === "string")) {
-      return values as string[];
-    }
-  }
-  return [];
-};
 
 const splitTools = (value: string): string[] =>
   value.split(/[\n,]/u).map((tool) => tool.trim()).filter(Boolean);
@@ -77,7 +66,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     .mode-row-copy small, .mode-row-copy p { color: var(--trouve-muted); font-size: 11px; }
     .mode-row-copy p { margin-top: 2px; }
     .mode-row-defaults { display: grid; gap: 3px; }
-    .mode-row-defaults select { min-height: 28px; }
+    .mode-row-defaults select, .mode-row-defaults input { min-height: 28px; }
     .mode-row-actions { display: flex; gap: 5px; }
     .mode-default-grid { grid-template-columns: 150px minmax(0, 1fr) 190px; align-items: end; }
     .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
@@ -170,6 +159,18 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const permission = String(data.get("permission_mode") ?? "ask") as PermissionMode;
     const thinking = String(data.get("thinking") ?? "");
     if (!["ask", "allow_list", "yolo"].includes(permission)) return;
+    const option = thinkingOption(
+      this.#availableModels().find((candidate) => candidate.id === model),
+    );
+    const canonicalThinking = thinking === ""
+      ? null
+      : canonicalThinkingSelection(option, thinking);
+    if (canonicalThinking === undefined) {
+      this.#message = "Choose a thinking setting supported by the selected model.";
+      this.#error = true;
+      this.requestUpdate();
+      return;
+    }
     this.#busy = true;
     this.#message = "Saving defaults…";
     this.#error = false;
@@ -177,7 +178,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     try {
       await protocol.setGlobalDefaults({
         model,
-        default_thinking_level: thinking || null,
+        default_thinking_level: canonicalThinking,
         permission_mode: permission,
       });
       const success = "Defaults saved for new threads.";
@@ -221,19 +222,35 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     }
     const modelValue = data.get("default_model");
     const thinkingValue = data.get("default_thinking_level");
+    const defaultModel = modelValue === null
+      ? existing?.persona.default_model ?? null
+      : String(modelValue) || null;
+    const thinkingDraft = thinkingValue === null
+      ? this.#modeFormThinkingDraft
+      : String(thinkingValue);
+    const effectiveModel = defaultModel || this.#providers?.default_model || "";
+    const selectedModel = this.#availableModels()
+      .find((candidate) => candidate.id === effectiveModel);
+    const defaultThinking = resolvePersonaThinkingSubmission(
+      selectedModel,
+      thinkingDraft,
+      existing?.persona.default_thinking_level,
+    );
+    if (defaultThinking === undefined) {
+      this.#message = "Choose a supported thinking setting.";
+      this.#error = true;
+      this.requestUpdate();
+      return;
+    }
     const request: ProtocolUpsertPersonaRequest = {
       display_name: displayName,
       group,
       system_prompt: systemPrompt,
       allowed_tools: splitTools(String(data.get("allowed_tools") ?? "")),
       read_only: data.get("read_only") === "on",
-      default_model: modelValue === null
-        ? existing?.persona.default_model ?? null
-        : String(modelValue) || null,
+      default_model: defaultModel,
       default_permission_mode: permission === "" ? null : permission as PermissionMode,
-      default_thinking_level: thinkingValue === null
-        ? existing?.persona.default_thinking_level ?? null
-        : String(thinkingValue) || null,
+      default_thinking_level: defaultThinking,
     };
     this.#busy = true;
     this.#message = `Saving ${id}…`;
@@ -299,7 +316,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const readOnly = info?.origin === "workspace";
     const configuredModelId = this.#modeFormModelId ?? mode?.default_model ?? "";
     const effectiveModelId = configuredModelId || this.#providers?.default_model || "";
-    const editorThinking = thinkingOptions(
+    const editorThinking = thinkingOption(
       this.#availableModels().find((candidate) => candidate.id === effectiveModelId),
     );
     return html`
@@ -319,14 +336,16 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
             const configuredModelId = (event.currentTarget as HTMLSelectElement).value;
             this.#modeFormModelId = configuredModelId;
             const effectiveModelId = configuredModelId || this.#providers?.default_model || "";
-            const options = thinkingOptions(this.#availableModels().find((candidate) => candidate.id === effectiveModelId));
+            const option = thinkingOption(this.#availableModels().find((candidate) => candidate.id === effectiveModelId));
             const current = this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? "";
-            this.#modeFormThinkingDraft = options.includes(current) ? current : "";
+            this.#modeFormThinkingDraft = canonicalThinkingSelection(option, current) ?? "";
             this.requestUpdate();
           }}><option value="">Global default</option>${this.#availableModels().map((candidate) => html`<option value=${candidate.id}>${modelSelectorLabel(candidate)}</option>`)}</select></label>
-          ${editorThinking.length === 0
-            ? html`<input type="hidden" name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} />`
-            : html`<label><span>Default thinking level</span><select name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @change=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Global default</option>${editorThinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
+          ${editorThinking === undefined
+            ? html`<label><span>Default thinking level</span><select disabled><option>Not supported</option></select></label>`
+            : editorThinking.budget === undefined
+              ? html`<label><span>Default thinking level</span><select name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @change=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Global default</option>${editorThinking.values.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`
+              : html`<label><span>Default thinking budget (tokens)</span><input name="default_thinking_level" type="number" step="1" min=${editorThinking.budget.minimum} max=${editorThinking.budget.maximum ?? nothing} placeholder="Global default" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @input=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLInputElement).value; }} /></label>`}
         </div>
         ${readOnly
           ? html`<p class="meta">Workspace personas are managed by the repository’s .agents configuration.</p>`
@@ -376,7 +395,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const mode = info.persona;
     const modelId = mode.default_model ?? "";
     const thinkingModel = this.#availableModels().find((model) => model.id === (modelId || this.#providers?.default_model));
-    const thinking = thinkingOptions(thinkingModel);
+    const thinking = thinkingOption(thinkingModel);
     const readOnly = info.origin === "workspace";
     return html`
       <article class="mode-row">
@@ -394,16 +413,40 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
               thinking: null,
             })}
           ><option value="">Global default</option>${this.#availableModels().map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}</option>`)}</select>
-          ${thinking.length === 0
+          ${thinking === undefined
             ? nothing
-            : html`<select
+            : thinking.budget === undefined
+              ? html`<select
                 aria-label=${`Default thinking level for ${mode.display_name}`}
                 .value=${mode.default_thinking_level ?? ""}
                 ?disabled=${readOnly || this.#busy}
                 @change=${(event: Event) => void this.#updateModeDefaults(info, {
                   thinking: (event.currentTarget as HTMLSelectElement).value || null,
                 })}
-              ><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select>`}
+              ><option value="">Model default</option>${thinking.values.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select>`
+              : html`<input
+                  aria-label=${`Default thinking budget for ${mode.display_name}`}
+                  type="number"
+                  step="1"
+                  min=${thinking.budget.minimum}
+                  max=${thinking.budget.maximum ?? nothing}
+                  placeholder="Model default"
+                  .value=${mode.default_thinking_level ?? ""}
+                  ?disabled=${readOnly || this.#busy}
+                  @change=${(event: Event) => {
+                    const value = (event.currentTarget as HTMLInputElement).value;
+                    const canonical = value === ""
+                      ? null
+                      : canonicalThinkingSelection(thinking, value);
+                    if (canonical === undefined) {
+                      this.#message = "Choose a thinking budget within the selected model's range.";
+                      this.#error = true;
+                      this.requestUpdate();
+                      return;
+                    }
+                    void this.#updateModeDefaults(info, { thinking: canonical });
+                  }}
+                />`}
         </div>
         <div class="mode-row-actions">
           ${readOnly ? nothing : html`<button type="button" data-persona-focus=${mode.id} aria-label=${`Edit ${mode.display_name}`} @click=${() => { this.#editingModeId = mode.id; this.#modeFormModelId = mode.default_model ?? ""; this.#modeFormThinkingDraft = mode.default_thinking_level ?? ""; this.requestUpdate(); }}>Edit</button>`}
@@ -418,7 +461,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
   override render() {
     const models = this.#availableModels();
     const selected = models.find((model) => model.id === (this.#defaultModelDraft || this.#providers?.default_model));
-    const thinking = thinkingOptions(selected);
+    const thinking = thinkingOption(selected);
     return html`
       <div class="stack">
         <h2 tabindex="-1" data-persona-focus-fallback>Personas &amp; Models</h2>
@@ -430,14 +473,19 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
           <div class="row">
             <label><span class="visually-hidden">Default model</span><select required name="model" .value=${this.#defaultModelDraft || this.#providers?.default_model || ""} ?disabled=${this.#busy || models.length === 0} @change=${(event: Event) => {
               this.#defaultModelDraft = (event.currentTarget as HTMLSelectElement).value;
-              const options = thinkingOptions(this.#availableModels().find((model) => model.id === this.#defaultModelDraft));
-              if (!options.includes(this.#defaultThinkingDraft)) this.#defaultThinkingDraft = "";
+              const option = thinkingOption(this.#availableModels().find((model) => model.id === this.#defaultModelDraft));
+              this.#defaultThinkingDraft = canonicalThinkingSelection(
+                option,
+                this.#defaultThinkingDraft,
+              ) ?? "";
               this.requestUpdate();
             }}><option value="" disabled>Choose model</option>${models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
           </div>
-          ${thinking.length === 0
-            ? html`<input name="thinking" type="hidden" .value=${this.#defaultThinkingDraft ?? ""} />`
-            : html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
+          ${thinking === undefined
+            ? html`<label><span>Global default thinking level</span><select disabled><option>Not supported</option></select></label><input name="thinking" type="hidden" value="" />`
+            : thinking.budget === undefined
+              ? html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.values.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`
+              : html`<label><span>Global default thinking budget (tokens)</span><input name="thinking" type="number" step="1" min=${thinking.budget.minimum} max=${thinking.budget.maximum ?? nothing} placeholder="Model default" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @input=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLInputElement).value; }} /></label>`}
           <p class="meta">Global default permissions — used by new threads whose persona has no default of its own.</p>
           <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
           <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Set defaults</button></div>

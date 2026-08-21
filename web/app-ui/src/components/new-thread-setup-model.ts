@@ -2,6 +2,7 @@ import {
   createNewSessionThreadRequest,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
+  thinkingSelectionIsValid,
   threadTitleFallback,
   thinkingOption,
   type ThinkingOption,
@@ -189,7 +190,7 @@ export const reconcileNewThreadDraft = (
     : modeDefaults.modelId;
   const refreshed = selectNewThreadModel(modeDefaults, modelId, catalog);
   const keepThinking = edits.thinking
-    && newThreadThinkingOption(refreshed, catalog)?.values.includes(draft.thinking) === true;
+    && thinkingSelectionIsValid(newThreadThinkingOption(refreshed, catalog), draft.thinking);
   const keepPermission = edits.permission
     && (draft.permissionMode === "ask"
       || draft.permissionMode === "allow_list"

@@ -71,7 +71,7 @@ const catalog: NewThreadSetupCatalog = {
   models: [
     model("provider/first"),
     model("provider/review", "effort", ["low", "high"], "high"),
-    model("provider/global"),
+    model("provider/global", "reasoning_effort"),
   ],
   providers,
 };
@@ -99,9 +99,60 @@ describe("new thread setup model", () => {
     });
     expect(effectiveNewThreadModel(draft, catalog)?.id).toBe("provider/global");
     expect(newThreadThinkingOption(draft, catalog)).toMatchObject({
-      key: "thinking_level",
+      key: "reasoning_effort",
       values: ["low", "medium", "high"],
     });
+  });
+
+  it("applies global fixed thinking budgets and emits numeric thread options", () => {
+    const fixedModel: ProtocolModelInfo = {
+      id: "provider/fixed",
+      display_name: "Fixed",
+      context_window: 128_000,
+      supports_tools: true,
+      options_schema: {
+        type: "object",
+        properties: {
+          thinking_budget_tokens: {
+            type: "integer",
+            minimum: 1024,
+            maximum: 32768,
+            default: 4096,
+          },
+        },
+      },
+    };
+    const fixedCatalog: NewThreadSetupCatalog = {
+      modes: [mode("code")],
+      models: [fixedModel],
+      providers: {
+        ...providers,
+        default_model: fixedModel.id,
+        default_thinking_level: "16384",
+      },
+    };
+    const inherited = createInitialNewThreadDraft(fixedCatalog);
+    expect(inherited).toMatchObject({
+      modelId: fixedModel.id,
+      thinking: "16384",
+      inheritedThinking: "16384",
+    });
+    expect(newThreadThinkingOption(inherited, fixedCatalog)).toMatchObject({
+      key: "thinking_budget_tokens",
+      budget: { minimum: 1024, maximum: 32768 },
+    });
+
+    const detail = createNewThreadSetupSubmission({
+      workspaceId: "ws-main",
+      sessionId: "se-main",
+      draft: {
+        ...inherited,
+        thinking: "8192",
+        inheritedThinking: undefined,
+      },
+      catalog: fixedCatalog,
+    });
+    expect(detail.request.model_options).toEqual({ thinking_budget_tokens: 8192 });
   });
 
   it("leaves untouched thinking and permission defaults for the server to inherit", () => {

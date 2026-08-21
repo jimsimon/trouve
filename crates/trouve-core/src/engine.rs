@@ -1364,6 +1364,7 @@ fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> 
     THINKING_OPTION_KEYS
         .iter()
         .any(|key| options.contains_key(*key))
+        || options.contains_key("thinking_budget_tokens")
 }
 
 fn inherit_thinking_option(
@@ -1419,6 +1420,57 @@ pub(crate) fn advertised_thinking_budget(
     })
 }
 
+fn parse_thinking_budget(value: &str) -> Option<u64> {
+    if let Ok(value) = value.parse::<u64>() {
+        return Some(value);
+    }
+    let (mantissa, exponent) = if let Some(index) = value.find(['e', 'E']) {
+        let exponent_text = value.get(index + 1..)?;
+        if exponent_text
+            .bytes()
+            .any(|byte| matches!(byte, b'e' | b'E'))
+        {
+            return None;
+        }
+        (&value[..index], exponent_text.parse::<i32>().ok()?)
+    } else {
+        (value, 0)
+    };
+    if mantissa.starts_with('-') {
+        return None;
+    }
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut digits = String::with_capacity(whole.len() + fraction.len());
+    digits.push_str(whole);
+    digits.push_str(fraction);
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let fractional_digits = i32::try_from(fraction.len()).ok()?;
+    let shift = exponent.checked_sub(fractional_digits)?;
+    if shift >= 0 {
+        return digits
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(10_u64.checked_pow(shift.try_into().ok()?)?);
+    }
+    let truncated = usize::try_from(shift.unsigned_abs()).ok()?;
+    let integer_digits = digits.len().checked_sub(truncated)?;
+    let integral = digits[integer_digits..].bytes().all(|byte| byte == b'0');
+    integral.then_some(())?;
+    digits[..integer_digits].parse::<u64>().ok()
+}
+
 /// Resolve the canonical inherited `thinking_level` key through a model's
 /// advertised options schema. Unknown/unsupported levels fall back to the
 /// model's schema default; models without an enum thinking knob drop the
@@ -1435,9 +1487,15 @@ fn normalize_thinking_option(
         if let Some(model) = model
             && let Some((minimum, maximum)) = advertised_thinking_budget(model)
         {
+            // An explicit native budget wins over a legacy/inherited canonical
+            // value, just as native enum options do below.
+            if options.contains_key("thinking_budget_tokens") {
+                options.remove("thinking_level");
+                return;
+            }
             let selected = canonical
                 .as_str()
-                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(parse_thinking_budget)
                 .filter(|value| *value >= minimum && maximum.is_none_or(|max| *value <= max))
                 .or_else(|| {
                     model
@@ -21816,6 +21874,20 @@ default_permission_mode = "ask"
             }),
             ..model.clone()
         };
+        let mut explicit_budget = serde_json::Map::from_iter([(
+            "thinking_budget_tokens".into(),
+            serde_json::json!(8192),
+        )]);
+        inherit_thinking_option(&mut explicit_budget, Some("16384"), None);
+        assert_eq!(explicit_budget.len(), 1, "an explicit token budget wins");
+        explicit_budget.insert("thinking_level".into(), serde_json::json!("16384"));
+        normalize_thinking_option(&mut explicit_budget, Some(&fixed_model));
+        assert_eq!(
+            explicit_budget.get("thinking_budget_tokens"),
+            Some(&serde_json::json!(8192))
+        );
+        assert!(!explicit_budget.contains_key("thinking_level"));
+
         options.remove("reasoning_effort");
         options.insert("thinking_level".into(), serde_json::json!("16384"));
         normalize_thinking_option(&mut options, Some(&fixed_model));
@@ -21827,6 +21899,23 @@ default_permission_mode = "ask"
             resolved_thinking_level(&options, Some(&fixed_model)).as_deref(),
             Some("16384")
         );
+
+        options.remove("thinking_budget_tokens");
+        options.insert("thinking_level".into(), serde_json::json!("1e4"));
+        normalize_thinking_option(&mut options, Some(&fixed_model));
+        assert_eq!(
+            options.get("thinking_budget_tokens"),
+            Some(&serde_json::json!(10000))
+        );
+
+        assert_eq!(parse_thinking_budget("1023.9999999999999999"), None);
+        assert_eq!(parse_thinking_budget("1e-999"), None);
+        assert_eq!(parse_thinking_budget("184467440737095516160.0"), None);
+        assert_eq!(parse_thinking_budget("1.0e4"), Some(10000));
+        assert_eq!(parse_thinking_budget(".1e5"), Some(10000));
+        assert_eq!(parse_thinking_budget("+1024.0"), Some(1024));
+        assert_eq!(parse_thinking_budget("+1.024e3"), Some(1024));
+        assert_eq!(parse_thinking_budget("-1024.0"), None);
 
         // No thinking enum means the inherited option is not sent.
         options.remove("thinking_budget_tokens");

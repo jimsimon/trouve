@@ -436,22 +436,36 @@ export class TrouveNewThreadSetup extends LitElement {
             ></trouve-model-picker>
           </div>
           <label>
-            <span>Thinking level</span>
-            <select
-              name="thinking"
-              .value=${thinking === undefined ? "" : this.#draft.thinking}
-              ?disabled=${controls.optionControlsDisabled}
-              @change=${this.#thinkingChanged}
-            >
-              ${thinking === undefined
-                ? html`<option value="">Not supported</option>`
-                : thinking.values.map(
-                    (value) => html`<option
-                      value=${value}
-                      .selected=${value === this.#draft.thinking}
-                    >${modelOptionLabel(value)}</option>`,
-                  )}
-            </select>
+            <span>${thinking?.budget === undefined
+              ? "Thinking level"
+              : "Thinking budget (tokens)"}</span>
+            ${thinking?.budget === undefined
+              ? html`<select
+                  name="thinking"
+                  .value=${thinking === undefined ? "" : this.#draft.thinking}
+                  ?disabled=${controls.optionControlsDisabled || thinking === undefined}
+                  @change=${this.#thinkingChanged}
+                >
+                  ${thinking === undefined
+                    ? html`<option value="">Not supported</option>`
+                    : thinking.values.map(
+                        (value) => html`<option
+                          value=${value}
+                          .selected=${value === this.#draft.thinking}
+                        >${modelOptionLabel(value)}</option>`,
+                      )}
+                </select>`
+              : html`<input
+                  name="thinking"
+                  type="number"
+                  required
+                  step="1"
+                  min=${thinking.budget.minimum}
+                  max=${thinking.budget.maximum ?? nothing}
+                  .value=${this.#draft.thinking}
+                  ?disabled=${controls.optionControlsDisabled}
+                  @input=${this.#thinkingChanged}
+                />`}
           </label>
           <label class=${`permission-field ${this.#draft.permissionMode === "yolo" ? "permission-yolo" : ""}`}>
             <span>${this.#draft.permissionMode === "yolo"
