@@ -114,26 +114,32 @@ import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
   beginNewSessionOptionLoad,
   canSubmitNewSession,
+  closeNewSessionSetup,
+  createNewSessionSetupLifecycle,
   createNewSessionOptionsLifecycle,
   createNewSessionThreadRequestFromSnapshot,
   createNewThreadOptionEdits,
   interruptNewSessionOptionLoad,
+  failNewSessionSetup,
   mergeNewSessionModelCatalogs,
   NEW_SESSION_OPTIONS_TIMEOUT_MS,
   newSessionOptionsAreAuthoritative,
   newSessionOptionsAreLoading,
   newSessionOptionsBlockSubmission,
   newSessionOptionsCatalogWorkspaceId,
+  navigateNewSessionSetup,
   newThreadInheritanceForWorkspace,
   reconcileNewThreadDefaults,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
+  openNewSessionSetup,
   sessionTitleFallback,
   settleNewSessionOptionLoad,
   snapshotNewSessionSubmission,
   thinkingOption,
   type NewThreadOptionEdits,
+  type NewSessionSetupLifecycle,
 } from "./new-session-model.js";
 import {
   composerTextareaLayout,
@@ -388,7 +394,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #pwaInstallPrompt: PwaInstallPromptEvent | undefined;
   #pwaInstallPending = false;
   #pwaInstallStatus = "";
-  #newSessionOpen = false;
+  #newSessionSetup: NewSessionSetupLifecycle<AppRoute> =
+    createNewSessionSetupLifecycle<AppRoute>();
   #newSessionPending = false;
   #newSessionError = "";
   #newSessionWorkspaceId = "";
@@ -418,6 +425,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionPromptComposing = false;
   #newSessionAttachments: PendingAttachment[] = [];
   #newSessionAttachmentPending = false;
+  #newSessionAttachmentGeneration = 0;
   #pullRequestActionPending = false;
   #collapsedWorkspaceIds = new Set<string>();
   #showArchivedWorkspaceIds = new Set<string>();
@@ -495,6 +503,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   override connectedCallback(): void {
     super.connectedCallback();
     this.#stopRouteChanges ??= this.#router.subscribe(this.#routeChanged);
+    const connectedRoute = readSignal(this.#router.route);
+    if (
+      this.#newSessionSetup.status === "open"
+      && this.#newSessionSetup.route !== connectedRoute
+    ) {
+      this.#routeChanged(connectedRoute);
+    }
     globalThis.addEventListener("trouve-pwa-update-ready", this.#pwaUpdateReady);
     if (deployment === "pwa") {
       globalThis.addEventListener("beforeinstallprompt", this.#pwaInstallAvailable);
@@ -517,7 +532,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#applyAppearanceToElement(this.#appearance.current.get());
       this.#startProtocolIngress();
     }
-    if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "") {
+    if (this.#newSessionSetup.status === "open" && this.#newSessionWorkspaceId !== "") {
       void this.#loadNewSessionOptions(this.#newSessionWorkspaceId, true);
     }
   }
@@ -535,6 +550,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#retryProtocolAfterVisibility,
     );
     this.#newSessionOptionsGeneration += 1;
+    this.#newSessionAttachmentGeneration += 1;
+    this.#newSessionAttachmentPending = false;
     this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(
       this.#newSessionOptionsLifecycle,
@@ -1375,19 +1392,36 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   #showNewSession(workspaceId?: string, preferredBaseRef = ""): void {
+    let restoringDraft = this.#newSessionSetup.status === "background-failed";
     const workspaces = readSignal(this.#store.workspaces);
-    const workspace = workspaces.find((candidate) => candidate.id === workspaceId)
-      ?? workspaces[0];
+    let workspace = restoringDraft
+      ? workspaces.find((candidate) => candidate.id === this.#newSessionWorkspaceId)
+      : workspaces.find((candidate) => candidate.id === workspaceId) ?? workspaces[0];
+    if (restoringDraft && workspace === undefined) {
+      this.#resetNewSession();
+      restoringDraft = false;
+      workspace = workspaces.find((candidate) => candidate.id === workspaceId) ?? workspaces[0];
+    }
     if (workspace === undefined) return;
-    this.#newSessionError = "";
-    this.#newSessionPrompt = "";
-    this.#newSessionPromptComposing = false;
-    this.#newSessionAttachments = [];
-    this.#newSessionAttachmentPending = false;
-    this.#newSessionWorkspaceId = workspace.id;
-    this.#resetNewSessionOptionsForWorkspace(workspace.id);
-    this.#newSessionPreferredBaseRef = preferredBaseRef;
-    this.#newSessionOpen = true;
+    const opened = openNewSessionSetup(
+      this.#newSessionSetup,
+      readSignal(this.#router.route),
+    );
+    if (opened === this.#newSessionSetup) return;
+    this.#newSessionSetup = opened;
+    if (!restoringDraft) {
+      this.#newSessionError = "";
+      this.#newSessionPrompt = "";
+      this.#newSessionPromptComposing = false;
+      this.#newSessionAttachments = [];
+      this.#newSessionAttachmentGeneration += 1;
+      this.#newSessionAttachmentPending = false;
+      this.#newSessionWorkspaceId = workspace.id;
+      this.#resetNewSessionOptionsForWorkspace(workspace.id);
+      this.#newSessionPreferredBaseRef = preferredBaseRef;
+    } else {
+      this.#shellNotice = "";
+    }
     this.requestUpdate();
     void this.updateComplete.then(() => {
       const textarea = this.querySelector<HTMLTextAreaElement>(
@@ -1396,8 +1430,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       textarea?.focus();
       this.#resizeNewSessionPrompt(textarea);
     });
-    void this.#loadNewSessionBranches(workspace.id);
-    void this.#loadNewSessionOptions(workspace.id);
+    const setupWorkspaceId = this.#newSessionWorkspaceId;
+    void this.#loadNewSessionBranches(setupWorkspaceId);
+    void this.#loadNewSessionOptions(setupWorkspaceId, restoringDraft);
   }
 
   async #openWorkspace(): Promise<void> {
@@ -1932,13 +1967,19 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.requestUpdate();
   };
 
-  readonly #routeChanged = (): void => {
-    if (!this.#newSessionOpen) return;
+  readonly #routeChanged = (route: AppRoute): void => {
+    if (this.#newSessionSetup.status !== "open") return;
+    const next = navigateNewSessionSetup(
+      this.#newSessionSetup,
+      route,
+      this.#newSessionPending,
+    );
+    if (next === this.#newSessionSetup) return;
     if (this.#newSessionPending) {
+      this.#newSessionSetup = next;
       // Navigation cannot cancel a create request already accepted by the
       // server. Hide its setup without clearing attachments that the request
       // still needs while it finishes in the background.
-      this.#newSessionOpen = false;
       this.requestUpdate();
       return;
     }
@@ -1947,7 +1988,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   };
 
   #resetNewSession(): void {
-    this.#newSessionOpen = false;
+    this.#newSessionSetup = closeNewSessionSetup(this.#newSessionSetup);
     this.#newSessionError = "";
     this.#newSessionBranchGeneration += 1;
     this.#newSessionOptionsGeneration += 1;
@@ -1960,6 +2001,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionOptionsError = "";
     this.#newSessionOptionsStatus = "";
     this.#newSessionAttachments = [];
+    this.#newSessionAttachmentGeneration += 1;
     this.#newSessionAttachmentPending = false;
     this.#newSessionPrompt = "";
     this.#newSessionPromptComposing = false;
@@ -2049,34 +2091,45 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   async #pickNewSessionNativeFiles(): Promise<void> {
     if (this.#nativeHost === undefined || this.#newSessionAttachmentPending) return;
+    const generation = ++this.#newSessionAttachmentGeneration;
     this.#newSessionAttachmentPending = true;
     this.#newSessionError = "";
     this.requestUpdate();
     try {
-      for (const attachment of await this.#nativeHost.pickFiles()) {
+      const attachments = await this.#nativeHost.pickFiles();
+      if (generation !== this.#newSessionAttachmentGeneration) return;
+      for (const attachment of attachments) {
         if (!this.#stageNewSessionAttachment(attachment)) break;
       }
     } catch {
+      if (generation !== this.#newSessionAttachmentGeneration) return;
       this.#newSessionError = "Files could not be read from the desktop picker.";
     } finally {
-      this.#newSessionAttachmentPending = false;
-      this.requestUpdate();
+      if (generation === this.#newSessionAttachmentGeneration) {
+        this.#newSessionAttachmentPending = false;
+        this.requestUpdate();
+      }
     }
   }
 
   async #readNewSessionClipboardImage(): Promise<void> {
     if (this.#nativeHost === undefined || this.#newSessionAttachmentPending) return;
+    const generation = ++this.#newSessionAttachmentGeneration;
     this.#newSessionAttachmentPending = true;
     this.#newSessionError = "";
     this.requestUpdate();
     try {
       const attachment = await this.#nativeHost.readClipboardImage();
+      if (generation !== this.#newSessionAttachmentGeneration) return;
       if (attachment !== undefined) this.#stageNewSessionAttachment(attachment);
     } catch {
+      if (generation !== this.#newSessionAttachmentGeneration) return;
       this.#newSessionError = "The desktop clipboard image could not be read.";
     } finally {
-      this.#newSessionAttachmentPending = false;
-      this.requestUpdate();
+      if (generation === this.#newSessionAttachmentGeneration) {
+        this.#newSessionAttachmentPending = false;
+        this.requestUpdate();
+      }
     }
   }
 
@@ -2099,6 +2152,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   async #addNewSessionAttachments(files: readonly File[]): Promise<void> {
     if (files.length === 0 || this.#newSessionAttachmentPending) return;
+    const generation = ++this.#newSessionAttachmentGeneration;
     this.#newSessionAttachmentPending = true;
     this.#newSessionError = "";
     this.requestUpdate();
@@ -2110,7 +2164,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             file,
             `new-session-${Date.now()}-${index + 1}.bin`,
           );
+          if (generation !== this.#newSessionAttachmentGeneration) return;
         } catch (error) {
+          if (generation !== this.#newSessionAttachmentGeneration) return;
           const kind = error instanceof AttachmentEncodingError
             ? error.kind
             : "read-failed";
@@ -2124,8 +2180,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         if (!this.#stageNewSessionAttachment(attachment)) break;
       }
     } finally {
-      this.#newSessionAttachmentPending = false;
-      this.requestUpdate();
+      if (generation === this.#newSessionAttachmentGeneration) {
+        this.#newSessionAttachmentPending = false;
+        this.requestUpdate();
+      }
     }
   }
 
@@ -2193,8 +2251,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         fetch_latest: fetchLatest,
       });
     } catch {
+      this.#newSessionSetup = navigateNewSessionSetup(
+        this.#newSessionSetup,
+        readSignal(this.#router.route),
+        true,
+      );
       this.#newSessionPending = false;
+      this.#newSessionSetup = failNewSessionSetup(this.#newSessionSetup);
       this.#newSessionError = "Session could not be created.";
+      if (this.#newSessionSetup.status === "background-failed") {
+        this.#shellNotice =
+          "Session could not be created. Open New Session to retry with your saved draft.";
+      }
       this.requestUpdate();
       return;
     }
@@ -2228,7 +2296,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       }
     }
     this.#newSessionPending = false;
-    this.#newSessionOpen = false;
+    this.#newSessionSetup = closeNewSessionSetup(this.#newSessionSetup);
     this.#newSessionBranchGeneration += 1;
     this.#newSessionOptionsGeneration += 1;
     this.#unsubscribeFromNewSessionLiveModels();
@@ -2237,6 +2305,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     );
     this.#newSessionPrompt = "";
     this.#newSessionAttachments = [];
+    this.#newSessionAttachmentGeneration += 1;
     this.#newSessionAttachmentPending = false;
     this.#newSessionPreferredBaseRef = "";
     form.reset();
@@ -2637,7 +2706,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       <main
         class="app-shell mobile-pane-${this.#mobilePane} ${fullScreenRoute
           ? "full-screen-route"
-          : ""} ${this.#newSessionOpen ? "new-session-open" : ""}"
+          : ""} ${this.#newSessionSetup.status === "open" ? "new-session-open" : ""}"
         data-theme=${theme}
         aria-label="trouve application"
         @trouve-open-internal=${this.#openInternal}
@@ -2958,7 +3027,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           id="new-session-screen"
           class="thread-panel new-session-screen"
           aria-labelledby="new-session-title"
-          ?hidden=${!this.#newSessionOpen}
+          ?hidden=${this.#newSessionSetup.status !== "open"}
         >
           <form @submit=${this.#createSession}>
             <header>

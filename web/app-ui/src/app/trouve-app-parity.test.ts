@@ -80,7 +80,7 @@ describe("root shell parity wiring", () => {
       "this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(",
     );
     expect(source).toContain(
-      'if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "")',
+      'if (this.#newSessionSetup.status === "open" && this.#newSessionWorkspaceId !== "")',
     );
     expect(source).toContain("beginNewSessionOptionLoad({");
     expect(source).toContain("snapshotNewSessionSubmission({");
@@ -102,8 +102,9 @@ describe("root shell parity wiring", () => {
 
   it("dismisses new-session setup when navigation opens another screen", () => {
     expect(source).toContain("this.#router.subscribe(this.#routeChanged)");
-    expect(source).toContain("readonly #routeChanged = (): void => {");
-    expect(source).toContain("if (!this.#newSessionOpen) return;");
+    expect(source).toContain("readonly #routeChanged = (route: AppRoute): void => {");
+    expect(source).toContain('if (this.#newSessionSetup.status !== "open") return;');
+    expect(source).toContain("navigateNewSessionSetup(");
     expect(source).toContain("this.#resetNewSession();");
   });
 });

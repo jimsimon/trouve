@@ -9,23 +9,28 @@ import {
   beginNewSessionOptionLoad,
   canSubmitNewSession,
   canonicalThinkingSelection,
+  closeNewSessionSetup,
+  createNewSessionSetupLifecycle,
   createNewSessionOptionsLifecycle,
   createNewSessionThreadRequest,
   createNewSessionThreadRequestFromSnapshot,
   createNewThreadOptionEdits,
   defaultThinkingSelection,
   interruptNewSessionOptionLoad,
+  failNewSessionSetup,
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
   NEW_THREAD_TITLE_FALLBACK,
   newSessionOptionsAreAuthoritative,
   newSessionOptionsBlockSubmission,
+  navigateNewSessionSetup,
   newThreadInheritanceForWorkspace,
   mergeNewSessionModelCatalogs,
   reconcileNewThreadDefaults,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
+  openNewSessionSetup,
   sessionTitleFallback,
   settleNewSessionOptionLoad,
   snapshotNewSessionSubmission,
@@ -58,6 +63,41 @@ const providers = (defaultModel: string): ProtocolProvidersResponse => ({
 });
 
 describe("new session model", () => {
+  it("scopes setup visibility to its opening route and restores failed background drafts", () => {
+    const settings = { kind: "settings" };
+    const inbox = { kind: "inbox" };
+    const initial = createNewSessionSetupLifecycle<object>();
+    const opened = openNewSessionSetup(initial, inbox);
+
+    expect(navigateNewSessionSetup(opened, inbox, false)).toBe(opened);
+    const background = navigateNewSessionSetup(opened, settings, true);
+    expect(background).toMatchObject({
+      status: "background-submitting",
+      generation: opened.generation,
+    });
+    const failed = failNewSessionSetup(background);
+    expect(failed.status).toBe("background-failed");
+    expect(openNewSessionSetup(failed, settings)).toEqual({
+      status: "open",
+      route: settings,
+      generation: opened.generation,
+    });
+  });
+
+  it("discards idle drafts on navigation and advances their generation", () => {
+    const opened = openNewSessionSetup(
+      createNewSessionSetupLifecycle<string>(),
+      "inbox",
+    );
+    const navigated = navigateNewSessionSetup(opened, "settings", false);
+    expect(navigated).toEqual({
+      status: "closed",
+      route: undefined,
+      generation: opened.generation + 1,
+    });
+    expect(closeNewSessionSetup(navigated).generation).toBe(navigated.generation + 1);
+  });
+
   it("uses the bounded first prompt line and removes invisible controls from fallback titles", () => {
     expect(sessionTitleFallback("  Build\n\t the   dashboard\r\n now  ")).toBe(
       "Build",

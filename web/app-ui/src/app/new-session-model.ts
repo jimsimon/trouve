@@ -76,6 +76,68 @@ export interface NewSessionOptionsLifecycle {
   readonly catalogWorkspaceId: string;
 }
 
+export type NewSessionSetupStatus =
+  | "closed"
+  | "open"
+  | "background-submitting"
+  | "background-failed";
+
+/** Route-scoped lifecycle for the new-session draft. Route identity is kept
+ * opaque so browser and test callers can use their native route values. */
+export interface NewSessionSetupLifecycle<Route> {
+  readonly status: NewSessionSetupStatus;
+  readonly route: Route | undefined;
+  readonly generation: number;
+}
+
+export const createNewSessionSetupLifecycle = <Route>(): NewSessionSetupLifecycle<Route> => ({
+  status: "closed",
+  route: undefined,
+  generation: 0,
+});
+
+export const openNewSessionSetup = <Route>(
+  current: NewSessionSetupLifecycle<Route>,
+  route: Route,
+): NewSessionSetupLifecycle<Route> => {
+  if (current.status === "background-submitting") return current;
+  if (current.status === "background-failed") {
+    return { ...current, status: "open", route };
+  }
+  return { status: "open", route, generation: current.generation + 1 };
+};
+
+export const navigateNewSessionSetup = <Route>(
+  current: NewSessionSetupLifecycle<Route>,
+  route: Route,
+  submissionPending: boolean,
+): NewSessionSetupLifecycle<Route> => {
+  if (current.status !== "open" || current.route === route) return current;
+  if (submissionPending) {
+    return { ...current, status: "background-submitting", route: undefined };
+  }
+  return {
+    status: "closed",
+    route: undefined,
+    generation: current.generation + 1,
+  };
+};
+
+export const failNewSessionSetup = <Route>(
+  current: NewSessionSetupLifecycle<Route>,
+): NewSessionSetupLifecycle<Route> =>
+  current.status === "background-submitting"
+    ? { ...current, status: "background-failed" }
+    : current;
+
+export const closeNewSessionSetup = <Route>(
+  current: NewSessionSetupLifecycle<Route>,
+): NewSessionSetupLifecycle<Route> => ({
+  status: "closed",
+  route: undefined,
+  generation: current.generation + 1,
+});
+
 export interface NewSessionOptionLoadState {
   readonly lifecycle: NewSessionOptionsLifecycle;
   readonly edits: NewThreadOptionEdits;
