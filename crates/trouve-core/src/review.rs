@@ -6315,12 +6315,15 @@ impl Engine {
             }
             if github_review_should_retry_without_comments(status.as_u16(), include_comments, &body)
             {
-                // A model can name a line that is not commentable in GitHub's
-                // diff. Without a visible blocking inline comment, publish a
-                // non-blocking review and retain the findings in the durable
-                // lifecycle comment.
+                // Explicit placement errors establish that only the inline
+                // comments were rejected. A generic 422 does not: retry it
+                // without comments, but preserve a blocking verdict so an
+                // unrelated validation failure cannot silently weaken the
+                // review. Findings remain in the durable lifecycle comment.
                 include_comments = false;
-                event = github_review_event_without_inline_comments(event);
+                if review_comments_failed_to_place(&body) {
+                    event = github_review_event_without_inline_comments(event);
+                }
                 continue;
             }
             if definitive_rejection {
@@ -14239,7 +14242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_placement_422_retries_once_without_inline_comments() {
+    async fn generic_422_retries_without_comments_and_preserves_blocking_verdict() {
         use tokio::io::AsyncWriteExt as _;
 
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -14277,7 +14280,7 @@ mod tests {
                     r#"{"message":"Unprocessable Entity"}"#,
                 ),
                 (
-                    r#""event":"comment""#,
+                    r#""event":"request_changes""#,
                     r#""comments":[]"#,
                     "201 Created",
                     r#"{"id":77,"html_url":"https://github.com/review-77"}"#,
