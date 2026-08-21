@@ -1282,7 +1282,7 @@ cat > /dev/null
 }
 
 #[tokio::test]
-async fn codex_adapter_reasserts_instructions_once_after_cold_resume() {
+async fn codex_adapter_refreshes_changed_instructions_before_reusing_a_thread() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
         tmp.path(),
@@ -1298,21 +1298,30 @@ IFS= read -r line # first turn/start
 printf '%s\n' "$line" > "$0.turn-start-1"
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+IFS= read -r line # second thread/resume after developer instructions change
+printf '%s\n' "$line" > "$0.thread-resume-2"
+echo '{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # second turn/start
 printf '%s\n' "$line" > "$0.turn-start-2"
-echo '{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","id":5,"result":{"turn":{"id":"turn-2"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
+IFS= read -r line # third turn/start reuses the refreshed thread
+printf '%s\n' "$line" > "$0.turn-start-3"
+echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-3"}}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-3","status":"completed"}}}'
 cat > /dev/null
 "#,
     );
     let backend = CodexBackend::new("codex", Some(stub.clone()));
-    for _ in 0..2 {
+    for instructions in ["mode prompt", "updated mode prompt", "updated mode prompt"] {
         let mut stream = start_turn(&backend, || {
-            turn(
+            let mut request = turn(
                 tmp.path().to_path_buf(),
                 Some("thr-1"),
                 BackendPermission::Ask,
-            )
+            );
+            request.instructions = Some(instructions.into());
+            request
         })
         .await;
         while let Some(event) = stream.next().await {
@@ -1335,12 +1344,27 @@ cat > /dev/null
         "<mode-instructions>\nmode prompt\n</mode-instructions>\n\ndo the thing",
         "the first cold-resumed request needs a prompt fallback for Codex versions that delay developer-instruction overrides"
     );
+    let second_resume: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.thread-resume-2")).unwrap())
+            .unwrap();
+    assert_eq!(
+        second_resume["params"]["developerInstructions"], "updated mode prompt",
+        "changed thread-level instructions must force a resume before the next turn"
+    );
     let second_turn: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{stub}.turn-start-2")).unwrap())
             .unwrap();
     assert_eq!(
-        second_turn["params"]["input"][0]["text"], "do the thing",
-        "once this app-server process has applied the instructions, later user prompts stay clean"
+        second_turn["params"]["input"][0]["text"],
+        "<mode-instructions>\nupdated mode prompt\n</mode-instructions>\n\ndo the thing",
+        "the first turn after an instruction change keeps the compatibility fallback"
+    );
+    let third_turn: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.turn-start-3")).unwrap())
+            .unwrap();
+    assert_eq!(
+        third_turn["params"]["input"][0]["text"], "do the thing",
+        "once the refreshed instructions have reached a turn, later user prompts stay clean"
     );
 }
 

@@ -266,17 +266,16 @@ impl AgentBackend for CodexBackend {
 
     async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
         let mcp_config = thread_mcp_config(&codex_config_override(turn));
-        if mcp_config.is_null() {
-            return None;
-        }
         let cached = self.server.lock().await.clone();
         let needs_load = match (cached.as_ref(), turn.session.as_deref()) {
             (Some(server), Some(thread_id)) if !server.is_closed() => {
-                !server.thread_config_matches(thread_id, &mcp_config).await
+                !server
+                    .thread_settings_match(thread_id, &mcp_config, turn.instructions.as_deref())
+                    .await
             }
             _ => true,
         };
-        needs_load.then_some(BackendStartupActivity::ConnectingTools)
+        (needs_load && !mcp_config.is_null()).then_some(BackendStartupActivity::ConnectingTools)
     }
 
     async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
@@ -358,7 +357,11 @@ impl AgentBackend for CodexBackend {
             start_params["model"] = json!(model_name);
         }
         let needs_load = match turn.session.as_deref() {
-            Some(thread_id) => !server.thread_config_matches(thread_id, &mcp_config).await,
+            Some(thread_id) => {
+                !server
+                    .thread_settings_match(thread_id, &mcp_config, turn.instructions.as_deref())
+                    .await
+            }
             None => true,
         };
         let mut fresh_session = false;
@@ -407,7 +410,7 @@ impl AgentBackend for CodexBackend {
         };
         if needs_load {
             server
-                .mark_thread_loaded(&codex_thread_id, mcp_config)
+                .mark_thread_loaded(&codex_thread_id, mcp_config, turn.instructions.clone())
                 .await;
         }
         tracing::info!(
@@ -559,20 +562,20 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
     config
 }
 
-/// Only MCP configuration determines whether a loaded Codex thread needs to
-/// be resumed. Other per-turn settings travel on `turn/start` or the prompt.
 fn thread_mcp_config(config: &Value) -> Value {
     config.get("mcp_servers").cloned().unwrap_or(Value::Null)
 }
 
-fn loaded_thread_config_matches(
-    loaded_threads: &HashMap<String, Value>,
+fn loaded_thread_settings_match(
+    loaded_threads: &HashMap<String, LoadedThreadSettings>,
     thread_id: &str,
     mcp_config: &Value,
+    developer_instructions: Option<&str>,
 ) -> bool {
-    loaded_threads
-        .get(thread_id)
-        .is_some_and(|loaded| loaded == mcp_config)
+    loaded_threads.get(thread_id).is_some_and(|loaded| {
+        loaded.mcp_config == *mcp_config
+            && loaded.developer_instructions.as_deref() == developer_instructions
+    })
 }
 
 /// Split a `<model>@<effort>` id into its parts. Threads created before the
@@ -3360,23 +3363,40 @@ async fn read_stdout<R: AsyncRead + Unpin>(
 
 const THREAD_CACHE_CAP: usize = 256;
 
+#[derive(Debug, PartialEq)]
+struct LoadedThreadSettings {
+    mcp_config: Value,
+    developer_instructions: Option<String>,
+}
+
 #[derive(Default)]
 struct LoadedThreadCache {
-    configs: HashMap<String, Value>,
+    settings: HashMap<String, LoadedThreadSettings>,
     order: VecDeque<String>,
 }
 
 impl LoadedThreadCache {
-    fn remember(&mut self, thread_id: &str, mcp_config: Value) {
-        if !self.configs.contains_key(thread_id) {
-            if self.configs.len() >= THREAD_CACHE_CAP
+    fn remember(
+        &mut self,
+        thread_id: &str,
+        mcp_config: Value,
+        developer_instructions: Option<String>,
+    ) {
+        if !self.settings.contains_key(thread_id) {
+            if self.settings.len() >= THREAD_CACHE_CAP
                 && let Some(evicted) = self.order.pop_front()
             {
-                self.configs.remove(&evicted);
+                self.settings.remove(&evicted);
             }
             self.order.push_back(thread_id.to_string());
         }
-        self.configs.insert(thread_id.to_string(), mcp_config);
+        self.settings.insert(
+            thread_id.to_string(),
+            LoadedThreadSettings {
+                mcp_config,
+                developer_instructions,
+            },
+        );
     }
 }
 struct AppServer {
@@ -3394,7 +3414,7 @@ struct AppServer {
     /// Per-thread guards serializing interruption through replacement
     /// registration.
     turn_lifecycles: TurnLifecycles,
-    /// MCP configuration attached to each thread loaded in this app-server
+    /// Thread-level settings attached to each thread loaded in this app-server
     /// process. A newly spawned process starts empty.
     loaded_threads: Mutex<LoadedThreadCache>,
     /// Instruction set known to have reached at least one turn in this
@@ -3474,16 +3494,31 @@ impl AppServer {
         self.closed.load(Ordering::Relaxed)
     }
 
-    async fn thread_config_matches(&self, thread_id: &str, mcp_config: &Value) -> bool {
+    async fn thread_settings_match(
+        &self,
+        thread_id: &str,
+        mcp_config: &Value,
+        developer_instructions: Option<&str>,
+    ) -> bool {
         let loaded_threads = self.loaded_threads.lock().await;
-        loaded_thread_config_matches(&loaded_threads.configs, thread_id, mcp_config)
+        loaded_thread_settings_match(
+            &loaded_threads.settings,
+            thread_id,
+            mcp_config,
+            developer_instructions,
+        )
     }
 
-    async fn mark_thread_loaded(&self, thread_id: &str, mcp_config: Value) {
+    async fn mark_thread_loaded(
+        &self,
+        thread_id: &str,
+        mcp_config: Value,
+        developer_instructions: Option<String>,
+    ) {
         self.loaded_threads
             .lock()
             .await
-            .remember(thread_id, mcp_config);
+            .remember(thread_id, mcp_config, developer_instructions);
     }
 
     fn instructions_need_prompt_fallback(&self, thread_id: &str, instructions: &str) -> bool {
@@ -7387,29 +7422,60 @@ cat > /dev/null
     }
 
     #[test]
-    fn loaded_threads_are_reused_until_their_mcp_config_changes() {
+    fn loaded_threads_are_reused_until_their_thread_settings_change() {
         let first = json!({ "trouve": { "url": "http://127.0.0.1/thread-1" } });
         let changed = json!({ "trouve": { "url": "http://127.0.0.1/thread-1?tools=1" } });
-        let loaded = HashMap::from([("thread-1".to_string(), first.clone())]);
+        let loaded = HashMap::from([(
+            "thread-1".to_string(),
+            LoadedThreadSettings {
+                mcp_config: first.clone(),
+                developer_instructions: Some("mode prompt".into()),
+            },
+        )]);
 
-        assert!(loaded_thread_config_matches(&loaded, "thread-1", &first));
-        assert!(!loaded_thread_config_matches(&loaded, "thread-1", &changed));
-        assert!(!loaded_thread_config_matches(&loaded, "thread-2", &first));
+        assert!(loaded_thread_settings_match(
+            &loaded,
+            "thread-1",
+            &first,
+            Some("mode prompt")
+        ));
+        assert!(!loaded_thread_settings_match(
+            &loaded,
+            "thread-1",
+            &changed,
+            Some("mode prompt")
+        ));
+        assert!(!loaded_thread_settings_match(
+            &loaded,
+            "thread-1",
+            &first,
+            Some("updated mode prompt")
+        ));
+        assert!(!loaded_thread_settings_match(
+            &loaded,
+            "thread-2",
+            &first,
+            Some("mode prompt")
+        ));
     }
 
     #[test]
     fn loaded_thread_cache_evicts_the_oldest_entry_at_capacity() {
         let mut loaded = LoadedThreadCache::default();
         for index in 0..=THREAD_CACHE_CAP {
-            loaded.remember(&format!("thread-{index}"), json!({ "index": index }));
+            loaded.remember(
+                &format!("thread-{index}"),
+                json!({ "index": index }),
+                Some(format!("instructions-{index}")),
+            );
         }
 
-        assert_eq!(loaded.configs.len(), THREAD_CACHE_CAP);
-        assert!(!loaded.configs.contains_key("thread-0"));
-        assert!(loaded.configs.contains_key("thread-1"));
+        assert_eq!(loaded.settings.len(), THREAD_CACHE_CAP);
+        assert!(!loaded.settings.contains_key("thread-0"));
+        assert!(loaded.settings.contains_key("thread-1"));
         assert!(
             loaded
-                .configs
+                .settings
                 .contains_key(&format!("thread-{THREAD_CACHE_CAP}"))
         );
     }
