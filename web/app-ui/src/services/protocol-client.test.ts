@@ -119,6 +119,25 @@ describe("ProtocolClient", () => {
     expect(String(error)).not.toContain("workspace secret");
   });
 
+  it("preserves structured update-thread errors for the settings UI", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json(
+        { code: "conflict", message: "cannot change thread settings while this thread is running a turn" },
+        { status: 409 },
+      ),
+    );
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+    const error = await client.updateThread("th_1", { permission_mode: "yolo" })
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect(error).toMatchObject({
+      message: "cannot change thread settings while this thread is running a turn",
+      status: 409,
+      code: "conflict",
+    });
+  });
+
   it("loads lightweight diff metadata separately from one encoded file patch", async () => {
     const requests: Request[] = [];
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {

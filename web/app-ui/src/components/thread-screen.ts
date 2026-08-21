@@ -5269,9 +5269,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       const updated = await services.protocol.updateThread(threadId, request);
       if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
       store.upsertThread(updated);
-    } catch {
+    } catch (error) {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
-        this.#requestError = errorMessage;
+        const detail = error instanceof Error ? error.message.trim() : "";
+        this.#requestError = detail === "" || detail === "update thread request failed"
+          ? errorMessage
+          : `${errorMessage} ${detail}`;
       }
     } finally {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
