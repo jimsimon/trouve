@@ -106,5 +106,8 @@ describe("root shell parity wiring", () => {
     expect(source).toContain('if (this.#newSessionSetup.status !== "open") return;');
     expect(source).toContain("navigateNewSessionSetup(");
     expect(source).toContain("this.#resetNewSession();");
+    expect(source).toContain('routeKey(readSignal(this.#router.route))');
+    expect(source).toContain('if (!restoringDraft) void this.#loadNewSessionBranches');
+    expect(source).toContain('this.querySelector<HTMLElement>("main.app-shell")?.focus()');
   });
 });

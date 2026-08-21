@@ -84,64 +84,64 @@ export type NewSessionSetupStatus =
 
 /** Route-scoped lifecycle for the new-session draft. Route identity is kept
  * opaque so browser and test callers can use their native route values. */
-export interface NewSessionSetupLifecycle<Route> {
+export interface NewSessionSetupLifecycle {
   readonly status: NewSessionSetupStatus;
-  readonly route: Route | undefined;
+  readonly routeKey: string;
   readonly generation: number;
 }
 
-export const createNewSessionSetupLifecycle = <Route>(): NewSessionSetupLifecycle<Route> => ({
+export const createNewSessionSetupLifecycle = (): NewSessionSetupLifecycle => ({
   status: "closed",
-  route: undefined,
+  routeKey: "",
   generation: 0,
 });
 
-export const openNewSessionSetup = <Route>(
-  current: NewSessionSetupLifecycle<Route>,
-  route: Route,
-): NewSessionSetupLifecycle<Route> => {
+export const openNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+  routeKey: string,
+): NewSessionSetupLifecycle => {
   if (current.status === "background-submitting") return current;
   if (current.status === "background-failed") {
-    return { ...current, status: "open", route };
+    return { ...current, status: "open", routeKey };
   }
-  return { status: "open", route, generation: current.generation + 1 };
+  return { status: "open", routeKey, generation: current.generation + 1 };
 };
 
-export const navigateNewSessionSetup = <Route>(
-  current: NewSessionSetupLifecycle<Route>,
-  route: Route,
+export const navigateNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+  routeKey: string,
   submissionPending: boolean,
-): NewSessionSetupLifecycle<Route> => {
-  if (current.status !== "open" || current.route === route) return current;
+): NewSessionSetupLifecycle => {
+  if (current.status !== "open" || current.routeKey === routeKey) return current;
   if (submissionPending) {
-    return { ...current, status: "background-submitting", route: undefined };
+    return { ...current, status: "background-submitting", routeKey: "" };
   }
   return {
     status: "closed",
-    route: undefined,
+    routeKey: "",
     generation: current.generation + 1,
   };
 };
 
-export const failNewSessionSetup = <Route>(
-  current: NewSessionSetupLifecycle<Route>,
-): NewSessionSetupLifecycle<Route> =>
+export const failNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+): NewSessionSetupLifecycle =>
   current.status === "background-submitting"
     ? { ...current, status: "background-failed" }
     : current;
 
-export const closeNewSessionSetup = <Route>(
-  current: NewSessionSetupLifecycle<Route>,
-): NewSessionSetupLifecycle<Route> => ({
+export const closeNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+): NewSessionSetupLifecycle => ({
   status: "closed",
-  route: undefined,
+  routeKey: "",
   generation: current.generation + 1,
 });
 
-export const completeNewSessionSetup = <Route>(
-  current: NewSessionSetupLifecycle<Route>,
+export const completeNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
 ): {
-  readonly lifecycle: NewSessionSetupLifecycle<Route>;
+  readonly lifecycle: NewSessionSetupLifecycle;
   readonly navigateToSession: boolean;
 } => ({
   lifecycle: closeNewSessionSetup(current),

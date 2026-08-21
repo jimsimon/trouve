@@ -109,6 +109,9 @@ export const routeHref = (route: Exclude<AppRoute, { kind: "not-found" }>): stri
   return path;
 };
 
+export const routeKey = (route: AppRoute): string =>
+  route.kind === "not-found" ? `not-found:${route.pathname}` : routeHref(route);
+
 export interface RouterPlatform {
   readonly pathname: () => string;
   readonly push: (href: string) => void;

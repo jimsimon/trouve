@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { AppRouter, parseRoute, routeHref } from "./app-router.js";
+import { AppRouter, parseRoute, routeHref, routeKey } from "./app-router.js";
 import { readSignal } from "../state/reactivity.js";
 
 describe("application routes", () => {
@@ -46,6 +46,13 @@ describe("application routes", () => {
     expect(parseRoute(routeHref({ kind: "automations" }))).toEqual({
       kind: "automations",
     });
+  });
+
+  it("uses semantic route keys for independently parsed equivalent routes", () => {
+    expect(routeKey(parseRoute("/settings/providers")))
+      .toBe(routeKey({ kind: "settings", section: "providers" }));
+    expect(routeKey({ kind: "not-found", pathname: "/unknown" }))
+      .toBe("not-found:/unknown");
   });
 
   it("owns navigation without replacing the stable router service", () => {

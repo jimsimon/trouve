@@ -14,6 +14,7 @@ import {
 import {
   createBrowserRouter,
   parseRoute,
+  routeKey,
   type AppRoute,
   type InspectionPanel,
 } from "../router/app-router.js";
@@ -395,8 +396,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #pwaInstallPrompt: PwaInstallPromptEvent | undefined;
   #pwaInstallPending = false;
   #pwaInstallStatus = "";
-  #newSessionSetup: NewSessionSetupLifecycle<AppRoute> =
-    createNewSessionSetupLifecycle<AppRoute>();
+  #newSessionSetup: NewSessionSetupLifecycle = createNewSessionSetupLifecycle();
   #newSessionPending = false;
   #newSessionError = "";
   #newSessionWorkspaceId = "";
@@ -507,7 +507,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const connectedRoute = readSignal(this.#router.route);
     if (
       this.#newSessionSetup.status === "open"
-      && this.#newSessionSetup.route !== connectedRoute
+      && this.#newSessionSetup.routeKey !== routeKey(connectedRoute)
     ) {
       this.#routeChanged(connectedRoute);
     }
@@ -1406,7 +1406,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (workspace === undefined) return;
     const opened = openNewSessionSetup(
       this.#newSessionSetup,
-      readSignal(this.#router.route),
+      routeKey(readSignal(this.#router.route)),
     );
     if (opened === this.#newSessionSetup) return;
     this.#newSessionSetup = opened;
@@ -1432,7 +1432,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#resizeNewSessionPrompt(textarea);
     });
     const setupWorkspaceId = this.#newSessionWorkspaceId;
-    void this.#loadNewSessionBranches(setupWorkspaceId);
+    if (!restoringDraft) void this.#loadNewSessionBranches(setupWorkspaceId);
     void this.#loadNewSessionOptions(setupWorkspaceId, restoringDraft);
   }
 
@@ -1972,21 +1972,32 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (this.#newSessionSetup.status !== "open") return;
     const next = navigateNewSessionSetup(
       this.#newSessionSetup,
-      route,
+      routeKey(route),
       this.#newSessionPending,
     );
     if (next === this.#newSessionSetup) return;
+    const restoreFocus = this.querySelector("#new-session-screen")
+      ?.contains(globalThis.document?.activeElement ?? null) === true;
     if (this.#newSessionPending) {
       this.#newSessionSetup = next;
       // Navigation cannot cancel a create request already accepted by the
       // server. Hide its setup without clearing attachments that the request
       // still needs while it finishes in the background.
       this.requestUpdate();
+      this.#restoreFocusAfterNewSessionDismissal(restoreFocus);
       return;
     }
     this.#resetNewSession();
     this.requestUpdate();
+    this.#restoreFocusAfterNewSessionDismissal(restoreFocus);
   };
+
+  #restoreFocusAfterNewSessionDismissal(restoreFocus: boolean): void {
+    if (!restoreFocus) return;
+    void this.updateComplete.then(() => {
+      this.querySelector<HTMLElement>("main.app-shell")?.focus();
+    });
+  }
 
   #resetNewSession(): void {
     this.#newSessionSetup = closeNewSessionSetup(this.#newSessionSetup);
@@ -2255,7 +2266,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     } catch {
       this.#newSessionSetup = navigateNewSessionSetup(
         this.#newSessionSetup,
-        readSignal(this.#router.route),
+        routeKey(readSignal(this.#router.route)),
         true,
       );
       this.#newSessionPending = false;
@@ -2299,7 +2310,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
     this.#newSessionSetup = navigateNewSessionSetup(
       this.#newSessionSetup,
-      readSignal(this.#router.route),
+      routeKey(readSignal(this.#router.route)),
       true,
     );
     const completion = completeNewSessionSetup(this.#newSessionSetup);
@@ -2720,6 +2731,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       || route.kind === "automations";
     return html`
       <main
+        tabindex="-1"
         class="app-shell mobile-pane-${this.#mobilePane} ${fullScreenRoute
           ? "full-screen-route"
           : ""} ${this.#newSessionSetup.status === "open" ? "new-session-open" : ""}"
@@ -3073,6 +3085,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 .value=${this.#newSessionBaseRef}
                 @change=${(event: Event) => {
                   this.#newSessionBaseRef = (event.currentTarget as HTMLSelectElement).value;
+                  this.#newSessionPreferredBaseRef = this.#newSessionBaseRef;
                 }}
                 ?disabled=${this.#newSessionPending || this.#newSessionBranchesPending}
               >

@@ -65,9 +65,9 @@ const providers = (defaultModel: string): ProtocolProvidersResponse => ({
 
 describe("new session model", () => {
   it("scopes setup visibility to its opening route and restores failed background drafts", () => {
-    const settings = { kind: "settings" };
-    const inbox = { kind: "inbox" };
-    const initial = createNewSessionSetupLifecycle<object>();
+    const settings = "/settings";
+    const inbox = "/inbox";
+    const initial = createNewSessionSetupLifecycle();
     const opened = openNewSessionSetup(initial, inbox);
 
     expect(navigateNewSessionSetup(opened, inbox, false)).toBe(opened);
@@ -80,7 +80,7 @@ describe("new session model", () => {
     expect(failed.status).toBe("background-failed");
     expect(openNewSessionSetup(failed, settings)).toEqual({
       status: "open",
-      route: settings,
+      routeKey: settings,
       generation: opened.generation,
     });
     expect(completeNewSessionSetup(background)).toMatchObject({
@@ -92,13 +92,13 @@ describe("new session model", () => {
 
   it("discards idle drafts on navigation and advances their generation", () => {
     const opened = openNewSessionSetup(
-      createNewSessionSetupLifecycle<string>(),
+      createNewSessionSetupLifecycle(),
       "inbox",
     );
     const navigated = navigateNewSessionSetup(opened, "settings", false);
     expect(navigated).toEqual({
       status: "closed",
-      route: undefined,
+      routeKey: "",
       generation: opened.generation + 1,
     });
     expect(closeNewSessionSetup(navigated).generation).toBe(navigated.generation + 1);
