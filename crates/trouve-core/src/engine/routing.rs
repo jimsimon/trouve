@@ -46,11 +46,10 @@ impl Engine {
             background_mutation_lease: None,
         };
 
-        let modes =
-            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
-        let mode = modes::find_mode(&modes, &thread.mode)
+        let personas = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        let mode = personas::find_persona(&personas, &thread.mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
 
         let mut candidates = tokio::select! {
             biased;
@@ -459,7 +458,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         tool_ctx: &ToolCtx,
         route: &ModelCandidate,
         specs: &[ToolSpec],
@@ -784,7 +783,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         route: &ModelCandidate,
         initial_content: &str,
         attachments: &[trouve_agents::TurnAttachment],
@@ -800,6 +799,7 @@ impl Engine {
         let ModelExecutor::Backend(backend) = &route.executor else {
             unreachable!("backend route helper received a native provider")
         };
+        let effective_read_only = !tools_enabled || mode.read_only;
         let scope = Scope::Thread(thread.id.clone());
         let backend_id = &route.provider_id;
         let payloads = if retrying {
@@ -1276,7 +1276,7 @@ impl Engine {
                                     session.clone(),
                                     approval.thread,
                                     approval.turn,
-                                    approval.mode,
+                                    effective_read_only || approval.mode.read_only,
                                     approval.call_id,
                                     approval.tool,
                                     approval.args,
@@ -1385,7 +1385,7 @@ impl Engine {
                         session.clone(),
                         thread.clone(),
                         turn,
-                        mode.clone(),
+                        effective_read_only,
                         call_id,
                         tool,
                         args,

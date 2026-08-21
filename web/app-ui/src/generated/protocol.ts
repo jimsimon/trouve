@@ -495,6 +495,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/config/provider-order": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_provider_order"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/github/prs/refresh": {
         parameters: {
             query?: never;
@@ -774,6 +790,22 @@ export interface paths {
             cookie?: never;
         };
         get: operations["mcp_server_logs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/model-routes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_model_routes"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2601,7 +2633,11 @@ export interface components {
         CreateThreadRequest: {
             /** @description Agent persona id (default: "code"). */
             mode?: string | null;
-            /** @description Provider/model identifier, e.g. "openai/gpt-4.1". */
+            /**
+             * @description Model id from `/v1/model-routes`. `auto/<model>` selects dynamically;
+             *     `provider/<model>` explicitly pins the thread to that route. Bare
+             *     neutral ids remain accepted for compatibility.
+             */
             model?: string | null;
             /** @description Model-specific options validated against the model's options schema. */
             model_options?: {
@@ -2656,6 +2692,15 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "turn.phase_changed";
+        } | {
+            model: string;
+            provider_id: string;
+            provider_model: string;
+            reason: components["schemas"]["ModelRouteReason"];
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "model.route_selected";
         } | {
             /** Format: int64 */
             turn: number;
@@ -3381,6 +3426,20 @@ export interface components {
             supports_tools: boolean;
         };
         /**
+         * @description One concrete provider route for an automatic or pinned model selection.
+         *     `provider_model` is the provider's own model id, without trouve's
+         *     provider prefix, and is the value passed to that provider at execution.
+         */
+        ModelRouteInfo: {
+            provider_id: string;
+            provider_model: string;
+        };
+        /**
+         * @description Why an automatic model selected a concrete provider route.
+         * @enum {string}
+         */
+        ModelRouteReason: "initial" | "capacity_failover" | "route_failover";
+        /**
          * @description Initial dimensions for a newly created terminal. The singular compatibility
          *     endpoint ignores these values when it re-attaches to a live terminal.
          */
@@ -3913,7 +3972,10 @@ export interface components {
             };
         };
         ProvidersResponse: {
-            /** @description Default model for new threads, e.g. "openai/gpt-4.1-mini". */
+            /**
+             * @description Default model for new threads. `auto/<model>` selects dynamically and
+             *     `provider/<model>` pins one route. Bare neutral values remain accepted.
+             */
             default_model: string;
             /**
              * @description Global default permission mode for new threads, used by modes without
@@ -3925,6 +3987,12 @@ export interface components {
              *     model at its own default.
              */
             default_thinking_level?: string | null;
+            /**
+             * @description Provider ids in preferred routing order. Every currently configured
+             *     provider is present; providers not explicitly ordered on the server
+             *     are appended deterministically.
+             */
+            provider_order?: string[];
             providers: components["schemas"]["ProviderInfo"][];
         };
         /**
@@ -4043,6 +4111,39 @@ export interface components {
         };
         /** @enum {string} */
         ReviewerPromptMode: "inherit" | "append" | "replace";
+        /**
+         * @description A model-picker entry. Automatic entries contain every compatible route;
+         *     concrete provider entries contain exactly one. [`ModelInfo`] remains the
+         *     provider-qualified compatibility catalog.
+         */
+        RoutedModelInfo: {
+            /**
+             * Format: int64
+             * @description Smallest context window across the available routes, so clients never
+             *     advertise a limit that the selected provider cannot honor.
+             */
+            context_window: number;
+            display_name: string;
+            /**
+             * @description `auto/<model>` for dynamic routing, or `provider/<model>` for a hard
+             *     pin. Models without a safe shared identity have only concrete entries.
+             */
+            id: string;
+            /**
+             * Format: double
+             * @description Prices are present only when every route reports the same value.
+             */
+            input_price_per_mtok?: number | null;
+            /**
+             * @description Provider-neutral options schema. Provider-specific option names are
+             *     translated after the harness selects a route.
+             */
+            options_schema: unknown;
+            /** Format: double */
+            output_price_per_mtok?: number | null;
+            routes: components["schemas"]["ModelRouteInfo"][];
+            supports_tools: boolean;
+        };
         /** @description Which stream an event belongs to. Cursors are monotonic per scope. */
         Scope: "server" | {
             session: components["schemas"]["String"];
@@ -4228,7 +4329,7 @@ export interface components {
              *     models that do support it.
              */
             default_thinking_level?: string | null;
-            /** @description Provider-qualified id, e.g. "openai/gpt-4.1-mini". */
+            /** @description `auto/<model>` id, or a provider-qualified id to pin a route. */
             model: string;
         };
         /**
@@ -4273,6 +4374,13 @@ export interface components {
             scope: string;
             /** @description Required for workspace scope: whose `.agents/.mcp.json` to edit. */
             workspace_id?: string | null;
+        };
+        /**
+         * @description Replace the global preference prefix used for provider-neutral routing.
+         *     Omitted configured providers remain eligible after the listed providers.
+         */
+        SetProviderOrderRequest: {
+            provider_ids: string[];
         };
         /**
          * @description A steering message accepted by the active vendor turn. Durable display
@@ -4741,6 +4849,10 @@ export interface components {
          */
         UpdateThreadRequest: {
             mode?: string | null;
+            /**
+             * @description `auto/<model>` selects dynamically; `provider/<model>` is a hard pin.
+             *     Changing this value clears the thread's automatic route affinity.
+             */
             model?: string | null;
             /** @description Replaces the thread's model options when present. */
             model_options?: {
@@ -6023,6 +6135,35 @@ export interface operations {
             };
         };
     };
+    set_provider_order: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetProviderOrderRequest"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     refresh_github_prs: {
         parameters: {
             query?: {
@@ -6553,6 +6694,25 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["McpLogs"];
+                };
+            };
+        };
+    };
+    list_model_routes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoutedModelInfo"][];
                 };
             };
         };
