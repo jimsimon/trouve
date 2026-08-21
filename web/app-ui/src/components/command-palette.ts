@@ -35,6 +35,69 @@ const stateLabel = (state: NonNullable<CommandPaletteItem["state"]>): string =>
     failed: "Failed",
   })[state];
 
+export const renderCommandPaletteOption = (
+  item: CommandPaletteItem,
+  index: number,
+  selected: boolean,
+  activate: (item: CommandPaletteItem) => void,
+) => {
+  const workDescription = item.sessionIndicator?.tooltip
+    || (item.state === undefined ? "" : stateLabel(item.state));
+  const stateDescription = [
+    workDescription,
+    item.pullRequestBadge?.tooltip,
+  ].filter((part) => part !== undefined && part !== "").join(". ");
+  const accessibleDescription = [
+    item.label,
+    item.current === true ? "Current" : "",
+    stateDescription,
+    item.detail,
+  ].filter((part) => part !== "").join(", ");
+  return html`
+    <button
+      id=${`command-palette-option-${index}`}
+      class="command-palette-option"
+      type="button"
+      role="option"
+      tabindex="-1"
+      aria-selected=${selected ? "true" : "false"}
+      aria-label=${accessibleDescription}
+      data-command-index=${index}
+      @click=${() => activate(item)}
+    >
+      <span class="command-palette-icon" aria-hidden="true">
+        ${item.sessionIndicator !== undefined
+          ? html`<span
+              class="session-indicator ${item.sessionIndicator.kind}"
+              title=${item.sessionIndicator.tooltip === ""
+                ? nothing
+                : item.sessionIndicator.tooltip}
+            >${item.sessionIndicator.icon === undefined
+              ? nothing
+              : fontAwesomeIcon(item.sessionIndicator.icon)}</span>`
+          : item.icon === undefined ? nothing : fontAwesomeIcon(item.icon)}
+      </span>
+      <span class="command-palette-copy">
+        <strong>${item.label}</strong>
+        <small>${item.detail}</small>
+      </span>
+      ${item.current !== true && item.pullRequestBadge === undefined
+        ? nothing
+        : html`<span class="command-palette-trailing">
+            ${item.current !== true
+              ? nothing
+              : html`<span class="command-palette-current">Current</span>`}
+            ${item.pullRequestBadge === undefined
+              ? nothing
+              : html`<span
+                  class="session-pr-badge ${item.pullRequestBadge.tone}"
+                  title=${item.pullRequestBadge.tooltip}
+                >${fontAwesomeIcon("code-pull-request")}</span>`}
+          </span>`}
+    </button>
+  `;
+};
+
 export class TrouveCommandPalette extends withSignalTracking(LitElement) {
   protected override createRenderRoot(): HTMLElement {
     return this;
@@ -324,55 +387,12 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
         aria-labelledby=${`command-group-${group}`}
       >
         <h2 id=${`command-group-${group}`}>${group}</h2>
-        ${indexed.map(({ item, index }) => {
-          const stateDescription = item.pullRequestBadge?.tooltip
-            || item.sessionIndicator?.tooltip
-            || (item.state === undefined ? "" : stateLabel(item.state));
-          const accessibleDescription = [
-            item.label,
-            item.current === true ? "Current" : "",
-            stateDescription,
-            item.detail,
-          ].filter((part) => part !== "").join(", ");
-          return html`
-            <button
-              id=${`command-palette-option-${index}`}
-              class="command-palette-option"
-              type="button"
-              role="option"
-              tabindex="-1"
-              aria-selected=${index === this.#selectedIndex ? "true" : "false"}
-              aria-label=${accessibleDescription}
-              data-command-index=${index}
-              @click=${() => this.#activate(item)}
-            >
-              <span class="command-palette-icon" aria-hidden="true">
-                ${item.pullRequestBadge !== undefined
-                  ? html`<span
-                      class="session-pr-badge ${item.pullRequestBadge.tone}"
-                      title=${item.pullRequestBadge.tooltip}
-                    >${fontAwesomeIcon("code-pull-request")}</span>`
-                  : item.sessionIndicator !== undefined
-                  ? html`<span
-                      class="session-indicator ${item.sessionIndicator.kind}"
-                      title=${item.sessionIndicator.tooltip === ""
-                        ? nothing
-                        : item.sessionIndicator.tooltip}
-                    >${item.sessionIndicator.icon === undefined
-                      ? nothing
-                      : fontAwesomeIcon(item.sessionIndicator.icon)}</span>`
-                  : item.icon === undefined ? nothing : fontAwesomeIcon(item.icon)}
-              </span>
-              <span class="command-palette-copy">
-                <strong>${item.label}</strong>
-                <small>${item.detail}</small>
-              </span>
-              ${item.current !== true
-                ? nothing
-                : html`<span class="command-palette-current">Current</span>`}
-            </button>
-          `;
-        })}
+        ${indexed.map(({ item, index }) => renderCommandPaletteOption(
+          item,
+          index,
+          index === this.#selectedIndex,
+          (candidate) => this.#activate(candidate),
+        ))}
       </section>
     `;
   }

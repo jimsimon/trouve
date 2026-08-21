@@ -74,13 +74,9 @@ describe("session pull-request navigation badges", () => {
     expect(sessionPullRequestBadge([])).toBeUndefined();
   });
 
-  it("uses the same session-state precedence in every navigator", () => {
+  it("returns a ready pull-request badge and no badge for an empty list", () => {
     const ready = [pr(7, { merge_state_status: "clean" })];
-    expect(visibleSessionPullRequestBadge(ready, "idle", false)?.tone).toBe("ready");
-    expect(visibleSessionPullRequestBadge(ready, "done", true)?.tone).toBe("ready");
-    expect(visibleSessionPullRequestBadge(ready, "running", true)).toBeUndefined();
-    expect(visibleSessionPullRequestBadge(ready, "attention", true)).toBeUndefined();
-    expect(visibleSessionPullRequestBadge(ready, "failed", true)).toBeUndefined();
-    expect(visibleSessionPullRequestBadge(ready, "done", false)).toBeUndefined();
+    expect(visibleSessionPullRequestBadge(ready)?.tone).toBe("ready");
+    expect(visibleSessionPullRequestBadge([])).toBeUndefined();
   });
 });
