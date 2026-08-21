@@ -1364,6 +1364,7 @@ fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> 
     THINKING_OPTION_KEYS
         .iter()
         .any(|key| options.contains_key(*key))
+        || options.contains_key("thinking_budget_tokens")
 }
 
 fn inherit_thinking_option(
@@ -1435,6 +1436,12 @@ fn normalize_thinking_option(
         if let Some(model) = model
             && let Some((minimum, maximum)) = advertised_thinking_budget(model)
         {
+            // An explicit native budget wins over a legacy/inherited canonical
+            // value, just as native enum options do below.
+            if options.contains_key("thinking_budget_tokens") {
+                options.remove("thinking_level");
+                return;
+            }
             let selected = canonical
                 .as_str()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -21816,6 +21823,20 @@ default_permission_mode = "ask"
             }),
             ..model.clone()
         };
+        let mut explicit_budget = serde_json::Map::from_iter([(
+            "thinking_budget_tokens".into(),
+            serde_json::json!(8192),
+        )]);
+        inherit_thinking_option(&mut explicit_budget, Some("16384"), None);
+        assert_eq!(explicit_budget.len(), 1, "an explicit token budget wins");
+        explicit_budget.insert("thinking_level".into(), serde_json::json!("16384"));
+        normalize_thinking_option(&mut explicit_budget, Some(&fixed_model));
+        assert_eq!(
+            explicit_budget.get("thinking_budget_tokens"),
+            Some(&serde_json::json!(8192))
+        );
+        assert!(!explicit_budget.contains_key("thinking_level"));
+
         options.remove("reasoning_effort");
         options.insert("thinking_level".into(), serde_json::json!("16384"));
         normalize_thinking_option(&mut options, Some(&fixed_model));

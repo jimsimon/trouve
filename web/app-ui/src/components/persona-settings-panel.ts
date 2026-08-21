@@ -2,8 +2,8 @@ import { ContextConsumer } from "@lit/context";
 import { css, html, LitElement, nothing } from "lit";
 
 import {
+  canonicalThinkingSelection,
   thinkingOption,
-  thinkingSelectionIsValid,
 } from "../app/new-session-model.js";
 import { appServicesContext } from "../contexts/app-contexts.js";
 import type {
@@ -158,6 +158,18 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const permission = String(data.get("permission_mode") ?? "ask") as PermissionMode;
     const thinking = String(data.get("thinking") ?? "");
     if (!["ask", "allow_list", "yolo"].includes(permission)) return;
+    const option = thinkingOption(
+      this.#availableModels().find((candidate) => candidate.id === model),
+    );
+    const canonicalThinking = thinking === ""
+      ? null
+      : canonicalThinkingSelection(option, thinking);
+    if (canonicalThinking === undefined) {
+      this.#message = "Choose a thinking setting supported by the selected model.";
+      this.#error = true;
+      this.requestUpdate();
+      return;
+    }
     this.#busy = true;
     this.#message = "Saving defaults…";
     this.#error = false;
@@ -165,7 +177,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     try {
       await protocol.setGlobalDefaults({
         model,
-        default_thinking_level: thinking || null,
+        default_thinking_level: canonicalThinking,
         permission_mode: permission,
       });
       const success = "Defaults saved for new threads.";
@@ -209,19 +221,34 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     }
     const modelValue = data.get("default_model");
     const thinkingValue = data.get("default_thinking_level");
+    const defaultModel = modelValue === null
+      ? existing?.persona.default_model ?? null
+      : String(modelValue) || null;
+    const rawThinking = thinkingValue === null
+      ? existing?.persona.default_thinking_level ?? null
+      : String(thinkingValue) || null;
+    const effectiveModel = defaultModel || this.#providers?.default_model || "";
+    const option = thinkingOption(
+      this.#availableModels().find((candidate) => candidate.id === effectiveModel),
+    );
+    const defaultThinking = rawThinking === null
+      ? null
+      : canonicalThinkingSelection(option, rawThinking);
+    if (defaultThinking === undefined) {
+      this.#message = "Choose a thinking setting supported by the selected model.";
+      this.#error = true;
+      this.requestUpdate();
+      return;
+    }
     const request: ProtocolUpsertPersonaRequest = {
       display_name: displayName,
       group,
       system_prompt: systemPrompt,
       allowed_tools: splitTools(String(data.get("allowed_tools") ?? "")),
       read_only: data.get("read_only") === "on",
-      default_model: modelValue === null
-        ? existing?.persona.default_model ?? null
-        : String(modelValue) || null,
+      default_model: defaultModel,
       default_permission_mode: permission === "" ? null : permission as PermissionMode,
-      default_thinking_level: thinkingValue === null
-        ? existing?.persona.default_thinking_level ?? null
-        : String(thinkingValue) || null,
+      default_thinking_level: defaultThinking,
     };
     this.#busy = true;
     this.#message = `Saving ${id}…`;
@@ -309,7 +336,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
             const effectiveModelId = configuredModelId || this.#providers?.default_model || "";
             const option = thinkingOption(this.#availableModels().find((candidate) => candidate.id === effectiveModelId));
             const current = this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? "";
-            this.#modeFormThinkingDraft = thinkingSelectionIsValid(option, current) ? current : "";
+            this.#modeFormThinkingDraft = canonicalThinkingSelection(option, current) ?? "";
             this.requestUpdate();
           }}><option value="">Global default</option>${this.#availableModels().map((candidate) => html`<option value=${candidate.id}>${modelSelectorLabel(candidate)}</option>`)}</select></label>
           ${editorThinking === undefined
@@ -406,8 +433,16 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
                   ?disabled=${readOnly || this.#busy}
                   @change=${(event: Event) => {
                     const value = (event.currentTarget as HTMLInputElement).value;
-                    if (value !== "" && !thinkingSelectionIsValid(thinking, value)) return;
-                    void this.#updateModeDefaults(info, { thinking: value || null });
+                    const canonical = value === ""
+                      ? null
+                      : canonicalThinkingSelection(thinking, value);
+                    if (canonical === undefined) {
+                      this.#message = "Choose a thinking budget within the selected model's range.";
+                      this.#error = true;
+                      this.requestUpdate();
+                      return;
+                    }
+                    void this.#updateModeDefaults(info, { thinking: canonical });
                   }}
                 />`}
         </div>
@@ -437,7 +472,10 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
             <label><span class="visually-hidden">Default model</span><select required name="model" .value=${this.#defaultModelDraft || this.#providers?.default_model || ""} ?disabled=${this.#busy || models.length === 0} @change=${(event: Event) => {
               this.#defaultModelDraft = (event.currentTarget as HTMLSelectElement).value;
               const option = thinkingOption(this.#availableModels().find((model) => model.id === this.#defaultModelDraft));
-              if (!thinkingSelectionIsValid(option, this.#defaultThinkingDraft)) this.#defaultThinkingDraft = "";
+              this.#defaultThinkingDraft = canonicalThinkingSelection(
+                option,
+                this.#defaultThinkingDraft,
+              ) ?? "";
               this.requestUpdate();
             }}><option value="" disabled>Choose model</option>${models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
           </div>

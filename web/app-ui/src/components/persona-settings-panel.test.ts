@@ -16,7 +16,7 @@ describe("persona settings thinking controls", () => {
 
   it("derives enum levels and fixed budgets from the shared model schema", () => {
     expect(source).toContain("thinkingOption(");
-    expect(source).toContain("thinkingSelectionIsValid(");
+    expect(source).toContain("canonicalThinkingSelection(");
     expect(source).toContain("Global default thinking budget (tokens)");
     expect(source).toContain("Default thinking budget (tokens)");
     expect(source).toContain('type="number"');

@@ -235,28 +235,45 @@ export const thinkingOption = (
   return undefined;
 };
 
+/**
+ * Parse a persisted/form thinking token against its model-advertised control.
+ * Numeric controls use the HTML number grammar and return a canonical decimal
+ * integer so accepted exponent-form values are safe to persist.
+ */
+export const canonicalThinkingSelection = (
+  option: ThinkingOption | null | undefined,
+  value: string | null | undefined,
+): string | undefined => {
+  const selected = nonEmpty(value);
+  if (option == null || selected === undefined) return undefined;
+  if (option.values.includes(selected)) return selected;
+  if (
+    option.budget === undefined
+    || !/^-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/iu.test(selected)
+  ) return undefined;
+  const budget = Number(selected);
+  return Number.isSafeInteger(budget)
+    && budget >= option.budget.minimum
+    && (option.budget.maximum === undefined || budget <= option.budget.maximum)
+    ? String(budget)
+    : undefined;
+};
+
 /** Validate a persisted/form thinking token against its model-advertised control. */
 export const thinkingSelectionIsValid = (
   option: ThinkingOption | null | undefined,
   value: string | null | undefined,
-): boolean => {
-  const selected = nonEmpty(value);
-  if (option == null || selected === undefined) return false;
-  if (option.values.includes(selected)) return true;
-  if (option.budget === undefined || !/^\d+$/u.test(selected)) return false;
-  const budget = Number(selected);
-  return Number.isSafeInteger(budget)
-    && budget >= option.budget.minimum
-    && (option.budget.maximum === undefined || budget <= option.budget.maximum);
-};
+): boolean => canonicalThinkingSelection(option, value) !== undefined;
 
 /** Resolve a valid configured value, schema default, or first/minimum option. */
 export const defaultThinkingSelection = (
   option: ThinkingOption | null | undefined,
   configured?: string | null,
 ): string => {
-  if (thinkingSelectionIsValid(option, configured)) return configured?.trim() ?? "";
-  if (thinkingSelectionIsValid(option, option?.defaultValue)) return option?.defaultValue ?? "";
+  const configuredSelection = canonicalThinkingSelection(option, configured);
+  if (configuredSelection !== undefined) return configuredSelection;
+  const defaultSelection = canonicalThinkingSelection(option, option?.defaultValue);
+  if (defaultSelection !== undefined) return defaultSelection;
   if (option?.budget !== undefined) return String(option.budget.minimum);
   return option?.values[0] ?? "";
 };

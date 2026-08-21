@@ -8,6 +8,7 @@ import type {
 import {
   beginNewSessionOptionLoad,
   canSubmitNewSession,
+  canonicalThinkingSelection,
   createNewSessionOptionsLifecycle,
   createNewSessionThreadRequest,
   createNewSessionThreadRequestFromSnapshot,
@@ -144,6 +145,9 @@ describe("new session model", () => {
       budget: { minimum: 1024, maximum: 32768 },
     });
     expect(thinkingSelectionIsValid(option, "16384")).toBe(true);
+    expect(thinkingSelectionIsValid(option, "1e4")).toBe(true);
+    expect(canonicalThinkingSelection(option, "1e4")).toBe("10000");
+    expect(defaultThinkingSelection(option, "1e4")).toBe("10000");
     expect(thinkingSelectionIsValid(option, "512")).toBe(false);
     expect(thinkingSelectionIsValid(option, "1.5")).toBe(false);
     expect(defaultThinkingSelection(option)).toBe("4096");
