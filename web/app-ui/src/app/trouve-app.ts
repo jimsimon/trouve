@@ -2972,17 +2972,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               title="Command palette (Ctrl/Cmd-K)"
               @click=${this.#openCommandPalette}
             >${fontAwesomeIcon("magnifying-glass")}</button>
-            <wa-button
-              size="s"
+            <button
+              class="workspace-open-button"
+              type="button"
               aria-label="Open workspace"
               title=${directoryPickerAvailable
                 ? "Choose a repository folder"
                 : "Browse is unavailable here; register a server-host path in Settings"}
               ?disabled=${!directoryPickerAvailable || this.#workspacePickerPending}
               @click=${() => void this.#openWorkspace()}
-            >${this.#workspacePickerPending
-              ? "Opening…"
-              : html`${fontAwesomeIcon("plus")} Open`}</wa-button>
+            >${fontAwesomeIcon(this.#workspacePickerPending ? "spinner" : "plus", {
+                spin: this.#workspacePickerPending,
+              })}</button>
           </div>
           <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">${this.#workspaceOrderStatus}</p>
           ${orderedWorkspaces.map(
