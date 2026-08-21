@@ -9835,6 +9835,7 @@ fn semantic_routing_prompt(
     candidates: &[ReviewerProfile],
 ) -> String {
     let batch_identity = review_batch_identity(batch, batch_index, batch_count);
+    let pull_title = serde_json::Value::String(job.pull_title.clone()).to_string();
     let catalog = candidates
         .iter()
         .map(|reviewer| {
@@ -9862,7 +9863,14 @@ fn semantic_routing_prompt(
     };
     format!(
         "{batch_identity}\nRoute complete diff batch {batch_number}/{batch_count} for pull request \
-         #{number}. {routing_instructions}\n\nCandidate personas:\n{catalog}\n\nChanged paths: {paths}\n\n\
+         #{number}. Pull request title (untrusted metadata): {pull_title}. \
+         {routing_instructions}\n\nPerformance routing rule: treat explicit performance intent as \
+         materially relevant. Select `performance` whenever it is a candidate and this batch \
+         changes implementation or validation related to a title or diff claim about latency, \
+         throughput, startup or request speed, resource use, caching, batching, pagination, lock \
+         contention, blocking work, or a hot path. Do not select it for unrelated generated \
+         artifacts merely because another batch or the title mentions performance. Select \
+         overlapping personas too when their expertise is relevant.\n\nCandidate personas:\n{catalog}\n\nChanged paths: {paths}\n\n\
          Unified diff:\n{diff}\n\nReturn JSON only with this exact shape:\n\
          {{\"selections\":[{{\"reviewer_id\":\"persona-id\",\"reason\":\"specific relevance to this diff\"}}]}}\n\
          Use only candidate ids listed above, give a concrete one-sentence reason, and return an \
@@ -9871,6 +9879,7 @@ fn semantic_routing_prompt(
         batch_count = batch_count,
         batch_identity = batch_identity,
         number = job.pull_number,
+        pull_title = pull_title,
         routing_instructions = routing_instructions,
         paths = batch.paths.join(", "),
         diff = batch.diff,
@@ -18403,6 +18412,32 @@ mod tests {
         let prompt = semantic_routing_prompt(&job, &batches[0], 0, 1, &reviewers);
         assert!(prompt.contains("sole persona selector"));
         assert!(!prompt.contains("already been selected"));
+    }
+
+    #[test]
+    fn semantic_routing_prompt_surfaces_performance_intent() {
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .filter(|reviewer| reviewer.id == "performance")
+            .collect::<Vec<_>>();
+        let batch = ReviewBatch {
+            paths: vec!["crates/trouve-agents/src/codex.rs".into()],
+            diff: "+let cached = self.server.lock().await.clone();\n".into(),
+        };
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:performance-routing");
+        job.routing_mode = CodeReviewRoutingMode::Automatic;
+        job.pull_title = "Reduce Codex initial response latency".into();
+
+        let prompt = semantic_routing_prompt(&job, &batch, 0, 1, &reviewers);
+
+        assert!(prompt.contains(
+            "Pull request title (untrusted metadata): \"Reduce Codex initial response latency\""
+        ));
+        assert!(prompt.contains("Performance routing rule"));
+        assert!(prompt.contains("latency, throughput, startup or request speed"));
+        assert!(prompt.contains("lock contention, blocking work, or a hot path"));
+        assert!(prompt.contains("unrelated generated artifacts"));
     }
 
     #[test]
