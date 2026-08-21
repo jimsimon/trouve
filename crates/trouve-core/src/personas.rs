@@ -646,7 +646,12 @@ mod tests {
         for id in ["plan", "review"] {
             let persona = find_persona(&personas, id).unwrap();
             assert!(persona.read_only);
-            assert!(persona.allowed_tools.iter().any(|tool| tool == "web_search"));
+            assert!(
+                persona
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| tool == "web_search")
+            );
             assert!(persona.allowed_tools.iter().any(|tool| tool == "web_fetch"));
             assert!(
                 persona
