@@ -22,6 +22,7 @@ export interface PullRequestPill {
 }
 
 export interface PullRequestReviewFinding {
+  readonly outsideDiff: boolean;
   readonly location: string;
   readonly title: string;
   readonly severity: string;
@@ -359,6 +360,7 @@ const rowFromPullRequest = (
           recommendation: theme.recommendation,
         }));
       return Object.freeze({
+      outsideDiff: finding.outside_diff ?? false,
       location: `${finding.path}:${finding.line}`,
       title: finding.title,
       severity: finding.severity,

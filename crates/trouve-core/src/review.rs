@@ -5,6 +5,7 @@
 //! and turns each immutable PR head into a normal trouve review session.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -35,8 +36,9 @@ use crate::store::{
     NewCodeReviewFindingDetails, NewCodeReviewJob, NewCodeReviewTask, NewCodeReviewTheme,
 };
 use crate::tools::{
-    ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryDiff,
-    ReviewRepositoryHistoryCleanup, ReviewRepositoryMergeBase, ReviewRepositorySync,
+    ReviewAnchor, ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryAnchors,
+    ReviewRepositoryDiff, ReviewRepositoryHistoryCleanup, ReviewRepositoryMergeBase,
+    ReviewRepositorySync,
 };
 
 const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
@@ -125,11 +127,17 @@ const REVIEW_DIFF_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_DIFF_MAX_FILES: usize = 250;
 const REVIEW_DIFF_MAX_CHANGED_LINES: u64 = 20_000;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
+const REVIEW_ANCHOR_TREE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const REVIEW_ANCHOR_MAX_DISTINCT_BLOBS: usize = MAX_CANDIDATE_FINDINGS;
+const REVIEW_ANCHOR_BLOB_MAX_BYTES: usize = 2 * 1024 * 1024;
+const REVIEW_ANCHOR_BLOBS_MAX_BYTES: usize = 16 * 1024 * 1024;
+const INVALID_OUTSIDE_ANCHOR_REJECTION: &str = "insufficient_evidence: final finding anchor does not identify a validated line in a tracked regular file at the immutable review head";
 const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
 const REVIEW_COMMENT_PAGE_SIZE: usize = 100;
 const REVIEW_COMMENT_MAX_PAGES: u64 = 10;
 const INLINE_REVIEW_COMMENT_MAX_BYTES: usize = 65_000;
 const INLINE_REVIEW_COMMENT_TRUNCATION_MARKER: &str = "\n\n---\nReview comment truncated; open the trouve dashboard for complete evidence and fix guidance.";
+const REVIEW_BODY_MAX_BYTES: usize = 60_000;
 const GITHUB_REST_CACHE_MAX_ENTRIES: usize = 512;
 const GITHUB_REST_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(75);
@@ -1161,6 +1169,10 @@ struct ReviewFinding {
     line: u64,
     #[serde(default = "default_review_side")]
     side: String,
+    /// Derived from the immutable base-to-head diff during structural
+    /// validation. Model-provided values are never trusted.
+    #[serde(default)]
+    outside_diff: bool,
     #[serde(default)]
     severity: String,
     #[serde(default = "default_review_confidence")]
@@ -4951,6 +4963,14 @@ impl Engine {
             bail!("reviewers returned more than {MAX_CANDIDATE_FINDINGS} candidate findings");
         }
         let candidates = structurally_valid_candidates(candidates, &diff_files);
+        let (coordinator_candidates, invalid_candidate_anchor_ids) = self
+            .retain_candidates_with_valid_anchors(
+                Path::new(&session.worktree_path),
+                &job.head_sha,
+                candidates.clone(),
+                superseded,
+            )
+            .await?;
         let previous_findings = self
             .store
             .open_code_review_findings(&job.repository, job.pull_number)?
@@ -4984,7 +5004,7 @@ impl Engine {
         )?;
         let previous_themes = prioritized_theme_history(&all_previous_themes);
         let load_external_comments = async {
-            if candidates.is_empty() && previous_findings.is_empty() {
+            if coordinator_candidates.is_empty() && previous_findings.is_empty() {
                 Vec::new()
             } else {
                 self.external_review_comments(&job).await
@@ -4995,7 +5015,7 @@ impl Engine {
             load_external_comments,
         );
         let coordinator_started = Instant::now();
-        let parsed = if candidates.is_empty() && previous_findings.is_empty() {
+        let parsed = if coordinator_candidates.is_empty() && previous_findings.is_empty() {
             ReviewOutput {
                 summary: no_candidate_review_summary(
                     selected_reviewer_count,
@@ -5003,7 +5023,13 @@ impl Engine {
                     reused_hunk_count,
                 ),
                 findings: Vec::new(),
-                rejected_candidates: Vec::new(),
+                rejected_candidates: invalid_candidate_anchor_ids
+                    .into_iter()
+                    .map(|candidate_id| ReviewCandidateRejection {
+                        candidate_id,
+                        reason: INVALID_OUTSIDE_ANCHOR_REJECTION.into(),
+                    })
+                    .collect(),
                 resolved_finding_ids: Vec::new(),
                 themes: Vec::new(),
             }
@@ -5012,7 +5038,7 @@ impl Engine {
             execution_record.job = job.clone();
             let prompt = validation_prompt(
                 &execution_record,
-                &candidates,
+                &coordinator_candidates,
                 &finding_history,
                 &previous_themes,
                 &external_comments,
@@ -5077,8 +5103,26 @@ impl Engine {
             let (mut turn, mut validated) = turn;
             validated.findings = coordinator_validated_findings(
                 std::mem::take(&mut validated.findings),
-                &candidates,
+                &coordinator_candidates,
                 &diff_files,
+            );
+            let (findings, invalid_finding_anchor_candidate_ids) = self
+                .retain_findings_with_valid_anchors(
+                    Path::new(&session.worktree_path),
+                    &job.head_sha,
+                    std::mem::take(&mut validated.findings),
+                    superseded,
+                )
+                .await?;
+            validated.findings = findings;
+            validated.rejected_candidates.extend(
+                invalid_candidate_anchor_ids
+                    .into_iter()
+                    .chain(invalid_finding_anchor_candidate_ids)
+                    .map(|candidate_id| ReviewCandidateRejection {
+                        candidate_id,
+                        reason: INVALID_OUTSIDE_ANCHOR_REJECTION.into(),
+                    }),
             );
             normalize_coordinator_output(&mut validated, &candidates, &previous_findings);
             turn.output = serde_json::to_string(&validated)?;
@@ -5230,6 +5274,7 @@ impl Engine {
                     evidence: finding.evidence.clone(),
                     origin,
                     theme_ids,
+                    outside_diff: finding.outside_diff,
                 }
             })
             .collect::<Vec<_>>();
@@ -6013,6 +6058,112 @@ impl Engine {
         }
     }
 
+    fn persist_publication_manifest_outcomes_best_effort(
+        &self,
+        job_id: &str,
+        manifest: &ReviewPublicationManifest,
+        accepted: bool,
+    ) -> Result<()> {
+        for (status, finding_ids) in manifest.outcome_groups(accepted)? {
+            self.persist_publication_status_best_effort(job_id, &finding_ids, status);
+        }
+        Ok(())
+    }
+
+    fn persist_review_level_finding_urls_best_effort<'a>(
+        &self,
+        job_id: &str,
+        findings: impl IntoIterator<Item = &'a trouve_protocol::CodeReviewFinding>,
+        review_url: &str,
+    ) {
+        for finding in findings {
+            if let Err(error) = self
+                .store
+                .update_code_review_finding_review_url(&finding.id, review_url)
+            {
+                tracing::warn!(
+                    job_id,
+                    finding_id = %finding.id,
+                    %error,
+                    "recording review-level finding URL failed"
+                );
+            }
+        }
+    }
+
+    async fn valid_outside_anchor_set(
+        &self,
+        worktree: &Path,
+        head_sha: &str,
+        anchors: Vec<ReviewAnchor>,
+        cancel: &CancellationToken,
+    ) -> Result<HashSet<(String, u64)>> {
+        if anchors.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let valid = self
+            .executor
+            .review_repository_valid_anchors(&ReviewRepositoryAnchors {
+                managed_root: self.data_dir.join("worktrees"),
+                worktree: worktree.to_path_buf(),
+                head_sha: head_sha.to_string(),
+                anchors,
+                cancel: cancel.clone(),
+                max_tree_bytes: REVIEW_ANCHOR_TREE_MAX_BYTES,
+                max_distinct_blobs: REVIEW_ANCHOR_MAX_DISTINCT_BLOBS,
+                max_blob_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
+                max_total_blob_bytes: REVIEW_ANCHOR_BLOBS_MAX_BYTES,
+            })
+            .await
+            .map_err(|error| anyhow!(error))?;
+        Ok(valid
+            .into_iter()
+            .map(|anchor| (anchor.path, anchor.line))
+            .collect())
+    }
+
+    async fn retain_candidates_with_valid_anchors(
+        &self,
+        worktree: &Path,
+        head_sha: &str,
+        candidates: Vec<CandidateFinding>,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<CandidateFinding>, Vec<String>)> {
+        let anchors = candidates
+            .iter()
+            .filter(|candidate| candidate.finding.outside_diff)
+            .map(|candidate| ReviewAnchor {
+                path: candidate.finding.path.clone(),
+                line: candidate.finding.line,
+            })
+            .collect();
+        let valid = self
+            .valid_outside_anchor_set(worktree, head_sha, anchors, cancel)
+            .await?;
+        Ok(partition_candidates_by_valid_anchors(candidates, &valid))
+    }
+
+    async fn retain_findings_with_valid_anchors(
+        &self,
+        worktree: &Path,
+        head_sha: &str,
+        findings: Vec<ReviewFinding>,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<ReviewFinding>, Vec<String>)> {
+        let anchors = findings
+            .iter()
+            .filter(|finding| finding.outside_diff)
+            .map(|finding| ReviewAnchor {
+                path: finding.path.clone(),
+                line: finding.line,
+            })
+            .collect();
+        let valid = self
+            .valid_outside_anchor_set(worktree, head_sha, anchors, cancel)
+            .await?;
+        Ok(partition_findings_by_valid_anchors(findings, &valid))
+    }
+
     async fn external_review_comments(
         &self,
         job: &trouve_protocol::CodeReviewJob,
@@ -6206,78 +6357,37 @@ impl Engine {
             })
             .collect::<HashMap<_, _>>();
         let mut comments = Vec::new();
+        let mut comment_finding_ids = Vec::new();
         let mut eligible_findings = Vec::new();
-        let mut ineligible_ids = Vec::new();
-        let mut suppressed_ids = Vec::new();
         let mut grouped_finding_ids = Vec::new();
         for finding in findings {
-            if !finding.has_inline_location() {
-                ineligible_ids.push(finding.id.as_str());
-            } else if !finding.is_publishable() {
-                suppressed_ids.push(finding.id.as_str());
-            } else if grouped_ids.contains(finding.id.as_str()) {
+            if !finding.has_inline_location() || !finding.is_publishable() {
+                continue;
+            }
+            if grouped_ids.contains(finding.id.as_str()) {
                 grouped_finding_ids.push(finding.id.as_str());
             } else {
-                let body = grouped_primary
-                    .get(finding.id.as_str())
-                    .map(|group| {
-                        render_inline_finding_grouped(finding, group.theme, &group.members)
-                    })
-                    .unwrap_or_else(|| render_inline_finding(finding));
-                comments.push(serde_json::json!({
-                    "path": finding.path,
-                    "line": finding.line,
-                    "side": if finding.side.eq_ignore_ascii_case("LEFT") { "LEFT" } else { "RIGHT" },
-                    "body": body,
-                }));
+                if !finding.outside_diff {
+                    let body = grouped_primary
+                        .get(finding.id.as_str())
+                        .map(|group| {
+                            render_inline_finding_grouped(finding, group.theme, &group.members)
+                        })
+                        .unwrap_or_else(|| render_inline_finding(finding));
+                    comments.push(serde_json::json!({
+                        "path": finding.path,
+                        "line": finding.line,
+                        "side": if finding.side.eq_ignore_ascii_case("LEFT") { "LEFT" } else { "RIGHT" },
+                        "body": body,
+                    }));
+                    comment_finding_ids.push(finding.id.as_str());
+                }
                 eligible_findings.push(finding);
             }
         }
-        let manifest = findings
-            .iter()
-            .map(|finding| {
-                let status = if !finding.has_inline_location() {
-                    "not_eligible"
-                } else if !finding.is_publishable() {
-                    "suppressed_by_policy"
-                } else if grouped_ids.contains(finding.id.as_str()) {
-                    "grouped_by_theme"
-                } else {
-                    "eligible"
-                };
-                (
-                    finding.id.as_str(),
-                    grouped_primary_ids
-                        .get(finding.id.as_str())
-                        .copied()
-                        .unwrap_or(finding.id.as_str()),
-                    status,
-                )
-            })
-            .collect::<Vec<_>>();
-        if !self
-            .store
-            .prepare_code_review_publication_manifest(&job.id, &manifest)?
-        {
-            bail!("review changed before its publication manifest was prepared");
-        }
-        self.persist_publication_status_best_effort(
-            &job.id,
-            &ineligible_ids,
-            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
-        );
-        self.persist_publication_status_best_effort(
-            &job.id,
-            &suppressed_ids,
-            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy,
-        );
         let eligible_ids = eligible_findings
             .iter()
             .map(|finding| finding.id.as_str())
-            .collect::<Vec<_>>();
-        let publication_findings = eligible_findings
-            .iter()
-            .map(|finding| (*finding).clone())
             .collect::<Vec<_>>();
         let path = format!(
             "/repos/{}/pulls/{}/reviews",
@@ -6306,7 +6416,71 @@ impl Engine {
             } else {
                 &[]
             };
-            let request = inline_review_request(job, event, submitted_comments);
+            let unplaced_comments = if include_comments {
+                &[]
+            } else {
+                comments.as_slice()
+            };
+            let unplaced_comment_ids = if include_comments {
+                &[]
+            } else {
+                comment_finding_ids.as_slice()
+            };
+            let submitted_inline_ids = if include_comments {
+                comment_finding_ids.iter().copied().collect::<HashSet<_>>()
+            } else {
+                HashSet::new()
+            };
+            let (request, rendered_review_body_ids) = inline_review_request(
+                job,
+                event,
+                submitted_comments,
+                &eligible_findings,
+                unplaced_comments,
+                unplaced_comment_ids,
+            );
+            let manifest_entries = findings
+                .iter()
+                .map(|finding| {
+                    let finding_id = finding.id.as_str();
+                    let primary_id = grouped_primary_ids
+                        .get(finding_id)
+                        .copied()
+                        .unwrap_or(finding_id);
+                    let representation = if !finding.has_inline_location() {
+                        ReviewPublicationRepresentation::NotEligible
+                    } else if !finding.is_publishable() {
+                        ReviewPublicationRepresentation::SuppressedByPolicy
+                    } else if grouped_ids.contains(finding_id) {
+                        if submitted_inline_ids.contains(primary_id) {
+                            ReviewPublicationRepresentation::GroupedInline
+                        } else if rendered_review_body_ids.contains(primary_id) {
+                            ReviewPublicationRepresentation::GroupedReviewBody
+                        } else {
+                            ReviewPublicationRepresentation::Omitted
+                        }
+                    } else if submitted_inline_ids.contains(finding_id) {
+                        ReviewPublicationRepresentation::Inline
+                    } else if rendered_review_body_ids.contains(finding_id) {
+                        ReviewPublicationRepresentation::ReviewBody
+                    } else {
+                        ReviewPublicationRepresentation::Omitted
+                    };
+                    ReviewPublicationManifestEntry::new(finding_id, primary_id, representation)
+                })
+                .collect::<Vec<_>>();
+            let manifest = ReviewPublicationManifest::current(
+                manifest_entries,
+                findings.iter().map(|finding| finding.id.as_str()),
+            )?;
+            let persisted_manifest = manifest.persisted_entries();
+            if !self
+                .store
+                .prepare_code_review_publication_manifest(&job.id, &persisted_manifest)?
+            {
+                bail!("review changed before its publication manifest was prepared");
+            }
+            self.persist_publication_manifest_outcomes_best_effort(&job.id, &manifest, false)?;
             if !self
                 .store
                 .mark_code_review_publication_dispatched(&job.id)?
@@ -6329,24 +6503,14 @@ impl Engine {
                         "recording accepted GitHub review outcome failed"
                     );
                 }
-                self.persist_publication_status_best_effort(
-                    &job.id,
-                    &eligible_ids,
-                    if include_comments {
-                        trouve_protocol::CodeReviewFindingPublicationStatus::Published
-                    } else {
-                        trouve_protocol::CodeReviewFindingPublicationStatus::Failed
-                    },
-                );
-                self.persist_publication_status_best_effort(
-                    &job.id,
-                    &grouped_finding_ids,
-                    if include_comments {
-                        trouve_protocol::CodeReviewFindingPublicationStatus::GroupedByTheme
-                    } else {
-                        trouve_protocol::CodeReviewFindingPublicationStatus::Failed
-                    },
-                );
+                self.persist_publication_manifest_outcomes_best_effort(&job.id, &manifest, true)?;
+                let review_level_finding_ids = manifest.review_level_finding_ids();
+                let inline_finding_ids = manifest.inline_finding_ids();
+                let publication_findings = findings
+                    .iter()
+                    .filter(|finding| inline_finding_ids.contains(finding.id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let body = match response.text().await {
                     Ok(body) => body,
                     Err(error) => {
@@ -6357,7 +6521,14 @@ impl Engine {
                         );
                         return match self.find_published_review(api, job).await {
                             Ok(published) => {
-                                if include_comments {
+                                self.persist_review_level_finding_urls_best_effort(
+                                    &job.id,
+                                    findings.iter().filter(|finding| {
+                                        review_level_finding_ids.contains(finding.id.as_str())
+                                    }),
+                                    &published.html_url,
+                                );
+                                if !inline_finding_ids.is_empty() {
                                     self.capture_published_review_comments(
                                         api,
                                         job,
@@ -6409,7 +6580,14 @@ impl Engine {
                         }
                     }
                 };
-                if include_comments {
+                self.persist_review_level_finding_urls_best_effort(
+                    &job.id,
+                    findings
+                        .iter()
+                        .filter(|finding| review_level_finding_ids.contains(finding.id.as_str())),
+                    &published.html_url,
+                );
+                if !inline_finding_ids.is_empty() {
                     self.capture_published_review_comments(
                         api,
                         job,
@@ -6859,134 +7037,110 @@ impl Engine {
             | ReviewPublicationPhase::Reconciled => {}
         }
         let findings = self.store.code_review_findings(&job.id)?;
-        let manifest = self.store.code_review_publication_manifest(&job.id)?;
-        let status_by_finding = manifest
-            .iter()
-            .map(|(finding_id, _, status)| (finding_id.as_str(), status.as_str()))
-            .collect::<HashMap<_, _>>();
-        let manifest_grouped_ids = manifest
-            .iter()
-            .filter(|(_, _, status)| status == "grouped_by_theme")
-            .map(|(finding_id, _, _)| finding_id.as_str())
-            .collect::<HashSet<_>>();
-        // Jobs created before publication manifests were introduced still need
-        // to recover the exact grouping policy used by their original publish.
-        let legacy_grouped_ids = if manifest.is_empty() {
-            let themes = self
-                .store
-                .code_review_themes_for_legacy_publication_job(&job.id)?;
-            legacy_review_theme_grouped_finding_ids(&findings, &themes)
-        } else {
-            HashSet::new()
+        let persisted_manifest = self.store.code_review_publication_manifest(&job.id)?;
+        let manifest = match ReviewPublicationManifest::from_persisted(
+            &persisted_manifest,
+            findings.iter().map(|finding| finding.id.as_str()),
+        )
+        .with_context(|| format!("invalid publication manifest for review {}", job.id))?
+        {
+            Some(manifest) => manifest
+                .into_current_for_recovery(&findings)
+                .with_context(|| {
+                    format!("invalid legacy publication manifest for review {}", job.id)
+                })?,
+            None => {
+                // Jobs created before publication manifests were introduced
+                // recover the policy from their immutable finding/theme rows.
+                let themes = self
+                    .store
+                    .code_review_themes_for_legacy_publication_job(&job.id)?;
+                inferred_legacy_review_publication_manifest(&findings, &themes)?
+            }
         };
-        let grouped_finding_ids = findings
-            .iter()
-            .filter(|finding| {
-                manifest_grouped_ids.contains(finding.id.as_str())
-                    || legacy_grouped_ids.contains(&finding.id)
-            })
-            .map(|finding| finding.id.as_str())
-            .collect::<Vec<_>>();
         let mut repaired_statuses = 0;
-        let ineligible_ids = findings
-            .iter()
-            .filter(|finding| {
-                status_by_finding.get(finding.id.as_str()) == Some(&"not_eligible")
-                    || (manifest.is_empty() && !finding.has_inline_location())
-            })
-            .map(|finding| finding.id.as_str())
-            .collect::<Vec<_>>();
-        repaired_statuses += self.store.set_code_review_findings_publication_status(
-            &ineligible_ids,
-            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
-        )?;
-        let suppressed_ids = findings
-            .iter()
-            .filter(|finding| {
-                status_by_finding.get(finding.id.as_str()) == Some(&"suppressed_by_policy")
-                    || (manifest.is_empty()
-                        && finding.has_inline_location()
-                        && !finding.is_publishable())
-            })
-            .map(|finding| finding.id.as_str())
-            .collect::<Vec<_>>();
-        repaired_statuses += self.store.set_code_review_findings_publication_status(
-            &suppressed_ids,
-            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy,
-        )?;
+        for (status, finding_ids) in manifest.outcome_groups(false)? {
+            repaired_statuses += self
+                .store
+                .set_code_review_findings_publication_status(&finding_ids, status)?;
+        }
         if repaired_statuses > 0 {
             self.emit_code_review_job_updated(&job.id)?;
             self.emit_code_review_updated(Some(job.id.clone()))?;
         }
-        let eligible = findings
+        let inline_finding_ids = manifest.inline_finding_ids();
+        let review_level_finding_ids = manifest.review_level_finding_ids();
+        let finding_by_id = findings
             .iter()
-            .filter(|finding| {
-                status_by_finding.get(finding.id.as_str()) == Some(&"eligible")
-                    || (manifest.is_empty()
-                        && finding.is_publishable()
-                        && !legacy_grouped_ids.contains(&finding.id))
-            })
-            .collect::<Vec<_>>();
+            .map(|finding| (finding.id.as_str(), finding))
+            .collect::<HashMap<_, _>>();
         let has_review_url = !record.job.review_url.is_empty()
             && record.job.review_url != record.job.lifecycle_comment_url;
         let fully_reconciled = record.publication_accepted
             && record.review_published
             && has_review_url
-            && eligible
-                .iter()
-                .all(|finding| match finding.github_publication_status {
-                    trouve_protocol::CodeReviewFindingPublicationStatus::Published => {
+            && manifest.entries.iter().all(|entry| {
+                let Some(finding) = finding_by_id.get(entry.finding_id.as_str()) else {
+                    return false;
+                };
+                let Ok(expected_status) = entry.representation.publication_status() else {
+                    return false;
+                };
+                finding.github_publication_status == expected_status
+                    && if entry.representation.requires_inline_comment() {
+                        finding.github_comment_id.is_some()
+                            && !finding.github_comment_url.is_empty()
+                    } else if entry.representation.receives_review_url() {
                         !finding.github_comment_url.is_empty()
+                    } else {
+                        true
                     }
-                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed
-                    | trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
-                    | trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
-                    | trouve_protocol::CodeReviewFindingPublicationStatus::GroupedByTheme => true,
-                    trouve_protocol::CodeReviewFindingPublicationStatus::Pending => false,
-                });
+            });
         if review_publication_phase(&record, fully_reconciled) == ReviewPublicationPhase::Reconciled
         {
             return Ok(());
         }
 
         let published = self.find_published_review(api, job).await?;
-        let expected_comment_ids = eligible
+        let publication_findings = findings
             .iter()
-            .filter(|finding| {
-                finding.github_publication_status
-                    != trouve_protocol::CodeReviewFindingPublicationStatus::Failed
-            })
-            .map(|finding| finding.id.as_str())
+            .filter(|finding| inline_finding_ids.contains(finding.id.as_str()))
+            .cloned()
             .collect::<Vec<_>>();
-        let publication_findings = eligible
-            .iter()
-            .map(|finding| (*finding).clone())
-            .collect::<Vec<_>>();
+        self.persist_review_level_finding_urls_best_effort(
+            &job.id,
+            findings
+                .iter()
+                .filter(|finding| review_level_finding_ids.contains(finding.id.as_str())),
+            &published.html_url,
+        );
+        let published_finding_ids = manifest.published_finding_ids()?;
         if !self.store.reconcile_code_review_publication(
             &job.id,
             &published.html_url,
-            &expected_comment_ids,
+            &published_finding_ids,
         )? {
             bail!("review job changed before accepted publication was reconciled");
         }
-        if self.store.set_code_review_findings_publication_status(
-            &grouped_finding_ids,
-            if expected_comment_ids.is_empty() {
-                trouve_protocol::CodeReviewFindingPublicationStatus::Failed
-            } else {
-                trouve_protocol::CodeReviewFindingPublicationStatus::GroupedByTheme
-            },
-        )? > 0
-        {
+        let mut repaired_statuses = 0;
+        for (status, finding_ids) in manifest.outcome_groups(true)? {
+            repaired_statuses += self
+                .store
+                .set_code_review_findings_publication_status(&finding_ids, status)?;
+        }
+        if repaired_statuses > 0 {
             self.emit_code_review_job_updated(&job.id)?;
             self.emit_code_review_updated(Some(job.id.clone()))?;
         }
-        if !expected_comment_ids.is_empty()
+        if !inline_finding_ids.is_empty()
             && !self
                 .capture_published_review_comments(api, job, published.id, &publication_findings)
                 .await
         {
-            bail!("accepted GitHub review comments remain pending reconciliation");
+            tracing::warn!(
+                job_id = %job.id,
+                "accepted GitHub review comments remain pending reconciliation"
+            );
         }
         self.emit_code_review_job_updated(&job.id)?;
         self.emit_code_review_updated(Some(job.id.clone()))?;
@@ -8499,6 +8653,7 @@ fn review_has_unresolved_publishable_findings(
         .iter()
         .filter(|finding| {
             finding.is_publishable()
+                && !finding.outside_diff
                 && finding.github_publication_status
                     == trouve_protocol::CodeReviewFindingPublicationStatus::Published
         })
@@ -8507,7 +8662,7 @@ fn review_has_unresolved_publishable_findings(
     review_has_unresolved_findings(
         current_findings
             .iter()
-            .filter(|finding| finding.is_publishable())
+            .filter(|finding| finding.is_publishable() && !finding.outside_diff)
             .count(),
         &previous_finding_ids,
         resolved_finding_ids,
@@ -9288,13 +9443,159 @@ fn inline_review_request(
     job: &trouve_protocol::CodeReviewJob,
     event: &str,
     comments: &[serde_json::Value],
-) -> serde_json::Value {
-    serde_json::json!({
-        "commit_id": job.head_sha,
-        "body": inline_review_marker(&job.id),
-        "event": event,
-        "comments": comments,
-    })
+    findings: &[&trouve_protocol::CodeReviewFinding],
+    unplaced_comments: &[serde_json::Value],
+    unplaced_comment_ids: &[&str],
+) -> (serde_json::Value, HashSet<String>) {
+    let mut body = inline_review_marker(&job.id);
+    let outside_findings = findings
+        .iter()
+        .copied()
+        .filter(|finding| finding.outside_diff && finding.is_publishable())
+        .collect::<Vec<_>>();
+    let mut rendered_finding_ids =
+        append_review_body_findings(&mut body, "Outside diff range comments", &outside_findings)
+            .into_iter()
+            .collect::<HashSet<_>>();
+    rendered_finding_ids.extend(append_review_body_comments(
+        &mut body,
+        "Comments GitHub could not place inline",
+        unplaced_comments,
+        unplaced_comment_ids,
+    ));
+    (
+        serde_json::json!({
+            "commit_id": job.head_sha,
+            "body": body,
+            "event": event,
+            "comments": comments,
+        }),
+        rendered_finding_ids,
+    )
+}
+
+fn append_review_body_comments(
+    body: &mut String,
+    summary: &str,
+    comments: &[serde_json::Value],
+    finding_ids: &[&str],
+) -> Vec<String> {
+    let count = comments.len().min(finding_ids.len());
+    if count == 0 {
+        return Vec::new();
+    }
+    let prefix = format!("\n\n<details><summary>{summary} ({})</summary>\n\n", count);
+    let suffix = "</details>\n";
+    if body
+        .len()
+        .saturating_add(prefix.len())
+        .saturating_add(suffix.len())
+        > REVIEW_BODY_MAX_BYTES
+    {
+        return Vec::new();
+    }
+    body.push_str(&prefix);
+    let mut rendered_ids = Vec::new();
+    for (comment, finding_id) in comments.iter().zip(finding_ids).take(count) {
+        let path = comment
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let line = comment
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let comment_body = comment
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let entry = format!("#### `{path}` line {line}\n\n{comment_body}\n\n");
+        if body
+            .len()
+            .saturating_add(entry.len())
+            .saturating_add(suffix.len())
+            > REVIEW_BODY_MAX_BYTES
+        {
+            break;
+        }
+        body.push_str(&entry);
+        rendered_ids.push((*finding_id).to_owned());
+    }
+    if rendered_ids.len() < count {
+        let note = format!(
+            "_{} finding(s) omitted here to stay within GitHub's review-body limit; open the trouve dashboard for complete output._\n\n",
+            count - rendered_ids.len()
+        );
+        if body
+            .len()
+            .saturating_add(note.len())
+            .saturating_add(suffix.len())
+            <= REVIEW_BODY_MAX_BYTES
+        {
+            body.push_str(&note);
+        }
+    }
+    body.push_str(suffix);
+    rendered_ids
+}
+
+fn append_review_body_findings(
+    body: &mut String,
+    summary: &str,
+    findings: &[&trouve_protocol::CodeReviewFinding],
+) -> Vec<String> {
+    if findings.is_empty() {
+        return Vec::new();
+    }
+    let prefix = format!(
+        "\n\n<details><summary>{summary} ({})</summary>\n\n",
+        findings.len()
+    );
+    let suffix = "</details>\n";
+    if body
+        .len()
+        .saturating_add(prefix.len())
+        .saturating_add(suffix.len())
+        > REVIEW_BODY_MAX_BYTES
+    {
+        return Vec::new();
+    }
+    body.push_str(&prefix);
+    let mut rendered_ids = Vec::new();
+    for finding in findings {
+        let entry = format!(
+            "#### `{}` line {}\n\n{}\n\n",
+            finding.path,
+            finding.line,
+            render_inline_finding(finding)
+        );
+        if body
+            .len()
+            .saturating_add(entry.len())
+            .saturating_add(suffix.len())
+            > REVIEW_BODY_MAX_BYTES
+        {
+            break;
+        }
+        body.push_str(&entry);
+        rendered_ids.push(finding.id.clone());
+    }
+    if rendered_ids.len() < findings.len() {
+        let note = format!(
+            "_{} finding(s) omitted here to stay within GitHub's review-body limit; open the trouve dashboard for complete output._\n\n",
+            findings.len() - rendered_ids.len()
+        );
+        if body
+            .len()
+            .saturating_add(note.len())
+            .saturating_add(suffix.len())
+            <= REVIEW_BODY_MAX_BYTES
+        {
+            body.push_str(&note);
+        }
+    }
+    body.push_str(suffix);
+    rendered_ids
 }
 
 fn inline_review_marker(job_id: &str) -> String {
@@ -10269,9 +10570,12 @@ fn reviewer_prompt(
          {extra}{reuse_note}\nChanged paths in this batch: {paths}\n\nUnified diff:\n{diff}\n\n\
          You are the `{reviewer_name}` reviewer. Your focused mandate is:\n\
          {reviewer_instructions}\n\nRouting rationale:\n{routing}\n\n\
-         Review every supplied file or fragment. Inspect relevant \
-         unchanged code with read/search tools only when the supplied diff leaves a concrete \
-         ambiguity. When you identify a shared mechanism, missing invariant, or lifecycle flaw, \
+         Review every supplied file or fragment. Inspect relevant unchanged callers, consumers, \
+         tests, and configuration with read/search tools when needed to verify the change's \
+         impact. A finding may point to an unchanged line or file outside the supplied diff only \
+         when that is the strongest concrete anchor for an impact introduced by this revision; \
+         use the exact head-revision path and line with side RIGHT. When you identify a shared \
+         mechanism, missing invariant, or lifecycle flaw, \
          sweep every changed call site and state transition in this batch for sibling \
          manifestations and report each independently actionable consequence now. Report only \
          actionable problems introduced by the change. Do not ask \
@@ -10360,7 +10664,10 @@ fn validation_prompt(
          of whether its severity/confidence combination will be posted to GitHub. Reassess each \
          candidate against the shared finding level rubric instead of copying its submitted \
          levels. Do not reject an otherwise real, actionable issue solely because its confidence \
-         is low; publication policy is applied after consolidation. {reuse_note}Exact relevant diff context is \
+         is low; publication policy is applied after consolidation. Preserve an outside-diff \
+         anchor only when repository evidence shows this revision introduced the impact and the \
+         unchanged head-revision line is the clearest location; otherwise move the finding to a \
+         commentable diff line or reject it. {reuse_note}Exact relevant diff context is \
          supplied below; use tools only when surrounding unchanged code is necessary to settle \
          a concrete ambiguity. Do not add a finding merely because a \
          reviewer suggested it. Each retained finding must include every contributing \
@@ -10950,6 +11257,45 @@ fn coordinator_validated_themes(
     coalesced
 }
 
+fn partition_findings_by_valid_anchors(
+    findings: Vec<ReviewFinding>,
+    valid: &HashSet<(String, u64)>,
+) -> (Vec<ReviewFinding>, Vec<String>) {
+    let mut retained = Vec::with_capacity(findings.len());
+    let mut rejected_candidate_ids = Vec::new();
+    let mut seen_rejected_candidate_ids = HashSet::new();
+    for finding in findings {
+        if !finding.outside_diff || valid.contains(&(finding.path.clone(), finding.line)) {
+            retained.push(finding);
+        } else {
+            for candidate_id in finding.source_candidate_ids {
+                if seen_rejected_candidate_ids.insert(candidate_id.clone()) {
+                    rejected_candidate_ids.push(candidate_id);
+                }
+            }
+        }
+    }
+    (retained, rejected_candidate_ids)
+}
+
+fn partition_candidates_by_valid_anchors(
+    candidates: Vec<CandidateFinding>,
+    valid: &HashSet<(String, u64)>,
+) -> (Vec<CandidateFinding>, Vec<String>) {
+    let mut retained = Vec::with_capacity(candidates.len());
+    let mut rejected_candidate_ids = Vec::new();
+    for candidate in candidates {
+        if !candidate.finding.outside_diff
+            || valid.contains(&(candidate.finding.path.clone(), candidate.finding.line))
+        {
+            retained.push(candidate);
+        } else {
+            rejected_candidate_ids.push(candidate.candidate_id);
+        }
+    }
+    (retained, rejected_candidate_ids)
+}
+
 fn candidate_rejections(
     review: &ReviewOutput,
     candidates: &[CandidateFinding],
@@ -10981,7 +11327,12 @@ fn candidate_rejections(
             confidence: candidate.finding.confidence.clone(),
             title: candidate.finding.title.clone(),
             body: candidate.finding.body.clone(),
-            reason: categorized_rejection_reason(reasons[candidate.candidate_id.as_str()]),
+            reason: categorized_rejection_reason(
+                reasons
+                    .get(candidate.candidate_id.as_str())
+                    .copied()
+                    .unwrap_or("The candidate was not retained and has no recorded reason."),
+            ),
         })
         .collect()
 }
@@ -11085,19 +11436,29 @@ fn normalize_finding(
         .chars()
         .take(200)
         .collect();
-    if finding.path.is_empty()
-        || finding.line == 0
-        || finding.title.is_empty()
-        || finding.body.is_empty()
-    {
+    let safe_path = !finding.path.is_empty()
+        && !finding.path.chars().any(char::is_control)
+        && !Path::new(&finding.path).is_absolute()
+        && Path::new(&finding.path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if !safe_path || finding.line == 0 || finding.title.is_empty() || finding.body.is_empty() {
         return None;
     }
-    let mut left = finding.side.eq_ignore_ascii_case("LEFT");
-    if !valid.contains(&(finding.path.clone(), finding.line, left)) {
+    let requested_side = finding.side.trim().to_ascii_uppercase();
+    let mut left = requested_side == "LEFT";
+    if valid.contains(&(finding.path.clone(), finding.line, left)) {
+        finding.outside_diff = false;
+    } else {
         if valid.contains(&(finding.path.clone(), finding.line, !left)) {
             left = !left;
+            finding.outside_diff = false;
         } else {
-            return None;
+            if requested_side != "RIGHT" {
+                return None;
+            }
+            left = false;
+            finding.outside_diff = true;
         }
     }
     finding.side = if left { "LEFT" } else { "RIGHT" }.into();
@@ -11148,6 +11509,450 @@ enum ReviewPublicationPhase {
     Reconciled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewPublicationRepresentation {
+    Inline,
+    ReviewBody,
+    GroupedInline,
+    GroupedReviewBody,
+    Omitted,
+    NotEligible,
+    SuppressedByPolicy,
+    LegacyEligible,
+    LegacyGroupedByTheme,
+}
+
+impl ReviewPublicationRepresentation {
+    fn persisted(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::ReviewBody => "review_body",
+            Self::GroupedInline => "grouped_inline",
+            Self::GroupedReviewBody => "grouped_review_body",
+            Self::Omitted => "omitted",
+            Self::NotEligible => "not_eligible",
+            Self::SuppressedByPolicy => "suppressed_by_policy",
+            Self::LegacyEligible => "eligible",
+            Self::LegacyGroupedByTheme => "grouped_by_theme",
+        }
+    }
+
+    fn from_persisted(value: &str) -> Result<Self> {
+        match value {
+            "inline" => Ok(Self::Inline),
+            "review_body" => Ok(Self::ReviewBody),
+            "grouped_inline" => Ok(Self::GroupedInline),
+            "grouped_review_body" => Ok(Self::GroupedReviewBody),
+            "omitted" => Ok(Self::Omitted),
+            "not_eligible" => Ok(Self::NotEligible),
+            "suppressed_by_policy" => Ok(Self::SuppressedByPolicy),
+            "eligible" => Ok(Self::LegacyEligible),
+            "grouped_by_theme" => Ok(Self::LegacyGroupedByTheme),
+            _ => bail!("unknown publication representation `{value}`"),
+        }
+    }
+
+    fn is_current_only(self) -> bool {
+        matches!(
+            self,
+            Self::Inline
+                | Self::ReviewBody
+                | Self::GroupedInline
+                | Self::GroupedReviewBody
+                | Self::Omitted
+        )
+    }
+
+    fn is_legacy_only(self) -> bool {
+        matches!(self, Self::LegacyEligible | Self::LegacyGroupedByTheme)
+    }
+
+    fn publication_status(self) -> Result<trouve_protocol::CodeReviewFindingPublicationStatus> {
+        use trouve_protocol::CodeReviewFindingPublicationStatus as Status;
+
+        match self {
+            Self::Inline | Self::ReviewBody => Ok(Status::Published),
+            Self::GroupedInline | Self::GroupedReviewBody => Ok(Status::GroupedByTheme),
+            Self::Omitted => Ok(Status::Failed),
+            Self::NotEligible => Ok(Status::NotEligible),
+            Self::SuppressedByPolicy => Ok(Status::SuppressedByPolicy),
+            Self::LegacyEligible | Self::LegacyGroupedByTheme => {
+                bail!("legacy publication representation was not resolved")
+            }
+        }
+    }
+
+    fn receives_review_url(self) -> bool {
+        matches!(self, Self::ReviewBody | Self::GroupedReviewBody)
+    }
+
+    fn requires_inline_comment(self) -> bool {
+        self == Self::Inline
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewPublicationManifestFormat {
+    Current,
+    Legacy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewPublicationManifestEntry {
+    finding_id: String,
+    primary_finding_id: String,
+    representation: ReviewPublicationRepresentation,
+}
+
+impl ReviewPublicationManifestEntry {
+    fn new(
+        finding_id: impl Into<String>,
+        primary_finding_id: impl Into<String>,
+        representation: ReviewPublicationRepresentation,
+    ) -> Self {
+        Self {
+            finding_id: finding_id.into(),
+            primary_finding_id: primary_finding_id.into(),
+            representation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewPublicationManifest {
+    format: ReviewPublicationManifestFormat,
+    entries: Vec<ReviewPublicationManifestEntry>,
+}
+
+impl ReviewPublicationManifest {
+    fn current<'a>(
+        entries: Vec<ReviewPublicationManifestEntry>,
+        finding_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self> {
+        Self::validated(
+            ReviewPublicationManifestFormat::Current,
+            entries,
+            finding_ids,
+        )
+    }
+
+    fn from_persisted<'a>(
+        entries: &[(String, String, String)],
+        finding_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Option<Self>> {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let entries = entries
+            .iter()
+            .map(|(finding_id, primary_finding_id, representation)| {
+                Ok(ReviewPublicationManifestEntry::new(
+                    finding_id,
+                    primary_finding_id,
+                    ReviewPublicationRepresentation::from_persisted(representation)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let has_current = entries
+            .iter()
+            .any(|entry| entry.representation.is_current_only());
+        let has_legacy = entries
+            .iter()
+            .any(|entry| entry.representation.is_legacy_only());
+        if has_current && has_legacy {
+            bail!("publication manifest mixes legacy and current representations");
+        }
+        let format = if has_current {
+            ReviewPublicationManifestFormat::Current
+        } else {
+            ReviewPublicationManifestFormat::Legacy
+        };
+        Self::validated(format, entries, finding_ids).map(Some)
+    }
+
+    fn validated<'a>(
+        format: ReviewPublicationManifestFormat,
+        entries: Vec<ReviewPublicationManifestEntry>,
+        finding_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self> {
+        let expected = finding_ids.into_iter().collect::<HashSet<_>>();
+        let mut by_id = HashMap::new();
+        for entry in &entries {
+            if !expected.contains(entry.finding_id.as_str()) {
+                bail!(
+                    "publication manifest contains unknown finding `{}`",
+                    entry.finding_id
+                );
+            }
+            if by_id.insert(entry.finding_id.as_str(), entry).is_some() {
+                bail!(
+                    "publication manifest contains duplicate finding `{}`",
+                    entry.finding_id
+                );
+            }
+        }
+        let missing = expected
+            .iter()
+            .copied()
+            .filter(|finding_id| !by_id.contains_key(finding_id))
+            .collect::<BTreeSet<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "publication manifest is missing finding(s): {}",
+                missing.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        for entry in &entries {
+            let primary = by_id
+                .get(entry.primary_finding_id.as_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "publication manifest finding `{}` references missing primary `{}`",
+                        entry.finding_id,
+                        entry.primary_finding_id
+                    )
+                })?;
+            match (format, entry.representation) {
+                (
+                    ReviewPublicationManifestFormat::Current,
+                    ReviewPublicationRepresentation::Inline
+                    | ReviewPublicationRepresentation::ReviewBody
+                    | ReviewPublicationRepresentation::NotEligible
+                    | ReviewPublicationRepresentation::SuppressedByPolicy,
+                ) => {
+                    if entry.finding_id != entry.primary_finding_id {
+                        bail!(
+                            "publication manifest finding `{}` must represent itself",
+                            entry.finding_id
+                        );
+                    }
+                }
+                (
+                    ReviewPublicationManifestFormat::Current,
+                    ReviewPublicationRepresentation::GroupedInline,
+                ) => {
+                    if entry.finding_id == entry.primary_finding_id
+                        || primary.representation != ReviewPublicationRepresentation::Inline
+                    {
+                        bail!(
+                            "grouped inline finding `{}` does not reference an inline primary",
+                            entry.finding_id
+                        );
+                    }
+                }
+                (
+                    ReviewPublicationManifestFormat::Current,
+                    ReviewPublicationRepresentation::GroupedReviewBody,
+                ) => {
+                    if entry.finding_id == entry.primary_finding_id
+                        || primary.representation != ReviewPublicationRepresentation::ReviewBody
+                    {
+                        bail!(
+                            "grouped review-body finding `{}` does not reference a review-body primary",
+                            entry.finding_id
+                        );
+                    }
+                }
+                (
+                    ReviewPublicationManifestFormat::Current,
+                    ReviewPublicationRepresentation::Omitted,
+                ) => {
+                    if entry.finding_id != entry.primary_finding_id
+                        && primary.representation != ReviewPublicationRepresentation::Omitted
+                    {
+                        bail!(
+                            "grouped omitted finding `{}` does not reference an omitted primary",
+                            entry.finding_id
+                        );
+                    }
+                }
+                (
+                    ReviewPublicationManifestFormat::Legacy,
+                    ReviewPublicationRepresentation::LegacyEligible
+                    | ReviewPublicationRepresentation::NotEligible
+                    | ReviewPublicationRepresentation::SuppressedByPolicy,
+                ) => {
+                    if entry.finding_id != entry.primary_finding_id {
+                        bail!(
+                            "legacy publication manifest finding `{}` must represent itself",
+                            entry.finding_id
+                        );
+                    }
+                }
+                (
+                    ReviewPublicationManifestFormat::Legacy,
+                    ReviewPublicationRepresentation::LegacyGroupedByTheme,
+                ) => {
+                    if entry.finding_id == entry.primary_finding_id
+                        || primary.representation != ReviewPublicationRepresentation::LegacyEligible
+                    {
+                        bail!(
+                            "legacy grouped finding `{}` does not reference an eligible primary",
+                            entry.finding_id
+                        );
+                    }
+                }
+                (ReviewPublicationManifestFormat::Current, representation) => bail!(
+                    "current publication manifest contains legacy representation `{}`",
+                    representation.persisted()
+                ),
+                (ReviewPublicationManifestFormat::Legacy, representation) => bail!(
+                    "legacy publication manifest contains current representation `{}`",
+                    representation.persisted()
+                ),
+            }
+        }
+        Ok(Self { format, entries })
+    }
+
+    fn persisted_entries(&self) -> Vec<(&str, &str, &str)> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.finding_id.as_str(),
+                    entry.primary_finding_id.as_str(),
+                    entry.representation.persisted(),
+                )
+            })
+            .collect()
+    }
+
+    fn into_current_for_recovery(
+        self,
+        findings: &[trouve_protocol::CodeReviewFinding],
+    ) -> Result<Self> {
+        if self.format == ReviewPublicationManifestFormat::Current {
+            return Ok(self);
+        }
+        let finding_by_id = findings
+            .iter()
+            .map(|finding| (finding.id.as_str(), finding))
+            .collect::<HashMap<_, _>>();
+        let mut primary_representations = HashMap::new();
+        for entry in &self.entries {
+            if entry.representation != ReviewPublicationRepresentation::LegacyEligible {
+                continue;
+            }
+            let finding = finding_by_id
+                .get(entry.finding_id.as_str())
+                .ok_or_else(|| anyhow!("publication manifest finding disappeared"))?;
+            let representation = if finding.outside_diff
+                || finding.github_publication_status
+                    == trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+            {
+                ReviewPublicationRepresentation::ReviewBody
+            } else {
+                ReviewPublicationRepresentation::Inline
+            };
+            primary_representations.insert(entry.finding_id.clone(), representation);
+        }
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let representation = match entry.representation {
+                    ReviewPublicationRepresentation::LegacyEligible => *primary_representations
+                        .get(entry.finding_id.as_str())
+                        .ok_or_else(|| anyhow!("eligible publication primary disappeared"))?,
+                    ReviewPublicationRepresentation::LegacyGroupedByTheme => {
+                        match primary_representations
+                            .get(entry.primary_finding_id.as_str())
+                            .copied()
+                        {
+                            Some(ReviewPublicationRepresentation::Inline) => {
+                                ReviewPublicationRepresentation::GroupedInline
+                            }
+                            Some(ReviewPublicationRepresentation::ReviewBody) => {
+                                ReviewPublicationRepresentation::GroupedReviewBody
+                            }
+                            _ => bail!(
+                                "legacy grouped finding `{}` has no recoverable primary",
+                                entry.finding_id
+                            ),
+                        }
+                    }
+                    representation => representation,
+                };
+                Ok(ReviewPublicationManifestEntry {
+                    representation,
+                    ..entry
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::current(entries, findings.iter().map(|finding| finding.id.as_str()))
+    }
+
+    fn outcome_groups(
+        &self,
+        accepted: bool,
+    ) -> Result<
+        Vec<(
+            trouve_protocol::CodeReviewFindingPublicationStatus,
+            Vec<&str>,
+        )>,
+    > {
+        use trouve_protocol::CodeReviewFindingPublicationStatus as Status;
+
+        let resolved = self
+            .entries
+            .iter()
+            .map(|entry| Ok((entry, entry.representation.publication_status()?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut groups = Vec::new();
+        for status in [
+            Status::Published,
+            Status::GroupedByTheme,
+            Status::Failed,
+            Status::NotEligible,
+            Status::SuppressedByPolicy,
+        ] {
+            if !accepted && matches!(status, Status::Published | Status::GroupedByTheme) {
+                continue;
+            }
+            let finding_ids = resolved
+                .iter()
+                .filter_map(|(entry, entry_status)| {
+                    (*entry_status == status).then_some(entry.finding_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if !finding_ids.is_empty() {
+                groups.push((status, finding_ids));
+            }
+        }
+        Ok(groups)
+    }
+
+    fn inline_finding_ids(&self) -> HashSet<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.representation.requires_inline_comment())
+            .map(|entry| entry.finding_id.as_str())
+            .collect()
+    }
+
+    fn review_level_finding_ids(&self) -> HashSet<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.representation.receives_review_url())
+            .map(|entry| entry.finding_id.as_str())
+            .collect()
+    }
+
+    fn published_finding_ids(&self) -> Result<Vec<&str>> {
+        let mut finding_ids = Vec::new();
+        for entry in &self.entries {
+            if entry.representation.publication_status()?
+                == trouve_protocol::CodeReviewFindingPublicationStatus::Published
+            {
+                finding_ids.push(entry.finding_id.as_str());
+            }
+        }
+        Ok(finding_ids)
+    }
+}
+
 fn review_publication_phase(
     record: &crate::store::CodeReviewJobRecord,
     fully_reconciled: bool,
@@ -11185,10 +11990,9 @@ fn review_theme_publication_groups<'a>(
         .collect::<HashMap<_, _>>();
     let mut publishable_by_theme: BTreeMap<&str, Vec<&trouve_protocol::CodeReviewFinding>> =
         BTreeMap::new();
-    for finding in findings
-        .iter()
-        .filter(|finding| finding.is_publishable() && finding.theme_ids.len() == 1)
-    {
+    for finding in findings.iter().filter(|finding| {
+        !finding.outside_diff && finding.is_publishable() && finding.theme_ids.len() == 1
+    }) {
         publishable_by_theme
             .entry(finding.theme_ids[0].as_str())
             .or_default()
@@ -11208,10 +12012,10 @@ fn review_theme_publication_groups<'a>(
         .collect()
 }
 
-fn legacy_review_theme_grouped_finding_ids(
+fn legacy_review_theme_grouped_primary_ids(
     findings: &[trouve_protocol::CodeReviewFinding],
     themes: &[trouve_protocol::CodeReviewTheme],
-) -> HashSet<String> {
+) -> HashMap<String, String> {
     let memberships = themes
         .iter()
         .flat_map(|theme| {
@@ -11233,9 +12037,49 @@ fn legacy_review_theme_grouped_finding_ids(
         .collect::<Vec<_>>();
     review_theme_publication_groups(&legacy_findings, themes)
         .iter()
-        .flat_map(|group| group.members.iter().skip(1))
-        .map(|finding| finding.id.clone())
+        .flat_map(|group| {
+            let primary_id = group.members[0].id.clone();
+            group
+                .members
+                .iter()
+                .skip(1)
+                .map(move |finding| (finding.id.clone(), primary_id.clone()))
+        })
         .collect()
+}
+
+fn inferred_legacy_review_publication_manifest(
+    findings: &[trouve_protocol::CodeReviewFinding],
+    themes: &[trouve_protocol::CodeReviewTheme],
+) -> Result<ReviewPublicationManifest> {
+    let grouped_primary_ids = legacy_review_theme_grouped_primary_ids(findings, themes);
+    let entries = findings
+        .iter()
+        .map(|finding| {
+            let representation = if !finding.has_inline_location() {
+                ReviewPublicationRepresentation::NotEligible
+            } else if !finding.is_publishable() {
+                ReviewPublicationRepresentation::SuppressedByPolicy
+            } else if grouped_primary_ids.contains_key(&finding.id) {
+                ReviewPublicationRepresentation::LegacyGroupedByTheme
+            } else {
+                ReviewPublicationRepresentation::LegacyEligible
+            };
+            ReviewPublicationManifestEntry::new(
+                &finding.id,
+                grouped_primary_ids
+                    .get(&finding.id)
+                    .map_or(finding.id.as_str(), String::as_str),
+                representation,
+            )
+        })
+        .collect::<Vec<_>>();
+    ReviewPublicationManifest::validated(
+        ReviewPublicationManifestFormat::Legacy,
+        entries,
+        findings.iter().map(|finding| finding.id.as_str()),
+    )?
+    .into_current_for_recovery(findings)
 }
 
 impl CodeReviewFindingPublicationExt for trouve_protocol::CodeReviewFinding {
@@ -11640,6 +12484,50 @@ mod tests {
         assert!(review_has_unresolved_findings(1, &[], &[]));
         assert!(review_has_unresolved_findings(0, &["old"], &[]));
         assert!(!review_has_unresolved_findings(0, &["old"], &["old"]));
+    }
+
+    #[test]
+    fn outside_diff_only_findings_publish_a_comment_verdict() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:outside-verdict");
+        store.claim_code_review_job().unwrap().unwrap();
+        let mut finding = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "One outside-diff issue.",
+                "Fix the outside-diff issue.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Test issue".into(),
+                    body: "Issue outside the pull request diff.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    outside_diff: true,
+                    ..Default::default()
+                }],
+                &[],
+                &[],
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let current_is_blocking =
+            review_has_unresolved_publishable_findings(std::slice::from_ref(&finding), &[], &[]);
+        assert_eq!(github_review_event(current_is_blocking), "COMMENT");
+
+        finding.github_publication_status =
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published;
+        let previous_is_blocking =
+            review_has_unresolved_publishable_findings(&[], std::slice::from_ref(&finding), &[]);
+        assert_eq!(github_review_event(previous_is_blocking), "COMMENT");
     }
 
     #[test]
@@ -13078,7 +13966,8 @@ mod tests {
             "side": "RIGHT",
             "body": "Inline finding"
         })];
-        let request = inline_review_request(&job, "REQUEST_CHANGES", &comments);
+        let (request, rendered_ids) =
+            inline_review_request(&job, "REQUEST_CHANGES", &comments, &[], &[], &[]);
 
         let body = request["body"].as_str().unwrap();
         assert!(!body.is_empty());
@@ -13088,6 +13977,35 @@ mod tests {
         );
         assert_eq!(request["event"], "REQUEST_CHANGES");
         assert_eq!(request["comments"].as_array().unwrap().len(), 1);
+        assert!(rendered_ids.is_empty());
+    }
+
+    #[test]
+    fn commentless_review_reuses_exact_submitted_inline_representation() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:commentless-review");
+        let grouped_body =
+            "Primary issue\n\nManifestations grouped under this root cause:\n- Grouped symptom";
+        let original_comments = vec![serde_json::json!({
+            "path": "src/lib.rs",
+            "line": 42,
+            "side": "RIGHT",
+            "body": grouped_body,
+        })];
+        let (request, rendered_ids) = inline_review_request(
+            &job,
+            "REQUEST_CHANGES",
+            &[],
+            &[],
+            &original_comments,
+            &["rvf-inline"],
+        );
+
+        let body = request["body"].as_str().unwrap();
+        assert!(body.contains("Comments GitHub could not place inline (1)"));
+        assert_eq!(body.matches(grouped_body).count(), 1);
+        assert!(request["comments"].as_array().unwrap().is_empty());
+        assert_eq!(rendered_ids, HashSet::from(["rvf-inline".to_owned()]));
     }
 
     #[test]
@@ -14399,6 +15317,316 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commentless_recovery_preserves_exact_finding_representations() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:commentless-recovery");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "A grouped inline issue, an outside issue, an omitted issue, and a suppressed issue.",
+                "Fix the published issues.",
+                5,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/inline.rs".into(),
+                        line: 10,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Inline primary".into(),
+                        body: "Primary manifestation.".into(),
+                        prompt_for_agents: "Fix the primary.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/grouped.rs".into(),
+                        line: 20,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Grouped symptom".into(),
+                        body: "Same root cause.".into(),
+                        prompt_for_agents: "Fix the root cause.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/outside.rs".into(),
+                        line: 30,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Outside issue".into(),
+                        body: "Rendered in the review body.".into(),
+                        prompt_for_agents: "Fix the outside issue.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/suppressed.rs".into(),
+                        line: 40,
+                        side: "RIGHT".into(),
+                        severity: "low".into(),
+                        confidence: "medium".into(),
+                        title: "Suppressed outside issue".into(),
+                        body: "Omitted from GitHub.".into(),
+                        prompt_for_agents: "Keep this internal.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/omitted.rs".into(),
+                        line: 50,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Omitted outside issue".into(),
+                        body: "Excluded by the review-body byte limit.".into(),
+                        prompt_for_agents: "Keep the omission durable.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[
+                    NewCodeReviewFindingDetails::default(),
+                    NewCodeReviewFindingDetails::default(),
+                    NewCodeReviewFindingDetails {
+                        outside_diff: true,
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        outside_diff: true,
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        outside_diff: true,
+                        ..Default::default()
+                    },
+                ],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let finding = |path: &str| {
+            findings
+                .iter()
+                .find(|finding| finding.path == path)
+                .unwrap()
+        };
+        let inline = finding("src/inline.rs");
+        let grouped = finding("src/grouped.rs");
+        let outside = finding("src/outside.rs");
+        let suppressed = finding("src/suppressed.rs");
+        let omitted = finding("src/omitted.rs");
+        assert!(
+            store
+                .prepare_code_review_publication_manifest(
+                    &job.id,
+                    &[
+                        (&inline.id, &inline.id, "review_body"),
+                        (&grouped.id, &inline.id, "grouped_review_body"),
+                        (&outside.id, &outside.id, "review_body"),
+                        (&suppressed.id, &suppressed.id, "suppressed_by_policy"),
+                        (&omitted.id, &omitted.id, "omitted"),
+                    ],
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .prepare_code_review_commentless_publication(
+                    &job.id,
+                    &[inline.id.as_str(), outside.id.as_str()],
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&job.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&job.id)
+                .unwrap()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let marker = inline_review_marker(&job.id);
+        let head_sha = job.head_sha.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_mock_http_request(&mut stream).await;
+            assert!(
+                request
+                    .starts_with("get /repos/acme/widgets/pulls/42/reviews?per_page=100&page=1 ")
+            );
+            let body = serde_json::json!([{
+                "id": 77,
+                "html_url": "https://github.com/review-77",
+                "body": marker,
+                "commit_id": head_sha,
+                "user": {"login": "trouve-ai[bot]", "type": "Bot"},
+            }])
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        engine
+            .sync_code_review_publication_projection(&api, &job)
+            .await
+            .unwrap();
+        await_mock_server(server).await;
+        let stored = engine.store.code_review_findings(&job.id).unwrap();
+        let stored = |path: &str| stored.iter().find(|finding| finding.path == path).unwrap();
+        assert_eq!(
+            stored("src/inline.rs").github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+        );
+        assert_eq!(
+            stored("src/grouped.rs").github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::GroupedByTheme
+        );
+        assert_eq!(
+            stored("src/outside.rs").github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+        );
+        assert_eq!(
+            stored("src/suppressed.rs").github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
+        );
+        assert_eq!(
+            stored("src/omitted.rs").github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+        );
+        for path in ["src/inline.rs", "src/grouped.rs", "src/outside.rs"] {
+            assert_eq!(
+                stored(path).github_comment_url,
+                "https://github.com/review-77"
+            );
+        }
+        assert!(stored("src/suppressed.rs").github_comment_url.is_empty());
+        assert!(stored("src/omitted.rs").github_comment_url.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_commentless_manifest_recovers_review_body_publication() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:legacy-commentless-recovery");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "One inline finding was moved into the review body.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/legacy.rs".into(),
+                    line: 12,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Legacy fallback".into(),
+                    body: "GitHub rejected inline placement.".into(),
+                    prompt_for_agents: "Fix the issue.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            store
+                .prepare_code_review_publication_manifest(
+                    &job.id,
+                    &[(&finding.id, &finding.id, "eligible")],
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .prepare_code_review_commentless_publication(&job.id, &[finding.id.as_str()])
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&job.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&job.id)
+                .unwrap()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let marker = inline_review_marker(&job.id);
+        let head_sha = job.head_sha.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_mock_http_request(&mut stream).await;
+            assert!(
+                request
+                    .starts_with("get /repos/acme/widgets/pulls/42/reviews?per_page=100&page=1 ")
+            );
+            let body = serde_json::json!([{
+                "id": 78,
+                "html_url": "https://github.com/review-78",
+                "body": marker,
+                "commit_id": head_sha,
+                "user": {"login": "trouve-ai[bot]", "type": "Bot"},
+            }])
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        engine
+            .sync_code_review_publication_projection(&api, &job)
+            .await
+            .unwrap();
+        await_mock_server(server).await;
+        let stored = engine.store.code_review_findings(&job.id).unwrap();
+        assert_eq!(
+            stored[0].github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+        );
+        assert_eq!(stored[0].github_comment_url, "https://github.com/review-78");
+        assert!(stored[0].github_comment_id.is_none());
+    }
+
+    #[tokio::test]
     async fn review_without_inline_comments_still_publishes_a_verdict() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -14521,22 +15749,43 @@ mod tests {
         store.claim_code_review_job().unwrap().unwrap();
         assert!(store.claim_code_review_publication(&job.id).unwrap());
         let findings = store
-            .save_code_review_result(
+            .save_code_review_result_with_themes(
                 &job.id,
-                "One inline issue.",
+                "One inline issue and one suppressed outside-diff issue.",
                 "Fix it.",
-                1,
-                &[NewCodeReviewFinding {
-                    path: "src/lib.rs".into(),
-                    line: 42,
-                    side: "RIGHT".into(),
-                    severity: "high".into(),
-                    confidence: "high".into(),
-                    title: "Test issue".into(),
-                    body: "Eligible issue.".into(),
-                    prompt_for_agents: "Fix it.".into(),
-                    sources: Vec::new(),
-                }],
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/lib.rs".into(),
+                        line: 42,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Test issue".into(),
+                        body: "Eligible issue.".into(),
+                        prompt_for_agents: "Fix it.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/suppressed.rs".into(),
+                        line: 7,
+                        side: "RIGHT".into(),
+                        severity: "low".into(),
+                        confidence: "medium".into(),
+                        title: "Suppressed outside issue".into(),
+                        body: "Do not publish this issue.".into(),
+                        prompt_for_agents: "Keep this internal.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[
+                    NewCodeReviewFindingDetails::default(),
+                    NewCodeReviewFindingDetails {
+                        outside_diff: true,
+                        ..Default::default()
+                    },
+                ],
+                &[],
                 &[],
             )
             .unwrap();
@@ -14596,10 +15845,156 @@ mod tests {
         await_mock_server(server).await;
         let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
         assert!(record.publication_accepted);
+        let stored_findings = engine.store.code_review_findings(&job.id).unwrap();
+        let stored_finding = stored_findings
+            .iter()
+            .find(|finding| finding.path == "src/lib.rs")
+            .unwrap();
         assert_eq!(
-            engine.store.code_review_findings(&job.id).unwrap()[0].github_publication_status,
-            trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+            stored_finding.github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published
         );
+        assert_eq!(
+            stored_finding.github_comment_url,
+            "https://github.com/review-77"
+        );
+        let suppressed = stored_findings
+            .iter()
+            .find(|finding| finding.path == "src/suppressed.rs")
+            .unwrap();
+        assert_eq!(
+            suppressed.github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
+        );
+        assert!(suppressed.github_comment_url.is_empty());
+        let manifest = engine
+            .store
+            .code_review_publication_manifest(&job.id)
+            .unwrap();
+        assert!(manifest.iter().any(|(finding_id, primary_id, status)| {
+            finding_id == &stored_finding.id && primary_id == finding_id && status == "review_body"
+        }));
+        assert!(manifest.iter().any(|(finding_id, primary_id, status)| {
+            finding_id == &suppressed.id
+                && primary_id == finding_id
+                && status == "suppressed_by_policy"
+        }));
+    }
+
+    #[tokio::test]
+    async fn review_body_limit_leaves_omitted_outside_findings_unpublished() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:bounded-outside-review");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let new_findings = (0..24)
+            .map(|index| NewCodeReviewFinding {
+                path: format!("src/outside-{index}.rs"),
+                line: index + 1,
+                side: "RIGHT".into(),
+                severity: "medium".into(),
+                confidence: "high".into(),
+                title: format!("Outside issue {index}"),
+                body: "x".repeat(4_000),
+                prompt_for_agents: "Fix the outside issue.".into(),
+                sources: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let details = (0..new_findings.len())
+            .map(|_| NewCodeReviewFindingDetails {
+                outside_diff: true,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "Many outside-diff issues.",
+                "Fix every published issue.",
+                new_findings.len() as u64,
+                &new_findings,
+                &details,
+                &[],
+                &[],
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_mock_http_request(&mut stream).await;
+            let body = r#"{"id":77,"html_url":"https://github.com/review-77"}"#;
+            let response = format!(
+                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine
+                .publish_review(&api, &job, &findings, true)
+                .await
+                .unwrap(),
+            "https://github.com/review-77"
+        );
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("mock server did not finish")
+            .expect("mock server task failed");
+        assert!(request.contains("finding(s) omitted"));
+        assert!(request.len() <= REVIEW_BODY_MAX_BYTES + 4_096);
+
+        let stored = engine.store.code_review_findings(&job.id).unwrap();
+        let manifest = engine
+            .store
+            .code_review_publication_manifest(&job.id)
+            .unwrap();
+        let mut published = 0;
+        let mut omitted = 0;
+        for finding in &stored {
+            let rendered = request.contains(&format!("finding:{}", finding.id));
+            let representation = manifest
+                .iter()
+                .find(|(finding_id, _, _)| finding_id == &finding.id)
+                .map(|(_, _, status)| status.as_str())
+                .unwrap();
+            if rendered {
+                published += 1;
+                assert_eq!(representation, "review_body");
+                assert_eq!(
+                    finding.github_publication_status,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Published
+                );
+                assert_eq!(finding.github_comment_url, "https://github.com/review-77");
+            } else {
+                omitted += 1;
+                assert_eq!(representation, "omitted");
+                assert_eq!(
+                    finding.github_publication_status,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+                );
+                assert!(finding.github_comment_url.is_empty());
+            }
+        }
+        assert!(published > 0);
+        assert!(omitted > 0);
     }
 
     #[tokio::test]
@@ -15899,6 +17294,7 @@ mod tests {
             path: "src/lib.rs".into(),
             line: 3,
             side: "RIGHT".into(),
+            outside_diff: false,
             severity: "medium".into(),
             confidence: "high".into(),
             title: "Test issue".into(),
@@ -15967,6 +17363,7 @@ mod tests {
                     path: "src/a.rs".into(),
                     line: 3,
                     side: "RIGHT".into(),
+                    outside_diff: false,
                     severity: "medium".into(),
                     confidence: "high".into(),
                     title: "Test issue".into(),
@@ -15979,6 +17376,7 @@ mod tests {
                     path: "src/b.rs".into(),
                     line: 7,
                     side: "RIGHT".into(),
+                    outside_diff: false,
                     severity: "medium".into(),
                     confidence: "high".into(),
                     title: "Test issue".into(),
@@ -16000,6 +17398,7 @@ mod tests {
             path: "src/lib.rs".into(),
             line: 3,
             side: "RIGHT".into(),
+            outside_diff: false,
             severity: "medium".into(),
             confidence: "high".into(),
             title: "Test issue".into(),
@@ -16031,6 +17430,7 @@ mod tests {
             path: format!("src/{candidate_id}.rs"),
             line: 3,
             side: "RIGHT".into(),
+            outside_diff: false,
             severity: "medium".into(),
             confidence: "high".into(),
             title: "Lifecycle state leaks".into(),
@@ -16132,9 +17532,198 @@ mod tests {
         assert_eq!(groups[0].members[0].id, "rvf-primary");
         assert_eq!(groups[0].members[1].id, "rvf-child");
         assert_eq!(
-            legacy_review_theme_grouped_finding_ids(&findings, &themes),
-            HashSet::from(["rvf-child".to_owned()])
+            legacy_review_theme_grouped_primary_ids(&findings, &themes),
+            HashMap::from([("rvf-child".to_owned(), "rvf-primary".to_owned())])
         );
+    }
+
+    #[test]
+    fn publication_representations_define_outcomes_and_reconciliation() {
+        use trouve_protocol::CodeReviewFindingPublicationStatus as Status;
+
+        for (representation, status, receives_review_url, requires_inline_comment) in [
+            (
+                ReviewPublicationRepresentation::Inline,
+                Status::Published,
+                false,
+                true,
+            ),
+            (
+                ReviewPublicationRepresentation::ReviewBody,
+                Status::Published,
+                true,
+                false,
+            ),
+            (
+                ReviewPublicationRepresentation::GroupedInline,
+                Status::GroupedByTheme,
+                false,
+                false,
+            ),
+            (
+                ReviewPublicationRepresentation::GroupedReviewBody,
+                Status::GroupedByTheme,
+                true,
+                false,
+            ),
+            (
+                ReviewPublicationRepresentation::Omitted,
+                Status::Failed,
+                false,
+                false,
+            ),
+            (
+                ReviewPublicationRepresentation::NotEligible,
+                Status::NotEligible,
+                false,
+                false,
+            ),
+            (
+                ReviewPublicationRepresentation::SuppressedByPolicy,
+                Status::SuppressedByPolicy,
+                false,
+                false,
+            ),
+        ] {
+            assert_eq!(representation.publication_status().unwrap(), status);
+            assert_eq!(representation.receives_review_url(), receives_review_url);
+            assert_eq!(
+                representation.requires_inline_comment(),
+                requires_inline_comment
+            );
+        }
+    }
+
+    #[test]
+    fn publication_manifest_rejects_unknown_mixed_and_incoherent_rows() {
+        let unknown = [("rvf-a".into(), "rvf-a".into(), "surprise".into())];
+        assert!(
+            ReviewPublicationManifest::from_persisted(&unknown, ["rvf-a"])
+                .unwrap_err()
+                .to_string()
+                .contains("unknown publication representation")
+        );
+
+        let mixed = [
+            ("rvf-a".into(), "rvf-a".into(), "inline".into()),
+            ("rvf-b".into(), "rvf-b".into(), "eligible".into()),
+        ];
+        assert!(
+            ReviewPublicationManifest::from_persisted(&mixed, ["rvf-a", "rvf-b"])
+                .unwrap_err()
+                .to_string()
+                .contains("mixes legacy and current")
+        );
+
+        let incomplete = [("rvf-a".into(), "rvf-a".into(), "inline".into())];
+        assert!(
+            ReviewPublicationManifest::from_persisted(&incomplete, ["rvf-a", "rvf-b"])
+                .unwrap_err()
+                .to_string()
+                .contains("missing finding")
+        );
+
+        let inconsistent_group = [
+            ("rvf-a".into(), "rvf-a".into(), "inline".into()),
+            ("rvf-b".into(), "rvf-a".into(), "grouped_review_body".into()),
+        ];
+        assert!(
+            ReviewPublicationManifest::from_persisted(&inconsistent_group, ["rvf-a", "rvf-b"])
+                .unwrap_err()
+                .to_string()
+                .contains("does not reference a review-body primary")
+        );
+    }
+
+    #[test]
+    fn legacy_and_empty_manifests_resolve_to_current_representations() {
+        let finding = |id: &str, outside_diff: bool, publication_status: &str| {
+            serde_json::from_value::<trouve_protocol::CodeReviewFinding>(serde_json::json!({
+                "id": id,
+                "job_id": "rvj-legacy-publication",
+                "path": format!("src/{id}.rs"),
+                "line": 7,
+                "side": "RIGHT",
+                "severity": "high",
+                "confidence": "high",
+                "title": "Recoverable issue",
+                "body": "The invariant is violated.",
+                "status": "open",
+                "outside_diff": outside_diff,
+                "github_publication_status": publication_status,
+                "theme_ids": if id == "rvf-outside" {
+                    Vec::<String>::new()
+                } else {
+                    vec!["rvth-legacy".to_owned()]
+                }
+            }))
+            .unwrap()
+        };
+        let findings = vec![
+            finding("rvf-primary", false, "failed"),
+            finding("rvf-child", false, "pending"),
+            finding("rvf-outside", true, "pending"),
+        ];
+        let rows = [
+            (
+                "rvf-primary".into(),
+                "rvf-primary".into(),
+                "eligible".into(),
+            ),
+            (
+                "rvf-child".into(),
+                "rvf-primary".into(),
+                "grouped_by_theme".into(),
+            ),
+            (
+                "rvf-outside".into(),
+                "rvf-outside".into(),
+                "eligible".into(),
+            ),
+        ];
+        let manifest = ReviewPublicationManifest::from_persisted(
+            &rows,
+            findings.iter().map(|finding| finding.id.as_str()),
+        )
+        .unwrap()
+        .unwrap()
+        .into_current_for_recovery(&findings)
+        .unwrap();
+        let representation = |finding_id: &str| {
+            manifest
+                .entries
+                .iter()
+                .find(|entry| entry.finding_id == finding_id)
+                .unwrap()
+                .representation
+        };
+        assert_eq!(
+            representation("rvf-primary"),
+            ReviewPublicationRepresentation::ReviewBody
+        );
+        assert_eq!(
+            representation("rvf-child"),
+            ReviewPublicationRepresentation::GroupedReviewBody
+        );
+        assert_eq!(
+            representation("rvf-outside"),
+            ReviewPublicationRepresentation::ReviewBody
+        );
+
+        let theme = serde_json::from_value::<trouve_protocol::CodeReviewTheme>(serde_json::json!({
+            "id": "rvth-legacy",
+            "repository": "acme/widgets",
+            "pull_number": 42,
+            "root_cause": "shared invariant",
+            "recommendation": "centralize it",
+            "status": "open",
+            "first_seen_head": "1".repeat(40),
+            "last_seen_head": "1".repeat(40),
+            "finding_ids": ["rvf-primary", "rvf-child"]
+        }))
+        .unwrap();
+        let inferred = inferred_legacy_review_publication_manifest(&findings, &[theme]).unwrap();
+        assert_eq!(manifest, inferred);
     }
 
     #[test]
@@ -16207,6 +17796,7 @@ mod tests {
             path: "src/lib.rs".into(),
             line: 3,
             side: "RIGHT".into(),
+            outside_diff: false,
             severity: "medium".into(),
             confidence: "high".into(),
             title: "Lifecycle state leaks".into(),
@@ -16258,6 +17848,7 @@ mod tests {
             path: "src/lib.rs".into(),
             line: 3,
             side: "RIGHT".into(),
+            outside_diff: false,
             severity: "medium".into(),
             confidence: "high".into(),
             title: "Test issue".into(),
@@ -17544,7 +19135,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_validation_fixes_sides_and_deduplicates_candidates() {
+    fn structural_validation_classifies_outside_diff_candidates() {
         let files = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -20,2 +2,3 @@\n context\n+added\n tail\n".into(),
@@ -17559,6 +19150,7 @@ mod tests {
                 path: path.into(),
                 line: 3,
                 side: side.into(),
+                outside_diff: false,
                 severity: "critical".into(),
                 confidence: "high".into(),
                 title: "Test issue".into(),
@@ -17573,13 +19165,99 @@ mod tests {
                 candidate("b/src/lib.rs", "LEFT", "real issue"),
                 candidate("src/lib.rs", "RIGHT", "real issue"),
                 candidate("src/other.rs", "RIGHT", "not in diff"),
+                candidate("src/removed.rs", "LEFT", "old-side anchor"),
+                candidate("../secrets", "RIGHT", "unsafe path"),
             ],
             &files,
         );
-        assert_eq!(valid.len(), 1);
-        assert_eq!(valid[0].finding.path, "src/lib.rs");
-        assert_eq!(valid[0].finding.side, "RIGHT");
-        assert_eq!(valid[0].finding.severity, "medium");
+        assert_eq!(valid.len(), 2);
+        let inline = &valid[0].finding;
+        assert_eq!(inline.path, "src/lib.rs");
+        assert_eq!(inline.side, "RIGHT");
+        assert!(!inline.outside_diff);
+        assert_eq!(inline.severity, "medium");
+        let outside = &valid[1].finding;
+        assert_eq!(outside.path, "src/other.rs");
+        assert_eq!(outside.side, "RIGHT");
+        assert!(outside.outside_diff);
+    }
+
+    #[test]
+    fn review_body_sections_are_distinct_and_bounded() {
+        let finding =
+            |id: &str, outside_diff: bool, title: &str| trouve_protocol::CodeReviewFinding {
+                id: id.into(),
+                job_id: "rvj_test".into(),
+                path: "src/consumer.rs".into(),
+                line: 47,
+                side: "RIGHT".into(),
+                outside_diff,
+                severity: "high".into(),
+                confidence: "high".into(),
+                title: title.into(),
+                body: "The changed API makes this consumer fail.".into(),
+                prompt_for_agents: "Update the consumer safely.".into(),
+                status: "open".into(),
+                sources: Vec::new(),
+                github_comment_id: None,
+                github_comment_url: String::new(),
+                github_publication_status:
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
+                evidence: Default::default(),
+                origin: Default::default(),
+                theme_ids: Vec::new(),
+                github_thread_id: None,
+                resolved_at: None,
+                observed_head: String::new(),
+                resolved_head: String::new(),
+                resolved_by_job_id: String::new(),
+            };
+        let outside = finding("rvf_outside", true, "Outside issue");
+        let inline = finding("rvf_inline", false, "Inline issue");
+        let mut body = inline_review_marker("rvj_test");
+        let outside_ids =
+            append_review_body_findings(&mut body, "Outside diff range comments", &[&outside]);
+        assert_eq!(outside_ids, ["rvf_outside"]);
+        assert!(body.contains("Outside diff range comments (1)"));
+        assert!(body.contains("Outside issue"));
+        assert!(!body.contains("Inline issue"));
+
+        let inline_ids = append_review_body_findings(
+            &mut body,
+            "Comments GitHub could not place inline",
+            &[&inline],
+        );
+        assert_eq!(inline_ids, ["rvf_inline"]);
+        assert_eq!(body.matches("Outside issue").count(), 1);
+        assert_eq!(body.matches("Inline issue").count(), 1);
+        assert!(body.contains("Comments GitHub could not place inline (1)"));
+
+        let large = (0..MAX_CANDIDATE_FINDINGS)
+            .map(|index| {
+                let mut finding = finding(&format!("rvf_{index}"), true, "Large finding");
+                finding.body = "x".repeat(4_000);
+                finding
+            })
+            .collect::<Vec<_>>();
+        let large = large.iter().collect::<Vec<_>>();
+        let mut bounded = inline_review_marker("rvj_large");
+        let rendered_ids =
+            append_review_body_findings(&mut bounded, "Outside diff range comments", &large);
+        assert!(bounded.len() <= REVIEW_BODY_MAX_BYTES);
+        assert!(bounded.contains("finding(s) omitted"));
+        assert!(!rendered_ids.is_empty());
+        assert!(rendered_ids.len() < large.len());
+        assert!(
+            rendered_ids
+                .iter()
+                .all(|finding_id| bounded.contains(finding_id))
+        );
+        assert!(
+            large
+                .iter()
+                .skip(rendered_ids.len())
+                .all(|finding| !bounded.contains(&finding.id))
+        );
     }
 
     #[test]
@@ -17588,6 +19266,7 @@ mod tests {
             path: "src/lib.rs".into(),
             line: 3,
             side: "RIGHT".into(),
+            outside_diff: false,
             severity: severity.into(),
             confidence: confidence.into(),
             title: "Test issue".into(),
@@ -17642,6 +19321,7 @@ mod tests {
                 path: "src/lib.rs".into(),
                 line: 2,
                 side: "RIGHT".into(),
+                outside_diff: false,
                 severity: "medium".into(),
                 confidence: "low".into(),
                 title: "Test issue".into(),
@@ -17678,6 +19358,7 @@ mod tests {
                 path: "src/lib.rs".into(),
                 line: 3,
                 side: "RIGHT".into(),
+                outside_diff: false,
                 severity: "medium".into(),
                 confidence: "high".into(),
                 title: "Test issue".into(),
@@ -17698,6 +19379,7 @@ mod tests {
                 path: "src/lib.rs".into(),
                 line: 3,
                 side: "RIGHT".into(),
+                outside_diff: false,
                 severity: "medium".into(),
                 confidence: "high".into(),
                 title: "Test issue".into(),
@@ -17740,6 +19422,99 @@ mod tests {
         );
         assert_eq!(rejected[1].candidate_id, "missing-reason");
         assert!(rejected[1].reason.starts_with("insufficient_evidence:"));
+
+        let unaccounted = ReviewOutput {
+            summary: String::new(),
+            findings: Vec::new(),
+            rejected_candidates: Vec::new(),
+            resolved_finding_ids: Vec::new(),
+            themes: Vec::new(),
+        };
+        let rejected_without_reason = candidate_rejections(&unaccounted, &candidates[..1]);
+        assert_eq!(rejected_without_reason.len(), 1);
+        assert!(
+            rejected_without_reason[0]
+                .reason
+                .starts_with("false_positive:")
+        );
+
+        let inline = ReviewFinding {
+            source_candidate_ids: vec![candidates[0].candidate_id.clone()],
+            ..candidates[0].finding.clone()
+        };
+        let invalid_outside = ReviewFinding {
+            path: "src/missing.rs".into(),
+            outside_diff: true,
+            source_candidate_ids: vec![candidates[1].candidate_id.clone()],
+            ..candidates[1].finding.clone()
+        };
+        let (findings, invalid_anchor_candidate_ids) =
+            partition_findings_by_valid_anchors(vec![inline, invalid_outside], &HashSet::new());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(invalid_anchor_candidate_ids, ["explained"]);
+        let mut anchor_filtered = ReviewOutput {
+            summary: String::new(),
+            findings,
+            rejected_candidates: invalid_anchor_candidate_ids
+                .into_iter()
+                .map(|candidate_id| ReviewCandidateRejection {
+                    candidate_id,
+                    reason: INVALID_OUTSIDE_ANCHOR_REJECTION.into(),
+                })
+                .collect(),
+            resolved_finding_ids: Vec::new(),
+            themes: Vec::new(),
+        };
+        normalize_coordinator_output(&mut anchor_filtered, &candidates, &[]);
+        let anchor_rejections = candidate_rejections(&anchor_filtered, &candidates);
+        assert_eq!(anchor_rejections.len(), 2);
+        assert_eq!(anchor_rejections[0].candidate_id, "explained");
+        assert_eq!(
+            anchor_rejections[0].reason,
+            INVALID_OUTSIDE_ANCHOR_REJECTION
+        );
+
+        let mut invalid_candidate = candidates[1].clone();
+        invalid_candidate.finding.path = "src/missing.rs".into();
+        invalid_candidate.finding.outside_diff = true;
+        let candidates_with_invalid_anchor = vec![candidates[0].clone(), invalid_candidate];
+        let (coordinator_candidates, invalid_candidate_anchor_ids) =
+            partition_candidates_by_valid_anchors(
+                candidates_with_invalid_anchor.clone(),
+                &HashSet::new(),
+            );
+        assert_eq!(coordinator_candidates.len(), 1);
+        assert_eq!(coordinator_candidates[0].candidate_id, "accepted");
+        assert_eq!(invalid_candidate_anchor_ids, ["explained"]);
+        let mut candidate_anchor_filtered = ReviewOutput {
+            summary: String::new(),
+            findings: vec![ReviewFinding {
+                source_candidate_ids: vec!["accepted".into()],
+                ..candidates[0].finding.clone()
+            }],
+            rejected_candidates: invalid_candidate_anchor_ids
+                .into_iter()
+                .map(|candidate_id| ReviewCandidateRejection {
+                    candidate_id,
+                    reason: INVALID_OUTSIDE_ANCHOR_REJECTION.into(),
+                })
+                .collect(),
+            resolved_finding_ids: Vec::new(),
+            themes: Vec::new(),
+        };
+        normalize_coordinator_output(
+            &mut candidate_anchor_filtered,
+            &candidates_with_invalid_anchor,
+            &[],
+        );
+        let candidate_anchor_rejections =
+            candidate_rejections(&candidate_anchor_filtered, &candidates_with_invalid_anchor);
+        assert_eq!(candidate_anchor_rejections.len(), 1);
+        assert_eq!(candidate_anchor_rejections[0].candidate_id, "explained");
+        assert_eq!(
+            candidate_anchor_rejections[0].reason,
+            INVALID_OUTSIDE_ANCHOR_REJECTION
+        );
 
         let files = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),

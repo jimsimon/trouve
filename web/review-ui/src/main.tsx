@@ -1537,7 +1537,10 @@ function JobDetailPane({
         {detail.findings.map((finding) => (
           <article class={`finding ${finding.severity}`} key={finding.id}>
             <header>
-              <strong>{finding.title}</strong>
+              <strong>
+                {finding.title}
+                {finding.outside_diff && " · outside diff"}
+              </strong>
               <StatusPill status={finding.status} />
             </header>
             <small>
@@ -1573,7 +1576,11 @@ function JobDetailPane({
             </small>
             <div class="action-row">
               <CopyButton text={finding.prompt_for_agents} />
-              <ExternalLink href={finding.github_comment_url}>Open inline comment ↗</ExternalLink>
+              <ExternalLink href={finding.github_comment_url}>
+                {finding.github_comment_id != null
+                  ? "Open inline comment ↗"
+                  : "Open review comment ↗"}
+              </ExternalLink>
             </div>
           </article>
         ))}

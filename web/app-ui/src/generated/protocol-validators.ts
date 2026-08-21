@@ -1894,7 +1894,7 @@ return errors === 0;
 validate112.evaluated = {"props":{"reviewer":true,"state":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema49 = {"type":"object","description":"A review produced by trouve's first-party review service. The marker is\njoined from durable job/finding records rather than inferred from an\nuntrusted comment author or body.","required":["job_id","bot_login","status","summary","prompt_for_agents","review_url"],"properties":{"bot_login":{"type":"string"},"findings":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFinding"}},"job_id":{"type":"string"},"prompt_for_agents":{"type":"string"},"review_url":{"type":"string"},"status":{"type":"string"},"summary":{"type":"string"},"themes":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewTheme"}}}};
-const schema50 = {"type":"object","description":"A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.","required":["id","job_id","path","line","side","severity","title","body","status"],"properties":{"body":{"type":"string"},"confidence":{"type":"string","description":"Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."},"evidence":{"$ref":"#/components/schemas/CodeReviewFindingEvidence"},"github_comment_id":{"type":["integer","null"],"format":"int64","minimum":0},"github_comment_url":{"type":"string"},"github_publication_status":{"$ref":"#/components/schemas/CodeReviewFindingPublicationStatus"},"github_thread_id":{"type":["string","null"]},"id":{"type":"string"},"job_id":{"type":"string"},"line":{"type":"integer","format":"int64","minimum":0},"observed_head":{"type":"string","description":"Immutable PR head on which this finding was first observed."},"origin":{"$ref":"#/components/schemas/CodeReviewFindingOrigin"},"path":{"type":"string"},"prompt_for_agents":{"type":"string"},"resolved_at":{"type":["string","null"],"format":"date-time"},"resolved_by_job_id":{"type":"string","description":"Review job that demonstrated the fix, for exact fix-diff reconstruction."},"resolved_head":{"type":"string","description":"Immutable PR head whose review demonstrated that the finding was fixed."},"severity":{"type":"string"},"side":{"type":"string"},"sources":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFindingSource"}},"status":{"type":"string","description":"`open`, `fixed`, or `dismissed`."},"theme_ids":{"type":"array","items":{"type":"string"}},"title":{"type":"string","description":"Concise, generated one-line summary of the issue."}}};
+const schema50 = {"type":"object","description":"A confirmed issue produced by the coordinator. Findings on commentable\ndiff lines are published as inline GitHub review comments; findings whose\nstrongest valid anchor is unchanged code are published in the review body.","required":["id","job_id","path","line","side","severity","title","body","status"],"properties":{"body":{"type":"string"},"confidence":{"type":"string","description":"Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."},"evidence":{"$ref":"#/components/schemas/CodeReviewFindingEvidence"},"github_comment_id":{"type":["integer","null"],"format":"int64","minimum":0},"github_comment_url":{"type":"string"},"github_publication_status":{"$ref":"#/components/schemas/CodeReviewFindingPublicationStatus"},"github_thread_id":{"type":["string","null"]},"id":{"type":"string"},"job_id":{"type":"string"},"line":{"type":"integer","format":"int64","minimum":0},"observed_head":{"type":"string","description":"Immutable PR head on which this finding was first observed."},"origin":{"$ref":"#/components/schemas/CodeReviewFindingOrigin"},"outside_diff":{"type":"boolean","description":"The finding is anchored to a head-revision line that GitHub cannot\nrepresent as an inline pull-request diff comment."},"path":{"type":"string"},"prompt_for_agents":{"type":"string"},"resolved_at":{"type":["string","null"],"format":"date-time"},"resolved_by_job_id":{"type":"string","description":"Review job that demonstrated the fix, for exact fix-diff reconstruction."},"resolved_head":{"type":"string","description":"Immutable PR head whose review demonstrated that the finding was fixed."},"severity":{"type":"string"},"side":{"type":"string"},"sources":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFindingSource"}},"status":{"type":"string","description":"`open`, `fixed`, or `dismissed`."},"theme_ids":{"type":"array","items":{"type":"string"}},"title":{"type":"string","description":"Concise, generated one-line summary of the issue."}}};
 const schema51 = {"type":"object","description":"Concrete evidence that makes a confirmed finding independently verifiable.","properties":{"consequence":{"type":"string"},"execution_path":{"type":"string"},"introduction":{"type":"string"},"preconditions":{"type":"string"},"regression_test":{"type":"string"}}};
 
 function validate116(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -2297,10 +2297,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.path !== undefined){
+if(data.outside_diff !== undefined){
 const _errs22 = errors;
-if(typeof data.path !== "string"){
-validate115.errors = [{instancePath:instancePath+"/path",schemaPath:"#/properties/path/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.outside_diff !== "boolean"){
+validate115.errors = [{instancePath:instancePath+"/outside_diff",schemaPath:"#/properties/outside_diff/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs22 === errors;
@@ -2309,10 +2309,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.prompt_for_agents !== undefined){
+if(data.path !== undefined){
 const _errs24 = errors;
-if(typeof data.prompt_for_agents !== "string"){
-validate115.errors = [{instancePath:instancePath+"/prompt_for_agents",schemaPath:"#/properties/prompt_for_agents/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.path !== "string"){
+validate115.errors = [{instancePath:instancePath+"/path",schemaPath:"#/properties/path/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs24 === errors;
@@ -2321,11 +2321,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.resolved_at !== undefined){
-let data14 = data.resolved_at;
+if(data.prompt_for_agents !== undefined){
 const _errs26 = errors;
-if((typeof data14 !== "string") && (data14 !== null)){
-validate115.errors = [{instancePath:instancePath+"/resolved_at",schemaPath:"#/properties/resolved_at/type",keyword:"type",params:{type: schema50.properties.resolved_at.type},message:"must be string,null"}];
+if(typeof data.prompt_for_agents !== "string"){
+validate115.errors = [{instancePath:instancePath+"/prompt_for_agents",schemaPath:"#/properties/prompt_for_agents/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs26 === errors;
@@ -2334,10 +2333,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.resolved_by_job_id !== undefined){
+if(data.resolved_at !== undefined){
+let data15 = data.resolved_at;
 const _errs28 = errors;
-if(typeof data.resolved_by_job_id !== "string"){
-validate115.errors = [{instancePath:instancePath+"/resolved_by_job_id",schemaPath:"#/properties/resolved_by_job_id/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data15 !== "string") && (data15 !== null)){
+validate115.errors = [{instancePath:instancePath+"/resolved_at",schemaPath:"#/properties/resolved_at/type",keyword:"type",params:{type: schema50.properties.resolved_at.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs28 === errors;
@@ -2346,10 +2346,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.resolved_head !== undefined){
+if(data.resolved_by_job_id !== undefined){
 const _errs30 = errors;
-if(typeof data.resolved_head !== "string"){
-validate115.errors = [{instancePath:instancePath+"/resolved_head",schemaPath:"#/properties/resolved_head/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.resolved_by_job_id !== "string"){
+validate115.errors = [{instancePath:instancePath+"/resolved_by_job_id",schemaPath:"#/properties/resolved_by_job_id/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs30 === errors;
@@ -2358,10 +2358,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.severity !== undefined){
+if(data.resolved_head !== undefined){
 const _errs32 = errors;
-if(typeof data.severity !== "string"){
-validate115.errors = [{instancePath:instancePath+"/severity",schemaPath:"#/properties/severity/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.resolved_head !== "string"){
+validate115.errors = [{instancePath:instancePath+"/resolved_head",schemaPath:"#/properties/resolved_head/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs32 === errors;
@@ -2370,10 +2370,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.side !== undefined){
+if(data.severity !== undefined){
 const _errs34 = errors;
-if(typeof data.side !== "string"){
-validate115.errors = [{instancePath:instancePath+"/side",schemaPath:"#/properties/side/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.severity !== "string"){
+validate115.errors = [{instancePath:instancePath+"/severity",schemaPath:"#/properties/severity/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs34 === errors;
@@ -2382,20 +2382,32 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.sources !== undefined){
-let data19 = data.sources;
+if(data.side !== undefined){
 const _errs36 = errors;
-if(errors === _errs36){
-if(Array.isArray(data19)){
-var valid1 = true;
-const len0 = data19.length;
-for(let i0=0; i0<len0; i0++){
+if(typeof data.side !== "string"){
+validate115.errors = [{instancePath:instancePath+"/side",schemaPath:"#/properties/side/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs36 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.sources !== undefined){
+let data20 = data.sources;
 const _errs38 = errors;
-if(!(validate122(data19[i0], {instancePath:instancePath+"/sources/" + i0,parentData:data19,parentDataProperty:i0,rootData,dynamicAnchors}))){
+if(errors === _errs38){
+if(Array.isArray(data20)){
+var valid1 = true;
+const len0 = data20.length;
+for(let i0=0; i0<len0; i0++){
+const _errs40 = errors;
+if(!(validate122(data20[i0], {instancePath:instancePath+"/sources/" + i0,parentData:data20,parentDataProperty:i0,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate122.errors : vErrors.concat(validate122.errors);
 errors = vErrors.length;
 }
-var valid1 = _errs38 === errors;
+var valid1 = _errs40 === errors;
 if(!valid1){
 break;
 }
@@ -2406,38 +2418,38 @@ validate115.errors = [{instancePath:instancePath+"/sources",schemaPath:"#/proper
 return false;
 }
 }
-var valid0 = _errs36 === errors;
+var valid0 = _errs38 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.status !== undefined){
-const _errs39 = errors;
+const _errs41 = errors;
 if(typeof data.status !== "string"){
 validate115.errors = [{instancePath:instancePath+"/status",schemaPath:"#/properties/status/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid0 = _errs39 === errors;
+var valid0 = _errs41 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.theme_ids !== undefined){
-let data22 = data.theme_ids;
-const _errs41 = errors;
-if(errors === _errs41){
-if(Array.isArray(data22)){
-var valid2 = true;
-const len1 = data22.length;
-for(let i1=0; i1<len1; i1++){
+let data23 = data.theme_ids;
 const _errs43 = errors;
-if(typeof data22[i1] !== "string"){
+if(errors === _errs43){
+if(Array.isArray(data23)){
+var valid2 = true;
+const len1 = data23.length;
+for(let i1=0; i1<len1; i1++){
+const _errs45 = errors;
+if(typeof data23[i1] !== "string"){
 validate115.errors = [{instancePath:instancePath+"/theme_ids/" + i1,schemaPath:"#/properties/theme_ids/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid2 = _errs43 === errors;
+var valid2 = _errs45 === errors;
 if(!valid2){
 break;
 }
@@ -2448,22 +2460,23 @@ validate115.errors = [{instancePath:instancePath+"/theme_ids",schemaPath:"#/prop
 return false;
 }
 }
-var valid0 = _errs41 === errors;
+var valid0 = _errs43 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.title !== undefined){
-const _errs45 = errors;
+const _errs47 = errors;
 if(typeof data.title !== "string"){
 validate115.errors = [{instancePath:instancePath+"/title",schemaPath:"#/properties/title/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid0 = _errs45 === errors;
+var valid0 = _errs47 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -2497,7 +2510,7 @@ return false;
 validate115.errors = vErrors;
 return errors === 0;
 }
-validate115.evaluated = {"props":{"body":true,"confidence":true,"evidence":true,"github_comment_id":true,"github_comment_url":true,"github_publication_status":true,"github_thread_id":true,"id":true,"job_id":true,"line":true,"observed_head":true,"origin":true,"path":true,"prompt_for_agents":true,"resolved_at":true,"resolved_by_job_id":true,"resolved_head":true,"severity":true,"side":true,"sources":true,"status":true,"theme_ids":true,"title":true},"dynamicProps":false,"dynamicItems":false};
+validate115.evaluated = {"props":{"body":true,"confidence":true,"evidence":true,"github_comment_id":true,"github_comment_url":true,"github_publication_status":true,"github_thread_id":true,"id":true,"job_id":true,"line":true,"observed_head":true,"origin":true,"outside_diff":true,"path":true,"prompt_for_agents":true,"resolved_at":true,"resolved_by_job_id":true,"resolved_head":true,"severity":true,"side":true,"sources":true,"status":true,"theme_ids":true,"title":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema55 = {"type":"object","description":"A root cause tracked across all review rounds for one pull request.","required":["id","repository","pull_number","root_cause","recommendation","status","first_seen_head","last_seen_head"],"properties":{"affected_paths":{"type":"array","items":{"type":"string"}},"finding_ids":{"type":"array","items":{"type":"string"}},"first_seen_head":{"type":"string"},"id":{"type":"string"},"last_seen_head":{"type":"string"},"observations":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewThemeObservation"}},"pull_number":{"type":"integer","format":"int64","minimum":0},"recommendation":{"type":"string"},"recurrence_count":{"type":"integer","format":"int64","minimum":0},"repository":{"type":"string"},"resolved_head":{"type":"string"},"root_cause":{"type":"string"},"status":{"type":"string","description":"`pending` while the producing review is unpublished, `open` while at\nleast one authoritative linked finding is open, otherwise `resolved`."}}};
 const schema56 = {"type":"object","required":["job_id","head_sha","kind","finding_ids","created_at"],"properties":{"created_at":{"type":"string","format":"date-time"},"finding_ids":{"type":"array","items":{"type":"string"}},"head_sha":{"type":"string"},"job_id":{"type":"string"},"kind":{"$ref":"#/components/schemas/CodeReviewThemeObservationKind"}}};
