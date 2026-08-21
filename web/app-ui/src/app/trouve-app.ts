@@ -3131,36 +3131,60 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 </select>
               </label>
               <label class="new-session-thinking">
-                <span>Thinking level</span>
-                <select
-                  name="thinking"
-                  .value=${newSessionThinkingOption === undefined ? "" : this.#newSessionThinking}
-                  ?disabled=${this.#newSessionPending}
-                  @change=${(event: Event) => {
-                    this.#newSessionOptionEdits = {
-                      ...this.#newSessionOptionEdits,
-                      thinking: true,
-                    };
-                    const value = (event.currentTarget as HTMLSelectElement).value;
-                    this.#newSessionThinking = value || resolveNewThreadDefaults(
-                      this.#newSessionModes,
-                      newSessionModels,
-                      this.#newSessionProviders,
-                      { modeId: this.#newSessionModeId, modelId: this.#newSessionModelId },
-                    ).thinking;
-                    this.#newSessionInheritedThinking = undefined;
-                    this.requestUpdate();
-                  }}
-                >
-                  ${newSessionThinkingOption === undefined
-                    ? html`<option value="">Not supported</option>`
-                    : newSessionThinkingOption.values.map(
-                        (value) => html`<option
-                          value=${value}
-                          .selected=${value === this.#newSessionThinking}
-                        >${modelOptionLabel(value)}</option>`,
-                      )}
-                </select>
+                <span>${newSessionThinkingOption?.budget === undefined
+                  ? "Thinking level"
+                  : "Thinking budget (tokens)"}</span>
+                ${newSessionThinkingOption?.budget === undefined
+                  ? html`<select
+                      name="thinking"
+                      .value=${newSessionThinkingOption === undefined ? "" : this.#newSessionThinking}
+                      ?disabled=${this.#newSessionPending || newSessionThinkingOption === undefined}
+                      @change=${(event: Event) => {
+                        this.#newSessionOptionEdits = {
+                          ...this.#newSessionOptionEdits,
+                          thinking: true,
+                        };
+                        const value = (event.currentTarget as HTMLSelectElement).value;
+                        this.#newSessionThinking = value || resolveNewThreadDefaults(
+                          this.#newSessionModes,
+                          newSessionModels,
+                          this.#newSessionProviders,
+                          { modeId: this.#newSessionModeId, modelId: this.#newSessionModelId },
+                        ).thinking;
+                        this.#newSessionInheritedThinking = undefined;
+                        this.requestUpdate();
+                      }}
+                    >
+                      ${newSessionThinkingOption === undefined
+                        ? html`<option value="">Not supported</option>`
+                        : newSessionThinkingOption.values.map(
+                            (value) => html`<option
+                              value=${value}
+                              .selected=${value === this.#newSessionThinking}
+                            >${modelOptionLabel(value)}</option>`,
+                          )}
+                    </select>`
+                  : html`<input
+                      name="thinking"
+                      type="number"
+                      required
+                      step="1"
+                      min=${newSessionThinkingOption.budget.minimum}
+                      max=${newSessionThinkingOption.budget.maximum ?? nothing}
+                      .value=${this.#newSessionThinking}
+                      ?disabled=${this.#newSessionPending}
+                      @input=${(event: Event) => {
+                        const value = (event.currentTarget as HTMLInputElement).value;
+                        if (value === "") return;
+                        this.#newSessionOptionEdits = {
+                          ...this.#newSessionOptionEdits,
+                          thinking: true,
+                        };
+                        this.#newSessionThinking = value;
+                        this.#newSessionInheritedThinking = undefined;
+                        this.requestUpdate();
+                      }}
+                    />`}
               </label>
             </div>
             ${this.#newSessionPermissionMode === "yolo"

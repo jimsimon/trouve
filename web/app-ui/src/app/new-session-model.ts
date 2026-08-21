@@ -14,12 +14,19 @@ type ThinkingOptionKey =
   | "thinking_level"
   | "reasoning_effort"
   | "effort"
-  | "reasoning";
+  | "reasoning"
+  | "thinking_budget_tokens";
+
+export interface ThinkingBudget {
+  readonly minimum: number;
+  readonly maximum?: number;
+}
 
 export interface ThinkingOption {
   readonly key: ThinkingOptionKey;
   readonly values: readonly string[];
   readonly defaultValue?: string;
+  readonly budget?: ThinkingBudget;
 }
 
 export type ResolvedPermissionMode = "ask" | "allow_list" | "yolo";
@@ -193,7 +200,65 @@ export const thinkingOption = (
       ...(hasDefault ? { defaultValue: defaultValue as string } : {}),
     };
   }
+
+  const budget = asRecord(properties["thinking_budget_tokens"]);
+  if (budget?.["type"] === "integer" || budget?.["type"] === "number") {
+    const advertisedMinimum = budget["minimum"];
+    const minimum = typeof advertisedMinimum === "number"
+        && Number.isSafeInteger(advertisedMinimum)
+        && advertisedMinimum >= 0
+      ? advertisedMinimum
+      : 1;
+    const advertisedMaximum = budget["maximum"];
+    const maximum = typeof advertisedMaximum === "number"
+        && Number.isSafeInteger(advertisedMaximum)
+        && advertisedMaximum >= minimum
+      ? advertisedMaximum
+      : undefined;
+    const advertisedDefault = budget["default"];
+    const defaultValue = typeof advertisedDefault === "number"
+        && Number.isSafeInteger(advertisedDefault)
+        && advertisedDefault >= minimum
+        && (maximum === undefined || advertisedDefault <= maximum)
+      ? String(advertisedDefault)
+      : undefined;
+    return {
+      key: "thinking_budget_tokens",
+      values: [],
+      ...(defaultValue === undefined ? {} : { defaultValue }),
+      budget: {
+        minimum,
+        ...(maximum === undefined ? {} : { maximum }),
+      },
+    };
+  }
   return undefined;
+};
+
+/** Validate a persisted/form thinking token against its model-advertised control. */
+export const thinkingSelectionIsValid = (
+  option: ThinkingOption | null | undefined,
+  value: string | null | undefined,
+): boolean => {
+  const selected = nonEmpty(value);
+  if (option == null || selected === undefined) return false;
+  if (option.values.includes(selected)) return true;
+  if (option.budget === undefined || !/^\d+$/u.test(selected)) return false;
+  const budget = Number(selected);
+  return Number.isSafeInteger(budget)
+    && budget >= option.budget.minimum
+    && (option.budget.maximum === undefined || budget <= option.budget.maximum);
+};
+
+/** Resolve a valid configured value, schema default, or first/minimum option. */
+export const defaultThinkingSelection = (
+  option: ThinkingOption | null | undefined,
+  configured?: string | null,
+): string => {
+  if (thinkingSelectionIsValid(option, configured)) return configured?.trim() ?? "";
+  if (thinkingSelectionIsValid(option, option?.defaultValue)) return option?.defaultValue ?? "";
+  if (option?.budget !== undefined) return String(option.budget.minimum);
+  return option?.values[0] ?? "";
 };
 
 /** Resolves the model shown for a new session in protocol precedence order. */
@@ -251,11 +316,8 @@ export const resolveNewThreadDefaults = (
     nonEmpty(mode?.default_thinking_level),
     nonEmpty(providers?.default_thinking_level),
   ].find((candidate): candidate is string =>
-    candidate !== undefined && option?.values.includes(candidate) === true);
-  const thinking = inheritedThinking
-    ?? option?.defaultValue
-    ?? option?.values[0]
-    ?? "";
+    candidate !== undefined && thinkingSelectionIsValid(option, candidate));
+  const thinking = inheritedThinking ?? defaultThinkingSelection(option);
   const inheritedPermissionMode = validPermissionMode(mode?.default_permission_mode)
     ?? validPermissionMode(providers?.default_permission_mode);
   const permissionMode = inheritedPermissionMode ?? "ask";
@@ -417,7 +479,7 @@ export const reconcileNewThreadDefaults = (
     selectableModels.find((model) => model.id === refreshed.modelId),
   );
   const keepThinking = edits.thinking
-    && option?.values.includes(selections.thinking) === true;
+    && thinkingSelectionIsValid(option, selections.thinking);
   const permissionMode = validPermissionMode(selections.permissionMode);
   const keepPermission = edits.permission && permissionMode !== undefined;
 
@@ -493,8 +555,12 @@ export const createNewSessionThreadRequest = (
   const inheritedThinking = nonEmpty(input.inheritedThinking);
   const modelOptions = thinking !== undefined
     && thinking !== inheritedThinking
-    && advertisedThinking?.values.includes(thinking) === true
-    ? { [advertisedThinking.key]: thinking }
+    && advertisedThinking !== undefined
+    && thinkingSelectionIsValid(advertisedThinking, thinking)
+    ? {
+        [advertisedThinking.key]:
+          advertisedThinking.budget === undefined ? thinking : Number(thinking),
+      }
     : undefined;
 
   return {

@@ -12,6 +12,7 @@ import {
   createNewSessionThreadRequest,
   createNewSessionThreadRequestFromSnapshot,
   createNewThreadOptionEdits,
+  defaultThinkingSelection,
   interruptNewSessionOptionLoad,
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
@@ -28,6 +29,7 @@ import {
   settleNewSessionOptionLoad,
   snapshotNewSessionSubmission,
   thinkingOption,
+  thinkingSelectionIsValid,
   threadTitleFallback,
 } from "./new-session-model.js";
 
@@ -124,6 +126,29 @@ describe("new session model", () => {
     });
   });
 
+  it("derives and validates fixed thinking budgets from model bounds", () => {
+    const option = thinkingOption(model({
+      properties: {
+        thinking_budget_tokens: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 32768,
+          default: 4096,
+        },
+      },
+    }));
+    expect(option).toEqual({
+      key: "thinking_budget_tokens",
+      values: [],
+      defaultValue: "4096",
+      budget: { minimum: 1024, maximum: 32768 },
+    });
+    expect(thinkingSelectionIsValid(option, "16384")).toBe(true);
+    expect(thinkingSelectionIsValid(option, "512")).toBe(false);
+    expect(thinkingSelectionIsValid(option, "1.5")).toBe(false);
+    expect(defaultThinkingSelection(option)).toBe("4096");
+  });
+
   it("rejects malformed schemas, enums, and defaults", () => {
     expect(thinkingOption(model([]))).toBeUndefined();
     expect(thinkingOption(model({ properties: [] }))).toBeUndefined();
@@ -161,7 +186,7 @@ describe("new session model", () => {
     };
     const models = [model({
       properties: {
-        thinking_level: {
+        reasoning_effort: {
           type: "string",
           enum: ["low", "medium", "high"],
           default: "low",
@@ -186,7 +211,7 @@ describe("new session model", () => {
     };
     const models = [model({
       properties: {
-        thinking_level: {
+        reasoning_effort: {
           type: "string",
           enum: ["low", "medium", "high"],
           default: "low",
@@ -199,6 +224,39 @@ describe("new session model", () => {
       permissionMode: "yolo",
       inheritedThinking: "high",
       inheritedPermissionMode: "yolo",
+    });
+  });
+
+  it("applies and serializes a global fixed thinking budget for new sessions", () => {
+    const modelInfo = model({
+      properties: {
+        thinking_budget_tokens: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 32768,
+          default: 4096,
+        },
+      },
+    }, "provider/fixed");
+    const globalProviders: ProtocolProvidersResponse = {
+      ...providers(modelInfo.id),
+      default_thinking_level: "16384",
+    };
+    const defaults = resolveNewThreadDefaults([mode()], [modelInfo], globalProviders);
+    expect(defaults).toMatchObject({
+      modelId: modelInfo.id,
+      thinking: "16384",
+      inheritedThinking: "16384",
+    });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      mode: defaults.modeId,
+      model: defaults.modelId,
+      thinking: "8192",
+      inheritedThinking: "16384",
+      modelInfo,
+    })).toMatchObject({
+      model_options: { thinking_budget_tokens: 8192 },
     });
   });
 
