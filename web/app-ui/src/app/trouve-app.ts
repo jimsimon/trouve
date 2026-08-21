@@ -132,6 +132,7 @@ import {
   navigateNewSessionSetup,
   newThreadInheritanceForWorkspace,
   reconcileNewThreadDefaults,
+  reconcileNewSessionCreate,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
@@ -2255,6 +2256,29 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
     const title = sessionTitleFallback(prompt);
 
+    let knownSessionIds: ReadonlySet<string>;
+    try {
+      knownSessionIds = new Set(
+        (await this.#protocolClient.sessions()).map((session) => session.id),
+      );
+    } catch {
+      this.#newSessionSetup = navigateNewSessionSetup(
+        this.#newSessionSetup,
+        routeKey(readSignal(this.#router.route)),
+        true,
+      );
+      this.#newSessionPending = false;
+      this.#newSessionSetup = failNewSessionSetup(this.#newSessionSetup);
+      this.#newSessionError =
+        "Sessions could not be refreshed. Session creation was not attempted.";
+      if (this.#newSessionSetup.status === "background-failed") {
+        this.#shellNotice =
+          "Session creation was not attempted. Open New Session to retry with your saved draft.";
+      }
+      this.requestUpdate();
+      return;
+    }
+
     let session;
     try {
       session = await this.#protocolClient.createSession({
@@ -2264,20 +2288,43 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         fetch_latest: fetchLatest,
       });
     } catch {
-      this.#newSessionSetup = navigateNewSessionSetup(
-        this.#newSessionSetup,
-        routeKey(readSignal(this.#router.route)),
-        true,
-      );
-      this.#newSessionPending = false;
-      this.#newSessionSetup = failNewSessionSetup(this.#newSessionSetup);
-      this.#newSessionError = "Session could not be created.";
-      if (this.#newSessionSetup.status === "background-failed") {
-        this.#shellNotice =
-          "Session could not be created. Open New Session to retry with your saved draft.";
+      let reconciliation;
+      try {
+        reconciliation = reconcileNewSessionCreate({
+          knownSessionIds,
+          sessions: await this.#protocolClient.sessions(),
+          workspaceId,
+          title,
+          baseRef,
+        });
+      } catch {
+        reconciliation = { status: "indeterminate" as const };
       }
-      this.requestUpdate();
-      return;
+      if (reconciliation.status === "created") {
+        session = reconciliation.session;
+      } else if (reconciliation.status === "indeterminate") {
+        this.#newSessionPending = false;
+        this.#resetNewSession();
+        this.#shellNotice =
+          "Session creation could not be confirmed. Refresh sessions before starting another session.";
+        this.requestUpdate();
+        return;
+      } else {
+        this.#newSessionSetup = navigateNewSessionSetup(
+          this.#newSessionSetup,
+          routeKey(readSignal(this.#router.route)),
+          true,
+        );
+        this.#newSessionPending = false;
+        this.#newSessionSetup = failNewSessionSetup(this.#newSessionSetup);
+        this.#newSessionError = "Session could not be created.";
+        if (this.#newSessionSetup.status === "background-failed") {
+          this.#shellNotice =
+            "Session could not be created. Open New Session to retry with your saved draft.";
+        }
+        this.requestUpdate();
+        return;
+      }
     }
 
     this.#store.upsertSessionMetadata(session);

@@ -28,6 +28,7 @@ import {
   newThreadInheritanceForWorkspace,
   mergeNewSessionModelCatalogs,
   reconcileNewThreadDefaults,
+  reconcileNewSessionCreate,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
@@ -64,6 +65,32 @@ const providers = (defaultModel: string): ProtocolProvidersResponse => ({
 });
 
 describe("new session model", () => {
+  it("reconciles a lost create response without offering an unsafe duplicate retry", () => {
+    const created = {
+      id: "session-new",
+      workspace_id: "workspace-1",
+      title: "Build dashboard",
+      branch: "trouve/session-new",
+      worktree_path: "/tmp/session-new",
+      base_ref: "main",
+      created_at: "2026-08-21T00:00:00Z",
+    };
+    const input = {
+      knownSessionIds: new Set(["session-old"]),
+      sessions: [created],
+      workspaceId: "workspace-1",
+      title: "Build dashboard",
+      baseRef: "main",
+    };
+
+    expect(reconcileNewSessionCreate(input)).toEqual({ status: "created", session: created });
+    expect(reconcileNewSessionCreate({ ...input, sessions: [] })).toEqual({
+      status: "not-created",
+    });
+    expect(reconcileNewSessionCreate({ ...input, sessions: [created, { ...created, id: "other" }] }))
+      .toEqual({ status: "indeterminate" });
+  });
+
   it("scopes setup visibility to its opening route and restores failed background drafts", () => {
     const settings = "/settings";
     const inbox = "/inbox";

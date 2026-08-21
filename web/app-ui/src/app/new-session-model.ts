@@ -3,6 +3,7 @@ import type {
   ProtocolCreateThreadRequest,
   ProtocolModelInfo,
   ProtocolProvidersResponse,
+  ProtocolSession,
 } from "../services/protocol-client.js";
 
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
@@ -523,6 +524,31 @@ export const canSubmitNewSession = (state: {
   readonly attachmentPending: boolean;
 }): boolean =>
   !state.sessionPending && !state.optionsBlocking && !state.attachmentPending;
+
+export type NewSessionCreateReconciliation =
+  | { readonly status: "created"; readonly session: ProtocolSession }
+  | { readonly status: "not-created" }
+  | { readonly status: "indeterminate" };
+
+/** Reconciles a lost create response against sessions known before the request. */
+export const reconcileNewSessionCreate = (input: {
+  readonly knownSessionIds: ReadonlySet<string>;
+  readonly sessions: readonly ProtocolSession[];
+  readonly workspaceId: string;
+  readonly title: string;
+  readonly baseRef: string;
+}): NewSessionCreateReconciliation => {
+  const matches = input.sessions.filter((session) =>
+    !input.knownSessionIds.has(session.id)
+    && session.workspace_id === input.workspaceId
+    && session.title === input.title
+    && (input.baseRef === "" || session.base_ref === input.baseRef));
+  if (matches.length === 0) return { status: "not-created" };
+  const session = matches[0];
+  return matches.length === 1 && session !== undefined
+    ? { status: "created", session }
+    : { status: "indeterminate" };
+};
 
 /** Capture the option values used after asynchronous title generation completes. */
 export const snapshotNewSessionSubmission = (
