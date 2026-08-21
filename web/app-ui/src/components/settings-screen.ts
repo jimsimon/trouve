@@ -511,6 +511,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                                 ["Open local files", currentCapabilities.openLocalFile],
                                 ["Reveal local files", currentCapabilities.revealLocalFile],
                                 ["Open HTTPS links", currentCapabilities.openHttpsUrl],
+                                ["Open videos externally", currentCapabilities.openVideoAttachment],
                                 ["Native notifications", currentCapabilities.nativeNotifications],
                                 ["Web notifications", currentCapabilities.webNotifications],
                                 ["Request user attention", currentCapabilities.userAttention],

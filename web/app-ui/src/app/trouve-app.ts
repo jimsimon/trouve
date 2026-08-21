@@ -53,6 +53,8 @@ import { queryBrowserSystemFontFamilies } from "../services/system-fonts.js";
 import {
   AttachmentEncodingError,
   encodeAttachment,
+  isVideoMime,
+  MAX_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENTS,
   pendingAttachmentPreviewUrl,
@@ -2546,6 +2548,123 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     globalThis.open(url.href, "_blank", "noopener,noreferrer");
   };
 
+  readonly #openVideo = (event: CustomEvent<{
+    readonly source: string;
+    readonly name: string;
+    readonly mime: string;
+  }>): void => {
+    event.stopPropagation();
+    if (!isVideoMime(event.detail.mime)) return;
+    if (deployment === "desktop") {
+      const host = this.#hostClient;
+      if (
+        host === undefined
+        || !readSignal(this.#capabilities.current).openVideoAttachment
+      ) {
+        this.#shellNotice = "External video playback is unavailable in this desktop preview.";
+        this.requestUpdate();
+        return;
+      }
+      void this.#pendingVideoAttachment(event.detail)
+        .then((attachment) => host.openVideoAttachment(attachment))
+        .catch(() => {
+          this.#shellNotice = "The video could not be opened in the system player.";
+          this.requestUpdate();
+        });
+      return;
+    }
+
+    const target = this.#browserVideoTarget(event.detail);
+    if (target === undefined) return;
+    globalThis.open(target.href, "_blank", "noopener,noreferrer");
+    if (target.revoke) {
+      globalThis.setTimeout(() => URL.revokeObjectURL(target.href), 60_000);
+    }
+  };
+
+  #videoDataAttachment(detail: {
+    readonly source: string;
+    readonly name: string;
+    readonly mime: string;
+  }): PendingAttachment | undefined {
+    const mime = detail.mime.toLowerCase();
+    const prefix = `data:${mime};base64,`;
+    if (!detail.source.startsWith(prefix)) return undefined;
+    const data = detail.source.slice(prefix.length);
+    try {
+      const size = globalThis.atob(data).length;
+      if (size < 1 || size > MAX_ATTACHMENT_BYTES) return undefined;
+      return {
+        upload: { name: detail.name, mime, data },
+        size,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  #protocolVideoUrl(source: string): URL | undefined {
+    let url: URL;
+    try {
+      url = new URL(source, globalThis.location.origin);
+    } catch {
+      return undefined;
+    }
+    if (
+      url.origin !== globalThis.location.origin
+      || !url.pathname.startsWith("/v1/attachments/")
+      || url.search !== ""
+      || url.hash !== ""
+    ) return undefined;
+    return url;
+  }
+
+  async #pendingVideoAttachment(detail: {
+    readonly source: string;
+    readonly name: string;
+    readonly mime: string;
+  }): Promise<PendingAttachment> {
+    const encoded = this.#videoDataAttachment(detail);
+    if (encoded !== undefined) return encoded;
+    const url = this.#protocolVideoUrl(detail.source);
+    if (url === undefined) throw new Error("invalid video attachment source");
+    const response = await globalThis.fetch(url, {
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error("video attachment download failed");
+    const blob = await response.blob();
+    return encodeAttachment(
+      new File([blob], detail.name, { type: detail.mime }),
+      detail.name,
+    );
+  }
+
+  #browserVideoTarget(detail: {
+    readonly source: string;
+    readonly name: string;
+    readonly mime: string;
+  }): { readonly href: string; readonly revoke: boolean } | undefined {
+    const encoded = this.#videoDataAttachment(detail);
+    if (encoded === undefined) {
+      const url = this.#protocolVideoUrl(detail.source);
+      return url === undefined ? undefined : { href: url.href, revoke: false };
+    }
+    try {
+      const binary = globalThis.atob(encoded.upload.data);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return {
+        href: URL.createObjectURL(new Blob([bytes], { type: encoded.upload.mime })),
+        revoke: true,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
   readonly #openFile = (event: CustomEvent<ChatFileTarget>): void => {
     event.stopPropagation();
     const route = readSignal(this.#router.route);
@@ -2772,6 +2891,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         aria-label="trouve application"
         @trouve-open-internal=${this.#openInternal}
         @trouve-open-external=${this.#openExternal}
+        @trouve-open-video=${this.#openVideo}
         @trouve-open-file=${this.#openFile}
         @trouve-open-inspection=${this.#openInspection}
         @trouve-chat-position=${this.#chatPositionChanged}
@@ -3160,12 +3280,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   ${this.#newSessionAttachments.map(
                     (attachment, index) => {
                       const preview = pendingAttachmentPreviewUrl(attachment);
+                      const video = isVideoMime(attachment.upload.mime);
                       return html`<li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
                         ${preview === undefined
                           ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
                           : html`<trouve-image-preview
                               .source=${preview}
                               .name=${attachment.upload.name}
+                              .mime=${attachment.upload.mime}
+                              .video=${video}
                             ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>

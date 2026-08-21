@@ -4,7 +4,7 @@
 export const hostBootstrap = validate52;
 const schema19 = {"$id":"urn:trouve:host-validator:hostBootstrap","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/HostBootstrap"};
 const schema21 = {"type":"object","required":["capabilities","csrf_token"],"properties":{"capabilities":{"$ref":"#/components/schemas/HostCapabilities"},"csrf_token":{"type":"string","description":"Ephemeral, origin-bound credential required on every gateway mutation.\nIt is neither persisted nor forwarded to the Trouve protocol server."},"font_families":{"type":"array","items":{"type":"string"},"description":"Installed system UI font families available to the shared frontend.\nOlder bridge bootstraps omit this field and fall back to the platform\ndefault font.","maxItems":4096}}};
-const schema22 = {"type":"object","description":"Capabilities are explicit so the PWA never pretends to have native access.","required":["kind","directory_picker","file_picker","clipboard_image","lifecycle_events","close_confirmation","open_local_file","reveal_local_file","open_https_url","native_notifications","web_notifications","user_attention","sleep_inhibition","window_geometry","visibility","occlusion","persistent_preferences","installable"],"properties":{"bridge_version":{"type":["integer","null"],"format":"int32","minimum":0},"clipboard_image":{"type":"boolean"},"close_confirmation":{"type":"boolean"},"directory_picker":{"type":"boolean"},"file_picker":{"type":"boolean"},"installable":{"type":"boolean"},"kind":{"$ref":"#/components/schemas/HostKind"},"lifecycle_events":{"type":"boolean"},"native_notifications":{"type":"boolean"},"occlusion":{"type":"boolean"},"open_https_url":{"type":"boolean"},"open_local_file":{"type":"boolean"},"persistent_preferences":{"type":"boolean"},"reveal_local_file":{"type":"boolean"},"sleep_inhibition":{"type":"boolean"},"user_attention":{"type":"boolean"},"visibility":{"type":"boolean"},"web_notifications":{"type":"boolean"},"window_geometry":{"type":"boolean"}}};
+const schema22 = {"type":"object","description":"Capabilities are explicit so the PWA never pretends to have native access.","required":["kind","directory_picker","file_picker","clipboard_image","lifecycle_events","close_confirmation","open_local_file","reveal_local_file","open_https_url","open_video_attachment","native_notifications","web_notifications","user_attention","sleep_inhibition","window_geometry","visibility","occlusion","persistent_preferences","installable"],"properties":{"bridge_version":{"type":["integer","null"],"format":"int32","minimum":0},"clipboard_image":{"type":"boolean"},"close_confirmation":{"type":"boolean"},"directory_picker":{"type":"boolean"},"file_picker":{"type":"boolean"},"installable":{"type":"boolean"},"kind":{"$ref":"#/components/schemas/HostKind"},"lifecycle_events":{"type":"boolean"},"native_notifications":{"type":"boolean"},"occlusion":{"type":"boolean"},"open_https_url":{"type":"boolean"},"open_local_file":{"type":"boolean"},"open_video_attachment":{"type":"boolean"},"persistent_preferences":{"type":"boolean"},"reveal_local_file":{"type":"boolean"},"sleep_inhibition":{"type":"boolean"},"user_attention":{"type":"boolean"},"visibility":{"type":"boolean"},"web_notifications":{"type":"boolean"},"window_geometry":{"type":"boolean"}}};
 const schema23 = {"type":"string","description":"Where the shared Lit application is running.","enum":["desktop","pwa","browser"]};
 
 function validate56(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -44,7 +44,7 @@ evaluated0.items = undefined;
 if(errors === 0){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing0;
-if(((((((((((((((((((data.kind === undefined) && (missing0 = "kind")) || ((data.directory_picker === undefined) && (missing0 = "directory_picker"))) || ((data.file_picker === undefined) && (missing0 = "file_picker"))) || ((data.clipboard_image === undefined) && (missing0 = "clipboard_image"))) || ((data.lifecycle_events === undefined) && (missing0 = "lifecycle_events"))) || ((data.close_confirmation === undefined) && (missing0 = "close_confirmation"))) || ((data.open_local_file === undefined) && (missing0 = "open_local_file"))) || ((data.reveal_local_file === undefined) && (missing0 = "reveal_local_file"))) || ((data.open_https_url === undefined) && (missing0 = "open_https_url"))) || ((data.native_notifications === undefined) && (missing0 = "native_notifications"))) || ((data.web_notifications === undefined) && (missing0 = "web_notifications"))) || ((data.user_attention === undefined) && (missing0 = "user_attention"))) || ((data.sleep_inhibition === undefined) && (missing0 = "sleep_inhibition"))) || ((data.window_geometry === undefined) && (missing0 = "window_geometry"))) || ((data.visibility === undefined) && (missing0 = "visibility"))) || ((data.occlusion === undefined) && (missing0 = "occlusion"))) || ((data.persistent_preferences === undefined) && (missing0 = "persistent_preferences"))) || ((data.installable === undefined) && (missing0 = "installable"))){
+if((((((((((((((((((((data.kind === undefined) && (missing0 = "kind")) || ((data.directory_picker === undefined) && (missing0 = "directory_picker"))) || ((data.file_picker === undefined) && (missing0 = "file_picker"))) || ((data.clipboard_image === undefined) && (missing0 = "clipboard_image"))) || ((data.lifecycle_events === undefined) && (missing0 = "lifecycle_events"))) || ((data.close_confirmation === undefined) && (missing0 = "close_confirmation"))) || ((data.open_local_file === undefined) && (missing0 = "open_local_file"))) || ((data.reveal_local_file === undefined) && (missing0 = "reveal_local_file"))) || ((data.open_https_url === undefined) && (missing0 = "open_https_url"))) || ((data.open_video_attachment === undefined) && (missing0 = "open_video_attachment"))) || ((data.native_notifications === undefined) && (missing0 = "native_notifications"))) || ((data.web_notifications === undefined) && (missing0 = "web_notifications"))) || ((data.user_attention === undefined) && (missing0 = "user_attention"))) || ((data.sleep_inhibition === undefined) && (missing0 = "sleep_inhibition"))) || ((data.window_geometry === undefined) && (missing0 = "window_geometry"))) || ((data.visibility === undefined) && (missing0 = "visibility"))) || ((data.occlusion === undefined) && (missing0 = "occlusion"))) || ((data.persistent_preferences === undefined) && (missing0 = "persistent_preferences"))) || ((data.installable === undefined) && (missing0 = "installable"))){
 validate55.errors = [{instancePath,schemaPath:"#/required",keyword:"required",params:{missingProperty: missing0},message:"must have required property '"+missing0+"'"}];
 return false;
 }
@@ -202,10 +202,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.persistent_preferences !== undefined){
+if(data.open_video_attachment !== undefined){
 const _errs24 = errors;
-if(typeof data.persistent_preferences !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/persistent_preferences",schemaPath:"#/properties/persistent_preferences/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.open_video_attachment !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/open_video_attachment",schemaPath:"#/properties/open_video_attachment/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs24 === errors;
@@ -214,10 +214,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.reveal_local_file !== undefined){
+if(data.persistent_preferences !== undefined){
 const _errs26 = errors;
-if(typeof data.reveal_local_file !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/reveal_local_file",schemaPath:"#/properties/reveal_local_file/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.persistent_preferences !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/persistent_preferences",schemaPath:"#/properties/persistent_preferences/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs26 === errors;
@@ -226,10 +226,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.sleep_inhibition !== undefined){
+if(data.reveal_local_file !== undefined){
 const _errs28 = errors;
-if(typeof data.sleep_inhibition !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/sleep_inhibition",schemaPath:"#/properties/sleep_inhibition/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.reveal_local_file !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/reveal_local_file",schemaPath:"#/properties/reveal_local_file/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs28 === errors;
@@ -238,10 +238,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.user_attention !== undefined){
+if(data.sleep_inhibition !== undefined){
 const _errs30 = errors;
-if(typeof data.user_attention !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/user_attention",schemaPath:"#/properties/user_attention/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.sleep_inhibition !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/sleep_inhibition",schemaPath:"#/properties/sleep_inhibition/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs30 === errors;
@@ -250,10 +250,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.visibility !== undefined){
+if(data.user_attention !== undefined){
 const _errs32 = errors;
-if(typeof data.visibility !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/visibility",schemaPath:"#/properties/visibility/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.user_attention !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/user_attention",schemaPath:"#/properties/user_attention/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs32 === errors;
@@ -262,10 +262,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.web_notifications !== undefined){
+if(data.visibility !== undefined){
 const _errs34 = errors;
-if(typeof data.web_notifications !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/web_notifications",schemaPath:"#/properties/web_notifications/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.visibility !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/visibility",schemaPath:"#/properties/visibility/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs34 === errors;
@@ -274,16 +274,29 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.window_geometry !== undefined){
+if(data.web_notifications !== undefined){
 const _errs36 = errors;
-if(typeof data.window_geometry !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/window_geometry",schemaPath:"#/properties/window_geometry/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.web_notifications !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/web_notifications",schemaPath:"#/properties/web_notifications/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs36 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.window_geometry !== undefined){
+const _errs38 = errors;
+if(typeof data.window_geometry !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/window_geometry",schemaPath:"#/properties/window_geometry/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs38 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -313,7 +326,7 @@ return false;
 validate55.errors = vErrors;
 return errors === 0;
 }
-validate55.evaluated = {"props":{"bridge_version":true,"clipboard_image":true,"close_confirmation":true,"directory_picker":true,"file_picker":true,"installable":true,"kind":true,"lifecycle_events":true,"native_notifications":true,"occlusion":true,"open_https_url":true,"open_local_file":true,"persistent_preferences":true,"reveal_local_file":true,"sleep_inhibition":true,"user_attention":true,"visibility":true,"web_notifications":true,"window_geometry":true},"dynamicProps":false,"dynamicItems":false};
+validate55.evaluated = {"props":{"bridge_version":true,"clipboard_image":true,"close_confirmation":true,"directory_picker":true,"file_picker":true,"installable":true,"kind":true,"lifecycle_events":true,"native_notifications":true,"occlusion":true,"open_https_url":true,"open_local_file":true,"open_video_attachment":true,"persistent_preferences":true,"reveal_local_file":true,"sleep_inhibition":true,"user_attention":true,"visibility":true,"web_notifications":true,"window_geometry":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate54(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

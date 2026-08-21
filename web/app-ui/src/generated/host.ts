@@ -116,6 +116,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/__trouve/host/v1/open-video-attachment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["open_video_attachment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/__trouve/host/v1/pick-directory": {
         parameters: {
             query?: never;
@@ -307,6 +323,7 @@ export interface components {
             occlusion: boolean;
             open_https_url: boolean;
             open_local_file: boolean;
+            open_video_attachment: boolean;
             persistent_preferences: boolean;
             reveal_local_file: boolean;
             sleep_inhibition: boolean;
@@ -730,6 +747,51 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["OpenHttpsUrlRequest"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    open_video_attachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachmentPayload"];
             };
         };
         responses: {

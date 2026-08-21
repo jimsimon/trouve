@@ -20,6 +20,7 @@ use std::future::Future;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -205,6 +206,10 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let notification_lifecycle = lifecycle.clone();
     let sleep_inhibitor = Arc::new(Mutex::new(sleep::SleepInhibitor::default()));
     let sleep_for_action = sleep_inhibitor.clone();
+    let video_temp_dir = Arc::new(tempfile::Builder::new().prefix("trouve-video-").tempdir()?);
+    let video_temp_dir_for_action = Arc::clone(&video_temp_dir);
+    let video_sequence = Arc::new(AtomicU64::new(0));
+    let video_sequence_for_action = Arc::clone(&video_sequence);
     let native_actions = HostNativeActions::default()
         .with_window_geometry()
         // Tao exposes focus and foreground transitions but no desktop
@@ -274,6 +279,17 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
             tokio::task::spawn_blocking(read_clipboard_image_attachment)
                 .await
                 .map_err(|_| "desktop clipboard worker was interrupted".to_string())?
+        })
+        .with_video_attachment_opener(move |attachment| {
+            let extension = attachment
+                .video_extension()
+                .ok_or_else(|| "unsupported video attachment type".to_string())?;
+            let sequence = video_sequence_for_action.fetch_add(1, Ordering::Relaxed);
+            let path = video_temp_dir_for_action
+                .path()
+                .join(format!("{sequence}.{extension}"));
+            std::fs::write(&path, attachment.bytes()).map_err(|error| error.to_string())?;
+            opener::open(path)
         })
         .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
     let host = if product_host {

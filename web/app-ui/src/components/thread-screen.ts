@@ -16,6 +16,7 @@ import {
   encodeAttachment,
   MAX_PENDING_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENTS,
+  isVideoMime,
   pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
@@ -62,6 +63,7 @@ import {
   formatAttachmentBytes,
   indexChatPresentation,
   isImageAttachment,
+  isVideoAttachment,
   protocolAttachmentPath,
   type ChatCopyResult,
   type ChatPresentationIndex,
@@ -1507,7 +1509,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               >
                 ${this.#queueEditRetainedAttachments.map(
                   (attachment, index) => {
-                    const preview = isImageAttachment(attachment)
+                    const video = isVideoAttachment(attachment);
+                    const preview = isImageAttachment(attachment) || video
                       ? protocolAttachmentPath(attachment)
                       : undefined;
                     return html`
@@ -1519,6 +1522,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                           : html`<trouve-image-preview
                               .source=${preview}
                               .name=${attachment.name}
+                              .mime=${attachment.mime}
+                              .video=${video}
                             ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.name}>${attachment.name}</strong>
@@ -1538,6 +1543,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 ${this.#pendingAttachments.map(
                   (attachment, index) => {
                     const preview = pendingAttachmentPreviewUrl(attachment);
+                    const video = isVideoMime(attachment.upload.mime);
                     return html`
                       <li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
                         ${preview === undefined
@@ -1545,6 +1551,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                           : html`<trouve-image-preview
                               .source=${preview}
                               .name=${attachment.upload.name}
+                              .mime=${attachment.upload.mime}
+                              .video=${video}
                             ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
@@ -2058,6 +2066,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 : html`<ul class="attachment-list" aria-label="Pending message attachments">
                     ${optimistic.attachments.map((attachment) => {
                       const preview = pendingAttachmentPreviewUrl(attachment);
+                      const video = isVideoMime(attachment.upload.mime);
                       return html`<li class=${preview === undefined
                         ? "file-attachment"
                         : "image-attachment"}>
@@ -2066,6 +2075,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                           : html`<trouve-image-preview
                               .source=${preview}
                               .name=${attachment.upload.name}
+                              .mime=${attachment.upload.mime}
+                              .video=${video}
                             ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
@@ -4608,19 +4619,23 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       <ul class="attachment-list" aria-label="Message attachments">
         ${attachments.map((attachment) => {
           const path = protocolAttachmentPath(attachment);
+          const image = isImageAttachment(attachment);
+          const video = isVideoAttachment(attachment);
           const copyKey = `attachment:${attachment.id}`;
           return html`
-            <li class=${isImageAttachment(attachment) ? "image-attachment" : "file-attachment"}>
-              ${path !== undefined && isImageAttachment(attachment)
+            <li class=${image || video ? "image-attachment" : "file-attachment"}>
+              ${path !== undefined && (image || video)
                 ? html`
                     <trouve-image-preview
                       .source=${path}
                       .name=${attachment.name}
+                      .mime=${attachment.mime}
+                      .video=${video}
                       lazy
                     ></trouve-image-preview>
                   `
                 : html`<span class="attachment-icon">${fontAwesomeIcon(
-                    isImageAttachment(attachment) ? "file-image" : "file",
+                    image ? "file-image" : "file",
                   )}</span>`}
               <div class="attachment-details">
                 <strong title=${attachment.name}>${attachment.name}</strong>

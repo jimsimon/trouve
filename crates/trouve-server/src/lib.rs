@@ -1563,15 +1563,21 @@ async fn get_attachment(
     Ok(response)
 }
 
-/// Only browser-safe raster formats may render in the application origin.
-/// In particular, SVG and user-supplied text/HTML are downloads even when a
-/// legacy database row claims a renderable MIME type.
+/// Only browser-safe raster and video formats may render in the application
+/// origin. In particular, SVG and user-supplied text/HTML are downloads even
+/// when a legacy database row claims a renderable MIME type.
 fn safe_attachment_preview_mime(mime: &str) -> Option<&'static str> {
     match mime.trim().to_ascii_lowercase().as_str() {
         "image/png" => Some("image/png"),
         "image/jpeg" => Some("image/jpeg"),
         "image/gif" => Some("image/gif"),
         "image/webp" => Some("image/webp"),
+        "video/mp4" => Some("video/mp4"),
+        "video/webm" => Some("video/webm"),
+        "video/ogg" => Some("video/ogg"),
+        "video/quicktime" => Some("video/quicktime"),
+        "video/x-matroska" => Some("video/x-matroska"),
+        "video/x-msvideo" => Some("video/x-msvideo"),
         _ => None,
     }
 }
@@ -2837,13 +2843,19 @@ mod attachment_response_tests {
     use super::{attachment_content_disposition, safe_attachment_preview_mime};
 
     #[test]
-    fn only_safe_raster_mime_types_render_inline() {
+    fn only_safe_media_mime_types_render_inline() {
         assert_eq!(safe_attachment_preview_mime("image/png"), Some("image/png"));
         assert_eq!(
             safe_attachment_preview_mime("IMAGE/JPEG"),
             Some("image/jpeg")
         );
         assert_eq!(safe_attachment_preview_mime("image/svg+xml"), None);
+        assert_eq!(safe_attachment_preview_mime("video/mp4"), Some("video/mp4"));
+        assert_eq!(
+            safe_attachment_preview_mime("VIDEO/WEBM"),
+            Some("video/webm")
+        );
+        assert_eq!(safe_attachment_preview_mime("video/svg+xml"), None);
         assert_eq!(safe_attachment_preview_mime("text/html"), None);
         assert_eq!(
             safe_attachment_preview_mime("image/png; charset=utf-8"),

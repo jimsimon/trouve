@@ -46,7 +46,9 @@ const NATIVE_NOTIFICATION_PATH: &str = "/__trouve/host/v1/native-notification";
 const USER_ATTENTION_PATH: &str = "/__trouve/host/v1/request-user-attention";
 const LOCAL_FILE_ACTION_PATH: &str = "/__trouve/host/v1/local-file-action";
 const OPEN_HTTPS_URL_PATH: &str = "/__trouve/host/v1/open-https-url";
+const OPEN_VIDEO_ATTACHMENT_PATH: &str = "/__trouve/host/v1/open-video-attachment";
 const MAX_NATIVE_PATH_BYTES: usize = 32 * 1024;
+const MAX_VIDEO_ATTACHMENT_ACTION_BYTES: usize = 14 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct OpenHttpsUrlRequest {
@@ -173,7 +175,8 @@ struct LifecycleQuery {
         send_native_notification,
         request_user_attention,
         local_file_action,
-        open_https_url
+        open_https_url,
+        open_video_attachment
     ),
     components(schemas(
         HostBootstrap,
@@ -335,6 +338,7 @@ impl HostGateway {
             capabilities.open_local_file = false;
             capabilities.reveal_local_file = false;
             capabilities.open_https_url = false;
+            capabilities.open_video_attachment = false;
             capabilities.native_notifications = false;
             capabilities.user_attention = false;
             capabilities.sleep_inhibition = false;
@@ -384,6 +388,8 @@ impl HostGateway {
             return;
         }
         self.state.capabilities.open_https_url = self.state.native_actions.can_open_https_url();
+        self.state.capabilities.open_video_attachment =
+            self.state.native_actions.can_open_video_attachment();
         self.state.capabilities.window_geometry =
             self.state.native_actions.can_manage_window_geometry();
         self.state.capabilities.file_picker = self.state.native_actions.can_pick_files();
@@ -466,6 +472,7 @@ impl HostGateway {
             .route(USER_ATTENTION_PATH, post(request_user_attention))
             .route(LOCAL_FILE_ACTION_PATH, post(local_file_action))
             .route(OPEN_HTTPS_URL_PATH, post(open_https_url))
+            .route(OPEN_VIDEO_ATTACHMENT_PATH, post(open_video_attachment))
             .route("/v1/{*path}", any(proxy_protocol))
             .fallback(any(serve_frontend))
             .with_state(self.state.clone())
@@ -1155,6 +1162,38 @@ async fn open_https_url(
     no_content()
 }
 
+#[utoipa::path(
+    post,
+    path = "/__trouve/host/v1/open-video-attachment",
+    request_body = AttachmentPayload,
+    responses((status = 204), (status = 400), (status = 403), (status = 404), (status = 500))
+)]
+async fn open_video_attachment(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+) -> Result<Response, GatewayRejection> {
+    validate_mutation(&state, request.headers())?;
+    if state.capabilities.kind != HostKind::Desktop
+        || !state.capabilities.open_video_attachment
+        || !state.native_actions.can_open_video_attachment()
+    {
+        return Err(GatewayRejection::Missing);
+    }
+    let payload: AttachmentPayload =
+        read_json_action(request, MAX_VIDEO_ATTACHMENT_ACTION_BYTES).await?;
+    let attachment =
+        native_attachment_from_payload(payload).map_err(|_| GatewayRejection::InvalidAction)?;
+    if attachment.video_extension().is_none() {
+        return Err(GatewayRejection::InvalidAction);
+    }
+    state
+        .native_actions
+        .open_video_attachment(attachment)
+        .map_err(|_| GatewayRejection::Internal)?;
+
+    no_content()
+}
+
 fn validate_picked_directory(path: &Path) -> Result<String, ()> {
     let Some(path) = path.to_str() else {
         return Err(());
@@ -1240,6 +1279,16 @@ fn native_attachment_payload(attachment: NativeAttachment) -> Result<AttachmentP
         data: base64::engine::general_purpose::STANDARD.encode(attachment.bytes),
         size_bytes,
     })
+}
+
+fn native_attachment_from_payload(payload: AttachmentPayload) -> Result<NativeAttachment, ()> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.data)
+        .map_err(|_| ())?;
+    if u64::try_from(bytes.len()).map_err(|_| ())? != payload.size_bytes {
+        return Err(());
+    }
+    NativeAttachment::new(payload.name, payload.mime, bytes).map_err(|_| ())
 }
 
 fn json_no_store<T: Serialize>(value: T) -> Result<Response, GatewayRejection> {
@@ -2093,6 +2142,7 @@ mod tests {
             .unwrap();
         let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
         assert!(!bootstrap.capabilities.open_https_url);
+        assert!(!bootstrap.capabilities.open_video_attachment);
 
         let response = app
             .clone()
@@ -2110,6 +2160,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn video_attachment_action_is_bounded_typed_and_csrf_protected() {
+        let opened = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let opened_for_action = Arc::clone(&opened);
+        let app = gateway()
+            .with_native_actions(HostNativeActions::default().with_video_attachment_opener(
+                move |attachment| {
+                    opened_for_action.lock().unwrap().push((
+                        attachment.video_extension().unwrap().to_string(),
+                        attachment.bytes().to_vec(),
+                    ));
+                    Ok(())
+                },
+            ))
+            .router();
+        let bootstrap_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        assert!(bootstrap.capabilities.open_video_attachment);
+
+        let payload = AttachmentPayload {
+            name: "clip.exe".into(),
+            mime: "video/mp4".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+            size_bytes: 5,
+        };
+        let body = serde_json::to_vec(&payload).unwrap();
+        let missing_proof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_proof.status(), StatusCode::FORBIDDEN);
+        assert!(opened.lock().unwrap().is_empty());
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .header(ORIGIN, "http://127.0.0.1:43127")
+                    .header(CSRF_HEADER, &bootstrap.csrf_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            [("mp4".into(), b"video".to_vec())]
+        );
+
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .header(ORIGIN, "http://127.0.0.1:43127")
+                    .header(CSRF_HEADER, &bootstrap.csrf_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&AttachmentPayload {
+                            name: "payload.exe".into(),
+                            mime: "application/x-executable".into(),
+                            data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+                            size_bytes: 5,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(opened.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

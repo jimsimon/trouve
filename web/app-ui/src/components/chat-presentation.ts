@@ -3,6 +3,7 @@ import type {
   ThreadChatItem,
   TurnState,
 } from "../state/thread-view-model.js";
+import { isVideoMime } from "../services/attachments.js";
 import { utf8Length, utf8Prefix } from "../services/utf8-text.js";
 
 type Attachment = ProtocolComponents["schemas"]["Attachment"];
@@ -156,6 +157,10 @@ export const protocolAttachmentPath = (
 export const isImageAttachment = (
   attachment: Pick<Attachment, "mime">,
 ): boolean => attachment.mime.toLowerCase().startsWith("image/");
+
+export const isVideoAttachment = (
+  attachment: Pick<Attachment, "mime">,
+): boolean => isVideoMime(attachment.mime);
 
 export const formatAttachmentBytes = (bytes: number): string => {
   const safeBytes = Number.isFinite(bytes) ? Math.max(0, Math.floor(bytes)) : 0;

@@ -30,6 +30,7 @@ web-preview = ["dep:tao", "dep:trouve-desktop-host", "dep:wry"]
 anyhow.workspace = true
 dirs.workspace = true
 tokio.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 trouve-client-core.workspace = true

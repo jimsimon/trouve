@@ -11,13 +11,27 @@ export interface PendingAttachment {
 
 const previewUrls = new WeakMap<PendingAttachment, string>();
 
-/** A CSP-compatible local preview for an image that has already been encoded
- * for upload. Non-images and malformed MIME types deliberately have no URL. */
+const PREVIEWABLE_VIDEO_MIMES = new Set([
+  "video/mp4",
+  "video/webm",
+  "video/ogg",
+  "video/quicktime",
+  "video/x-matroska",
+  "video/x-msvideo",
+]);
+
+export const isVideoMime = (mime: string): boolean =>
+  PREVIEWABLE_VIDEO_MIMES.has(mime.toLowerCase());
+
+/** A CSP-compatible local preview for media that has already been encoded for
+ * upload. Files and malformed MIME types deliberately have no URL. */
 export const pendingAttachmentPreviewUrl = (
   attachment: PendingAttachment,
 ): string | undefined => {
   const mime = attachment.upload.mime.toLowerCase();
-  if (!/^image\/[a-z0-9!#$&^_.+-]+$/iu.test(mime) || attachment.upload.data === "") {
+  const previewable = /^image\/[a-z0-9!#$&^_.+-]+$/iu.test(mime)
+    || isVideoMime(mime);
+  if (!previewable || attachment.upload.data === "") {
     return undefined;
   }
   const cached = previewUrls.get(attachment);

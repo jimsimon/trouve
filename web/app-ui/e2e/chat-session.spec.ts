@@ -1537,7 +1537,7 @@ test("pending image and file attachments reuse submitted chip geometry", async (
   expect(geometry.filePadding).toBe(geometry.imagePadding);
 });
 
-test("image attachment thumbnails open an accessible full-size preview", async ({ page }) => {
+test("image attachment thumbnails open an accessible gallery", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
@@ -1552,10 +1552,101 @@ test("image attachment thumbnails open an accessible full-size preview", async (
       type: "user.message",
       turn: 8,
       content: "Preview this image",
+      attachments: [
+        {
+          id: "att_preview_1",
+          name: "full-size-preview.png",
+          mime: "image/png",
+          size_bytes: 68,
+        },
+        {
+          id: "att_preview_2",
+          name: "alternate-preview.gif",
+          mime: "image/gif",
+          size_bytes: 68,
+        },
+      ],
+    }),
+    threadEvent(18, {
+      type: "turn.completed",
+      turn: 8,
+      usage: { input_tokens: 4, output_tokens: 0, cost_usd: 0 },
+      checkpoint_id: null,
+    }),
+  ]);
+
+  const message = page.locator(".user-message").filter({ hasText: "Preview this image" });
+  const preview = message.locator("trouve-image-preview").first();
+  const trigger = preview.getByRole("button", {
+    name: "View full-size image: full-size-preview.png",
+  });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+
+  const dialog = preview.locator("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toHaveAccessibleName(
+    "Full-size preview of full-size-preview.png",
+  );
+  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_preview_1",
+  );
+  await expect(dialog.locator(".image-preview-full")).toHaveCSS("object-fit", "contain");
+  await expect(dialog.getByRole("button", { name: "Close image preview" })).toBeFocused();
+  await expect(dialog.locator(".image-preview-counter")).toHaveText("1 of 2");
+  await dialog.getByRole("button", { name: "Next image" }).click();
+  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_preview_2",
+  );
+  await expect(dialog.locator(".image-preview-counter")).toHaveText("2 of 2");
+  await page.keyboard.press("ArrowLeft");
+  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_preview_1",
+  );
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await dialog.getByRole("button", { name: "Close image preview" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+});
+
+test("video attachments render thumbnails and open the browser player", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.addInitScript(() => {
+    const opened: string[] = [];
+    Object.defineProperty(globalThis, "__trouveOpenedVideos", {
+      value: opened,
+      configurable: true,
+    });
+    globalThis.open = ((url?: string | URL) => {
+      opened.push(String(url));
+      return null;
+    }) as typeof globalThis.open;
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Play this video",
       attachments: [{
-        id: "att_preview_1",
-        name: "full-size-preview.png",
-        mime: "image/png",
+        id: "att_video_1",
+        name: "demo.mp4",
+        mime: "video/mp4",
         size_bytes: 68,
       }],
     }),
@@ -1567,33 +1658,19 @@ test("image attachment thumbnails open an accessible full-size preview", async (
     }),
   ]);
 
-  const message = page.locator(".user-message").filter({ hasText: "Preview this image" });
-  const preview = message.locator("trouve-image-preview");
-  const trigger = preview.getByRole("button", {
-    name: "View full-size image: full-size-preview.png",
-  });
-  await expect(trigger).toBeVisible();
-  await trigger.click();
-
-  const dialog = preview.getByRole("dialog", {
-    name: "Full-size preview of full-size-preview.png",
-  });
-  await expect(dialog).toBeVisible();
-  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+  const message = page.locator(".user-message").filter({ hasText: "Play this video" });
+  const preview = message.locator("trouve-image-preview[video]");
+  await expect(preview.locator("video")).toHaveAttribute(
     "src",
-    "/v1/attachments/att_preview_1",
+    "/v1/attachments/att_video_1",
   );
-  await expect(dialog.locator(".image-preview-full")).toHaveCSS("object-fit", "contain");
-  await expect(dialog.getByRole("button", { name: "Close image preview" })).toBeFocused();
-
-  await page.keyboard.press("Escape");
-  await expect(dialog).toBeHidden();
-  await expect(trigger).toBeFocused();
-
-  await trigger.click();
-  await dialog.getByRole("button", { name: "Close image preview" }).click();
-  await expect(dialog).toBeHidden();
-  await expect(trigger).toBeFocused();
+  await preview.getByRole("button", {
+    name: "Open video in external player: demo.mp4",
+  }).click();
+  await expect.poll(() => page.evaluate(
+    () => (globalThis as typeof globalThis & { __trouveOpenedVideos: string[] })
+      .__trouveOpenedVideos,
+  )).toEqual(["http://127.0.0.1:4173/v1/attachments/att_video_1"]);
 });
 
 test("unsubmitted composer drafts persist per thread across navigation and reload", async ({
