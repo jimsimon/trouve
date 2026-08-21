@@ -190,9 +190,18 @@ be the only trigger source, or serve as a fallback when webhooks provide the
 fast path. Set `TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS` to any positive number
 of seconds and restart the server container to change the interval. Invalid and
 zero values fall back to 60 seconds. Polling uses lightweight PR metadata and
-durable deduplication; the model runs at most once for an automatic
-base/head/config combination, while each reviewer re-request gets its own
-generation.
+durable deduplication. Once a base/head revision has a queued, running, failed,
+or published automatic-equivalent attempt, polling does not start another
+automatic pass for it, including after a repository policy change. Draft-only
+manual reviews and stale or cancelled attempts do not suppress the next
+automatic review. An explicit dashboard retry, persona retry, reviewer
+re-request, or trusted `@trouve-ai review` comment may intentionally run the
+same revision again. Every newly started review snapshots the repository's
+current configuration, regardless of how it was triggered. Retries retain the
+predecessor's base/head revision. The persona retry control validates the
+selected failed persona, then starts a fresh whole-job replacement so
+successful tasks from an older settings snapshot are not mixed with current
+settings. Every reviewer selected by the current policy runs again.
 
 Each job fetches the exact base and head commits into a managed repository and
 creates an isolated trouve session at that head. The complete diff is enumerated
@@ -211,8 +220,9 @@ If semantic triage is disabled or its model response fails validation,
 Additive continues with its baseline and enabled core personas. Automatic
 requires semantic triage and fails the review if routing fails. Semantic output
 is restricted to the offered persona IDs and requires a concrete reason. A
-once-persisted routing snapshot is reused by interrupted-job recovery and
-persona retries.
+once-persisted routing snapshot is reused by interrupted-job recovery.
+User-initiated retries create a new snapshot from the current
+repository settings.
 
 Candidate findings are first checked against actual commentable diff lines. A
 separate final editor pass then verifies them against the repository, removes
@@ -220,14 +230,13 @@ false positives and findings not introduced by the revision, merges semantic
 duplicates, corrects line metadata, and produces the published summary. The
 result is checked against diff lines again before it is sent to GitHub.
 
-When either commit or the effective review configuration changes—including
-routing mode, semantic triage, router model/thinking, persona
-inclusion/exclusion, reviewer selection, model overrides, or prompt
-overrides—queued reviews for the old
-revision/configuration are marked stale and an in-flight model turn is
-cancelled before the replacement is queued. Before publishing, trouve reads the
-PR again and marks the job stale if either commit moved. Inline findings that
-GitHub still rejects are preserved in a summary-only fallback review.
+Each job snapshots the effective review configuration when it is queued. Later
+settings changes apply to newly queued jobs without changing or cancelling
+existing work. When either commit changes, queued reviews for the old revision
+are marked stale and an in-flight model turn is cancelled before the
+replacement is queued. Before publishing, trouve reads the PR again and marks
+the job stale if either commit moved. Inline findings that GitHub still rejects
+are preserved in a summary-only fallback review.
 
 The dashboard displays the most recently observed installation rate-limit
 remainder and reset time. Its 15-second UI refresh only talks to the local

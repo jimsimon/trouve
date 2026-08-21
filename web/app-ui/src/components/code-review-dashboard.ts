@@ -681,10 +681,10 @@ export class TrouveCodeReviewDashboard extends LitElement {
             ${active
               ? html`
                   <button class="compact danger" type="button" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "cancel")}>${busy ? "Working…" : "Cancel"}</button>
-                  <button class="compact" type="button" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>Cancel & retry</button>
+                  <button class="compact" type="button" title="Starts a replacement review with current repository settings" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>Cancel & retry</button>
                 `
               : canRetryCodeReviewJob(job.status)
-                ? html`<button class="compact" type="button" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>${busy ? "Retrying…" : "Retry"}</button>`
+                ? html`<button class="compact" type="button" title="Starts a replacement review with current repository settings" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>${busy ? "Retrying…" : "Retry"}</button>`
                 : nothing}
           </div>
         </footer>
@@ -696,8 +696,8 @@ export class TrouveCodeReviewDashboard extends LitElement {
                 <p>${pending.action === "cancel"
                   ? `Cancel the review for PR #${job.pull_number}? Completed output remains in review history.`
                   : active
-                    ? `Cancel current work and queue a retry for PR #${job.pull_number}?`
-                    : `Queue a new retry for PR #${job.pull_number}?`}</p>
+                    ? `Cancel current work and queue a replacement for PR #${job.pull_number} using current repository settings? Every currently selected reviewer persona will run again.`
+                    : `Queue a replacement for PR #${job.pull_number} using current repository settings? Every currently selected reviewer persona will run again.`}</p>
                 <div class="actions">
                   <button class="compact" type="button" @click=${this.#dismissConfirmation}>Keep current job</button>
                   <button class="compact ${pending.action === "cancel" ? "danger" : "primary"}" type="button" @click=${() => this.#runJobAction(job, pending.action)}>Confirm ${pending.action === "cancel" ? "cancel" : "retry"}</button>
@@ -969,7 +969,11 @@ export class TrouveCodeReviewDashboard extends LitElement {
 
     if (!this.isConnected) return;
     this.#upsertJob(updated);
-    this.#liveStatus = action === "cancel" ? "Review cancelled." : "Review retry queued.";
+    this.#liveStatus = action === "cancel"
+      ? "Review cancelled."
+      : updated.id === job.id
+        ? "Review publication had already started; the existing review was reconciled instead of retried."
+        : `Replacement review ${updated.id} queued; all currently selected reviewer personas will run again.`;
     try {
       this.#replaceDashboard(await services.protocol.codeReviewDashboard());
     } catch {

@@ -11,3 +11,11 @@ test("review data and CLI status do not rely on manual refresh controls", () => 
   assert.match(source, /CLI_IDLE_REFRESH_MS/u);
   assert.match(source, /Retrying automatically\./u);
 });
+
+test("persona retry labels describe the actual terminal state", () => {
+  assert.ok(
+    source.includes(
+      'aria-label={`Retry full review after ${group.name} ${group.status}`}',
+    ),
+  );
+});

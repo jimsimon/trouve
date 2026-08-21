@@ -3113,6 +3113,22 @@ pub struct CodeReviewJobRecord {
 }
 
 #[derive(Debug, Clone)]
+pub enum CodeReviewJobRetryOutcome {
+    Replacement(trouve_protocol::CodeReviewJob),
+    PublicationClaimed(trouve_protocol::CodeReviewJob),
+}
+
+impl std::ops::Deref for CodeReviewJobRetryOutcome {
+    type Target = trouve_protocol::CodeReviewJob;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Replacement(job) | Self::PublicationClaimed(job) => job,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CodeReviewBatchSnapshotUpdate {
     pub changed: bool,
 }
@@ -8447,7 +8463,6 @@ impl Store {
         pull_number: u64,
         base_ref: &str,
         head_sha: &str,
-        config_hash: &str,
     ) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
@@ -8456,17 +8471,11 @@ impl Store {
                 "SELECT id FROM code_review_jobs
                  WHERE repository = ?1 AND pull_number = ?2
                    AND status IN ('queued', 'running')
-                   AND (base_ref != ?3 OR head_sha != ?4 OR config_hash != ?5)
+                   AND (base_ref != ?3 OR head_sha != ?4)
                  ORDER BY created_at",
             )?;
             let rows = stmt.query_map(
-                params![
-                    repository,
-                    pull_number as i64,
-                    base_ref,
-                    head_sha,
-                    config_hash
-                ],
+                params![repository, pull_number as i64, base_ref, head_sha],
                 |row| row.get(0),
             )?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -8478,17 +8487,14 @@ impl Store {
                      error = ?5, completed_at = ?6
                  WHERE repository = ?1 AND pull_number = ?2
                    AND status IN ('queued', 'running')
-                   AND (base_ref != ?3 OR head_sha != ?4 OR config_hash != ?7)",
+                   AND (base_ref != ?3 OR head_sha != ?4)",
                 params![
                     repository,
                     pull_number as i64,
                     base_ref,
                     head_sha,
-                    format!(
-                        "superseded by pull request revision {base_ref}..{head_sha} or review configuration"
-                    ),
+                    format!("superseded by pull request revision {base_ref}..{head_sha}"),
                     chrono::Utc::now().to_rfc3339(),
-                    config_hash,
                 ],
             )?;
         }
@@ -8628,6 +8634,79 @@ impl Store {
             .query_row(
                 "SELECT 1 FROM code_review_jobs WHERE dedupe_key = ?1",
                 params![dedupe_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn code_review_job_exists_for_revision(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        base_ref: &str,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "WITH RECURSIVE retry_lineage(id, retry_of, trigger, dedupe_key) AS (
+                   SELECT id, retry_of, trigger, dedupe_key
+                   FROM code_review_jobs
+                   WHERE repository = ?1 AND pull_number = ?2
+                     AND base_ref = ?3 AND head_sha = ?4
+                     AND status IN ('queued', 'running', 'succeeded', 'failed')
+                   UNION ALL
+                   SELECT predecessor.id, predecessor.retry_of,
+                          predecessor.trigger, predecessor.dedupe_key
+                   FROM code_review_jobs AS predecessor
+                   JOIN retry_lineage AS replacement
+                     ON predecessor.id = replacement.retry_of
+                 )
+                 SELECT 1 FROM retry_lineage
+                 WHERE trigger = 'automatic'
+                    OR dedupe_key LIKE '%:automatic:%'
+                 LIMIT 1",
+                params![repository, pull_number as i64, base_ref, head_sha],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn code_review_job_has_prior_revision(
+        &self,
+        id: &str,
+        repository: &str,
+        pull_number: u64,
+        base_ref: &str,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "WITH RECURSIVE retry_lineage(id, retry_of, trigger, dedupe_key) AS (
+                   SELECT prior.id, prior.retry_of, prior.trigger, prior.dedupe_key
+                   FROM code_review_jobs AS prior
+                   WHERE prior.repository = ?2 AND prior.pull_number = ?3
+                     AND prior.base_ref = ?4 AND prior.head_sha = ?5
+                     AND prior.status IN ('queued', 'running', 'succeeded', 'failed')
+                     AND prior.rowid < (
+                       SELECT current.rowid FROM code_review_jobs AS current
+                       WHERE current.id = ?1
+                     )
+                   UNION ALL
+                   SELECT predecessor.id, predecessor.retry_of,
+                          predecessor.trigger, predecessor.dedupe_key
+                   FROM code_review_jobs AS predecessor
+                   JOIN retry_lineage AS replacement
+                     ON predecessor.id = replacement.retry_of
+                 )
+                 SELECT 1 FROM retry_lineage
+                 WHERE trigger = 'automatic'
+                    OR dedupe_key LIKE '%:automatic:%'
+                 LIMIT 1",
+                params![id, repository, pull_number as i64, base_ref, head_sha],
                 |_| Ok(()),
             )
             .optional()?
@@ -9490,7 +9569,8 @@ impl Store {
     /// Successful task attempts remain durable and are reused when the job
     /// resumes. New queued rows retain each failed attempt for inspection
     /// while making the newest attempt authoritative for persona rollups.
-    pub fn retry_code_review_persona(
+    #[cfg(test)]
+    pub(crate) fn retry_code_review_persona(
         &self,
         id: &str,
         reviewer_id: &str,
@@ -11612,7 +11692,8 @@ impl Store {
     pub fn retry_code_review_job(
         &self,
         id: &str,
-    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        new_job: &NewCodeReviewJob,
+    ) -> Result<Option<CodeReviewJobRetryOutcome>> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
         let old = tx
@@ -11626,10 +11707,27 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
+        if let Some(retried_by) = old.job.retried_by.as_deref() {
+            let replacement = tx
+                .query_row(
+                    &format!(
+                        "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"
+                    ),
+                    params![retried_by],
+                    row_to_code_review_job,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("review job {id} points to missing replacement {retried_by}")
+                })?;
+            tx.commit()?;
+            return Ok(Some(CodeReviewJobRetryOutcome::Replacement(
+                replacement.job,
+            )));
+        }
         if old.publication_claimed {
-            anyhow::bail!(
-                "review publication may already exist; reconcile it instead of publishing again"
-            );
+            tx.commit()?;
+            return Ok(Some(CodeReviewJobRetryOutcome::PublicationClaimed(old.job)));
         }
         if old.job.status == "queued" {
             tx.execute(
@@ -11649,6 +11747,9 @@ impl Store {
         }
         let new_id = crate::new_id("rv");
         let now = chrono::Utc::now().to_rfc3339();
+        let reviewers = serde_json::to_string(&new_job.reviewers)?;
+        let included_reviewer_ids = serde_json::to_string(&new_job.included_reviewer_ids)?;
+        let excluded_reviewer_ids = serde_json::to_string(&new_job.excluded_reviewer_ids)?;
         tx.execute(
             "INSERT INTO code_review_jobs
                     (id, dedupe_key, installation_id, repository, pull_number,
@@ -11659,32 +11760,60 @@ impl Store {
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
                      coordinator_thinking_level, review_watermark_sha)
-             SELECT ?2, ?3, installation_id, repository, pull_number,
-                    pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
-                    'queued', model, prompt, identities, config_hash, ?4,
-                    review_base_sha, review_scope, id, total_reviewers,
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'retry',
+                    'queued', ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
                     (SELECT COALESCE(MAX(generation.publication_generation), 0) + 1
                      FROM code_review_jobs AS generation
-                     WHERE generation.repository = source.repository
-                       AND generation.pull_number = source.pull_number
-                       AND generation.head_sha = source.head_sha),
-                    routing_mode, semantic_routing, included_reviewer_ids,
-                    excluded_reviewer_ids, router_model, router_thinking_level,
-                    coordinator_thinking_level, review_watermark_sha
-             FROM code_review_jobs AS source WHERE source.id = ?1",
-            params![id, new_id, format!("retry:{id}:{new_id}"), now],
+                     WHERE generation.repository = ?4
+                       AND generation.pull_number = ?5
+                       AND generation.head_sha = ?8),
+                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?16)",
+            params![
+                new_id,
+                new_job.dedupe_key,
+                new_job.installation_id as i64,
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.pull_title,
+                new_job.pull_url,
+                new_job.head_sha,
+                new_job.base_ref,
+                new_job.head_ref,
+                new_job.model,
+                new_job.prompt,
+                reviewers,
+                new_job.config_hash,
+                now,
+                new_job.review_base_sha,
+                code_review_scope_str(new_job.scope),
+                id,
+                new_job.reviewers.len() as i64,
+                code_review_routing_mode_str(new_job.routing_mode),
+                new_job.semantic_routing,
+                included_reviewer_ids,
+                excluded_reviewer_ids,
+                new_job.router_model,
+                new_job.router_thinking_level,
+                new_job.coordinator_thinking_level,
+            ],
         )?;
-        tx.execute(
-            "UPDATE code_review_jobs SET retried_by = ?2 WHERE id = ?1",
+        let linked = tx.execute(
+            "UPDATE code_review_jobs SET retried_by = ?2
+             WHERE id = ?1 AND retried_by IS NULL",
             params![id, new_id],
         )?;
+        if linked == 0 {
+            anyhow::bail!("review job {id} was retried concurrently");
+        }
         let replacement = tx.query_row(
             &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
             params![new_id],
             row_to_code_review_job,
         )?;
         tx.commit()?;
-        Ok(Some(replacement.job))
+        Ok(Some(CodeReviewJobRetryOutcome::Replacement(
+            replacement.job,
+        )))
     }
 
     pub fn code_review_job_cancel_requested(&self, id: &str) -> Result<bool> {
@@ -13193,6 +13322,37 @@ fn row_to_checkpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
 mod tests {
     use super::*;
     use trouve_protocol::{Event, ToolStatus};
+
+    fn retry_request_for(store: &Store, id: &str, dedupe_key: &str) -> NewCodeReviewJob {
+        let record = store.code_review_job(id).unwrap().unwrap();
+        let job = record.job;
+        NewCodeReviewJob {
+            dedupe_key: dedupe_key.into(),
+            installation_id: job.installation_id,
+            repository: job.repository,
+            pull_number: job.pull_number,
+            pull_title: job.pull_title,
+            pull_url: job.pull_url,
+            head_sha: job.head_sha,
+            review_base_sha: job.review_base_sha,
+            base_ref: job.base_ref,
+            head_ref: job.head_ref,
+            scope: job.scope,
+            trigger: "retry".into(),
+            retry_of: Some(id.into()),
+            model: job.model,
+            coordinator_thinking_level: job.coordinator_thinking_level,
+            router_model: job.router_model,
+            router_thinking_level: job.router_thinking_level,
+            prompt: record.prompt,
+            reviewers: record.reviewers,
+            routing_mode: job.routing_mode,
+            semantic_routing: job.semantic_routing,
+            included_reviewer_ids: job.included_reviewer_ids,
+            excluded_reviewer_ids: job.excluded_reviewer_ids,
+            config_hash: "retry-config".into(),
+        }
+    }
 
     #[test]
     fn event_writer_errors_preserve_sqlite_classification() {
@@ -17741,7 +17901,11 @@ mod tests {
             )
             .unwrap();
 
-        let retry = store.retry_code_review_job(&job.id).unwrap().unwrap();
+        let retry_request = retry_request_for(&store, &job.id, "retry:generation");
+        let retry = store
+            .retry_code_review_job(&job.id, &retry_request)
+            .unwrap()
+            .unwrap();
         let generation = store
             .conn
             .lock()
@@ -18500,7 +18664,11 @@ mod tests {
     fn late_publication_repair_does_not_regress_the_pull_watermark() {
         let store = Store::open_in_memory().unwrap();
         let older = enqueue_backoff_test_job(&store);
-        let newer = store.retry_code_review_job(&older.id).unwrap().unwrap();
+        let retry_request = retry_request_for(&store, &older.id, "retry:late-repair");
+        let newer = store
+            .retry_code_review_job(&older.id, &retry_request)
+            .unwrap()
+            .unwrap();
         store
             .conn
             .lock()
@@ -18549,7 +18717,11 @@ mod tests {
     fn superseded_direct_publication_does_not_regress_the_pull_watermark() {
         let store = Store::open_in_memory().unwrap();
         let older = enqueue_backoff_test_job(&store);
-        let newer = store.retry_code_review_job(&older.id).unwrap().unwrap();
+        let retry_request = retry_request_for(&store, &older.id, "retry:superseded-direct");
+        let newer = store
+            .retry_code_review_job(&older.id, &retry_request)
+            .unwrap()
+            .unwrap();
         store
             .conn
             .lock()
@@ -21021,15 +21193,56 @@ mod tests {
                 .is_empty()
         );
 
-        let replacement = store.retry_code_review_job(&queued.id).unwrap().unwrap();
+        let latest_reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .skip(2)
+            .take(1)
+            .collect::<Vec<_>>();
+        let mut replacement_request =
+            retry_request_for(&store, &queued.id, "acme/widgets#42:retry:latest-config");
+        replacement_request.pull_title = "Ship widgets now".into();
+        replacement_request.model = Some("provider/latest".into());
+        replacement_request.coordinator_thinking_level = Some("high".into());
+        replacement_request.router_model = Some("provider/latest-router".into());
+        replacement_request.router_thinking_level = Some("medium".into());
+        replacement_request.prompt = "Use the latest policy".into();
+        replacement_request.reviewers = latest_reviewers;
+        replacement_request.routing_mode = trouve_protocol::CodeReviewRoutingMode::Automatic;
+        replacement_request.semantic_routing = true;
+        replacement_request.included_reviewer_ids = vec!["performance".into()];
+        replacement_request.excluded_reviewer_ids = vec!["accessibility".into()];
+        replacement_request.config_hash = "latest-config".into();
+        let replacement = store
+            .retry_code_review_job(&queued.id, &replacement_request)
+            .unwrap()
+            .unwrap();
+        let repeated = store
+            .retry_code_review_job(&queued.id, &replacement_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.id, replacement.id);
         assert_eq!(replacement.retry_of.as_deref(), Some(queued.id.as_str()));
         assert_eq!(
             replacement.coordinator_thinking_level.as_deref(),
-            Some("medium")
+            Some("high")
         );
-        assert_eq!(replacement.router_model.as_deref(), Some("provider/router"));
-        assert_eq!(replacement.router_thinking_level.as_deref(), Some("low"));
+        assert_eq!(replacement.model.as_deref(), Some("provider/latest"));
+        assert_eq!(
+            replacement.router_model.as_deref(),
+            Some("provider/latest-router")
+        );
+        assert_eq!(replacement.router_thinking_level.as_deref(), Some("medium"));
+        assert_eq!(replacement.progress.total_reviewers, 1);
+        assert_eq!(
+            store
+                .code_review_job(&replacement.id)
+                .unwrap()
+                .unwrap()
+                .prompt,
+            "Use the latest policy"
+        );
         let jobs = store.list_code_review_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 2, "a predecessor has only one replacement");
         assert_eq!(jobs[0].id, queued.id);
         assert_eq!(jobs[0].status, "running");
         assert_eq!(jobs[1].id, replacement.id);
@@ -22063,11 +22276,31 @@ mod tests {
             assert_eq!(recovered.publication_accepted, was_accepted, "{}", job.id);
         }
 
-        assert!(store.retry_code_review_job(&prepared.id).unwrap().is_some());
-        let error = store.retry_code_review_job(&dispatched.id).unwrap_err();
-        assert!(error.to_string().contains("reconcile it"));
-        let error = store.retry_code_review_job(&accepted.id).unwrap_err();
-        assert!(error.to_string().contains("reconcile it"));
+        let prepared_retry = retry_request_for(&store, &prepared.id, "retry:prepared");
+        assert!(
+            store
+                .retry_code_review_job(&prepared.id, &prepared_retry)
+                .unwrap()
+                .is_some()
+        );
+        let dispatched_retry = retry_request_for(&store, &dispatched.id, "retry:dispatched");
+        let outcome = store
+            .retry_code_review_job(&dispatched.id, &dispatched_retry)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CodeReviewJobRetryOutcome::PublicationClaimed(ref job) if job.id == dispatched.id
+        ));
+        let accepted_retry = retry_request_for(&store, &accepted.id, "retry:accepted");
+        let outcome = store
+            .retry_code_review_job(&accepted.id, &accepted_retry)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CodeReviewJobRetryOutcome::PublicationClaimed(ref job) if job.id == accepted.id
+        ));
     }
 
     #[test]
@@ -22088,6 +22321,144 @@ mod tests {
         assert_eq!(
             store.list_built_in_reviewer_defaults().unwrap(),
             vec![reviewer]
+        );
+    }
+
+    #[test]
+    fn only_automatic_equivalent_attempts_suppress_a_revision() {
+        let store = Store::open_in_memory().unwrap();
+        let enqueue = |dedupe_key: &str, trigger: &str| {
+            store
+                .enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key: dedupe_key.into(),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number: 42,
+                    pull_title: "Ship widgets".into(),
+                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                    head_sha: "head-2".into(),
+                    review_base_sha: "base-2".into(),
+                    base_ref: "base-2".into(),
+                    head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                    trigger: trigger.into(),
+                    retry_of: None,
+                    model: None,
+                    coordinator_thinking_level: None,
+                    router_model: None,
+                    router_thinking_level: None,
+                    prompt: String::new(),
+                    reviewers: Vec::new(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                    semantic_routing: false,
+                    included_reviewer_ids: Vec::new(),
+                    excluded_reviewer_ids: Vec::new(),
+                    config_hash: "config".into(),
+                })
+                .unwrap()
+                .unwrap()
+        };
+
+        let draft_manual = enqueue("acme/widgets#42:base-2:head-2:manual:draft", "manual");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'succeeded' WHERE id = ?1",
+                params![draft_manual.id],
+            )
+            .unwrap();
+        let draft_retry_request = retry_request_for(&store, &draft_manual.id, "retry:manual-draft");
+        let draft_retry = store
+            .retry_code_review_job(&draft_manual.id, &draft_retry_request)
+            .unwrap()
+            .unwrap();
+        let nested_retry_request =
+            retry_request_for(&store, &draft_retry.id, "retry:manual-draft-again");
+        let nested_retry = store
+            .retry_code_review_job(&draft_retry.id, &nested_retry_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(nested_retry.trigger, "retry");
+        let stale_automatic = enqueue("acme/widgets#42:base-2:head-2:automatic:stale", "automatic");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'stale' WHERE id = ?1",
+                params![stale_automatic.id],
+            )
+            .unwrap();
+
+        assert!(
+            !store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap(),
+            "draft manual retries and stale jobs are not automatic-equivalent attempts"
+        );
+        let automatic = enqueue(
+            "acme/widgets#42:base-2:head-2:automatic:replacement",
+            "automatic",
+        );
+        assert!(
+            !store
+                .code_review_job_has_prior_revision(
+                    &automatic.id,
+                    "acme/widgets",
+                    42,
+                    "base-2",
+                    "head-2",
+                )
+                .unwrap(),
+            "stale and manual predecessors do not terminate a new automatic job"
+        );
+        assert!(
+            store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-3", "head-2")
+                .unwrap(),
+            "a base advance with the same head is a distinct revision"
+        );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'stale' WHERE id = ?1",
+                params![automatic.id],
+            )
+            .unwrap();
+        let ready_manual = enqueue(
+            "acme/widgets#42:base-2:head-2:automatic:manual-ready",
+            "manual",
+        );
+        assert!(
+            store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap(),
+            "a ready-state manual request carrying the automatic key is equivalent"
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'failed' WHERE id = ?1",
+                params![ready_manual.id],
+            )
+            .unwrap();
+        assert!(
+            store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap(),
+            "a failed automatic-equivalent attempt remains a durable suppression watermark"
         );
     }
 
@@ -22140,14 +22511,43 @@ mod tests {
         let old_config = enqueue("old-config", "base-2", "head-2", "old-config");
         let current = enqueue("current", "base-2", "head-2", "config");
 
+        assert!(
+            store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-3")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .code_review_job_has_prior_revision(
+                    &old_config.id,
+                    "acme/widgets",
+                    42,
+                    "base-2",
+                    "head-2",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .code_review_job_has_prior_revision(
+                    &current.id,
+                    "acme/widgets",
+                    42,
+                    "base-2",
+                    "head-2",
+                )
+                .unwrap()
+        );
+
         let mut superseded = store
-            .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2", "config")
+            .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2")
             .unwrap();
-        let mut expected = vec![
-            old_head.id.clone(),
-            old_base.id.clone(),
-            old_config.id.clone(),
-        ];
+        let mut expected = vec![old_head.id.clone(), old_base.id.clone()];
         superseded.sort();
         expected.sort();
         assert_eq!(superseded, expected);
@@ -22177,6 +22577,16 @@ mod tests {
                 .job
                 .status,
             "queued"
+        );
+        assert_eq!(
+            store
+                .code_review_job(&old_config.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "queued",
+            "configuration changes apply to new jobs without superseding existing snapshots"
         );
         assert!(
             !store
@@ -22283,8 +22693,10 @@ mod tests {
 
         let requeued_automatic = enqueue("automatic-queued", "automatic");
         assert_ne!(requeued_automatic.id, queued_automatic.id);
+        let retry_request =
+            retry_request_for(&store, &running_automatic.id, "retry:draft-automatic");
         let retry = store
-            .retry_code_review_job(&running_automatic.id)
+            .retry_code_review_job(&running_automatic.id, &retry_request)
             .unwrap()
             .unwrap();
         assert_eq!(retry.trigger, "retry");
