@@ -60,6 +60,70 @@ const searchableText = (value: unknown): string => {
   return parts.join("\n");
 };
 
+const searchableItemContent = (item: ThreadChatItem): unknown => {
+  switch (item.kind) {
+    case "user":
+    case "steered":
+      return [
+        item.content,
+        item.attachments.map((attachment) => [
+          attachment.name,
+          attachment.mime,
+          attachment.size_bytes,
+        ]),
+      ];
+    case "assistant":
+    case "progress":
+    case "thinking":
+      return item.content;
+    case "subagent":
+      return [item.prompt, item.model];
+    case "compaction":
+      return item.state.kind === "completed"
+        ? ["context compaction completed", item.state.messagesCompacted]
+        : [`context compaction ${item.state.kind}`];
+    case "todo":
+      return [item.content, item.state];
+    case "tool":
+      return [
+        item.tool,
+        item.args,
+        item.result,
+        item.output.text,
+        item.status,
+        item.durationMs,
+      ];
+    case "turn-status": {
+      const state = item.state;
+      if (state.kind === "failed") return ["turn failed", state.error];
+      if (state.kind === "completed" || state.kind === "running") {
+        const usage = state.usage;
+        return usage === undefined
+          ? [`turn ${state.kind}`]
+          : [
+              `turn ${state.kind}`,
+              `input tokens ${usage.input_tokens}`,
+              `output tokens ${usage.output_tokens}`,
+              usage.cached_input_tokens == null
+                ? undefined
+                : `cached input tokens ${usage.cached_input_tokens}`,
+              usage.cost_usd == null ? undefined : `cost ${usage.cost_usd}`,
+            ];
+      }
+      return [`turn ${state.kind}`];
+    }
+    case "questions":
+      return [
+        item.title,
+        item.questions.map((question) => [
+          question.prompt,
+          question.options.map((option) => option.label),
+        ]),
+        item.answers?.map((answer) => answer.other_text) ?? [],
+      ];
+  }
+};
+
 /** Literal, per-turn transcript matches in display order. */
 export const chatFindUnitIds = (
   items: readonly ThreadChatItem[],
@@ -72,7 +136,11 @@ export const chatFindUnitIds = (
   return Object.freeze(
     buildChatLayout(items).units
       .filter((unit) => {
-        const text = searchableText(unit);
+        const text = searchableText([
+          unit.prompt === undefined ? undefined : searchableItemContent(unit.prompt),
+          ...unit.items.map(searchableItemContent),
+          unit.status === undefined ? undefined : searchableItemContent(unit.status),
+        ]);
         return (caseSensitive ? text : text.toLowerCase()).includes(expected);
       })
       .map((unit) => unit.id),

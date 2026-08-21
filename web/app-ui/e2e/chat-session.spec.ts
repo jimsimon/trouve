@@ -4791,16 +4791,30 @@ test("prefetches older history before the reader reaches the loaded boundary", a
 });
 
 test("find defaults to insensitive matching and restores separate thread state", async ({ page }) => {
-  await installProtocolFixtures(page, { additionalThreads: [{
-    id: "th_find_second",
-    session_id: "se_1",
-    title: "Second find thread",
-    mode: "code",
-    model: "test/second",
-    model_options: {},
-    permission_mode: "ask",
-    created_at: "2026-08-05T08:00:00Z",
-  }] });
+  await installProtocolFixtures(page, {
+    additionalThreads: [{
+      id: "th_find_second",
+      session_id: "se_1",
+      title: "Second find thread",
+      mode: "code",
+      model: "test/second",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:00:00Z",
+    }],
+    threadViewFixture: () => ({
+      cursor: 20,
+      snapshot: {
+        item_offset: 0,
+        total_items: 2,
+        has_older: false,
+        items: [
+          { kind: "user", turn: 1, content: "Build Agent Alpha", attachments: [] },
+          { kind: "user", turn: 2, content: "Agent Beta", attachments: [] },
+        ],
+      },
+    }),
+  });
   await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture");
   await replayHistory(page);
 
@@ -4830,6 +4844,32 @@ test("find defaults to insensitive matching and restores separate thread state",
   await expect(find.getByRole("button", { name: "Match case" }))
     .toHaveAttribute("aria-pressed", "true");
   await expect(find.getByRole("status")).toHaveText("1 of 1");
+
+  await find.getByRole("button", { name: "Match case" }).click();
+  const input = find.getByRole("searchbox", { name: "Search this chat" });
+  await input.fill("agent");
+  await expect(find.getByRole("status")).toHaveText("1 of 2");
+  await input.press("Enter");
+  await expect(find.getByRole("status")).toHaveText("2 of 2");
+  await page.evaluate(() => {
+    const input = document.querySelector<HTMLInputElement>(".chat-find-input");
+    const tab = document.querySelector<HTMLButtonElement>(
+      '[data-thread-tab-id="th_find_second"]',
+    );
+    if (input === null || tab === null) throw new Error("missing find debounce fixture");
+    input.value = "ag";
+    input.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      data: "ag",
+      inputType: "insertText",
+    }));
+    tab.click();
+  });
+  await expect(page).toHaveURL(/\/threads\/th_find_second$/u);
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
+  find = page.getByRole("search", { name: "Find in chat" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" })).toHaveValue("ag");
+  await expect(find.getByRole("status")).toHaveText("1 of 2");
 });
 
 test("find preserves its restored selection while an evicted thread reloads", async ({ page }) => {

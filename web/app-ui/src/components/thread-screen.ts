@@ -978,13 +978,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       ?? this.#chatFindRestoredActiveUnitId;
   }
 
-  #saveChatFindState(threadId = this.threadId): void {
+  #saveChatFindState(threadId = this.threadId, clearActive = false): void {
     if (threadId === "") return;
     this.#chatFindByThread.set(threadId, Object.freeze({
       open: this.#chatFindOpen,
       query: this.#chatFindQuery,
       caseSensitive: this.#chatFindCaseSensitive,
-      activeUnitId: this.#activeChatFindUnitId(),
+      activeUnitId: clearActive ? undefined : this.#activeChatFindUnitId(),
     }));
   }
 
@@ -1069,19 +1069,23 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   readonly #chatFindChanged = (event: InputEvent): void => {
     this.#chatFindQuery = (event.currentTarget as HTMLInputElement).value;
+    this.#chatFindUnitIds = [];
+    this.#chatFindActiveIndex = -1;
     this.#chatFindRestoredActiveUnitId = undefined;
     this.#chatFindRefreshKey = "";
     this.#scheduleChatFindRefresh(true, true);
-    this.#saveChatFindState();
+    this.#saveChatFindState(this.threadId, true);
     this.requestUpdate();
   };
 
   readonly #toggleChatFindCase = (): void => {
     this.#chatFindCaseSensitive = !this.#chatFindCaseSensitive;
+    this.#chatFindUnitIds = [];
+    this.#chatFindActiveIndex = -1;
     this.#chatFindRestoredActiveUnitId = undefined;
     this.#chatFindRefreshKey = "";
     this.#scheduleChatFindRefresh(true, true);
-    this.#saveChatFindState();
+    this.#saveChatFindState(this.threadId, true);
     this.requestUpdate();
   };
 

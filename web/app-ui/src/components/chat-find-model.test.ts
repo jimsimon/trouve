@@ -44,6 +44,9 @@ describe("chat find model", () => {
     expect(chatFindUnitIds(items, "Agent", true)).toEqual(["turn:1"]);
     expect(chatFindUnitIds(items, "agent", true)).toEqual(["turn:2"]);
     expect(chatFindUnitIds(items, "  SearchPanel  ", false)).toEqual(["turn:2"]);
+    expect(chatFindUnitIds(items, "assistant", false)).toEqual([]);
+    expect(chatFindUnitIds(items, "assistant:1", false)).toEqual([]);
+    expect(chatFindUnitIds(items, "turn:2", false)).toEqual([]);
     expect(chatFindUnitIds(items, "", false)).toEqual([]);
   });
 
@@ -56,7 +59,7 @@ describe("chat find model", () => {
         tool: "read_file",
         args: { path: "src/parser.rs" },
         status: "ok",
-        result: { summary: "Nested fence recovered" },
+        result: { summary: "Nested fence recovered", exit_code: 11, success: false },
         output: { text: "line output", bytes: 11, omitted: false },
       },
       {
