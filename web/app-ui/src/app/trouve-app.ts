@@ -457,6 +457,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         readonly startWidth: number;
       }
     | undefined;
+  #stopRouteChanges: (() => void) | undefined;
 
   readonly #servicesProvider = new ContextProvider(this, {
     context: appServicesContext,
@@ -493,6 +494,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   override connectedCallback(): void {
     super.connectedCallback();
+    this.#stopRouteChanges ??= this.#router.subscribe(this.#routeChanged);
     globalThis.addEventListener("trouve-pwa-update-ready", this.#pwaUpdateReady);
     if (deployment === "pwa") {
       globalThis.addEventListener("beforeinstallprompt", this.#pwaInstallAvailable);
@@ -521,6 +523,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   override disconnectedCallback(): void {
+    this.#stopRouteChanges?.();
+    this.#stopRouteChanges = undefined;
     globalThis.removeEventListener("trouve-pwa-update-ready", this.#pwaUpdateReady);
     globalThis.removeEventListener("beforeinstallprompt", this.#pwaInstallAvailable);
     globalThis.removeEventListener("appinstalled", this.#pwaInstalled);
@@ -1924,6 +1928,25 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   readonly #closeNewSession = (): void => {
     if (this.#newSessionPending) return;
+    this.#resetNewSession();
+    this.requestUpdate();
+  };
+
+  readonly #routeChanged = (): void => {
+    if (!this.#newSessionOpen) return;
+    if (this.#newSessionPending) {
+      // Navigation cannot cancel a create request already accepted by the
+      // server. Hide its setup without clearing attachments that the request
+      // still needs while it finishes in the background.
+      this.#newSessionOpen = false;
+      this.requestUpdate();
+      return;
+    }
+    this.#resetNewSession();
+    this.requestUpdate();
+  };
+
+  #resetNewSession(): void {
     this.#newSessionOpen = false;
     this.#newSessionError = "";
     this.#newSessionBranchGeneration += 1;
@@ -1942,8 +1965,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPromptComposing = false;
     this.#newSessionPermissionMode = "";
     this.#newSessionPreferredBaseRef = "";
-    this.requestUpdate();
-  };
+  }
 
   #resizeNewSessionPrompt(
     textarea = this.querySelector<HTMLTextAreaElement>(

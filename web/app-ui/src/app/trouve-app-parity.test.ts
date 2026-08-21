@@ -99,4 +99,11 @@ describe("root shell parity wiring", () => {
     expect(source).not.toContain("this.#reconcileNewSessionModelCatalog()");
     expect(source).toContain("this.#resetNewSessionOptionsForWorkspace(workspaceId)");
   });
+
+  it("dismisses new-session setup when navigation opens another screen", () => {
+    expect(source).toContain("this.#router.subscribe(this.#routeChanged)");
+    expect(source).toContain("readonly #routeChanged = (): void => {");
+    expect(source).toContain("if (!this.#newSessionOpen) return;");
+    expect(source).toContain("this.#resetNewSession();");
+  });
 });

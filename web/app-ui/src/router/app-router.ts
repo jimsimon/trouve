@@ -116,11 +116,14 @@ export interface RouterPlatform {
   readonly listen: (listener: () => void) => () => void;
 }
 
+export type AppRouteListener = (route: AppRoute) => void;
+
 export class AppRouter {
   readonly #platform: RouterPlatform;
   readonly #route = createSignal<AppRoute>({ kind: "inbox" });
   readonly route: ReadonlySignal<AppRoute> = this.#route;
   readonly #stopListening: () => void;
+  readonly #listeners = new Set<AppRouteListener>();
   #lastSettingsSection: string | undefined;
 
   constructor(platform: RouterPlatform) {
@@ -131,8 +134,13 @@ export class AppRouter {
     this.#stopListening = platform.listen(() => {
       const route = parseRoute(platform.pathname());
       this.#rememberSettingsSection(route);
-      this.#route.set(route);
+      this.#publish(route);
     });
+  }
+
+  subscribe(listener: AppRouteListener): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
   }
 
   navigate(route: Exclude<AppRoute, { kind: "not-found" }>, replace = false): void {
@@ -155,7 +163,12 @@ export class AppRouter {
     const href = routeHref(destination);
     if (replace) this.#platform.replace(href);
     else this.#platform.push(href);
-    this.#route.set(destination);
+    this.#publish(destination);
+  }
+
+  #publish(route: AppRoute): void {
+    this.#route.set(route);
+    for (const listener of [...this.#listeners]) listener(route);
   }
 
   #rememberSettingsSection(route: AppRoute): void {
@@ -166,6 +179,7 @@ export class AppRouter {
 
   dispose(): void {
     this.#stopListening();
+    this.#listeners.clear();
   }
 }
 

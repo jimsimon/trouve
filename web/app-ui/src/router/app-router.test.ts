@@ -64,6 +64,35 @@ describe("application routes", () => {
     expect(readSignal(router.route)).toEqual({ kind: "settings", section: "providers" });
   });
 
+  it("notifies subscribers when application or browser navigation changes the route", () => {
+    let pathname = "/inbox";
+    let browserNavigation: (() => void) | undefined;
+    const router = new AppRouter({
+      pathname: () => pathname,
+      push: (href) => {
+        pathname = href;
+      },
+      replace: vi.fn(),
+      listen: (listener) => {
+        browserNavigation = listener;
+        return () => undefined;
+      },
+    });
+    const listener = vi.fn();
+    const unsubscribe = router.subscribe(listener);
+
+    router.navigate({ kind: "settings" });
+    pathname = "/reviews";
+    browserNavigation?.();
+
+    expect(listener).toHaveBeenNthCalledWith(1, { kind: "settings" });
+    expect(listener).toHaveBeenNthCalledWith(2, { kind: "reviews" });
+
+    unsubscribe();
+    router.navigate({ kind: "inbox" });
+    expect(listener).toHaveBeenCalledTimes(2);
+  });
+
   it("remembers the last settings screen for the router lifetime", () => {
     let pathname = "/inbox";
     const push = vi.fn((href: string) => {
