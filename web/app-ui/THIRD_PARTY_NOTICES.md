@@ -3,6 +3,8 @@
 This file is generated from `web/app-ui/package-lock.json` by
 `npm run generate:notices`. It inventories both runtime and development
 dependencies; the packaged Vite assets contain only the runtime subset.
+Packages used both at runtime and directly for development retain the
+`runtime/transitive` scope so the packaged dependency remains visible.
 Review each newly introduced license before regenerating this file.
 
 WebAwesome is the MIT-licensed Free distribution (`@awesome.me/webawesome`).
