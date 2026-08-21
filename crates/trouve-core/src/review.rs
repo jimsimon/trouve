@@ -30,9 +30,9 @@ use trouve_protocol::{
 use crate::config::GithubReviewAppConfig;
 use crate::engine::{Engine, EngineError};
 use crate::store::{
-    CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewManualRequest, CodeReviewModelTiming,
-    CodeReviewTaskMetrics, NewCodeReviewFinding, NewCodeReviewFindingDetails, NewCodeReviewJob,
-    NewCodeReviewTask, NewCodeReviewTheme,
+    CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewJobRetryOutcome, CodeReviewManualRequest,
+    CodeReviewModelTiming, CodeReviewTaskMetrics, NewCodeReviewFinding,
+    NewCodeReviewFindingDetails, NewCodeReviewJob, NewCodeReviewTask, NewCodeReviewTheme,
 };
 use crate::tools::{
     ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryDiff,
@@ -2390,11 +2390,22 @@ impl Engine {
                 Some(&old.job),
             )
             .await?;
-        let replacement = self
+        let retry_outcome = self
             .store
             .retry_code_review_job(id, &new_job)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        let replacement = match retry_outcome {
+            CodeReviewJobRetryOutcome::Replacement(replacement) => replacement,
+            CodeReviewJobRetryOutcome::PublicationClaimed(job) => {
+                self.sync_code_review_projection(&job).await;
+                return self
+                    .store
+                    .code_review_job(id)?
+                    .map(|record| record.job)
+                    .ok_or_else(|| EngineError::NotFound(format!("review job {id}")));
+            }
+        };
         self.code_review.cancel_job(id);
         self.emit_code_review_job_updated(id)?;
         self.emit_code_review_updated(Some(id.to_owned()))?;
@@ -5063,10 +5074,14 @@ impl Engine {
                 }
             };
             let (mut turn, mut validated) = turn;
+            validated.findings = coordinator_validated_findings(
+                std::mem::take(&mut validated.findings),
+                &candidates,
+                &diff_files,
+            );
             normalize_coordinator_output(&mut validated, &candidates, &previous_findings);
             turn.output = serde_json::to_string(&validated)?;
-            let findings =
-                coordinator_validated_findings(validated.findings, &candidates, &diff_files);
+            let findings = std::mem::take(&mut validated.findings);
             if let Some(task) = self.store.finish_code_review_task(
                 &task.id,
                 "succeeded",
@@ -14139,12 +14154,15 @@ mod tests {
         assert!(record.publication_dispatched);
         assert!(!record.publication_accepted);
         let retry_request = test_retry_job_request(&job, "retry:dispatched-publication");
-        assert!(
-            engine
-                .store
-                .retry_code_review_job(&job.id, &retry_request)
-                .is_err()
-        );
+        let retry_outcome = engine
+            .store
+            .retry_code_review_job(&job.id, &retry_request)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            retry_outcome,
+            CodeReviewJobRetryOutcome::PublicationClaimed(ref claimed) if claimed.id == job.id
+        ));
         engine
             .store
             .set_code_review_finding_publication_status(
@@ -17468,6 +17486,34 @@ mod tests {
         );
         assert_eq!(rejected[1].candidate_id, "missing-reason");
         assert!(rejected[1].reason.starts_with("insufficient_evidence:"));
+
+        let files = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1,3 @@\n+one\n+two\n+three\n"
+                .into(),
+            generated_header: None,
+        }];
+        let mut structurally_rejected = ReviewOutput {
+            summary: String::new(),
+            findings: vec![ReviewFinding {
+                source_candidate_ids: vec![candidates[0].candidate_id.clone()],
+                ..candidates[0].finding.clone()
+            }],
+            rejected_candidates: Vec::new(),
+            resolved_finding_ids: Vec::new(),
+            themes: Vec::new(),
+        };
+        structurally_rejected.findings = coordinator_validated_findings(
+            std::mem::take(&mut structurally_rejected.findings),
+            &candidates,
+            &files,
+        );
+        normalize_coordinator_output(&mut structurally_rejected, &candidates, &[]);
+
+        let rejected = candidate_rejections(&structurally_rejected, &candidates);
+        assert_eq!(rejected.len(), candidates.len());
+        assert_eq!(rejected[0].candidate_id, "accepted");
+        assert!(rejected[0].reason.starts_with("insufficient_evidence:"));
     }
 
     #[test]

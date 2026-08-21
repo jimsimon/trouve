@@ -1642,7 +1642,7 @@ function JobDetailPane({
                             type="button"
                             disabled={Boolean(busy)}
                             onClick={() => void retryFailedPersona(group.persona!.reviewer_id)}
-                            aria-label={`Retry full review after ${group.name} failed`}
+                            aria-label={`Retry full review after ${group.name} ${group.status}`}
                             title="Starts a new review and reruns every selected persona using current settings"
                           >
                             {busy === `persona:${group.persona.reviewer_id}`

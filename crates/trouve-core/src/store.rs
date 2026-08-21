@@ -3111,6 +3111,22 @@ pub struct CodeReviewJobRecord {
 }
 
 #[derive(Debug, Clone)]
+pub enum CodeReviewJobRetryOutcome {
+    Replacement(trouve_protocol::CodeReviewJob),
+    PublicationClaimed(trouve_protocol::CodeReviewJob),
+}
+
+impl std::ops::Deref for CodeReviewJobRetryOutcome {
+    type Target = trouve_protocol::CodeReviewJob;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Replacement(job) | Self::PublicationClaimed(job) => job,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CodeReviewBatchSnapshotUpdate {
     pub changed: bool,
 }
@@ -8618,14 +8634,22 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT 1 FROM code_review_jobs
-                 WHERE repository = ?1 AND pull_number = ?2
-                   AND base_ref = ?3 AND head_sha = ?4
-                   AND status IN ('queued', 'running', 'succeeded', 'failed')
-                   AND (
-                     trigger IN ('automatic', 'retry')
-                     OR dedupe_key LIKE '%:automatic:%'
-                   )
+                "WITH RECURSIVE retry_lineage(id, retry_of, trigger, dedupe_key) AS (
+                   SELECT id, retry_of, trigger, dedupe_key
+                   FROM code_review_jobs
+                   WHERE repository = ?1 AND pull_number = ?2
+                     AND base_ref = ?3 AND head_sha = ?4
+                     AND status IN ('queued', 'running', 'succeeded', 'failed')
+                   UNION ALL
+                   SELECT predecessor.id, predecessor.retry_of,
+                          predecessor.trigger, predecessor.dedupe_key
+                   FROM code_review_jobs AS predecessor
+                   JOIN retry_lineage AS replacement
+                     ON predecessor.id = replacement.retry_of
+                 )
+                 SELECT 1 FROM retry_lineage
+                 WHERE trigger = 'automatic'
+                    OR dedupe_key LIKE '%:automatic:%'
                  LIMIT 1",
                 params![repository, pull_number as i64, base_ref, head_sha],
                 |_| Ok(()),
@@ -8645,18 +8669,26 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT 1 FROM code_review_jobs AS prior
-                 WHERE prior.repository = ?2 AND prior.pull_number = ?3
-                   AND prior.base_ref = ?4 AND prior.head_sha = ?5
-                   AND prior.status IN ('queued', 'running', 'succeeded', 'failed')
-                   AND (
-                     prior.trigger IN ('automatic', 'retry')
-                     OR prior.dedupe_key LIKE '%:automatic:%'
-                   )
-                   AND prior.rowid < (
-                     SELECT current.rowid FROM code_review_jobs AS current
-                     WHERE current.id = ?1
-                   )
+                "WITH RECURSIVE retry_lineage(id, retry_of, trigger, dedupe_key) AS (
+                   SELECT prior.id, prior.retry_of, prior.trigger, prior.dedupe_key
+                   FROM code_review_jobs AS prior
+                   WHERE prior.repository = ?2 AND prior.pull_number = ?3
+                     AND prior.base_ref = ?4 AND prior.head_sha = ?5
+                     AND prior.status IN ('queued', 'running', 'succeeded', 'failed')
+                     AND prior.rowid < (
+                       SELECT current.rowid FROM code_review_jobs AS current
+                       WHERE current.id = ?1
+                     )
+                   UNION ALL
+                   SELECT predecessor.id, predecessor.retry_of,
+                          predecessor.trigger, predecessor.dedupe_key
+                   FROM code_review_jobs AS predecessor
+                   JOIN retry_lineage AS replacement
+                     ON predecessor.id = replacement.retry_of
+                 )
+                 SELECT 1 FROM retry_lineage
+                 WHERE trigger = 'automatic'
+                    OR dedupe_key LIKE '%:automatic:%'
                  LIMIT 1",
                 params![id, repository, pull_number as i64, base_ref, head_sha],
                 |_| Ok(()),
@@ -11645,7 +11677,7 @@ impl Store {
         &self,
         id: &str,
         new_job: &NewCodeReviewJob,
-    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+    ) -> Result<Option<CodeReviewJobRetryOutcome>> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
         let old = tx
@@ -11673,12 +11705,13 @@ impl Store {
                     anyhow::anyhow!("review job {id} points to missing replacement {retried_by}")
                 })?;
             tx.commit()?;
-            return Ok(Some(replacement.job));
+            return Ok(Some(CodeReviewJobRetryOutcome::Replacement(
+                replacement.job,
+            )));
         }
         if old.publication_claimed {
-            anyhow::bail!(
-                "review publication may already exist; reconcile it instead of publishing again"
-            );
+            tx.commit()?;
+            return Ok(Some(CodeReviewJobRetryOutcome::PublicationClaimed(old.job)));
         }
         if old.job.status == "queued" {
             tx.execute(
@@ -11762,7 +11795,9 @@ impl Store {
             row_to_code_review_job,
         )?;
         tx.commit()?;
-        Ok(Some(replacement.job))
+        Ok(Some(CodeReviewJobRetryOutcome::Replacement(
+            replacement.job,
+        )))
     }
 
     pub fn code_review_job_cancel_requested(&self, id: &str) -> Result<bool> {
@@ -22232,15 +22267,23 @@ mod tests {
                 .is_some()
         );
         let dispatched_retry = retry_request_for(&store, &dispatched.id, "retry:dispatched");
-        let error = store
+        let outcome = store
             .retry_code_review_job(&dispatched.id, &dispatched_retry)
-            .unwrap_err();
-        assert!(error.to_string().contains("reconcile it"));
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CodeReviewJobRetryOutcome::PublicationClaimed(ref job) if job.id == dispatched.id
+        ));
         let accepted_retry = retry_request_for(&store, &accepted.id, "retry:accepted");
-        let error = store
+        let outcome = store
             .retry_code_review_job(&accepted.id, &accepted_retry)
-            .unwrap_err();
-        assert!(error.to_string().contains("reconcile it"));
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CodeReviewJobRetryOutcome::PublicationClaimed(ref job) if job.id == accepted.id
+        ));
     }
 
     #[test]
@@ -22309,6 +22352,18 @@ mod tests {
                 params![draft_manual.id],
             )
             .unwrap();
+        let draft_retry_request = retry_request_for(&store, &draft_manual.id, "retry:manual-draft");
+        let draft_retry = store
+            .retry_code_review_job(&draft_manual.id, &draft_retry_request)
+            .unwrap()
+            .unwrap();
+        let nested_retry_request =
+            retry_request_for(&store, &draft_retry.id, "retry:manual-draft-again");
+        let nested_retry = store
+            .retry_code_review_job(&draft_retry.id, &nested_retry_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(nested_retry.trigger, "retry");
         let stale_automatic = enqueue("acme/widgets#42:base-2:head-2:automatic:stale", "automatic");
         store
             .conn
@@ -22324,7 +22379,7 @@ mod tests {
             !store
                 .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
                 .unwrap(),
-            "draft manual and stale jobs are not automatic-equivalent attempts"
+            "draft manual retries and stale jobs are not automatic-equivalent attempts"
         );
         let automatic = enqueue(
             "acme/widgets#42:base-2:head-2:automatic:replacement",
