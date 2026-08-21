@@ -34,6 +34,13 @@ const githubSnapshot = {
   pull_requests: { host: "github.com", viewer: "octocat", prs: [pr] },
 };
 
+test("serves the routed About icon during development", async ({ request }) => {
+  const response = await request.get("/icons/trouve-512.png");
+  expect(response.ok()).toBe(true);
+  expect(response.headers()["content-type"]).toBe("image/png");
+  expect((await response.body()).byteLength).toBeGreaterThan(0);
+});
+
 const installFixtureEventSource = async (page: Page): Promise<void> => {
   await page.addInitScript((event) => {
     class FixtureEventSource {

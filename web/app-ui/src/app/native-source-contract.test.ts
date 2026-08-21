@@ -23,6 +23,7 @@ const auditedSources = [
   "crates/trouve-app/src/web_preview.rs",
   "crates/trouve-app/src/web_preview_support.rs",
   "crates/trouve-app/src/wry_main.rs",
+  "crates/trouve-app/tests/version.rs",
   "crates/trouve-client-core/src/client.rs",
   "crates/trouve-client-core/src/lib.rs",
   "crates/trouve-client-core/src/protocol_compatibility.rs",
