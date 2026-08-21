@@ -70,6 +70,14 @@ export default defineConfig(({ mode }) => {
   );
   const productIconPlugin: Plugin = {
     name: "trouve-shared-product-icon",
+    configureServer(server) {
+      server.middlewares.use("/icons/trouve-512.png", (_request, response) => {
+        response.statusCode = 200;
+        response.setHeader("Content-Type", "image/png");
+        response.setHeader("Content-Length", String(iconSource.byteLength));
+        response.end(iconSource);
+      });
+    },
     generateBundle() {
       this.emitFile({
         type: "asset",

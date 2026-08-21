@@ -4,8 +4,8 @@
 
 fn version_requested() -> bool {
     std::env::args_os()
-        .nth(1)
-        .is_some_and(|argument| argument == "--version" || argument == "-V")
+        .skip(1)
+        .any(|argument| argument == "--version" || argument == "-V")
 }
 
 #[tokio::main]

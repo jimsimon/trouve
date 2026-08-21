@@ -530,7 +530,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                             <h1 id="settings-title">About</h1>
                             <p class="settings-note">Application details for this Trouve build.</p>
                             <section class="settings-about-card" aria-label="Trouve application details">
-                              <img src="icons/trouve-512.png" alt="" />
+                              <img src="/icons/trouve-512.png" alt="" />
                               <div class="settings-about-copy">
                                 <strong>trouve</strong>
                                 <span>A protocol-first AI coding harness</span>

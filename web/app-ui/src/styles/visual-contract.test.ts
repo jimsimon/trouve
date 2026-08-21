@@ -691,7 +691,7 @@ describe("Trouve visual contract", () => {
   it("shows the synchronized release version in the Lit About screen", () => {
     expect(settings).toContain("Trouve application details");
     expect(settings).toContain("v${__TROUVE_FRONTEND_VERSION__}");
-    expect(settings).toContain('src="icons/trouve-512.png"');
+    expect(settings).toContain('src="/icons/trouve-512.png"');
     expect(app).toMatch(/\.settings-about-card \{[^}]*display:\s*grid/s);
   });
 
