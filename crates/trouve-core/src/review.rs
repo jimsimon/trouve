@@ -5027,6 +5027,11 @@ impl Engine {
             .iter()
             .map(|finding| (finding.id.as_str(), finding))
             .collect::<HashMap<_, _>>();
+        let resolved_finding_ids = parsed
+            .resolved_finding_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         let finding_details = parsed
             .findings
             .iter()
@@ -5063,9 +5068,10 @@ impl Engine {
                 let has_resolved_support = historical_themes
                     .iter()
                     .any(|theme| theme.status == "resolved")
-                    || referenced_findings
-                        .iter()
-                        .any(|finding| finding.status == "fixed");
+                    || referenced_findings.iter().any(|finding| {
+                        finding.status == "fixed"
+                            || resolved_finding_ids.contains(finding.id.as_str())
+                    });
                 let origin = finding_origin_with_history(
                     finding.origin,
                     has_historical_support,
@@ -6307,12 +6313,18 @@ impl Engine {
                 event = "COMMENT";
                 continue;
             }
-            if status.as_u16() == 422 && include_comments && review_comments_failed_to_place(&body)
-            {
+            if github_review_should_retry_without_comments(status.as_u16(), include_comments) {
                 // A model can name a line that is not commentable in GitHub's
-                // diff. Without a visible blocking inline comment, publish a
-                // non-blocking review and retain the findings in the durable
-                // lifecycle comment.
+                // diff. GitHub sometimes reports that as only a generic 422,
+                // so retry every otherwise-unhandled 422 once without inline
+                // comments. Invalid commit, body, or event metadata remains in
+                // the retry and will still fail rather than being hidden.
+                if !review_comments_failed_to_place(&body) {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        "GitHub returned a generic 422 for an inline review; retrying without comments"
+                    );
+                }
                 include_comments = false;
                 event = github_review_event_without_inline_comments(event);
                 continue;
@@ -8372,6 +8384,10 @@ fn github_rejected_own_pull_verdict(response_body: &str) -> bool {
 
 fn github_review_should_fallback_to_comment(event: &str, response_body: &str) -> bool {
     event != "COMMENT" && github_rejected_own_pull_verdict(response_body)
+}
+
+fn github_review_should_retry_without_comments(status: u16, include_comments: bool) -> bool {
+    status == 422 && include_comments
 }
 
 fn compact_elapsed(milliseconds: u64) -> String {
@@ -10533,8 +10549,8 @@ fn finding_origin_with_history(
         return NewChange;
     }
     match requested {
-        NewChange if has_resolved_support => Recurrence,
-        NewChange | PreviouslyMissed => PreviouslyMissed,
+        NewChange => NewChange,
+        PreviouslyMissed => PreviouslyMissed,
         Recurrence | FixRegression if !has_resolved_support => PreviouslyMissed,
         Recurrence => Recurrence,
         FixRegression => FixRegression,
@@ -11338,6 +11354,9 @@ mod tests {
             "COMMENT",
             r#"{"message":"Can not approve your own pull request"}"#
         ));
+        assert!(github_review_should_retry_without_comments(422, true));
+        assert!(!github_review_should_retry_without_comments(422, false));
+        assert!(!github_review_should_retry_without_comments(400, true));
     }
 
     #[test]
@@ -15653,7 +15672,7 @@ mod tests {
     #[test]
     fn finding_origins_accept_same_round_themes_with_durable_history() {
         use trouve_protocol::CodeReviewFindingOrigin::{
-            FixRegression, NewChange, PreviouslyMissed, Recurrence,
+            FixRegression, NewChange, PreviouslyMissed,
         };
 
         assert_eq!(
@@ -15666,7 +15685,7 @@ mod tests {
         );
         assert_eq!(
             finding_origin_with_history(NewChange, true, true),
-            Recurrence
+            NewChange
         );
     }
 
