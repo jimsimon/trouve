@@ -10,6 +10,7 @@ import {
   canSubmitNewSession,
   canonicalThinkingSelection,
   closeNewSessionSetup,
+  completeNewSessionSetup,
   createNewSessionSetupLifecycle,
   createNewSessionOptionsLifecycle,
   createNewSessionThreadRequest,
@@ -82,6 +83,11 @@ describe("new session model", () => {
       route: settings,
       generation: opened.generation,
     });
+    expect(completeNewSessionSetup(background)).toMatchObject({
+      lifecycle: { status: "closed" },
+      navigateToSession: false,
+    });
+    expect(completeNewSessionSetup(opened).navigateToSession).toBe(true);
   });
 
   it("discards idle drafts on navigation and advances their generation", () => {

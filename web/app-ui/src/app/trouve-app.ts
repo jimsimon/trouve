@@ -115,6 +115,7 @@ import {
   beginNewSessionOptionLoad,
   canSubmitNewSession,
   closeNewSessionSetup,
+  completeNewSessionSetup,
   createNewSessionSetupLifecycle,
   createNewSessionOptionsLifecycle,
   createNewSessionThreadRequestFromSnapshot,
@@ -2238,6 +2239,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const submissionAttachments = this.#newSessionAttachments.map(({ upload }) => upload);
     this.#newSessionPending = true;
     this.#newSessionError = "";
+    this.#shellNotice = "";
     this.requestUpdate();
 
     const title = sessionTitleFallback(prompt);
@@ -2295,8 +2297,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.#shellNotice = "Session and thread created, but the initial prompt could not be sent.";
       }
     }
+    this.#newSessionSetup = navigateNewSessionSetup(
+      this.#newSessionSetup,
+      readSignal(this.#router.route),
+      true,
+    );
+    const completion = completeNewSessionSetup(this.#newSessionSetup);
     this.#newSessionPending = false;
-    this.#newSessionSetup = closeNewSessionSetup(this.#newSessionSetup);
+    this.#newSessionSetup = completion.lifecycle;
     this.#newSessionBranchGeneration += 1;
     this.#newSessionOptionsGeneration += 1;
     this.#unsubscribeFromNewSessionLiveModels();
@@ -2309,6 +2317,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionAttachmentPending = false;
     this.#newSessionPreferredBaseRef = "";
     form.reset();
+    if (!completion.navigateToSession) {
+      const notice = `Session “${session.title}” was created in the background.`;
+      this.#shellNotice = this.#shellNotice === ""
+        ? notice
+        : `${notice} ${this.#shellNotice}`;
+      this.requestUpdate();
+      return;
+    }
     this.#router.navigate({
       kind: "session",
       workspaceId: session.workspace_id,

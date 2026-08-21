@@ -138,6 +138,16 @@ export const closeNewSessionSetup = <Route>(
   generation: current.generation + 1,
 });
 
+export const completeNewSessionSetup = <Route>(
+  current: NewSessionSetupLifecycle<Route>,
+): {
+  readonly lifecycle: NewSessionSetupLifecycle<Route>;
+  readonly navigateToSession: boolean;
+} => ({
+  lifecycle: closeNewSessionSetup(current),
+  navigateToSession: current.status === "open",
+});
+
 export interface NewSessionOptionLoadState {
   readonly lifecycle: NewSessionOptionsLifecycle;
   readonly edits: NewThreadOptionEdits;
