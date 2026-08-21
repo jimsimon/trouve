@@ -41,22 +41,18 @@ export const renderCommandPaletteOption = (
   selected: boolean,
   activate: (item: CommandPaletteItem) => void,
 ) => {
-  const stateDescription = [
-    item.sessionIndicator?.tooltip,
-    item.pullRequestBadge?.tooltip,
-  ].filter((part) => part !== undefined && part !== "").join(". ")
+  const workDescription = item.sessionIndicator?.tooltip
     || (item.state === undefined ? "" : stateLabel(item.state));
+  const stateDescription = [
+    workDescription,
+    item.pullRequestBadge?.tooltip,
+  ].filter((part) => part !== undefined && part !== "").join(". ");
   const accessibleDescription = [
     item.label,
     item.current === true ? "Current" : "",
     stateDescription,
     item.detail,
   ].filter((part) => part !== "").join(", ");
-  const trailingDescription = [
-    item.current === true ? "Current" : "",
-    item.sessionIndicator?.tooltip,
-    item.pullRequestBadge?.tooltip,
-  ].filter((part) => part !== undefined && part !== "").join(". ");
   return html`
     <button
       id=${`command-palette-option-${index}`}
@@ -87,10 +83,7 @@ export const renderCommandPaletteOption = (
       </span>
       ${item.current !== true && item.pullRequestBadge === undefined
         ? nothing
-        : html`<span
-            class="command-palette-trailing"
-            aria-label=${trailingDescription}
-          >
+        : html`<span class="command-palette-trailing">
             ${item.current !== true
               ? nothing
               : html`<span class="command-palette-current">Current</span>`}

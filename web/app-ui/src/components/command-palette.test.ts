@@ -315,6 +315,11 @@ describe("command palette component contract", () => {
         "unread",
         "Unviewed work",
       ],
+      [
+        { attention: "none", active: true, outcome: "running", state: "running" },
+        "busy",
+        "Running",
+      ],
     ];
     for (const [overrides, kind, workTooltip] of cases) {
       const item = buildCommandPaletteItems({
@@ -332,8 +337,8 @@ describe("command palette component contract", () => {
       expect(item).toBeDefined();
       const rendered = [...render(renderCommandPaletteOption(item!, 0, true, () => {}))]
         .join("");
-      const trailingLabel = rendered.match(
-        /class="command-palette-trailing"\s+aria-label="([^"]+)"/,
+      const optionLabel = rendered.match(
+        /class="command-palette-option"[\s\S]*?aria-label="([^"]+)"/,
       )?.[1];
 
       expect(rendered.match(/class="command-palette-trailing"/g)).toHaveLength(1);
@@ -341,8 +346,8 @@ describe("command palette component contract", () => {
       expect(rendered.indexOf(">Current<")).toBeLessThan(
         rendered.indexOf('class="session-pr-badge blocked"'),
       );
-      expect(trailingLabel).toContain(workTooltip);
-      expect(trailingLabel).toContain("Pull request\n#3183 · Unable to merge");
+      expect(optionLabel).toContain(workTooltip);
+      expect(optionLabel).toContain("Pull request\n#3183 · Unable to merge");
     }
   });
 
