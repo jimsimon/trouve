@@ -49,7 +49,11 @@ const searchableText = (
     length += text.length + 1;
   };
   const visit = (candidate: unknown, depth: number): void => {
-    if (length >= SEARCH_TEXT_LIMIT || depth > 12 || candidate == null) return;
+    if (length >= SEARCH_TEXT_LIMIT || depth > 12) {
+      complete = false;
+      return;
+    }
+    if (candidate == null) return;
     if (visited >= SEARCH_NODE_LIMIT || budget.remainingNodes <= 0) {
       complete = false;
       return;
@@ -78,7 +82,7 @@ const searchableText = (
           || visited >= SEARCH_NODE_LIMIT
           || budget.remainingNodes <= 0
         ) {
-          if (visited >= SEARCH_NODE_LIMIT || budget.remainingNodes <= 0) complete = false;
+          complete = false;
           break;
         }
       }
@@ -93,7 +97,7 @@ const searchableText = (
         || visited >= SEARCH_NODE_LIMIT
         || budget.remainingNodes <= 0
       ) {
-        if (visited >= SEARCH_NODE_LIMIT || budget.remainingNodes <= 0) complete = false;
+        complete = false;
         break;
       }
     }
@@ -192,17 +196,22 @@ const searchableItemRevision = (item: ThreadChatItem): readonly unknown[] => {
 const sameRevision = (left: readonly unknown[], right: readonly unknown[]): boolean =>
   left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
 
+const cachedSearchableItemText = (item: ThreadChatItem): string | undefined => {
+  const cached = searchableItemCache.get(item);
+  return cached !== undefined && sameRevision(cached.revision, searchableItemRevision(item))
+    ? cached.text
+    : undefined;
+};
+
 const searchableItemText = (
   item: ThreadChatItem,
   budget: SearchBudget,
 ): SearchableTextResult => {
   const revision = searchableItemRevision(item);
-  const cached = searchableItemCache.get(item);
+  const cachedText = cachedSearchableItemText(item);
+  if (cachedText !== undefined) return { text: cachedText, complete: true };
   const remainingItems = Math.max(1, budget.remainingItems);
   budget.remainingItems = Math.max(0, budget.remainingItems - 1);
-  if (cached !== undefined && sameRevision(cached.revision, revision)) {
-    return { text: cached.text, complete: true };
-  }
   const allowance = Math.min(
     SEARCH_NODE_LIMIT,
     Math.floor(budget.remainingNodes / remainingItems),
@@ -228,7 +237,9 @@ const searchableUnitText = (
     if (item === undefined) return;
     if (length >= SEARCH_TEXT_LIMIT) {
       complete = false;
-      budget.remainingItems = Math.max(0, budget.remainingItems - 1);
+      if (cachedSearchableItemText(item) === undefined) {
+        budget.remainingItems = Math.max(0, budget.remainingItems - 1);
+      }
       return;
     }
     const result = searchableItemText(item, budget);
@@ -256,12 +267,22 @@ export const chatFindMatches = (
   }
   const expected = caseSensitive ? needle : needle.toLowerCase();
   const units = buildChatLayout(items).units;
-  const itemCount = units.reduce(
-    (count, unit) => count + (unit.prompt === undefined ? 0 : 1)
-      + unit.items.length + (unit.status === undefined ? 0 : 1),
-    0,
-  );
-  const budget = { remainingNodes: SEARCH_OPERATION_NODE_LIMIT, remainingItems: itemCount };
+  let cacheMissCount = 0;
+  for (const unit of units) {
+    if (unit.prompt !== undefined && cachedSearchableItemText(unit.prompt) === undefined) {
+      cacheMissCount += 1;
+    }
+    for (const item of unit.items) {
+      if (cachedSearchableItemText(item) === undefined) cacheMissCount += 1;
+    }
+    if (unit.status !== undefined && cachedSearchableItemText(unit.status) === undefined) {
+      cacheMissCount += 1;
+    }
+  }
+  const budget = {
+    remainingNodes: SEARCH_OPERATION_NODE_LIMIT,
+    remainingItems: cacheMissCount,
+  };
   const unitIds: string[] = [];
   let incomplete = false;
   for (const unit of units) {

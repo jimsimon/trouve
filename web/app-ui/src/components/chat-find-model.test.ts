@@ -175,6 +175,49 @@ describe("chat find model", () => {
     expect(reads - coldReads).toBeLessThan(15_000);
   });
 
+  it("redistributes cached-item capacity to an earlier incomplete projection", () => {
+    const args: Record<string, unknown> = {};
+    for (let index = 0; index < 6_000; index += 1) {
+      args[`padding-${index}`] = "padding";
+    }
+    args.target = "Late budget match";
+    const structured: ThreadChatItem[] = [
+      {
+        id: "user:warm-budget",
+        kind: "user",
+        turn: 1,
+        content: "Warm budget preface",
+        attachments: [],
+      },
+      {
+        id: "tool:warm-budget",
+        kind: "tool",
+        callId: "call-warm-budget",
+        tool: "read_file",
+        args,
+        status: "ok",
+        result: null,
+        output: { text: "", bytes: 0, omitted: false },
+      },
+      {
+        id: "user:cached-tail",
+        kind: "user",
+        turn: 2,
+        content: "Cached tail",
+        attachments: [],
+      },
+    ];
+
+    expect(chatFindMatches(structured, "late budget match", false)).toEqual({
+      unitIds: [],
+      incomplete: true,
+    });
+    expect(chatFindMatches(structured, "late budget match", false)).toEqual({
+      unitIds: ["turn:1"],
+      incomplete: false,
+    });
+  });
+
   it("preserves an active match during streaming and wraps navigation", () => {
     expect(reconcileChatFind(["a", "b", "c"], "b")).toEqual({
       unitIds: ["a", "b", "c"],
