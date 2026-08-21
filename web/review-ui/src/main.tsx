@@ -1156,31 +1156,39 @@ function JobDetailPane({
       detail.personas.find((persona) => persona.reviewer_id === reviewerId)?.reviewer_name ||
       "Reviewer persona";
     setBusy(action);
-    setRetryStatus(`Retrying ${label}…`);
+    setRetryStatus(`Retrying full review after ${label}…`);
+    let replacement: ReviewJob;
     try {
-      await retryPersona(submittedJobId, reviewerId);
+      replacement = await retryPersona(submittedJobId, reviewerId);
     } catch (cause) {
       if (aliveRef.current === submittedJobId) {
         setError(cause instanceof Error ? cause.message : String(cause));
-        setRetryStatus(`${label} retry failed.`);
+        setRetryStatus(`Full review retry after ${label} failed.`);
         setBusy("");
       }
       return;
     }
     if (aliveRef.current !== submittedJobId) return;
-    activityGroupButtonRefs.current[action]?.focus();
-    setRetryStatus(`${label} retry queued.`);
     onChanged();
-    try {
-      const refreshed = await load();
-      if (aliveRef.current === submittedJobId && refreshed) {
-        const retriedTask = pickPreferredTask(
-          refreshed.tasks.filter((task) => task.reviewer_id === reviewerId),
-        );
-        setSelectedTaskId(retriedTask?.id ?? "");
+    if (replacement.id === submittedJobId) {
+      setNavigationStatus(
+        "Review publication had already started; the existing review was reconciled instead of retried.",
+      );
+      try {
+        await load();
+      } finally {
+        if (aliveRef.current === submittedJobId) setBusy("");
       }
-    } finally {
-      if (aliveRef.current === submittedJobId) setBusy("");
+    } else {
+      focusReplacementJobIdRef.current = replacement.id;
+      setNavigationStatus(
+        `Opened replacement review ${replacement.id}; all reviewer personas will run again.`,
+      );
+      setRetryStatus(`Full review retry after ${label} queued.`);
+      navigate("jobs", replacement.id);
+      if (aliveRef.current === submittedJobId) {
+        setBusy("");
+      }
     }
   };
 
@@ -1730,12 +1738,22 @@ function JobDetailPane({
                               ? retryFailedPersona(group.persona.reviewer_id)
                               : retryFailedFinalEditor())
                           }
-                          aria-label={`Retry ${group.name}`}
+                          aria-label={
+                            group.persona
+                              ? `Retry full review after ${group.name} ${group.status}`
+                              : `Retry ${group.name}`
+                          }
+                          title={
+                            group.persona
+                              ? "Starts a new review and reruns every selected persona using current settings"
+                              : "Retries only the final review editor and retains successful reviewer output"
+                          }
                         >
-                          {retrying ? "Retrying…" : "Retry"}
+                          {retrying ? "Retrying…" : group.persona ? "Retry all" : "Retry"}
                         </button>
                       )}
                       {job.status === "failed" &&
+                        group.id === "coordinator" &&
                         ["failed", "cancelled"].includes(group.status) &&
                         coordinatorRetryBlocked && (
                           <small class="retry-blocked">Retry personas first</small>

@@ -260,7 +260,7 @@ export const canRetryCodeReviewJob = (status: string): boolean =>
   !canCancelCodeReviewJob(status);
 
 export const canRetryFinalEditor = (job: FinalEditorRetrySummary): boolean =>
-  (job.status === "failed" || job.status === "cancelled")
+  job.status === "failed"
   && job.progress !== undefined
   && job.progress.completed_reviewers >= job.progress.total_reviewers;
 

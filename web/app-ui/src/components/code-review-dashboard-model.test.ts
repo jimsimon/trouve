@@ -160,7 +160,7 @@ describe("code-review dashboard model", () => {
     expect(canRetryFinalEditor({
       status: "cancelled",
       progress: { completed_reviewers: 0, total_reviewers: 0 },
-    })).toBe(true);
+    })).toBe(false);
     expect(canRetryFinalEditor({
       status: "failed",
       progress: { completed_reviewers: 2, total_reviewers: 3 },

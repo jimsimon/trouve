@@ -18657,6 +18657,7 @@ mod tests {
             store
                 .finish_code_review_job(&job.id, "failed", "", "late timeout")
                 .unwrap()
+                .is_some()
         );
 
         let record = store.code_review_job(&job.id).unwrap().unwrap();
@@ -20808,6 +20809,7 @@ mod tests {
                         "stale: pull request is a draft; automatic review stopped",
                     )
                     .unwrap()
+                    .is_some()
             );
             legacy
         };
@@ -22634,6 +22636,7 @@ mod tests {
             store
                 .finish_code_review_job(&queued.id, "failed", "", "test complete")
                 .unwrap()
+                .is_some()
         );
         assert_eq!(
             store.code_review_jobs_with_pending_events(10).unwrap(),

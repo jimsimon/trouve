@@ -2466,9 +2466,9 @@ impl Engine {
                     "reviewer persona {reviewer_id} was not part of review job {id}"
                 ))
             })?;
-        if !matches!(persona.status.as_str(), "failed" | "cancelled") {
+        if matches!(persona.status.as_str(), "succeeded" | "not_applicable") {
             return Err(EngineError::BadRequest(format!(
-                "reviewer persona {reviewer_id} has no failed or cancelled batches to retry"
+                "reviewer persona {reviewer_id} completed successfully and does not require retry"
             )));
         }
         // A new job is required to apply the current repository-wide models,
@@ -13694,7 +13694,20 @@ mod tests {
             .unwrap();
         let (replaced_job, replaced_task) =
             queue_test_final_editor_retry(&engine.store, "acme/widgets#42:event-retry");
-        engine.retry_review_job(&replaced_job.id).await.unwrap();
+        let retry = engine
+            .store
+            .retry_code_review_job(
+                &replaced_job.id,
+                &test_retry_job_request(&replaced_job, "acme/widgets#42:event-retry-replacement"),
+            )
+            .unwrap()
+            .unwrap();
+        let CodeReviewJobRetryOutcome::Replacement(retry) = retry else {
+            panic!("unclaimed review should create a replacement");
+        };
+        engine
+            .emit_code_review_tasks(retry.predecessor_tasks)
+            .unwrap();
 
         for (job_id, task_id) in [
             (cancelled_job.id, cancelled_task.id),
