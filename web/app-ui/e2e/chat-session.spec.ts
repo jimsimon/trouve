@@ -4878,6 +4878,13 @@ test("find shortcuts coordinate focus with the thread switcher", async ({ page }
   await find.getByRole("button", { name: "Close find" }).click();
   await threads.click();
   await expect(threadSearch).toBeFocused();
+  await threadSearch.press("Control+k");
+  await expect(commandSearch).toBeFocused();
+  await commandSearch.press("Control+f");
+  await expect(commandSearch).toBeFocused();
+  await expect(find).toHaveCount(0);
+  await commandSearch.press("Escape");
+  await expect(threadSearch).toBeFocused();
   await threadSearch.press("Control+f");
   await expect(switcher).toHaveCount(0);
   find = page.getByRole("search", { name: "Find in chat" });

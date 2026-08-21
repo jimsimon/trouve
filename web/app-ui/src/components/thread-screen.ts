@@ -1029,6 +1029,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       || (!event.ctrlKey && !event.metaKey)
       || this.threadId === ""
       || this.#newThreadSetupOpen
+      || document.querySelector("dialog[open]") !== null
     ) return;
     event.preventDefault();
     event.stopPropagation();
