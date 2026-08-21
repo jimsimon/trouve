@@ -1436,9 +1436,10 @@ fn parse_thinking_budget(value: &str) -> Option<u64> {
     } else {
         (value, 0)
     };
-    if matches!(mantissa.as_bytes().first(), Some(b'-' | b'+')) {
+    if mantissa.starts_with('-') {
         return None;
     }
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     if (whole.is_empty() && fraction.is_empty())
         || !whole
@@ -21912,6 +21913,9 @@ default_permission_mode = "ask"
         assert_eq!(parse_thinking_budget("184467440737095516160.0"), None);
         assert_eq!(parse_thinking_budget("1.0e4"), Some(10000));
         assert_eq!(parse_thinking_budget(".1e5"), Some(10000));
+        assert_eq!(parse_thinking_budget("+1024.0"), Some(1024));
+        assert_eq!(parse_thinking_budget("+1.024e3"), Some(1024));
+        assert_eq!(parse_thinking_budget("-1024.0"), None);
 
         // No thinking enum means the inherited option is not sent.
         options.remove("thinking_budget_tokens");

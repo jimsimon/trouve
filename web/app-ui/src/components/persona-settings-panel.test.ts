@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import { resolvePersonaThinkingSubmission } from "../app/new-session-model.js";
+
 const source = readFileSync(
   new URL("./persona-settings-panel.ts", import.meta.url),
   "utf8",
@@ -22,8 +24,12 @@ describe("persona settings thinking controls", () => {
     expect(source).toContain('type="number"');
   });
 
-  it("preserves unchanged thinking defaults when model metadata is unavailable", () => {
-    expect(source).toContain("selectedModel === undefined");
-    expect(source).toContain("rawThinking === existing?.persona.default_thinking_level");
+  it("rejects edited drafts when model metadata disappears during submission", () => {
+    expect(resolvePersonaThinkingSubmission(undefined, "low", "high"))
+      .toBeUndefined();
+    expect(resolvePersonaThinkingSubmission(undefined, "high", "high"))
+      .toBe("high");
+    expect(resolvePersonaThinkingSubmission(undefined, "", "high"))
+      .toBeNull();
   });
 });

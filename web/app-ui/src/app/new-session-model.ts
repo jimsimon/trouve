@@ -259,6 +259,19 @@ export const canonicalThinkingSelection = (
     : undefined;
 };
 
+/** Resolve the thinking value submitted by a persona editor. */
+export const resolvePersonaThinkingSubmission = (
+  model: ProtocolModelInfo | undefined,
+  draft: string | undefined,
+  persisted: string | null | undefined,
+): string | null | undefined => {
+  const option = thinkingOption(model);
+  const selected = draft ?? persisted;
+  if (!selected || (model !== undefined && option === undefined)) return null;
+  return canonicalThinkingSelection(option, selected)
+    ?? (model === undefined && selected === persisted ? selected : undefined);
+};
+
 /** Validate a persisted/form thinking token against its model-advertised control. */
 export const thinkingSelectionIsValid = (
   option: ThinkingOption | null | undefined,

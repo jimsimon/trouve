@@ -3,6 +3,7 @@ import { css, html, LitElement, nothing } from "lit";
 
 import {
   canonicalThinkingSelection,
+  resolvePersonaThinkingSubmission,
   thinkingOption,
 } from "../app/new-session-model.js";
 import { appServicesContext } from "../contexts/app-contexts.js";
@@ -224,24 +225,19 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
     const defaultModel = modelValue === null
       ? existing?.persona.default_model ?? null
       : String(modelValue) || null;
-    const rawThinking = thinkingValue === null
-      ? existing?.persona.default_thinking_level ?? null
-      : String(thinkingValue) || null;
+    const thinkingDraft = thinkingValue === null
+      ? this.#modeFormThinkingDraft
+      : String(thinkingValue);
     const effectiveModel = defaultModel || this.#providers?.default_model || "";
     const selectedModel = this.#availableModels()
       .find((candidate) => candidate.id === effectiveModel);
-    const option = thinkingOption(selectedModel);
-    const defaultThinking = selectedModel !== undefined && option === undefined
-      ? null
-      : rawThinking === null
-      ? null
-      : canonicalThinkingSelection(option, rawThinking)
-        ?? (selectedModel === undefined
-            && rawThinking === existing?.persona.default_thinking_level
-          ? rawThinking
-          : undefined);
+    const defaultThinking = resolvePersonaThinkingSubmission(
+      selectedModel,
+      thinkingDraft,
+      existing?.persona.default_thinking_level,
+    );
     if (defaultThinking === undefined) {
-      this.#message = "Choose a thinking setting supported by the selected model.";
+      this.#message = "Choose a supported thinking setting.";
       this.#error = true;
       this.requestUpdate();
       return;
