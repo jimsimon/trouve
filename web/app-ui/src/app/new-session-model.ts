@@ -76,6 +76,140 @@ export interface NewSessionOptionsLifecycle {
   readonly catalogWorkspaceId: string;
 }
 
+export type NewSessionSetupStatus =
+  | "closed"
+  | "open"
+  | "background-submitting"
+  | "background-failed";
+
+export interface NewSessionCreateRequestSnapshot {
+  readonly workspaceId: string;
+  readonly title: string;
+  readonly baseRef: string;
+  readonly fetchLatest: boolean;
+}
+
+/** Route-scoped lifecycle for the new-session draft. Route identity is kept
+ * opaque so browser and test callers can use their native route values. */
+export interface NewSessionSetupLifecycle {
+  readonly status: NewSessionSetupStatus;
+  readonly routeKey: string;
+  readonly generation: number;
+  readonly idempotencyKey: string;
+  readonly createRequest: NewSessionCreateRequestSnapshot | undefined;
+}
+
+export const createNewSessionSetupLifecycle = (): NewSessionSetupLifecycle => ({
+  status: "closed",
+  routeKey: "",
+  generation: 0,
+  idempotencyKey: "",
+  createRequest: undefined,
+});
+
+export const openNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+  routeKey: string,
+): NewSessionSetupLifecycle => {
+  if (current.status === "background-submitting") return current;
+  if (current.status === "background-failed") {
+    return { ...current, status: "open", routeKey };
+  }
+  return {
+    status: "open",
+    routeKey,
+    generation: current.generation + 1,
+    idempotencyKey: "",
+    createRequest: undefined,
+  };
+};
+
+export const beginNewSessionSubmission = (
+  current: NewSessionSetupLifecycle,
+  createIdempotencyKey: () => string,
+  createRequest: NewSessionCreateRequestSnapshot,
+): NewSessionSetupLifecycle => ({
+  ...current,
+  idempotencyKey: current.idempotencyKey || createIdempotencyKey(),
+  createRequest: current.createRequest ?? createRequest,
+});
+
+export const navigateNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+  routeKey: string,
+  submissionPending: boolean,
+): NewSessionSetupLifecycle => {
+  if (current.status !== "open" || current.routeKey === routeKey) return current;
+  if (submissionPending) {
+    return { ...current, status: "background-submitting", routeKey: "" };
+  }
+  return {
+    status: "closed",
+    routeKey: "",
+    generation: current.generation + 1,
+    idempotencyKey: "",
+    createRequest: undefined,
+  };
+};
+
+export const failNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+): NewSessionSetupLifecycle =>
+  current.status === "background-submitting"
+    ? { ...current, status: "background-failed" }
+    : current;
+
+export const shouldRestoreFailedNewSessionDraft = (
+  current: NewSessionSetupLifecycle,
+  draftWorkspaceId: string,
+  requestedWorkspaceId: string | undefined,
+): boolean =>
+  current.status === "background-failed"
+  && (requestedWorkspaceId === undefined || requestedWorkspaceId === draftWorkspaceId);
+
+export const closeNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+): NewSessionSetupLifecycle => ({
+  status: "closed",
+  routeKey: "",
+  generation: current.generation + 1,
+  idempotencyKey: "",
+  createRequest: undefined,
+});
+
+export const openNewSessionSetupForWorkspace = (
+  current: NewSessionSetupLifecycle,
+  routeKey: string,
+  draftWorkspaceId: string,
+  requestedWorkspaceId: string | undefined,
+): {
+  readonly lifecycle: NewSessionSetupLifecycle;
+  readonly restoringDraft: boolean;
+} => {
+  const restoringDraft = shouldRestoreFailedNewSessionDraft(
+    current,
+    draftWorkspaceId,
+    requestedWorkspaceId,
+  );
+  const starting = current.status === "background-failed" && !restoringDraft
+    ? closeNewSessionSetup(current)
+    : current;
+  return {
+    lifecycle: openNewSessionSetup(starting, routeKey),
+    restoringDraft,
+  };
+};
+
+export const completeNewSessionSetup = (
+  current: NewSessionSetupLifecycle,
+): {
+  readonly lifecycle: NewSessionSetupLifecycle;
+  readonly navigateToSession: boolean;
+} => ({
+  lifecycle: closeNewSessionSetup(current),
+  navigateToSession: current.status === "open",
+});
+
 export interface NewSessionOptionLoadState {
   readonly lifecycle: NewSessionOptionsLifecycle;
   readonly edits: NewThreadOptionEdits;

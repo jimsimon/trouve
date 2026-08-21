@@ -2581,6 +2581,11 @@ export interface components {
              */
             fetch_latest?: boolean;
             /**
+             * @description Stable client-generated key for retrying this create operation without
+             *     creating a second session if the original response is lost.
+             */
+            idempotency_key?: string | null;
+            /**
              * @description Human-readable title. When title-derived branch naming is enabled,
              *     this is also used to derive the branch slug.
              */

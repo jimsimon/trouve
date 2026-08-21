@@ -290,7 +290,9 @@ pub use requests::*;
 // 7.8: running turns expose an additive phase event/snapshot field, and
 // session title updates accept an expected persisted title for atomic
 // background upgrades (additive).
-pub const PROTOCOL_VERSION: &str = "7.8";
+// 7.9: session creation accepts an additive idempotency key so clients can
+// safely retry when a committed response is lost.
+pub const PROTOCOL_VERSION: &str = "7.9";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

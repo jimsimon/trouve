@@ -6,28 +6,37 @@ import type {
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
 import {
+  beginNewSessionSubmission,
   beginNewSessionOptionLoad,
   canSubmitNewSession,
   canonicalThinkingSelection,
+  closeNewSessionSetup,
+  completeNewSessionSetup,
+  createNewSessionSetupLifecycle,
   createNewSessionOptionsLifecycle,
   createNewSessionThreadRequest,
   createNewSessionThreadRequestFromSnapshot,
   createNewThreadOptionEdits,
   defaultThinkingSelection,
   interruptNewSessionOptionLoad,
+  failNewSessionSetup,
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
   NEW_THREAD_TITLE_FALLBACK,
   newSessionOptionsAreAuthoritative,
   newSessionOptionsBlockSubmission,
+  navigateNewSessionSetup,
   newThreadInheritanceForWorkspace,
   mergeNewSessionModelCatalogs,
   reconcileNewThreadDefaults,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
+  openNewSessionSetup,
+  openNewSessionSetupForWorkspace,
   sessionTitleFallback,
   settleNewSessionOptionLoad,
+  shouldRestoreFailedNewSessionDraft,
   snapshotNewSessionSubmission,
   thinkingOption,
   thinkingSelectionIsValid,
@@ -58,6 +67,122 @@ const providers = (defaultModel: string): ProtocolProvidersResponse => ({
 });
 
 describe("new session model", () => {
+  it("scopes setup visibility to its opening route and restores failed background drafts", () => {
+    const settings = "/settings";
+    const inbox = "/inbox";
+    const initial = createNewSessionSetupLifecycle();
+    const opened = openNewSessionSetup(initial, inbox);
+
+    expect(navigateNewSessionSetup(opened, inbox, false)).toBe(opened);
+    const background = navigateNewSessionSetup(opened, settings, true);
+    expect(background).toMatchObject({
+      status: "background-submitting",
+      generation: opened.generation,
+    });
+    const failed = failNewSessionSetup(background);
+    expect(failed.status).toBe("background-failed");
+    expect(openNewSessionSetup(failed, settings)).toEqual({
+      status: "open",
+      routeKey: settings,
+      generation: opened.generation,
+      idempotencyKey: "",
+      createRequest: undefined,
+    });
+    expect(completeNewSessionSetup(background)).toMatchObject({
+      lifecycle: { status: "closed" },
+      navigateToSession: false,
+    });
+    expect(completeNewSessionSetup(opened).navigateToSession).toBe(true);
+  });
+
+  it("discards idle drafts on navigation and advances their generation", () => {
+    const opened = openNewSessionSetup(
+      createNewSessionSetupLifecycle(),
+      "inbox",
+    );
+    const navigated = navigateNewSessionSetup(opened, "settings", false);
+    expect(navigated).toEqual({
+      status: "closed",
+      routeKey: "",
+      generation: opened.generation + 1,
+      idempotencyKey: "",
+      createRequest: undefined,
+    });
+    expect(closeNewSessionSetup(navigated).generation).toBe(navigated.generation + 1);
+  });
+
+  it("reuses the same session-create idempotency key until setup completes", () => {
+    const opened = openNewSessionSetup(createNewSessionSetupLifecycle(), "/inbox");
+    const originalRequest = {
+      workspaceId: "ws-a",
+      title: "Original title",
+      baseRef: "main",
+      fetchLatest: true,
+    };
+    const submitted = beginNewSessionSubmission(
+      opened,
+      () => "create-once",
+      originalRequest,
+    );
+    const retried = beginNewSessionSubmission(
+      failNewSessionSetup(navigateNewSessionSetup(submitted, "/settings", true)),
+      () => "must-not-replace",
+      {
+        workspaceId: "ws-a",
+        title: "Edited title",
+        baseRef: "release",
+        fetchLatest: false,
+      },
+    );
+
+    expect(retried.idempotencyKey).toBe("create-once");
+    expect(retried.createRequest).toEqual(originalRequest);
+    expect(closeNewSessionSetup(retried).idempotencyKey).toBe("");
+    expect(closeNewSessionSetup(retried).createRequest).toBeUndefined();
+  });
+
+  it("restores a failed draft only when the workspace choice is compatible", () => {
+    const submitted = beginNewSessionSubmission(
+      openNewSessionSetup(createNewSessionSetupLifecycle(), "/inbox"),
+      () => "create-once",
+      {
+        workspaceId: "ws-a",
+        title: "Original title",
+        baseRef: "main",
+        fetchLatest: true,
+      },
+    );
+    const failed = failNewSessionSetup(
+      navigateNewSessionSetup(submitted, "/settings", true),
+    );
+
+    expect(shouldRestoreFailedNewSessionDraft(failed, "ws-a", undefined)).toBe(true);
+    expect(shouldRestoreFailedNewSessionDraft(failed, "ws-a", "ws-a")).toBe(true);
+    expect(shouldRestoreFailedNewSessionDraft(failed, "ws-a", "ws-b")).toBe(false);
+
+    const restored = openNewSessionSetupForWorkspace(
+      failed,
+      "/settings",
+      "ws-a",
+      "ws-a",
+    );
+    expect(restored).toMatchObject({
+      lifecycle: { status: "open", idempotencyKey: "create-once" },
+      restoringDraft: true,
+    });
+    const replaced = openNewSessionSetupForWorkspace(
+      failed,
+      "/settings",
+      "ws-a",
+      "ws-b",
+    );
+    expect(replaced).toMatchObject({
+      lifecycle: { status: "open", idempotencyKey: "", createRequest: undefined },
+      restoringDraft: false,
+    });
+    expect(replaced.lifecycle.generation).toBeGreaterThan(failed.generation);
+  });
+
   it("uses the bounded first prompt line and removes invisible controls from fallback titles", () => {
     expect(sessionTitleFallback("  Build\n\t the   dashboard\r\n now  ")).toBe(
       "Build",

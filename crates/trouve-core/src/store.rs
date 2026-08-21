@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS sessions (
   archived INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS session_create_requests (
+  idempotency_key TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+  request_fingerprint TEXT NOT NULL
+);
 -- Provider-reported PR numbers are nominations, not authorization. Capture
 -- the session worktree's coherent checked-out branch and exact HEAD when the
 -- creator completes, then reconcile that immutable evidence with GitHub
@@ -595,6 +600,7 @@ CREATE TABLE IF NOT EXISTS code_review_polled_comments (
 /// `CREATE TABLE IF NOT EXISTS` won't touch existing tables, so column
 /// additions are retried and "duplicate column" errors are ignored.
 const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE session_create_requests ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
@@ -4067,6 +4073,8 @@ enum StoreMutation {
     Insert {
         session: Box<Session>,
         initial_checkpoint: Box<CheckpointRow>,
+        idempotency_key: Option<String>,
+        request_fingerprint: Option<String>,
     },
     Update {
         id: String,
@@ -4507,6 +4515,10 @@ fn update_thread_row(
 
 fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
+        "DELETE FROM session_create_requests WHERE session_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
         "DELETE FROM session_pr_verification_intents WHERE session_id = ?1",
         params![id],
     )?;
@@ -4589,8 +4601,20 @@ fn apply_store_mutation(
         StoreMutation::Insert {
             session,
             initial_checkpoint,
+            idempotency_key,
+            request_fingerprint,
         } => {
             insert_session_row(conn, session)?;
+            if let (Some(idempotency_key), Some(request_fingerprint)) =
+                (idempotency_key, request_fingerprint)
+            {
+                conn.execute(
+                    "INSERT INTO session_create_requests
+                       (idempotency_key, session_id, request_fingerprint)
+                     VALUES (?1, ?2, ?3)",
+                    params![idempotency_key, session.id, request_fingerprint],
+                )?;
+            }
             insert_initial_checkpoint_row(conn, initial_checkpoint, timestamp)?;
         }
         StoreMutation::Update {
@@ -6310,6 +6334,7 @@ impl Store {
         &self,
         session: &Session,
         initial_checkpoint: &CheckpointRow,
+        idempotency: Option<(&str, &str)>,
         events: Vec<(Scope, Event)>,
     ) -> Result<Vec<EventEnvelope>> {
         self.append_pending_events(serialize_lifecycle_events(
@@ -6317,6 +6342,8 @@ impl Store {
             StoreMutation::Insert {
                 session: Box::new(session.clone()),
                 initial_checkpoint: Box::new(initial_checkpoint.clone()),
+                idempotency_key: idempotency.map(|(key, _)| key.to_owned()),
+                request_fingerprint: idempotency.map(|(_, fingerprint)| fingerprint.to_owned()),
             },
         )?)
     }
@@ -6328,6 +6355,25 @@ impl Store {
              FROM sessions WHERE id = ?1",
             params![id],
             row_to_session,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn session_by_create_idempotency_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Session, String)>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT sessions.id, sessions.workspace_id, sessions.title, sessions.branch,
+                    sessions.worktree_path, sessions.base_ref, sessions.archived,
+                    sessions.created_at, session_create_requests.request_fingerprint
+             FROM session_create_requests
+             JOIN sessions ON sessions.id = session_create_requests.session_id
+             WHERE session_create_requests.idempotency_key = ?1",
+            params![key],
+            |row| Ok((row_to_session(row)?, row.get(8)?)),
         )
         .optional()
         .map_err(Into::into)
@@ -15213,6 +15259,7 @@ mod tests {
                 .insert_session_with_lifecycle(
                     &session,
                     &invalid_checkpoint,
+                    None,
                     vec![(
                         Scope::Server,
                         Event::SessionCreated {

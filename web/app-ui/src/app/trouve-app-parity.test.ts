@@ -80,7 +80,7 @@ describe("root shell parity wiring", () => {
       "this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(",
     );
     expect(source).toContain(
-      'if (this.#newSessionOpen && this.#newSessionWorkspaceId !== "")',
+      'if (this.#newSessionSetup.status === "open" && this.#newSessionWorkspaceId !== "")',
     );
     expect(source).toContain("beginNewSessionOptionLoad({");
     expect(source).toContain("snapshotNewSessionSubmission({");
@@ -98,5 +98,18 @@ describe("root shell parity wiring", () => {
     );
     expect(source).not.toContain("this.#reconcileNewSessionModelCatalog()");
     expect(source).toContain("this.#resetNewSessionOptionsForWorkspace(workspaceId)");
+  });
+
+  it("dismisses new-session setup when navigation opens another screen", () => {
+    expect(source).toContain("this.#router.subscribe(this.#routeChanged)");
+    expect(source).toContain("readonly #routeChanged = (route: AppRoute): void => {");
+    expect(source).toContain('if (this.#newSessionSetup.status !== "open") return;');
+    expect(source).toContain("navigateNewSessionSetup(");
+    expect(source).toContain("beginNewSessionSubmission(");
+    expect(source).toContain("idempotency_key: createIdempotencyKey");
+    expect(source).toContain("this.#resetNewSession();");
+    expect(source).toContain('routeKey(readSignal(this.#router.route))');
+    expect(source).toContain('if (!restoringDraft) void this.#loadNewSessionBranches');
+    expect(source).toContain('this.querySelector<HTMLElement>("main.app-shell")?.focus()');
   });
 });

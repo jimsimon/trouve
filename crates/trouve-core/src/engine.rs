@@ -1900,6 +1900,9 @@ pub struct Engine {
     /// write guard. This lets review/plan work fan out without weakening the
     /// sessions-own-worktrees serialization invariant.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    /// Serializes retries for one client-generated session-create key before
+    /// any worktree mutation or event-writer batch is started.
+    session_create_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Narrower execution lanes for tools operating on a session worktree.
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
@@ -2027,6 +2030,15 @@ pub struct Engine {
     /// Reachability check driven by the connectivity monitor. `None`
     /// disables monitoring entirely.
     connectivity_probe: Option<crate::connectivity::Probe>,
+}
+
+/// Keeps an idempotent session-create reservation alive with the detached
+/// worktree attempt. Field order is intentional: if the request awaiting the
+/// task is cancelled, the worktree receipt rolls back before the key guard is
+/// released to a retry.
+struct SessionWorktreeCreateAttempt {
+    creation: Result<crate::tools::SessionWorktreeCreation, String>,
+    idempotency_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2317,6 +2329,7 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
+            session_create_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
             session_pr_verification_wake: Arc::new(tokio::sync::Notify::new()),
@@ -3841,6 +3854,7 @@ impl Engine {
         let session = self
             .create_session(trouve_protocol::CreateSessionRequest {
                 workspace_id: automation.workspace_id.clone(),
+                idempotency_key: None,
                 title: Some(format!(
                     "{} — {}",
                     automation.name,
@@ -7564,6 +7578,30 @@ impl Engine {
 
     // --- sessions -----------------------------------------------------------
 
+    fn session_create_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.session_create_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn session_create_request_fingerprint(
+        req: &CreateSessionRequest,
+    ) -> Result<String, EngineError> {
+        serde_json::to_string(&(
+            &req.workspace_id,
+            &req.title,
+            &req.base_ref,
+            &req.checkout_ref,
+            req.fetch_latest,
+        ))
+        .map_err(|error| EngineError::Internal(error.into()))
+    }
+
     async fn rollback_failed_session_creation(
         &self,
         worktree: &Path,
@@ -7598,6 +7636,41 @@ impl Engine {
 
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
         let create_started = Instant::now();
+        let idempotency_key = match req.idempotency_key.as_deref() {
+            Some(key)
+                if key.is_empty()
+                    || key.len() > 128
+                    || !key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) =>
+            {
+                return Err(EngineError::BadRequest(
+                    "session idempotency key must be 1-128 ASCII letters, digits, '.', '_', or '-'"
+                        .into(),
+                ));
+            }
+            Some(key) => Some(key.to_owned()),
+            None => None,
+        };
+        let request_fingerprint = Self::session_create_request_fingerprint(&req)?;
+        let create_lock = idempotency_key
+            .as_deref()
+            .map(|key| self.session_create_lock(key));
+        let create_guard = match create_lock {
+            Some(lock) => Some(lock.lock_owned().await),
+            None => None,
+        };
+        if let Some(key) = idempotency_key.as_deref()
+            && let Some((existing, persisted_fingerprint)) =
+                self.store.session_by_create_idempotency_key(key)?
+        {
+            if persisted_fingerprint != request_fingerprint {
+                return Err(EngineError::Conflict(
+                    "session idempotency key was already used for a different request".into(),
+                ));
+            }
+            return self.get_session(&existing.id);
+        }
         let ws = self
             .store
             .open_workspace(&req.workspace_id)?
@@ -7634,13 +7707,20 @@ impl Engine {
         // dropped and synchronously rolls the attempt back.
         let executor = self.executor.clone();
         let worktree_started = Instant::now();
-        let mut creation =
-            tokio::spawn(async move { executor.create_session_worktree(&creation_request).await })
-                .await
-                .map_err(|error| {
-                    EngineError::Internal(anyhow!("session creation task failed: {error}"))
-                })?
-                .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        let create_attempt = tokio::spawn(async move {
+            SessionWorktreeCreateAttempt {
+                creation: executor.create_session_worktree(&creation_request).await,
+                idempotency_guard: create_guard,
+            }
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!("session creation task failed: {error}")))?;
+        // Keep the task-owned guard in the request after receipt delivery. The
+        // receipt is declared later and therefore drops first on cancellation.
+        let _create_guard = create_attempt.idempotency_guard;
+        let mut creation = create_attempt
+            .creation
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         tracing::info!(
             %session_id,
             fetch_latest,
@@ -7677,6 +7757,9 @@ impl Engine {
         let inserted = self.store.insert_session_with_lifecycle(
             &session,
             &checkpoint,
+            idempotency_key
+                .as_deref()
+                .map(|key| (key, request_fingerprint.as_str())),
             vec![
                 (
                     Scope::Server,
@@ -7708,26 +7791,83 @@ impl Engine {
                 // Intentionally synchronous and immediately after commit.
                 creation.mark_durable();
             }
-            Err(error) => match self.store.session(&session_id) {
-                Ok(Some(_)) => {
-                    // The writer may have committed and then lost its reply.
-                    // The relational mutation and lifecycle events share that
-                    // transaction, so an existing row proves durability.
-                    tracing::warn!(session_id, %error, "session insert reply failed after durable commit");
-                    creation.mark_durable();
+            Err(error) => {
+                if let Some(key) = idempotency_key.as_deref() {
+                    match self.store.session_by_create_idempotency_key(key) {
+                        Ok(Some((_existing, persisted_fingerprint)))
+                            if persisted_fingerprint != request_fingerprint =>
+                        {
+                            self.rollback_failed_session_creation(
+                                &worktree_path,
+                                &session_id,
+                                creation,
+                            )
+                            .await;
+                            return Err(EngineError::Conflict(
+                                "session idempotency key was already used for a different request"
+                                    .into(),
+                            ));
+                        }
+                        Ok(Some((existing, _))) if existing.id != session_id => {
+                            self.rollback_failed_session_creation(
+                                &worktree_path,
+                                &session_id,
+                                creation,
+                            )
+                            .await;
+                            return Ok(existing);
+                        }
+                        Ok(Some(_)) => {
+                            tracing::warn!(
+                                session_id,
+                                %error,
+                                "idempotent session insert reply failed after durable commit"
+                            );
+                            creation.mark_durable();
+                        }
+                        Ok(None) => {
+                            self.rollback_failed_session_creation(
+                                &worktree_path,
+                                &session_id,
+                                creation,
+                            )
+                            .await;
+                            return Err(error.into());
+                        }
+                        Err(inspect_error) => {
+                            creation.preserve_for_recovery();
+                            return Err(EngineError::Internal(error.context(format!(
+                                "session insert outcome is ambiguous and its ownership marker was retained: {inspect_error:#}"
+                            ))));
+                        }
+                    }
+                } else {
+                    match self.store.session(&session_id) {
+                        Ok(Some(_)) => {
+                            // The writer may have committed and then lost its reply.
+                            // The relational mutation and lifecycle events share that
+                            // transaction, so an existing row proves durability.
+                            tracing::warn!(session_id, %error, "session insert reply failed after durable commit");
+                            creation.mark_durable();
+                        }
+                        Ok(None) => {
+                            self.rollback_failed_session_creation(
+                                &worktree_path,
+                                &session_id,
+                                creation,
+                            )
+                            .await;
+                            return Err(error.into());
+                        }
+                        Err(inspect_error) => {
+                            creation.preserve_for_recovery();
+                            return Err(EngineError::Internal(error.context(format!(
+                                "session insert outcome is ambiguous and its ownership marker was retained: {inspect_error:#}"
+                            ))));
+                        }
+                    }
                 }
-                Ok(None) => {
-                    self.rollback_failed_session_creation(&worktree_path, &session_id, creation)
-                        .await;
-                    return Err(error.into());
-                }
-                Err(inspect_error) => {
-                    creation.preserve_for_recovery();
-                    return Err(EngineError::Internal(error.context(format!(
-                        "session insert outcome is ambiguous and its ownership marker was retained: {inspect_error:#}"
-                    ))));
-                }
-            },
+            }
         }
         match self.executor.finalize_session_worktree(creation).await {
             Ok(()) => {}
@@ -8521,6 +8661,7 @@ impl Engine {
         let session = self
             .create_session(CreateSessionRequest {
                 workspace_id: source_session.workspace_id,
+                idempotency_key: None,
                 title: Some(format!(
                     "{} (fork after turn {})",
                     source_session.title, checkpoint.turn
@@ -14167,6 +14308,7 @@ impl Engine {
             let child_session = self
                 .create_session(CreateSessionRequest {
                     workspace_id: session.workspace_id.clone(),
+                    idempotency_key: None,
                     title: Some(title),
                     base_ref: Some(base_ref.clone()),
                     checkout_ref: None,
@@ -18255,6 +18397,7 @@ mod tests {
         let error = engine
             .create_session(CreateSessionRequest {
                 workspace_id: workspace.id.clone(),
+                idempotency_key: None,
                 title: Some("Must roll back".into()),
                 base_ref: Some("main".into()),
                 checkout_ref: None,
@@ -18308,6 +18451,7 @@ mod tests {
     fn session_probe_request(workspace: &Workspace) -> CreateSessionRequest {
         CreateSessionRequest {
             workspace_id: workspace.id.clone(),
+            idempotency_key: None,
             title: Some("Executor boundary".into()),
             base_ref: Some("main".into()),
             checkout_ref: None,
@@ -18347,6 +18491,137 @@ mod tests {
             1
         );
         assert_eq!(probe.requested_worktrees.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_creation_idempotency_key_returns_the_committed_session() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let mut request = session_probe_request(&workspace);
+        request.idempotency_key = Some("create-session-once".into());
+
+        let first = engine.create_session(request.clone()).await.unwrap();
+        let retry = engine.create_session(request).await.unwrap();
+
+        assert_eq!(retry.id, first.id);
+        assert_eq!(store.list_sessions(Some(&workspace.id)).unwrap().len(), 1);
+        assert_eq!(probe.requested_worktrees.lock().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .session_by_create_idempotency_key("create-session-once")
+                .unwrap()
+                .map(|(session, _)| session.id),
+            Some(first.id),
+        );
+    }
+
+    #[tokio::test]
+    async fn session_creation_idempotency_key_rejects_a_different_request() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let mut request = session_probe_request(&workspace);
+        request.idempotency_key = Some("create-session-fingerprint".into());
+        engine.create_session(request.clone()).await.unwrap();
+        request.title = Some("Different session".into());
+
+        let error = engine.create_session(request).await.unwrap_err();
+
+        assert!(matches!(error, EngineError::Conflict(_)));
+        assert_eq!(store.list_sessions(Some(&workspace.id)).unwrap().len(), 1);
+        assert_eq!(probe.requested_worktrees.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_creation_retries_share_one_worktree_attempt() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            true,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let mut request = session_probe_request(&workspace);
+        request.idempotency_key = Some("create-session-concurrently".into());
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            let request = request.clone();
+            async move { engine.create_session(request).await.unwrap() }
+        });
+        probe
+            .create_started
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        let retry = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.create_session(request).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        probe.create_release.add_permits(2);
+
+        let (first, retry) = tokio::join!(first, retry);
+        assert_eq!(retry.unwrap().id, first.unwrap().id);
+        assert_eq!(store.list_sessions(Some(&workspace.id)).unwrap().len(), 1);
+        assert_eq!(probe.requested_worktrees.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_session_creation_retry_waits_for_attempt_cleanup() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            true,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let mut request = session_probe_request(&workspace);
+        request.idempotency_key = Some("create-session-after-cancellation".into());
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            let request = request.clone();
+            async move { engine.create_session(request).await }
+        });
+        probe
+            .create_started
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let retry = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.create_session(request).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(probe.requested_worktrees.lock().unwrap().len(), 1);
+
+        probe.create_release.add_permits(1);
+        probe
+            .create_started
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        probe.create_release.add_permits(1);
+
+        let session = retry.await.unwrap();
+        assert_eq!(store.list_sessions(Some(&workspace.id)).unwrap().len(), 1);
+        assert_eq!(store.session(&session.id).unwrap().unwrap().id, session.id);
+        assert_eq!(probe.requested_worktrees.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

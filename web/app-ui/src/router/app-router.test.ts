@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { AppRouter, parseRoute, routeHref } from "./app-router.js";
+import { AppRouter, parseRoute, routeHref, routeKey } from "./app-router.js";
 import { readSignal } from "../state/reactivity.js";
 
 describe("application routes", () => {
@@ -48,6 +48,13 @@ describe("application routes", () => {
     });
   });
 
+  it("uses semantic route keys for independently parsed equivalent routes", () => {
+    expect(routeKey(parseRoute("/settings/providers")))
+      .toBe(routeKey({ kind: "settings", section: "providers" }));
+    expect(routeKey({ kind: "not-found", pathname: "/unknown" }))
+      .toBe("not-found:/unknown");
+  });
+
   it("owns navigation without replacing the stable router service", () => {
     let pathname = "/inbox";
     const push = vi.fn((href: string) => {
@@ -62,6 +69,35 @@ describe("application routes", () => {
     router.navigate({ kind: "settings", section: "providers" });
     expect(push).toHaveBeenCalledWith("/settings/providers");
     expect(readSignal(router.route)).toEqual({ kind: "settings", section: "providers" });
+  });
+
+  it("notifies subscribers when application or browser navigation changes the route", () => {
+    let pathname = "/inbox";
+    let browserNavigation: (() => void) | undefined;
+    const router = new AppRouter({
+      pathname: () => pathname,
+      push: (href) => {
+        pathname = href;
+      },
+      replace: vi.fn(),
+      listen: (listener) => {
+        browserNavigation = listener;
+        return () => undefined;
+      },
+    });
+    const listener = vi.fn();
+    const unsubscribe = router.subscribe(listener);
+
+    router.navigate({ kind: "settings" });
+    pathname = "/reviews";
+    browserNavigation?.();
+
+    expect(listener).toHaveBeenNthCalledWith(1, { kind: "settings" });
+    expect(listener).toHaveBeenNthCalledWith(2, { kind: "reviews" });
+
+    unsubscribe();
+    router.navigate({ kind: "inbox" });
+    expect(listener).toHaveBeenCalledTimes(2);
   });
 
   it("remembers the last settings screen for the router lifetime", () => {
