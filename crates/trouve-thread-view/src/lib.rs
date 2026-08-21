@@ -877,6 +877,39 @@ mod tests {
     }
 
     #[test]
+    fn turn_phase_tracks_start_update_and_cancellation() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "m".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        assert_eq!(projection.snapshot.turn_phase, Some(TurnPhase::Processing));
+
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::TurnPhaseChanged {
+                turn: 1,
+                phase: TurnPhase::ConnectingTools,
+            },
+        ));
+        assert_eq!(
+            projection.snapshot.turn_phase,
+            Some(TurnPhase::ConnectingTools)
+        );
+
+        projection.apply(&envelope(3, 2, Event::TurnCancelled { turn: 1 }));
+        assert_eq!(projection.snapshot.turn_phase, None);
+    }
+
+    #[test]
     fn todo_updates_materialize_lifecycle_rows_during_a_turn() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
