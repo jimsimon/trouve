@@ -105,6 +105,8 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("readonly #routeChanged = (route: AppRoute): void => {");
     expect(source).toContain('if (this.#newSessionSetup.status !== "open") return;');
     expect(source).toContain("navigateNewSessionSetup(");
+    expect(source).toContain("beginNewSessionSubmission(");
+    expect(source).toContain("idempotency_key: createIdempotencyKey");
     expect(source).toContain("this.#resetNewSession();");
     expect(source).toContain('routeKey(readSignal(this.#router.route))');
     expect(source).toContain('if (!restoringDraft) void this.#loadNewSessionBranches');

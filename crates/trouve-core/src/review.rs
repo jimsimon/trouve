@@ -4441,6 +4441,7 @@ impl Engine {
         let session = self
             .create_session(CreateSessionRequest {
                 workspace_id: workspace.id,
+                idempotency_key: None,
                 title: Some(format!("Review {} #{}", job.repository, job.pull_number)),
                 base_ref: Some(job.review_base_sha.clone()),
                 checkout_ref: Some(job.head_sha.clone()),

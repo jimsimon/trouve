@@ -6,6 +6,7 @@ import type {
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
 import {
+  beginNewSessionSubmission,
   beginNewSessionOptionLoad,
   canSubmitNewSession,
   canonicalThinkingSelection,
@@ -28,13 +29,14 @@ import {
   newThreadInheritanceForWorkspace,
   mergeNewSessionModelCatalogs,
   reconcileNewThreadDefaults,
-  reconcileNewSessionCreate,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   openNewSessionSetup,
+  openNewSessionSetupForWorkspace,
   sessionTitleFallback,
   settleNewSessionOptionLoad,
+  shouldRestoreFailedNewSessionDraft,
   snapshotNewSessionSubmission,
   thinkingOption,
   thinkingSelectionIsValid,
@@ -65,32 +67,6 @@ const providers = (defaultModel: string): ProtocolProvidersResponse => ({
 });
 
 describe("new session model", () => {
-  it("reconciles a lost create response without offering an unsafe duplicate retry", () => {
-    const created = {
-      id: "session-new",
-      workspace_id: "workspace-1",
-      title: "Build dashboard",
-      branch: "trouve/session-new",
-      worktree_path: "/tmp/session-new",
-      base_ref: "main",
-      created_at: "2026-08-21T00:00:00Z",
-    };
-    const input = {
-      knownSessionIds: new Set(["session-old"]),
-      sessions: [created],
-      workspaceId: "workspace-1",
-      title: "Build dashboard",
-      baseRef: "main",
-    };
-
-    expect(reconcileNewSessionCreate(input)).toEqual({ status: "created", session: created });
-    expect(reconcileNewSessionCreate({ ...input, sessions: [] })).toEqual({
-      status: "not-created",
-    });
-    expect(reconcileNewSessionCreate({ ...input, sessions: [created, { ...created, id: "other" }] }))
-      .toEqual({ status: "indeterminate" });
-  });
-
   it("scopes setup visibility to its opening route and restores failed background drafts", () => {
     const settings = "/settings";
     const inbox = "/inbox";
@@ -109,6 +85,8 @@ describe("new session model", () => {
       status: "open",
       routeKey: settings,
       generation: opened.generation,
+      idempotencyKey: "",
+      createRequest: undefined,
     });
     expect(completeNewSessionSetup(background)).toMatchObject({
       lifecycle: { status: "closed" },
@@ -127,8 +105,82 @@ describe("new session model", () => {
       status: "closed",
       routeKey: "",
       generation: opened.generation + 1,
+      idempotencyKey: "",
+      createRequest: undefined,
     });
     expect(closeNewSessionSetup(navigated).generation).toBe(navigated.generation + 1);
+  });
+
+  it("reuses the same session-create idempotency key until setup completes", () => {
+    const opened = openNewSessionSetup(createNewSessionSetupLifecycle(), "/inbox");
+    const originalRequest = {
+      workspaceId: "ws-a",
+      title: "Original title",
+      baseRef: "main",
+      fetchLatest: true,
+    };
+    const submitted = beginNewSessionSubmission(
+      opened,
+      () => "create-once",
+      originalRequest,
+    );
+    const retried = beginNewSessionSubmission(
+      failNewSessionSetup(navigateNewSessionSetup(submitted, "/settings", true)),
+      () => "must-not-replace",
+      {
+        workspaceId: "ws-a",
+        title: "Edited title",
+        baseRef: "release",
+        fetchLatest: false,
+      },
+    );
+
+    expect(retried.idempotencyKey).toBe("create-once");
+    expect(retried.createRequest).toEqual(originalRequest);
+    expect(closeNewSessionSetup(retried).idempotencyKey).toBe("");
+    expect(closeNewSessionSetup(retried).createRequest).toBeUndefined();
+  });
+
+  it("restores a failed draft only when the workspace choice is compatible", () => {
+    const submitted = beginNewSessionSubmission(
+      openNewSessionSetup(createNewSessionSetupLifecycle(), "/inbox"),
+      () => "create-once",
+      {
+        workspaceId: "ws-a",
+        title: "Original title",
+        baseRef: "main",
+        fetchLatest: true,
+      },
+    );
+    const failed = failNewSessionSetup(
+      navigateNewSessionSetup(submitted, "/settings", true),
+    );
+
+    expect(shouldRestoreFailedNewSessionDraft(failed, "ws-a", undefined)).toBe(true);
+    expect(shouldRestoreFailedNewSessionDraft(failed, "ws-a", "ws-a")).toBe(true);
+    expect(shouldRestoreFailedNewSessionDraft(failed, "ws-a", "ws-b")).toBe(false);
+
+    const restored = openNewSessionSetupForWorkspace(
+      failed,
+      "/settings",
+      "ws-a",
+      "ws-a",
+    );
+    expect(restored).toMatchObject({
+      lifecycle: { status: "open", idempotencyKey: "create-once" },
+      restoringDraft: true,
+    });
+    const replaced = openNewSessionSetupForWorkspace(
+      failed,
+      "/settings",
+      "ws-a",
+      "ws-b",
+    );
+    expect(replaced).toMatchObject({
+      lifecycle: { status: "open", idempotencyKey: "", createRequest: undefined },
+      restoringDraft: false,
+    });
+    expect(replaced.lifecycle.generation).toBeGreaterThan(failed.generation);
   });
 
   it("uses the bounded first prompt line and removes invisible controls from fallback titles", () => {

@@ -221,6 +221,11 @@ pub struct Workspace {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateSessionRequest {
     pub workspace_id: WorkspaceId,
+    /// Stable client-generated key for retrying this create operation without
+    /// creating a second session if the original response is lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min_length = 1, max_length = 128, pattern = "^[A-Za-z0-9._-]+$")]
+    pub idempotency_key: Option<String>,
     /// Human-readable title. When title-derived branch naming is enabled,
     /// this is also used to derive the branch slug.
     #[serde(skip_serializing_if = "Option::is_none")]

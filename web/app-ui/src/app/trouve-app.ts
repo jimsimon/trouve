@@ -113,6 +113,7 @@ import { AppStore } from "../state/app-store.js";
 import { createSignal, readSignal, withSignalTracking } from "../state/reactivity.js";
 import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
+  beginNewSessionSubmission,
   beginNewSessionOptionLoad,
   canSubmitNewSession,
   closeNewSessionSetup,
@@ -132,11 +133,11 @@ import {
   navigateNewSessionSetup,
   newThreadInheritanceForWorkspace,
   reconcileNewThreadDefaults,
-  reconcileNewSessionCreate,
   resolveNewSessionBaseRef,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   openNewSessionSetup,
+  openNewSessionSetupForWorkspace,
   sessionTitleFallback,
   settleNewSessionOptionLoad,
   snapshotNewSessionSubmission,
@@ -1394,21 +1395,31 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   #showNewSession(workspaceId?: string, preferredBaseRef = ""): void {
-    let restoringDraft = this.#newSessionSetup.status === "background-failed";
+    const currentRouteKey = routeKey(readSignal(this.#router.route));
+    let opening = openNewSessionSetupForWorkspace(
+      this.#newSessionSetup,
+      currentRouteKey,
+      this.#newSessionWorkspaceId,
+      workspaceId,
+    );
+    let { restoringDraft } = opening;
     const workspaces = readSignal(this.#store.workspaces);
     let workspace = restoringDraft
       ? workspaces.find((candidate) => candidate.id === this.#newSessionWorkspaceId)
       : workspaces.find((candidate) => candidate.id === workspaceId) ?? workspaces[0];
     if (restoringDraft && workspace === undefined) {
       this.#resetNewSession();
+      opening = openNewSessionSetupForWorkspace(
+        this.#newSessionSetup,
+        currentRouteKey,
+        "",
+        workspaceId,
+      );
       restoringDraft = false;
       workspace = workspaces.find((candidate) => candidate.id === workspaceId) ?? workspaces[0];
     }
     if (workspace === undefined) return;
-    const opened = openNewSessionSetup(
-      this.#newSessionSetup,
-      routeKey(readSignal(this.#router.route)),
-    );
+    const opened = opening.lifecycle;
     if (opened === this.#newSessionSetup) return;
     this.#newSessionSetup = opened;
     if (!restoringDraft) {
@@ -2222,10 +2233,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     })) return;
     const form = event.currentTarget as HTMLFormElement;
     const data = new FormData(form);
-    const workspaceId = String(data.get("workspace_id") ?? "");
+    const retainedCreateRequest = this.#newSessionSetup.createRequest;
+    const workspaceId = retainedCreateRequest?.workspaceId
+      ?? String(data.get("workspace_id") ?? "");
     const prompt = String(data.get("prompt") ?? "").trim();
-    const baseRef = String(data.get("base_ref") ?? "");
-    const fetchLatest = data.get("fetch_latest") === "on";
+    const baseRef = retainedCreateRequest?.baseRef
+      ?? String(data.get("base_ref") ?? "");
+    const fetchLatest = retainedCreateRequest?.fetchLatest
+      ?? data.get("fetch_latest") === "on";
     if (
       workspaceId === ""
       || (prompt === "" && this.#newSessionAttachments.length === 0)
@@ -2249,18 +2264,36 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       ),
     });
     const submissionAttachments = this.#newSessionAttachments.map(({ upload }) => upload);
+    const title = retainedCreateRequest?.title ?? sessionTitleFallback(prompt);
+    const createRequest = {
+      workspaceId,
+      title,
+      baseRef,
+      fetchLatest,
+    };
+    this.#newSessionSetup = beginNewSessionSubmission(
+      this.#newSessionSetup,
+      () => globalThis.crypto.randomUUID(),
+      createRequest,
+    );
+    const createIdempotencyKey = this.#newSessionSetup.idempotencyKey;
+    const submittedCreateRequest = this.#newSessionSetup.createRequest ?? createRequest;
     this.#newSessionPending = true;
     this.#newSessionError = "";
     this.#shellNotice = "";
     this.requestUpdate();
 
-    const title = sessionTitleFallback(prompt);
-
-    let knownSessionIds: ReadonlySet<string>;
+    let session;
     try {
-      knownSessionIds = new Set(
-        (await this.#protocolClient.sessions()).map((session) => session.id),
-      );
+      session = await this.#protocolClient.createSession({
+        workspace_id: submittedCreateRequest.workspaceId,
+        idempotency_key: createIdempotencyKey,
+        title: submittedCreateRequest.title,
+        ...(submittedCreateRequest.baseRef === ""
+          ? {}
+          : { base_ref: submittedCreateRequest.baseRef }),
+        fetch_latest: submittedCreateRequest.fetchLatest,
+      });
     } catch {
       this.#newSessionSetup = navigateNewSessionSetup(
         this.#newSessionSetup,
@@ -2269,66 +2302,19 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       );
       this.#newSessionPending = false;
       this.#newSessionSetup = failNewSessionSetup(this.#newSessionSetup);
-      this.#newSessionError =
-        "Sessions could not be refreshed. Session creation was not attempted.";
+      this.#newSessionError = "Session could not be created.";
       if (this.#newSessionSetup.status === "background-failed") {
         this.#shellNotice =
-          "Session creation was not attempted. Open New Session to retry with your saved draft.";
+          "Session could not be created. Open New Session to retry with your saved draft.";
       }
       this.requestUpdate();
       return;
     }
 
-    let session;
-    try {
-      session = await this.#protocolClient.createSession({
-        workspace_id: workspaceId,
-        title,
-        ...(baseRef === "" ? {} : { base_ref: baseRef }),
-        fetch_latest: fetchLatest,
-      });
-    } catch {
-      let reconciliation;
-      try {
-        reconciliation = reconcileNewSessionCreate({
-          knownSessionIds,
-          sessions: await this.#protocolClient.sessions(),
-          workspaceId,
-          title,
-          baseRef,
-        });
-      } catch {
-        reconciliation = { status: "indeterminate" as const };
-      }
-      if (reconciliation.status === "created") {
-        session = reconciliation.session;
-      } else if (reconciliation.status === "indeterminate") {
-        this.#newSessionPending = false;
-        this.#resetNewSession();
-        this.#shellNotice =
-          "Session creation could not be confirmed. Refresh sessions before starting another session.";
-        this.requestUpdate();
-        return;
-      } else {
-        this.#newSessionSetup = navigateNewSessionSetup(
-          this.#newSessionSetup,
-          routeKey(readSignal(this.#router.route)),
-          true,
-        );
-        this.#newSessionPending = false;
-        this.#newSessionSetup = failNewSessionSetup(this.#newSessionSetup);
-        this.#newSessionError = "Session could not be created.";
-        if (this.#newSessionSetup.status === "background-failed") {
-          this.#shellNotice =
-            "Session could not be created. Open New Session to retry with your saved draft.";
-        }
-        this.requestUpdate();
-        return;
-      }
-    }
-
     this.#store.upsertSessionMetadata(session);
-    this.#upgradeSessionTitleInBackground(session.id, title, prompt);
+    if (retainedCreateRequest === undefined) {
+      this.#upgradeSessionTitleInBackground(session.id, submittedCreateRequest.title, prompt);
+    }
     let threadId: string | undefined;
     try {
       const thread = await this.#protocolClient.createThread(
@@ -3108,7 +3094,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             <header>
               <div>
                 <h2 id="new-session-title">New session</h2>
-                <p>Pick where to work, what to branch from, and how the agent should run.</p>
+                <p>${this.#newSessionSetup.createRequest === undefined
+                  ? "Pick where to work, what to branch from, and how the agent should run."
+                  : "Retrying the original session creation. Its workspace, title, and branch are fixed; you can still edit the first message."}</p>
               </div>
             </header>
             <label class="new-session-workspace">
@@ -3118,7 +3106,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 required
                 .value=${this.#newSessionWorkspaceId}
                 @change=${this.#selectNewSessionWorkspace}
-                ?disabled=${this.#newSessionPending}
+                ?disabled=${this.#newSessionPending
+                  || this.#newSessionSetup.createRequest !== undefined}
               >
                 ${orderedWorkspaces.map(
                   (workspace) => html`<option value=${workspace.id}>${workspace.name}</option>`,
@@ -3134,7 +3123,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   this.#newSessionBaseRef = (event.currentTarget as HTMLSelectElement).value;
                   this.#newSessionPreferredBaseRef = this.#newSessionBaseRef;
                 }}
-                ?disabled=${this.#newSessionPending || this.#newSessionBranchesPending}
+                ?disabled=${this.#newSessionPending
+                  || this.#newSessionBranchesPending
+                  || this.#newSessionSetup.createRequest !== undefined}
               >
                 ${this.#newSessionBranchesPending
                   ? html`<option value="">Loading branches…</option>`
@@ -3148,7 +3139,19 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               ? nothing
               : html`<p class="dialog-warning new-session-branch-warning" role="status">${this.#newSessionBranchError}</p>`}
             <label class="dialog-checkbox">
-              <input name="fetch_latest" type="checkbox" checked ?disabled=${this.#newSessionPending} />
+              ${this.#newSessionSetup.createRequest === undefined
+                ? html`<input
+                    name="fetch_latest"
+                    type="checkbox"
+                    checked
+                    ?disabled=${this.#newSessionPending}
+                  />`
+                : html`<input
+                    name="fetch_latest"
+                    type="checkbox"
+                    .checked=${this.#newSessionSetup.createRequest.fetchLatest}
+                    disabled
+                  />`}
               <span>Use latest remote branch</span>
             </label>
             ${this.#newSessionAttachments.length === 0

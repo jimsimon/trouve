@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.8"
+    "version": "7.9"
   },
   "paths": {
     "/v1/approvals": {
@@ -7122,6 +7122,16 @@
           "fetch_latest": {
             "type": "boolean",
             "description": "Fetch the base branch's configured upstream and start from its latest\nremote commit. Refs without an upstream are used as-is."
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable client-generated key for retrying this create operation without\ncreating a second session if the original response is lost.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$"
           },
           "title": {
             "type": [
