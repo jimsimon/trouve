@@ -1421,13 +1421,55 @@ pub(crate) fn advertised_thinking_budget(
 }
 
 fn parse_thinking_budget(value: &str) -> Option<u64> {
-    value.parse::<u64>().ok().or_else(|| {
-        let parsed = value.parse::<f64>().ok()?;
-        (parsed.is_finite()
-            && parsed.fract() == 0.0
-            && (0.0..=9_007_199_254_740_991.0).contains(&parsed))
-        .then_some(parsed as u64)
-    })
+    if let Ok(value) = value.parse::<u64>() {
+        return Some(value);
+    }
+    let (mantissa, exponent) = if let Some(index) = value.find(['e', 'E']) {
+        let exponent_text = value.get(index + 1..)?;
+        if exponent_text
+            .bytes()
+            .any(|byte| matches!(byte, b'e' | b'E'))
+        {
+            return None;
+        }
+        (&value[..index], exponent_text.parse::<i32>().ok()?)
+    } else {
+        (value, 0)
+    };
+    if matches!(mantissa.as_bytes().first(), Some(b'-' | b'+')) {
+        return None;
+    }
+    let (whole, fraction) = mantissa
+        .split_once('.')
+        .map_or((mantissa, ""), |parts| parts);
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut digits = String::with_capacity(whole.len() + fraction.len());
+    digits.push_str(whole);
+    digits.push_str(fraction);
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let fractional_digits = i32::try_from(fraction.len()).ok()?;
+    let shift = exponent.checked_sub(fractional_digits)?;
+    if shift >= 0 {
+        return digits
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(10_u64.checked_pow(shift.try_into().ok()?)?);
+    }
+    let truncated = usize::try_from(shift.unsigned_abs()).ok()?;
+    let integer_digits = digits.len().checked_sub(truncated)?;
+    let integral = digits[integer_digits..].bytes().all(|byte| byte == b'0');
+    integral.then_some(())?;
+    digits[..integer_digits].parse::<u64>().ok()
 }
 
 /// Resolve the canonical inherited `thinking_level` key through a model's
@@ -21866,6 +21908,12 @@ default_permission_mode = "ask"
             options.get("thinking_budget_tokens"),
             Some(&serde_json::json!(10000))
         );
+
+        assert_eq!(parse_thinking_budget("1023.9999999999999999"), None);
+        assert_eq!(parse_thinking_budget("1e-999"), None);
+        assert_eq!(parse_thinking_budget("184467440737095516160.0"), None);
+        assert_eq!(parse_thinking_budget("1.0e4"), Some(10000));
+        assert_eq!(parse_thinking_budget(".1e5"), Some(10000));
 
         // No thinking enum means the inherited option is not sent.
         options.remove("thinking_budget_tokens");
