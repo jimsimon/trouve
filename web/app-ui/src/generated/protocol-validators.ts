@@ -10201,7 +10201,7 @@ validate265.evaluated = {"items":true,"dynamicProps":false,"dynamicItems":false}
 
 export const automation = validate270;
 const schema125 = {"$id":"urn:trouve:protocol-validator:automation","$ref":"urn:trouve:protocol-openapi#/components/schemas/Automation"};
-const schema126 = {"type":"object","description":"A scheduled prompt. Each run creates a fresh session (worktree) in the\nworkspace, a thread with the configured persona/model, and sends the\nprompt — exactly as if the user had typed it.","required":["id","name","prompt","workspace_id","schedule","enabled","created_at"],"properties":{"created_at":{"type":"string"},"enabled":{"type":"boolean"},"id":{"type":"string"},"last_error":{"type":"string","description":"Why the last run failed (\"\" = it didn't)."},"last_run_at":{"type":["string","null"],"description":"Last fire time (RFC3339)."},"last_session_id":{"type":["string","null"],"description":"Session created by the last run."},"mode":{"type":["string","null"],"description":"Agent persona for the runs (None = the default persona)."},"model":{"type":["string","null"],"description":"Model for the runs (None = the persona's default)."},"name":{"type":"string"},"next_run_at":{"type":["string","null"],"description":"Next fire time (RFC3339), when enabled."},"permission_mode":{"$ref":"#/components/schemas/PermissionMode","description":"Permission policy applied only to sessions created by this automation.\nDefaults to Ask; Yolo is an explicit unattended-execution opt-in."},"prompt":{"type":"string"},"schedule":{"$ref":"#/components/schemas/AutomationSchedule"},"thinking_level":{"type":["string","null"],"description":"Thinking level for the runs (None = the selected model/persona/global\ndefault). The engine maps this canonical value to the model's\nadvertised option key when the turn starts."},"workspace_id":{"$ref":"#/components/schemas/String"}}};
+const schema126 = {"type":"object","description":"A scheduled prompt. Each run creates a fresh session (worktree) in the\nworkspace, a thread with the configured persona/model, and sends the\nprompt — exactly as if the user had typed it.","required":["id","name","prompt","workspace_id","schedule","enabled","created_at"],"properties":{"created_at":{"type":"string"},"enabled":{"type":"boolean"},"id":{"type":"string"},"last_error":{"type":"string","description":"Why the last run failed (\"\" = it didn't)."},"last_run_at":{"type":["string","null"],"description":"Last fire time (RFC3339)."},"last_session_id":{"type":["string","null"],"description":"Session created by the last run."},"mode":{"type":["string","null"],"description":"Agent persona for the runs (None = the default persona)."},"model":{"type":["string","null"],"description":"Model for the runs (None = the persona's default)."},"model_options":{"type":"object","description":"Model-specific values selected from the model's `options_schema`.\n`thinking_level` remains as a compatibility shorthand; values in this\nobject take precedence when both select the same model capability.","additionalProperties":{},"propertyNames":{"type":"string"}},"name":{"type":"string"},"next_run_at":{"type":["string","null"],"description":"Next fire time (RFC3339), when enabled."},"permission_mode":{"$ref":"#/components/schemas/PermissionMode","description":"Permission policy applied only to sessions created by this automation.\nDefaults to Ask; Yolo is an explicit unattended-execution opt-in."},"prompt":{"type":"string"},"schedule":{"$ref":"#/components/schemas/AutomationSchedule"},"thinking_level":{"type":["string","null"],"description":"Thinking level for the runs (None = the selected model/persona/global\ndefault). The engine maps this canonical value to the model's\nadvertised option key when the turn starts."},"workspace_id":{"$ref":"#/components/schemas/String"}}};
 const schema127 = {"type":"object","description":"When an automation fires. Times are the server's local time zone.","required":["kind"],"properties":{"days":{"type":"array","items":{"type":"integer","format":"int32","minimum":0},"description":"Weekly: days it fires (0 = Monday … 6 = Sunday); at least one."},"kind":{"type":"string","description":"\"hourly\", \"daily\", or \"weekly\"."},"minute":{"type":"integer","format":"int32","description":"Hourly: minute of the hour (0-59).","minimum":0},"time":{"type":"string","description":"Daily/weekly: time of day as \"HH:MM\" (24h)."}}};
 
 function validate273(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -10439,11 +10439,43 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.name !== undefined){
+if(data.model_options !== undefined){
+let data8 = data.model_options;
 const _errs17 = errors;
-if(typeof data.name !== "string"){
-validate271.errors = [{instancePath:instancePath+"/name",schemaPath:"#/properties/name/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(errors === _errs17){
+if(data8 && typeof data8 == "object" && !Array.isArray(data8)){
+for(const key0 in data8){
+const _errs19 = errors;
+if(typeof key0 !== "string"){
+const err0 = {instancePath:instancePath+"/model_options",schemaPath:"#/properties/model_options/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key0};
+if(vErrors === null){
+vErrors = [err0];
+}
+else {
+vErrors.push(err0);
+}
+errors++;
+}
+var valid1 = _errs19 === errors;
+if(!valid1){
+const err1 = {instancePath:instancePath+"/model_options",schemaPath:"#/properties/model_options/propertyNames",keyword:"propertyNames",params:{propertyName: key0},message:"property name must be valid"};
+if(vErrors === null){
+vErrors = [err1];
+}
+else {
+vErrors.push(err1);
+}
+errors++;
+validate271.errors = vErrors;
 return false;
+break;
+}
+}
+}
+else {
+validate271.errors = [{instancePath:instancePath+"/model_options",schemaPath:"#/properties/model_options/type",keyword:"type",params:{type: "object"},message:"must be object"}];
+return false;
+}
 }
 var valid0 = _errs17 === errors;
 }
@@ -10451,35 +10483,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.next_run_at !== undefined){
-let data9 = data.next_run_at;
-const _errs19 = errors;
-if((typeof data9 !== "string") && (data9 !== null)){
-validate271.errors = [{instancePath:instancePath+"/next_run_at",schemaPath:"#/properties/next_run_at/type",keyword:"type",params:{type: schema126.properties.next_run_at.type},message:"must be string,null"}];
-return false;
-}
-var valid0 = _errs19 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.permission_mode !== undefined){
-const _errs21 = errors;
-if(!(validate73(data.permission_mode, {instancePath:instancePath+"/permission_mode",parentData:data,parentDataProperty:"permission_mode",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate73.errors : vErrors.concat(validate73.errors);
-errors = vErrors.length;
-}
-var valid0 = _errs21 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.prompt !== undefined){
+if(data.name !== undefined){
 const _errs22 = errors;
-if(typeof data.prompt !== "string"){
-validate271.errors = [{instancePath:instancePath+"/prompt",schemaPath:"#/properties/prompt/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.name !== "string"){
+validate271.errors = [{instancePath:instancePath+"/name",schemaPath:"#/properties/name/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs22 === errors;
@@ -10488,11 +10495,12 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.schedule !== undefined){
+if(data.next_run_at !== undefined){
+let data10 = data.next_run_at;
 const _errs24 = errors;
-if(!(validate273(data.schedule, {instancePath:instancePath+"/schedule",parentData:data,parentDataProperty:"schedule",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate273.errors : vErrors.concat(validate273.errors);
-errors = vErrors.length;
+if((typeof data10 !== "string") && (data10 !== null)){
+validate271.errors = [{instancePath:instancePath+"/next_run_at",schemaPath:"#/properties/next_run_at/type",keyword:"type",params:{type: schema126.properties.next_run_at.type},message:"must be string,null"}];
+return false;
 }
 var valid0 = _errs24 === errors;
 }
@@ -10500,29 +10508,66 @@ else {
 var valid0 = true;
 }
 if(valid0){
+if(data.permission_mode !== undefined){
+const _errs26 = errors;
+if(!(validate73(data.permission_mode, {instancePath:instancePath+"/permission_mode",parentData:data,parentDataProperty:"permission_mode",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate73.errors : vErrors.concat(validate73.errors);
+errors = vErrors.length;
+}
+var valid0 = _errs26 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.prompt !== undefined){
+const _errs27 = errors;
+if(typeof data.prompt !== "string"){
+validate271.errors = [{instancePath:instancePath+"/prompt",schemaPath:"#/properties/prompt/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs27 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.schedule !== undefined){
+const _errs29 = errors;
+if(!(validate273(data.schedule, {instancePath:instancePath+"/schedule",parentData:data,parentDataProperty:"schedule",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate273.errors : vErrors.concat(validate273.errors);
+errors = vErrors.length;
+}
+var valid0 = _errs29 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
 if(data.thinking_level !== undefined){
-let data13 = data.thinking_level;
-const _errs25 = errors;
-if((typeof data13 !== "string") && (data13 !== null)){
+let data14 = data.thinking_level;
+const _errs30 = errors;
+if((typeof data14 !== "string") && (data14 !== null)){
 validate271.errors = [{instancePath:instancePath+"/thinking_level",schemaPath:"#/properties/thinking_level/type",keyword:"type",params:{type: schema126.properties.thinking_level.type},message:"must be string,null"}];
 return false;
 }
-var valid0 = _errs25 === errors;
+var valid0 = _errs30 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.workspace_id !== undefined){
-const _errs27 = errors;
+const _errs32 = errors;
 if(!(validate55(data.workspace_id, {instancePath:instancePath+"/workspace_id",parentData:data,parentDataProperty:"workspace_id",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate55.errors : vErrors.concat(validate55.errors);
 errors = vErrors.length;
 }
-var valid0 = _errs27 === errors;
+var valid0 = _errs32 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -10548,7 +10593,7 @@ return false;
 validate271.errors = vErrors;
 return errors === 0;
 }
-validate271.evaluated = {"props":{"created_at":true,"enabled":true,"id":true,"last_error":true,"last_run_at":true,"last_session_id":true,"mode":true,"model":true,"name":true,"next_run_at":true,"permission_mode":true,"prompt":true,"schedule":true,"thinking_level":true,"workspace_id":true},"dynamicProps":false,"dynamicItems":false};
+validate271.evaluated = {"props":{"created_at":true,"enabled":true,"id":true,"last_error":true,"last_run_at":true,"last_session_id":true,"mode":true,"model":true,"model_options":true,"name":true,"next_run_at":true,"permission_mode":true,"prompt":true,"schedule":true,"thinking_level":true,"workspace_id":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate270(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -10569,7 +10614,7 @@ errors = vErrors.length;
 validate270.errors = vErrors;
 return errors === 0;
 }
-validate270.evaluated = {"props":{"created_at":true,"enabled":true,"id":true,"last_error":true,"last_run_at":true,"last_session_id":true,"mode":true,"model":true,"name":true,"next_run_at":true,"permission_mode":true,"prompt":true,"schedule":true,"thinking_level":true,"workspace_id":true},"dynamicProps":false,"dynamicItems":false};
+validate270.evaluated = {"props":{"created_at":true,"enabled":true,"id":true,"last_error":true,"last_run_at":true,"last_session_id":true,"mode":true,"model":true,"model_options":true,"name":true,"next_run_at":true,"permission_mode":true,"prompt":true,"schedule":true,"thinking_level":true,"workspace_id":true},"dynamicProps":false,"dynamicItems":false};
 
 export const automations = validate277;
 const schema128 = {"$id":"urn:trouve:protocol-validator:automations","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/Automation"}};
@@ -10692,11 +10737,43 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.name !== undefined){
+if(data.model_options !== undefined){
+let data8 = data.model_options;
 const _errs17 = errors;
-if(typeof data.name !== "string"){
-validate278.errors = [{instancePath:instancePath+"/name",schemaPath:"#/properties/name/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(errors === _errs17){
+if(data8 && typeof data8 == "object" && !Array.isArray(data8)){
+for(const key0 in data8){
+const _errs19 = errors;
+if(typeof key0 !== "string"){
+const err0 = {instancePath:instancePath+"/model_options",schemaPath:"#/properties/model_options/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key0};
+if(vErrors === null){
+vErrors = [err0];
+}
+else {
+vErrors.push(err0);
+}
+errors++;
+}
+var valid1 = _errs19 === errors;
+if(!valid1){
+const err1 = {instancePath:instancePath+"/model_options",schemaPath:"#/properties/model_options/propertyNames",keyword:"propertyNames",params:{propertyName: key0},message:"property name must be valid"};
+if(vErrors === null){
+vErrors = [err1];
+}
+else {
+vErrors.push(err1);
+}
+errors++;
+validate278.errors = vErrors;
 return false;
+break;
+}
+}
+}
+else {
+validate278.errors = [{instancePath:instancePath+"/model_options",schemaPath:"#/properties/model_options/type",keyword:"type",params:{type: "object"},message:"must be object"}];
+return false;
+}
 }
 var valid0 = _errs17 === errors;
 }
@@ -10704,35 +10781,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.next_run_at !== undefined){
-let data9 = data.next_run_at;
-const _errs19 = errors;
-if((typeof data9 !== "string") && (data9 !== null)){
-validate278.errors = [{instancePath:instancePath+"/next_run_at",schemaPath:"#/properties/next_run_at/type",keyword:"type",params:{type: schema126.properties.next_run_at.type},message:"must be string,null"}];
-return false;
-}
-var valid0 = _errs19 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.permission_mode !== undefined){
-const _errs21 = errors;
-if(!(validate73(data.permission_mode, {instancePath:instancePath+"/permission_mode",parentData:data,parentDataProperty:"permission_mode",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate73.errors : vErrors.concat(validate73.errors);
-errors = vErrors.length;
-}
-var valid0 = _errs21 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.prompt !== undefined){
+if(data.name !== undefined){
 const _errs22 = errors;
-if(typeof data.prompt !== "string"){
-validate278.errors = [{instancePath:instancePath+"/prompt",schemaPath:"#/properties/prompt/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.name !== "string"){
+validate278.errors = [{instancePath:instancePath+"/name",schemaPath:"#/properties/name/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs22 === errors;
@@ -10741,11 +10793,12 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.schedule !== undefined){
+if(data.next_run_at !== undefined){
+let data10 = data.next_run_at;
 const _errs24 = errors;
-if(!(validate273(data.schedule, {instancePath:instancePath+"/schedule",parentData:data,parentDataProperty:"schedule",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate273.errors : vErrors.concat(validate273.errors);
-errors = vErrors.length;
+if((typeof data10 !== "string") && (data10 !== null)){
+validate278.errors = [{instancePath:instancePath+"/next_run_at",schemaPath:"#/properties/next_run_at/type",keyword:"type",params:{type: schema126.properties.next_run_at.type},message:"must be string,null"}];
+return false;
 }
 var valid0 = _errs24 === errors;
 }
@@ -10753,29 +10806,66 @@ else {
 var valid0 = true;
 }
 if(valid0){
+if(data.permission_mode !== undefined){
+const _errs26 = errors;
+if(!(validate73(data.permission_mode, {instancePath:instancePath+"/permission_mode",parentData:data,parentDataProperty:"permission_mode",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate73.errors : vErrors.concat(validate73.errors);
+errors = vErrors.length;
+}
+var valid0 = _errs26 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.prompt !== undefined){
+const _errs27 = errors;
+if(typeof data.prompt !== "string"){
+validate278.errors = [{instancePath:instancePath+"/prompt",schemaPath:"#/properties/prompt/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs27 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.schedule !== undefined){
+const _errs29 = errors;
+if(!(validate273(data.schedule, {instancePath:instancePath+"/schedule",parentData:data,parentDataProperty:"schedule",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate273.errors : vErrors.concat(validate273.errors);
+errors = vErrors.length;
+}
+var valid0 = _errs29 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
 if(data.thinking_level !== undefined){
-let data13 = data.thinking_level;
-const _errs25 = errors;
-if((typeof data13 !== "string") && (data13 !== null)){
+let data14 = data.thinking_level;
+const _errs30 = errors;
+if((typeof data14 !== "string") && (data14 !== null)){
 validate278.errors = [{instancePath:instancePath+"/thinking_level",schemaPath:"#/properties/thinking_level/type",keyword:"type",params:{type: schema126.properties.thinking_level.type},message:"must be string,null"}];
 return false;
 }
-var valid0 = _errs25 === errors;
+var valid0 = _errs30 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.workspace_id !== undefined){
-const _errs27 = errors;
+const _errs32 = errors;
 if(!(validate55(data.workspace_id, {instancePath:instancePath+"/workspace_id",parentData:data,parentDataProperty:"workspace_id",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate55.errors : vErrors.concat(validate55.errors);
 errors = vErrors.length;
 }
-var valid0 = _errs27 === errors;
+var valid0 = _errs32 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -10801,7 +10891,7 @@ return false;
 validate278.errors = vErrors;
 return errors === 0;
 }
-validate278.evaluated = {"props":{"created_at":true,"enabled":true,"id":true,"last_error":true,"last_run_at":true,"last_session_id":true,"mode":true,"model":true,"name":true,"next_run_at":true,"permission_mode":true,"prompt":true,"schedule":true,"thinking_level":true,"workspace_id":true},"dynamicProps":false,"dynamicItems":false};
+validate278.evaluated = {"props":{"created_at":true,"enabled":true,"id":true,"last_error":true,"last_run_at":true,"last_session_id":true,"mode":true,"model":true,"model_options":true,"name":true,"next_run_at":true,"permission_mode":true,"prompt":true,"schedule":true,"thinking_level":true,"workspace_id":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate277(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

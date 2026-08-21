@@ -4325,15 +4325,15 @@ impl Engine {
         {
             return Ok(serde_json::Map::new());
         }
-        let all_modes =
-            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        let all_modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
         let mode_id = requested_mode.unwrap_or("code");
-        let mode = modes::find_mode(&all_modes, mode_id)
-            .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
+        let mode = personas::find_persona(&all_modes, mode_id)
+            .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
+        let global_defaults = self.global_defaults.read().unwrap().clone();
         let model_id = requested_model
             .map(String::from)
             .or_else(|| mode.default_model.clone())
-            .unwrap_or_else(|| self.default_model.read().unwrap().clone());
+            .unwrap_or(global_defaults.model);
         let model = self.resolve_model_info(&model_id).await?;
         let mut options = requested_options.clone();
         if let Some(level) = legacy_thinking_level
