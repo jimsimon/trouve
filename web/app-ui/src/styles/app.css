@@ -85,9 +85,8 @@ trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto
 .navigation-icon-button:hover::after, .navigation-icon-button:focus-visible::after { opacity: 1; }
 .workspace-list-heading { height: 34px; display: flex; align-items: center; gap: 8px; }
 .workspace-list-heading > strong { min-width: 0; flex: 1; color: var(--trouve-text-hi); font-size: 15px; }
-.workspace-list-heading wa-button { flex: none; }
-.command-palette-compact { width: 26px; height: 26px; flex: none; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 14px; }
-.command-palette-compact:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.command-palette-compact, .workspace-open-button { width: 26px; height: 26px; flex: none; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 14px; }
+.command-palette-compact:hover, .workspace-open-button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
 .workspace-list-options-wrap { position: relative; flex: none; }
 .workspace-list-options-button { width: 26px; height: 26px; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 16px; }
 .workspace-list-options-button:hover, .workspace-list-options-button[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }

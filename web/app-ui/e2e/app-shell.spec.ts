@@ -390,6 +390,18 @@ test("workspace list options dismiss with Escape and an outside pointer", async 
     await page.getByRole("button", { name: "Sessions", exact: true }).click();
   }
 
+  const heading = page.locator(".workspace-list-heading");
+  const openWorkspace = heading.getByRole("button", { name: "Open workspace" });
+  await expect(openWorkspace.locator('[data-font-awesome-icon="plus"]')).toBeVisible();
+  await expect(openWorkspace).toHaveText("+");
+  const optionsBounds = await heading
+    .getByRole("button", { name: "Workspace list options" })
+    .boundingBox();
+  const openBounds = await openWorkspace.boundingBox();
+  expect(optionsBounds).not.toBeNull();
+  expect(openBounds).not.toBeNull();
+  expect(optionsBounds!.x).toBeLessThan(openBounds!.x);
+
   const toggle = page.getByRole("button", { name: "Workspace list options" });
   const options = page.getByRole("group", { name: "Workspace list options" });
   await toggle.click();
