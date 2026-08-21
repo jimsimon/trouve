@@ -3691,7 +3691,7 @@ test("thought completion clears stale activity while standalone and grouped tool
   await expect(transientActivity).toContainText("Running commands…");
 });
 
-test("a progress stream replaces the transient spinner with its message icon", async ({ page }) => {
+test("a progress stream uses its message icon while activity remains visible", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
@@ -3721,7 +3721,7 @@ test("a progress stream replaces the transient spinner with its message icon", a
   const transientActivity = agent.locator(
     ":scope > .turn-timeline > .turn-transient-activity",
   );
-  await expect(transientActivity).toContainText("Processing…");
+  await expect(transientActivity).toContainText("gpt-5.6-sol");
   await expect(transientActivity.locator(".turn-transient-spinner.trouve-icon-spin"))
     .toBeVisible();
 
@@ -3733,7 +3733,9 @@ test("a progress stream replaces the transient spinner with its message icon", a
   await expect(progress).toHaveClass(/running/u);
   await expect(progress.locator('[data-font-awesome-icon="message"]')).toBeVisible();
   await expect(progress.locator(".trouve-icon-spin")).toHaveCount(0);
-  await expect(transientActivity).toHaveCount(0);
+  await expect(transientActivity).toContainText("Waiting for gpt-5.6-sol…");
+  await expect(transientActivity.locator(".turn-transient-spinner.trouve-icon-spin"))
+    .toBeVisible();
 
   await emit(page, threadEvent(74, {
     type: "assistant.progress_completed",
