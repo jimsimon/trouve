@@ -1130,9 +1130,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         || this.threadId !== threadId
         || this.#chatFindRevisionKey() !== key
       ) return;
-      const items = this.#store.value?.threadView(threadId)?.items ?? [];
+      const view = this.#store.value?.threadView(threadId);
+      if (view?.snapshotLoaded !== true) {
+        // Keep the restored active unit until the folded snapshot is ready.
+        // The store signal update will schedule a fresh reconciliation.
+        this.#chatFindRefreshKey = "";
+        return;
+      }
       const reconciled = reconcileChatFind(
-        chatFindUnitIds(items, this.#chatFindQuery, this.#chatFindCaseSensitive),
+        chatFindUnitIds(view.items, this.#chatFindQuery, this.#chatFindCaseSensitive),
         activeUnitId,
         resetActive,
       );

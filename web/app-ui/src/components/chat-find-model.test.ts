@@ -69,6 +69,8 @@ describe("chat find model", () => {
       },
     ];
     expect(chatFindUnitIds(structured, "parser.rs", false)).toEqual(["turn:0:tool:1"]);
+    expect(chatFindUnitIds(structured, "11", false)).toEqual(["turn:0:tool:1"]);
+    expect(chatFindUnitIds(structured, "false", false)).toEqual(["turn:0:tool:1"]);
     expect(chatFindUnitIds(structured, "which branch", false)).toEqual([
       "turn:0:tool:1",
     ]);

@@ -4832,6 +4832,71 @@ test("find defaults to insensitive matching and restores separate thread state",
   await expect(find.getByRole("status")).toHaveText("1 of 1");
 });
 
+test("find preserves its restored selection while an evicted thread reloads", async ({ page }) => {
+  const additionalThreads = Array.from({ length: 8 }, (_, index) => ({
+    id: `th_find_evict_${index + 1}`,
+    session_id: "se_1",
+    title: `Eviction thread ${index + 1}`,
+    mode: "code",
+    model: "test/eviction",
+    model_options: {},
+    permission_mode: "ask",
+    created_at: `2026-08-05T08:00:0${index}Z`,
+  }));
+  let snapshotLoads = 0;
+  let releaseReload = (): void => {};
+  const reloadReleased = new Promise<void>((resolve) => {
+    releaseReload = resolve;
+  });
+  await installProtocolFixtures(page, {
+    additionalThreads,
+    threadViewFixture: async (before) => {
+      if (before !== undefined) throw new Error(`unexpected history boundary ${before}`);
+      snapshotLoads += 1;
+      if (snapshotLoads > 1) await reloadReleased;
+      return {
+        cursor: 20,
+        snapshot: {
+          item_offset: 0,
+          total_items: 2,
+          has_older: false,
+          items: [
+            { kind: "user", turn: 1, content: "Restore needle first", attachments: [] },
+            { kind: "user", turn: 2, content: "Restore needle second", attachments: [] },
+          ],
+        },
+      };
+    },
+  });
+  await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture");
+  await expect(page.getByText("Restore needle second", { exact: true })).toBeVisible();
+
+  await page.keyboard.press("Control+f");
+  let find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("restore needle");
+  await expect(find.getByRole("status")).toHaveText("1 of 2");
+  await find.getByRole("searchbox", { name: "Search this chat" }).press("Enter");
+  await expect(find.getByRole("status")).toHaveText("2 of 2");
+
+  for (const thread of additionalThreads) {
+    await page.getByRole("button", { name: "Threads (9)" }).click();
+    await page.getByRole("treeitem", { name: new RegExp(thread.title, "u") }).click();
+    await expect(page).toHaveURL(new RegExp(`/threads/${thread.id}$`, "u"));
+  }
+  await page.getByRole("button", { name: "Threads (9)" }).click();
+  await page.getByRole("treeitem", { name: /Chat rendering/u }).click();
+  await expect.poll(() => snapshotLoads).toBe(2);
+  await page.waitForTimeout(200);
+  find = page.getByRole("search", { name: "Find in chat" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" }))
+    .toHaveValue("restore needle");
+
+  releaseReload();
+  await expect(find.getByRole("status")).toHaveText("2 of 2");
+  await expect(page.locator(".chat-find-active"))
+    .toContainText("Restore needle second");
+});
+
 test("find shortcuts coordinate focus with the thread switcher", async ({ page }) => {
   await installProtocolFixtures(page, { additionalThreads: [{
     id: "th_find_shortcut_second",

@@ -14,6 +14,12 @@ const searchableText = (value: unknown): string => {
   const seen = new Set<object>();
   let length = 0;
   let visited = 0;
+  const append = (value: string): void => {
+    const remaining = SEARCH_TEXT_LIMIT - length;
+    const text = value.slice(0, remaining);
+    parts.push(text);
+    length += text.length + 1;
+  };
   const visit = (candidate: unknown, depth: number): void => {
     if (
       length >= SEARCH_TEXT_LIMIT
@@ -23,10 +29,15 @@ const searchableText = (value: unknown): string => {
     ) return;
     visited += 1;
     if (typeof candidate === "string") {
-      const remaining = SEARCH_TEXT_LIMIT - length;
-      const text = candidate.slice(0, remaining);
-      parts.push(text);
-      length += text.length + 1;
+      append(candidate);
+      return;
+    }
+    if (typeof candidate === "boolean") {
+      append(String(candidate));
+      return;
+    }
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      append(String(candidate));
       return;
     }
     if (typeof candidate !== "object" || seen.has(candidate)) return;
