@@ -23,11 +23,12 @@ use utoipa::{OpenApi, ToSchema};
 #[cfg(test)]
 use crate::AssetManifest;
 use crate::{
-    Asset, AssetLookup, CloseDecision, ExternalHttpsUrl, FrontendSource, GatewayOrigin,
-    HostCapabilities, HostKind, HostLifecycleEnvelope, HostLifecycleState, HostNativeActions,
-    HostPreferences, HostValidationError, LocalFileAction, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES,
-    MAX_NATIVE_ATTACHMENTS, MAX_SYSTEM_FONT_FAMILIES, NativeAttachment, NativeNotification,
-    system_font_families, valid_session_relative_path, validate_native_attachment,
+    Asset, AssetLookup, CloseDecision, DesktopUpdateState, ExternalHttpsUrl, FrontendSource,
+    GatewayOrigin, HostCapabilities, HostKind, HostLifecycleEnvelope, HostLifecycleState,
+    HostNativeActions, HostPreferences, HostValidationError, LocalFileAction,
+    MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS, MAX_SYSTEM_FONT_FAMILIES,
+    NativeAttachment, NativeNotification, system_font_families, valid_session_relative_path,
+    validate_native_attachment,
 };
 
 pub const HOST_API_PREFIX: &str = "/__trouve/host/v1";
@@ -46,6 +47,9 @@ const NATIVE_NOTIFICATION_PATH: &str = "/__trouve/host/v1/native-notification";
 const USER_ATTENTION_PATH: &str = "/__trouve/host/v1/request-user-attention";
 const LOCAL_FILE_ACTION_PATH: &str = "/__trouve/host/v1/local-file-action";
 const OPEN_HTTPS_URL_PATH: &str = "/__trouve/host/v1/open-https-url";
+const DESKTOP_UPDATE_PATH: &str = "/__trouve/host/v1/update";
+const DESKTOP_UPDATE_CHECK_PATH: &str = "/__trouve/host/v1/update/check";
+const DESKTOP_UPDATE_INSTALL_PATH: &str = "/__trouve/host/v1/update/install";
 const MAX_NATIVE_PATH_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -173,7 +177,10 @@ struct LifecycleQuery {
         send_native_notification,
         request_user_attention,
         local_file_action,
-        open_https_url
+        open_https_url,
+        get_desktop_update,
+        check_desktop_update,
+        install_desktop_update
     ),
     components(schemas(
         HostBootstrap,
@@ -199,6 +206,8 @@ struct LifecycleQuery {
         crate::AppearancePreferences,
         crate::ChatPreferences,
         crate::GeneralPreferences,
+        crate::DesktopUpdatePhase,
+        crate::DesktopUpdateState,
         crate::NotificationPreferences,
         crate::HostKind,
         crate::WindowGeometry
@@ -254,6 +263,7 @@ struct GatewayState {
     native_actions: HostNativeActions,
     native_picker_permit: Arc<tokio::sync::Semaphore>,
     clipboard_image_permit: Arc<tokio::sync::Semaphore>,
+    desktop_update_permit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Whether a configured protocol upstream is owned by this desktop app.
@@ -341,6 +351,7 @@ impl HostGateway {
             capabilities.window_geometry = false;
             capabilities.visibility = false;
             capabilities.occlusion = false;
+            capabilities.self_update = false;
         }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -364,6 +375,7 @@ impl HostGateway {
                 native_actions: HostNativeActions::default(),
                 native_picker_permit: Arc::new(tokio::sync::Semaphore::new(1)),
                 clipboard_image_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+                desktop_update_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             },
         })
     }
@@ -398,6 +410,7 @@ impl HostGateway {
         self.state.capabilities.sleep_inhibition = self.state.native_actions.can_inhibit_sleep();
         self.state.capabilities.visibility = self.state.native_actions.can_report_visibility();
         self.state.capabilities.occlusion = self.state.native_actions.can_report_occlusion();
+        self.state.capabilities.self_update = self.state.native_actions.can_self_update();
         // Only the app-owned embedded/elected server is known to share this
         // process's filesystem namespace. An explicit upstream can be a
         // loopback tunnel or container port-forward, so fail closed for every
@@ -466,6 +479,9 @@ impl HostGateway {
             .route(USER_ATTENTION_PATH, post(request_user_attention))
             .route(LOCAL_FILE_ACTION_PATH, post(local_file_action))
             .route(OPEN_HTTPS_URL_PATH, post(open_https_url))
+            .route(DESKTOP_UPDATE_PATH, get(get_desktop_update))
+            .route(DESKTOP_UPDATE_CHECK_PATH, post(check_desktop_update))
+            .route(DESKTOP_UPDATE_INSTALL_PATH, post(install_desktop_update))
             .route("/v1/{*path}", any(proxy_protocol))
             .fallback(any(serve_frontend))
             .with_state(self.state.clone())
@@ -603,7 +619,7 @@ impl HostGateway {
         let mut capabilities = capabilities;
         capabilities.persistent_preferences = preference_path.is_some();
         let preferences = match preference_path.as_deref() {
-            Some(path) => load_preferences(path, preferences)?,
+            Some(path) => load_host_preferences(path, preferences)?,
             None => preferences,
         };
         let mut gateway = Self::new(origin, frontend, capabilities, preferences)?
@@ -750,6 +766,85 @@ async fn put_preferences(
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     apply_security_headers(response.headers_mut());
     Ok(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/__trouve/host/v1/update",
+    responses((status = 200, body = DesktopUpdateState), (status = 403), (status = 404))
+)]
+async fn get_desktop_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Result<Response, GatewayRejection> {
+    validate_read(&state, &headers)?;
+    require_desktop_updater(&state)?;
+    let update = state
+        .native_actions
+        .desktop_update_status()
+        .map_err(|_| GatewayRejection::Internal)?;
+    json_no_store(update)
+}
+
+#[utoipa::path(
+    post,
+    path = "/__trouve/host/v1/update/check",
+    responses((status = 200, body = DesktopUpdateState), (status = 403), (status = 404), (status = 409), (status = 500))
+)]
+async fn check_desktop_update(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+) -> Result<Response, GatewayRejection> {
+    validate_mutation(&state, request.headers())?;
+    require_desktop_updater(&state)?;
+    require_empty_action_body(request).await?;
+    let _permit = state
+        .desktop_update_permit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| GatewayRejection::Busy)?;
+    let update = state
+        .native_actions
+        .check_desktop_update()
+        .await
+        .map_err(|_| GatewayRejection::Internal)?;
+    json_no_store(update)
+}
+
+#[utoipa::path(
+    post,
+    path = "/__trouve/host/v1/update/install",
+    responses((status = 200, body = DesktopUpdateState), (status = 403), (status = 404), (status = 409), (status = 500))
+)]
+async fn install_desktop_update(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+) -> Result<Response, GatewayRejection> {
+    validate_mutation(&state, request.headers())?;
+    require_desktop_updater(&state)?;
+    require_empty_action_body(request).await?;
+    let _permit = state
+        .desktop_update_permit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| GatewayRejection::Busy)?;
+    let update = state
+        .native_actions
+        .install_desktop_update()
+        .await
+        .map_err(|_| GatewayRejection::Internal)?;
+    json_no_store(update)
+}
+
+fn require_desktop_updater(state: &GatewayState) -> Result<(), GatewayRejection> {
+    if state.capabilities.kind == HostKind::Desktop
+        && state.capabilities.self_update
+        && state.native_actions.can_self_update()
+    {
+        Ok(())
+    } else {
+        Err(GatewayRejection::Missing)
+    }
 }
 
 #[utoipa::path(
@@ -1251,7 +1346,10 @@ fn json_no_store<T: Serialize>(value: T) -> Result<Response, GatewayRejection> {
     Ok(response)
 }
 
-fn load_preferences(
+/// Read and validate persisted desktop preferences without starting the
+/// gateway. The product updater uses this before any server or main window is
+/// created.
+pub fn load_host_preferences(
     path: &Path,
     fallback: HostPreferences,
 ) -> Result<HostPreferences, HostGatewayError> {
@@ -1298,7 +1396,8 @@ fn merge_and_persist_preferences(
         .open(lock_path)?;
     lock.lock_exclusive()?;
     let result = (|| {
-        let latest = load_preferences(path, baseline.clone()).map_err(std::io::Error::other)?;
+        let latest =
+            load_host_preferences(path, baseline.clone()).map_err(std::io::Error::other)?;
         let merged = merge_preference_changes(&latest, baseline, incoming, include_geometry);
         validate_preferences(&merged).map_err(std::io::Error::other)?;
         persist_preferences(path, &merged)?;
@@ -1812,6 +1911,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::DesktopUpdatePhase;
 
     fn asset(content_type: &str, bytes: &'static [u8], immutable: bool) -> Asset {
         Asset {
@@ -2323,6 +2423,99 @@ mod tests {
             assert_eq!(body, "host gateway failure");
             assert!(!body.contains("secret"));
         }
+    }
+
+    #[tokio::test]
+    async fn desktop_update_status_and_actions_are_capability_and_csrf_scoped() {
+        let status = DesktopUpdateState {
+            current_version: "4.0.0".into(),
+            available_version: Some("4.1.0".into()),
+            phase: DesktopUpdatePhase::Available,
+            message: "Version 4.1.0 is ready to install.".into(),
+            progress_percent: None,
+        };
+        let status_reader = status.clone();
+        let checked = status.clone();
+        let installed = DesktopUpdateState {
+            phase: DesktopUpdatePhase::Restarting,
+            message: "Restarting into version 4.1.0…".into(),
+            progress_percent: Some(100),
+            ..status.clone()
+        };
+        let app = gateway()
+            .with_native_actions(HostNativeActions::default().with_desktop_updater(
+                move || Ok(status_reader.clone()),
+                move || {
+                    let checked = checked.clone();
+                    async move { Ok(checked) }
+                },
+                move || {
+                    let installed = installed.clone();
+                    async move { Ok(installed) }
+                },
+            ))
+            .router();
+        let bootstrap_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        assert!(bootstrap.capabilities.self_update);
+
+        let current = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(DESKTOP_UPDATE_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json::<DesktopUpdateState>(current).await, status);
+
+        let missing_proof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(DESKTOP_UPDATE_CHECK_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_proof.status(), StatusCode::FORBIDDEN);
+
+        let checked = app
+            .clone()
+            .oneshot(action_request(
+                DESKTOP_UPDATE_CHECK_PATH,
+                &bootstrap.csrf_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json::<DesktopUpdateState>(checked).await, status);
+        let installed = app
+            .oneshot(action_request(
+                DESKTOP_UPDATE_INSTALL_PATH,
+                &bootstrap.csrf_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json::<DesktopUpdateState>(installed).await.phase,
+            DesktopUpdatePhase::Restarting
+        );
     }
 
     #[tokio::test]
@@ -3612,20 +3805,20 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            load_preferences(&path, HostPreferences::default())
+            load_host_preferences(&path, HostPreferences::default())
                 .unwrap()
                 .appearance
                 .theme,
             "colorblind-dark"
         );
         assert!(
-            !load_preferences(&path, HostPreferences::default())
+            !load_host_preferences(&path, HostPreferences::default())
                 .unwrap()
                 .chat
                 .collapse_thinking_with_tools
         );
         assert!(
-            !load_preferences(&path, HostPreferences::default())
+            !load_host_preferences(&path, HostPreferences::default())
                 .unwrap()
                 .chat
                 .collapse_sequential_tool_calls
@@ -3654,7 +3847,7 @@ mod tests {
         persist_preferences(&path, &second).unwrap();
 
         assert_eq!(
-            load_preferences(&path, HostPreferences::default()).unwrap(),
+            load_host_preferences(&path, HostPreferences::default()).unwrap(),
             second
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -3698,7 +3891,7 @@ mod tests {
             .into()
         );
         assert_eq!(
-            load_preferences(&path, HostPreferences::default()).unwrap(),
+            load_host_preferences(&path, HostPreferences::default()).unwrap(),
             second
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -3822,7 +4015,7 @@ mod tests {
         assert_eq!(merged.navigation_width, 318.0);
         assert_eq!(merged.inspection_width, 512.0);
         assert_eq!(
-            load_preferences(&path, HostPreferences::default()).unwrap(),
+            load_host_preferences(&path, HostPreferences::default()).unwrap(),
             merged
         );
 
@@ -3915,7 +4108,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let returned: HostPreferences = response.json().await.unwrap();
         assert_eq!(returned.geometry, Some(geometry.clone()));
-        let stored = load_preferences(&path, HostPreferences::default()).unwrap();
+        let stored = load_host_preferences(&path, HostPreferences::default()).unwrap();
         assert_eq!(stored.geometry, Some(geometry));
         assert_eq!(stored.appearance.theme, "light");
         assert_eq!(stored.navigation_width, 318.0);

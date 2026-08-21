@@ -701,6 +701,16 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(/\.settings-about-card \{[^}]*display:\s*grid/s);
   });
 
+  it("keeps desktop update controls in General rather than About", () => {
+    const general = settings.indexOf('<h1 id="settings-title">General</h1>');
+    const automaticUpdates = settings.indexOf('id="settings-automatic-updates"');
+    const about = settings.indexOf('<h1 id="settings-title">About</h1>');
+    expect(general).toBeGreaterThan(-1);
+    expect(automaticUpdates).toBeGreaterThan(general);
+    expect(automaticUpdates).toBeLessThan(about);
+    expect(settings).toContain("Install v${this.#desktopUpdateState?.availableVersion");
+  });
+
   it("ships every current semantic palette from the generated source", () => {
     expect([...themes.matchAll(/\[data-theme="([^"]+)"\]/g)].map((match) => match[1])).toEqual([
       "dark",

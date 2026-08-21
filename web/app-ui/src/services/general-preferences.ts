@@ -5,10 +5,12 @@ import {
 
 export interface GeneralPreferences {
   readonly preventSleepWhileRunning: boolean;
+  readonly automaticUpdates: boolean;
 }
 
 export const DEFAULT_GENERAL_PREFERENCES: GeneralPreferences = Object.freeze({
   preventSleepWhileRunning: true,
+  automaticUpdates: true,
 });
 
 const STORAGE_KEY = "trouve.general.v1";
@@ -26,6 +28,10 @@ export const normalizeGeneralPreferences = (
     typeof value.preventSleepWhileRunning === "boolean"
       ? value.preventSleepWhileRunning
       : fallback.preventSleepWhileRunning,
+  automaticUpdates:
+    typeof value.automaticUpdates === "boolean"
+      ? value.automaticUpdates
+      : fallback.automaticUpdates,
 });
 
 export const browserGeneralPreferenceStorage = (

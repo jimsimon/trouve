@@ -1,14 +1,16 @@
-# ADR 0022: Automatic desktop updates at startup
+# ADR 0043: Automatic desktop updates at startup
 
-Status: Accepted (2026-07)
+Status: Accepted (2026-08)
 
 ## Context
 
-ADR 0021 gave direct binary installations a checksummed update path, but made
+ADR 0042 gave direct binary installations a checksummed update path, but made
 desktop installation an explicit follow-up action after a background check.
 That still requires users to notice the result and leaves many installations
 behind the release train. The desktop already has a client-local General
 settings store suitable for preferences that do not belong to server state.
+The Wry desktop and Lit frontend share these preferences through the native
+host bridge, so startup can read the same value before the web app exists.
 
 ## Decision
 
@@ -21,7 +23,7 @@ install actions available.
 
 `TROUVE_DISABLE_AUTO_UPDATE` remains a deployment-level override. Development
 builds still cannot replace themselves. Standalone server and search restart
-policy is unchanged from ADR 0021.
+policy is unchanged from ADR 0042.
 
 The updater remains a library linked into each release binary rather than an
 independently running executable. Updating any component therefore also

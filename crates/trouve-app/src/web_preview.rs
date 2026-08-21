@@ -11,8 +11,10 @@ mod native_notification;
 mod opener;
 #[path = "sleep.rs"]
 mod sleep;
+#[path = "startup.rs"]
+mod startup;
 #[path = "web_preview_support.rs"]
-mod web_preview_support;
+pub(crate) mod web_preview_support;
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -43,7 +45,8 @@ include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 type DirectoryPickerReply = oneshot::Sender<Result<Option<PathBuf>, String>>;
 type FilePickerReply = oneshot::Sender<Result<Option<Vec<NativeAttachment>>, String>>;
 
-enum AppEvent {
+pub(crate) enum AppEvent {
+    Startup(startup::Event),
     PickDirectory(DirectoryPickerReply),
     PickFiles(FilePickerReply),
     NativePickerClosed,
@@ -54,6 +57,9 @@ enum AppEvent {
     CloseDecisionApplied {
         request_id: u64,
         decision: CloseDecision,
+    },
+    RestartAfterUpdate {
+        version: String,
     },
     QuitNow,
 }
@@ -195,6 +201,14 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     )?;
 
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let startup = if product_host {
+        startup::run_preflight(&mut event_loop)?
+    } else {
+        startup::PreflightResult::continue_without_update()
+    };
+    if startup.exit_process {
+        return Ok(());
+    }
     let directory_proxy = event_loop.create_proxy();
     let file_proxy = event_loop.create_proxy();
     let quit_proxy = event_loop.create_proxy();
@@ -205,7 +219,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let notification_lifecycle = lifecycle.clone();
     let sleep_inhibitor = Arc::new(Mutex::new(sleep::SleepInhibitor::default()));
     let sleep_for_action = sleep_inhibitor.clone();
-    let native_actions = HostNativeActions::default()
+    let mut native_actions = HostNativeActions::default()
         .with_window_geometry()
         // Tao exposes focus and foreground transitions but no desktop
         // occlusion event, so that capability remains explicitly false.
@@ -276,6 +290,34 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 .map_err(|_| "desktop clipboard worker was interrupted".to_string())?
         })
         .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
+    if product_host && !cfg!(debug_assertions) {
+        let updates = startup::UpdateManager::new(startup.update_state);
+        updates.spawn_runtime_poll(web_preview_support::preference_path());
+        let status_updates = updates.clone();
+        let check_updates = updates.clone();
+        let install_updates = updates.clone();
+        let restart_proxy = event_loop.create_proxy();
+        native_actions = native_actions.with_desktop_updater(
+            move || Ok(status_updates.status()),
+            move || {
+                let updates = check_updates.clone();
+                async move { Ok(updates.check().await) }
+            },
+            move || {
+                let updates = install_updates.clone();
+                let restart_proxy = restart_proxy.clone();
+                async move {
+                    let state = updates.install_and_restart().await;
+                    if state.phase == trouve_desktop_host::DesktopUpdatePhase::Restarting
+                        && let Some(version) = state.available_version.clone()
+                    {
+                        let _ = restart_proxy.send_event(AppEvent::RestartAfterUpdate { version });
+                    }
+                    Ok(state)
+                }
+            },
+        );
+    }
     let host = if product_host {
         WebPreviewHost::start_product_with_native_actions(frontend, native_actions)?
     } else {
@@ -380,12 +422,15 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let geometry_updates_for_events = geometry_updates.clone();
     let mut geometry_save_deadline: Option<Instant> = None;
     let mut close_confirmation = CloseConfirmationWatchdog::default();
+    let restart_after_shutdown = Arc::new(Mutex::new(None::<String>));
+    let restart_after_events = restart_after_shutdown.clone();
     let exit_code = event_loop.run_return(move |event, _, control_flow| {
         *control_flow = control_flow_for_pending_deadlines(
             geometry_save_deadline,
             close_confirmation.deadline(),
         );
         match event {
+            Event::UserEvent(AppEvent::Startup(_)) => {}
             Event::UserEvent(AppEvent::PickDirectory(reply)) => {
                 let dialog = AsyncFileDialog::new()
                     .set_title("Open workspace (git repository)")
@@ -449,6 +494,12 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 if close_confirmation.resolve(request_id, decision) {
                     *control_flow = ControlFlow::Exit;
                 }
+            }
+            Event::UserEvent(AppEvent::RestartAfterUpdate { version }) => {
+                *restart_after_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version);
+                *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(AppEvent::QuitNow) => *control_flow = ControlFlow::Exit,
             Event::WindowEvent {
@@ -525,6 +576,13 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     drop(webview);
     drop(window);
     host.shutdown();
+    if let Some(version) = restart_after_shutdown
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        startup::restart_updated_app(&version)?;
+    }
     if exit_code != 0 {
         anyhow::bail!("desktop webview event loop exited with status {exit_code}");
     }

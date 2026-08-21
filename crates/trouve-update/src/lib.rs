@@ -1,5 +1,5 @@
 //! Checksummed self-updates for binaries published by the trouve release
-//! train (ADR 0021).
+//! train (ADR 0042).
 //!
 //! A release is selected by its canonical `vX.Y.Z` tag and exact
 //! component/target asset. The archive is downloaded to a temporary
@@ -468,6 +468,7 @@ fn extract_binary(
     binary_name: &str,
     destination: &Path,
 ) -> Result<()> {
+    let packaged_binary = Path::new("bin").join(binary_name);
     let mut output = std::fs::File::create(destination)
         .with_context(|| format!("creating {}", destination.display()))?;
     let written = match kind {
@@ -479,7 +480,7 @@ fn extract_binary(
             for entry in archive.entries().context("reading update tar archive")? {
                 let mut entry = entry.context("reading update tar entry")?;
                 let path = entry.path().context("reading update tar entry path")?;
-                if path != Path::new(binary_name) {
+                if path != Path::new(binary_name) && path != packaged_binary {
                     continue;
                 }
                 if !entry.header().entry_type().is_file() {
@@ -497,17 +498,20 @@ fn extract_binary(
                 .with_context(|| format!("opening {}", archive_path.display()))?;
             let mut archive =
                 zip::ZipArchive::new(archive_file).context("reading update zip archive")?;
+            let packaged_binary = format!("bin/{binary_name}");
             let matches = archive
                 .file_names()
-                .filter(|name| *name == binary_name)
-                .count();
-            if matches != 1 {
+                .filter(|name| *name == binary_name || *name == packaged_binary)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
                 bail!(
-                    "update archive contains {matches} entries named {binary_name}; expected one"
+                    "update archive contains {} usable entries named {binary_name}; expected one",
+                    matches.len()
                 );
             }
             let mut entry = archive
-                .by_name(binary_name)
+                .by_name(&matches[0])
                 .with_context(|| format!("reading {binary_name} from update zip archive"))?;
             if entry.is_dir() {
                 bail!("update archive entry {binary_name} is not a regular file");
@@ -662,6 +666,29 @@ mod tests {
         header.set_cksum();
         archive
             .append_data(&mut header, "trouve", payload.as_slice())
+            .unwrap();
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let output = temp.path().join("new-trouve");
+        extract_binary(&archive_path, ArchiveKind::TarGz, "trouve", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), payload);
+    }
+
+    #[test]
+    fn extracts_linux_package_binary_from_bin_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("update.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let payload = b"packaged trouve binary";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "bin/trouve", payload.as_slice())
             .unwrap();
         let encoder = archive.into_inner().unwrap();
         encoder.finish().unwrap();

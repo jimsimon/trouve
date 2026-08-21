@@ -1,6 +1,6 @@
-# ADR 0021: Checksummed self-updating release binaries
+# ADR 0042: Checksummed self-updating release binaries
 
-Status: Accepted (2026-07)
+Status: Accepted (2026-08)
 
 ## Context
 

@@ -1,10 +1,10 @@
-# ADR 0024: Startup-only automatic desktop installation
+# ADR 0045: Startup-only automatic desktop installation
 
-Status: Accepted (2026-07)
+Status: Accepted (2026-08)
 
 ## Context
 
-The pre-main updater from ADR 0023 can safely replace and restart the desktop
+The pre-main updater from ADR 0044 can safely replace and restart the desktop
 before server, session, or user work begins. Reusing that automatic install
 behavior for a release discovered after the main window appears would instead
 interrupt active agent turns and the user's current work without consent.

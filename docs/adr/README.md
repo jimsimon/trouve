@@ -51,3 +51,7 @@ sequentially.
 | [0039](0039-retire-servo-qualification-hosts.md) | Retire Servo qualification hosts | Accepted |
 | [0040](0040-durable-root-cause-history-for-code-review.md) | Durable root-cause history for code review | Accepted |
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
+| [0042](0042-checksummed-self-updating-release-binaries.md) | Checksummed self-updating release binaries | Accepted |
+| [0043](0043-automatic-desktop-updates-at-startup.md) | Automatic desktop updates at startup | Accepted |
+| [0044](0044-pre-main-window-update-preflight.md) | Pre-main-window update preflight | Accepted |
+| [0045](0045-startup-only-automatic-desktop-installation.md) | Startup-only automatic desktop installation | Accepted |

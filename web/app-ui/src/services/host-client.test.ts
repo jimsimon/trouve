@@ -33,6 +33,7 @@ const validCapabilities = {
   open_local_file: true,
   persistent_preferences: true,
   reveal_local_file: true,
+  self_update: true,
   sleep_inhibition: true,
   user_attention: true,
   visibility: true,
@@ -81,6 +82,7 @@ describe("HostClient", () => {
       bridgeVersion: 8,
       directoryPicker: true,
       lifecycleEvents: true,
+      selfUpdate: true,
     });
     expect(client.systemFontFamilies()).toEqual(["Noto Sans", "Zed Sans"]);
     expect(client.mutationHeaders()).toEqual({
@@ -115,6 +117,42 @@ describe("HostClient", () => {
     await client.bootstrap();
     await expect(client.putPreferences(preferences)).resolves.toEqual(preferences);
     expect(requests.at(-1)?.headers.get("x-trouve-host-csrf")).toBe("b".repeat(64));
+  });
+
+  it("reads update status and authenticates explicit update actions", async () => {
+    const requests: Request[] = [];
+    const update = {
+      available_version: "4.1.0",
+      current_version: "4.0.0",
+      message: "Version 4.1.0 is ready to install.",
+      phase: "available",
+      progress_percent: null,
+    } as const;
+    const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      if (request.url.endsWith("/capabilities")) {
+        return Response.json({ capabilities: validCapabilities, csrf_token: "u".repeat(64) });
+      }
+      return Response.json(update);
+    });
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+    await client.bootstrap();
+
+    await expect(client.getDesktopUpdate()).resolves.toEqual({
+      availableVersion: "4.1.0",
+      currentVersion: "4.0.0",
+      message: "Version 4.1.0 is ready to install.",
+      phase: "available",
+      progressPercent: undefined,
+    });
+    await client.checkDesktopUpdate();
+    await client.installDesktopUpdate();
+
+    expect(requests.at(-2)?.url).toContain("/update/check");
+    expect(requests.at(-1)?.url).toContain("/update/install");
+    expect(requests.at(-2)?.headers.get("x-trouve-host-csrf")).toBe("u".repeat(64));
+    expect(requests.at(-1)?.headers.get("x-trouve-host-csrf")).toBe("u".repeat(64));
   });
 
   it("gates close acknowledgement on the independently versioned bridge", async () => {
@@ -723,6 +761,7 @@ describe("HostClient", () => {
   it("maps and updates all host-backed presentation preferences", () => {
     expect(generalPreferencesFromHost(preferences)).toEqual({
       preventSleepWhileRunning: true,
+      automaticUpdates: true,
     });
     expect(chatPreferencesFromHost(preferences)).toEqual({
       collapseSequentialToolCalls: true,
@@ -769,6 +808,7 @@ describe("HostClient", () => {
     });
     let next = withHostGeneralPreferences(preferences, {
       preventSleepWhileRunning: false,
+      automaticUpdates: false,
     });
     next = withHostChatPreferences(next, {
       collapseSequentialToolCalls: true,
@@ -798,6 +838,7 @@ describe("HostClient", () => {
       pinnedThreadTabs: ["th-1"],
     });
     expect(next.general?.prevent_sleep_while_running).toBe(false);
+    expect(next.general?.automatic_updates).toBe(false);
     expect(next.chat?.collapse_sequential_tool_calls).toBe(true);
     expect(next.chat?.collapse_thinking_with_tools).toBe(true);
     expect(next.chat?.collapse_compaction_with_tools).toBe(true);

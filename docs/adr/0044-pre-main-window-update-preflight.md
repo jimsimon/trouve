@@ -1,10 +1,10 @@
-# ADR 0023: Pre-main-window update preflight
+# ADR 0044: Pre-main-window update preflight
 
-Status: Accepted (2026-07)
+Status: Accepted (2026-08)
 
 ## Context
 
-ADR 0022 made desktop updates automatic at startup, but the original
+ADR 0043 made desktop updates automatic at startup, but the original
 implementation opened the full application while checking and then restarted
 it without any visible update state outside Settings. That made slow downloads
 look like an unexplained restart and allowed the embedded server and session
@@ -24,8 +24,10 @@ application unusable. A successful replacement restarts with a one-shot
 version marker; the replacement process consumes that marker and opens the
 main window without repeating the preflight.
 
-The startup window is part of `trouve-app` and uses the same Slint theme and
-assets. Disabling automatic updates in Settings or with
+The startup window is part of `trouve-app`. It is a small Wry HTML surface on
+the Tao event loop that is later reused for the main Lit application window;
+the updater does not start a second UI framework or nested event loop.
+Disabling automatic updates in Settings or with
 `TROUVE_DISABLE_AUTO_UPDATE` skips the preflight entirely. Manual checks remain
 inside Settings → General.
 

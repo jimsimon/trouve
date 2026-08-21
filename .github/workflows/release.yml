@@ -326,6 +326,10 @@ jobs:
       # softprops/action-gh-release uploads assets to the repository release.
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
       - name: Download compliance artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -368,6 +372,15 @@ jobs:
             fi
           ) | sort -k2 > "$checksum_file"
           mv "$checksum_file" artifacts/SHA256SUMS
+      - name: Verify self-update release contract
+        shell: bash
+        run: |
+          args=()
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            args+=(--allow-missing-search)
+          fi
+          python3 scripts/verify_release_assets.py \
+            artifacts/SHA256SUMS "$RELEASE_TAG" "${args[@]}"
       # Attaches to the existing release when one was published from the UI;
       # creates the release when the run came from a pushed tag.
       - name: Create or update GitHub Release
@@ -588,20 +601,27 @@ jobs:
             return 1
           }
 
+          wait_until_published() {
+            local crate="$1"
+            for attempt in $(seq 1 18); do
+              if published "$crate"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 18 ]; then
+                echo "$crate@$version did not become visible on crates.io." >&2
+                return 1
+              fi
+              sleep 10
+            done
+          }
+
           publish_with_retries trouve-process 6
+          publish_with_retries trouve-update 6
 
           # crates.io may accept a crate before its sparse index entry is visible
           # to a dependent package. Wait for that entry before publishing search.
-          for attempt in $(seq 1 18); do
-            if published trouve-process; then
-              break
-            fi
-            if [ "$attempt" -eq 18 ]; then
-              echo "trouve-process@$version did not become visible on crates.io." >&2
-              exit 1
-            fi
-            sleep 10
-          done
+          wait_until_published trouve-process
+          wait_until_published trouve-update
 
           publish_with_retries trouve-search 6
         env:

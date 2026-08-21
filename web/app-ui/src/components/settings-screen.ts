@@ -15,6 +15,7 @@ import {
   THEME_NAMES,
 } from "../services/theme-controller.js";
 import { APPEARANCE_FONT_SIZES } from "../services/appearance-preferences.js";
+import type { DesktopUpdateState } from "../services/host-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./cli-settings.js";
@@ -75,6 +76,11 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #notificationPending = false;
   #fontFamiliesRequested = false;
   #fontFamiliesLoading = false;
+  #desktopUpdateState: DesktopUpdateState | undefined;
+  #desktopUpdateLoading = false;
+  #desktopUpdateActionPending = false;
+  #desktopUpdateError = "";
+  #desktopUpdatePollTimer: ReturnType<typeof setInterval> | undefined;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -99,10 +105,12 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   override connectedCallback(): void {
     super.connectedCallback();
     globalThis.addEventListener("focus", this.#refreshWebNotificationCapability);
+    queueMicrotask(() => void this.#loadDesktopUpdate(true));
   }
 
   override disconnectedCallback(): void {
     globalThis.removeEventListener("focus", this.#refreshWebNotificationCapability);
+    this.#stopDesktopUpdatePolling();
     super.disconnectedCallback();
   }
 
@@ -110,6 +118,69 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     if (settingsSection(this.section) === "appearance") {
       void this.#loadFontFamilies();
     }
+    if (
+      settingsSection(this.section) === "general"
+      && this.#desktopUpdateState === undefined
+      && !this.#desktopUpdateLoading
+    ) {
+      void this.#loadDesktopUpdate(true);
+    }
+  }
+
+  async #loadDesktopUpdate(silent: boolean): Promise<void> {
+    const capabilities = this.#capabilities.value;
+    const action = this.#services.value?.nativeHost?.getDesktopUpdate;
+    if (
+      capabilities === undefined
+      || !readSignal(capabilities.current).selfUpdate
+      || action === undefined
+      || this.#desktopUpdateLoading
+    ) return;
+    this.#desktopUpdateLoading = true;
+    try {
+      this.#desktopUpdateState = await action();
+      this.#desktopUpdateError = "";
+    } catch {
+      if (!silent) this.#desktopUpdateError = "Update status could not be loaded.";
+    } finally {
+      this.#desktopUpdateLoading = false;
+      if (this.isConnected) this.requestUpdate();
+    }
+  }
+
+  async #runDesktopUpdateAction(): Promise<void> {
+    const nativeHost = this.#services.value?.nativeHost;
+    const installing = this.#desktopUpdateState?.phase === "available";
+    const action = installing
+      ? nativeHost?.installDesktopUpdate
+      : nativeHost?.checkDesktopUpdate;
+    if (action === undefined || this.#desktopUpdateActionPending) return;
+    this.#desktopUpdateActionPending = true;
+    this.#desktopUpdateError = "";
+    if (installing) {
+      this.#desktopUpdatePollTimer = globalThis.setInterval(
+        () => void this.#loadDesktopUpdate(true),
+        500,
+      );
+    }
+    this.requestUpdate();
+    try {
+      this.#desktopUpdateState = await action();
+    } catch {
+      this.#desktopUpdateError = installing
+        ? "The update could not be installed. You can try again without leaving the app."
+        : "The update check could not be completed.";
+    } finally {
+      this.#desktopUpdateActionPending = false;
+      this.#stopDesktopUpdatePolling();
+      if (this.isConnected) this.requestUpdate();
+    }
+  }
+
+  #stopDesktopUpdatePolling(): void {
+    if (this.#desktopUpdatePollTimer === undefined) return;
+    globalThis.clearInterval(this.#desktopUpdatePollTimer);
+    this.#desktopUpdatePollTimer = undefined;
   }
 
   async #loadFontFamilies(): Promise<void> {
@@ -219,6 +290,13 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     const generalPreferences = readSignal(services.generalPreferences);
     const chatPreferences = readSignal(services.chatPreferences);
     const notificationPreferences = readSignal(services.notificationPreferences);
+    const updatePhase = this.#desktopUpdateState?.phase;
+    const updateBusy = this.#desktopUpdateActionPending
+      || updatePhase === "checking"
+      || updatePhase === "downloading"
+      || updatePhase === "verifying"
+      || updatePhase === "installing"
+      || updatePhase === "restarting";
     const routeSection = this.section;
     return html`
       <div class="settings-screen">
@@ -262,6 +340,60 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                         : html`<p class="settings-note capability-note">${services.deployment === "pwa"
                           ? "Wake lock depends on browser and device support in the installed PWA."
                           : "This preview host does not currently expose sleep inhibition; the preference is retained."}</p>`}
+                      ${services.deployment === "desktop"
+                        ? html`
+                            <div class="settings-subsection">
+                              <h2>Updates</h2>
+                              <label class="settings-check compact" for="settings-automatic-updates">
+                                <input
+                                  id="settings-automatic-updates"
+                                  type="checkbox"
+                                  .checked=${generalPreferences.automaticUpdates}
+                                  @change=${(event: Event) => services.setGeneralPreferences({
+                                    automaticUpdates:
+                                      (event.currentTarget as HTMLInputElement).checked,
+                                  })}
+                                />
+                                <span>Automatically update before opening trouve</span>
+                              </label>
+                              <p class="settings-note">When enabled, startup checks, downloads, verifies, and installs a release before the main window opens. Updates found while you are using trouve wait for this button or a later restart.</p>
+                              ${currentCapabilities.selfUpdate
+                                ? html`
+                                    <section class="desktop-update-card" aria-label="Desktop update status">
+                                      <div class="desktop-update-heading">
+                                        <strong>${this.#desktopUpdateState?.message
+                                          ?? (this.#desktopUpdateLoading ? "Loading update status…" : "Ready to check for updates")}</strong>
+                                        <span class="desktop-update-version">v${this.#desktopUpdateState?.currentVersion ?? __TROUVE_FRONTEND_VERSION__}</span>
+                                      </div>
+                                      ${this.#desktopUpdateState?.progressPercent === undefined
+                                        ? nothing
+                                        : html`<progress
+                                            max="100"
+                                            .value=${this.#desktopUpdateState.progressPercent}
+                                            aria-label="Update progress"
+                                          ></progress>`}
+                                      ${this.#desktopUpdateError === ""
+                                        ? nothing
+                                        : html`<p class="settings-note" role="alert">${this.#desktopUpdateError}</p>`}
+                                      <div class="settings-actions">
+                                        <button
+                                          type="button"
+                                          ?disabled=${updateBusy || this.#desktopUpdateLoading}
+                                          @click=${() => void this.#runDesktopUpdateAction()}
+                                        >${updatePhase === "available"
+                                            ? `Install v${this.#desktopUpdateState?.availableVersion ?? "update"} and restart`
+                                            : updateBusy
+                                              ? "Updating…"
+                                              : updatePhase === "error"
+                                                ? "Try again"
+                                                : "Check for updates"}</button>
+                                      </div>
+                                    </section>
+                                  `
+                                : html`<p class="settings-note capability-note">Self-update is disabled in development and web-preview builds. Packaged release builds expose update status and manual installation here.</p>`}
+                            </div>
+                          `
+                        : nothing}
                     </div>
                   `
                 : active === "providers"
@@ -519,6 +651,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                                 ["Visibility state", currentCapabilities.visibility],
                                 ["Occlusion state", currentCapabilities.occlusion],
                                 ["Installable", currentCapabilities.installable],
+                                ["Self-update", currentCapabilities.selfUpdate],
                               ].map(
                                 ([label, value]) => html`<div><dt>${label}</dt><dd>${typeof value === "boolean" ? (value ? "Available" : "Unavailable") : value}</dd></div>`,
                               )}
