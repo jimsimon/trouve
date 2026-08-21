@@ -106,6 +106,7 @@ describe("chat find model", () => {
 
   it("reuses searchable projections while item revisions are unchanged", () => {
     let reads = 0;
+    let revisionReads = 0;
     const args: Record<string, unknown> = {};
     Object.defineProperty(args, "needle", {
       enumerable: true,
@@ -114,22 +115,31 @@ describe("chat find model", () => {
         return "Cached projection";
       },
     });
-    const structured: ThreadChatItem[] = [{
+    let currentArgs: unknown = args;
+    const tool: Extract<ThreadChatItem, { readonly kind: "tool" }> = {
       id: "tool:cached",
       kind: "tool",
       callId: "call-cached",
       tool: "read_file",
-      args,
+      get args() {
+        revisionReads += 1;
+        return currentArgs;
+      },
+      set args(value: unknown) {
+        currentArgs = value;
+      },
       status: "ok",
       result: null,
       output: { text: "", bytes: 0, omitted: false },
-    }];
+    };
+    const structured: ThreadChatItem[] = [tool];
 
     expect(chatFindUnitIds(structured, "cached", false)).toEqual(["turn:0:tool:cached"]);
+    const coldRevisionReads = revisionReads;
     expect(chatFindUnitIds(structured, "projection", false)).toEqual(["turn:0:tool:cached"]);
     expect(reads).toBe(1);
-    const tool = structured[0];
-    if (tool?.kind !== "tool") throw new Error("missing cached tool fixture");
+    // Layout checks tool args once; the only other read is the single revision validation.
+    expect(revisionReads - coldRevisionReads).toBe(2);
     tool.args = { needle: "Updated projection" };
     expect(chatFindUnitIds(structured, "updated", false)).toEqual(["turn:0:tool:cached"]);
   });
