@@ -6313,7 +6313,7 @@ impl Engine {
                 event = "COMMENT";
                 continue;
             }
-            if status.as_u16() == 422 && include_comments && review_comments_failed_to_place(&body)
+            if github_review_should_retry_without_comments(status.as_u16(), include_comments, &body)
             {
                 // A model can name a line that is not commentable in GitHub's
                 // diff. Without a visible blocking inline comment, publish a
@@ -9199,6 +9199,37 @@ fn review_comments_failed_to_place(body: &str) -> bool {
     !errors.is_empty() && errors.iter().all(placement_error)
 }
 
+fn generic_review_validation_failure(body: &str) -> bool {
+    let message = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(payload) => {
+            if payload.get("errors").is_some() {
+                return false;
+            }
+            payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        }
+        Err(_) => body.trim().to_owned(),
+    }
+    .to_ascii_lowercase();
+    matches!(
+        message.as_str(),
+        "unprocessable entity" | "validation failed"
+    )
+}
+
+fn github_review_should_retry_without_comments(
+    status: u16,
+    include_comments: bool,
+    body: &str,
+) -> bool {
+    status == 422
+        && include_comments
+        && (review_comments_failed_to_place(body) || generic_review_validation_failure(body))
+}
+
 fn apply_reviewer_overrides(
     reviewers: Vec<ReviewerProfile>,
     overrides: &[ReviewerOverride],
@@ -9846,8 +9877,11 @@ fn pull_title_has_performance_intent(title: &str) -> bool {
                 | "latency"
                 | "throughput"
                 | "startup"
+                | "speed"
                 | "speedup"
                 | "faster"
+                | "accelerate"
+                | "accelerated"
                 | "optimize"
                 | "optimized"
                 | "optimization"
@@ -9856,8 +9890,25 @@ fn pull_title_has_performance_intent(title: &str) -> bool {
                 | "optimisation"
                 | "bottleneck"
                 | "contention"
+                | "resource"
+                | "resources"
+                | "memory"
+                | "cpu"
+                | "allocation"
+                | "allocations"
+                | "cache"
+                | "cached"
+                | "caches"
                 | "caching"
+                | "batch"
+                | "batched"
+                | "batching"
+                | "paginate"
+                | "paginated"
                 | "pagination"
+                | "blocking"
+                | "hot"
+                | "hotpath"
         )
     })
 }
@@ -11157,6 +11208,38 @@ fn merge_review_task_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn read_mock_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 2048];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+            let Some(headers_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or_default();
+            if request.len() >= headers_end.saturating_add(content_length) {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap().to_ascii_lowercase()
+    }
 
     async fn await_mock_server(server: tokio::task::JoinHandle<()>) {
         tokio::time::timeout(Duration::from_secs(5), server)
@@ -14156,6 +14239,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_placement_422_retries_once_without_inline_comments() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:generic-placement");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One inline issue.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Test issue".into(),
+                    body: "Eligible issue.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected_event, expected_comments, status, body) in [
+                (
+                    r#""event":"request_changes""#,
+                    r#""comments":[{"path":"src/lib.rs""#,
+                    "422 Unprocessable Entity",
+                    r#"{"message":"Unprocessable Entity"}"#,
+                ),
+                (
+                    r#""event":"comment""#,
+                    r#""comments":[]"#,
+                    "201 Created",
+                    r#"{"id":77,"html_url":"https://github.com/review-77"}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_mock_http_request(&mut stream).await;
+                assert!(
+                    request.starts_with("post /repos/acme/widgets/pulls/42/reviews "),
+                    "{request}"
+                );
+                assert!(request.contains(expected_event), "{request}");
+                assert!(request.contains(expected_comments), "{request}");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine
+                .publish_review(&api, &job, &findings, true)
+                .await
+                .unwrap(),
+            "https://github.com/review-77"
+        );
+        await_mock_server(server).await;
+        let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.publication_accepted);
+        assert_eq!(
+            engine.store.code_review_findings(&job.id).unwrap()[0].github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+        );
+    }
+
+    #[tokio::test]
     async fn clean_review_dismisses_the_apps_block_and_publishes_only_a_comment() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -14451,7 +14624,7 @@ mod tests {
     }
 
     #[test]
-    fn only_line_placement_validation_errors_are_suppressed() {
+    fn only_placement_or_generic_validation_errors_retry_without_comments() {
         for body in [
             r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReviewComment","field":"line","code":"invalid"}]}"#,
             r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReviewComment","field":"path","code":"invalid"}]}"#,
@@ -14459,6 +14632,10 @@ mod tests {
             r#"{"message":"Validation Failed","errors":["Pull request review thread line must be part of the diff"]}"#,
         ] {
             assert!(review_comments_failed_to_place(body), "{body}");
+            assert!(
+                github_review_should_retry_without_comments(422, true, body),
+                "{body}"
+            );
         }
         for body in [
             r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReview","field":"body","code":"missing"}]}"#,
@@ -14467,7 +14644,31 @@ mod tests {
             r#"{"message":"Validation Failed","errors":[{"field":"line","code":"invalid"},{"field":"body","code":"missing"}]}"#,
         ] {
             assert!(!review_comments_failed_to_place(body), "{body}");
+            assert!(
+                !github_review_should_retry_without_comments(422, true, body),
+                "{body}"
+            );
         }
+        for body in [
+            r#"{"message":"Unprocessable Entity"}"#,
+            r#"{"message":"Validation Failed"}"#,
+            "Unprocessable Entity",
+        ] {
+            assert!(
+                github_review_should_retry_without_comments(422, true, body),
+                "{body}"
+            );
+        }
+        assert!(!github_review_should_retry_without_comments(
+            422,
+            false,
+            r#"{"message":"Unprocessable Entity"}"#
+        ));
+        assert!(!github_review_should_retry_without_comments(
+            400,
+            true,
+            r#"{"message":"Unprocessable Entity"}"#
+        ));
     }
 
     #[test]
@@ -18473,6 +18674,14 @@ mod tests {
         let prompt = semantic_routing_prompt(&job, &batch, 0, 1, &reviewers);
 
         assert!(pull_title_has_performance_intent(&job.pull_title));
+        for title in [
+            "Improve batching",
+            "Reduce resource use",
+            "Speed up query execution",
+            "Remove blocking work from the hot path",
+        ] {
+            assert!(pull_title_has_performance_intent(title), "{title}");
+        }
         assert!(!pull_title_has_performance_intent(
             "Correct empty-state rendering"
         ));
