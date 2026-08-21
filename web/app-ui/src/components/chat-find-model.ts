@@ -34,8 +34,13 @@ export interface ChatFindMatches {
 
 interface CachedSearchableItem {
   readonly revision: readonly unknown[];
+  readonly projection: CachedSearchableProjection;
+}
+
+interface CachedSearchableProjection {
   readonly text: string;
   readonly textBytes: number;
+  active: boolean;
 }
 
 interface SearchableItemState {
@@ -43,14 +48,15 @@ interface SearchableItemState {
   readonly cachedText: string | undefined;
 }
 
-const searchableItemCache = new Map<object, CachedSearchableItem>();
+const searchableItemCache = new WeakMap<object, CachedSearchableItem>();
+const searchableProjectionLru = new Set<CachedSearchableProjection>();
 let searchableItemCacheTextBytes = 0;
 
-const removeCachedSearchableItem = (item: object): void => {
-  const cached = searchableItemCache.get(item);
-  if (cached === undefined) return;
-  searchableItemCache.delete(item);
-  searchableItemCacheTextBytes -= cached.textBytes;
+const removeCachedSearchableProjection = (projection: CachedSearchableProjection): void => {
+  if (!projection.active) return;
+  searchableProjectionLru.delete(projection);
+  searchableItemCacheTextBytes -= projection.textBytes;
+  projection.active = false;
 };
 
 const cacheSearchableItem = (
@@ -58,21 +64,26 @@ const cacheSearchableItem = (
   revision: readonly unknown[],
   text: string,
 ): void => {
-  removeCachedSearchableItem(item);
-  // JavaScript strings retain at most two bytes per code unit. Counting that
-  // upper bound keeps both the cached text and its strongly held item keys
-  // under explicit aggregate limits.
+  const previous = searchableItemCache.get(item);
+  if (previous !== undefined) removeCachedSearchableProjection(previous.projection);
+  // JavaScript strings retain at most two bytes per code unit. The strong LRU
+  // owns only these detached projections; source items and their revision
+  // graphs remain weakly owned and can be collected with their thread view.
   const textBytes = text.length * 2;
   if (textBytes > SEARCH_CACHE_TEXT_BYTE_LIMIT) return;
   while (
-    searchableItemCache.size >= SEARCH_CACHE_ENTRY_LIMIT
+    searchableProjectionLru.size >= SEARCH_CACHE_ENTRY_LIMIT
     || searchableItemCacheTextBytes + textBytes > SEARCH_CACHE_TEXT_BYTE_LIMIT
   ) {
-    const oldest = searchableItemCache.keys().next().value as object | undefined;
+    const oldest = searchableProjectionLru.values().next().value as
+      | CachedSearchableProjection
+      | undefined;
     if (oldest === undefined) break;
-    removeCachedSearchableItem(oldest);
+    removeCachedSearchableProjection(oldest);
   }
-  searchableItemCache.set(item, { revision, text, textBytes });
+  const projection = { text, textBytes, active: true };
+  searchableItemCache.set(item, { revision, projection });
+  searchableProjectionLru.add(projection);
   searchableItemCacheTextBytes += textBytes;
 };
 
@@ -255,18 +266,20 @@ const sameRevision = (left: readonly unknown[], right: readonly unknown[]): bool
 const searchableItemState = (item: ThreadChatItem): SearchableItemState => {
   const revision = searchableItemRevision(item);
   const cached = searchableItemCache.get(item);
-  if (cached !== undefined && !sameRevision(cached.revision, revision)) {
-    removeCachedSearchableItem(item);
+  const valid = cached !== undefined
+    && cached.projection.active
+    && sameRevision(cached.revision, revision);
+  if (cached !== undefined && !valid) {
+    removeCachedSearchableProjection(cached.projection);
+    searchableItemCache.delete(item);
   } else if (cached !== undefined) {
     // Refresh the insertion order so eviction is least-recently-used.
-    searchableItemCache.delete(item);
-    searchableItemCache.set(item, cached);
+    searchableProjectionLru.delete(cached.projection);
+    searchableProjectionLru.add(cached.projection);
   }
   return {
     revision,
-    cachedText: cached !== undefined && sameRevision(cached.revision, revision)
-      ? cached.text
-      : undefined,
+    cachedText: valid && cached !== undefined ? cached.projection.text : undefined,
   };
 };
 
