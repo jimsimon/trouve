@@ -1441,7 +1441,7 @@ fn parse_thinking_budget(value: &str) -> Option<u64> {
     }
     let (whole, fraction) = mantissa
         .split_once('.')
-        .map_or((mantissa, ""), |parts| parts);
+        .unwrap_or((mantissa, ""));
     if (whole.is_empty() && fraction.is_empty())
         || !whole
             .bytes()
