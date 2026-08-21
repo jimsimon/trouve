@@ -266,6 +266,9 @@ impl AgentBackend for CodexBackend {
 
     async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
         let mcp_config = thread_mcp_config(&codex_config_override(turn));
+        if mcp_config.is_null() {
+            return None;
+        }
         let cached = self.server.lock().await.clone();
         let needs_load = match (cached.as_ref(), turn.session.as_deref()) {
             (Some(server), Some(thread_id)) if !server.is_closed() => {
