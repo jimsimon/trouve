@@ -259,6 +259,18 @@ export const canonicalThinkingSelection = (
     : undefined;
 };
 
+/** Preserve an unchanged persisted token when its model metadata is unavailable. */
+export const canonicalThinkingSelectionOrPreserve = (
+  option: ThinkingOption | null | undefined,
+  value: string | null,
+  previous: string | null | undefined,
+  modelMetadataAvailable: boolean,
+): string | null | undefined => {
+  if (value === null) return null;
+  return canonicalThinkingSelection(option, value)
+    ?? (!modelMetadataAvailable && value === previous ? value : undefined);
+};
+
 /** Validate a persisted/form thinking token against its model-advertised control. */
 export const thinkingSelectionIsValid = (
   option: ThinkingOption | null | undefined,
@@ -332,8 +344,8 @@ export const resolveNewThreadDefaults = (
   const inheritedThinking = [
     nonEmpty(mode?.default_thinking_level),
     nonEmpty(providers?.default_thinking_level),
-  ].find((candidate): candidate is string =>
-    candidate !== undefined && thinkingSelectionIsValid(option, candidate));
+  ].map((candidate) => canonicalThinkingSelection(option, candidate))
+    .find((candidate): candidate is string => candidate !== undefined);
   const thinking = inheritedThinking ?? defaultThinkingSelection(option);
   const inheritedPermissionMode = validPermissionMode(mode?.default_permission_mode)
     ?? validPermissionMode(providers?.default_permission_mode);

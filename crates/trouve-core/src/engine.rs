@@ -1420,6 +1420,16 @@ pub(crate) fn advertised_thinking_budget(
     })
 }
 
+fn parse_thinking_budget(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().or_else(|| {
+        let parsed = value.parse::<f64>().ok()?;
+        (parsed.is_finite()
+            && parsed.fract() == 0.0
+            && (0.0..=9_007_199_254_740_991.0).contains(&parsed))
+        .then_some(parsed as u64)
+    })
+}
+
 /// Resolve the canonical inherited `thinking_level` key through a model's
 /// advertised options schema. Unknown/unsupported levels fall back to the
 /// model's schema default; models without an enum thinking knob drop the
@@ -1444,7 +1454,7 @@ fn normalize_thinking_option(
             }
             let selected = canonical
                 .as_str()
-                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(parse_thinking_budget)
                 .filter(|value| *value >= minimum && maximum.is_none_or(|max| *value <= max))
                 .or_else(|| {
                     model
@@ -21847,6 +21857,14 @@ default_permission_mode = "ask"
         assert_eq!(
             resolved_thinking_level(&options, Some(&fixed_model)).as_deref(),
             Some("16384")
+        );
+
+        options.remove("thinking_budget_tokens");
+        options.insert("thinking_level".into(), serde_json::json!("1e4"));
+        normalize_thinking_option(&mut options, Some(&fixed_model));
+        assert_eq!(
+            options.get("thinking_budget_tokens"),
+            Some(&serde_json::json!(10000))
         );
 
         // No thinking enum means the inherited option is not sent.

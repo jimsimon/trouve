@@ -9,6 +9,7 @@ import {
   beginNewSessionOptionLoad,
   canSubmitNewSession,
   canonicalThinkingSelection,
+  canonicalThinkingSelectionOrPreserve,
   createNewSessionOptionsLifecycle,
   createNewSessionThreadRequest,
   createNewSessionThreadRequestFromSnapshot,
@@ -153,6 +154,16 @@ describe("new session model", () => {
     expect(defaultThinkingSelection(option)).toBe("4096");
   });
 
+  it("preserves unchanged thinking defaults while model metadata is unavailable", () => {
+    expect(canonicalThinkingSelectionOrPreserve(undefined, "high", "high", false))
+      .toBe("high");
+    expect(canonicalThinkingSelectionOrPreserve(undefined, "medium", "high", false))
+      .toBeUndefined();
+    expect(canonicalThinkingSelectionOrPreserve(undefined, "high", "high", true))
+      .toBeUndefined();
+    expect(canonicalThinkingSelectionOrPreserve(undefined, null, "high", false)).toBeNull();
+  });
+
   it("rejects malformed schemas, enums, and defaults", () => {
     expect(thinkingOption(model([]))).toBeUndefined();
     expect(thinkingOption(model({ properties: [] }))).toBeUndefined();
@@ -261,6 +272,26 @@ describe("new session model", () => {
       modelInfo,
     })).toMatchObject({
       model_options: { thinking_budget_tokens: 8192 },
+    });
+  });
+
+  it("canonicalizes inherited exponent-form fixed budgets", () => {
+    const modelInfo = model({
+      properties: {
+        thinking_budget_tokens: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 32768,
+        },
+      },
+    }, "provider/fixed");
+    const defaults = resolveNewThreadDefaults([mode()], [modelInfo], {
+      ...providers(modelInfo.id),
+      default_thinking_level: "1e4",
+    });
+    expect(defaults).toMatchObject({
+      thinking: "10000",
+      inheritedThinking: "10000",
     });
   });
 
