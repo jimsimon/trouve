@@ -234,15 +234,19 @@ export const reconcileNewThreadDraft = (
     && (draft.permissionMode === "ask"
       || draft.permissionMode === "allow_list"
       || draft.permissionMode === "yolo");
+  const modelOptions = edits.thinking
+    ? sanitizeModelOptions(effectiveNewThreadModel(refreshed, catalog), draft.modelOptions)
+    : {};
+  const thinking = thinkingOption(effectiveNewThreadModel(refreshed, catalog));
+  const hasThinkingOverride = thinking !== undefined
+    && modelOptions[thinking.key] !== undefined;
 
   return {
     ...draft,
     modeId: refreshed.modeId,
     modelId: refreshed.modelId,
-    modelOptions: edits.thinking
-      ? sanitizeModelOptions(effectiveNewThreadModel(refreshed, catalog), draft.modelOptions)
-      : {},
-    inheritedThinking: refreshed.inheritedThinking,
+    modelOptions,
+    inheritedThinking: hasThinkingOverride ? undefined : refreshed.inheritedThinking,
     permissionMode: keepPermission ? draft.permissionMode : refreshed.permissionMode,
     inheritedPermissionMode: keepPermission
       ? undefined

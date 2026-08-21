@@ -3,7 +3,7 @@ import { css, html, LitElement, nothing } from "lit";
 
 import { appServicesContext, appStoreContext } from "../contexts/app-contexts.js";
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolAutomation,
   ProtocolAutomationTemplate,
   ProtocolModelInfo,
@@ -347,7 +347,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   #automations: readonly ProtocolAutomation[] = [];
   #templates: readonly ProtocolAutomationTemplate[] = [];
   #workspaces: readonly ProtocolWorkspace[] = [];
-  #modes: readonly ProtocolAgentMode[] = [];
+  #modes: readonly ProtocolAgentPersona[] = [];
   #models: readonly ProtocolModelInfo[] = [];
   #providers: ProtocolProvidersResponse | undefined;
   #modesLoading = false;
@@ -401,7 +401,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#modesError = "";
     this.requestUpdate();
     try {
-      const modes = await services.protocol.modes(workspaceId);
+      const modes = await services.protocol.personas(workspaceId);
       if (
         generation !== this.#modesGeneration
         || workspaceId !== this.#modesWorkspaceId
@@ -1024,7 +1024,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
 
   #effectiveAutomationModel(
     draft: AutomationDraft = this.#draft,
-    modes: readonly ProtocolAgentMode[] = this.#modesWorkspaceId === draft.workspaceId
+    modes: readonly ProtocolAgentPersona[] = this.#modesWorkspaceId === draft.workspaceId
       ? this.#modes
       : [],
     models: readonly ProtocolModelInfo[] = this.#availableModels(),
@@ -1047,7 +1047,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     }
     try {
       const [modes, models, providers] = await Promise.all([
-        services.protocol.modes(draft.workspaceId),
+        services.protocol.personas(draft.workspaceId),
         services.modelCatalog.refresh("if-stale"),
         services.protocol.providers(),
       ]);

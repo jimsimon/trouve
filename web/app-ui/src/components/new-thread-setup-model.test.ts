@@ -140,7 +140,7 @@ describe("new thread setup model", () => {
     });
     expect(newThreadModelOptionControls(inherited, fixedCatalog)[0]).toMatchObject({
       key: "thinking_budget_tokens",
-      kind: "scalar",
+      kind: "text",
       text: "16384",
     });
 

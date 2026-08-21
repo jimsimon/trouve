@@ -29,7 +29,7 @@ describe("automations screen model-option lifecycle", () => {
       "async #modelForMutation(draft: AutomationDraft)",
       "\n  #scheduleLoadRetry()",
     );
-    expect(resolve).toContain("services.protocol.modes(draft.workspaceId)");
+    expect(resolve).toContain("services.protocol.personas(draft.workspaceId)");
     expect(resolve).toContain('services.modelCatalog.refresh("if-stale")');
     expect(resolve).toContain("services.protocol.providers()");
     expect(resolve).toContain("modes.some((mode) => mode.id === modeId)");

@@ -62,7 +62,8 @@ describe("root shell parity wiring", () => {
 
   it("keeps async new-session defaults synchronized with native select options", () => {
     expect(source).toContain(".selected=${mode.id === this.#newSessionModeId}");
-    expect(source).toContain(".selected=${value === this.#newSessionThinking}");
+    expect(source).toContain("const newSessionModelOptions = modelOptionControls(");
+    expect(source).toContain(".controls=${newSessionModelOptions}");
     expect(source).toContain(
       '.selected=${this.#newSessionPermissionMode === "ask"}',
     );
@@ -129,10 +130,11 @@ describe("root shell parity wiring", () => {
   });
 
   it("preserves new-session model options when a mode keeps the effective model", () => {
-    const start = source.indexOf(".value=${this.#newSessionModeId}");
-    const handler = source.slice(start, source.indexOf("</select>", start));
-    expect(handler).toContain("const previousModel = resolveNewSessionModel(");
-    expect(handler).toContain("const nextModel = resolveNewSessionModel(");
-    expect(handler).toContain("if (nextModel !== previousModel) this.#newSessionModelOptions = {};");
+    const start = source.indexOf("#reconcileNewSessionDefaults(models:");
+    const reconcile = source.slice(start, source.indexOf("\n  /**", start));
+    expect(reconcile).toContain("const previousModelId = resolveNewSessionModel(");
+    expect(reconcile).toContain("const nextModelId = resolveNewSessionModel(");
+    expect(reconcile).toContain("previousModelId === nextModelId");
+    expect(reconcile).toContain("sanitizeModelOptions(nextModel, this.#newSessionModelOptions)");
   });
 });
