@@ -4859,6 +4859,16 @@ test("find shortcuts coordinate focus with the thread switcher", async ({ page }
   await expect(threads).toBeFocused();
 
   await threads.click();
+  await threadSearch.press("Control+k");
+  const commandSearch = page.getByRole("combobox", {
+    name: "Search commands, sessions, and threads",
+  });
+  await expect(commandSearch).toBeFocused();
+  await commandSearch.press("Escape");
+  await expect(commandSearch).toHaveCount(0);
+  await expect(switcher).toBeVisible();
+  await expect(threadSearch).toBeFocused();
+
   await find.getByRole("searchbox", { name: "Search this chat" }).focus();
   await page.keyboard.press("Escape");
   await expect(switcher).toHaveCount(0);

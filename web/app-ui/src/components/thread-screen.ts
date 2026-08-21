@@ -1009,6 +1009,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   readonly #chatFindGlobalKeydown = (event: KeyboardEvent): void => {
+    if (event.key === "Escape" && document.querySelector("dialog[open]") !== null) return;
     if (event.key === "Escape" && this.#threadSwitcherOpen) {
       event.preventDefault();
       event.stopPropagation();
