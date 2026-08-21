@@ -38,6 +38,7 @@ interface CachedSearchableItem {
 }
 
 interface CachedSearchableProjection {
+  readonly item: WeakRef<object>;
   readonly text: string;
   readonly textBytes: number;
   active: boolean;
@@ -57,6 +58,10 @@ const removeCachedSearchableProjection = (projection: CachedSearchableProjection
   searchableProjectionLru.delete(projection);
   searchableItemCacheTextBytes -= projection.textBytes;
   projection.active = false;
+  const item = projection.item.deref();
+  if (item !== undefined && searchableItemCache.get(item)?.projection === projection) {
+    searchableItemCache.delete(item);
+  }
 };
 
 const cacheSearchableItem = (
@@ -81,11 +86,18 @@ const cacheSearchableItem = (
     if (oldest === undefined) break;
     removeCachedSearchableProjection(oldest);
   }
-  const projection = { text, textBytes, active: true };
+  const projection = { item: new WeakRef(item), text, textBytes, active: true };
   searchableItemCache.set(item, { revision, projection });
   searchableProjectionLru.add(projection);
   searchableItemCacheTextBytes += textBytes;
 };
+
+/** Test/diagnostic hook for the aggregate cache contract. */
+export const chatFindCacheDebugSnapshot = (item: ThreadChatItem) => Object.freeze({
+  itemCached: searchableItemCache.has(item),
+  projectionCount: searchableProjectionLru.size,
+  textBytes: searchableItemCacheTextBytes,
+});
 
 const searchableText = (
   value: unknown,

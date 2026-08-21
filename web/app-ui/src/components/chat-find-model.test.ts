@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ThreadChatItem } from "../state/thread-view-model.js";
 import {
+  chatFindCacheDebugSnapshot,
   chatFindMatches,
   chatFindUnitIds,
   reconcileChatFind,
@@ -185,6 +186,11 @@ describe("chat find model", () => {
 
     expect(chatFindUnitIds(tools, "not present", false)).toEqual([]);
     expect(reads).toBe(48);
+    expect(chatFindCacheDebugSnapshot(tools[1]!).itemCached).toBe(false);
+    const cache = chatFindCacheDebugSnapshot(tools.at(-1)!);
+    expect(cache.itemCached).toBe(true);
+    expect(cache.projectionCount).toBeLessThanOrEqual(256);
+    expect(cache.textBytes).toBeLessThanOrEqual(2 * 1024 * 1024);
     expect(chatFindUnitIds(tools.slice(0, 2), "0:", false)).toEqual(["turn:1"]);
     expect(reads).toBe(49);
   });
