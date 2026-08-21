@@ -9,7 +9,6 @@ import {
   beginNewSessionOptionLoad,
   canSubmitNewSession,
   canonicalThinkingSelection,
-  canonicalThinkingSelectionOrPreserve,
   createNewSessionOptionsLifecycle,
   createNewSessionThreadRequest,
   createNewSessionThreadRequestFromSnapshot,
@@ -152,16 +151,6 @@ describe("new session model", () => {
     expect(thinkingSelectionIsValid(option, "512")).toBe(false);
     expect(thinkingSelectionIsValid(option, "1.5")).toBe(false);
     expect(defaultThinkingSelection(option)).toBe("4096");
-  });
-
-  it("preserves unchanged thinking defaults while model metadata is unavailable", () => {
-    expect(canonicalThinkingSelectionOrPreserve(undefined, "high", "high", false))
-      .toBe("high");
-    expect(canonicalThinkingSelectionOrPreserve(undefined, "medium", "high", false))
-      .toBeUndefined();
-    expect(canonicalThinkingSelectionOrPreserve(undefined, "high", "high", true))
-      .toBeUndefined();
-    expect(canonicalThinkingSelectionOrPreserve(undefined, null, "high", false)).toBeNull();
   });
 
   it("rejects malformed schemas, enums, and defaults", () => {

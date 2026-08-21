@@ -21,4 +21,9 @@ describe("persona settings thinking controls", () => {
     expect(source).toContain("Default thinking budget (tokens)");
     expect(source).toContain('type="number"');
   });
+
+  it("preserves unchanged thinking defaults when model metadata is unavailable", () => {
+    expect(source).toContain("selectedModel === undefined");
+    expect(source).toContain("rawThinking === existing?.persona.default_thinking_level");
+  });
 });
