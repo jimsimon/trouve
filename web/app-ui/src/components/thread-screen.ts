@@ -516,6 +516,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #chatFindRefreshKey = "";
   #chatFindRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #chatFindLoadGeneration = 0;
+  #chatFindHistoryLoading = false;
   readonly #chatFindByThread = new Map<string, StoredChatFindState>();
 
   readonly #services = new ContextConsumer(this, {
@@ -728,6 +729,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#resizeComposer();
     this.#observeThreadWorkingSet();
     if (this.#chatFindOpen) this.#scheduleChatFindRefresh(false, false);
+    this.#ensureChatFindHistoryLoading();
     if (this.#pendingThreadTabFocus !== "") {
       const threadId = this.#pendingThreadTabFocus;
       const tab = [...this.querySelectorAll<HTMLButtonElement>("[data-thread-tab-id]")]
@@ -940,6 +942,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#clearHistoryRetryTimer();
     this.#clearChatFindRefresh();
     this.#chatFindLoadGeneration += 1;
+    this.#chatFindHistoryLoading = false;
     this.#cancelHistoryAnchorCorrection();
     this.#parkedLayoutAnchor = undefined;
     this.#scrollIndicatorMetrics = undefined;
@@ -988,6 +991,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #restoreChatFindState(threadId: string): void {
     this.#clearChatFindRefresh();
     this.#chatFindLoadGeneration += 1;
+    this.#chatFindHistoryLoading = false;
     const state = this.#chatFindByThread.get(threadId);
     this.#chatFindOpen = state?.open ?? false;
     this.#chatFindQuery = state?.query ?? "";
@@ -1005,6 +1009,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   readonly #chatFindGlobalKeydown = (event: KeyboardEvent): void => {
+    if (event.key === "Escape" && this.#threadSwitcherOpen) return;
     if (event.key === "Escape" && this.#chatFindOpen) {
       event.preventDefault();
       event.stopPropagation();
@@ -1021,6 +1026,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     ) return;
     event.preventDefault();
     event.stopPropagation();
+    if (this.#threadSwitcherOpen) {
+      this.#threadSwitcherOpen = false;
+      this.#threadSwitcherQuery = "";
+    }
     this.#openChatFind();
   };
 
@@ -1042,6 +1051,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #closeChatFind(): void {
     this.#chatFindOpen = false;
     this.#chatFindLoadGeneration += 1;
+    this.#chatFindHistoryLoading = false;
     this.#clearChatFindRefresh();
     this.#saveChatFindState();
     this.requestUpdate();
@@ -1143,33 +1153,50 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   }
 
+  #ensureChatFindHistoryLoading(): void {
+    if (
+      !this.#chatFindOpen
+      || this.#chatFindHistoryLoading
+      || this.threadId === ""
+      || this.#historyError !== ""
+    ) return;
+    const view = this.#store.value?.threadView(this.threadId);
+    if (view?.hasOlder === true && view.itemOffset > 0) {
+      void this.#loadAllHistoryForFind();
+    }
+  }
+
   async #loadAllHistoryForFind(): Promise<void> {
+    if (this.#chatFindHistoryLoading) return;
     const generation = ++this.#chatFindLoadGeneration;
     const threadId = this.threadId;
-    while (
-      this.isConnected
-      && this.#chatFindOpen
-      && this.threadId === threadId
-      && generation === this.#chatFindLoadGeneration
-    ) {
-      const view = this.#store.value?.threadView(threadId);
-      if (view?.hasOlder !== true || view.itemOffset === 0 || this.#historyError !== "") break;
-      if (this.#historyLoading) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        continue;
+    this.#chatFindHistoryLoading = true;
+    try {
+      while (
+        this.isConnected
+        && this.#chatFindOpen
+        && this.threadId === threadId
+        && generation === this.#chatFindLoadGeneration
+      ) {
+        const view = this.#store.value?.threadView(threadId);
+        if (view?.hasOlder !== true || view.itemOffset === 0 || this.#historyError !== "") break;
+        if (this.#historyLoading) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          continue;
+        }
+        const before = view.itemOffset;
+        await this.#loadOlderHistory(false);
+        const after = this.#store.value?.threadView(threadId)?.itemOffset ?? before;
+        if (after >= before) break;
       }
-      const before = view.itemOffset;
-      await this.#loadOlderHistory(true);
-      const after = this.#store.value?.threadView(threadId)?.itemOffset ?? before;
-      if (after >= before) break;
-    }
-    if (
-      this.#chatFindOpen
-      && this.threadId === threadId
-      && generation === this.#chatFindLoadGeneration
-    ) {
-      this.#chatFindRefreshKey = "";
-      this.#scheduleChatFindRefresh(false, false);
+    } finally {
+      if (generation === this.#chatFindLoadGeneration) {
+        this.#chatFindHistoryLoading = false;
+        if (this.#chatFindOpen && this.threadId === threadId) {
+          this.#chatFindRefreshKey = "";
+          this.#scheduleChatFindRefresh(false, false);
+        }
+      }
     }
   }
 
