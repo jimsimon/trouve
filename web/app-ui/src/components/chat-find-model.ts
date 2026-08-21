@@ -12,11 +12,17 @@ const SEARCH_OPERATION_NODE_LIMIT = 20_000;
 
 interface SearchBudget {
   remainingNodes: number;
+  remainingItems: number;
 }
 
 interface SearchableTextResult {
   readonly text: string;
   readonly complete: boolean;
+}
+
+export interface ChatFindMatches {
+  readonly unitIds: readonly string[];
+  readonly incomplete: boolean;
 }
 
 interface CachedSearchableItem {
@@ -26,7 +32,10 @@ interface CachedSearchableItem {
 
 const searchableItemCache = new WeakMap<object, CachedSearchableItem>();
 
-const searchableText = (value: unknown, budget: SearchBudget): SearchableTextResult => {
+const searchableText = (
+  value: unknown,
+  budget: Pick<SearchBudget, "remainingNodes">,
+): SearchableTextResult => {
   const parts: string[] = [];
   const seen = new Set<object>();
   let length = 0;
@@ -34,6 +43,7 @@ const searchableText = (value: unknown, budget: SearchBudget): SearchableTextRes
   let complete = true;
   const append = (value: string): void => {
     const remaining = SEARCH_TEXT_LIMIT - length;
+    if (value.length > remaining) complete = false;
     const text = value.slice(0, remaining);
     parts.push(text);
     length += text.length + 1;
@@ -182,13 +192,27 @@ const searchableItemRevision = (item: ThreadChatItem): readonly unknown[] => {
 const sameRevision = (left: readonly unknown[], right: readonly unknown[]): boolean =>
   left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
 
-const searchableItemText = (item: ThreadChatItem, budget: SearchBudget): string => {
+const searchableItemText = (
+  item: ThreadChatItem,
+  budget: SearchBudget,
+): SearchableTextResult => {
   const revision = searchableItemRevision(item);
   const cached = searchableItemCache.get(item);
-  if (cached !== undefined && sameRevision(cached.revision, revision)) return cached.text;
-  const { text, complete } = searchableText(searchableItemContent(item), budget);
+  const remainingItems = Math.max(1, budget.remainingItems);
+  budget.remainingItems = Math.max(0, budget.remainingItems - 1);
+  if (cached !== undefined && sameRevision(cached.revision, revision)) {
+    return { text: cached.text, complete: true };
+  }
+  const allowance = Math.min(
+    SEARCH_NODE_LIMIT,
+    Math.floor(budget.remainingNodes / remainingItems),
+  );
+  if (allowance <= 0) return { text: "", complete: false };
+  const itemBudget = { remainingNodes: allowance };
+  const { text, complete } = searchableText(searchableItemContent(item), itemBudget);
+  budget.remainingNodes -= allowance - itemBudget.remainingNodes;
   if (complete) searchableItemCache.set(item, { revision, text });
-  return text;
+  return { text, complete };
 };
 
 const searchableUnitText = (
@@ -196,40 +220,64 @@ const searchableUnitText = (
   items: readonly ThreadChatItem[],
   status: ThreadChatItem | undefined,
   budget: SearchBudget,
-): string => {
+): SearchableTextResult => {
   const parts: string[] = [];
   let length = 0;
+  let complete = true;
   const append = (item: ThreadChatItem | undefined): void => {
-    if (item === undefined || length >= SEARCH_TEXT_LIMIT) return;
-    const text = searchableItemText(item, budget).slice(0, SEARCH_TEXT_LIMIT - length);
+    if (item === undefined) return;
+    if (length >= SEARCH_TEXT_LIMIT) {
+      complete = false;
+      budget.remainingItems = Math.max(0, budget.remainingItems - 1);
+      return;
+    }
+    const result = searchableItemText(item, budget);
+    if (!result.complete) complete = false;
+    const text = result.text.slice(0, SEARCH_TEXT_LIMIT - length);
+    if (text.length < result.text.length) complete = false;
     parts.push(text);
     length += text.length + 1;
   };
   append(prompt);
   for (const item of items) append(item);
   append(status);
-  return parts.join("\n");
+  return { text: parts.join("\n"), complete };
 };
 
 /** Literal, per-turn transcript matches in display order. */
+export const chatFindMatches = (
+  items: readonly ThreadChatItem[],
+  query: string,
+  caseSensitive: boolean,
+): ChatFindMatches => {
+  const needle = query.trim();
+  if (needle === "") {
+    return Object.freeze({ unitIds: Object.freeze([]), incomplete: false });
+  }
+  const expected = caseSensitive ? needle : needle.toLowerCase();
+  const units = buildChatLayout(items).units;
+  const itemCount = units.reduce(
+    (count, unit) => count + (unit.prompt === undefined ? 0 : 1)
+      + unit.items.length + (unit.status === undefined ? 0 : 1),
+    0,
+  );
+  const budget = { remainingNodes: SEARCH_OPERATION_NODE_LIMIT, remainingItems: itemCount };
+  const unitIds: string[] = [];
+  let incomplete = false;
+  for (const unit of units) {
+    const result = searchableUnitText(unit.prompt, unit.items, unit.status, budget);
+    if (!result.complete) incomplete = true;
+    const text = caseSensitive ? result.text : result.text.toLowerCase();
+    if (text.includes(expected)) unitIds.push(unit.id);
+  }
+  return Object.freeze({ unitIds: Object.freeze(unitIds), incomplete });
+};
+
 export const chatFindUnitIds = (
   items: readonly ThreadChatItem[],
   query: string,
   caseSensitive: boolean,
-): readonly string[] => {
-  const needle = query.trim();
-  if (needle === "") return Object.freeze([]);
-  const expected = caseSensitive ? needle : needle.toLowerCase();
-  const budget = { remainingNodes: SEARCH_OPERATION_NODE_LIMIT };
-  return Object.freeze(
-    buildChatLayout(items).units
-      .filter((unit) => {
-        const text = searchableUnitText(unit.prompt, unit.items, unit.status, budget);
-        return (caseSensitive ? text : text.toLowerCase()).includes(expected);
-      })
-      .map((unit) => unit.id),
-  );
-};
+): readonly string[] => chatFindMatches(items, query, caseSensitive).unitIds;
 
 /** Preserve the active turn across streaming recomputes when it still matches. */
 export const reconcileChatFind = (

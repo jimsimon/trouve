@@ -68,7 +68,7 @@ import {
 } from "./chat-presentation.js";
 import { chatTurnControlState } from "./chat-turn-controls.js";
 import {
-  chatFindUnitIds,
+  chatFindMatches,
   reconcileChatFind,
   stepChatFindIndex,
 } from "./chat-find-model.js";
@@ -511,6 +511,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #chatFindQuery = "";
   #chatFindCaseSensitive = false;
   #chatFindUnitIds: readonly string[] = [];
+  #chatFindIncomplete = false;
   #chatFindActiveIndex = -1;
   #chatFindRestoredActiveUnitId: string | undefined;
   #chatFindRefreshKey = "";
@@ -995,6 +996,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#chatFindQuery = state?.query ?? "";
     this.#chatFindCaseSensitive = state?.caseSensitive ?? false;
     this.#chatFindUnitIds = [];
+    this.#chatFindIncomplete = false;
     this.#chatFindActiveIndex = -1;
     this.#chatFindRestoredActiveUnitId = state?.activeUnitId;
     this.#chatFindRefreshKey = "";
@@ -1077,6 +1079,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#cancelChatFindHistoryLoading();
     }
     this.#chatFindUnitIds = [];
+    this.#chatFindIncomplete = false;
     this.#chatFindActiveIndex = -1;
     this.#chatFindRestoredActiveUnitId = undefined;
     this.#chatFindRefreshKey = "";
@@ -1089,6 +1092,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   readonly #toggleChatFindCase = (): void => {
     this.#chatFindCaseSensitive = !this.#chatFindCaseSensitive;
     this.#chatFindUnitIds = [];
+    this.#chatFindIncomplete = false;
     this.#chatFindActiveIndex = -1;
     this.#chatFindRestoredActiveUnitId = undefined;
     this.#chatFindRefreshKey = "";
@@ -1150,12 +1154,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         this.#chatFindRefreshKey = "";
         return;
       }
+      const matches = chatFindMatches(
+        view.items,
+        this.#chatFindQuery,
+        this.#chatFindCaseSensitive,
+      );
       const reconciled = reconcileChatFind(
-        chatFindUnitIds(view.items, this.#chatFindQuery, this.#chatFindCaseSensitive),
+        matches.unitIds,
         activeUnitId,
         resetActive,
       );
       this.#chatFindUnitIds = reconciled.unitIds;
+      this.#chatFindIncomplete = matches.incomplete;
       this.#chatFindActiveIndex = reconciled.activeIndex;
       const restoredActiveUnitId = this.#chatFindRestoredActiveUnitId;
       const restorationPending = restoredActiveUnitId !== undefined
@@ -1778,8 +1788,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 this.#chatFindQuery === ""
                   ? ""
                   : this.#chatFindUnitIds.length === 0
-                    ? "No matches"
-                    : `${this.#chatFindActiveIndex + 1} of ${this.#chatFindUnitIds.length}`
+                    ? this.#chatFindIncomplete ? "No matches (partial search)" : "No matches"
+                    : `${this.#chatFindActiveIndex + 1} of ${this.#chatFindUnitIds.length}${
+                      this.#chatFindIncomplete ? " (partial search)" : ""
+                    }`
               }</span>
               <button
                 type="button"
@@ -2459,7 +2471,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#syncQuestionWizards(items);
     const presentation = indexChatPresentation(items);
     const layout = buildChatLayout(items);
-    const chatFindMatches = new Set(this.#chatFindUnitIds);
+    const chatFindMatchIds = new Set(this.#chatFindUnitIds);
     const activeChatFindUnitId = this.#activeChatFindUnitId();
     let activeTurn: number | undefined;
     let waitingForCapacity = false;
@@ -2624,7 +2636,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 </div>`;
               }
               const unit = layout.units[item.unitIndex];
-              const chatFindMatch = this.#chatFindOpen && chatFindMatches.has(item.id);
+              const chatFindMatch = this.#chatFindOpen && chatFindMatchIds.has(item.id);
               const chatFindActive = chatFindMatch && item.id === activeChatFindUnitId;
               return unit === undefined
                 ? nothing

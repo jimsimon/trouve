@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ThreadChatItem } from "../state/thread-view-model.js";
 import {
+  chatFindMatches,
   chatFindUnitIds,
   reconcileChatFind,
   stepChatFindIndex,
@@ -133,7 +134,7 @@ describe("chat find model", () => {
     expect(chatFindUnitIds(structured, "updated", false)).toEqual(["turn:0:tool:cached"]);
   });
 
-  it("shares one traversal budget across all uncached transcript items", () => {
+  it("shares one fair traversal budget across all uncached transcript items", () => {
     let reads = 0;
     const structured: ThreadChatItem[] = Array.from({ length: 3 }, (_, toolIndex) => {
       const args: Record<string, unknown> = {};
@@ -158,8 +159,20 @@ describe("chat find model", () => {
       };
     });
 
-    expect(chatFindUnitIds(structured, "not present", false)).toEqual([]);
+    structured.push({
+      id: "user:after-aggregate",
+      kind: "user",
+      turn: 1,
+      content: "Tail match remains searchable",
+      attachments: [],
+    });
+
+    const result = chatFindMatches(structured, "tail match", false);
+    expect(result).toEqual({ unitIds: ["turn:1"], incomplete: true });
     expect(reads).toBeLessThan(15_000);
+    const coldReads = reads;
+    expect(chatFindMatches(structured, "tail match", false)).toEqual(result);
+    expect(reads - coldReads).toBeLessThan(15_000);
   });
 
   it("preserves an active match during streaming and wraps navigation", () => {
