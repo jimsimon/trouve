@@ -133,6 +133,35 @@ describe("chat find model", () => {
     expect(chatFindUnitIds(structured, "updated", false)).toEqual(["turn:0:tool:cached"]);
   });
 
+  it("shares one traversal budget across all uncached transcript items", () => {
+    let reads = 0;
+    const structured: ThreadChatItem[] = Array.from({ length: 3 }, (_, toolIndex) => {
+      const args: Record<string, unknown> = {};
+      for (let index = 0; index < 5_000; index += 1) {
+        Object.defineProperty(args, `padding-${index}`, {
+          enumerable: true,
+          get: () => {
+            reads += 1;
+            return "padding";
+          },
+        });
+      }
+      return {
+        id: `tool:aggregate-${toolIndex}`,
+        kind: "tool",
+        callId: `call-aggregate-${toolIndex}`,
+        tool: "read_file",
+        args,
+        status: "ok",
+        result: null,
+        output: { text: "", bytes: 0, omitted: false },
+      };
+    });
+
+    expect(chatFindUnitIds(structured, "not present", false)).toEqual([]);
+    expect(reads).toBeLessThan(15_000);
+  });
+
   it("preserves an active match during streaming and wraps navigation", () => {
     expect(reconcileChatFind(["a", "b", "c"], "b")).toEqual({
       unitIds: ["a", "b", "c"],
