@@ -58,7 +58,7 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
         built_in(
             "api-compatibility",
             "API Steward",
-            "Check public APIs, wire formats, schemas, migrations, configuration, persisted data, CLI behavior, and downstream callers for breaking or ambiguous changes. Verify backward/forward compatibility and safe rollout behavior.",
+            "Check public APIs, wire formats, schemas, migrations, configuration, persisted data, CLI behavior, direct dependency API transitions, and downstream callers for breaking or ambiguous changes. Treat 0.x minor dependency upgrades as potentially breaking. Verify backward/forward compatibility and safe rollout behavior.",
         ),
         built_in(
             "data-integrity",
@@ -73,7 +73,7 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
         built_in(
             "dependencies",
             "Supply Chain Analyst",
-            "Inspect dependency, lockfile, build, packaging, and CI changes for unsafe sources, accidental upgrades or downgrades, feature mismatches, license or provenance concerns, non-reproducible builds, and deployment incompatibilities.",
+            "Inspect dependency, lockfile, build, packaging, and CI changes for unsafe sources, accidental upgrades or downgrades, feature mismatches, license or provenance concerns, non-reproducible builds, and deployment incompatibilities. For direct version or feature transitions, including 0.x minor and crypto, parser, or runtime upgrades, trace affected APIs into changed and unchanged call sites; verify required trait imports, output types, formatting, and other API changes, and prioritize concrete compile or runtime failures over speculative coverage concerns.",
         ),
         built_in(
             "accessibility",
@@ -174,6 +174,29 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn dependency_reviewers_cover_consumed_api_transitions() {
+        let reviewers = built_in_reviewers();
+        let api = reviewers
+            .iter()
+            .find(|reviewer| reviewer.id == "api-compatibility")
+            .unwrap();
+        let dependencies = reviewers
+            .iter()
+            .find(|reviewer| reviewer.id == "dependencies")
+            .unwrap();
+
+        assert!(api.prompt.contains("direct dependency API transitions"));
+        assert!(api.prompt.contains("0.x minor dependency upgrades"));
+        assert!(dependencies.prompt.contains("trace affected APIs"));
+        assert!(dependencies.prompt.contains("required trait imports"));
+        assert!(
+            dependencies
+                .prompt
+                .contains("concrete compile or runtime failures")
+        );
     }
 
     #[test]

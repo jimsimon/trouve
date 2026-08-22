@@ -10301,6 +10301,58 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Returns newest-first coordinator adjudications from successful prior
+    /// review rounds for the same pull request.
+    pub fn code_review_candidate_rejection_history_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        excluded_job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewCandidateRejection>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT rejection.candidate_id, rejection.task_id,
+                    rejection.reviewer_id, rejection.reviewer_name,
+                    rejection.path, rejection.line, rejection.side,
+                    rejection.severity, rejection.confidence,
+                    rejection.title, rejection.body, rejection.reason
+             FROM code_review_candidate_rejections rejection
+             JOIN code_review_jobs job ON job.id = rejection.job_id
+             WHERE job.repository = ?1 AND job.pull_number = ?2
+               AND job.id != ?3 AND job.status = 'succeeded'
+             ORDER BY job.completed_at DESC, rejection.created_at DESC,
+                      rejection.candidate_id DESC
+             LIMIT ?4",
+        )?;
+        Ok(stmt
+            .query_map(
+                params![
+                    repository,
+                    pull_number as i64,
+                    excluded_job_id,
+                    limit as i64
+                ],
+                |row| {
+                    Ok(trouve_protocol::CodeReviewCandidateRejection {
+                        candidate_id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        reviewer_id: row.get(2)?,
+                        reviewer_name: row.get(3)?,
+                        path: row.get(4)?,
+                        line: row.get::<_, i64>(5)? as u64,
+                        side: row.get(6)?,
+                        severity: row.get(7)?,
+                        confidence: row.get(8)?,
+                        title: row.get(9)?,
+                        body: row.get(10)?,
+                        reason: row.get(11)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Records the containing review URL for a finding rendered in the review
     /// body without changing whether its inline publication succeeded.
     pub fn update_code_review_finding_review_url(
@@ -21846,6 +21898,30 @@ mod tests {
         store
             .finish_code_review_job(&first.id, "succeeded", "https://example.test/review/1", "")
             .unwrap();
+        let prior_rejections = store
+            .code_review_candidate_rejection_history_for_pull(
+                &first.repository,
+                first.pull_number,
+                &legacy.id,
+                10,
+            )
+            .unwrap();
+        assert_eq!(prior_rejections.len(), 2);
+        assert!(prior_rejections.iter().any(|rejection| {
+            rejection.candidate_id == "weak"
+                && rejection.reason.starts_with("insufficient_evidence:")
+        }));
+        assert!(
+            store
+                .code_review_candidate_rejection_history_for_pull(
+                    &first.repository,
+                    first.pull_number,
+                    &first.id,
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
 
         let second = enqueue(
             "acme/widgets#42:churn-round-2",
