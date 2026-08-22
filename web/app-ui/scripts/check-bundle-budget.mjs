@@ -25,11 +25,13 @@ const worker = javascript.find(({ name }) => name.startsWith("content-worker-"))
 // presentation preference, and Font Awesome icon UI; the PWA remains on the
 // original entry ceiling. Font assets have their own explicit budget below.
 const entryLimit = mode === "desktop" ? 856_000 : 850_000;
-// Keep a temporary narrow ceiling while rebasing the command/skill UI onto
-// detailed agent activity. The post-rebase build records the combined clean
-// artifact and tightens this value to measured headroom.
-const totalJavaScriptLimit = 3_215_000;
-const totalStyleLimit = 186_000;
+// The locked Vite/Rolldown graph emits 3,220,112 B after combining detailed
+// agent activity with generated command/skill validators and deterministic
+// command UI. Preserve less than 2 kB of headroom.
+const totalJavaScriptLimit = 3_222_000;
+// The combined clean artifact emits about 182.9 kB of CSS. Preserve roughly
+// 2 kB of headroom while retaining a regression-sensitive ceiling.
+const totalStyleLimit = 185_000;
 const limits = {
   entry: entryLimit,
   worker: 350_000,

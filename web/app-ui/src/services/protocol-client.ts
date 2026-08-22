@@ -1333,8 +1333,8 @@ export class ProtocolClient {
     );
   }
 
-  setSkillsSettings(request: ProtocolSetSkillsSettingsRequest): Promise<void> {
-    return this.#mutation("/v1/config/skills", "save skill settings", "PUT", request);
+  async setSkillsSettings(request: ProtocolSetSkillsSettingsRequest): Promise<void> {
+    await this.#mutation("/v1/config/skills", "save skill settings", "PUT", request);
   }
 
   gitWorktreeSettings(): Promise<ProtocolGitWorktreeSettings> {

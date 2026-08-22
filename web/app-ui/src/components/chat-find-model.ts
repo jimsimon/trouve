@@ -189,6 +189,8 @@ const searchableItemContent = (item: ThreadChatItem): unknown => {
     case "progress":
     case "thinking":
       return item.content;
+    case "command":
+      return [item.name, item.arguments, item.output];
     case "subagent":
       return [item.prompt, item.model];
     case "compaction":
@@ -250,6 +252,8 @@ const searchableItemRevision = (item: ThreadChatItem): readonly unknown[] => {
     case "progress":
     case "thinking":
       return [item.content];
+    case "command":
+      return [item.name, item.arguments, item.output];
     case "subagent":
       return [item.prompt, item.model];
     case "compaction":
