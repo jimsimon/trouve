@@ -9331,6 +9331,8 @@ fn redact_public_secrets(text: &str) -> String {
         let trimmed_start = token.trim_start_matches(wrapper);
         let core = trimmed_start.trim_end_matches(wrapper);
         let lower = core.to_ascii_lowercase();
+        let token_lower = token.to_ascii_lowercase();
+        let mut first_separated = None;
         for (label, authorization) in [
             ("authorization", true),
             ("password", false),
@@ -9343,7 +9345,6 @@ fn redact_public_secrets(text: &str) -> String {
                 return Some(SecretLabel::Bare { authorization });
             }
 
-            let token_lower = token.to_ascii_lowercase();
             let mut search_start = 0;
             while let Some(relative) = token_lower[search_start..].find(label) {
                 let label_start = search_start + relative;
@@ -9358,44 +9359,48 @@ fn redact_public_secrets(text: &str) -> String {
                 let separator = token_lower.as_bytes().get(label_end).copied();
                 if valid_boundary && matches!(separator, Some(b':' | b'=')) {
                     let mut value_start = label_end + 1;
-                    let quote = token[value_start..]
+                    let value_quote = token[value_start..]
                         .chars()
                         .next()
                         .filter(|character| matches!(character, '\'' | '"'));
-                    if let Some(quote) = quote {
+                    if let Some(quote) = value_quote {
                         value_start += quote.len_utf8();
                     }
+                    let quote = value_quote.or_else(|| {
+                        token[..label_start]
+                            .chars()
+                            .next_back()
+                            .filter(|character| matches!(character, '\'' | '"'))
+                    });
+                    let url_query = quote.is_none()
+                        && (token[..label_start].contains("://")
+                            || token[..label_start].contains('?')
+                            || token[..label_start].starts_with('&'));
                     let value_end = token[value_start..]
                         .char_indices()
                         .find_map(|(offset, character)| {
                             let closes_quote = quote == Some(character);
-                            let ends_fragment = quote.is_none()
-                                && matches!(
-                                    character,
-                                    '&' | '#'
-                                        | ','
-                                        | ';'
-                                        | ')'
-                                        | ']'
-                                        | '}'
-                                        | '\''
-                                        | '"'
-                                        | '<'
-                                        | '>'
-                                );
+                            let ends_fragment = url_query && matches!(character, '&' | '#');
                             (closes_quote || ends_fragment).then_some(value_start + offset)
                         })
                         .unwrap_or(token.len());
-                    return Some(SecretLabel::Separated {
+                    let candidate = SecretLabel::Separated {
                         authorization,
                         value_start,
                         value_end,
-                    });
+                    };
+                    if first_separated
+                        .as_ref()
+                        .is_none_or(|(first_start, _)| label_start < *first_start)
+                    {
+                        first_separated = Some((label_start, candidate));
+                    }
+                    break;
                 }
                 search_start = label_start + 1;
             }
         }
-        None
+        first_separated.map(|(_, label)| label)
     }
 
     fn separator(token: &str) -> bool {
@@ -9447,14 +9452,14 @@ fn redact_public_secrets(text: &str) -> String {
             }) => {
                 let value = &token[value_start..value_end];
                 if value.is_empty() {
-                    output.push_str(token);
+                    output.push_str(&token[..value_end]);
                     *pending = if value_end == token.len() {
                         PendingSecret::Value { authorization }
                     } else {
                         PendingSecret::None
                     };
                 } else if authorization && authorization_scheme(value) {
-                    output.push_str(token);
+                    output.push_str(&token[..value_end]);
                     *pending = if value_end == token.len() {
                         PendingSecret::Value {
                             authorization: false,
@@ -9465,7 +9470,10 @@ fn redact_public_secrets(text: &str) -> String {
                 } else {
                     output.push_str(&token[..value_start]);
                     output.push_str("[REDACTED]");
-                    output.push_str(&token[value_end..]);
+                    *pending = PendingSecret::None;
+                }
+                if value_end < token.len() {
+                    push_token(output, &token[value_end..], pending);
                 }
             }
             None if public_secret_like_token(token) => output.push_str("[REDACTED]"),
@@ -20318,17 +20326,23 @@ mod tests {
     fn public_secret_redaction_handles_embedded_and_url_credential_fragments() {
         let rendered = redact_public_secrets(
             "env:api_key=short-secret \
-             https://host.test/path?token=url-secret&mode=test \
-             password=\"quoted-secret\" notatoken=public",
+             https://host.test/path?token=url-secret&mode=test&api_key=second-secret \
+             password=\"quoted-secret\" password=secret#suffix notatoken=public",
         );
 
         assert_eq!(
             rendered,
             "env:api_key=[REDACTED] \
-             https://host.test/path?token=[REDACTED]&mode=test \
-             password=\"[REDACTED]\" notatoken=public"
+             https://host.test/path?token=[REDACTED]&mode=test&api_key=[REDACTED] \
+             password=\"[REDACTED]\" password=[REDACTED] notatoken=public"
         );
-        for secret in ["short-secret", "url-secret", "quoted-secret"] {
+        for secret in [
+            "short-secret",
+            "url-secret",
+            "second-secret",
+            "quoted-secret",
+            "secret#suffix",
+        ] {
             assert!(!rendered.contains(secret));
         }
     }
