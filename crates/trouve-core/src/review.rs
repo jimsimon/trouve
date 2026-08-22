@@ -162,6 +162,7 @@ const LIFECYCLE_FINDING_BODY_MAX_BYTES: usize = 2_000;
 const LIFECYCLE_COMMENT_TRUNCATION_MARKER: &str =
     "\n\n---\nComment truncated; open the trouve dashboard for complete review details.";
 const RETRY_CHECK_ACTION_DESCRIPTION: &str = "Retry this review on the current PR head";
+const RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION: &str = "Retry only the final review editor";
 const FULL_REVIEW_CHECK_ACTION_DESCRIPTION: &str = "Review full branch against the PR base";
 const REVIEWER_EXECUTION_GUIDANCE: &str = "\
 Time and exploration budget: finish this review in about three minutes. Use no more than 12 \
@@ -3978,13 +3979,19 @@ impl Engine {
             if !external_id.is_empty()
                 && (action == "rerequested"
                     || (action == "requested_action"
-                        && matches!(requested_action, "retry" | "full_review")))
+                        && matches!(
+                            requested_action,
+                            "retry" | "retry_final_editor" | "full_review"
+                        )))
             {
                 let engine = self.clone();
                 let job_id = external_id.to_owned();
                 let full = requested_action == "full_review";
+                let final_editor_only = requested_action == "retry_final_editor";
                 tokio::spawn(async move {
-                    let result = if full {
+                    let result = if final_editor_only {
+                        engine.retry_review_final_editor(&job_id).await.map(|_| ())
+                    } else if full {
                         match engine.store.code_review_job(&job_id) {
                             Ok(Some(record)) => engine
                                 .request_code_review(trouve_protocol::RequestCodeReviewRequest {
@@ -5284,7 +5291,8 @@ impl Engine {
             );
             let unadjudicated =
                 normalize_coordinator_output(&mut validated, &candidates, &previous_findings);
-            if !unadjudicated.is_empty() {
+            let adjudication_incomplete = !unadjudicated.is_empty();
+            if adjudication_incomplete {
                 tracing::warn!(
                     job_id = %job.id,
                     candidate_ids = ?unadjudicated,
@@ -5296,10 +5304,18 @@ impl Engine {
             let findings = std::mem::take(&mut validated.findings);
             if let Some(task) = self.store.finish_code_review_task(
                 &task.id,
-                "succeeded",
+                if adjudication_incomplete {
+                    "failed"
+                } else {
+                    "succeeded"
+                },
                 &turn.output,
                 findings.len() as u64,
-                "",
+                if adjudication_incomplete {
+                    "candidate decisions remained unresolved after repair"
+                } else {
+                    ""
+                },
             )? {
                 self.emit_code_review_task(&job.id, task)?;
             }
@@ -5459,7 +5475,8 @@ impl Engine {
         let prompt_for_agents =
             review_prompt_for_agents(&job, &parsed.summary, &parsed.findings, &parsed.themes);
         let candidate_rejections = candidate_rejections(&parsed, &candidates);
-        let persisted = self.store.save_code_review_result_with_themes(
+        let unadjudicated_candidates = unadjudicated_candidates(&parsed, &candidates);
+        let persisted = self.store.save_code_review_result_with_adjudication(
             &job.id,
             &parsed.summary,
             &prompt_for_agents,
@@ -5468,7 +5485,14 @@ impl Engine {
             &finding_details,
             &stored_themes,
             &candidate_rejections,
+            &unadjudicated_candidates,
         )?;
+        if !unadjudicated_candidates.is_empty() {
+            bail!(
+                "final review editor left {} candidate decision(s) unresolved after repair; retry the coordinator",
+                unadjudicated_candidates.len()
+            );
+        }
         ensure_review_current(superseded)?;
         self.revalidate_code_review_publication(&api, &job).await?;
         ensure_review_current(superseded)?;
@@ -7372,6 +7396,8 @@ impl Engine {
             .code_review_job_detail(&job.id)?
             .ok_or_else(|| anyhow!("review job no longer exists"))?;
         let job = &detail.job;
+        let needs_adjudication =
+            job.status == "failed" && !detail.unadjudicated_candidates.is_empty();
         let status = match job.status.as_str() {
             "queued" => "queued",
             "running" => "in_progress",
@@ -7380,6 +7406,7 @@ impl Engine {
         let conclusion = match job.status.as_str() {
             "succeeded" if job.issue_count == 0 => Some("success"),
             "succeeded" => Some("neutral"),
+            "failed" if needs_adjudication => Some("action_required"),
             "failed" => Some("failure"),
             "cancelled" | "stale" => Some("cancelled"),
             _ => None,
@@ -7395,6 +7422,10 @@ impl Engine {
             "succeeded" => format!(
                 "Review finished with {} confirmed issue(s); {} previously reported issue(s) were fixed.",
                 job.issue_count, job.fixed_issue_count
+            ),
+            "failed" if needs_adjudication => format!(
+                "Review requires another final-editor pass: {} candidate decision(s) remain unresolved.",
+                detail.unadjudicated_candidates.len()
             ),
             _ => {
                 if job.error.is_empty() {
@@ -7414,7 +7445,14 @@ impl Engine {
             "status": status,
             "details_url": job.pull_url,
             "output": {
-                "title": format!("Trouve Code Review: {}", display_review_status(&job.status)),
+                "title": format!(
+                    "Trouve Code Review: {}",
+                    if needs_adjudication {
+                        "Needs Attention".to_owned()
+                    } else {
+                        display_review_status(&job.status)
+                    }
+                ),
                 "summary": check_summary,
                 "text": check_details,
             }
@@ -7423,6 +7461,7 @@ impl Engine {
             debug_assert!(
                 [
                     RETRY_CHECK_ACTION_DESCRIPTION,
+                    RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION,
                     FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
                 ]
                 .iter()
@@ -7432,18 +7471,33 @@ impl Engine {
             );
             check_body["conclusion"] = serde_json::Value::String(conclusion.into());
             check_body["completed_at"] = serde_json::Value::String(Utc::now().to_rfc3339());
-            check_body["actions"] = serde_json::json!([
-                {
-                    "label": "Run again",
-                    "description": RETRY_CHECK_ACTION_DESCRIPTION,
-                    "identifier": "retry"
-                },
-                {
-                    "label": "Full branch review",
-                    "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
-                    "identifier": "full_review"
-                }
-            ]);
+            check_body["actions"] = if needs_adjudication {
+                serde_json::json!([
+                    {
+                        "label": "Retry final editor",
+                        "description": RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION,
+                        "identifier": "retry_final_editor"
+                    },
+                    {
+                        "label": "Full branch review",
+                        "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
+                        "identifier": "full_review"
+                    }
+                ])
+            } else {
+                serde_json::json!([
+                    {
+                        "label": "Run again",
+                        "description": RETRY_CHECK_ACTION_DESCRIPTION,
+                        "identifier": "retry"
+                    },
+                    {
+                        "label": "Full branch review",
+                        "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
+                        "identifier": "full_review"
+                    }
+                ])
+            };
         }
         if status == "in_progress" {
             check_body["started_at"] =
@@ -9005,6 +9059,8 @@ fn render_check_details(
         body.push_str("\n```\n\n");
     }
 
+    append_unadjudicated_candidate_section(&mut body, &detail.unadjudicated_candidates);
+
     if !detail.personas.is_empty() {
         body.push_str("### Reviewer status\n\n");
         body.push_str("| Reviewer | Status | Batches | Elapsed | Model |\n");
@@ -9065,6 +9121,37 @@ fn render_check_details(
     }
 
     body
+}
+
+fn append_unadjudicated_candidate_section(
+    body: &mut String,
+    candidates: &[trouve_protocol::CodeReviewUnadjudicatedCandidate],
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let mut section = format!(
+        "### Unresolved final-editor decisions\n\n{} reviewer candidate(s) were neither retained nor substantively rejected. The review is incomplete; retry the final editor before relying on it.\n\n",
+        candidates.len()
+    );
+    for candidate in candidates {
+        section.push_str(&format!(
+            "- **{}** — `{}`:{} · {} · severity {} · confidence {}\n  {}\n",
+            markdown_table_cell(&candidate.title),
+            markdown_table_cell(&candidate.path),
+            candidate.line,
+            markdown_table_cell(&candidate.reviewer_name),
+            markdown_table_cell(&candidate.severity),
+            markdown_table_cell(&candidate.confidence),
+            markdown_table_cell(&candidate.body),
+        ));
+    }
+    body.push_str(&bounded_utf8(
+        &section,
+        LIFECYCLE_FINDINGS_MAX_BYTES,
+        "\n_Unresolved candidate list truncated; open the trouve dashboard for complete details._\n",
+    ));
+    body.push('\n');
 }
 
 fn bounded_check_details(details: &str) -> String {
@@ -9225,6 +9312,7 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         "running" => "🔎",
         "succeeded" if job.issue_count == 0 => "✅",
         "succeeded" => "🟡",
+        "failed" if !detail.unadjudicated_candidates.is_empty() => "⚠️",
         "cancelled" | "stale" => "⏹️",
         _ => "❌",
     };
@@ -9232,7 +9320,11 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         "## {icon} Trouve Code Review — {status}\n\n\
          **Progress:** {complete}/{total} reviewer personas ({percent}%)  \n\
          **Scope:** {scope} `{base}`…`{head}`  \n",
-        status = display_review_status(&job.status),
+        status = if job.status == "failed" && !detail.unadjudicated_candidates.is_empty() {
+            "Needs Attention".to_owned()
+        } else {
+            display_review_status(&job.status)
+        },
         complete = job.progress.completed_reviewers,
         total = job.progress.total_reviewers,
         percent = job.progress.percent,
@@ -9247,6 +9339,11 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         body.push_str(&format!(
             "**Result:** {} confirmed issue(s)  \n",
             detail.findings.len()
+        ));
+    } else if job.status == "failed" && !detail.unadjudicated_candidates.is_empty() {
+        body.push_str(&format!(
+            "**Result:** incomplete — {} candidate decision(s) unresolved  \n",
+            detail.unadjudicated_candidates.len()
         ));
     }
     body.push_str(&format!(
@@ -9308,6 +9405,7 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
             detail.findings.len()
         ));
     }
+    append_unadjudicated_candidate_section(&mut body, &detail.unadjudicated_candidates);
     let publishable_findings = detail
         .findings
         .iter()
@@ -11663,6 +11761,34 @@ fn candidate_rejections(
                 reason: categorized_rejection_reason(reason),
             })
         })
+        .collect()
+}
+
+fn unadjudicated_candidates(
+    review: &ReviewOutput,
+    candidates: &[CandidateFinding],
+) -> Vec<trouve_protocol::CodeReviewUnadjudicatedCandidate> {
+    let unadjudicated = unadjudicated_candidate_ids(review, candidates)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    candidates
+        .iter()
+        .filter(|candidate| unadjudicated.contains(candidate.candidate_id.as_str()))
+        .map(
+            |candidate| trouve_protocol::CodeReviewUnadjudicatedCandidate {
+                candidate_id: candidate.candidate_id.clone(),
+                task_id: candidate.task_id.clone(),
+                reviewer_id: candidate.reviewer_id.clone(),
+                reviewer_name: candidate.reviewer_name.clone(),
+                path: candidate.finding.path.clone(),
+                line: candidate.finding.line,
+                side: candidate.finding.side.clone(),
+                severity: candidate.finding.severity.clone(),
+                confidence: candidate.finding.confidence.clone(),
+                title: candidate.finding.title.clone(),
+                body: candidate.finding.body.clone(),
+            },
+        )
         .collect()
 }
 
@@ -14113,6 +14239,89 @@ mod tests {
             body.contains("**Error:** model review remained invalid after one JSON repair attempt")
         );
         assert!(!body.contains("Trouve Code Review — Running"));
+    }
+
+    #[test]
+    fn unadjudicated_review_lifecycle_distinguishes_failure_from_retry_progress() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:unadjudicated-lifecycle");
+        store.claim_code_review_job().unwrap().unwrap();
+        let coordinator = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Coordinator,
+                reviewer_id: None,
+                reviewer_name: "Final review editor".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/model".into()),
+                prompt: "Adjudicate candidates".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(&coordinator.id, "session", "thread", "provider/model")
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_task(
+                &coordinator.id,
+                "failed",
+                "{}",
+                0,
+                "candidate decisions remained unresolved after repair",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .save_code_review_result_with_adjudication(
+                &queued.id,
+                "Review incomplete.",
+                "",
+                1,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[trouve_protocol::CodeReviewUnadjudicatedCandidate {
+                    candidate_id: "candidate-1".into(),
+                    task_id: "task-1".into(),
+                    reviewer_id: "correctness".into(),
+                    reviewer_name: "Correctness".into(),
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Unresolved behavior".into(),
+                    body: "The final editor omitted a decision.".into(),
+                }],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &queued.id,
+                "failed",
+                "",
+                "final editor left a candidate unresolved",
+            )
+            .unwrap();
+
+        let failed = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let body = render_lifecycle_comment(&failed);
+        assert!(body.starts_with("## ⚠️ Trouve Code Review — Needs Attention"));
+        assert!(body.contains("**Result:** incomplete — 1 candidate decision(s) unresolved"));
+        assert!(body.contains("### Unresolved final-editor decisions"));
+        assert!(body.contains("**Unresolved behavior**"));
+
+        store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap()
+            .unwrap();
+        let retrying = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let body = render_lifecycle_comment(&retrying);
+        assert!(body.starts_with("## ⏳ Trouve Code Review — Queued"));
+        assert!(!body.contains("Trouve Code Review — Needs Attention"));
+        assert!(!body.contains("**Result:** incomplete"));
     }
 
     #[test]
@@ -19475,6 +19684,7 @@ mod tests {
     fn check_run_action_descriptions_fit_github_limits() {
         for description in [
             RETRY_CHECK_ACTION_DESCRIPTION,
+            RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION,
             FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
         ] {
             assert!(description.chars().count() <= CHECK_ACTION_DESCRIPTION_MAX_CHARS);
@@ -19859,6 +20069,10 @@ mod tests {
             rejected[0].reason,
             "internal_duplicate: duplicate of the accepted finding"
         );
+        let unresolved = unadjudicated_candidates(&review, &candidates);
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].candidate_id, "missing-reason");
+        assert_eq!(unresolved[0].reviewer_name, "Correctness");
 
         let unaccounted = ReviewOutput {
             summary: String::new(),

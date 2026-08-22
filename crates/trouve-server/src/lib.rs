@@ -369,6 +369,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::CodeReviewFindingEvidence,
         trouve_protocol::CodeReviewFindingOrigin,
         trouve_protocol::CodeReviewCandidateRejection,
+        trouve_protocol::CodeReviewUnadjudicatedCandidate,
         trouve_protocol::CodeReviewFinding,
         trouve_protocol::CodeReviewTheme,
         trouve_protocol::CodeReviewThemeObservation,

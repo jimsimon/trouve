@@ -2172,6 +2172,11 @@ export interface components {
             summary?: string;
             tasks?: components["schemas"]["CodeReviewTask"][];
             themes?: components["schemas"]["CodeReviewTheme"][];
+            /**
+             * @description Candidates left without a final-editor decision after the bounded
+             *     repair attempt. Their presence means the review is incomplete.
+             */
+            unadjudicated_candidates?: components["schemas"]["CodeReviewUnadjudicatedCandidate"][];
         };
         CodeReviewJobList: {
             jobs: components["schemas"]["CodeReviewJob"][];
@@ -2558,6 +2563,30 @@ export interface components {
          * @enum {string}
          */
         CodeReviewThemeObservationKind: "new" | "continuation" | "recurrence";
+        /**
+         * @description A reviewer candidate the final editor neither retained nor substantively
+         *     rejected. This represents incomplete coordinator work, not a negative
+         *     decision about the candidate.
+         */
+        CodeReviewUnadjudicatedCandidate: {
+            body: string;
+            candidate_id: string;
+            /**
+             * @description Strength of the reviewer evidence, independently of impact.
+             *     `high`, `medium`, or `low`; legacy records default to `medium`.
+             */
+            confidence?: string;
+            /** Format: int64 */
+            line: number;
+            path: string;
+            reviewer_id: string;
+            reviewer_name: string;
+            severity: string;
+            side: string;
+            task_id: string;
+            /** @description Concise, generated one-line summary of the candidate issue. */
+            title: string;
+        };
         /**
          * @description One slash command / skill the vendor harness accepts in prompts (e.g.
          *     "/simplify"), surfaced by clients as prompt-box completions.

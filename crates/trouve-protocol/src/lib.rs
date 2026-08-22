@@ -298,7 +298,9 @@ pub use requests::*;
 // retaining successful reviewer task outputs (additive).
 // 7.12: code-review jobs expose the server-authoritative final-editor retry
 // capability derived from their latest durable task attempts (additive).
-pub const PROTOCOL_VERSION: &str = "7.12";
+// 7.13: code-review details expose reviewer candidates left unresolved after
+// final-editor repair so clients can represent incomplete reviews (additive).
+pub const PROTOCOL_VERSION: &str = "7.13";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

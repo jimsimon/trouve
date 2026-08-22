@@ -550,6 +550,22 @@ CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
   created_at TEXT NOT NULL,
   PRIMARY KEY (job_id, candidate_id)
 );
+CREATE TABLE IF NOT EXISTS code_review_unadjudicated_candidates (
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  candidate_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  reviewer_id TEXT NOT NULL,
+  reviewer_name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  side TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  confidence TEXT NOT NULL DEFAULT 'medium',
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (job_id, candidate_id)
+);
 CREATE TABLE IF NOT EXISTS code_review_pr_state (
   repository TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
@@ -10044,6 +10060,32 @@ impl Store {
         themes: &[NewCodeReviewTheme],
         candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.save_code_review_result_with_adjudication(
+            job_id,
+            summary,
+            prompt_for_agents,
+            candidate_issue_count,
+            findings,
+            finding_details,
+            themes,
+            candidate_rejections,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_code_review_result_with_adjudication(
+        &self,
+        job_id: &str,
+        summary: &str,
+        prompt_for_agents: &str,
+        candidate_issue_count: u64,
+        findings: &[NewCodeReviewFinding],
+        finding_details: &[NewCodeReviewFindingDetails],
+        themes: &[NewCodeReviewTheme],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+        unadjudicated_candidates: &[trouve_protocol::CodeReviewUnadjudicatedCandidate],
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
         if !finding_details.is_empty() && finding_details.len() != findings.len() {
             anyhow::bail!("review finding details must align with findings");
         }
@@ -10084,6 +10126,10 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM code_review_candidate_rejections WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_unadjudicated_candidates WHERE job_id = ?1",
             params![job_id],
         )?;
         tx.execute(
@@ -10251,6 +10297,29 @@ impl Store {
                 ],
             )?;
         }
+        for candidate in unadjudicated_candidates {
+            tx.execute(
+                "INSERT INTO code_review_unadjudicated_candidates
+                        (candidate_id, job_id, task_id, reviewer_id, reviewer_name,
+                         path, line, side, severity, confidence, title, body, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    candidate.candidate_id,
+                    job_id,
+                    candidate.task_id,
+                    candidate.reviewer_id,
+                    candidate.reviewer_name,
+                    candidate.path,
+                    candidate.line as i64,
+                    candidate.side,
+                    candidate.severity,
+                    candidate.confidence,
+                    candidate.title,
+                    candidate.body,
+                    now,
+                ],
+            )?;
+        }
         tx.execute(
             "UPDATE code_review_jobs
              SET summary = ?2, prompt_for_agents = ?3,
@@ -10296,6 +10365,37 @@ impl Store {
                     title: row.get(9)?,
                     body: row.get(10)?,
                     reason: row.get(11)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn code_review_unadjudicated_candidates(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewUnadjudicatedCandidate>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT candidate_id, task_id, reviewer_id, reviewer_name,
+                    path, line, side, severity, confidence, title, body
+             FROM code_review_unadjudicated_candidates
+             WHERE job_id = ?1
+             ORDER BY reviewer_name, path, line, candidate_id",
+        )?;
+        Ok(stmt
+            .query_map(params![job_id], |row| {
+                Ok(trouve_protocol::CodeReviewUnadjudicatedCandidate {
+                    candidate_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    reviewer_id: row.get(2)?,
+                    reviewer_name: row.get(3)?,
+                    path: row.get(4)?,
+                    line: row.get::<_, i64>(5)? as u64,
+                    side: row.get(6)?,
+                    severity: row.get(7)?,
+                    confidence: row.get(8)?,
+                    title: row.get(9)?,
+                    body: row.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -11525,6 +11625,7 @@ impl Store {
         let findings = self.code_review_findings(id)?;
         let themes = self.code_review_themes_for_job(id)?;
         let candidate_rejections = self.code_review_candidate_rejections(id)?;
+        let unadjudicated_candidates = self.code_review_unadjudicated_candidates(id)?;
         let routing_decisions = self.code_review_routing_decisions(id)?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
             job: record.job,
@@ -11534,6 +11635,7 @@ impl Store {
             findings,
             themes,
             candidate_rejections,
+            unadjudicated_candidates,
             routing_decisions,
             summary: record.summary,
             prompt_for_agents: record.prompt_for_agents,
@@ -21477,7 +21579,7 @@ mod tests {
                 .unwrap()
         );
         let findings = store
-            .save_code_review_result_with_themes(
+            .save_code_review_result_with_adjudication(
                 &queued.id,
                 "One issue",
                 "Fix every confirmed issue.",
@@ -21531,6 +21633,19 @@ mod tests {
                     body: "This branch could be simplified.".into(),
                     reason: "This is a non-actionable style preference.".into(),
                 }],
+                &[trouve_protocol::CodeReviewUnadjudicatedCandidate {
+                    candidate_id: "candidate-3".into(),
+                    task_id: task.id.clone(),
+                    reviewer_id: "correctness".into(),
+                    reviewer_name: "Correctness".into(),
+                    path: "src/lib.rs".into(),
+                    line: 21,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Unresolved behavior".into(),
+                    body: "The final editor did not decide this candidate.".into(),
+                }],
             )
             .unwrap();
         assert_eq!(findings.len(), 1);
@@ -21540,6 +21655,11 @@ mod tests {
         assert_eq!(detail.tasks[0].output, "candidate output");
         assert_eq!(detail.personas[0].candidate_issue_count, 1);
         assert_eq!(detail.candidate_rejections.len(), 1);
+        assert_eq!(detail.unadjudicated_candidates.len(), 1);
+        assert_eq!(
+            detail.unadjudicated_candidates[0].candidate_id,
+            "candidate-3"
+        );
         assert_eq!(detail.candidate_rejections[0].confidence, "high");
         assert_eq!(
             detail.candidate_rejections[0].reason,

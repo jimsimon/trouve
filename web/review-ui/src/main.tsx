@@ -1250,10 +1250,11 @@ function JobDetailPane({
     ),
   );
   const candidateRejections = detail.candidate_rejections ?? [];
+  const unadjudicatedCandidates = detail.unadjudicated_candidates ?? [];
   const routingDecisions = detail.routing_decisions ?? [];
   const unrecordedCandidateDecisions = Math.max(
     0,
-    job.candidate_issue_count - acceptedCandidateIds.size - candidateRejections.length,
+    job.candidate_issue_count - acceptedCandidateIds.size - candidateRejections.length - unadjudicatedCandidates.length,
   );
   const activityGroups: Array<{
     id: string;
@@ -1373,6 +1374,12 @@ function JobDetailPane({
   const finalEditorRetryBlocked = [...latestReviewerTasks.values()].some(
     (task) => !["succeeded", "not_applicable"].includes(task.status),
   );
+  const latestCoordinatorTask = coordinatorTasks[coordinatorTasks.length - 1];
+  const finalEditorRetryable =
+    ["failed", "cancelled"].includes(job.status) &&
+    latestCoordinatorTask !== undefined &&
+    ["failed", "cancelled"].includes(latestCoordinatorTask.status) &&
+    !finalEditorRetryBlocked;
   const selectedTaskSummary =
     detail.tasks.find((task) => task.id === selectedTaskId) ?? detail.tasks[0];
   const retainedTask = selectedTaskSummary ? taskDetails[selectedTaskSummary.id] : undefined;
@@ -1498,9 +1505,16 @@ function JobDetailPane({
           </>
         )}
         {!["running", "queued"].includes(job.status) && (
-          <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
-            {busy === "retry" ? "Retrying…" : "Retry"}
-          </button>
+          <>
+            {finalEditorRetryable && unadjudicatedCandidates.length > 0 && (
+              <button type="button" disabled={Boolean(busy)} onClick={() => void retryFailedFinalEditor()}>
+                {busy === "final-editor" ? "Retrying…" : "Retry final editor"}
+              </button>
+            )}
+            <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
+              {busy === "retry" ? "Retrying…" : unadjudicatedCandidates.length > 0 ? "Rerun all reviewers" : "Retry"}
+            </button>
+          </>
         )}
         <button class="ghost" type="button" disabled={Boolean(busy)} onClick={() => void act("full")}>
           {busy === "full" ? "Requesting…" : "Full branch review"}
@@ -1573,7 +1587,7 @@ function JobDetailPane({
             <p>
               {job.issue_count} confirmed findings · {acceptedCandidateIds.size} selected candidates
               {" · "}
-              {candidateRejections.length} rejected · {job.fixed_issue_count} fixed
+              {candidateRejections.length} rejected · {unadjudicatedCandidates.length} unresolved · {job.fixed_issue_count} fixed
             </p>
           </div>
           {detail.prompt_for_agents && (
@@ -1581,6 +1595,25 @@ function JobDetailPane({
           )}
         </div>
         {detail.summary && <p class="summary">{detail.summary}</p>}
+        {unadjudicatedCandidates.length > 0 && (
+          <div class="banner warning" role="alert">
+            {job.status === "running" || job.status === "queued" ? (
+              <>
+                <strong>Final-editor retry in progress</strong>
+                <p>
+                  The prior unresolved candidates remain visible until the replacement final-editor decision completes.
+                </p>
+              </>
+            ) : (
+              <>
+                <strong>Review incomplete</strong>
+                <p>
+                  The final editor did not decide {unadjudicatedCandidates.length} candidate issue{unadjudicatedCandidates.length === 1 ? "" : "s"}. No clean verdict was published, and these candidates will not become rejection precedent.
+                </p>
+              </>
+            )}
+          </div>
+        )}
         {(detail.themes ?? []).length > 0 && (
           <div class="theme-list">
             {(detail.themes ?? []).map((theme) => (
@@ -1669,6 +1702,29 @@ function JobDetailPane({
                   <div>
                     <b>Not selected:</b> {rejection.reason}
                   </div>
+                </article>
+              ))}
+            </div>
+          </details>
+        )}
+        {unadjudicatedCandidates.length > 0 && (
+          <details class="candidate-decisions unresolved" open>
+            <summary>
+              <strong>{unadjudicatedCandidates.length} unresolved final-editor decision{unadjudicatedCandidates.length === 1 ? "" : "s"}</strong>
+              <span>Reviewer evidence awaiting adjudication</span>
+            </summary>
+            <div class="rejection-list">
+              {unadjudicatedCandidates.map((candidate) => (
+                <article class="candidate-rejection candidate-unadjudicated" key={candidate.candidate_id}>
+                  <header>
+                    <strong>{candidate.title}</strong>
+                    <span>{candidate.reviewer_name}</span>
+                  </header>
+                  <small>
+                    {candidate.path}:{candidate.line} · Severity: {candidate.severity.toUpperCase()} · Confidence: {(candidate.confidence ?? "medium").toUpperCase()}
+                  </small>
+                  <p>{candidate.body}</p>
+                  <div><b>Status:</b> Awaiting a final-editor decision</div>
                 </article>
               ))}
             </div>
