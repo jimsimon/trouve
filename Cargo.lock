@@ -7585,6 +7585,7 @@ name = "trouve-update"
 version = "4.0.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "flate2",
  "fs4",
  "futures",
@@ -7599,7 +7600,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "trouve-process",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

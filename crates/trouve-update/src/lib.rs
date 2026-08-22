@@ -24,9 +24,8 @@ const MAX_CHECKSUM_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = MAX_BINARY_BYTES + 64 * 1024 * 1024;
-const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const MAX_VERSION_OUTPUT_BYTES: usize = 4096;
+const MAX_INSTALLED_VERSION_BYTES: u64 = 128;
+const UPDATE_STATE_DIRECTORY: &str = "updates";
 
 /// Set this to a truthy value to disable startup/background updates. Manual
 /// update commands and the desktop's explicit update button still work.
@@ -335,7 +334,7 @@ pub async fn install_latest(component: Component, current_version: &str) -> Resu
     let lock = acquire_update_lock(None).await?;
     let current = Version::parse(current_version)
         .with_context(|| format!("invalid current version {current_version:?}"))?;
-    let observed = installed_binary_version(&lock.executable, component.display_name(), None)
+    let observed = installed_binary_version(&lock.executable)
         .await
         .filter(|installed| installed > &current)
         .unwrap_or(current);
@@ -345,7 +344,13 @@ pub async fn install_latest(component: Component, current_version: &str) -> Resu
             version: check.current,
         });
     };
-    install_release_locked(&release, |_| {}, Arc::new(InstallCancellation::default())).await?;
+    install_release_locked(
+        &release,
+        &lock.executable,
+        |_| {},
+        Arc::new(InstallCancellation::default()),
+    )
+    .await?;
     Ok(UpdateStatus::Updated {
         from: check.current,
         to: release.version,
@@ -385,157 +390,189 @@ pub async fn install_release_with_progress_and_cancel(
     }
     ensure_not_cancelled(&cancellation)?;
     let lock = acquire_update_lock(Some(Arc::clone(&cancellation))).await?;
-    let binary_name = release
-        .binary_name
-        .strip_suffix(".exe")
-        .unwrap_or(&release.binary_name);
-    if installed_binary_version(
-        &lock.executable,
-        binary_name,
-        Some(Arc::clone(&cancellation)),
-    )
-    .await
-    .is_some_and(|installed| installed >= release.version)
+    if installed_binary_version(&lock.executable)
+        .await
+        .is_some_and(|installed| installed >= release.version)
     {
         return Ok(());
     }
-    install_release_locked(release, progress, cancellation).await
+    ensure_not_cancelled(&cancellation)?;
+    install_release_locked(release, &lock.executable, progress, cancellation).await
 }
 
-async fn installed_binary_version(
-    executable: &Path,
-    binary_name: &str,
-    cancellation: Option<Arc<InstallCancellation>>,
-) -> Option<Version> {
+async fn installed_binary_version(executable: &Path) -> Option<Version> {
     let executable = executable.to_owned();
-    let binary_name = binary_name.to_owned();
     tokio::task::spawn_blocking(move || {
-        probe_binary_version(&executable, &binary_name, cancellation.as_deref())
+        let state_root = update_state_root()?;
+        installed_binary_version_at(&state_root, &executable)
     })
     .await
     .ok()?
-    .ok()
 }
 
-fn probe_binary_version(
-    executable: &Path,
-    binary_name: &str,
-    cancellation: Option<&InstallCancellation>,
-) -> Result<Version> {
-    if let Some(cancellation) = cancellation {
-        ensure_not_cancelled(cancellation)?;
-    }
-    let mut command = std::process::Command::new(executable);
-    command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+fn update_state_root() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|directory| directory.join("trouve").join(UPDATE_STATE_DIRECTORY))
+}
+
+fn installed_binary_version_at(state_root: &Path, executable: &Path) -> Option<Version> {
+    verify_private_update_state_root(state_root).ok()?;
+    let identity = executable_identity(executable).ok()?;
+    read_installed_version(&update_state_path(state_root, executable, &identity))
+}
+
+fn record_installed_version(state_root: &Path, executable: &Path, version: &Version) -> Result<()> {
+    verify_private_update_state_root(state_root)?;
+    let identity = executable_identity(executable)?;
+    let state = update_state_path(state_root, executable, &identity);
+    let text = format!("{version}\n");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
-    let mut child = trouve_process::spawn(&mut command)
-        .with_context(|| format!("probing installed executable {}", executable.display()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("installed executable version output was not captured"))?;
-    let (output_sender, output_receiver) = std::sync::mpsc::sync_channel(1);
-    let output_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::with_capacity(MAX_VERSION_OUTPUT_BYTES + 1);
-        let result = stdout
-            .take((MAX_VERSION_OUTPUT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = output_sender.send(result);
-    });
-    let deadline = std::time::Instant::now() + VERSION_PROBE_TIMEOUT;
-    let mut output = None;
-    let mut status = None;
-    loop {
-        if cancellation.is_some_and(InstallCancellation::is_cancelled) {
-            terminate_version_probe(&mut child);
-            let _ = output_reader.join();
-            bail!("update cancelled");
+    match options.open(&state) {
+        Ok(mut file) => {
+            file.write_all(text.as_bytes())
+                .context("writing installed-version state")?;
+            file.sync_all().context("syncing installed-version state")?;
+            sync_directory(state_root).context("syncing update-state directory")
         }
-        if output.is_none() {
-            match output_receiver.try_recv() {
-                Ok(Ok(bytes)) if bytes.len() > MAX_VERSION_OUTPUT_BYTES => {
-                    terminate_version_probe(&mut child);
-                    let _ = output_reader.join();
-                    bail!("installed executable version output exceeds the limit");
-                }
-                Ok(Ok(bytes)) => output = Some(bytes),
-                Ok(Err(error)) => {
-                    terminate_version_probe(&mut child);
-                    let _ = output_reader.join();
-                    return Err(error).context("reading installed executable version output");
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    terminate_version_probe(&mut child);
-                    let _ = output_reader.join();
-                    bail!("installed executable version output reader stopped");
-                }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if read_installed_version(&state).as_ref() == Some(version) {
+                Ok(())
+            } else {
+                bail!("installed-version state conflicts with the replacement executable")
             }
         }
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(next) => status = next,
-                Err(error) => {
-                    terminate_version_probe(&mut child);
-                    let _ = output_reader.join();
-                    return Err(error).context("waiting for installed executable version probe");
-                }
-            }
-        }
-        if status.is_some() && output.is_some() {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            terminate_version_probe(&mut child);
-            let _ = output_reader.join();
-            bail!("installed executable version probe timed out");
-        }
-        std::thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+        Err(error) => Err(error)
+            .with_context(|| format!("creating installed-version state {}", state.display())),
     }
-    let _ = output_reader.join();
-    if !status.is_some_and(|status| status.success()) {
-        bail!("installed executable version probe failed");
-    }
-    parse_binary_version(&output.unwrap_or_default(), binary_name)
-        .ok_or_else(|| anyhow!("installed executable returned an invalid version"))
 }
 
-fn parse_binary_version(output: &[u8], binary_name: &str) -> Option<Version> {
-    let line = std::str::from_utf8(output).ok()?.lines().next()?.trim();
-    let version = line.strip_prefix(binary_name)?.trim();
-    Version::parse(version).ok()
+fn read_installed_version(path: &Path) -> Option<Version> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_INSTALLED_VERSION_BYTES {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut text = String::new();
+    file.take(MAX_INSTALLED_VERSION_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_INSTALLED_VERSION_BYTES || text.lines().count() != 1 {
+        return None;
+    }
+    Version::parse(text.trim()).ok()
 }
 
-fn terminate_version_probe(child: &mut std::process::Child) {
+fn prepare_private_update_state_root(state_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(state_root)
+        .with_context(|| format!("creating update-state directory {}", state_root.display()))?;
     #[cfg(unix)]
-    if let Ok(process_group) = i32::try_from(child.id()) {
-        // The probe is placed in its own process group under the shared launch
-        // boundary, so helpers inheriting stdout cannot outlive cleanup.
-        unsafe {
-            libc::kill(-process_group, libc::SIGKILL);
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata =
+            std::fs::symlink_metadata(state_root).context("inspecting update-state directory")?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("update-state path is not a real directory");
         }
+        std::fs::set_permissions(state_root, std::fs::Permissions::from_mode(0o700))
+            .context("securing update-state directory")?;
+    }
+    verify_private_update_state_root(state_root)
+}
+
+fn verify_private_update_state_root(state_root: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(state_root)
+        .with_context(|| format!("inspecting update-state directory {}", state_root.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("update-state path is not a real directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            bail!("update-state directory is not private to the current user");
+        }
+    }
+    Ok(())
+}
+
+fn update_state_path(state_root: &Path, executable: &Path, identity: &str) -> std::path::PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(b"trouve-update-state-v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        digest.update(executable.as_os_str().as_bytes());
     }
     #[cfg(windows)]
     {
-        let mut taskkill = std::process::Command::new("taskkill");
-        taskkill.args(["/F", "/T", "/PID", &child.id().to_string()]);
-        let _ = trouve_process::status(&mut taskkill);
+        use std::os::windows::ffi::OsStrExt as _;
+        for unit in executable.as_os_str().encode_wide() {
+            digest.update(unit.to_le_bytes());
+        }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    #[cfg(not(any(unix, windows)))]
+    digest.update(executable.to_string_lossy().as_bytes());
+    digest.update(b"\0");
+    digest.update(identity.as_bytes());
+    state_root.join(format!("{}.version", hex::encode(digest.finalize())))
+}
+
+fn executable_identity(executable: &Path) -> Result<String> {
+    let file = std::fs::File::open(executable)
+        .with_context(|| format!("opening executable identity {}", executable.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading executable identity {}", executable.display()))?;
+    if !metadata.is_file() {
+        bail!("updated executable is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(format!(
+            "unix:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        let succeeded =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+        if succeeded == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("querying installed executable file identity");
+        }
+        Ok(format!(
+            "windows:{}:{}:{}:{}",
+            information.dwVolumeSerialNumber,
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+            metadata.file_size(),
+            metadata.last_write_time()
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    bail!("installed-version state is unsupported on this platform")
 }
 
 async fn install_release_locked(
     release: &Release,
+    installed_executable: &Path,
     progress: impl Fn(InstallProgress),
     cancellation: Arc<InstallCancellation>,
 ) -> Result<()> {
@@ -595,17 +632,24 @@ async fn install_release_locked(
 
     ensure_not_cancelled(&cancellation)?;
     progress(InstallProgress::Installing);
-    let installed_executable =
-        std::env::current_exe().context("locating executable installation directory")?;
+    let installed_executable = installed_executable.to_owned();
     let installed_parent = installed_executable
         .parent()
         .ok_or_else(|| anyhow!("updated executable path has no parent"))?
         .to_owned();
+    let state_root =
+        update_state_root().ok_or_else(|| anyhow!("locating per-user update-state directory"))?;
+    let version = release.version.clone();
     tokio::task::spawn_blocking(move || {
+        prepare_private_update_state_root(&state_root)?;
         sync_directory(&installed_parent)
             .context("syncing installation directory before replacement")?;
         cancellation.commit_install()?;
         self_replace::self_replace(&replacement).context("replacing the running executable")?;
+        // This is deduplication metadata, not part of the replacement commit.
+        // Publish it only for the final path identity, and never turn a
+        // successful executable replacement into an update failure.
+        let _ = record_installed_version(&state_root, &installed_executable, &version);
         sync_directory(&installed_parent).context("syncing installed executable directory")
     })
     .await
@@ -1165,59 +1209,41 @@ mod tests {
     }
 
     #[test]
-    fn installed_version_requires_exact_executable_output() {
-        assert_eq!(
-            parse_binary_version(b"trouve-search 4.1.0\n", "trouve-search"),
-            Some(Version::parse("4.1.0").unwrap())
-        );
-        assert_eq!(
-            parse_binary_version(b"trouve 99.0.0\n", "trouve-search"),
-            None
-        );
-        assert_eq!(
-            parse_binary_version(b"trouve-search 4.1.0 forged\n", "trouve-search"),
-            None
-        );
-    }
-
-    #[cfg(unix)]
-    fn version_probe_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt as _;
-
+    fn installed_version_state_is_bound_to_the_installed_file_identity() {
         let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
         let executable = temp.path().join("trouve-search");
-        std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (temp, executable)
+        std::fs::write(&executable, b"trusted installed executable").unwrap();
+        let version = Version::parse("4.1.0").unwrap();
+
+        prepare_private_update_state_root(&state_root).unwrap();
+        record_installed_version(&state_root, &executable, &version).unwrap();
+        assert_eq!(
+            installed_binary_version_at(&state_root, &executable),
+            Some(version)
+        );
+
+        let untrusted = temp.path().join("untrusted-trouve-search");
+        std::fs::write(&untrusted, b"untrusted replacement").unwrap();
+        std::fs::remove_file(&executable).unwrap();
+        std::fs::rename(&untrusted, &executable).unwrap();
+        assert_eq!(installed_binary_version_at(&state_root, &executable), None);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn installed_version_probe_is_cancellable_and_reaps_helpers() {
-        let (_temp, executable) = version_probe_script("sleep 30");
-        let cancellation = Arc::new(InstallCancellation::default());
-        let request = Arc::clone(&cancellation);
-        let requester = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            assert!(request.request_cancel());
-        });
-        let started = std::time::Instant::now();
-        let error =
-            probe_binary_version(&executable, "trouve-search", Some(&cancellation)).unwrap_err();
-        requester.join().unwrap();
-        assert!(error.to_string().contains("update cancelled"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
+    fn installed_version_state_rejects_noncanonical_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let executable = temp.path().join("trouve");
+        std::fs::write(&executable, b"executable").unwrap();
+        prepare_private_update_state_root(&state_root).unwrap();
+        let identity = executable_identity(&executable).unwrap();
+        let state = update_state_path(&state_root, &executable, &identity);
 
-    #[cfg(unix)]
-    #[test]
-    fn installed_version_probe_rejects_output_while_it_crosses_the_bound() {
-        let body = "printf 'trouve-search 4.1.0\\n'; i=0; while [ \"$i\" -lt 5000 ]; do printf x; i=$((i + 1)); done; sleep 30";
-        let (_temp, executable) = version_probe_script(body);
-        let started = std::time::Instant::now();
-        let error = probe_binary_version(&executable, "trouve-search", None).unwrap_err();
-        assert!(error.to_string().contains("exceeds the limit"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        std::fs::write(&state, b"4.1.0\nforged\n").unwrap();
+        assert_eq!(installed_binary_version_at(&state_root, &executable), None);
+        std::fs::write(&state, vec![b'x'; MAX_INSTALLED_VERSION_BYTES as usize + 1]).unwrap();
+        assert_eq!(installed_binary_version_at(&state_root, &executable), None);
     }
 
     #[test]

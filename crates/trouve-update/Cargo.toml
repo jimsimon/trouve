@@ -9,11 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
 flate2.workspace = true
 futures.workspace = true
 fs4.workspace = true
 hex.workspace = true
-libc = "0.2.186"
 reqwest.workspace = true
 rustls.workspace = true
 semver.workspace = true
@@ -23,5 +23,10 @@ self-replace.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-trouve-process.workspace = true
 zip.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
