@@ -21,9 +21,13 @@ use super::AppEvent;
 
 const UPDATE_RESTART_ENV: &str = "TROUVE_UPDATE_RESTARTED_VERSION";
 const UPDATE_RELAUNCH_GATE_ENV: &str = "TROUVE_UPDATE_RELAUNCH_GATE";
+const UPDATE_RELAUNCH_SUPERVISOR_ENV: &str = "TROUVE_UPDATE_RELAUNCH_SUPERVISOR";
+const UPDATE_READY_ACK_ENV: &str = "TROUVE_UPDATE_READY_ACK";
 const UPDATE_RELAUNCH_GATE_V2_PREFIX: &str = "trouve-update-relaunch-v2-";
+const UPDATE_READY_ACK_PREFIX: &str = "trouve-update-ready-v1-";
 const UPDATE_RELAUNCH_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_RELAUNCH_GATE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const UPDATE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 const SPLASH_HTML: &str = r#"<!doctype html>
@@ -43,6 +47,8 @@ main { width: min(430px, calc(100vw - 52px)); text-align: center; }
   background: linear-gradient(145deg, #7f7cff, #4d68dd); box-shadow: 0 18px 45px #06081299; }
 h1 { margin: 0; font-size: 21px; font-weight: 650; letter-spacing: -.01em; }
 p { min-height: 20px; margin: 9px 0 18px; color: #aeb7cc; font-size: 13px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 progress { width: 100%; height: 7px; appearance: none; border: 0; border-radius: 99px; overflow: hidden; }
 progress::-webkit-progress-bar { background: #2b3142; }
 progress::-webkit-progress-value { background: linear-gradient(90deg, #7775ff, #91a4ff); }
@@ -61,6 +67,7 @@ button.primary { border-color: #7478ff; background: #6266df; color: white; }
   <section id="announcement" role="status" aria-live="polite" aria-atomic="true">
     <h1 id="status">Checking for updates…</h1>
   </section>
+  <p id="failure-announcement" class="visually-hidden" role="alert"></p>
   <p id="detail">Contacting the stable release channel</p>
   <progress id="progress" max="100" aria-label="Update progress"></progress>
   <div id="actions" class="actions" role="group" aria-label="Update recovery actions" hidden>
@@ -71,10 +78,11 @@ button.primary { border-color: #7478ff; background: #6266df; color: white; }
 </main>
 <script>
 window.__trouveStage = (status, detail, progress, failed) => {
-  const announcement = document.getElementById("announcement");
-  announcement.setAttribute("aria-live", failed ? "assertive" : "polite");
   const statusNode = document.getElementById("status");
   if (statusNode.textContent !== status) statusNode.textContent = status;
+  const failureNode = document.getElementById("failure-announcement");
+  const failureDetail = failed ? detail : "";
+  if (failureNode.textContent !== failureDetail) failureNode.textContent = failureDetail;
   document.getElementById("detail").textContent = detail;
   const bar = document.getElementById("progress");
   if (progress === null) bar.removeAttribute("value");
@@ -104,6 +112,7 @@ pub(crate) enum Event {
 pub(crate) struct PreflightResult {
     pub exit_process: bool,
     pub update_state: DesktopUpdateState,
+    pub self_update_available: bool,
 }
 
 impl PreflightResult {
@@ -111,6 +120,7 @@ impl PreflightResult {
         Self {
             exit_process: false,
             update_state: idle_state("Desktop updates are available in the packaged app."),
+            self_update_available: false,
         }
     }
 }
@@ -125,6 +135,23 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                 "Self-update is disabled in development builds.",
                 None,
             ),
+            self_update_available: false,
+        });
+    }
+
+    if let Err(error) = trouve_update::ensure_self_update_supported() {
+        return Ok(PreflightResult {
+            exit_process: false,
+            update_state: state(
+                DesktopUpdatePhase::Disabled,
+                None,
+                &format!(
+                    "Self-update is unavailable for this package-managed installation: {}",
+                    concise_error(&format!("{error:#}"))
+                ),
+                None,
+            ),
+            self_update_available: false,
         });
     }
 
@@ -132,6 +159,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
         return Ok(PreflightResult {
             exit_process: false,
             update_state: idle_state(&format!("Version {version} was installed successfully.")),
+            self_update_available: true,
         });
     }
 
@@ -151,6 +179,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
             update_state: idle_state(
                 "Automatic updates are disabled by TROUVE_DISABLE_AUTO_UPDATE. Manual checks remain available.",
             ),
+            self_update_available: true,
         });
     }
     if !preferences.general.automatic_updates {
@@ -159,6 +188,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
             update_state: idle_state(
                 "Automatic updates are off. You can still check manually in Settings.",
             ),
+            self_update_available: true,
         });
     }
 
@@ -266,6 +296,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                         &format!("Startup update failed: {last_failure}"),
                         None,
                     ),
+                    self_update_available: true,
                 });
                 *control_flow = ControlFlow::Exit;
             }
@@ -273,6 +304,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                 result = Some(PreflightResult {
                     exit_process: false,
                     update_state: update,
+                    self_update_available: true,
                 });
                 *control_flow = ControlFlow::Exit;
             }
@@ -285,6 +317,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                         "Restarting into the installed update…",
                         Some(100),
                     ),
+                    self_update_available: true,
                 });
                 *control_flow = ControlFlow::Exit;
             }
@@ -297,6 +330,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                     result = Some(PreflightResult {
                         exit_process: true,
                         update_state: idle_state("Update cancelled."),
+                        self_update_available: true,
                     });
                     *control_flow = ControlFlow::Exit;
                 } else {
@@ -318,6 +352,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
     Ok(result.unwrap_or_else(|| PreflightResult {
         exit_process: true,
         update_state: idle_state("Update cancelled."),
+        self_update_available: true,
     }))
 }
 
@@ -469,13 +504,125 @@ fn take_restarted_version() -> Option<String> {
 }
 
 pub(crate) fn restart_updated_app(version: &str) -> Result<()> {
+    let acknowledgement = UpdateReadyAcknowledgement::new();
     let executable = std::env::current_exe().context("locating the updated executable")?;
-    std::process::Command::new(&executable)
+    let mut command = std::process::Command::new(&executable);
+    command
         .args(std::env::args_os().skip(1))
         .env(UPDATE_RESTART_ENV, version)
-        .spawn()
+        .env(UPDATE_READY_ACK_ENV, &acknowledgement.path);
+    let mut child = trouve_process::spawn(&mut command)
         .with_context(|| format!("starting {}", executable.display()))?;
-    Ok(())
+    let ready = wait_for_update_ready(
+        &acknowledgement.path,
+        UPDATE_READY_TIMEOUT,
+        UPDATE_RELAUNCH_GATE_POLL_INTERVAL,
+        || Ok(child.try_wait()?.is_none()),
+    );
+    if ready.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    ready
+}
+
+struct UpdateReadyAcknowledgement {
+    path: PathBuf,
+}
+
+impl UpdateReadyAcknowledgement {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "{UPDATE_READY_ACK_PREFIX}{}-{nonce}.ack",
+                std::process::id()
+            )),
+        }
+    }
+}
+
+impl Drop for UpdateReadyAcknowledgement {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %self.path.display(), "removing update readiness acknowledgement failed");
+            }
+        }
+    }
+}
+
+fn wait_for_update_ready(
+    path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut child_running: impl FnMut() -> std::io::Result<bool>,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if path
+            .try_exists()
+            .with_context(|| format!("checking update readiness {}", path.display()))?
+        {
+            return Ok(());
+        }
+        if !child_running().context("checking the updated trouve process")? {
+            anyhow::bail!("the updated trouve process exited before its main window was ready");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for the updated trouve main window");
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+/// Signal an update supervisor only after the embedded server, gateway, and
+/// main webview have all initialized successfully.
+pub(crate) fn take_update_ready_acknowledgement() -> Result<Option<PathBuf>> {
+    let acknowledgement = std::env::var_os(UPDATE_READY_ACK_ENV);
+    // Called at process entry before worker threads exist.
+    unsafe {
+        std::env::remove_var(UPDATE_READY_ACK_ENV);
+    }
+    let Some(acknowledgement) = acknowledgement else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(acknowledgement);
+    let valid = path.parent() == Some(std::env::temp_dir().as_path())
+        && path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with(UPDATE_READY_ACK_PREFIX));
+    if !valid {
+        anyhow::bail!("update readiness acknowledgement path is invalid");
+    }
+    Ok(Some(path))
+}
+
+pub(crate) fn signal_update_ready(path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("creating update readiness {}", path.display()))?;
+    use std::io::Write as _;
+    file.write_all(b"ready\n")
+        .context("writing update readiness acknowledgement")?;
+    file.sync_all()
+        .context("syncing update readiness acknowledgement")
 }
 
 /// Delay product initialization in a replacement process until the retiring
@@ -494,6 +641,172 @@ pub(crate) fn wait_for_update_relaunch_gate() -> Result<()> {
         UPDATE_RELAUNCH_GATE_TIMEOUT,
         UPDATE_RELAUNCH_GATE_POLL_INTERVAL,
     )
+}
+
+/// Run the recovery launcher used by an in-app update. The retiring host
+/// remains responsible for its current UI until it releases the gate; this
+/// launcher then keeps a splash and recovery controls alive until the new
+/// main webview explicitly acknowledges readiness.
+#[allow(dead_code)] // Product entry point uses this; the comparison target does not.
+pub(crate) fn run_update_relaunch_supervisor() -> Result<bool> {
+    let version = std::env::var(UPDATE_RELAUNCH_SUPERVISOR_ENV).ok();
+    let Some(version) = version else {
+        return Ok(false);
+    };
+    let acknowledgement = take_update_ready_acknowledgement()?;
+    let gate = std::env::var_os(UPDATE_RELAUNCH_GATE_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("update relaunch supervisor has no ownership gate"))?;
+    // Supervisor dispatch happens at process entry before worker threads.
+    unsafe {
+        std::env::remove_var(UPDATE_RELAUNCH_SUPERVISOR_ENV);
+        std::env::remove_var(UPDATE_RELAUNCH_GATE_ENV);
+    }
+    if version != env!("CARGO_PKG_VERSION") {
+        anyhow::bail!("update relaunch supervisor version does not match this executable");
+    }
+
+    let mut event_loop = tao::event_loop::EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let window = WindowBuilder::new()
+        .with_title("trouve")
+        .with_inner_size(LogicalSize::new(520, 330))
+        .with_resizable(false)
+        .build(&event_loop)?;
+    let proxy = event_loop.create_proxy();
+    let navigation_proxy = proxy.clone();
+    let html = SPLASH_HTML
+        .replace("__VERSION__", env!("CARGO_PKG_VERSION"))
+        .replace(">Open trouve</button>", ">Close</button>");
+    let builder = WebViewBuilder::new()
+        .with_html(html)
+        .with_navigation_handler(move |url| {
+            let event = match url.as_str() {
+                "https://startup.trouve/retry" | "https://startup.trouve/retry/" => {
+                    Some(Event::Retry)
+                }
+                "https://startup.trouve/continue" | "https://startup.trouve/continue/" => {
+                    Some(Event::Open)
+                }
+                _ => None,
+            };
+            if let Some(event) = event {
+                let _ = navigation_proxy.send_event(AppEvent::Startup(event));
+            }
+            false
+        })
+        .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+        .with_drag_drop_handler(|_| true);
+    #[cfg(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ))]
+    let webview = builder.build(&window)?;
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    let webview = {
+        use tao::platform::unix::WindowExtUnix as _;
+        use wry::WebViewBuilderExtUnix as _;
+        let container = window
+            .default_vbox()
+            .ok_or_else(|| anyhow::anyhow!("update recovery window has no GTK container"))?;
+        builder.build_gtk(container)?
+    };
+    signal_update_ready(acknowledgement.as_deref())?;
+
+    spawn_supervised_relaunch(proxy.clone(), version.clone(), gate.clone());
+    let mut running = true;
+    event_loop.run_return(|event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            TaoEvent::UserEvent(AppEvent::Startup(Event::Stage {
+                status,
+                detail,
+                progress_percent,
+            })) => render_stage(&webview, &status, &detail, progress_percent, false),
+            TaoEvent::UserEvent(AppEvent::Startup(Event::Failed(error))) => {
+                running = false;
+                render_stage(
+                    &webview,
+                    "Couldn't restart trouve",
+                    &concise_error(&error),
+                    Some(0),
+                    true,
+                );
+            }
+            TaoEvent::UserEvent(AppEvent::Startup(Event::Retry)) if !running => {
+                running = true;
+                render_stage(
+                    &webview,
+                    "Starting updated trouve…",
+                    "Waiting for the application to become ready",
+                    Some(99),
+                    false,
+                );
+                spawn_supervised_relaunch(proxy.clone(), version.clone(), gate.clone());
+            }
+            TaoEvent::UserEvent(AppEvent::Startup(Event::Open | Event::ExitProcess)) => {
+                *control_flow = ControlFlow::Exit;
+            }
+            TaoEvent::WindowEvent {
+                window_id,
+                event: WindowEvent::CloseRequested,
+                ..
+            } if window_id == window.id() => *control_flow = ControlFlow::Exit,
+            _ => {}
+        }
+    });
+    drop(webview);
+    drop(window);
+    Ok(true)
+}
+
+#[allow(dead_code)] // Reachable only through the product-only supervisor.
+fn spawn_supervised_relaunch(
+    proxy: tao::event_loop::EventLoopProxy<AppEvent>,
+    version: String,
+    gate: PathBuf,
+) {
+    std::thread::spawn(move || {
+        send(
+            &proxy,
+            Event::Stage {
+                status: "Finishing update handoff…".into(),
+                detail: "Waiting for the previous app window to close safely".into(),
+                progress_percent: Some(98),
+            },
+        );
+        if let Err(error) = wait_for_relaunch_gate(
+            &gate,
+            UPDATE_RELAUNCH_GATE_TIMEOUT,
+            UPDATE_RELAUNCH_GATE_POLL_INTERVAL,
+        ) {
+            send(&proxy, Event::Failed(format!("{error:#}")));
+            return;
+        }
+        send(
+            &proxy,
+            Event::Stage {
+                status: "Starting updated trouve…".into(),
+                detail: "Waiting for the application to become ready".into(),
+                progress_percent: Some(99),
+            },
+        );
+        match restart_updated_app(&version) {
+            Ok(()) => send(&proxy, Event::ExitProcess),
+            Err(error) => send(
+                &proxy,
+                Event::Failed(format!(
+                    "version {version} is installed, but its main window did not start: {error:#}"
+                )),
+            ),
+        }
+    });
 }
 
 fn wait_for_relaunch_gate(path: &Path, timeout: Duration, poll_interval: Duration) -> Result<()> {
@@ -644,15 +957,28 @@ impl Drop for UpdateRelaunchGate {
 /// its host until release is called after shutdown.
 pub(crate) fn prepare_updated_app_relaunch(version: &str) -> Result<UpdateRelaunchGate> {
     let gate = UpdateRelaunchGate::create()?;
+    let acknowledgement = UpdateReadyAcknowledgement::new();
     let gate_path = &gate.path;
     let executable = std::env::current_exe().context("locating the updated executable")?;
     let mut command = std::process::Command::new(&executable);
     command
         .args(std::env::args_os().skip(1))
-        .env(UPDATE_RESTART_ENV, version)
-        .env(UPDATE_RELAUNCH_GATE_ENV, gate_path);
-    trouve_process::spawn(&mut command)
+        .env(UPDATE_RELAUNCH_SUPERVISOR_ENV, version)
+        .env(UPDATE_RELAUNCH_GATE_ENV, gate_path)
+        .env(UPDATE_READY_ACK_ENV, &acknowledgement.path);
+    let mut child = trouve_process::spawn(&mut command)
         .with_context(|| format!("starting gated {}", executable.display()))?;
+    let ready = wait_for_update_ready(
+        &acknowledgement.path,
+        UPDATE_READY_TIMEOUT,
+        UPDATE_RELAUNCH_GATE_POLL_INTERVAL,
+        || Ok(child.try_wait()?.is_none()),
+    );
+    if ready.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    ready.context("waiting for the update recovery window")?;
     Ok(gate)
 }
 
@@ -997,7 +1323,13 @@ mod tests {
     #[test]
     fn startup_splash_announces_coarse_progress_and_focuses_recovery() {
         assert!(SPLASH_HTML.contains("role=\"status\" aria-live=\"polite\""));
-        assert!(SPLASH_HTML.contains("</section>\n  <p id=\"detail\""));
+        assert!(
+            SPLASH_HTML
+                .contains("id=\"failure-announcement\" class=\"visually-hidden\" role=\"alert\"")
+        );
+        assert!(SPLASH_HTML.contains("const failureDetail = failed ? detail : \"\""));
+        assert!(SPLASH_HTML.contains("</section>\n  <p id=\"failure-announcement\""));
+        assert!(SPLASH_HTML.contains("</p>\n  <p id=\"detail\""));
         assert!(SPLASH_HTML.contains("statusNode.textContent !== status"));
         assert!(SPLASH_HTML.contains("aria-label=\"Update progress\""));
         assert!(SPLASH_HTML.contains("aria-label=\"Update recovery actions\" hidden"));
@@ -1102,6 +1434,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn replacement_process_requires_an_explicit_main_window_acknowledgement() {
+        let acknowledgement = UpdateReadyAcknowledgement::new();
+        let path = acknowledgement.path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            std::fs::write(path, b"ready\n").unwrap();
+        });
+        wait_for_update_ready(
+            &acknowledgement.path,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            || Ok(true),
+        )
+        .unwrap();
+        writer.join().unwrap();
+
+        let missing = UpdateReadyAcknowledgement::new();
+        let error = wait_for_update_ready(
+            &missing.path,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exited before its main window was ready")
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::StreamExt as _;
@@ -24,10 +24,50 @@ const MAX_CHECKSUM_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = MAX_BINARY_BYTES + 64 * 1024 * 1024;
+const INSTALLED_VERSION_MARKER_SUFFIX: &str = "update-version";
 
 /// Set this to a truthy value to disable startup/background updates. Manual
 /// update commands and the desktop's explicit update button still work.
 pub const DISABLE_AUTO_UPDATE_ENV: &str = "TROUVE_DISABLE_AUTO_UPDATE";
+
+/// Verify that the running executable lives in an installation directory the
+/// current user can update without elevation. Package-managed locations such
+/// as /usr/bin and Program Files intentionally fail this probe.
+pub fn ensure_self_update_supported() -> Result<()> {
+    let executable = std::env::current_exe().context("locating the installed executable")?;
+    ensure_update_directory_writable(&executable)
+}
+
+fn ensure_update_directory_writable(executable: &Path) -> Result<()> {
+    let parent = executable
+        .parent()
+        .ok_or_else(|| anyhow!("installed executable path has no parent"))?;
+    let file_name = executable
+        .file_name()
+        .ok_or_else(|| anyhow!("installed executable path has no file name"))?
+        .to_string_lossy();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe = parent.join(format!(
+        ".{file_name}.update-probe-{}-{nonce}",
+        std::process::id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .with_context(|| {
+            format!(
+                "installation directory {} is not writable; this installation is package-managed",
+                parent.display()
+            )
+        })?;
+    drop(file);
+    std::fs::remove_file(&probe)
+        .with_context(|| format!("removing update probe {}", probe.display()))
+}
 
 /// One independently shipped executable in a trouve release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,13 +327,20 @@ pub async fn install_latest(component: Component, current_version: &str) -> Resu
         bail!("self-update is disabled for development builds");
     }
     let _lock = acquire_update_lock(None).await?;
-    let check = check(component, current_version).await?;
+    let executable = std::env::current_exe().context("locating installed executable")?;
+    let current = Version::parse(current_version)
+        .with_context(|| format!("invalid current version {current_version:?}"))?;
+    let observed = installed_version(&executable)
+        .filter(|installed| installed > &current)
+        .unwrap_or(current);
+    let check = check(component, &observed.to_string()).await?;
     let Some(release) = check.update else {
         return Ok(UpdateStatus::UpToDate {
             version: check.current,
         });
     };
     install_release_locked(&release, |_| {}, Arc::new(InstallCancellation::default())).await?;
+    record_installed_version(&executable, &release.version)?;
     Ok(UpdateStatus::Updated {
         from: check.current,
         to: release.version,
@@ -333,7 +380,72 @@ pub async fn install_release_with_progress_and_cancel(
     }
     ensure_not_cancelled(&cancellation)?;
     let _lock = acquire_update_lock(Some(Arc::clone(&cancellation))).await?;
-    install_release_locked(release, progress, cancellation).await
+    let executable = std::env::current_exe().context("locating installed executable")?;
+    if installed_version(&executable).is_some_and(|installed| installed >= release.version) {
+        return Ok(());
+    }
+    install_release_locked(release, progress, cancellation)
+        .await
+        .and_then(|()| record_installed_version(&executable, &release.version))
+}
+
+fn installed_version_marker(executable: &Path) -> Result<std::path::PathBuf> {
+    let parent = executable
+        .parent()
+        .ok_or_else(|| anyhow!("updated executable path has no parent"))?;
+    let file_name = executable
+        .file_name()
+        .ok_or_else(|| anyhow!("updated executable path has no file name"))?
+        .to_string_lossy();
+    Ok(parent.join(format!(".{file_name}.{INSTALLED_VERSION_MARKER_SUFFIX}")))
+}
+
+fn executable_fingerprint(executable: &Path) -> Result<(u64, u128)> {
+    let metadata = std::fs::metadata(executable)
+        .with_context(|| format!("reading installed executable {}", executable.display()))?;
+    let modified = metadata
+        .modified()
+        .context("reading installed executable modification time")?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok((metadata.len(), modified))
+}
+
+fn installed_version(executable: &Path) -> Option<Version> {
+    let marker = installed_version_marker(executable).ok()?;
+    let text = std::fs::read_to_string(marker).ok()?;
+    let mut fields = text.split_whitespace();
+    let version = Version::parse(fields.next()?).ok()?;
+    let recorded_len = fields.next()?.parse::<u64>().ok()?;
+    let recorded_modified = fields.next()?.parse::<u128>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let (actual_len, actual_modified) = executable_fingerprint(executable).ok()?;
+    (recorded_len == actual_len && recorded_modified == actual_modified).then_some(version)
+}
+
+fn record_installed_version(executable: &Path, version: &Version) -> Result<()> {
+    let marker = installed_version_marker(executable)?;
+    let (len, modified) = executable_fingerprint(executable)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&marker)
+        .with_context(|| format!("opening installed-version marker {}", marker.display()))?;
+    writeln!(file, "{version} {len} {modified}").context("writing installed-version marker")?;
+    file.sync_all()
+        .context("syncing installed-version marker")?;
+    if let Some(parent) = marker.parent() {
+        sync_directory(parent).context("syncing installed-version marker directory")?;
+    }
+    Ok(())
 }
 
 async fn install_release_locked(
@@ -701,6 +813,9 @@ fn extract_binary_with_expanded_limit(
             if entry.is_dir() {
                 bail!("update archive entry {binary_name} is not a regular file");
             }
+            if !zip_mode_is_regular(entry.unix_mode()) {
+                bail!("update archive entry {binary_name} is not a regular file");
+            }
             copy_limited(&mut entry, &mut output)?
         }
     };
@@ -717,6 +832,12 @@ fn extract_binary_with_expanded_limit(
         sync_directory(parent).context("syncing update staging directory")?;
     }
     Ok(())
+}
+
+fn zip_mode_is_regular(mode: Option<u32>) -> bool {
+    const FILE_TYPE_MASK: u32 = 0o170_000;
+    const REGULAR_FILE: u32 = 0o100_000;
+    mode.is_none_or(|mode| mode & FILE_TYPE_MASK == REGULAR_FILE)
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -922,6 +1043,61 @@ mod tests {
         let output = temp.path().join("new-trouve");
         extract_binary(&archive_path, ArchiveKind::TarGz, "trouve", &output).unwrap();
         assert_eq!(std::fs::read(output).unwrap(), payload);
+    }
+
+    #[test]
+    fn zip_entry_modes_reject_links_and_special_files() {
+        assert!(zip_mode_is_regular(None));
+        assert!(zip_mode_is_regular(Some(0o100_755)));
+        assert!(!zip_mode_is_regular(Some(0o120_777)));
+        assert!(!zip_mode_is_regular(Some(0o010_644)));
+    }
+
+    #[test]
+    fn rejects_zip_symlink_at_the_expected_executable_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("update.zip");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let mut archive = zip::ZipWriter::new(archive_file);
+        archive
+            .add_symlink(
+                "trouve.exe",
+                "elsewhere.exe",
+                zip::write::SimpleFileOptions::default().unix_permissions(0o777),
+            )
+            .unwrap();
+        archive.finish().unwrap();
+
+        let error = extract_binary(
+            &archive_path,
+            ArchiveKind::Zip,
+            "trouve.exe",
+            &temp.path().join("new-trouve.exe"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn installed_version_marker_matches_only_its_exact_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("trouve-search");
+        std::fs::write(&executable, b"first binary").unwrap();
+        let version = Version::parse("4.1.0").unwrap();
+        record_installed_version(&executable, &version).unwrap();
+        assert_eq!(installed_version(&executable), Some(version));
+
+        std::fs::write(&executable, b"replacement binary with a new length").unwrap();
+        assert_eq!(installed_version(&executable), None);
+    }
+
+    #[test]
+    fn update_support_probe_rejects_a_non_directory_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let not_a_directory = temp.path().join("package");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let error = ensure_update_directory_writable(&not_a_directory.join("trouve")).unwrap_err();
+        assert!(error.to_string().contains("package-managed"));
     }
 
     #[test]

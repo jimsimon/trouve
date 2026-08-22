@@ -75,6 +75,13 @@ const desktopUpdateIsBusy = (state: DesktopUpdateState | undefined): boolean =>
     "restarting",
   ].includes(state.phase);
 
+const desktopUpdatePhaseAnnouncement = (
+  state: DesktopUpdateState | undefined,
+  loading: boolean,
+): string => state === undefined
+  ? (loading ? "Loading update status." : "")
+  : `Update ${state.phase}.`;
+
 export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   static override properties = {
     section: { type: String },
@@ -394,6 +401,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                                   id="settings-automatic-updates"
                                   type="checkbox"
                                   .checked=${generalPreferences.automaticUpdates}
+                                  ?disabled=${!currentCapabilities.selfUpdate}
                                   @change=${(event: Event) => services.setGeneralPreferences({
                                     automaticUpdates:
                                       (event.currentTarget as HTMLInputElement).checked,
@@ -405,6 +413,15 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                               ${currentCapabilities.selfUpdate
                                 ? html`
                                     <section class="desktop-update-card" aria-label="Desktop update status">
+                                      <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+                                        ${desktopUpdatePhaseAnnouncement(
+                                          this.#desktopUpdateState,
+                                          this.#desktopUpdateLoading,
+                                        )}
+                                      </p>
+                                      ${this.#desktopUpdateState?.phase === "error"
+                                        ? html`<p class="visually-hidden" role="alert">${this.#desktopUpdateState.message}</p>`
+                                        : nothing}
                                       <div class="desktop-update-heading">
                                         <strong>${this.#desktopUpdateState?.message
                                           ?? (this.#desktopUpdateLoading ? "Loading update status…" : "Ready to check for updates")}</strong>
@@ -435,7 +452,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                                       </div>
                                     </section>
                                   `
-                                : html`<p class="settings-note capability-note">Self-update is disabled in development and web-preview builds. Packaged release builds expose update status and manual installation here.</p>`}
+                                : html`<p class="settings-note capability-note">Self-update is unavailable in development, web-preview, and package-managed installations. The automatic-update preference is retained for a supported packaged release.</p>`}
                             </div>
                           `
                         : nothing}

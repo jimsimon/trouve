@@ -465,6 +465,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #hostRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #desktopUpdateStatusTimer: ReturnType<typeof setInterval> | undefined;
   #desktopUpdateState: DesktopUpdateState | undefined;
+  #desktopUpdateGeneration = 0;
+  #desktopUpdateActionPending = false;
   #routeRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #navigationWidth = 260;
   #inspectionWidth = 460;
@@ -582,6 +584,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#sleepActivityReconcilePending = false;
     this.#flushResumePreferences();
     this.#desktopCoordinator?.stop();
+    this.#desktopUpdateGeneration += 1;
+    this.#desktopUpdateActionPending = false;
     this.#stopDesktopUpdateStatusPolling();
     this.#browserWakeLock?.stop();
     this.#clearAutomaticRetryTimers();
@@ -823,21 +827,38 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   async #readDesktopUpdateStatus(): Promise<DesktopUpdateState> {
+    const generation = this.#desktopUpdateGeneration;
     const state = await this.#hostClient!.getDesktopUpdate();
-    this.#desktopUpdateState = state;
-    this.requestUpdate();
+    if (
+      generation === this.#desktopUpdateGeneration
+      && !this.#desktopUpdateActionPending
+    ) {
+      this.#desktopUpdateState = state;
+      this.requestUpdate();
+    }
     return state;
   }
 
   async #runDesktopUpdateAction(
     action: "check" | "install",
   ): Promise<DesktopUpdateState> {
-    const state = action === "check"
-      ? await this.#hostClient!.checkDesktopUpdate()
-      : await this.#hostClient!.installDesktopUpdate();
-    this.#desktopUpdateState = state;
-    this.requestUpdate();
-    return state;
+    const generation = ++this.#desktopUpdateGeneration;
+    this.#desktopUpdateActionPending = true;
+    try {
+      const state = action === "check"
+        ? await this.#hostClient!.checkDesktopUpdate()
+        : await this.#hostClient!.installDesktopUpdate();
+      if (generation === this.#desktopUpdateGeneration) {
+        this.#desktopUpdateState = state;
+        this.requestUpdate();
+      }
+      return state;
+    } finally {
+      if (generation === this.#desktopUpdateGeneration) {
+        this.#desktopUpdateGeneration += 1;
+        this.#desktopUpdateActionPending = false;
+      }
+    }
   }
 
   #startDesktopUpdateStatusPolling(): void {

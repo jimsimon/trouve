@@ -78,6 +78,7 @@ mod unix {
     /// How long a proxy waits for a freshly spawned daemon to bind.
     const SPAWN_WAIT: Duration = Duration::from_secs(10);
     const MAX_DAEMON_LOG_BYTES: u64 = 1024 * 1024;
+    const DAEMON_LOG_RETENTION_INTERVAL: Duration = Duration::from_secs(1);
 
     pub(super) fn daemon_enabled() -> bool {
         !matches!(
@@ -141,13 +142,19 @@ mod unix {
             .append(true)
             .mode(0o600)
             .open(&log_path)?;
-        // Truncate the existing inode instead of renaming it: a live daemon
-        // may still own an inherited stderr descriptor for this file.
+        fs::set_permissions(log_path, fs::Permissions::from_mode(0o600))?;
+        Ok(log)
+    }
+
+    fn truncate_daemon_log_if_needed(sock: &Path) -> std::io::Result<()> {
+        let log = open_daemon_log(sock)?;
+        // Only the daemon lock owner may truncate. Keeping the inode means
+        // the inherited stderr descriptor remains attached to the bounded
+        // current log.
         if log.metadata()?.len() >= MAX_DAEMON_LOG_BYTES {
             log.set_len(0)?;
         }
-        fs::set_permissions(log_path, fs::Permissions::from_mode(0o600))?;
-        Ok(log)
+        Ok(())
     }
 
     // ---------------------------------------------------------------- daemon
@@ -171,6 +178,9 @@ mod unix {
             // Another daemon already owns this socket; nothing to do.
             return ExitCode::SUCCESS;
         }
+        if let Err(e) = truncate_daemon_log_if_needed(&sock) {
+            eprintln!("cannot retain daemon log: {e}");
+        }
         // Holding the lock proves any existing socket file is a leftover
         // from a crashed daemon, so removing it is safe.
         let _ = fs::remove_file(&sock);
@@ -192,7 +202,16 @@ mod unix {
         let active = Arc::new(AtomicUsize::new(0));
         let idle = idle_timeout();
         let mut last_activity = Instant::now();
+        let mut last_log_retention = Instant::now();
+        let mut retain_log = true;
         loop {
+            if retain_log && last_log_retention.elapsed() >= DAEMON_LOG_RETENTION_INTERVAL {
+                last_log_retention = Instant::now();
+                if let Err(e) = truncate_daemon_log_if_needed(&sock) {
+                    eprintln!("cannot retain daemon log: {e}");
+                    retain_log = false;
+                }
+            }
             match listener.accept() {
                 Ok((stream, _)) => {
                     last_activity = Instant::now();
@@ -317,7 +336,6 @@ mod unix {
 
     struct ConnectResult {
         connection: Option<DaemonConn>,
-        child_started: bool,
     }
 
     fn connect_or_spawn(sock: &Path, content: &[ContentType]) -> ConnectResult {
@@ -325,25 +343,18 @@ mod unix {
             Ok(connection) => {
                 return ConnectResult {
                     connection: Some(connection),
-                    child_started: false,
                 };
             }
             // The socket path exceeds sockaddr_un's limit (104 bytes on
             // macOS): no daemon can ever bind it, so don't spawn one and
             // wait — serve in-process straight away.
             Err(error) if error.kind() == ErrorKind::InvalidInput => {
-                return ConnectResult {
-                    connection: None,
-                    child_started: false,
-                };
+                return ConnectResult { connection: None };
             }
             Err(_) => {}
         }
         if spawn_daemon(sock, content).is_err() {
-            return ConnectResult {
-                connection: None,
-                child_started: false,
-            };
+            return ConnectResult { connection: None };
         }
         // Wait for a daemon to bind — ours, or a competing proxy's whose
         // daemon won the lock (just as good).
@@ -353,22 +364,16 @@ mod unix {
             if let Ok(connection) = DaemonConn::open(sock) {
                 return ConnectResult {
                     connection: Some(connection),
-                    child_started: true,
                 };
             }
             if Instant::now() >= deadline {
-                return ConnectResult {
-                    connection: None,
-                    child_started: true,
-                };
+                return ConnectResult { connection: None };
             }
         }
     }
 
-    fn schedule_local_fallback_update(child_started: bool) {
-        if !child_started {
-            crate::cli::spawn_auto_update();
-        }
+    fn schedule_local_fallback_update() {
+        crate::cli::spawn_auto_update();
     }
 
     /// Absolute form of a relative `repo` argument. The daemon runs in its
@@ -418,7 +423,7 @@ mod unix {
         let mut backend = match connection.connection {
             Some(conn) => Backend::Daemon(conn),
             None => {
-                schedule_local_fallback_update(connection.child_started);
+                schedule_local_fallback_update();
                 Backend::Local(IndexCache::new(content.to_vec()))
             }
         };
@@ -479,7 +484,7 @@ mod unix {
             Err(_) => {
                 let connection = connect_or_spawn(sock, content);
                 let Some(mut fresh) = connection.connection else {
-                    schedule_local_fallback_update(connection.child_started);
+                    schedule_local_fallback_update();
                     return Err(());
                 };
                 let response = fresh.roundtrip(line, expects_response).map_err(|_| ())?;
@@ -566,7 +571,7 @@ mod unix {
             );
         }
         #[test]
-        fn daemon_log_truncates_the_active_inode_at_the_size_limit() {
+        fn only_the_daemon_owner_truncates_the_active_inode_at_the_size_limit() {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("daemon");
             let sock = dir.join("mcp-test.sock");
@@ -578,7 +583,12 @@ mod unix {
                 .unwrap();
             active.flush().unwrap();
 
+            // A competing proxy only opens the shared log and preserves the
+            // current owner's diagnostics.
             drop(open_daemon_log(&sock).unwrap());
+            assert_eq!(fs::metadata(&log_path).unwrap().len(), MAX_DAEMON_LOG_BYTES);
+
+            truncate_daemon_log_if_needed(&sock).unwrap();
             assert_eq!(fs::metadata(&log_path).unwrap().len(), 0);
 
             writeln!(active, "still active").unwrap();

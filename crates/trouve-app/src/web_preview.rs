@@ -182,14 +182,27 @@ fn allow_unbundled_frontend(product_host: bool, debug_build: bool) -> bool {
 #[allow(dead_code)] // Used only by the explicit `trouve-web-preview` target.
 fn main() -> anyhow::Result<()> {
     wait_for_update_relaunch_gate()?;
-    run(false)
+    run(false, None)
 }
 
 pub(crate) fn wait_for_update_relaunch_gate() -> anyhow::Result<()> {
     startup::wait_for_update_relaunch_gate()
 }
 
-pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
+#[allow(dead_code)] // Used by the product entry point, not the preview binary.
+pub(crate) fn run_update_relaunch_supervisor() -> anyhow::Result<bool> {
+    startup::run_update_relaunch_supervisor()
+}
+
+#[allow(dead_code)] // Used by the product entry point, not the preview binary.
+pub(crate) fn take_update_ready_acknowledgement() -> anyhow::Result<Option<PathBuf>> {
+    startup::take_update_ready_acknowledgement()
+}
+
+pub(crate) fn run(
+    product_host: bool,
+    update_ready_acknowledgement: Option<PathBuf>,
+) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -293,7 +306,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 .map_err(|_| "desktop clipboard worker was interrupted".to_string())?
         })
         .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
-    if product_host && !cfg!(debug_assertions) {
+    if product_host && !cfg!(debug_assertions) && startup.self_update_available {
         let updates = startup::UpdateManager::new(startup.update_state);
         updates.spawn_runtime_poll(web_preview_support::preference_path());
         let status_updates = updates.clone();
@@ -422,6 +435,9 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("system webview window has no GTK container"))?;
         builder.build_gtk(container)?
     };
+    if product_host {
+        startup::signal_update_ready(update_ready_acknowledgement.as_deref())?;
+    }
 
     let window_for_events = window.clone();
     let geometry_for_events = geometry.clone();

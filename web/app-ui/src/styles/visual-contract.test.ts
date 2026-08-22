@@ -725,6 +725,16 @@ describe("Trouve visual contract", () => {
     );
   });
 
+  it("orders app-level desktop update publications and announces coarse settings phases", () => {
+    expect(shell).toContain("const generation = ++this.#desktopUpdateGeneration;");
+    expect(shell).toContain("if (generation === this.#desktopUpdateGeneration)");
+    expect(shell).toContain("&& !this.#desktopUpdateActionPending");
+    expect(settings).toContain("?disabled=${!currentCapabilities.selfUpdate}");
+    expect(settings).toContain('role="status" aria-live="polite" aria-atomic="true"');
+    expect(settings).toContain('class="visually-hidden" role="alert"');
+    expect(settings).toContain(": `Update ${state.phase}.`;");
+  });
+
   it("ships every current semantic palette from the generated source", () => {
     expect([...themes.matchAll(/\[data-theme="([^"]+)"\]/g)].map((match) => match[1])).toEqual([
       "dark",
