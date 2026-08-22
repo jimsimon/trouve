@@ -711,6 +711,20 @@ describe("Trouve visual contract", () => {
     expect(settings).toContain("Install v${this.#desktopUpdateState?.availableVersion");
   });
 
+  it("keeps desktop update polling scoped to the connected settings lifecycle", () => {
+    expect(settings).toContain("this.#desktopUpdateGeneration += 1;");
+    expect(settings).toContain("this.#desktopUpdateActionPending = false;");
+    expect(settings).toContain(
+      "if (!this.isConnected || completionGeneration !== this.#desktopUpdateGeneration) return;",
+    );
+    expect(settings.indexOf("completionGeneration !==")).toBeLessThan(
+      settings.lastIndexOf("this.#desktopUpdateActionPending = false;"),
+    );
+    expect(settings).toContain(
+      "if (!this.isConnected || this.#desktopUpdatePollTimer !== undefined) return;",
+    );
+  });
+
   it("ships every current semantic palette from the generated source", () => {
     expect([...themes.matchAll(/\[data-theme="([^"]+)"\]/g)].map((match) => match[1])).toEqual([
       "dark",

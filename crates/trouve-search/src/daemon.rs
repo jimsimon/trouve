@@ -136,21 +136,16 @@ mod unix {
 
     fn open_daemon_log(sock: &Path) -> std::io::Result<fs::File> {
         let log_path = sock.with_extension("log");
-        if fs::metadata(&log_path).is_ok_and(|metadata| metadata.len() >= MAX_DAEMON_LOG_BYTES) {
-            let rotated = log_path.with_extension("log.1");
-            match fs::remove_file(&rotated) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            fs::rename(&log_path, &rotated)?;
-            fs::set_permissions(&rotated, fs::Permissions::from_mode(0o600))?;
-        }
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(&log_path)?;
+        // Truncate the existing inode instead of renaming it: a live daemon
+        // may still own an inherited stderr descriptor for this file.
+        if log.metadata()?.len() >= MAX_DAEMON_LOG_BYTES {
+            log.set_len(0)?;
+        }
         fs::set_permissions(log_path, fs::Permissions::from_mode(0o600))?;
         Ok(log)
     }
@@ -571,23 +566,25 @@ mod unix {
             );
         }
         #[test]
-        fn daemon_log_rotates_at_the_size_limit() {
+        fn daemon_log_truncates_the_active_inode_at_the_size_limit() {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("daemon");
             let sock = dir.join("mcp-test.sock");
             ensure_daemon_dir(&sock).unwrap();
             let log_path = sock.with_extension("log");
-            fs::write(&log_path, vec![b'x'; MAX_DAEMON_LOG_BYTES as usize]).unwrap();
+            let mut active = open_daemon_log(&sock).unwrap();
+            active
+                .write_all(&vec![b'x'; MAX_DAEMON_LOG_BYTES as usize])
+                .unwrap();
+            active.flush().unwrap();
 
             drop(open_daemon_log(&sock).unwrap());
-
-            let rotated = log_path.with_extension("log.1");
             assert_eq!(fs::metadata(&log_path).unwrap().len(), 0);
-            assert_eq!(fs::metadata(&rotated).unwrap().len(), MAX_DAEMON_LOG_BYTES);
-            assert_eq!(
-                fs::metadata(rotated).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
+
+            writeln!(active, "still active").unwrap();
+            active.flush().unwrap();
+            assert_eq!(fs::read_to_string(&log_path).unwrap(), "still active\n");
+            assert!(!log_path.with_extension("log.1").exists());
         }
 
         #[test]

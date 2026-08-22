@@ -125,6 +125,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   override disconnectedCallback(): void {
     globalThis.removeEventListener("focus", this.#refreshWebNotificationCapability);
     this.#desktopUpdateGeneration += 1;
+    this.#desktopUpdateActionPending = false;
     this.#stopDesktopUpdatePolling();
     super.disconnectedCallback();
   }
@@ -178,16 +179,21 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       : nativeHost?.checkDesktopUpdate;
     if (action === undefined || this.#desktopUpdateActionPending) return;
     this.#desktopUpdateGeneration += 1;
+    const actionGeneration = this.#desktopUpdateGeneration;
     this.#desktopUpdateActionPending = true;
     this.#desktopUpdateError = "";
     this.#startDesktopUpdatePolling();
     this.requestUpdate();
     let keepPolling = false;
+    let completionGeneration = actionGeneration;
     try {
       const state = await action();
+      if (actionGeneration !== this.#desktopUpdateGeneration || !this.isConnected) return;
       this.#desktopUpdateGeneration += 1;
+      completionGeneration = this.#desktopUpdateGeneration;
       this.#desktopUpdateState = state;
     } catch (error) {
+      if (actionGeneration !== this.#desktopUpdateGeneration || !this.isConnected) return;
       if (error instanceof HostClientError && error.kind === "action-busy") {
         keepPolling = true;
       } else {
@@ -196,6 +202,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
           : "The update check could not be completed.";
       }
     } finally {
+      if (!this.isConnected || completionGeneration !== this.#desktopUpdateGeneration) return;
       this.#desktopUpdateActionPending = false;
       if (keepPolling || desktopUpdateIsBusy(this.#desktopUpdateState)) {
         this.#startDesktopUpdatePolling();
@@ -203,12 +210,12 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       } else {
         this.#stopDesktopUpdatePolling();
       }
-      if (this.isConnected) this.requestUpdate();
+      this.requestUpdate();
     }
   }
 
   #startDesktopUpdatePolling(): void {
-    if (this.#desktopUpdatePollTimer !== undefined) return;
+    if (!this.isConnected || this.#desktopUpdatePollTimer !== undefined) return;
     this.#desktopUpdatePollTimer = globalThis.setInterval(
       () => void this.#loadDesktopUpdate(true),
       500,

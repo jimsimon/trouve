@@ -156,18 +156,25 @@ impl InstallCancellation {
     }
 }
 
+const UPDATE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 struct UpdateLock {
     _file: std::fs::File,
 }
 
-async fn acquire_update_lock() -> Result<UpdateLock> {
+async fn acquire_update_lock(cancellation: Option<Arc<InstallCancellation>>) -> Result<UpdateLock> {
     let executable = std::env::current_exe().context("locating executable for update lock")?;
-    tokio::task::spawn_blocking(move || acquire_update_lock_for(&executable))
-        .await
-        .context("joining update-lock task")?
+    tokio::task::spawn_blocking(move || {
+        acquire_update_lock_for(&executable, cancellation.as_deref())
+    })
+    .await
+    .context("joining update-lock task")?
 }
 
-fn acquire_update_lock_for(executable: &Path) -> Result<UpdateLock> {
+fn acquire_update_lock_for(
+    executable: &Path,
+    cancellation: Option<&InstallCancellation>,
+) -> Result<UpdateLock> {
     use fs4::fs_std::FileExt as _;
 
     let file_name = executable
@@ -188,8 +195,20 @@ fn acquire_update_lock_for(executable: &Path) -> Result<UpdateLock> {
     let file = options
         .open(&path)
         .with_context(|| format!("opening update lock {}", path.display()))?;
-    file.lock_exclusive()
-        .with_context(|| format!("locking updated executable {}", executable.display()))?;
+    loop {
+        if let Some(cancellation) = cancellation {
+            ensure_not_cancelled(cancellation)?;
+        }
+        match file.try_lock_exclusive() {
+            Ok(true) => break,
+            Ok(false) => std::thread::sleep(UPDATE_LOCK_POLL_INTERVAL),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("locking updated executable {}", executable.display())
+                });
+            }
+        }
+    }
     Ok(UpdateLock { _file: file })
 }
 
@@ -267,7 +286,7 @@ pub async fn install_latest(component: Component, current_version: &str) -> Resu
     if cfg!(debug_assertions) {
         bail!("self-update is disabled for development builds");
     }
-    let _lock = acquire_update_lock().await?;
+    let _lock = acquire_update_lock(None).await?;
     let check = check(component, current_version).await?;
     let Some(release) = check.update else {
         return Ok(UpdateStatus::UpToDate {
@@ -312,7 +331,8 @@ pub async fn install_release_with_progress_and_cancel(
     if cfg!(debug_assertions) {
         bail!("self-update is disabled for development builds");
     }
-    let _lock = acquire_update_lock().await?;
+    ensure_not_cancelled(&cancellation)?;
+    let _lock = acquire_update_lock(Some(Arc::clone(&cancellation))).await?;
     install_release_locked(release, progress, cancellation).await
 }
 
@@ -967,11 +987,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("trouve-search");
         std::fs::write(&executable, b"binary").unwrap();
-        let first = acquire_update_lock_for(&executable).unwrap();
+        let first = acquire_update_lock_for(&executable, None).unwrap();
         let second_executable = executable.clone();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let second = acquire_update_lock_for(&second_executable).unwrap();
+            let second = acquire_update_lock_for(&second_executable, None).unwrap();
             acquired_tx.send(()).unwrap();
             second
         });
@@ -982,6 +1002,32 @@ mod tests {
         drop(first);
         acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         drop(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn executable_update_lock_wait_is_cancellable() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("trouve");
+        std::fs::write(&executable, b"binary").unwrap();
+        let first = acquire_update_lock_for(&executable, None).unwrap();
+        let cancellation = Arc::new(InstallCancellation::default());
+        let waiter_cancellation = Arc::clone(&cancellation);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = acquire_update_lock_for(&executable, Some(&waiter_cancellation)).map(drop);
+            finished_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(cancellation.request_cancel());
+        let error = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), "update cancelled");
+        drop(first);
+        waiter.join().unwrap();
     }
 
     #[test]
