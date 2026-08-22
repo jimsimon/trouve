@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  commandRetryAfterCompletion,
   commandRetryForSubmission,
   type CommandRetry,
 } from "./thread-screen.js";
@@ -39,5 +40,25 @@ describe("commandRetryForSubmission", () => {
 
     expect(commandRetryForSubmission(prior, "th_1", "redo", "", false, createKey)).toBe(prior);
     expect(createKey).not.toHaveBeenCalled();
+  });
+});
+
+describe("commandRetryAfterCompletion", () => {
+  const older: CommandRetry = {
+    threadId: "th_1",
+    name: "status",
+    arguments: "",
+    idempotencyKey: "older-key",
+  };
+  const newer: CommandRetry = {
+    threadId: "th_1",
+    name: "rename",
+    arguments: "New title",
+    idempotencyKey: "newer-key",
+  };
+
+  it("clears only the completed request's retry identity", () => {
+    expect(commandRetryAfterCompletion(older, older)).toBeUndefined();
+    expect(commandRetryAfterCompletion(newer, older)).toBe(newer);
   });
 });

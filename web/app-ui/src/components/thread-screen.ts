@@ -391,6 +391,11 @@ export const commandRetryForSubmission = (
   };
 };
 
+export const commandRetryAfterCompletion = (
+  current: CommandRetry | undefined,
+  completed: CommandRetry | undefined,
+): CommandRetry | undefined => current === completed ? undefined : current;
+
 const activityGroupStatusLabel = (status: ActivityGroupStatus): string =>
   ({
     "awaiting-approval": "Approval needed",
@@ -7075,6 +7080,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       requestWillBeSent,
       () => globalThis.crypto.randomUUID(),
     );
+    const clearThisCommandRetry = (): void => {
+      this.#commandRetry = commandRetryAfterCompletion(this.#commandRetry, commandRetry);
+    };
     // Any distinct valid submission expires an earlier retry identity. Local
     // validation failures preserve the prior request's recovery key.
     this.#commandRetry = commandRetry;
@@ -7139,14 +7147,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           arguments: commandArguments,
         });
         if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {
-          this.#commandRetry = undefined;
           return;
         }
         const action = result.action ?? { type: "none" as const };
         if (action.type === "switch_thread") {
           const threads = await services.protocol.threads(sessionId);
           if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {
-            this.#commandRetry = undefined;
             return;
           }
           for (const thread of threads) store.upsertThread(thread);
@@ -7169,7 +7175,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         // Keep the identity through every action follow-up. If fetching or
         // navigation fails, resubmission replays the durable command result
         // and resumes post-processing without repeating its side effect.
-        this.#commandRetry = undefined;
+        clearThisCommandRetry();
       } else if (steering) {
         await services.protocol.steerTurn(threadId, request);
         if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;

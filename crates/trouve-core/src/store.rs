@@ -7253,7 +7253,8 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "DELETE FROM command_execution_requests
              WHERE idempotency_key = ?1 AND thread_id = ?2
-               AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL",
+               AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL
+               AND side_effect_started = 0",
             params![idempotency_key, thread_id, request_fingerprint],
         )?;
         Ok(())
@@ -17174,6 +17175,9 @@ mod tests {
         );
         store
             .begin_command_side_effect("command-once", "th_command", "fingerprint")
+            .unwrap();
+        store
+            .release_command_execution("command-once", "th_command", "fingerprint")
             .unwrap();
         let pending = store
             .claim_command_execution("command-once", "th_command", "fingerprint")

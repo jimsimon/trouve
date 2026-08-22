@@ -533,6 +533,22 @@ pub fn load(
     }
 }
 
+/// Load a skill through the model-facing tool surface. Explicit user slash
+/// commands deliberately use [`load`] instead, because front matter may hide
+/// a skill from autonomous model invocation while keeping it user-invocable.
+pub fn load_for_model(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+    name: &str,
+    include_builtins: bool,
+) -> Result<(Skill, String)> {
+    let (skill, instructions) = load(config_dir, workspace_root, name, include_builtins)?;
+    if skill.disable_model_invocation {
+        bail!("skill {name} is not available for model invocation");
+    }
+    Ok((skill, instructions))
+}
+
 /// Build the provider-neutral prompt completion catalog.
 pub fn command_catalog(
     config_dir: Option<&Path>,

@@ -85,6 +85,7 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
   const unitIdForItem = new Map<string, string>();
   let current: MutableTurnUnit | undefined;
   let lastExplicitTurn: number | undefined;
+  const emittedTurnSegments = new Set<number>();
 
   const flush = (): void => {
     if (current === undefined) return;
@@ -92,7 +93,10 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
     const turn = active.turn ?? lastExplicitTurn ?? 0;
     const id = active.turn === undefined
       ? `standalone:${active.firstId}`
-      : `turn:${turn}`;
+      : emittedTurnSegments.has(turn)
+        ? `turn:${turn}:segment:${active.firstId}`
+        : `turn:${turn}`;
+    if (active.turn !== undefined) emittedTurnSegments.add(turn);
     const linkedSpawnCalls = new Set(
       active.items.flatMap((item) =>
         item.kind === "subagent" && item.callId !== undefined ? [item.callId] : []),

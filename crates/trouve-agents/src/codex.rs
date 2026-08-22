@@ -1642,6 +1642,9 @@ fn turn_stream(
                 route_closed = true;
             }
         }
+        // OAuth refreshes are rare; preserve any rotated credentials once per
+        // turn before either terminal or exceptional cleanup returns.
+        server.sync_auth().await;
         if !cancelled
             && !client_gone
             && !route_overloaded
@@ -1736,9 +1739,6 @@ fn turn_stream(
                 .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "unroutable")
                 .await;
         }
-        // OAuth refreshes are rare; preserve any rotated credentials once per
-        // turn instead of reading both auth files after every JSON-RPC reply.
-        server.sync_auth().await;
         server.unsubscribe(&codex_thread_id, &route_tx).await;
         if let Err(error) = server.release_thread(&codex_thread_id).await {
             tracing::warn!(
@@ -3708,6 +3708,8 @@ fn stage_auth_snapshot_from(
             "Codex credentials are being updated (usually by an interactive login); retry shortly",
         ));
     };
+    let backup = auth_publication_backup(&source)?;
+    recover_auth_publication(&source, &backup)?;
     let baseline = match std::fs::read(&source) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -8282,6 +8284,24 @@ for line in sys.stdin:
             .unwrap()
             .expect("snapshot should succeed after login releases the lock");
         assert_eq!(std::fs::read(snapshot.isolated).unwrap(), b"old");
+    }
+
+    #[test]
+    fn auth_snapshot_recovers_an_interrupted_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let backup = auth_publication_backup(&source).unwrap();
+        let isolated_home = temp.path().join("isolated-home");
+        std::fs::write(&backup, b"recover-me").unwrap();
+        std::fs::create_dir(&isolated_home).unwrap();
+
+        let snapshot = stage_auth_snapshot_from(source.clone(), &isolated_home)
+            .unwrap()
+            .expect("the recovered credentials should be snapshotted");
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"recover-me");
+        assert_eq!(std::fs::read(snapshot.isolated).unwrap(), b"recover-me");
+        assert!(!backup.exists());
     }
 
     #[test]

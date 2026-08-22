@@ -39,7 +39,7 @@ impl Tool for LoadSkill {
         let Some(name) = args.get("name").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: name");
         };
-        match crate::skills::load(
+        match crate::skills::load_for_model(
             ctx.config_dir.as_deref(),
             ctx.workspace_root.as_deref(),
             name,
@@ -114,5 +114,33 @@ mod tests {
 
         let workspace = LoadSkill.run(&ctx, &json!({"name": "review"})).await;
         assert_eq!(workspace.status, trouve_protocol::ToolStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn model_loader_rejects_skills_hidden_from_model_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".agents/skills/manual-only")).unwrap();
+        std::fs::write(
+            repo.join(".agents/skills/manual-only/SKILL.md"),
+            "---\nname: manual-only\ndescription: User-directed workflow\ndisable-model-invocation: true\nuser-invocable: true\n---\n\nFollow the user's explicit request.",
+        )
+        .unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            workspace_root: Some(repo),
+            ..ToolCtx::default()
+        };
+
+        let result = LoadSkill.run(&ctx, &json!({"name": "manual-only"})).await;
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            result
+                .result
+                .to_string()
+                .contains("not available for model invocation"),
+            "unexpected denial: {}",
+            result.result
+        );
     }
 }

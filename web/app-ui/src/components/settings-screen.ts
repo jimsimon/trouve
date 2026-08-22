@@ -140,8 +140,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
 
   async #setBuiltinSkillsEnabled(enabled: boolean): Promise<void> {
     const services = this.#services.value;
-    const previous = this.#skillsSettings;
-    if (services === undefined || previous === undefined || this.#skillsPending) return;
+    if (services === undefined || this.#skillsSettings === undefined || this.#skillsPending) return;
     this.#skillsSettings = { builtin_skills_enabled: enabled };
     this.#skillsPending = true;
     this.#skillsError = "";
@@ -149,8 +148,14 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     try {
       await services.protocol.setSkillsSettings({ builtin_skills_enabled: enabled });
     } catch {
-      this.#skillsSettings = previous;
-      this.#skillsError = "Built-in skill settings could not be saved.";
+      try {
+        this.#skillsSettings = await services.protocol.skillsSettings();
+        this.#skillsError = "The save was not confirmed; the current setting was reloaded.";
+      } catch {
+        this.#skillsSettings = undefined;
+        this.#skillsLoadAttempted = false;
+        this.#skillsError = "The save outcome is unknown. Reload the setting before trying again.";
+      }
     } finally {
       this.#skillsPending = false;
       this.requestUpdate();

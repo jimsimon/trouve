@@ -187,14 +187,30 @@ async fn tools_list(
             },
         }));
     }
-    let specs = engine
+    let specs = match engine
         .bridged_tool_specs_for_revision_with_skills(
             thread_id,
             catalog_revision,
             builtin_skills_enabled,
         )
         .await
-        .map_err(|e| format!("supplemental tool catalog unavailable for {thread_id}: {e}"))?;
+    {
+        Ok(specs) => specs,
+        Err(error) if serve_approval => {
+            // Claude's permission-prompt hook is independently available and
+            // must keep working when supplemental MCP discovery is degraded.
+            tracing::warn!(
+                thread_id,
+                "supplemental tool catalog unavailable; serving approval fallback: {error}"
+            );
+            return Ok(json!({ "tools": tools }));
+        }
+        Err(error) => {
+            return Err(format!(
+                "supplemental tool catalog unavailable for {thread_id}: {error}"
+            ));
+        }
+    };
     tools.extend(
         specs
             .iter()
@@ -305,7 +321,8 @@ fn codex_tool_call_metadata(params: &Value) -> Result<(&str, Option<&str>), Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_tool_call_metadata, tool_available_for_bridge};
+    use super::{codex_tool_call_metadata, tool_available_for_bridge, tools_list};
+    use trouve_core::{Engine, config::Config, store::Store};
 
     #[test]
     fn supplemental_catalog_gates_tool_execution() {
@@ -347,5 +364,29 @@ mod tests {
         ] {
             assert!(codex_tool_call_metadata(&malformed).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn approval_tool_survives_supplemental_catalog_failure() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config::default(),
+        );
+
+        let response = tools_list(&engine, "missing-thread", true, None, true)
+            .await
+            .expect("approval fallback should remain independently available");
+        let tools = response["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "approval_prompt");
+
+        assert!(
+            tools_list(&engine, "missing-thread", false, None, true)
+                .await
+                .is_err(),
+            "catalog-only bridges must still surface discovery failures"
+        );
     }
 }

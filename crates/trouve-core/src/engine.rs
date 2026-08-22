@@ -1140,7 +1140,6 @@ struct BridgeEchoCall {
 #[derive(Default)]
 struct BridgeEchoTracker {
     calls: Mutex<HashMap<String, Vec<BridgeEchoCall>>>,
-    changed: tokio::sync::Notify,
 }
 
 struct BridgeEchoTurn<'a> {
@@ -1151,18 +1150,7 @@ struct BridgeEchoTurn<'a> {
 
 impl Drop for BridgeEchoTurn<'_> {
     fn drop(&mut self) {
-        let mut calls = self.tracker.calls.lock().unwrap();
-        if calls
-            .get(&self.thread_id)
-            .is_some_and(|entries| entries.iter().all(|entry| entry.turn == self.turn))
-        {
-            calls.remove(&self.thread_id);
-        } else if let Some(entries) = calls.get_mut(&self.thread_id) {
-            entries.retain(|entry| entry.turn != self.turn);
-            if entries.is_empty() {
-                calls.remove(&self.thread_id);
-            }
-        }
+        self.tracker.clear_turn(&self.thread_id, self.turn);
     }
 }
 
@@ -1199,7 +1187,21 @@ impl BridgeEchoTracker {
                 args: args.clone(),
                 vendor_call_id: None,
             });
-        self.changed.notify_waiters();
+    }
+
+    fn clear_turn(&self, thread_id: &str, turn: u64) {
+        let mut calls = self.calls.lock().unwrap();
+        if calls
+            .get(thread_id)
+            .is_some_and(|entries| entries.iter().all(|entry| entry.turn == turn))
+        {
+            calls.remove(thread_id);
+        } else if let Some(entries) = calls.get_mut(thread_id) {
+            entries.retain(|entry| entry.turn != turn);
+            if entries.is_empty() {
+                calls.remove(thread_id);
+            }
+        }
     }
 
     fn try_claim(
@@ -1231,7 +1233,7 @@ impl BridgeEchoTracker {
             })
     }
 
-    async fn claim(
+    fn claim(
         &self,
         thread_id: &str,
         turn: u64,
@@ -1242,20 +1244,105 @@ impl BridgeEchoTracker {
         // Vendor-native calls can never correlate with an MCP request and
         // must not pay the bridge dispatch grace period.
         trouve_bridge_echo_payload(tool, args)?;
-        // Some harnesses announce a tool immediately before dispatching its
-        // HTTP MCP request. Give that independently-running request a brief
-        // chance to establish trusted state, without indefinitely stalling
-        // an unmatched vendor-native event.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let changed = self.changed.notified();
-            if let Some(call_id) = self.try_claim(thread_id, turn, vendor_call_id, tool, args) {
-                return Some(call_id);
-            }
-            if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                return None;
-            }
+        // Only state already established by the trusted MCP request can
+        // suppress a vendor event. An uncorrelated wrapper-shaped event is
+        // processed immediately instead of blocking the backend stream.
+        self.try_claim(thread_id, turn, vendor_call_id, tool, args)
+    }
+}
+
+#[derive(Debug)]
+struct RawVendorToolCall {
+    thread_id: String,
+    turn: u64,
+    call_id: String,
+    tool: String,
+    args: serde_json::Value,
+}
+
+#[derive(Default)]
+struct RawVendorToolCalls {
+    calls: Mutex<Vec<RawVendorToolCall>>,
+}
+
+struct RawVendorToolTurn<'a> {
+    tracker: &'a RawVendorToolCalls,
+    thread_id: String,
+    turn: u64,
+}
+
+impl Drop for RawVendorToolTurn<'_> {
+    fn drop(&mut self) {
+        self.tracker.clear_turn(&self.thread_id, self.turn);
+    }
+}
+
+impl RawVendorToolCalls {
+    fn begin_turn(&self, thread_id: &str, turn: u64) -> RawVendorToolTurn<'_> {
+        self.clear_turn(thread_id, turn);
+        RawVendorToolTurn {
+            tracker: self,
+            thread_id: thread_id.to_string(),
+            turn,
         }
+    }
+
+    fn register(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) {
+        let mut calls = self.calls.lock().unwrap();
+        calls.retain(|call| {
+            call.thread_id != thread_id || call.turn != turn || call.call_id != call_id
+        });
+        calls.push(RawVendorToolCall {
+            thread_id: thread_id.to_string(),
+            turn,
+            call_id: call_id.to_string(),
+            tool: canonical_vendor_tool(tool).to_string(),
+            args: args.clone(),
+        });
+    }
+
+    fn complete(&self, thread_id: &str, turn: u64, call_id: &str) {
+        self.calls.lock().unwrap().retain(|call| {
+            call.thread_id != thread_id || call.turn != turn || call.call_id != call_id
+        });
+    }
+
+    fn clear_turn(&self, thread_id: &str, turn: u64) {
+        self.calls
+            .lock()
+            .unwrap()
+            .retain(|call| call.thread_id != thread_id || call.turn != turn);
+    }
+
+    fn newest_exact(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        tool: &str,
+        args: &serde_json::Value,
+        excluded: &HashSet<String>,
+    ) -> Option<String> {
+        let tool = canonical_vendor_tool(tool);
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|call| {
+                call.thread_id == thread_id
+                    && call.turn == turn
+                    && call.tool == tool
+                    && call.args == *args
+                    && !excluded.contains(&call.call_id)
+            })
+            .map(|call| call.call_id.clone())
     }
 }
 
@@ -2179,6 +2266,7 @@ pub struct Engine {
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
     bridge_echoes: BridgeEchoTracker,
+    raw_vendor_tool_calls: RawVendorToolCalls,
     turn_scheduler: TurnScheduler,
     /// Last command catalog emitted per thread. Catalogs are recomputed
     /// before turns so edited skills converge, but identical durable events
@@ -2668,6 +2756,7 @@ impl Engine {
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
             bridge_echoes: BridgeEchoTracker::default(),
+            raw_vendor_tool_calls: RawVendorToolCalls::default(),
             turn_scheduler: TurnScheduler::new(),
             command_catalogs: Mutex::new(HashMap::new()),
             command_catalog_locks: Mutex::new(HashMap::new()),
@@ -5037,29 +5126,26 @@ impl Engine {
             self.persist_config_checked(&updated)?;
             *config = updated;
         }
-        self.republish_command_catalogs_inner();
-        Ok(())
+        self.republish_command_catalogs_inner()
     }
 
     fn republish_command_catalogs(&self) {
         let _catalog_generation = self.command_catalog_generation.read().unwrap();
-        self.republish_command_catalogs_inner();
+        if let Err(error) = self.republish_command_catalogs_inner() {
+            tracing::warn!("failed to reconcile command catalogs: {error}");
+        }
     }
 
-    fn republish_command_catalogs_inner(&self) {
-        let sessions = match self.store.list_sessions(None) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                tracing::warn!("failed to list sessions for skill catalog refresh: {error}");
-                return;
-            }
-        };
+    fn republish_command_catalogs_inner(&self) -> Result<(), EngineError> {
+        let sessions = self.store.list_sessions(None)?;
+        let mut failures = Vec::new();
         for session in sessions {
             let workspace = match self.store.workspace(&session.workspace_id) {
                 Ok(Some(workspace)) => workspace,
                 Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!(session_id = %session.id, "failed to load workspace for skill catalog refresh: {error}");
+                    failures.push(format!("session {} workspace: {error}", session.id));
                     continue;
                 }
             };
@@ -5067,6 +5153,7 @@ impl Engine {
                 Ok(threads) => threads,
                 Err(error) => {
                     tracing::warn!(session_id = %session.id, "failed to list threads for skill catalog refresh: {error}");
+                    failures.push(format!("session {} threads: {error}", session.id));
                     continue;
                 }
             };
@@ -5075,8 +5162,18 @@ impl Engine {
                     self.emit_command_catalog_inner(&thread.id, Path::new(&workspace.path))
                 {
                     tracing::warn!(thread_id = %thread.id, "failed to refresh skill command catalog: {error}");
+                    failures.push(format!("thread {} catalog: {error}", thread.id));
                 }
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(EngineError::Internal(anyhow!(
+                "built-in skill setting was saved, but {} command catalog refresh(es) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            )))
         }
     }
 
@@ -8817,6 +8914,11 @@ impl Engine {
         // A previous command may have changed this thread while we waited.
         let thread = self.get_thread(thread_id)?;
         let session = self.get_session(&thread.session_id)?;
+        if matches!(name, "undo" | "redo") && self.subagent_is_read_only(&thread)? {
+            return Err(EngineError::BadRequest(format!(
+                "/{name} is unavailable from a read-only spawned thread"
+            )));
+        }
         let workspace = self
             .store
             .workspace(&session.workspace_id)?
@@ -9040,6 +9142,7 @@ impl Engine {
                     (output, CommandAction::None)
                 } else {
                     let mode = single_command_argument(spec, &arguments)?;
+                    command_claim.begin_side_effect()?;
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -9071,6 +9174,7 @@ impl Engine {
                     (output, CommandAction::None)
                 } else {
                     let model = single_command_argument(spec, &arguments)?;
+                    command_claim.begin_side_effect()?;
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -9103,6 +9207,7 @@ impl Engine {
                             return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
                         }
                     };
+                    command_claim.begin_side_effect()?;
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -9145,7 +9250,13 @@ impl Engine {
             }
             "tools" => {
                 require_no_command_arguments(spec, &arguments)?;
-                let mut tools = self.bridged_tool_specs(thread_id).await?;
+                let mut tools = self
+                    .build_bridged_tool_specs_with_cancel_and_skills(
+                        thread_id,
+                        tokio_util::sync::CancellationToken::new(),
+                        self.builtin_skills_enabled(),
+                    )
+                    .await?;
                 tools.sort_by(|left, right| left.name.cmp(&right.name));
                 let mut output = String::from(
                     "## Available Trouve tools\n\n| Tool | Description |\n| --- | --- |\n",
@@ -9260,6 +9371,7 @@ impl Engine {
                 if arguments.is_empty() {
                     return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
                 }
+                command_claim.begin_side_effect()?;
                 let updated = self.update_session(
                     &session.id,
                     &UpdateSessionRequest {
@@ -11890,6 +12002,20 @@ impl Engine {
         builtin_skills_enabled: bool,
     ) -> Result<Vec<ToolSpec>, EngineError> {
         let cancel = self.active_bridge_cancel(thread_id)?;
+        self.build_bridged_tool_specs_with_cancel_and_skills(
+            thread_id,
+            cancel,
+            builtin_skills_enabled,
+        )
+        .await
+    }
+
+    async fn build_bridged_tool_specs_with_cancel_and_skills(
+        &self,
+        thread_id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+        builtin_skills_enabled: bool,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
         let (_, _, mode, ctx) =
             self.bridged_context_with_cancel_and_skills(thread_id, cancel, builtin_skills_enabled)?;
         let mut specs: Vec<ToolSpec> = self
@@ -12270,9 +12396,10 @@ impl Engine {
         Ok(approved)
     }
 
-    /// The newest still-open vendor tool call in this turn that a
-    /// permission request refers to: same tool, preferring an exact args
-    /// match, never one already carrying an approval.
+    /// The newest still-open vendor tool call in this turn that a permission
+    /// request refers to. Identity uses the lossless provider payload; the
+    /// canonical projection is presentation-only and must never authorize a
+    /// different operation that happens to render the same way.
     fn open_vendor_call(
         &self,
         thread_id: &str,
@@ -12280,60 +12407,18 @@ impl Engine {
         tool: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
-        // Tool cards persist Trouve's canonical display vocabulary. Approval
-        // callbacks carry the provider's raw vocabulary, so normalize before
-        // matching or two in-flight calls of the same operation can attach
-        // the prompt to the wrong card.
-        let (tool, args) = normalize_vendor_tool_call(tool, args);
         let events = self
             .store
             .events_after(&Scope::Thread(thread_id.to_string()), 0)
             .ok()?;
-        let mut open: Vec<(String, serde_json::Value)> = Vec::new();
         let mut gated: std::collections::HashSet<String> = Default::default();
         for env in &events {
-            match &env.event {
-                Event::ToolRequested {
-                    turn: t,
-                    call_id,
-                    tool: name,
-                    args: a,
-                    ..
-                } if *t == turn && name == &tool => {
-                    open.push((call_id.clone(), a.clone()));
-                }
-                Event::ToolCompleted { call_id, .. } => {
-                    open.retain(|(id, _)| id != call_id);
-                }
-                Event::ApprovalRequested { call_id, .. } => {
-                    gated.insert(call_id.clone());
-                }
-                _ => {}
+            if let Event::ApprovalRequested { call_id, .. } = &env.event {
+                gated.insert(call_id.clone());
             }
         }
-        open.retain(|(id, _)| !gated.contains(id));
-        // Stored args may carry injected "_line" display hints the vendor's
-        // approval request doesn't have; ignore them when matching.
-        let strip = |v: &serde_json::Value| {
-            let mut v = v.clone();
-            if let Some(map) = v.as_object_mut() {
-                map.remove("_line");
-                if let Some(edits) = map.get_mut("edits").and_then(|e| e.as_array_mut()) {
-                    for e in edits {
-                        if let Some(m) = e.as_object_mut() {
-                            m.remove("_line");
-                        }
-                    }
-                }
-            }
-            v
-        };
-        let args = strip(&args);
-        open.iter()
-            .rev()
-            .find(|(_, a)| strip(a) == args)
-            .or(open.last())
-            .map(|(id, _)| id.clone())
+        self.raw_vendor_tool_calls
+            .newest_exact(thread_id, turn, tool, args, &gated)
     }
 
     /// Whether a `tool.requested` card already exists for this call in the
@@ -12919,6 +13004,10 @@ impl Engine {
         if collaborator.terminal {
             return Ok(());
         }
+        self.bridge_echoes
+            .clear_turn(&collaborator.thread.id, collaborator.turn);
+        self.raw_vendor_tool_calls
+            .clear_turn(&collaborator.thread.id, collaborator.turn);
         // A terminal collaborator cannot emit a later completion event; drop
         // every vendor-native mutation lease before persistence bookkeeping.
         collaborator.mutation_permits.clear();
@@ -13116,8 +13205,15 @@ impl Engine {
             BackendCollaboratorEvent::ToolStarted {
                 call_id,
                 tool,
-                mut args,
+                args,
             } => {
+                self.raw_vendor_tool_calls.register(
+                    &collaborator.thread.id,
+                    turn,
+                    &call_id,
+                    &tool,
+                    &args,
+                );
                 collaborator
                     .tool_started_at
                     .insert(call_id.clone(), Instant::now());
@@ -13130,13 +13226,14 @@ impl Engine {
                         content: std::mem::take(&mut collaborator.segment),
                     });
                 }
-                annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
+                let (display_tool, mut display_args) = normalize_vendor_tool_call(&tool, &args);
+                annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
                 if !self.tool_card_exists(&collaborator.thread.id, turn, &call_id) {
                     collaborator.persisted.push(Event::ToolRequested {
                         turn,
                         call_id: call_id.clone(),
-                        tool,
-                        args,
+                        tool: display_tool,
+                        args: display_args,
                         requires_approval: false,
                     });
                 }
@@ -13150,6 +13247,8 @@ impl Engine {
                 ok,
                 result,
             } => {
+                self.raw_vendor_tool_calls
+                    .complete(&collaborator.thread.id, turn, &call_id);
                 // Match the root backend path: the vendor has acknowledged
                 // tool completion, so release its exclusive worktree lane
                 // before event persistence and result-derived bookkeeping.
@@ -13472,6 +13571,7 @@ impl Engine {
         }
         let backend_turn_started = Instant::now();
         let _bridge_echo_turn = self.bridge_echoes.begin_turn(&thread.id, turn);
+        let _raw_vendor_tool_turn = self.raw_vendor_tool_calls.begin_turn(&thread.id, turn);
         let mut stream = match backend.run_turn(backend_turn).await {
             Ok(stream) => stream,
             Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
@@ -14018,7 +14118,6 @@ impl Engine {
                     if self
                         .bridge_echoes
                         .claim(&thread.id, turn, &call_id, &tool, &args)
-                        .await
                         .is_some()
                     {
                         // The MCP request itself already produced the one
@@ -14028,6 +14127,8 @@ impl Engine {
                         ignored_bridge_call_ids.insert(call_id);
                         continue;
                     }
+                    self.raw_vendor_tool_calls
+                        .register(&thread.id, turn, &call_id, &tool, &args);
                     let (display_tool, mut display_args) = normalize_vendor_tool_call(&tool, &args);
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
@@ -14277,6 +14378,8 @@ impl Engine {
                         backend_mutation_permits.remove(&call_id);
                         continue;
                     }
+                    self.raw_vendor_tool_calls
+                        .complete(&thread.id, turn, &call_id);
                     let status = if ok {
                         ToolStatus::Ok
                     } else {
@@ -14396,7 +14499,6 @@ impl Engine {
                         || self
                             .bridge_echoes
                             .claim(&thread.id, turn, &call_id, &tool, &args)
-                            .await
                             .is_some()
                     {
                         // ToolExecutor already applied the canonical gate.
@@ -19356,8 +19458,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn supplemental_bridge_catalog_includes_user_mcp_tools() {
+    struct CommandTestFixture {
+        _data: tempfile::TempDir,
+        engine: Arc<Engine>,
+        thread: Thread,
+        full_catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn command_test_fixture() -> CommandTestFixture {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
         let workspace = Workspace {
@@ -19393,11 +19501,29 @@ mod tests {
         };
         store.insert_thread(&thread, &Default::default()).unwrap();
         let full_catalog_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let engine = Engine::new(store, data.path().into(), &Config::default()).with_executor(
-            Arc::new(DiscoveryProbeExecutor {
-                full_catalog_calls: full_catalog_calls.clone(),
-            }),
+        let engine = Arc::new(
+            Engine::new(store, data.path().into(), &Config::default()).with_executor(Arc::new(
+                DiscoveryProbeExecutor {
+                    full_catalog_calls: full_catalog_calls.clone(),
+                },
+            )),
         );
+        CommandTestFixture {
+            _data: data,
+            engine,
+            thread,
+            full_catalog_calls,
+        }
+    }
+
+    #[tokio::test]
+    async fn supplemental_bridge_catalog_includes_user_mcp_tools() {
+        let CommandTestFixture {
+            _data,
+            engine,
+            thread,
+            full_catalog_calls,
+        } = command_test_fixture();
         let _cancel = engine.register_cancel(&thread.id);
 
         let specs = engine.bridged_tool_specs(&thread.id).await.unwrap();
@@ -19414,6 +19540,111 @@ mod tests {
         assert!(specs.iter().any(|spec| spec.name == "ask_question"));
         assert!(specs.iter().any(|spec| spec.name == "search_transcript"));
         engine.clear_cancel(&thread.id);
+
+        let tools = engine
+            .execute_command(
+                &thread.id,
+                ExecuteCommandRequest {
+                    idempotency_key: "idle-tools-catalog".into(),
+                    name: "tools".into(),
+                    arguments: String::new(),
+                },
+            )
+            .await
+            .expect("/tools must build its catalog while the thread is idle");
+        assert!(tools.output.contains("mcp__trusted__external"));
+    }
+
+    #[tokio::test]
+    async fn configuration_commands_fence_receipts_before_mutation() {
+        let CommandTestFixture {
+            _data,
+            engine,
+            thread,
+            ..
+        } = command_test_fixture();
+        for (command, arguments) in [
+            ("mode", "plan"),
+            ("model", "codex/alternate"),
+            ("permissions", "ask"),
+            ("rename", "Renamed minimal bridge"),
+        ] {
+            let idempotency_key = format!("fenced-config-{command}");
+            engine
+                .execute_command(
+                    &thread.id,
+                    ExecuteCommandRequest {
+                        idempotency_key: idempotency_key.clone(),
+                        name: command.into(),
+                        arguments: arguments.into(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("/{command} failed: {error}"));
+            assert!(
+                engine
+                    .store
+                    .command_execution(&idempotency_key)
+                    .unwrap()
+                    .is_some_and(|record| record.side_effect_started),
+                "/{command} must fence its receipt before changing durable state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_spawned_threads_cannot_restore_shared_checkpoints() {
+        let CommandTestFixture {
+            _data,
+            engine,
+            thread,
+            ..
+        } = command_test_fixture();
+        let read_only_child = Thread {
+            id: "th_minimal_bridge_plan_child".into(),
+            session_id: thread.session_id.clone(),
+            parent_thread_id: Some(thread.id.clone()),
+            title: None,
+            mode: "plan".into(),
+            model: thread.model.clone(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: true,
+            todos: Vec::new(),
+        };
+        engine
+            .store
+            .insert_spawned_thread(&read_only_child, &Default::default(), &thread.id, "agent")
+            .unwrap();
+        for command in ["undo", "redo"] {
+            let idempotency_key = format!("read-only-child-{command}");
+            let error = engine
+                .execute_command(
+                    &read_only_child.id,
+                    ExecuteCommandRequest {
+                        idempotency_key: idempotency_key.clone(),
+                        name: command.into(),
+                        arguments: String::new(),
+                    },
+                )
+                .await
+                .expect_err("read-only spawned threads must not restore shared checkpoints");
+            match error {
+                EngineError::BadRequest(message) => {
+                    assert!(message.contains("read-only spawned thread"), "{message}");
+                }
+                other => panic!("unexpected /{command} error: {other}"),
+            }
+            assert!(
+                engine
+                    .store
+                    .command_execution(&idempotency_key)
+                    .unwrap()
+                    .is_none(),
+                "rejected commands must not claim an execution receipt"
+            );
+        }
     }
 
     #[test]
@@ -19467,6 +19698,91 @@ mod tests {
             .is_none()
         );
         assert!(trouve_bridge_wrapper_call("commandExecution", &args).is_none());
+    }
+
+    #[test]
+    fn raw_vendor_tool_identity_keeps_lossless_approval_correlation() {
+        let tracker = RawVendorToolCalls::default();
+        let _turn = tracker.begin_turn("thread", 4);
+        let first = serde_json::json!({
+            "command": "cargo test",
+            "cwd": "/worktree/a",
+            "env": { "FEATURE": "one" }
+        });
+        let second = serde_json::json!({
+            "command": "cargo test",
+            "cwd": "/worktree/b",
+            "env": { "FEATURE": "two" }
+        });
+        tracker.register("thread", 4, "call-a", "Bash", &first);
+        tracker.register("thread", 4, "call-b", "Bash", &second);
+
+        assert_eq!(
+            tracker.newest_exact("thread", 4, "shell", &first, &HashSet::new()),
+            Some("call-a".into())
+        );
+        assert_eq!(
+            tracker.newest_exact(
+                "thread",
+                4,
+                "shell",
+                &serde_json::json!({ "command": "cargo test" }),
+                &HashSet::new(),
+            ),
+            None,
+            "display-equivalent arguments must not authorize another operation"
+        );
+        assert_eq!(
+            tracker.newest_exact(
+                "thread",
+                4,
+                "shell",
+                &first,
+                &HashSet::from(["call-a".into()]),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unmatched_bridge_shaped_events_do_not_wait_for_future_calls() {
+        let tracker = BridgeEchoTracker::default();
+        let _turn = tracker.begin_turn("thread", 8);
+        let started = Instant::now();
+        assert!(
+            tracker
+                .claim(
+                    "thread",
+                    8,
+                    "vendor-call",
+                    "mcp__trouve__read_file",
+                    &serde_json::json!({ "path": "README.md" }),
+                )
+                .is_none()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn collaborator_completion_clears_its_bridge_echoes() {
+        let tracker = BridgeEchoTracker::default();
+        let args = serde_json::json!({ "query": "ownership" });
+        tracker.register("child-thread", 3, "canonical-call", "search", &args);
+
+        tracker.clear_turn("child-thread", 3);
+
+        assert!(
+            tracker
+                .claim(
+                    "child-thread",
+                    3,
+                    "vendor-call",
+                    "mcp__trouve__search",
+                    &args,
+                )
+                .is_none(),
+            "a completed collaborator must not leave suppressible bridge state"
+        );
     }
 
     struct CatalogTestProvider {

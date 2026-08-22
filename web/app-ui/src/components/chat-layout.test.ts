@@ -32,6 +32,27 @@ describe("buildChatLayout", () => {
     expect(isStandaloneCommandUnit(turnUnit!)).toBe(false);
   });
 
+  it("gives post-command activity in the same turn a distinct unit id", () => {
+    const layout = buildChatLayout([
+      { id: "before", kind: "thinking", turn: 3, content: "Before", complete: true },
+      {
+        id: "command-1",
+        kind: "command",
+        name: "status",
+        arguments: "",
+        output: "Ready",
+      },
+      { id: "after", kind: "thinking", turn: 3, content: "After", complete: false },
+    ]);
+
+    expect(layout.units.map((unit) => unit.id)).toEqual([
+      "turn:3",
+      "standalone:command-1",
+      "turn:3:segment:after",
+    ]);
+    expect(new Set(layout.units.map((unit) => unit.id)).size).toBe(layout.units.length);
+  });
+
   it("groups each prompt and assistant/work run into one turn", () => {
     const items: ThreadChatItem[] = [
       { id: "u1", kind: "user", turn: 1, content: "Do it", attachments: [] },
