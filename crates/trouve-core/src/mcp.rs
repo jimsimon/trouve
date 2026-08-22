@@ -2629,6 +2629,9 @@ impl McpManager {
             .connection
             .call_tool_controlled(tool, args, cancel, request_timeout)
             .await;
+        // Idle time starts when the operation finishes, not when the cached
+        // connection was acquired. Refresh on success and every error path.
+        connection.touch();
         if let Err(error) = &result
             && !error.connection_reusable
         {
@@ -4775,6 +4778,99 @@ for line in sys.stdin:
             manager.connections.lock().await.entries.is_empty(),
             "the unreferenced idle connection remained cached"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn completed_long_running_call_gets_a_fresh_idle_window() {
+        let script = r#"
+import json, sys, time
+marker_path = sys.argv[1]
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "fake", "version": "0"}}
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
+    elif method == "tools/call":
+        with open(marker_path, "w") as marker:
+            marker.write("active")
+            marker.flush()
+        time.sleep(0.1)
+        result = {"content": [{"type": "text", "text": "done"}]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("long_running_mcp.py");
+        let marker_path = tmp.path().join("active.marker");
+        std::fs::write(&script_path, script).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_config_path(config_dir.path()),
+            serde_json::to_string(&json!({"mcpServers": {"fake": {
+                "command": "python3",
+                "args": [script_path.to_string_lossy(), marker_path.to_string_lossy()],
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(McpManager::default());
+        let worktree = tmp.path().to_path_buf();
+        let config_dir_path = config_dir.path().to_path_buf();
+        let call = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            let worktree = worktree.clone();
+            let config_dir = config_dir_path.clone();
+            async move {
+                manager
+                    .call(
+                        Some(&config_dir),
+                        None,
+                        &worktree,
+                        "mcp__fake__echo",
+                        &json!({}),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !marker_path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("long-running call did not start");
+
+        let last_used = manager
+            .connections
+            .lock()
+            .await
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .last_used
+            .clone();
+        *last_used.lock().unwrap() = std::time::Instant::now()
+            .checked_sub(MCP_IDLE_TIMEOUT + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(call.await.unwrap().unwrap().1, Value::String("done".into()));
+
+        reap_idle_connections(&manager.connections, manager.logs(), MCP_IDLE_TIMEOUT).await;
+        assert!(
+            !manager.connections.lock().await.entries.is_empty(),
+            "a just-completed call was treated as idle from its start time"
+        );
+        assert!(last_used.lock().unwrap().elapsed() < std::time::Duration::from_secs(1));
+        manager.evict_worktree(&worktree).await.unwrap();
     }
 
     #[cfg(target_os = "linux")]

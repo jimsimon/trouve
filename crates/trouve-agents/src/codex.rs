@@ -1523,13 +1523,10 @@ fn turn_stream(
             // Remove the route before yielding completion. A consumer is
             // allowed to drop immediately after receiving the terminal event.
             server.unsubscribe(&codex_thread_id, &route_tx).await;
-            if let Err(error) = server.release_thread(&codex_thread_id).await {
-                tracing::warn!(
-                    thread_id = %codex_thread_id,
-                    "codex: failed to unsubscribe completed app-server thread: {error}"
-                );
-            }
             cleanup.disarm();
+            // Publish the terminal result before best-effort vendor cleanup.
+            // The lifecycle guard still prevents this thread from resuming
+            // until an older unsubscribe can no longer race the replacement.
             match params["turn"]["status"].as_str() {
                 Some("completed") => {
                     let _ = tx
@@ -1562,6 +1559,12 @@ fn turn_stream(
                         )))
                         .await;
                 }
+            }
+            if let Err(error) = server.release_thread(&codex_thread_id).await {
+                tracing::warn!(
+                    thread_id = %codex_thread_id,
+                    "codex: failed to unsubscribe completed app-server thread: {error}"
+                );
             }
             return;
         }
@@ -1600,6 +1603,12 @@ fn turn_stream(
                 .await;
         }
         server.unsubscribe(&codex_thread_id, &route_tx).await;
+        if let Err(error) = server.release_thread(&codex_thread_id).await {
+            tracing::warn!(
+                thread_id = %codex_thread_id,
+                "codex: failed to unsubscribe cleaned-up app-server thread: {error}"
+            );
+        }
         cleanup.disarm();
     })
 }
@@ -3540,17 +3549,18 @@ impl AppServer {
     /// Release app-server's subscription after a terminal turn. A later
     /// trouve turn resumes the persisted vendor thread and subscribes again.
     async fn release_thread(&self, thread_id: &str) -> Result<(), BackendError> {
-        let result = self
-            .request_with_cancel_timeout(
-                "thread/unsubscribe",
-                json!({ "threadId": thread_id }),
-                None,
-                true,
-                THREAD_UNSUBSCRIBE_TIMEOUT,
-            )
-            .await;
+        // Forget before the RPC so a replacement that starts while cleanup
+        // is in flight cannot decide to reuse the stale subscription.
         self.loaded_threads.lock().await.forget(thread_id);
-        result.map(|_| ())
+        self.request_with_cancel_timeout(
+            "thread/unsubscribe",
+            json!({ "threadId": thread_id }),
+            None,
+            false,
+            THREAD_UNSUBSCRIBE_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
     }
 
     fn instructions_need_prompt_fallback(&self, thread_id: &str, instructions: &str) -> bool {
