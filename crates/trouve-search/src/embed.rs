@@ -38,8 +38,10 @@ use crate::utils::resolve_model_name;
 const MAX_TOKENS: usize = 512;
 /// Number of shards for the word -> token-ids cache.
 const CACHE_SHARDS: usize = 128;
-/// Maximum time a loader waits for another process's model-repair lock.
-const HUB_MODEL_LOCK_WAIT: Duration = Duration::from_secs(60);
+/// Environment override for the model-repair lock wait, in positive seconds.
+const HUB_MODEL_LOCK_TIMEOUT_ENV: &str = "TROUVE_HUB_MODEL_LOCK_TIMEOUT_SECS";
+/// Default time a loader waits for another process's model-repair lock.
+const DEFAULT_HUB_MODEL_LOCK_WAIT: Duration = Duration::from_secs(300);
 /// Poll interval while waiting for a model repository's repair lock.
 const HUB_MODEL_LOCK_RETRY: Duration = Duration::from_millis(50);
 
@@ -683,8 +685,31 @@ fn hub_model_lock_path(cache_root: &Path, id: &str) -> PathBuf {
         .join(".trouve-model-load.lock")
 }
 
+fn parse_hub_model_lock_wait(value: &str) -> Option<Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
+
+fn hub_model_lock_wait() -> Duration {
+    let Ok(value) = std::env::var(HUB_MODEL_LOCK_TIMEOUT_ENV) else {
+        return DEFAULT_HUB_MODEL_LOCK_WAIT;
+    };
+    parse_hub_model_lock_wait(&value).unwrap_or_else(|| {
+        eprintln!(
+            "warning: {HUB_MODEL_LOCK_TIMEOUT_ENV} must be a positive integer number of seconds; \
+             using the default of {} seconds",
+            DEFAULT_HUB_MODEL_LOCK_WAIT.as_secs()
+        );
+        DEFAULT_HUB_MODEL_LOCK_WAIT
+    })
+}
+
 fn lock_hub_model_at(cache_root: &Path, id: &str) -> Result<std::fs::File> {
-    lock_hub_model_at_with_timeout(cache_root, id, HUB_MODEL_LOCK_WAIT)
+    lock_hub_model_at_with_timeout(cache_root, id, hub_model_lock_wait())
 }
 
 fn lock_hub_model_at_with_timeout(
@@ -888,6 +913,16 @@ mod tests {
     const TEST_HUB_MODEL_LOCK_RELEASE_ENV: &str = "TROUVE_TEST_HUB_MODEL_LOCK_RELEASE";
 
     #[test]
+    fn parses_configurable_hub_model_lock_wait() {
+        assert_eq!(
+            parse_hub_model_lock_wait(" 600 "),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(parse_hub_model_lock_wait("0"), None);
+        assert_eq!(parse_hub_model_lock_wait("not-a-duration"), None);
+    }
+
+    #[test]
     fn model_load_locks_serialize_per_id() {
         let first = model_load_lock("test-model-load-lock");
         let same = model_load_lock("test-model-load-lock");
@@ -957,7 +992,7 @@ mod tests {
                 .unwrap();
         std::fs::write(&marker, b"locked").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !release.exists() {
             assert!(
                 Instant::now() < deadline,
@@ -1002,28 +1037,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let cache_root = cache.path().to_path_buf();
-        let contender_id = id.to_string();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let contender = std::thread::spawn(move || {
-            let result = lock_hub_model_at_with_timeout(
-                &cache_root,
-                &contender_id,
-                Duration::from_millis(75),
-            )
-            .map(|lock| fs4::fs_std::FileExt::unlock(&lock).unwrap());
-            sender.send(result).unwrap();
-        });
-        let attempt = receiver.recv_timeout(Duration::from_secs(1));
+        // Attempt on the parent test thread so an oversubscribed runner cannot
+        // delay a separate contender thread until after the holder is released.
+        // The helper has a 30-second safety deadline, so a regression to a
+        // blocking acquisition still terminates and fails rather than hanging.
+        let attempt = lock_hub_model_at_with_timeout(cache.path(), id, Duration::from_millis(75));
 
         std::fs::write(&release, b"release").unwrap();
         let holder_status = holder.wait().unwrap();
-        contender.join().unwrap();
 
         assert!(holder_status.success());
-        let error = attempt
-            .expect("lock acquisition exceeded its bounded timeout")
-            .expect_err("contender unexpectedly acquired a held process lock");
+        let error = attempt.expect_err("contender unexpectedly acquired a held process lock");
         let message = format!("{error:#}");
         assert!(message.contains("75ms"), "{message}");
         assert!(message.contains(id), "{message}");

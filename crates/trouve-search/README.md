@@ -210,7 +210,11 @@ two-line change (a dependency in `Cargo.toml` and a match arm in
 
 Resolved in order: `TROUVE_CACHE_LOCATION` (absolute path), then the platform
 cache dir (`~/.cache/trouve` on Linux). Set `TROUVE_MODEL_NAME` to override
-the embedding model.
+the embedding model. Processes wait up to five minutes for another process to
+finish downloading or repairing the same Hub model; set
+`TROUVE_HUB_MODEL_LOCK_TIMEOUT_SECS` to a positive number of seconds when a
+large model or slow network needs a longer wait, or when faster failure is
+preferred.
 
 The upstream semble environment variables (`SEMBLE_CACHE_LOCATION`,
 `SEMBLE_MODEL_NAME`) are still honoured as fallbacks when the corresponding
