@@ -205,8 +205,7 @@ impl EmbeddingModel {
             }
         }
 
-        let files = resolve_model_files(&id)?;
-        let model = load_model_with_refresh(&id, &files, || refresh_model_files(&id, &files))
+        let model = load_model_with_cache_coordination(&id)
             .with_context(|| format!("failed to load embedding model {id:?}"))?;
         let loaded = Arc::new(model);
         cache.lock().unwrap().push(loaded.clone());
@@ -234,6 +233,15 @@ impl EmbeddingModel {
             .unwrap_or(true);
 
         let file = std::fs::File::open(&files.model).context("failed to open model.safetensors")?;
+        if files.origin == ModelOrigin::Hub
+            && file
+                .metadata()
+                .context("failed to inspect model.safetensors")?
+                .len()
+                == 0
+        {
+            return Err(invalid_model_artifact("cached model.safetensors is empty"));
+        }
         // Safety: the mmap'd model file is assumed not to be truncated
         // concurrently; same contract as the snapshot mmaps.
         let map = Arc::new(unsafe { Mmap::map(&file) }.context("failed to mmap model")?);
@@ -663,6 +671,61 @@ struct ModelFiles {
     origin: ModelOrigin,
 }
 
+fn hub_model_lock_path(cache_root: &Path, id: &str) -> PathBuf {
+    let repo = hf_hub::Repo::model(id.to_string());
+    cache_root
+        .join(repo.folder_name())
+        .join(".trouve-model-load.lock")
+}
+
+fn lock_hub_model_at(cache_root: &Path, id: &str) -> Result<std::fs::File> {
+    use fs4::fs_std::FileExt as _;
+
+    let lock_path = hub_model_lock_path(cache_root, id);
+    let parent = lock_path
+        .parent()
+        .with_context(|| format!("Hub model lock has no parent: {}", lock_path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating Hub model cache directory {}", parent.display()))?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening Hub model lock {}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("locking Hub model cache for {id:?}"))?;
+    Ok(lock)
+}
+
+fn with_hub_model_lock<T>(id: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let cache = hf_hub::Cache::from_env();
+    let lock = lock_hub_model_at(cache.path(), id)?;
+    let result = operation();
+    let unlock = fs4::fs_std::FileExt::unlock(&lock)
+        .with_context(|| format!("unlocking Hub model cache for {id:?}"));
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn load_model_with_cache_coordination(id: &str) -> Result<EmbeddingModel> {
+    if Path::new(id).exists() {
+        let files = resolve_model_files(id)?;
+        return load_model_with_refresh(id, &files, || refresh_model_files(id, &files));
+    }
+
+    // The Hub cache is shared across processes. Hold one repository-level
+    // filesystem lock from resolution through validation and any repair so a
+    // concurrent loader cannot observe snapshot pointers being replaced.
+    with_hub_model_lock(id, || {
+        let files = resolve_hub_model_files(id, false)?;
+        load_model_with_refresh(id, &files, || refresh_model_files(id, &files))
+    })
+}
+
 /// Load a resolved model and, when offered by the caller, retry once with a
 /// freshly downloaded set of files. Local model directories deliberately pass
 /// `Ok(None)` so a validation error never mutates user-owned files.
@@ -823,6 +886,25 @@ mod tests {
         drop(lock_ignore_poison(&load_lock));
     }
 
+    #[test]
+    fn hub_model_lock_serializes_file_handles() {
+        use fs4::fs_std::FileExt as _;
+
+        let cache = tempfile::tempdir().unwrap();
+        let id = "owner/test-hub-model-lock";
+        let first = lock_hub_model_at(cache.path(), id).unwrap();
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(hub_model_lock_path(cache.path(), id))
+            .unwrap();
+
+        assert!(!second.try_lock_exclusive().unwrap());
+        fs4::fs_std::FileExt::unlock(&first).unwrap();
+        assert!(second.try_lock_exclusive().unwrap());
+        second.unlock().unwrap();
+    }
+
     /// WordLevel tokenizer with `words` in the vocabulary (plus [UNK] at 0).
     fn tokenizer_json(words: &[&str]) -> String {
         let mut vocab = serde_json::Map::new();
@@ -906,6 +988,39 @@ mod tests {
 
         assert!(attempted_refresh);
         assert_eq!(model.encode_one("alpha").len(), 2);
+    }
+
+    #[test]
+    fn empty_hub_model_refreshes() {
+        let cached = tempfile::tempdir().unwrap();
+        let refreshed = tempfile::tempdir().unwrap();
+        let mut cached_files = write_model(cached.path(), &["alpha"], 2, None);
+        cached_files.origin = ModelOrigin::Hub;
+        std::fs::write(&cached_files.model, []).unwrap();
+        let refreshed_files = write_model(refreshed.path(), &["alpha"], 2, None);
+
+        let mut attempted_refresh = false;
+        let model = load_model_with_refresh("test", &cached_files, || {
+            attempted_refresh = true;
+            Ok(Some(refreshed_files))
+        })
+        .unwrap();
+
+        assert!(attempted_refresh);
+        assert_eq!(model.encode_one("alpha").len(), 2);
+    }
+
+    #[test]
+    fn empty_local_model_does_not_refresh() {
+        let cached = tempfile::tempdir().unwrap();
+        let cached_files = write_model(cached.path(), &["alpha"], 2, None);
+        std::fs::write(&cached_files.model, []).unwrap();
+
+        EmbeddingModel::load(cached.path().to_str())
+            .map(|_| ())
+            .unwrap_err();
+
+        assert_eq!(std::fs::metadata(&cached_files.model).unwrap().len(), 0);
     }
 
     #[test]
