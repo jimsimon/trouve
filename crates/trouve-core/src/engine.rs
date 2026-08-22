@@ -1289,10 +1289,18 @@ impl BridgeEchoTracker {
             }
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return None,
+                _ = cancel.cancelled() => {
+                    // Cancellation and trusted registration can become ready
+                    // together. Preserve a correlation already established
+                    // at this terminal boundary instead of releasing its
+                    // wrapper as a second native tool call.
+                    return self.try_claim(thread_id, turn, vendor_call_id, tool, args);
+                }
                 result = tokio::time::timeout_at(deadline.into(), changed.as_mut()) => {
                     if result.is_err() {
-                        return None;
+                        // The deadline can race the registration notification
+                        // in the same way; make one final state-based claim.
+                        return self.try_claim(thread_id, turn, vendor_call_id, tool, args);
                     }
                 }
             }
@@ -13875,7 +13883,9 @@ impl Engine {
                 );
             let input = if let Some(event) = replay_backend_events.pop_front() {
                 BackendLoopInput::Event(Some(Ok(event)))
-            } else if let Some(error) = pending_backend_error.take() {
+            } else if pending_bridge_echo_claims.is_empty()
+                && let Some(error) = pending_backend_error.take()
+            {
                 BackendLoopInput::Event(Some(Err(error)))
             } else if pending_steer_lane.is_some() {
                 // Poll lane acquisition ahead of the backend stream so a
@@ -14198,14 +14208,9 @@ impl Engine {
                     }
                     Err(BackendError::Cancelled) if cancel.is_cancelled() => {
                         if !pending_bridge_echo_ids.is_empty() {
-                            // Cancellation can make both the provider stream
-                            // and the correlation futures ready together. Do
-                            // not rely on select branch order: release the
-                            // claims and replay every event already observed
-                            // before honoring the terminal cancellation.
-                            pending_bridge_echo_claims.clear();
-                            released_bridge_call_ids.extend(pending_bridge_echo_ids.drain());
-                            replay_backend_events.append(&mut deferred_backend_events);
+                            // Let each claim settle against tracker state
+                            // before replay. Its cancellation path re-checks
+                            // for a concurrently completed trusted request.
                             pending_backend_error = Some(BackendError::Cancelled);
                             backend_stream_ended = true;
                             consecutive_backend_events = 0;
@@ -14215,13 +14220,11 @@ impl Engine {
                     }
                     Err(error) => {
                         if !pending_bridge_echo_ids.is_empty() {
-                            // Preserve every lifecycle and transcript event
-                            // already observed before surfacing the terminal
-                            // stream failure. No later trusted request can be
-                            // relied on once its owning stream has failed.
-                            pending_bridge_echo_claims.clear();
-                            released_bridge_call_ids.extend(pending_bridge_echo_ids.drain());
-                            replay_backend_events.append(&mut deferred_backend_events);
+                            // Preserve every lifecycle and transcript event,
+                            // but first let pending claims observe any trusted
+                            // registration that completed concurrently with
+                            // the stream failure. The bounded claim deadline
+                            // prevents terminal cleanup from waiting forever.
                             pending_backend_error = Some(error);
                             backend_stream_ended = true;
                             consecutive_backend_events = 0;
@@ -14572,6 +14575,19 @@ impl Engine {
                     turn_id,
                     event,
                 } => {
+                    let event = if pending_backend_error.is_some() {
+                        match event {
+                            BackendCollaboratorEvent::ApprovalNeeded { responder, .. } => {
+                                // The provider has already failed, so it cannot
+                                // consume a newly approved collaborator action.
+                                let _ = responder.send(false);
+                                continue;
+                            }
+                            event => event,
+                        }
+                    } else {
+                        event
+                    };
                     if !collaborators.contains_key(&session_id) {
                         let parent_session_id = active_vendor_session
                             .as_deref()
@@ -14824,6 +14840,12 @@ impl Engine {
                         let _ = responder.send(true);
                         continue;
                     }
+                    if pending_backend_error.is_some() {
+                        // Replaying events observed before a terminal stream
+                        // failure must not open a new user interaction.
+                        let _ = responder.send(false);
+                        continue;
+                    }
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -14856,6 +14878,12 @@ impl Engine {
                     questions,
                     responder,
                 } => {
+                    if pending_backend_error.is_some() {
+                        // The failed provider can no longer consume answers;
+                        // surface its terminal error without blocking on UI.
+                        let _ = responder.send(None);
+                        continue;
+                    }
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -20182,6 +20210,34 @@ mod tests {
                 .await
                 .expect("cancelled bridge claim waited for the reorder deadline")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_a_concurrently_ready_bridge_correlation() {
+        let tracker = BridgeEchoTracker::default();
+        let _turn = tracker.begin_turn("thread", 8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let args = serde_json::json!({ "path": "README.md" });
+        let claim = tracker.claim_after_dispatch(
+            "thread",
+            8,
+            "vendor-call",
+            "mcp__trouve__read_file",
+            &args,
+            &cancel,
+        );
+        tokio::pin!(claim);
+        tokio::task::yield_now().await;
+
+        // Make both select branches ready before polling the claim again.
+        tracker.register("thread", 8, "canonical-call", "read_file", &args);
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(50), claim)
+                .await
+                .expect("ready correlation was lost during cancellation"),
+            Some("canonical-call".into())
         );
     }
 
