@@ -34,7 +34,7 @@ describe("thread screen asynchronous lifecycle guards", () => {
 
   it("invalidates history before a late page can recreate a deleted view", () => {
     const history = section(
-      "async #loadOlderHistory(loadAll: boolean)",
+      "async #loadOlderHistory(loadAll: boolean, signal?: AbortSignal)",
       "\n  readonly #toggleAccessibleHistory",
     );
     expect(disconnected).toContain("this.#historyGeneration += 1;");
@@ -45,6 +45,25 @@ describe("thread screen asynchronous lifecycle guards", () => {
       "if (!this.#isCurrentHistoryRequest",
       "store.prependThreadViewSnapshot",
     );
+  });
+
+  it("cancels find-owned history requests across query and view lifecycles", () => {
+    const find = section(
+      "#cancelChatFindHistoryLoading(): void {",
+      "\n  #selectThreadWithKeyboard(",
+    );
+    const history = section(
+      "async #loadOlderHistory(loadAll: boolean, signal?: AbortSignal)",
+      "\n  readonly #toggleAccessibleHistory",
+    );
+    expect(find).toContain("this.#chatFindHistoryAbort?.abort();");
+    expect(find).toContain('this.#chatFindQuery.trim() === ""');
+    expect(find).toContain("new AbortController()");
+    expect(find).toContain("this.#loadOlderHistory(false, abort.signal)");
+    expect(history).toContain("!signal?.aborted");
+    expect(find).toContain("const restorationPending = restoredActiveUnitId !== undefined");
+    expect(find).toContain("&& view.hasOlder");
+    expect(disconnected).toContain("this.#cancelChatFindHistoryLoading();");
   });
 
   it("guards an accepted message before reconciling optimistic store state", () => {
