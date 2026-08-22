@@ -2747,6 +2747,17 @@ fn parse_attachments(json: &str) -> Vec<trouve_protocol::Attachment> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
+/// Model options were unrestricted JSON before protocol 7.14. Keep usable
+/// scalar entries at the storage read boundary while omitting legacy values
+/// that the current wire contract cannot represent.
+fn parse_model_options(json: &str) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, value)| value.is_string() || value.is_number() || value.is_boolean())
+        .collect()
+}
+
 /// One `automations` row (column order matches the SELECTs below).
 fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol::Automation> {
     let model_options_json: String = r.get(7)?;
@@ -2760,7 +2771,7 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
         mode: r.get(4)?,
         model: r.get(5)?,
         thinking_level: r.get(6)?,
-        model_options: serde_json::from_str(&model_options_json).unwrap_or_default(),
+        model_options: parse_model_options(&model_options_json),
         permission_mode: permission_mode_from(&permission_mode),
         schedule: serde_json::from_str(&schedule_json).unwrap_or(
             trouve_protocol::AutomationSchedule {
@@ -6949,7 +6960,7 @@ impl Store {
             params![id],
             |r| r.get(0),
         )?;
-        Ok(serde_json::from_str(&text)?)
+        Ok(parse_model_options(&text))
     }
 
     pub fn list_threads(&self, session_id: &str) -> Result<Vec<Thread>> {
@@ -13679,7 +13690,7 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         mode: r.get(2)?,
         model: r.get(3)?,
         permission_mode: permission_mode_from(&r.get::<_, String>(4)?),
-        model_options: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+        model_options: parse_model_options(&r.get::<_, String>(5)?),
         created_at: r
             .get::<_, String>(6)?
             .parse()
@@ -17139,6 +17150,99 @@ mod tests {
         let q = store.queued_prompts("th_1").unwrap();
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].content, "keep me");
+    }
+
+    #[test]
+    fn legacy_non_scalar_model_options_are_filtered_on_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy-model-options.db");
+        {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "th_legacy_options");
+            store
+                .insert_automation(&trouve_protocol::Automation {
+                    id: "auto_legacy_options".into(),
+                    name: "Legacy options".into(),
+                    prompt: "Run it".into(),
+                    workspace_id: "ws_q".into(),
+                    mode: Some("code".into()),
+                    model: Some("p/m".into()),
+                    thinking_level: None,
+                    model_options: serde_json::Map::new(),
+                    permission_mode: PermissionMode::Ask,
+                    schedule: trouve_protocol::AutomationSchedule {
+                        kind: "daily".into(),
+                        minute: 0,
+                        time: "09:00".into(),
+                        days: Vec::new(),
+                    },
+                    enabled: false,
+                    next_run_at: None,
+                    last_run_at: None,
+                    last_session_id: None,
+                    last_error: String::new(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                })
+                .unwrap();
+        }
+
+        let legacy = serde_json::json!({
+            "text": "high",
+            "number": 0.4,
+            "boolean": true,
+            "null": null,
+            "array": ["legacy"],
+            "object": {"legacy": true}
+        })
+        .to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE threads SET model_options = ?1 WHERE id = ?2",
+                params![legacy, "th_legacy_options"],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE automations SET model_options = ?1 WHERE id = ?2",
+                params![legacy, "auto_legacy_options"],
+            )
+            .unwrap();
+        }
+
+        let expected = serde_json::json!({
+            "text": "high",
+            "number": 0.4,
+            "boolean": true
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .thread("th_legacy_options")
+                .unwrap()
+                .unwrap()
+                .model_options,
+            expected
+        );
+        assert_eq!(
+            store.list_threads("se_q").unwrap()[0].model_options,
+            expected
+        );
+        assert_eq!(
+            store.thread_model_options("th_legacy_options").unwrap(),
+            expected
+        );
+        assert_eq!(
+            store
+                .automation("auto_legacy_options")
+                .unwrap()
+                .unwrap()
+                .model_options,
+            expected
+        );
+        assert_eq!(store.list_automations().unwrap()[0].model_options, expected);
     }
 
     #[test]
