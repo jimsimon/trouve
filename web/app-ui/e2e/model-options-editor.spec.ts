@@ -72,7 +72,16 @@ test("model-option choices preserve selected state and scalar value types", asyn
     ];
     const changes: unknown[] = [];
     editor.addEventListener("trouve-model-option-changed", (event) => {
-      changes.push((event as CustomEvent).detail);
+      const detail = (event as CustomEvent<{ key: string; value: unknown }>).detail;
+      changes.push(detail);
+      if (detail.key === "instructions" && detail.value === undefined) {
+        editor.controls = editor.controls.map((control) => {
+          const option = control as Record<string, unknown>;
+          return option["key"] === detail.key
+            ? { ...option, overridden: false, text: "" }
+            : control;
+        });
+      }
     });
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges = changes;
     document.body.append(editor);
@@ -111,7 +120,9 @@ test("model-option choices preserve selected state and scalar value types", asyn
   ]);
 
   await context.selectOption({ label: "Model default · 1M" });
-  await editor.getByLabel("Use model default for Instructions").click();
+  const resetInstructions = editor.getByLabel("Use model default for Instructions");
+  await resetInstructions.click();
+  await expect(instructions).toBeFocused();
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges,
   )).toEqual([

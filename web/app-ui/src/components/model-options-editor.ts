@@ -267,10 +267,13 @@ export class TrouveModelOptionsEditor extends LitElement {
               ? html`<button
                   class="reset-option"
                   type="button"
-                  title="Use model default"
                   aria-label=${`Use model default for ${control.label}`}
                   ?disabled=${this.disabled}
-                  @click=${() => this.#emit(control.key, undefined)}
+                  @click=${(event: Event) => {
+                    ((event.target as HTMLElement)
+                      .previousElementSibling as HTMLInputElement).focus();
+                    this.#emit(control.key, undefined);
+                  }}
                 >↺</button>`
               : nothing}
           </div>

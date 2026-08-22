@@ -1535,6 +1535,10 @@ impl ExactJsonNumber {
         })
     }
 
+    fn is_integer(&self) -> bool {
+        self.digits == "0" || self.exponent >= 0
+    }
+
     fn compare(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let magnitude = self.compare_magnitude(other)?;
         Some(match (self.negative, other.negative) {
@@ -1589,13 +1593,7 @@ fn advertised_bound(
 }
 
 fn json_number_is_integer(number: &serde_json::Number) -> bool {
-    const MAX_SAFE_FLOAT_INTEGER: f64 = 9_007_199_254_740_991.0;
-
-    number.as_i64().is_some()
-        || number.as_u64().is_some()
-        || number.as_f64().is_some_and(|number| {
-            number.is_finite() && number.fract() == 0.0 && number.abs() <= MAX_SAFE_FLOAT_INTEGER
-        })
+    ExactJsonNumber::parse(number).is_some_and(|number| number.is_integer())
 }
 
 fn schema_scalar(value: &serde_json::Value) -> bool {
@@ -25449,6 +25447,7 @@ default_permission_mode = "ask"
                         "type": "integer",
                         "enum": [9007199254740992_u64, 9007199254740993_u64]
                     },
+                    "huge_integer": {"type": "integer"},
                     "fast": {"type": "boolean"},
                     "context": {
                         "oneOf": [
@@ -25499,6 +25498,17 @@ default_permission_mode = "ask"
         ]);
         assert!(validate_model_options(&valid, &model).is_ok());
 
+        for valid_integer in [
+            r#"{"huge_integer":1e20}"#,
+            r#"{"huge_integer":100000000000000000000}"#,
+        ] {
+            let options: serde_json::Value = serde_json::from_str(valid_integer).unwrap();
+            assert!(
+                validate_model_options(options.as_object().unwrap(), &model).is_ok(),
+                "{valid_integer} is mathematically integral"
+            );
+        }
+
         let wrong_choice = serde_json::json!({"effort": "medium"});
         let wrong_choice_error = validate_model_options(wrong_choice.as_object().unwrap(), &model)
             .unwrap_err()
@@ -25537,12 +25547,16 @@ default_permission_mode = "ask"
             );
         }
 
-        let rounded_fractional: serde_json::Value =
-            serde_json::from_str(r#"{"large_budget":9007199254740992.5}"#).unwrap();
-        assert!(
-            validate_model_options(rounded_fractional.as_object().unwrap(), &model).is_err(),
-            "an unsafe floating-point integer must not pass integer validation"
-        );
+        for fractional in [
+            r#"{"huge_integer":9007199254740990.6}"#,
+            r#"{"huge_integer":9007199254740992.5}"#,
+        ] {
+            let options: serde_json::Value = serde_json::from_str(fractional).unwrap();
+            assert!(
+                validate_model_options(options.as_object().unwrap(), &model).is_err(),
+                "{fractional} must not pass integer validation"
+            );
+        }
     }
 
     #[tokio::test]
