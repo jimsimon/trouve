@@ -192,6 +192,8 @@ mod tests {
         assert!(api.prompt.contains("0.x minor dependency upgrades"));
         assert!(dependencies.prompt.contains("trace affected APIs"));
         assert!(dependencies.prompt.contains("required trait imports"));
+        assert!(dependencies.prompt.contains("output types"));
+        assert!(dependencies.prompt.contains("formatting"));
         assert!(
             dependencies
                 .prompt

@@ -5529,7 +5529,33 @@ impl Engine {
         else {
             bail!("stale: review was cancelled or replaced before result persistence");
         };
+        let accepted_revision = async {
+            self.revalidate_code_review_publication(&api, &job).await?;
+            ensure_review_current(superseded)
+        }
+        .await;
+        if let Err(error) = accepted_revision {
+            match self.store.discard_unaccepted_code_review_result(&job.id) {
+                Ok(true) => return Err(error),
+                Ok(false) => {
+                    return Err(error)
+                        .context("staged review result could not be discarded before publication");
+                }
+                Err(discard_error) => {
+                    return Err(error).context(format!(
+                        "discarding staged review result after failed revalidation: {discard_error:#}"
+                    ));
+                }
+            }
+        }
         if !self.store.claim_code_review_publication(&job.id)? {
+            let discarded = self
+                .store
+                .discard_unaccepted_code_review_result(&job.id)
+                .context("discarding staged review result after publication claim rejection")?;
+            if !discarded {
+                bail!("stale: review changed and its staged result could not be discarded");
+            }
             bail!("stale: review was cancelled or replaced before publication");
         }
         // Only findings that can produce a visible inline comment may make
@@ -9343,10 +9369,10 @@ fn finish_lifecycle_comment(mut body: String, job_id: &str) -> String {
 
 fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
     let job = &detail.job;
-    // A cancelled or stale job never accepted its coordinator result for the
-    // live pull-request revision. Keep diagnostic status and timing visible,
-    // but never project potentially obsolete model-authored result content.
-    let expose_results = !matches!(job.status.as_str(), "cancelled" | "stale");
+    // Only terminal review outcomes expose coordinator-authored results. A
+    // queued or running job may hold a staged result while its live revision
+    // is revalidated; cancelled and stale jobs never accepted that result.
+    let expose_results = matches!(job.status.as_str(), "succeeded" | "failed");
     let result_summary = if expose_results {
         detail.summary.as_str()
     } else {
@@ -14368,6 +14394,12 @@ mod tests {
                 &[],
             )
             .unwrap();
+        let staged = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let running_body = render_lifecycle_comment(&staged);
+        assert!(running_body.starts_with("## 🔎 Trouve Code Review — Running"));
+        assert!(!running_body.contains("Obsolete coordinator summary"));
+        assert!(!running_body.contains("Obsolete finding title"));
+        assert!(!running_body.contains("Apply the obsolete fix"));
         store
             .finish_code_review_job(
                 &queued.id,

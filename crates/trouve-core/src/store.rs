@@ -3346,6 +3346,9 @@ const CURRENT_CODE_REVIEW_JOB_PREDICATE: &str = concat!(
     ")",
 );
 
+const LEGACY_UNADJUDICATED_REASON_MARKER: &str = "did not provide a specific reason";
+const LEGACY_MISSING_REASON_MARKER: &str = "has no recorded reason";
+
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
     pub job_id: String,
@@ -10432,6 +10435,100 @@ impl Store {
         Ok(Some(self.code_review_findings(job_id)?))
     }
 
+    /// Discards a staged coordinator result before any GitHub publication was
+    /// dispatched. A failed post-persistence live revision check uses this to
+    /// remove every unaccepted result artifact and release any local claim.
+    pub fn discard_unaccepted_code_review_result(&self, job_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let discardable: bool = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs
+               WHERE id = ?1 AND publication_dispatched = 0
+                 AND publication_accepted = 0 AND review_published = 0
+             )",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        if !discardable {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let affected_theme_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT theme_id FROM code_review_theme_observations WHERE job_id = ?1
+                 UNION
+                 SELECT theme_id FROM code_review_finding_themes WHERE linked_by_job_id = ?1
+                 UNION
+                 SELECT link.theme_id
+                 FROM code_review_finding_themes link
+                 JOIN code_review_findings finding ON finding.id = link.finding_id
+                 WHERE finding.job_id = ?1",
+            )?;
+            stmt.query_map(params![job_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
+            "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_finding_themes
+             WHERE linked_by_job_id = ?1
+                OR finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_finding_sources
+             WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_findings WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_candidate_rejections WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_unadjudicated_candidates WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "UPDATE code_review_tasks SET confirmed_issue_count = 0 WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        let reset = tx.execute(
+            "UPDATE code_review_jobs
+             SET summary = '', prompt_for_agents = '', candidate_issue_count = 0,
+                 issue_count = 0, publication_claimed = 0,
+                 publication_dispatched = 0, publication_accepted = 0,
+                 publication_order = 0
+             WHERE id = ?1 AND publication_dispatched = 0
+               AND publication_accepted = 0 AND review_published = 0",
+            params![job_id],
+        )?;
+        if reset == 0 {
+            return Ok(false);
+        }
+        for theme_id in affected_theme_ids {
+            tx.execute(
+                "DELETE FROM code_review_themes
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM code_review_theme_observations WHERE theme_id = ?1
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM code_review_finding_themes WHERE theme_id = ?1
+                   )",
+                params![theme_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     fn code_review_candidate_rejections(
         &self,
         job_id: &str,
@@ -10523,8 +10620,8 @@ impl Store {
                     OR rejection.reason LIKE 'non_actionable:%')
                AND length(trim(substr(rejection.reason,
                                       instr(rejection.reason, ':') + 1))) > 0
-               AND rejection.reason NOT LIKE '%did not provide a specific reason%'
-               AND rejection.reason NOT LIKE '%has no recorded reason%'
+               AND rejection.reason NOT LIKE '%' || ?5 || '%'
+               AND rejection.reason NOT LIKE '%' || ?6 || '%'
              ORDER BY job.publication_order DESC, job.completed_at DESC,
                       rejection.created_at DESC, job.created_at DESC, job.id DESC,
                       rejection.candidate_id DESC
@@ -10536,7 +10633,9 @@ impl Store {
                     repository,
                     pull_number as i64,
                     excluded_job_id,
-                    limit as i64
+                    limit as i64,
+                    LEGACY_UNADJUDICATED_REASON_MARKER,
+                    LEGACY_MISSING_REASON_MARKER,
                 ],
                 |row| {
                     Ok(trouve_protocol::CodeReviewCandidateRejection {
@@ -12138,9 +12237,14 @@ impl Store {
                  WHERE j.status = 'succeeded'
                    AND (?1 IS NULL OR j.repository = ?1)
                    AND (?2 IS NULL OR j.completed_at >= ?2)
-                   AND r.reason NOT LIKE '%did not provide a specific reason%'
-                   AND r.reason NOT LIKE '%has no recorded reason%'",
-                params![repository, start_param],
+                   AND r.reason NOT LIKE '%' || ?3 || '%'
+                   AND r.reason NOT LIKE '%' || ?4 || '%'",
+                params![
+                    repository,
+                    start_param,
+                    LEGACY_UNADJUDICATED_REASON_MARKER,
+                    LEGACY_MISSING_REASON_MARKER,
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             let (
@@ -21172,6 +21276,128 @@ mod tests {
     }
 
     #[test]
+    fn staged_result_can_be_discarded_before_publication() {
+        let store = Store::open_in_memory().unwrap();
+        let current = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            current.id
+        );
+        let findings = [NewCodeReviewFinding {
+            path: "src/lib.rs".into(),
+            line: 7,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Staged finding".into(),
+            body: "Only valid for the staged revision.".into(),
+            prompt_for_agents: "Fix the staged finding.".into(),
+            sources: Vec::new(),
+        }];
+        let finding_details = [NewCodeReviewFindingDetails {
+            theme_ids: vec!["staged-theme".into()],
+            ..Default::default()
+        }];
+        let themes = [NewCodeReviewTheme {
+            id: "staged-theme".into(),
+            root_cause: "staged root cause".into(),
+            recommendation: "staged recommendation".into(),
+            observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+            previous_finding_ids: Vec::new(),
+        }];
+        let rejections = [trouve_protocol::CodeReviewCandidateRejection {
+            candidate_id: "rejected".into(),
+            task_id: "task".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            path: "src/lib.rs".into(),
+            line: 8,
+            side: "RIGHT".into(),
+            severity: "low".into(),
+            confidence: "high".into(),
+            title: "Rejected candidate".into(),
+            body: "Not actionable.".into(),
+            reason: "non_actionable: no current defect".into(),
+        }];
+        let unadjudicated = [trouve_protocol::CodeReviewUnadjudicatedCandidate {
+            candidate_id: "unresolved".into(),
+            task_id: "task".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            path: "src/lib.rs".into(),
+            line: 9,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Unresolved candidate".into(),
+            body: "The editor omitted a decision.".into(),
+        }];
+
+        let saved = store
+            .save_current_code_review_result_with_adjudication(
+                &current.id,
+                "Staged result",
+                "Staged prompt",
+                3,
+                &findings,
+                &finding_details,
+                &themes,
+                &rejections,
+                &unadjudicated,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(saved.len(), 1);
+        let staged = store.code_review_job(&current.id).unwrap().unwrap();
+        assert!(!staged.publication_claimed);
+        let staged_detail = store.code_review_job_detail(&current.id).unwrap().unwrap();
+        assert_eq!(staged_detail.findings.len(), 1);
+        assert_eq!(staged_detail.candidate_rejections.len(), 1);
+        assert_eq!(staged_detail.unadjudicated_candidates.len(), 1);
+        let mut replacement_request = backoff_test_job_request();
+        replacement_request.dedupe_key = "acme/widgets#42:replacement-after-stage".into();
+        store
+            .enqueue_code_review_job(&replacement_request)
+            .unwrap()
+            .unwrap();
+        assert!(!store.claim_code_review_publication(&current.id).unwrap());
+        assert!(
+            store
+                .discard_unaccepted_code_review_result(&current.id)
+                .unwrap()
+        );
+
+        let discarded = store.code_review_job(&current.id).unwrap().unwrap();
+        assert!(!discarded.publication_claimed);
+        assert_eq!(discarded.summary, "");
+        assert_eq!(discarded.prompt_for_agents, "");
+        assert_eq!(discarded.job.candidate_issue_count, 0);
+        assert_eq!(discarded.job.issue_count, 0);
+        let detail = store.code_review_job_detail(&current.id).unwrap().unwrap();
+        assert!(detail.findings.is_empty());
+        assert!(detail.candidate_rejections.is_empty());
+        assert!(detail.unadjudicated_candidates.is_empty());
+        let conn = store.conn.lock().unwrap();
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_review_theme_observations WHERE job_id = ?1",
+                params![current.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let orphan_themes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_review_themes WHERE root_cause = 'staged root cause'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 0);
+        assert_eq!(orphan_themes, 0);
+    }
+
+    #[test]
     fn watermark_backfill_uses_last_published_head_not_effective_base() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
@@ -22196,7 +22422,9 @@ mod tests {
                         confidence: "high".into(),
                         title: "Unknown decision".into(),
                         body: "The coordinator did not adjudicate this candidate.".into(),
-                        reason: "insufficient_evidence: The final review editor did not retain this candidate and did not provide a specific reason.".into(),
+                        reason: format!(
+                            "insufficient_evidence: The final review editor did not retain this candidate and {LEGACY_UNADJUDICATED_REASON_MARKER}."
+                        ),
                     },
                 ],
             )
