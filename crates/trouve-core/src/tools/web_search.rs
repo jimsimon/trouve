@@ -46,6 +46,7 @@ enum SearchError {
 struct McpSession {
     id: Option<String>,
     protocol_version: String,
+    cleanup_permit: Option<tokio::sync::mpsc::OwnedPermit<SessionCleanupJob>>,
 }
 
 struct DispatchBody {
@@ -92,6 +93,7 @@ impl ProviderDispatcher {
         cancel: &tokio_util::sync::CancellationToken,
         request: reqwest::RequestBuilder,
         body: &Value,
+        fence_after_handoff: bool,
     ) -> Result<reqwest::Response, SearchError> {
         let mut last_request = tokio::select! {
             biased;
@@ -139,7 +141,18 @@ impl ProviderDispatcher {
                 None
             },
             response = &mut send => Some(response),
-            _ = cancel.cancelled() => return Err(SearchError::Cancelled),
+            _ = cancel.cancelled() => {
+                if acknowledged_rx.try_recv().is_ok() {
+                    *last_request = Some(Instant::now());
+                    drop(last_request);
+                    if fence_after_handoff {
+                        return send.await.map_err(|error| {
+                            SearchError::Failed(format!("request failed: {error}"))
+                        });
+                    }
+                }
+                return Err(SearchError::Cancelled);
+            },
             _ = &mut handoff_timeout => {
                 return Err(SearchError::Failed(format!(
                     "provider dispatch timed out after {:.1}s",
@@ -154,6 +167,11 @@ impl ProviderDispatcher {
             return response
                 .map_err(|error| SearchError::Failed(format!("request failed: {error}")));
         }
+        if fence_after_handoff {
+            return send
+                .await
+                .map_err(|error| SearchError::Failed(format!("request failed: {error}")));
+        }
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(SearchError::Cancelled),
@@ -163,14 +181,16 @@ impl ProviderDispatcher {
     }
 }
 
-struct SessionCleanupRequest {
-    endpoint: String,
-    session_id: String,
-    protocol_version: String,
+enum SessionCleanupJob {
+    Established {
+        endpoint: String,
+        session_id: String,
+        protocol_version: String,
+    },
 }
 
 struct SessionCleanupWorker {
-    sender: Option<tokio::sync::mpsc::Sender<SessionCleanupRequest>>,
+    sender: Option<tokio::sync::mpsc::Sender<SessionCleanupJob>>,
     thread: Option<std::thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
 }
@@ -178,7 +198,7 @@ struct SessionCleanupWorker {
 impl SessionCleanupWorker {
     fn new() -> Self {
         let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<SessionCleanupRequest>(SESSION_CLEANUP_CAPACITY);
+            tokio::sync::mpsc::channel::<SessionCleanupJob>(SESSION_CLEANUP_CAPACITY);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = pending.clone();
         let thread = std::thread::Builder::new()
@@ -205,11 +225,16 @@ impl SessionCleanupWorker {
                         let client = client.clone();
                         let pending = worker_pending.clone();
                         cleanups.spawn(async move {
+                            let SessionCleanupJob::Established {
+                                endpoint,
+                                session_id,
+                                protocol_version,
+                            } = request;
                             let _ = client
-                                .delete(request.endpoint)
+                                .delete(endpoint)
                                 .timeout(SESSION_CLEANUP_TIMEOUT)
-                                .header(MCP_PROTOCOL_VERSION_HEADER, request.protocol_version)
-                                .header(MCP_SESSION_ID_HEADER, request.session_id)
+                                .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
+                                .header(MCP_SESSION_ID_HEADER, session_id)
                                 .send()
                                 .await;
                             pending.fetch_sub(1, Ordering::Release);
@@ -226,28 +251,32 @@ impl SessionCleanupWorker {
         }
     }
 
-    fn schedule(&self, provider: &SearchProvider, session: &McpSession) -> bool {
-        let Some(session_id) = &session.id else {
-            return true;
-        };
+    async fn reserve(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::mpsc::OwnedPermit<SessionCleanupJob>, SearchError> {
         let Some(sender) = &self.sender else {
-            return false;
+            return Err(SearchError::Failed(
+                "web search session cleanup is unavailable".into(),
+            ));
         };
-        self.pending.fetch_add(1, Ordering::AcqRel);
-        let request = SessionCleanupRequest {
-            endpoint: provider.endpoint.clone(),
-            session_id: session_id.clone(),
-            protocol_version: session.protocol_version.clone(),
-        };
-        if sender.try_send(request).is_err() {
-            self.pending.fetch_sub(1, Ordering::Release);
-            tracing::warn!(
-                provider = provider.name,
-                "web search session cleanup queue full; session will expire remotely"
-            );
-            return false;
+        let sender = sender.clone();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(SearchError::Cancelled),
+            permit = sender.reserve_owned() => permit.map_err(|_| {
+                SearchError::Failed("web search session cleanup is unavailable".into())
+            }),
         }
-        true
+    }
+
+    fn send(
+        &self,
+        permit: tokio::sync::mpsc::OwnedPermit<SessionCleanupJob>,
+        job: SessionCleanupJob,
+    ) {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        permit.send(job);
     }
 }
 
@@ -556,6 +585,9 @@ impl WebSearch {
         ctx: &ToolCtx,
         provider: &SearchProvider,
     ) -> Result<McpSession, SearchError> {
+        // Reserving cleanup capacity before initialization means every remote
+        // session we may allocate already owns a bounded teardown path.
+        let cleanup_permit = self.cleanup.reserve(&ctx.cancel).await?;
         let body = json!({
             "jsonrpc": "2.0",
             "id": 0,
@@ -569,9 +601,18 @@ impl WebSearch {
                 },
             },
         });
+        // Once the transport accepts this body, wait through response headers
+        // even if the caller cancels. Initialization may allocate a remote
+        // session, and its response headers are the only way to identify it
+        // for teardown. The request client's overall timeout bounds the fence.
         let response = self
             .dispatcher
-            .dispatch(&ctx.cancel, self.provider_request(provider, None), &body)
+            .dispatch(
+                &ctx.cancel,
+                self.provider_request(provider, None),
+                &body,
+                true,
+            )
             .await?;
         let session_id = response
             .headers()
@@ -585,18 +626,19 @@ impl WebSearch {
         let mut session = McpSession {
             id: session_id,
             protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
+            cleanup_permit: Some(cleanup_permit),
         };
         let value = match self.read_mcp_response(ctx, response, 0).await {
             Ok(value) => value,
             Err(error) => {
-                self.close_provider_session(provider, &session);
+                self.close_provider_session(provider, session);
                 return Err(error);
             }
         };
         if value.get("error").is_some() {
             let error = extract_mcp_value(&value)
                 .expect_err("an MCP error response cannot contain a successful tool result");
-            self.close_provider_session(provider, &session);
+            self.close_provider_session(provider, session);
             return Err(SearchError::Failed(bounded_error(
                 &error,
                 MAX_PROVIDER_ERROR_CHARS,
@@ -607,7 +649,7 @@ impl WebSearch {
             .and_then(Value::as_str)
             .filter(|version| !version.is_empty())
         else {
-            self.close_provider_session(provider, &session);
+            self.close_provider_session(provider, session);
             return Err(SearchError::Failed(
                 "provider initialization omitted protocol version".into(),
             ));
@@ -632,18 +674,31 @@ impl WebSearch {
                     "provider rejected MCP initialization with HTTP {}",
                     response.status()
                 ));
-                self.close_provider_session(provider, &session);
+                self.close_provider_session(provider, session);
                 Err(error)
             }
             Err(error) => {
-                self.close_provider_session(provider, &session);
+                self.close_provider_session(provider, session);
                 Err(error)
             }
         }
     }
 
-    fn close_provider_session(&self, provider: &SearchProvider, session: &McpSession) {
-        self.cleanup.schedule(provider, session);
+    fn close_provider_session(&self, provider: &SearchProvider, mut session: McpSession) {
+        let Some(permit) = session.cleanup_permit.take() else {
+            return;
+        };
+        let Some(session_id) = session.id else {
+            return;
+        };
+        self.cleanup.send(
+            permit,
+            SessionCleanupJob::Established {
+                endpoint: provider.endpoint.clone(),
+                session_id,
+                protocol_version: session.protocol_version,
+            },
+        );
     }
 
     async fn call_provider(
@@ -669,6 +724,7 @@ impl WebSearch {
                 &ctx.cancel,
                 self.provider_request(provider, Some(&session)),
                 &body,
+                false,
             )
             .await
         {
@@ -682,7 +738,7 @@ impl WebSearch {
                 }),
             Err(error) => Err(error),
         };
-        self.close_provider_session(provider, &session);
+        self.close_provider_session(provider, session);
         result
     }
 
@@ -1495,7 +1551,7 @@ mod tests {
             body,
             Duration::ZERO,
             Duration::ZERO,
-            Duration::from_secs(30),
+            Duration::from_millis(20),
             None,
         )
         .await;
@@ -1527,6 +1583,18 @@ mod tests {
             first.await.unwrap().status,
             trouve_protocol::ToolStatus::Error
         );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.method == "DELETE")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a cancelled handed-off initialization must be cleaned up");
 
         let second_ctx = ToolCtx {
             thread_id: "thread-b".into(),
@@ -1541,7 +1609,21 @@ mod tests {
             }
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while requests.lock().unwrap().len() < 2 {
+            while requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request
+                        .body
+                        .as_ref()
+                        .and_then(|body| body.get("method"))
+                        .and_then(Value::as_str)
+                        == Some("initialize")
+                })
+                .count()
+                < 2
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1549,7 +1631,19 @@ mod tests {
         .unwrap();
         let observed_spacing = {
             let observed = requests.lock().unwrap();
-            observed[1].at.duration_since(observed[0].at)
+            let initialization_times: Vec<_> = observed
+                .iter()
+                .filter(|request| {
+                    request
+                        .body
+                        .as_ref()
+                        .and_then(|body| body.get("method"))
+                        .and_then(Value::as_str)
+                        == Some("initialize")
+                })
+                .map(|request| request.at)
+                .collect();
+            initialization_times[1].duration_since(initialization_times[0])
         };
         assert!(observed_spacing >= Duration::from_millis(70));
         second_cancel.cancel();
@@ -1921,47 +2015,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_admission_is_bounded_under_a_provider_stall() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let provider =
-            SearchProvider::parallel(format!("http://{}/mcp", listener.local_addr().unwrap()));
-        tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let _socket = socket;
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                });
-            }
-        });
+    async fn cleanup_capacity_is_reserved_before_initialization() {
         let worker = SessionCleanupWorker::new();
-        let pending = worker.pending.clone();
-        let session = McpSession {
-            id: Some("bounded-session".into()),
-            protocol_version: MCP_PROTOCOL_VERSION.into(),
-        };
-
-        let rejected = (0..1_000)
-            .filter(|_| !worker.schedule(&provider, &session))
-            .count();
-        assert!(
-            rejected > 0,
-            "a cancellation burst must hit bounded admission"
-        );
-        assert!(
-            pending.load(Ordering::Acquire)
-                <= SESSION_CLEANUP_CAPACITY + SESSION_CLEANUP_CONCURRENCY
-        );
-
-        let drop_started = Instant::now();
-        drop(worker);
-        assert!(drop_started.elapsed() < Duration::from_millis(100));
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while pending.load(Ordering::Acquire) != 0 {
-                tokio::task::yield_now().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::new();
+        for _ in 0..SESSION_CLEANUP_CAPACITY {
+            match worker.reserve(&cancel).await {
+                Ok(permit) => permits.push(permit),
+                Err(_) => panic!("configured cleanup capacity must be reservable"),
             }
-        })
-        .await
-        .expect("bounded cleanup must drain after its owner closes admission");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), worker.reserve(&cancel))
+                .await
+                .is_err(),
+            "session creation must wait before exceeding cleanup capacity"
+        );
+
+        drop(permits.pop());
+        let replacement = tokio::time::timeout(Duration::from_secs(1), worker.reserve(&cancel))
+            .await
+            .expect("released cleanup capacity must admit another session");
+        assert!(replacement.is_ok());
+        drop(replacement);
+        drop(permits);
+        drop(worker);
     }
 
     #[tokio::test]
