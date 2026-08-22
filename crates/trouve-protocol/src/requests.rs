@@ -2586,8 +2586,11 @@ pub struct CodeReviewDashboard {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchList {
     pub branches: Vec<String>,
-    /// The branch HEAD currently points at (default selection).
+    /// The branch or commit HEAD currently points at.
     pub head: String,
+    /// The default branch advertised by the repository's origin remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
 }
 
 // --- provider configuration -------------------------------------------------

@@ -1864,7 +1864,9 @@ export interface components {
         /** @description Local branches of a workspace repository, for base-ref selection. */
         BranchList: {
             branches: string[];
-            /** @description The branch HEAD currently points at (default selection). */
+            /** @description The default branch advertised by the repository's origin remote. */
+            default_branch?: string | null;
+            /** @description The branch or commit HEAD currently points at. */
             head: string;
         };
         CheckRun: {

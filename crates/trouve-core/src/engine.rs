@@ -7569,7 +7569,12 @@ impl Engine {
         tokio::task::spawn_blocking(move || -> Result<BranchList> {
             let branches = git::list_branches(&repo)?;
             let head = git::head_ref(&repo)?;
-            Ok(BranchList { branches, head })
+            let default_branch = git::default_branch(&repo);
+            Ok(BranchList {
+                branches,
+                head,
+                default_branch,
+            })
         })
         .await
         .map_err(|e| EngineError::Internal(anyhow!(e)))?
