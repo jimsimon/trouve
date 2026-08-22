@@ -3,8 +3,12 @@
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::time::{Duration, Instant};
 
 const QUEUE_CAPACITY: usize = 16;
+const LAUNCHER_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_TIMEOUT: Duration = Duration::from_secs(12);
+const LAUNCHER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 static WORKER: OnceLock<Option<SyncSender<OsString>>> = OnceLock::new();
 
 /// Open a URL or path with the system handler without blocking the caller.
@@ -20,10 +24,22 @@ pub fn open(path: impl AsRef<OsStr>) -> Result<(), String> {
 /// Open a path and report whether the system launcher accepted it.
 ///
 /// Video playback uses this completion-aware variant so a failed association
-/// does not look successful or retain an unusable cache entry. The launcher
-/// process is short-lived; the external player remains independent.
-pub fn open_confirmed(path: impl AsRef<OsStr>) -> Result<(), String> {
-    open_and_reap(path.as_ref()).map_err(|error| error.to_string())
+/// does not look successful or retain an unusable cache entry. The blocking
+/// launcher runs outside the gateway workers and is killed if it does not
+/// hand playback off promptly; the external player remains independent.
+pub async fn open_confirmed(path: impl AsRef<OsStr>) -> Result<(), String> {
+    let path = path.as_ref().to_owned();
+    let mut worker = tokio::task::spawn_blocking(move || open_and_reap(&path));
+    match tokio::time::timeout(WORKER_TIMEOUT, &mut worker).await {
+        Ok(Ok(result)) => result.map_err(|error| error.to_string()),
+        Ok(Err(error)) => Err(format!("system opener worker was interrupted: {error}")),
+        Err(_) => {
+            // This cancels a queued blocking task. A task that has already
+            // started is independently bounded by `LAUNCHER_TIMEOUT` below.
+            worker.abort();
+            Err("system opener worker timed out".to_string())
+        }
+    }
 }
 
 fn enqueue(request: OsString) -> Result<(), String> {
@@ -67,13 +83,14 @@ fn open_and_reap(path: &OsStr) -> std::io::Result<()> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        match trouve_process::status(&mut command) {
+        match wait_for_launcher(&mut command, LAUNCHER_TIMEOUT) {
             Ok(status) if status.success() => return Ok(()),
             Ok(status) => {
                 return Err(std::io::Error::other(format!(
                     "launcher {command:?} failed with {status:?}"
                 )));
             }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
@@ -83,4 +100,32 @@ fn open_and_reap(path: &OsStr) -> std::io::Result<()> {
             "no system launcher is available",
         )
     }))
+}
+
+fn wait_for_launcher(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = trouve_process::spawn(command)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "system launcher timed out",
+            ));
+        }
+        std::thread::sleep(LAUNCHER_POLL_INTERVAL);
+    }
 }

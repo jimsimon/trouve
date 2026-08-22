@@ -70,6 +70,14 @@ struct VideoPlaybackCacheEntry {
     identity: [u8; 32],
     size: usize,
     modified: SystemTime,
+    active_leases: usize,
+    launched: bool,
+}
+
+#[derive(Debug)]
+struct VideoPlaybackLease {
+    path: PathBuf,
+    identity: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -101,21 +109,21 @@ impl VideoPlaybackCache {
         })
     }
 
-    fn open(&mut self, attachment: &NativeAttachment) -> Result<(), VideoAttachmentOpenError> {
-        self.open_with(attachment, |path| opener::open_confirmed(path))
-    }
-
+    #[cfg(test)]
     fn open_with<F>(
         &mut self,
         attachment: &NativeAttachment,
-        open: F,
+        mut open: F,
     ) -> Result<(), VideoAttachmentOpenError>
     where
         F: FnMut(&std::path::Path) -> Result<(), String>,
     {
-        self.open_with_cleanup(attachment, open, remove_temporary_video)
+        let lease = self.prepare(attachment)?;
+        let result = open(&lease.path).map_err(VideoAttachmentOpenError::Failed);
+        self.complete(lease, result)
     }
 
+    #[cfg(test)]
     fn open_with_cleanup<F, R>(
         &mut self,
         attachment: &NativeAttachment,
@@ -126,19 +134,52 @@ impl VideoPlaybackCache {
         F: FnMut(&std::path::Path) -> Result<(), String>,
         R: FnMut(&std::path::Path) -> bool,
     {
+        let lease = self.prepare_with_cleanup(attachment, &mut remove)?;
+        let result = open(&lease.path).map_err(VideoAttachmentOpenError::Failed);
+        self.complete_with_cleanup(lease, result, &mut remove)
+    }
+
+    fn prepare(
+        &mut self,
+        attachment: &NativeAttachment,
+    ) -> Result<VideoPlaybackLease, VideoAttachmentOpenError> {
+        self.prepare_with_cleanup(attachment, remove_temporary_video)
+    }
+
+    fn prepare_with_cleanup<R>(
+        &mut self,
+        attachment: &NativeAttachment,
+        mut remove: R,
+    ) -> Result<VideoPlaybackLease, VideoAttachmentOpenError>
+    where
+        R: FnMut(&std::path::Path) -> bool,
+    {
         let extension = attachment.video_extension().ok_or_else(|| {
             VideoAttachmentOpenError::Failed("unsupported video attachment type".to_string())
         })?;
         let identity = video_attachment_identity(extension, attachment.bytes());
-        self.entries
-            .retain(|entry| retained_video_is_usable(entry) || !remove(&entry.path));
-        if let Some(entry) = self.entries.iter().find(|entry| entry.identity == identity) {
+        self.entries.retain(|entry| {
+            entry.active_leases > 0 || retained_video_is_usable(entry) || !remove(&entry.path)
+        });
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity == identity)
+        {
             if !retained_video_is_usable(entry) {
                 return Err(VideoAttachmentOpenError::Failed(
                     "stale temporary video could not be replaced".to_string(),
                 ));
             }
-            return open(&entry.path).map_err(VideoAttachmentOpenError::Failed);
+            entry.active_leases = entry.active_leases.checked_add(1).ok_or_else(|| {
+                VideoAttachmentOpenError::Failed(
+                    "video playback lease count overflowed".to_string(),
+                )
+            })?;
+            return Ok(VideoPlaybackLease {
+                path: entry.path.clone(),
+                identity,
+            });
         }
 
         let retained_bytes = self
@@ -177,13 +218,71 @@ impl VideoPlaybackCache {
             identity,
             size: attachment.bytes().len(),
             modified,
+            active_leases: 1,
+            launched: false,
         });
-        let result = open(&path).map_err(VideoAttachmentOpenError::Failed);
-        if result.is_err() && remove(&path) {
-            self.entries.retain(|entry| entry.path != path);
+        Ok(VideoPlaybackLease { path, identity })
+    }
+
+    fn complete(
+        &mut self,
+        lease: VideoPlaybackLease,
+        result: Result<(), VideoAttachmentOpenError>,
+    ) -> Result<(), VideoAttachmentOpenError> {
+        self.complete_with_cleanup(lease, result, remove_temporary_video)
+    }
+
+    fn complete_with_cleanup<R>(
+        &mut self,
+        lease: VideoPlaybackLease,
+        result: Result<(), VideoAttachmentOpenError>,
+        mut remove: R,
+    ) -> Result<(), VideoAttachmentOpenError>
+    where
+        R: FnMut(&std::path::Path) -> bool,
+    {
+        let mut remove_failed_entry = false;
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity == lease.identity && entry.path == lease.path)
+        {
+            entry.active_leases = entry.active_leases.checked_sub(1).ok_or_else(|| {
+                VideoAttachmentOpenError::Failed(
+                    "video playback lease was already reconciled".to_string(),
+                )
+            })?;
+            if result.is_ok() {
+                entry.launched = true;
+            } else {
+                remove_failed_entry = entry.active_leases == 0 && !entry.launched;
+            }
+        }
+        if remove_failed_entry && remove(&lease.path) {
+            self.entries.retain(|entry| entry.path != lease.path);
         }
         result
     }
+}
+
+async fn open_video_attachment(
+    cache: Arc<Mutex<VideoPlaybackCache>>,
+    attachment: NativeAttachment,
+) -> Result<(), VideoAttachmentOpenError> {
+    let lease = {
+        let mut cache = cache.lock().map_err(|_| {
+            VideoAttachmentOpenError::Failed("video playback cache is unavailable".to_string())
+        })?;
+        cache.prepare(&attachment)?
+    };
+
+    let result = opener::open_confirmed(&lease.path)
+        .await
+        .map_err(VideoAttachmentOpenError::Failed);
+    let mut cache = cache.lock().map_err(|_| {
+        VideoAttachmentOpenError::Failed("video playback cache is unavailable".to_string())
+    })?;
+    cache.complete(lease, result)
 }
 
 fn retained_video_is_usable(entry: &VideoPlaybackCacheEntry) -> bool {
@@ -432,14 +531,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 .map_err(|_| "desktop clipboard worker was interrupted".to_string())?
         })
         .with_video_attachment_opener(move |attachment| {
-            video_playback_cache_for_action
-                .lock()
-                .map_err(|_| {
-                    VideoAttachmentOpenError::Failed(
-                        "video playback cache is unavailable".to_string(),
-                    )
-                })?
-                .open(&attachment)
+            open_video_attachment(Arc::clone(&video_playback_cache_for_action), attachment)
         })
         .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
     let host = if product_host {
@@ -921,6 +1013,31 @@ mod close_confirmation_tests {
             std::fs::read_dir(cache.directory.path()).unwrap().count(),
             0
         );
+    }
+
+    #[test]
+    fn video_playback_leases_keep_shared_launches_alive_until_reconciled() {
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        let attachment = video_attachment("demo.mp4", b"video");
+        let failed_lease = cache.prepare(&attachment).unwrap();
+        let successful_lease = cache.prepare(&attachment).unwrap();
+
+        assert_eq!(failed_lease.path, successful_lease.path);
+        assert_eq!(cache.entries[0].active_leases, 2);
+        assert_eq!(
+            cache.complete(
+                failed_lease,
+                Err(VideoAttachmentOpenError::Failed("no player".into())),
+            ),
+            Err(VideoAttachmentOpenError::Failed("no player".into()))
+        );
+        assert_eq!(cache.entries[0].active_leases, 1);
+        assert!(cache.entries[0].path.exists());
+
+        cache.complete(successful_lease, Ok(())).unwrap();
+        assert_eq!(cache.entries[0].active_leases, 0);
+        assert!(cache.entries[0].launched);
+        assert!(cache.entries[0].path.exists());
     }
 
     #[test]

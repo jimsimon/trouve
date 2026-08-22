@@ -686,8 +686,10 @@ impl ExternalHttpsUrl {
 }
 
 type ExternalHttpsOpener = dyn Fn(&ExternalHttpsUrl) -> Result<(), String> + Send + Sync + 'static;
+type VideoAttachmentOpenerFuture =
+    Pin<Box<dyn Future<Output = Result<(), VideoAttachmentOpenError>> + Send + 'static>>;
 type VideoAttachmentOpener =
-    dyn Fn(NativeAttachment) -> Result<(), VideoAttachmentOpenError> + Send + Sync + 'static;
+    dyn Fn(NativeAttachment) -> VideoAttachmentOpenerFuture + Send + Sync + 'static;
 type DirectoryPickerFuture =
     Pin<Box<dyn Future<Output = Result<Option<PathBuf>, String>> + Send + 'static>>;
 type DirectoryPicker = dyn Fn() -> DirectoryPickerFuture + Send + Sync + 'static;
@@ -1059,11 +1061,14 @@ impl HostNativeActions {
         self
     }
 
-    pub fn with_video_attachment_opener<F>(mut self, opener: F) -> Self
+    /// Attach external video playback without blocking a gateway runtime worker.
+    pub fn with_video_attachment_opener<F, Fut>(mut self, opener: F) -> Self
     where
-        F: Fn(NativeAttachment) -> Result<(), VideoAttachmentOpenError> + Send + Sync + 'static,
+        F: Fn(NativeAttachment) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), VideoAttachmentOpenError>> + Send + 'static,
     {
-        self.video_attachment_opener = Some(Arc::new(opener));
+        self.video_attachment_opener =
+            Some(Arc::new(move |attachment| Box::pin(opener(attachment))));
         self
     }
 
@@ -1319,13 +1324,14 @@ impl HostNativeActions {
             .ok_or_else(|| "external URL opener is unavailable".to_string())?(url)
     }
 
-    pub(crate) fn open_video_attachment(
+    pub(crate) async fn open_video_attachment(
         &self,
         attachment: NativeAttachment,
     ) -> Result<(), VideoAttachmentOpenError> {
         self.video_attachment_opener.as_ref().ok_or_else(|| {
             VideoAttachmentOpenError::Failed("video attachment opener is unavailable".to_string())
         })?(attachment)
+        .await
     }
 }
 

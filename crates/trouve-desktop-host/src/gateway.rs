@@ -1195,6 +1195,7 @@ async fn open_video_attachment(
     state
         .native_actions
         .open_video_attachment(attachment)
+        .await
         .map_err(|error| match error {
             VideoAttachmentOpenError::Capacity => GatewayRejection::VideoPlaybackCapacity,
             VideoAttachmentOpenError::Failed(_) => GatewayRejection::Internal,
@@ -2178,11 +2179,14 @@ mod tests {
         let app = gateway()
             .with_native_actions(HostNativeActions::default().with_video_attachment_opener(
                 move |attachment| {
-                    opened_for_action.lock().unwrap().push((
-                        attachment.video_extension().unwrap().to_string(),
-                        attachment.bytes().to_vec(),
-                    ));
-                    Ok(())
+                    let opened_for_action = Arc::clone(&opened_for_action);
+                    async move {
+                        opened_for_action.lock().unwrap().push((
+                            attachment.video_extension().unwrap().to_string(),
+                            attachment.bytes().to_vec(),
+                        ));
+                        Ok(())
+                    }
                 },
             ))
             .router();
@@ -2271,12 +2275,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn video_attachment_launcher_does_not_block_gateway_reads() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_for_action = Arc::clone(&started);
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let release_rx_for_action = Arc::clone(&release_rx);
+        let app = gateway()
+            .with_native_actions(HostNativeActions::default().with_video_attachment_opener(
+                move |_| {
+                    let started = Arc::clone(&started_for_action);
+                    let release_rx = release_rx_for_action.lock().unwrap().take().unwrap();
+                    async move {
+                        started.notify_one();
+                        release_rx.await.map_err(|_| {
+                            VideoAttachmentOpenError::Failed(
+                                "test launcher release was dropped".to_string(),
+                            )
+                        })?;
+                        Ok(())
+                    }
+                },
+            ))
+            .router();
+        let bootstrap_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        let body = serde_json::to_vec(&AttachmentPayload {
+            name: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+            size_bytes: 5,
+        })
+        .unwrap();
+
+        let launch_app = app.clone();
+        let csrf_token = bootstrap.csrf_token.clone();
+        let launch = tokio::spawn(async move {
+            launch_app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                        .header(HOST, "127.0.0.1:43127")
+                        .header(ORIGIN, "http://127.0.0.1:43127")
+                        .header(CSRF_HEADER, csrf_token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        started.notified().await;
+
+        let capabilities = app
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+
+        release.send(()).unwrap();
+        assert_eq!(launch.await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn video_attachment_capacity_has_a_distinct_actionable_response() {
         let app = gateway()
-            .with_native_actions(
-                HostNativeActions::default()
-                    .with_video_attachment_opener(|_| Err(VideoAttachmentOpenError::Capacity)),
-            )
+            .with_native_actions(HostNativeActions::default().with_video_attachment_opener(
+                |_| async { Err(VideoAttachmentOpenError::Capacity) },
+            ))
             .router();
         let bootstrap_response = app
             .clone()
