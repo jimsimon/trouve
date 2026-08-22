@@ -1068,7 +1068,16 @@ fn turn_stream(
         let mut overload_signal = rx.overload_signal();
         let mut close_signal = rx.close_signal();
         let process_route = async {
+            // Give a queued terminal event one chance to win a simultaneous
+            // consumer drop, then observe closure between every routed input.
+            // Without this checkpoint an always-ready route can monopolize
+            // the outer biased select and keep an abandoned turn alive.
+            let mut processed_route_input = false;
             loop {
+                if processed_route_input && tx.is_closed() {
+                    client_gone = true;
+                    break;
+                }
                 let input = if terminal_params.is_some() {
                     if let Some(deadline) = collaborator_lifecycle.next_start_deadline() {
                         tokio::select! {
@@ -1097,6 +1106,7 @@ fn turn_stream(
                         message = rx.recv() => CodexRouteInput::Message(message),
                     }
                 };
+                processed_route_input = true;
                 let msg = match input {
                     CodexRouteInput::Message(Some(message)) => message,
                     CodexRouteInput::Message(None) => break,

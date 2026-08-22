@@ -1915,9 +1915,9 @@ async fn reap_idle_connections(
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry.reusable
-                    && Arc::strong_count(&entry.connection) == 1
-                    && entry.last_used.lock().unwrap().elapsed() >= idle_timeout
+                Arc::strong_count(&entry.connection) == 1
+                    && (!entry.reusable
+                        || entry.last_used.lock().unwrap().elapsed() >= idle_timeout)
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
@@ -1939,7 +1939,14 @@ async fn reap_idle_connections(
                 }) {
                     state.entries.remove(&key);
                 }
-                logs.push(&key.1, "idle connection reaped");
+                logs.push(
+                    &key.1,
+                    if entry.reusable {
+                        "idle connection reaped"
+                    } else {
+                        "quarantined connection reaped on retry"
+                    },
+                );
             }
             Err(error) => {
                 // Keep the entry quarantined. A replacement must never overlap
@@ -4044,6 +4051,62 @@ for line in sys.stdin:
             .evict(tmp.path(), "fake", &replacement)
             .await
             .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn idle_reaper_retries_quarantined_cleanup_without_a_new_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("idle_retry_server.py");
+        let started = tmp.path().join("idle_retry.started");
+        std::fs::write(&script, CONFIG_RACE_TEST_SERVER).unwrap();
+        let config = config_race_test_config(&script, &started, None);
+        let manager = McpManager::default();
+        let key = (
+            tmp.path().to_string_lossy().into_owned(),
+            "fake".to_string(),
+        );
+        let connection = manager
+            .connection_with_config(tmp.path(), "fake", &config, &CancellationToken::new())
+            .await
+            .unwrap();
+        connection
+            .connection
+            .injected_terminate_failure
+            .store(true, Ordering::Relaxed);
+        *connection.last_used.lock().unwrap() = std::time::Instant::now()
+            .checked_sub(MCP_IDLE_TIMEOUT + std::time::Duration::from_secs(1))
+            .unwrap();
+        drop(connection);
+
+        reap_idle_connections(&manager.connections, manager.logs(), MCP_IDLE_TIMEOUT).await;
+        let retained = {
+            let state = manager.connections.lock().await;
+            let retained = state
+                .entries
+                .get(&key)
+                .expect("failed cleanup did not retain the connection");
+            assert!(!retained.reusable);
+            Arc::clone(&retained.connection)
+        };
+        retained
+            .injected_terminate_failure
+            .store(false, Ordering::Relaxed);
+        drop(retained);
+        {
+            let state = manager.connections.lock().await;
+            assert_eq!(
+                Arc::strong_count(&state.entries.get(&key).unwrap().connection),
+                1,
+                "test retained an MCP connection borrower before the retry"
+            );
+        }
+
+        reap_idle_connections(&manager.connections, manager.logs(), MCP_IDLE_TIMEOUT).await;
+        assert!(
+            manager.connections.lock().await.entries.is_empty(),
+            "quarantined idle cleanup was not retried"
+        );
     }
 
     #[cfg(target_os = "linux")]
