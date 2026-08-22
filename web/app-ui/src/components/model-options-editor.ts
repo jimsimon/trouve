@@ -17,12 +17,13 @@ const textInputValueIsValid = (
 ): boolean => {
   if (raw === "" || control.scalarType === "string") return true;
   const value = Number(raw);
+  const significant = raw.split(/[eE]/u)[0]!
+    .replace(/\D/gu, "").replace(/^0+|0+$/gu, "");
   return Number.isFinite(value)
     // IEEE-754 guarantees round trips for 15 significant decimal digits.
     // Longer inputs are safe only when JavaScript preserves their exact token.
     && (raw === String(value)
-      || raw.split(/[eE]/u)[0]!
-        .replace(/\D/gu, "").replace(/^0+|0+$/gu, "").length <= 15)
+      || significant.length <= 15 && (value !== 0 || significant === ""))
     && (control.scalarType !== "integer" || Number.isSafeInteger(value))
     && (control.minimum === undefined || value >= control.minimum)
     && (control.maximum === undefined || value <= control.maximum);
