@@ -44,12 +44,13 @@ These are load-bearing. Do not violate them without a new ADR.
    transports such as integrated PTY instances and their byte streams may use
    request/SSE endpoints and are not reconstructed after server restart (ADR
    0019).
-3. **Every side effect goes through `ToolExecutor`.** File edits, shell,
-   git, MCP calls — one chokepoint for permissions, audit, and (later)
-   sandboxed executors. Never spawn a process or write a file from the agent
-   loop directly. Vendor harnesses use the full tool bridge by default;
-   unavoidable vendor-native tools are disabled or confined read-only, and
-   approval-only fallbacks hold an engine mutation lease (ADR 0030).
+3. **Every Trouve-owned side effect goes through `ToolExecutor`.** File
+   edits, shell, git, and MCP calls from native API/local turns use one
+   chokepoint for permissions, audit, and (later) sandboxed executors.
+   Subscription CLI adapters may retain certified vendor-native execution
+   tools under ADR 0043, but their calls, approvals, results, and audit events
+   must map to canonical Trouve operations. Never spawn a process or write a
+   file from the agent loop directly.
 4. **Sessions own worktrees.** Agent mutations happen in the session's git
    worktree, never in the user's checkout. Read-only filesystem tools may also
    inspect canonical host-registered instruction/package roots, but those
@@ -92,6 +93,12 @@ These are load-bearing. Do not violate them without a new ADR.
     `trouve-process`. Process-tree creation holds that shared macOS boundary
     from sentinel setup through spawn; ordinary callers release it immediately
     after creating the child and wait outside it (ADR 0038).
+11. **Trouve owns the agent control plane.** Commands, skills, personas,
+    rules, permissions, canonical tool semantics, audit events, and
+    presentation are provider-independent (ADR 0043). Subscription adapters
+    may retain model-optimized native execution tools, but every visible
+    operation maps to Trouve's canonical taxonomy. Vendor commands, skills,
+    plugins, and MCP configuration must not become a second product surface.
 
 ## Conventions
 

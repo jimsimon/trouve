@@ -15,9 +15,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
-    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, SessionAttention,
-    SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadStatus,
-    ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
+    CommandInfo, CommandResult, Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session,
+    SessionAttention, SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread,
+    ThreadStatus, ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
 };
 use trouve_thread_view::{MaterializedThreadItem, ThreadProjection};
 
@@ -39,8 +39,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // ends, so interrupted collaboration waits cannot replay as active forever.
 // v10 retains active-turn usage aggregates so reconnecting clients receive
 // the same monotonic token totals as live event folds. v11 separates active
-// usage from the latest measurement. v12 keeps last_usage completed-only.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 12;
+// usage from the latest measurement. v12 keeps last_usage completed-only. v13
+// splits active thinking around independent deterministic command output.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 13;
 // A snapshot folds events without holding the SQLite connection. A terminal
 // event can therefore advance the materialized cache before the snapshot
 // reacquires the connection. Rebuild from that newer cache instead of mixing
@@ -103,6 +104,18 @@ CREATE TABLE IF NOT EXISTS threads (
   todos TEXT NOT NULL DEFAULT '[]',
   last_turn INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS command_execution_requests (
+  idempotency_key TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  request_fingerprint TEXT NOT NULL,
+  result TEXT,
+  side_effect_started INTEGER NOT NULL DEFAULT 0,
+  writer_generation INTEGER NOT NULL DEFAULT 0,
+  error_kind TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  completed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   thread_id TEXT NOT NULL REFERENCES threads(id),
@@ -754,6 +767,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         [],
         |row| row.get::<_, bool>(0),
     )?;
+    migrate_command_execution_phases(conn)?;
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -791,6 +805,118 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+/// Add command execution phases and durable writer provenance. A zero-valued
+/// phase is reclaimable only when its receipt identifies the current
+/// phase-aware writer generation; older and interrupted writers remain
+/// conservative. Column additions, classification, and migration markers
+/// share one transaction so this migration cannot create a new ambiguous
+/// partial state.
+fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
+    const PHASE_MIGRATION_ID: &str = "command-execution-side-effect-phase-v1";
+    const WRITER_MIGRATION_ID: &str = "command-execution-writer-generation-v2";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [WRITER_MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [WRITER_MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    let had_phase_column = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('command_execution_requests')
+           WHERE name = 'side_effect_started'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !had_phase_column {
+        tx.execute_batch(
+            "ALTER TABLE command_execution_requests
+               ADD COLUMN side_effect_started INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let had_error_kind = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('command_execution_requests')
+           WHERE name = 'error_kind'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !had_error_kind {
+        tx.execute_batch(
+            "ALTER TABLE command_execution_requests
+               ADD COLUMN error_kind TEXT;",
+        )?;
+    }
+    let had_error_message = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('command_execution_requests')
+           WHERE name = 'error_message'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !had_error_message {
+        tx.execute_batch(
+            "ALTER TABLE command_execution_requests
+               ADD COLUMN error_message TEXT;",
+        )?;
+    }
+    let had_writer_generation = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('command_execution_requests')
+           WHERE name = 'writer_generation'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !had_writer_generation {
+        tx.execute_batch(
+            "ALTER TABLE command_execution_requests
+               ADD COLUMN writer_generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        // No global marker can prove which binary wrote an individual row:
+        // an older process may insert after a schema migration. Receipts that
+        // predate per-row provenance therefore remain generation zero and
+        // uncertain, even when the phase-v1 marker exists.
+        tx.execute(
+            "UPDATE command_execution_requests
+             SET side_effect_started = 1
+             WHERE result IS NULL",
+            [],
+        )?;
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![PHASE_MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![WRITER_MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -4155,6 +4281,29 @@ impl ArtifactCleanupJob {
     }
 }
 
+pub(crate) struct CommandExecutionRecord {
+    pub thread_id: String,
+    pub request_fingerprint: String,
+    pub result: Option<CommandResult>,
+    pub side_effect_started: bool,
+    pub writer_generation: i64,
+    pub failure: Option<CommandExecutionFailure>,
+}
+
+const COMMAND_EXECUTION_WRITER_GENERATION: i64 = 1;
+
+pub(crate) struct CommandExecutionFailure {
+    pub kind: String,
+    pub message: String,
+}
+
+pub(crate) struct CommandExecutionCompletion {
+    pub idempotency_key: String,
+    pub thread_id: String,
+    pub request_fingerprint: String,
+    pub result: CommandResult,
+}
+
 /// One serialized event, in flight to the writer thread.
 struct PendingEvent {
     scope: Scope,
@@ -4192,6 +4341,10 @@ enum StoreMutation {
         thread: Box<Thread>,
         model_options: serde_json::Map<String, serde_json::Value>,
         spawn: Option<(String, String)>,
+        command_completion: Option<Box<CommandExecutionCompletion>>,
+    },
+    CompleteCommandExecution {
+        completion: Box<CommandExecutionCompletion>,
     },
     Delete {
         id: String,
@@ -4612,6 +4765,60 @@ fn update_thread_row(
     Ok(())
 }
 
+fn row_to_command_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandExecutionRecord> {
+    let result = row
+        .get::<_, Option<String>>(2)?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    Ok(CommandExecutionRecord {
+        thread_id: row.get(0)?,
+        request_fingerprint: row.get(1)?,
+        result,
+        side_effect_started: row.get::<_, i64>(3)? != 0,
+        writer_generation: row.get(4)?,
+        failure: match (
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        ) {
+            (Some(kind), Some(message)) => Some(CommandExecutionFailure { kind, message }),
+            _ => None,
+        },
+    })
+}
+
+fn complete_command_execution_row(
+    conn: &Connection,
+    completion: &CommandExecutionCompletion,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let result = serde_json::to_string(&completion.result)?;
+    let updated = conn.execute(
+        "UPDATE command_execution_requests
+         SET result = ?4, completed_at = ?5
+         WHERE idempotency_key = ?1 AND thread_id = ?2
+           AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL",
+        params![
+            completion.idempotency_key,
+            completion.thread_id,
+            completion.request_fingerprint,
+            result,
+            timestamp.to_rfc3339(),
+        ],
+    )?;
+    anyhow::ensure!(
+        updated == 1,
+        "command execution claim is missing, mismatched, or already complete"
+    );
+    Ok(())
+}
+
 fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM session_create_requests WHERE session_id = ?1",
@@ -4629,6 +4836,11 @@ fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
     )?;
     conn.execute(
         "DELETE FROM messages WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM command_execution_requests WHERE thread_id IN
          (SELECT id FROM threads WHERE session_id = ?1)",
         params![id],
     )?;
@@ -4746,6 +4958,7 @@ fn apply_store_mutation(
             thread,
             model_options,
             spawn,
+            command_completion,
         } => {
             // Validate the owner in this transaction so a stale engine
             // snapshot cannot surface an FK error after session deletion.
@@ -4795,6 +5008,12 @@ fn apply_store_mutation(
                     params![thread.id, parent, kind],
                 )?;
             }
+            if let Some(completion) = command_completion {
+                complete_command_execution_row(conn, completion, timestamp)?;
+            }
+        }
+        StoreMutation::CompleteCommandExecution { completion } => {
+            complete_command_execution_row(conn, completion, timestamp)?;
         }
         StoreMutation::Delete { id, cleanup } => {
             insert_artifact_cleanup_job(conn, cleanup, timestamp)?;
@@ -5874,6 +6093,33 @@ impl Store {
         Ok(cursor.unwrap_or(0) as u64)
     }
 
+    /// Recover the newest provider-neutral command catalog from the durable
+    /// thread log. The in-memory engine cache is intentionally rebuildable;
+    /// this prevents startup reconciliation from appending a duplicate event
+    /// merely because the process restarted.
+    pub(crate) fn latest_command_catalog(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Vec<CommandInfo>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT payload FROM events
+             WHERE scope_kind = 'thread' AND scope_id = ?1
+               AND (instr(payload, '\"type\":\"thread.command_catalog_updated\"') > 0
+                 OR instr(payload, '\"type\":\"thread.commands_updated\"') > 0)
+             ORDER BY cursor DESC",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |row| row.get::<_, String>(0))?;
+        for payload in rows {
+            match serde_json::from_str::<Event>(&payload?) {
+                Ok(Event::CommandCatalogUpdated { commands })
+                | Ok(Event::CommandsUpdated { commands }) => return Ok(Some(commands)),
+                Ok(_) | Err(_) => continue,
+            }
+        }
+        Ok(None)
+    }
+
     /// Fold a thread's durable events into a cached current-state snapshot.
     ///
     /// Raw rows are captured through one cursor while holding the connection,
@@ -6879,6 +7125,167 @@ impl Store {
         insert_thread_row(&self.conn.lock().unwrap(), t, model_options)
     }
 
+    /// Claim a client command request before any side effect. `None` means
+    /// this caller owns a new claim; `Some` is the durable prior attempt.
+    pub(crate) fn claim_command_execution(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+    ) -> Result<Option<CommandExecutionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO command_execution_requests
+               (idempotency_key, thread_id, request_fingerprint,
+                writer_generation, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                idempotency_key,
+                thread_id,
+                request_fingerprint,
+                COMMAND_EXECUTION_WRITER_GENERATION,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        let prior = if inserted == 0 {
+            tx.query_row(
+                "SELECT thread_id, request_fingerprint, result, side_effect_started,
+                        writer_generation, error_kind, error_message
+                 FROM command_execution_requests WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                row_to_command_execution,
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let prior = prior.and_then(|record| {
+            let same_request =
+                record.thread_id == thread_id && record.request_fingerprint == request_fingerprint;
+            if same_request
+                && record.result.is_none()
+                && record.failure.is_none()
+                && !record.side_effect_started
+                && record.writer_generation == COMMAND_EXECUTION_WRITER_GENERATION
+            {
+                None
+            } else {
+                Some(record)
+            }
+        });
+        tx.commit()?;
+        Ok(prior)
+    }
+
+    pub(crate) fn command_execution(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<CommandExecutionRecord>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT thread_id, request_fingerprint, result, side_effect_started,
+                        writer_generation, error_kind, error_message
+                 FROM command_execution_requests WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                row_to_command_execution,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn begin_command_side_effect(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+    ) -> Result<()> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE command_execution_requests SET side_effect_started = 1
+             WHERE idempotency_key = ?1 AND thread_id = ?2
+               AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL",
+            params![idempotency_key, thread_id, request_fingerprint],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "command execution claim is missing or complete"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn fail_command_execution(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+        kind: &str,
+        message: &str,
+    ) -> Result<()> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE command_execution_requests
+             SET error_kind = ?4, error_message = ?5, completed_at = ?6
+             WHERE idempotency_key = ?1 AND thread_id = ?2
+               AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL",
+            params![
+                idempotency_key,
+                thread_id,
+                request_fingerprint,
+                kind,
+                message,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "command execution claim is missing or complete"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn release_command_execution(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM command_execution_requests
+             WHERE idempotency_key = ?1 AND thread_id = ?2
+               AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL
+               AND side_effect_started = 0",
+            params![idempotency_key, thread_id, request_fingerprint],
+        )?;
+        Ok(())
+    }
+
+    /// Complete an owned command claim and publish its replayable output in
+    /// the same SQLite transaction. A retry can therefore return the durable
+    /// result without executing the command again.
+    pub(crate) fn complete_command_execution_with_event(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+        result: &CommandResult,
+        event: Event,
+    ) -> Result<()> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Thread(thread_id.to_string()), event)],
+            StoreMutation::CompleteCommandExecution {
+                completion: Box::new(CommandExecutionCompletion {
+                    idempotency_key: idempotency_key.to_string(),
+                    thread_id: thread_id.to_string(),
+                    request_fingerprint: request_fingerprint.to_string(),
+                    result: result.clone(),
+                }),
+            },
+        )?;
+        self.append_pending_events(pending)?;
+        Ok(())
+    }
+
     /// Insert a thread (and optional spawn edge) together with its durable
     /// creation edge. Parent ownership is validated in the same transaction.
     pub(crate) fn insert_thread_with_event(
@@ -6887,19 +7294,62 @@ impl Store {
         model_options: &serde_json::Map<String, serde_json::Value>,
         spawn: Option<(&str, &str)>,
         event: Event,
+        additional_events: Vec<(Scope, Event)>,
     ) -> Result<EventEnvelope> {
+        self.insert_thread_with_event_and_completion(
+            thread,
+            model_options,
+            spawn,
+            event,
+            additional_events,
+            None,
+        )
+    }
+
+    pub(crate) fn insert_thread_with_command_completion(
+        &self,
+        thread: &Thread,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        spawn: Option<(&str, &str)>,
+        event: Event,
+        additional_events: Vec<(Scope, Event)>,
+        command_completion: CommandExecutionCompletion,
+    ) -> Result<EventEnvelope> {
+        self.insert_thread_with_event_and_completion(
+            thread,
+            model_options,
+            spawn,
+            event,
+            additional_events,
+            Some(command_completion),
+        )
+    }
+
+    fn insert_thread_with_event_and_completion(
+        &self,
+        thread: &Thread,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        spawn: Option<(&str, &str)>,
+        event: Event,
+        additional_events: Vec<(Scope, Event)>,
+        command_completion: Option<CommandExecutionCompletion>,
+    ) -> Result<EventEnvelope> {
+        let mut events = vec![(Scope::Server, event)];
+        events.extend(additional_events);
         let pending = serialize_lifecycle_events(
-            vec![(Scope::Server, event)],
+            events,
             StoreMutation::InsertThread {
                 thread: Box::new(thread.clone()),
                 model_options: model_options.clone(),
                 spawn: spawn.map(|(parent, kind)| (parent.to_string(), kind.to_string())),
+                command_completion: command_completion.map(Box::new),
             },
         )?;
         Ok(self
             .append_pending_events(pending)?
-            .pop()
-            .expect("one lifecycle event returns one envelope"))
+            .into_iter()
+            .next()
+            .expect("thread lifecycle returns its source envelope"))
     }
 
     /// Insert a spawned thread and its parent edge in one transaction. A
@@ -13352,6 +13802,30 @@ impl Store {
         .transpose()
     }
 
+    /// Exact-key variant for capability-isolated backend namespaces. Unlike
+    /// `backend_session`, this never adopts a pre-keyed legacy row whose tool
+    /// surface is unknown.
+    pub fn backend_session_exact(
+        &self,
+        thread_id: &str,
+        backend: &str,
+    ) -> Result<Option<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT backend_session_id, seen_messages FROM backend_sessions
+                 WHERE thread_id = ?1 AND backend = ?2",
+                params![thread_id, backend],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        row.map(|(id, seen)| {
+            let seen = u64::try_from(seen).context("backend seen_messages was negative")?;
+            Ok((id, seen))
+        })
+        .transpose()
+    }
+
     pub fn set_backend_session(
         &self,
         thread_id: &str,
@@ -16594,6 +17068,13 @@ mod tests {
             store.backend_session("th_legacy", "cursor").unwrap(),
             Some(("old-sess".into(), 0))
         );
+        assert_eq!(
+            store
+                .backend_session_exact("th_legacy", "cursor#trouve-native-v1")
+                .unwrap(),
+            None,
+            "versioned capability namespaces must not adopt an ambiguous legacy session"
+        );
         store
             .set_backend_session("th_legacy", "cursor", "new-sess")
             .unwrap();
@@ -16672,6 +17153,428 @@ mod tests {
                 &serde_json::Map::new(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn command_execution_claim_and_result_are_durable_and_atomic() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_command");
+
+        assert!(
+            store
+                .claim_command_execution("command-once", "th_command", "fingerprint")
+                .unwrap()
+                .is_none()
+        );
+        // A crash before any side-effect boundary is safe to reclaim.
+        assert!(
+            store
+                .claim_command_execution("command-once", "th_command", "fingerprint")
+                .unwrap()
+                .is_none()
+        );
+        store
+            .begin_command_side_effect("command-once", "th_command", "fingerprint")
+            .unwrap();
+        store
+            .release_command_execution("command-once", "th_command", "fingerprint")
+            .unwrap();
+        let pending = store
+            .claim_command_execution("command-once", "th_command", "fingerprint")
+            .unwrap()
+            .unwrap();
+        assert!(pending.result.is_none());
+        assert!(pending.side_effect_started);
+        assert_eq!(
+            pending.writer_generation,
+            COMMAND_EXECUTION_WRITER_GENERATION
+        );
+
+        let result = CommandResult {
+            name: "new".into(),
+            output: "Created thread `th_child`.".into(),
+            action: trouve_protocol::CommandAction::SwitchThread {
+                thread_id: "th_child".into(),
+            },
+        };
+        store
+            .complete_command_execution_with_event(
+                "command-once",
+                "th_command",
+                "fingerprint",
+                &result,
+                Event::CommandExecuted {
+                    name: "new".into(),
+                    arguments: String::new(),
+                    output: result.output.clone(),
+                },
+            )
+            .unwrap();
+
+        let replay = store
+            .claim_command_execution("command-once", "th_command", "fingerprint")
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(replay.name, result.name);
+        assert_eq!(replay.output, result.output);
+        assert_eq!(replay.action, result.action);
+
+        assert!(
+            store
+                .claim_command_execution("command-failure", "th_command", "failure-fingerprint")
+                .unwrap()
+                .is_none()
+        );
+        store
+            .begin_command_side_effect("command-failure", "th_command", "failure-fingerprint")
+            .unwrap();
+        store
+            .fail_command_execution(
+                "command-failure",
+                "th_command",
+                "failure-fingerprint",
+                "bad_request",
+                "nothing to undo",
+            )
+            .unwrap();
+        let failure = store
+            .claim_command_execution("command-failure", "th_command", "failure-fingerprint")
+            .unwrap()
+            .unwrap()
+            .failure
+            .unwrap();
+        assert_eq!(failure.kind, "bad_request");
+        assert_eq!(failure.message, "nothing to undo");
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread("th_command".into()), 0)
+                .unwrap()
+                .into_iter()
+                .filter(|event| matches!(event.event, Event::CommandExecuted { .. }))
+                .count(),
+            1
+        );
+
+        store.delete_session("se_q").unwrap();
+        assert!(store.command_execution("command-once").unwrap().is_none());
+    }
+
+    #[test]
+    fn command_execution_claim_requires_current_writer_generation() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_old_command_writer");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO command_execution_requests
+                   (idempotency_key, thread_id, request_fingerprint, created_at)
+                 VALUES ('old-writer-command', 'th_old_command_writer',
+                         'old-writer-fingerprint', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let prior = store
+            .claim_command_execution(
+                "old-writer-command",
+                "th_old_command_writer",
+                "old-writer-fingerprint",
+            )
+            .unwrap()
+            .expect("an older writer generation is not safely reclaimable");
+        assert!(!prior.side_effect_started);
+        assert_eq!(prior.writer_generation, 0);
+    }
+
+    #[test]
+    fn command_execution_migration_preserves_legacy_incomplete_claim_as_uncertain() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("legacy-command-execution.sqlite3");
+        let store = Store::open(&database).unwrap();
+        seed_thread(&store, "th_legacy_command");
+        drop(store);
+
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DELETE FROM store_migrations
+                  WHERE id = 'command-execution-side-effect-phase-v1';
+                 DELETE FROM store_migrations
+                  WHERE id = 'command-execution-writer-generation-v2';
+                 DROP TABLE command_execution_requests;
+                 CREATE TABLE command_execution_requests (
+                   idempotency_key TEXT PRIMARY KEY,
+                   thread_id TEXT NOT NULL REFERENCES threads(id),
+                   request_fingerprint TEXT NOT NULL,
+                   result TEXT,
+                   created_at TEXT NOT NULL,
+                   completed_at TEXT
+                 );
+                 INSERT INTO command_execution_requests
+                        (idempotency_key, thread_id, request_fingerprint, created_at)
+                 VALUES ('legacy-command', 'th_legacy_command', 'legacy-fingerprint',
+                         '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let store = Store::open(&database).unwrap();
+        let legacy_claim = store
+            .claim_command_execution("legacy-command", "th_legacy_command", "legacy-fingerprint")
+            .unwrap()
+            .expect("legacy incomplete claim must remain uncertain");
+        assert!(legacy_claim.side_effect_started);
+        assert_eq!(legacy_claim.writer_generation, 0);
+        assert!(legacy_claim.result.is_none());
+        assert!(legacy_claim.failure.is_none());
+    }
+
+    #[test]
+    fn command_execution_migration_keeps_pre_provenance_receipts_uncertain() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("phase-aware-command-execution.sqlite3");
+        let store = Store::open(&database).unwrap();
+        seed_thread(&store, "th_phase_aware_command");
+        assert!(
+            store
+                .claim_command_execution(
+                    "phase-aware-command",
+                    "th_phase_aware_command",
+                    "phase-aware-fingerprint",
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        let phase_aware = Connection::open(&database).unwrap();
+        phase_aware
+            .execute_batch(
+                "DELETE FROM store_migrations
+                  WHERE id = 'command-execution-writer-generation-v2';
+                 ALTER TABLE command_execution_requests
+                  DROP COLUMN writer_generation;",
+            )
+            .unwrap();
+        drop(phase_aware);
+
+        let store = Store::open(&database).unwrap();
+        let pending = store
+            .claim_command_execution(
+                "phase-aware-command",
+                "th_phase_aware_command",
+                "phase-aware-fingerprint",
+            )
+            .unwrap()
+            .expect("pre-provenance receipt must remain uncertain");
+        assert!(pending.side_effect_started);
+        assert_eq!(pending.writer_generation, 0);
+    }
+
+    #[test]
+    fn command_execution_migration_preserves_current_per_row_provenance() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data
+            .path()
+            .join("current-command-execution-provenance.sqlite3");
+        let store = Store::open(&database).unwrap();
+        seed_thread(&store, "th_current_command");
+        assert!(
+            store
+                .claim_command_execution(
+                    "current-command",
+                    "th_current_command",
+                    "current-fingerprint",
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        let current = Connection::open(&database).unwrap();
+        current
+            .execute(
+                "DELETE FROM store_migrations
+                 WHERE id IN (
+                   'command-execution-side-effect-phase-v1',
+                   'command-execution-writer-generation-v2'
+                 )",
+                [],
+            )
+            .unwrap();
+        drop(current);
+
+        let store = Store::open(&database).unwrap();
+        let pending = store
+            .command_execution("current-command")
+            .unwrap()
+            .expect("current receipt remains durable");
+        assert!(!pending.side_effect_started);
+        assert_eq!(
+            pending.writer_generation,
+            COMMAND_EXECUTION_WRITER_GENERATION
+        );
+        assert!(
+            store
+                .claim_command_execution(
+                    "current-command",
+                    "th_current_command",
+                    "current-fingerprint",
+                )
+                .unwrap()
+                .is_none(),
+            "per-row provenance is sufficient without a global marker"
+        );
+    }
+
+    #[test]
+    fn command_execution_migration_conservatively_handles_unmarked_phase_column() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data
+            .path()
+            .join("partial-command-execution-migration.sqlite3");
+        let store = Store::open(&database).unwrap();
+        seed_thread(&store, "th_partial_command");
+        assert!(
+            store
+                .claim_command_execution(
+                    "partial-command",
+                    "th_partial_command",
+                    "partial-fingerprint",
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        let partial = Connection::open(&database).unwrap();
+        partial
+            .execute_batch(
+                "DELETE FROM store_migrations
+                  WHERE id IN (
+                    'command-execution-side-effect-phase-v1',
+                    'command-execution-writer-generation-v2'
+                  );
+                 ALTER TABLE command_execution_requests
+                  DROP COLUMN writer_generation;",
+            )
+            .unwrap();
+        drop(partial);
+
+        let store = Store::open(&database).unwrap();
+        let pending = store
+            .claim_command_execution(
+                "partial-command",
+                "th_partial_command",
+                "partial-fingerprint",
+            )
+            .unwrap()
+            .expect("unmarked phase receipt must remain uncertain");
+        assert!(pending.side_effect_started);
+        assert_eq!(pending.writer_generation, 0);
+    }
+
+    #[test]
+    fn thread_creation_and_command_completion_commit_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_source");
+        assert!(
+            store
+                .claim_command_execution("new-key", "th_source", "new-fingerprint")
+                .unwrap()
+                .is_none()
+        );
+        let child = Thread {
+            id: "th_child".into(),
+            session_id: "se_q".into(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let result = CommandResult {
+            name: "new".into(),
+            output: "Created thread `th_child`.".into(),
+            action: trouve_protocol::CommandAction::SwitchThread {
+                thread_id: child.id.clone(),
+            },
+        };
+        let events = vec![
+            (
+                Scope::Thread(child.id.clone()),
+                Event::CommandCatalogUpdated { commands: vec![] },
+            ),
+            (
+                Scope::Thread("th_source".into()),
+                Event::CommandExecuted {
+                    name: "new".into(),
+                    arguments: String::new(),
+                    output: result.output.clone(),
+                },
+            ),
+        ];
+
+        let failed = store.insert_thread_with_command_completion(
+            &child,
+            &serde_json::Map::new(),
+            None,
+            Event::ThreadCreated {
+                thread_id: child.id.clone(),
+                session_id: child.session_id.clone(),
+            },
+            events.clone(),
+            CommandExecutionCompletion {
+                idempotency_key: "new-key".into(),
+                thread_id: "th_source".into(),
+                request_fingerprint: "wrong-fingerprint".into(),
+                result: result.clone(),
+            },
+        );
+        assert!(failed.is_err());
+        assert!(store.thread(&child.id).unwrap().is_none());
+
+        store
+            .insert_thread_with_command_completion(
+                &child,
+                &serde_json::Map::new(),
+                None,
+                Event::ThreadCreated {
+                    thread_id: child.id.clone(),
+                    session_id: child.session_id.clone(),
+                },
+                events,
+                CommandExecutionCompletion {
+                    idempotency_key: "new-key".into(),
+                    thread_id: "th_source".into(),
+                    request_fingerprint: "new-fingerprint".into(),
+                    result: result.clone(),
+                },
+            )
+            .unwrap();
+        assert!(store.thread(&child.id).unwrap().is_some());
+        assert_eq!(
+            store.latest_command_catalog(&child.id).unwrap(),
+            Some(vec![])
+        );
+        let replay = store
+            .command_execution("new-key")
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(replay.name, result.name);
+        assert_eq!(replay.output, result.output);
+        assert_eq!(replay.action, result.action);
     }
 
     #[test]

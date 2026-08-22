@@ -292,6 +292,25 @@ impl ProtocolClient {
         self.send_message_with(thread_id, content, Vec::new()).await
     }
 
+    /// Execute a Trouve-owned action command without starting a model turn.
+    pub async fn execute_command(
+        &self,
+        thread_id: &str,
+        idempotency_key: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Result<CommandResult> {
+        self.post_json(
+            &format!("/threads/{thread_id}/commands"),
+            &ExecuteCommandRequest {
+                idempotency_key: idempotency_key.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        )
+        .await
+    }
+
     /// Send a prompt with attachment uploads (base64 bytes; stored
     /// server-side and passed to the agent).
     pub async fn send_message_with(
@@ -758,6 +777,20 @@ impl ProtocolClient {
     pub async fn cancel_title_model_install(&self) -> Result<()> {
         self.delete("/config/git-worktrees/title-model/install")
             .await
+    }
+
+    pub async fn skills_settings(&self) -> Result<trouve_protocol::SkillsSettings> {
+        self.get_json("/config/skills").await
+    }
+
+    pub async fn set_builtin_skills_enabled(&self, enabled: bool) -> Result<()> {
+        self.put_empty(
+            "/config/skills",
+            &trouve_protocol::SetSkillsSettingsRequest {
+                builtin_skills_enabled: enabled,
+            },
+        )
+        .await
     }
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {

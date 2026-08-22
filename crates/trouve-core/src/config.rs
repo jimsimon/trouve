@@ -56,6 +56,11 @@ pub struct Config {
     /// Unset preserves the historical CPU-only behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_model_resource_policy: Option<trouve_protocol::TitleModelResourcePolicy>,
+    /// Whether trouve's compiled-in skills are exposed to agents and slash
+    /// command completion. Unset means enabled. User and workspace skills
+    /// remain available when this is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_skills_enabled: Option<bool>,
     /// Whether new session branches include a slug derived from the session
     /// title. Unset means compact `trouve/<short-id>` branches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,12 +160,6 @@ pub struct ProviderConfig {
     /// stub binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Claude Code and Codex: bridge trouve's ToolExecutor in over MCP for
-    /// full tool/permission fidelity. Claude's built-ins are disabled; Codex
-    /// built-ins are confined to a read-only sandbox. Defaults to true for
-    /// those backends; explicit false retains the vendor-native fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_bridge: Option<bool>,
 }
 
 impl Default for ProviderConfig {
@@ -176,7 +175,6 @@ impl Default for ProviderConfig {
             query_params: Default::default(),
             oauth: None,
             command: None,
-            tool_bridge: None,
         }
     }
 }
@@ -186,6 +184,13 @@ fn default_kind() -> String {
 }
 
 impl Config {
+    /// Built-in skills are an enabled-by-default capability. Keeping the
+    /// stored value optional preserves the default for existing configs
+    /// without rewriting them merely because another setting changed.
+    pub fn builtin_skills_enabled(&self) -> bool {
+        self.builtin_skills_enabled.unwrap_or(true)
+    }
+
     pub fn load() -> Self {
         Self::load_from(&config_path())
     }
@@ -300,5 +305,26 @@ mod tests {
         assert_eq!(cfg.code_review_timeout_seconds, Some(1_200));
         assert_eq!(cfg.code_review_reviewer_timeout_seconds, Some(720));
         assert_eq!(cfg.code_review_coordinator_timeout_seconds, Some(360));
+    }
+
+    #[test]
+    fn builtin_skills_default_on_and_round_trip_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let default = Config::default();
+        assert!(default.builtin_skills_enabled());
+
+        let mut disabled = default;
+        disabled.builtin_skills_enabled = Some(false);
+        disabled.save_to(&path).unwrap();
+
+        let loaded = Config::load_from(&path);
+        assert!(!loaded.builtin_skills_enabled());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("builtin_skills_enabled = false")
+        );
     }
 }

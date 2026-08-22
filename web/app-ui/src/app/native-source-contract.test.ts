@@ -59,6 +59,8 @@ const rustEventToWire = {
   AssistantProgressCompleted: "assistant.progress_completed",
   AssistantThinking: "assistant.thinking",
   AssistantThinkingCompleted: "assistant.thinking_completed",
+  CommandCatalogUpdated: "thread.command_catalog_updated",
+  CommandExecuted: "thread.command_executed",
   CommandsUpdated: "thread.commands_updated",
   CompactionCompleted: "thread.compaction_completed",
   CompactionFailed: "thread.compaction_failed",

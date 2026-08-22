@@ -1,16 +1,15 @@
-//! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude
-//! Code, Codex) back into trouve — the successor to the old spawned
+//! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude,
+//! Codex, and Cursor) back into trouve — the successor to the old spawned
 //! `mcp-bridge` subprocess.
 //!
 //! The engine points vendor agents at
-//! `/internal/threads/{id}/mcp?tools=0|1&approval=0|1&ticket=...` as an HTTP MCP
-//! server. It always serves trouve's read-only semantic search tools and
-//! the interactive question tool; with `approval=1` it serves
+//! `/internal/threads/{id}/mcp?approval=0|1&ticket=...` as an HTTP MCP server.
+//! It serves Trouve-owned supplemental capabilities and user-configured MCP
+//! tools; with `approval=1` it also serves
 //! `approval_prompt` (Claude's `--permission-prompt-tool` target: permission
-//! requests become trouve approvals); with `tools=1` it additionally serves
-//! the full ToolExecutor tool set. Every `tools/call` goes straight into
-//! the engine, so bridged calls flow through the same permission gate,
-//! approval hub, and event log as native tool calls.
+//! requests become trouve approvals). Every `tools/call` goes straight into
+//! the engine, so supplemental calls flow through the same permission gate,
+//! approval hub, and event log as native provider calls.
 //!
 //! Stateless per the MCP streamable-HTTP transport: plain JSON responses
 //! (no SSE upgrade, no session ids), notifications get `202 Accepted`.
@@ -26,30 +25,40 @@ use trouve_core::Engine;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Tools served even without full tool bridging: the vendor agent keeps its
-/// own built-ins, but trouve's native semantic search and the interactive
-/// question tool (harness features the vendor has no equivalent of) are
-/// always offered.
-const ALWAYS_BRIDGED: &[&str] = &["search", "find_related", "ask_question"];
+/// Trouve-owned capabilities that supplement the vendor's optimized core
+/// tools. User MCP tools are included dynamically by their `mcp__` prefix.
+const SUPPLEMENTAL_TOOLS: &[&str] = &[
+    "search",
+    "find_related",
+    "ask_question",
+    "load_skill",
+    "todo_write",
+    "search_transcript",
+    "spawn_thread",
+    "spawn_session",
+    "spawn_output",
+];
 
 #[derive(serde::Deserialize)]
 pub(crate) struct McpQuery {
-    /// Serve the full ToolExecutor tool set (vendor built-ins stand down).
-    tools: Option<u8>,
     /// Serve the `approval_prompt` permission gate (Claude needs it; agents
     /// with native approval flows like Codex turn it off).
     approval: Option<u8>,
     /// Opaque active-turn capability issued by the engine. It binds this
-    /// route path and both flags; the reusable process bridge token alone is
+    /// route path and approval flag; the reusable process bridge token alone is
     /// intentionally insufficient authorization.
     ticket: Option<String>,
+    /// Revision embedded in the vendor's configured URL. The engine prepared
+    /// this catalog before launching the turn, so tools/list can reuse it.
+    #[serde(default)]
+    catalog_revision: Option<String>,
 }
 
-fn tool_call_is_available(name: &str, bridge_tools: bool, serve_approval: bool) -> bool {
+fn tool_available_for_bridge(name: &str, serve_approval: bool) -> bool {
     if name == "approval_prompt" {
         serve_approval
     } else {
-        bridge_tools || ALWAYS_BRIDGED.contains(&name)
+        SUPPLEMENTAL_TOOLS.contains(&name) || name.starts_with("mcp__")
     }
 }
 
@@ -59,13 +68,6 @@ pub(crate) async fn mcp_endpoint(
     Query(q): Query<McpQuery>,
     Json(msg): Json<Value>,
 ) -> Response {
-    let Some(bridge_tools) = q.tools.filter(|value| *value <= 1).map(|value| value == 1) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "missing or invalid bridge tools claim",
-        )
-            .into_response();
-    };
     let Some(serve_approval) = q
         .approval
         .filter(|value| *value <= 1)
@@ -80,9 +82,7 @@ pub(crate) async fn mcp_endpoint(
     let Some(ticket) = q.ticket.as_deref() else {
         return (StatusCode::UNAUTHORIZED, "missing bridge capability ticket").into_response();
     };
-    let Some(claims) =
-        engine.validate_bridge_ticket(ticket, &thread_id, bridge_tools, serve_approval)
-    else {
+    let Some(claims) = engine.validate_bridge_ticket(ticket, &thread_id, serve_approval) else {
         return (
             StatusCode::UNAUTHORIZED,
             "invalid or stale bridge capability ticket",
@@ -111,11 +111,23 @@ pub(crate) async fn mcp_endpoint(
                 result's file_path and line to discover similar code.",
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => tools_list(&engine, &thread_id, bridge_tools, serve_approval).await,
+        "tools/list" => {
+            let revision = q
+                .catalog_revision
+                .as_deref()
+                .and_then(|value| u64::from_str_radix(value, 16).ok());
+            tools_list(
+                &engine,
+                &thread_id,
+                serve_approval,
+                revision,
+                claims.builtin_skills_enabled,
+            )
+            .await
+        }
         "tools/call"
-            if tool_call_is_available(
+            if tool_available_for_bridge(
                 msg["params"]["name"].as_str().unwrap_or_default(),
-                bridge_tools,
                 serve_approval,
             ) =>
         {
@@ -127,6 +139,7 @@ pub(crate) async fn mcp_endpoint(
                     &thread_id,
                     &msg["params"],
                     claims.correlate_codex_owner,
+                    claims.builtin_skills_enabled,
                 )
                 .await
             }
@@ -151,8 +164,9 @@ pub(crate) async fn mcp_endpoint(
 async fn tools_list(
     engine: &Engine,
     thread_id: &str,
-    bridge_tools: bool,
     serve_approval: bool,
+    catalog_revision: Option<u64>,
+    builtin_skills_enabled: bool,
 ) -> Result<Value, String> {
     // The approval gate is served for Claude (its permission-prompt tool is
     // invoked by name and must exist on the configured MCP server).
@@ -173,23 +187,42 @@ async fn tools_list(
             },
         }));
     }
-    // Best-effort: the approval gate must exist even when the thread lookup
-    // fails, so a failed spec fetch just serves fewer tools.
-    match engine.bridged_tool_specs(thread_id, bridge_tools).await {
-        Ok(specs) => tools.extend(
-            specs
-                .iter()
-                .filter(|s| bridge_tools || ALWAYS_BRIDGED.contains(&s.name.as_str()))
-                .map(|s| {
-                    json!({
-                        "name": s.name,
-                        "description": s.description,
-                        "inputSchema": s.parameters,
-                    })
-                }),
-        ),
-        Err(e) => tracing::warn!("mcp bridge: tool specs unavailable for {thread_id}: {e}"),
-    }
+    let specs = match engine
+        .bridged_tool_specs_for_revision_with_skills(
+            thread_id,
+            catalog_revision,
+            builtin_skills_enabled,
+        )
+        .await
+    {
+        Ok(specs) => specs,
+        Err(error) if serve_approval => {
+            // Claude's permission-prompt hook is independently available and
+            // must keep working when supplemental MCP discovery is degraded.
+            tracing::warn!(
+                thread_id,
+                "supplemental tool catalog unavailable; serving approval fallback: {error}"
+            );
+            return Ok(json!({ "tools": tools }));
+        }
+        Err(error) => {
+            return Err(format!(
+                "supplemental tool catalog unavailable for {thread_id}: {error}"
+            ));
+        }
+    };
+    tools.extend(
+        specs
+            .iter()
+            .filter(|s| tool_available_for_bridge(&s.name, serve_approval))
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "inputSchema": s.parameters,
+                })
+            }),
+    );
     Ok(json!({ "tools": tools }))
 }
 
@@ -224,22 +257,29 @@ async fn tools_call(
     thread_id: &str,
     params: &Value,
     correlate_codex_owner: bool,
+    builtin_skills_enabled: bool,
 ) -> Result<Value, String> {
     let name = params["name"].as_str().unwrap_or_default();
+    if !tool_available_for_bridge(name, false) {
+        return Err(format!("tool {name:?} is disabled for this bridge"));
+    }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     let result = if correlate_codex_owner {
         let (vendor_thread_id, vendor_call_id) = codex_tool_call_metadata(params)?;
         engine
-            .bridged_codex_tool_call(
+            .bridged_codex_tool_call_with_skills(
                 thread_id,
                 Some(vendor_thread_id),
                 vendor_call_id,
                 name,
                 &arguments,
+                builtin_skills_enabled,
             )
             .await
     } else {
-        engine.bridged_tool_call(thread_id, name, &arguments).await
+        engine
+            .bridged_tool_call_with_skills(thread_id, name, &arguments, builtin_skills_enabled)
+            .await
     };
     match result {
         Ok(content) => Ok(json!({
@@ -281,19 +321,19 @@ fn codex_tool_call_metadata(params: &Value) -> Result<(&str, Option<&str>), Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_tool_call_metadata, tool_call_is_available};
+    use super::{codex_tool_call_metadata, tool_available_for_bridge, tools_list};
+    use trouve_core::{Engine, config::Config, store::Store};
 
     #[test]
-    fn query_flags_gate_tool_execution_as_well_as_discovery() {
-        assert!(tool_call_is_available("search", false, false));
-        assert!(tool_call_is_available("find_related", false, false));
-        assert!(tool_call_is_available("ask_question", false, false));
-        assert!(!tool_call_is_available("write_file", false, false));
-        assert!(!tool_call_is_available("approval_prompt", false, false));
-
-        assert!(tool_call_is_available("write_file", true, false));
-        assert!(!tool_call_is_available("approval_prompt", true, false));
-        assert!(tool_call_is_available("approval_prompt", false, true));
+    fn supplemental_catalog_gates_tool_execution() {
+        assert!(tool_available_for_bridge("search", false));
+        assert!(tool_available_for_bridge("find_related", false));
+        assert!(tool_available_for_bridge("ask_question", false));
+        assert!(tool_available_for_bridge("load_skill", false));
+        assert!(tool_available_for_bridge("mcp__jira__search", false));
+        assert!(!tool_available_for_bridge("write_file", false));
+        assert!(!tool_available_for_bridge("approval_prompt", false));
+        assert!(tool_available_for_bridge("approval_prompt", true));
     }
 
     #[test]
@@ -324,5 +364,29 @@ mod tests {
         ] {
             assert!(codex_tool_call_metadata(&malformed).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn approval_tool_survives_supplemental_catalog_failure() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config::default(),
+        );
+
+        let response = tools_list(&engine, "missing-thread", true, None, true)
+            .await
+            .expect("approval fallback should remain independently available");
+        let tools = response["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "approval_prompt");
+
+        assert!(
+            tools_list(&engine, "missing-thread", false, None, true)
+                .await
+                .is_err(),
+            "catalog-only bridges must still surface discovery failures"
+        );
     }
 }

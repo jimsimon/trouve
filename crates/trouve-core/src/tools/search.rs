@@ -138,30 +138,9 @@ locating implementations, or understanding how something works.
   a search result already located.
 - Call `find_related` on the `trouve` server with a result's file_path and \
   line to find similar implementations, callers, or tests.
-- Plain grep is appropriate only for exhaustive literal matches (e.g. every \
-  occurrence of an exact string before a rename) after `search` has located \
-  the primary definition.";
-
-/// Full-bridge execution guidance. Vendor-native mutation tools are disabled
-/// (Claude) or confined to a read-only sandbox (Codex); the MCP bridge is the
-/// only supported path for side effects so the engine can serialize writes.
-pub const VENDOR_TOOL_BRIDGE_GUIDANCE: &str = "\
-## Tool execution
-
-Use tools from the `trouve` MCP server for every file edit, shell command, \
-git operation, or other side effect. Vendor-native mutation tools are not \
-available in this turn. In particular, do not use Codex's built-in \
-`apply_patch` or `exec_command` for mutations; use the corresponding `trouve` \
-MCP tools. A read-only error from a vendor-native tool does not mean the \
-trouve thread or Code mode is read-only. Independent read-only tool calls may \
-run in parallel; trouve serializes mutation-capable calls within the session \
-worktree.
-
-The advertised edit-tool catalog is model-specific and authoritative. Use its \
-preferred existing-file editor. When `hashline_edit` is advertised as required, \
-use `read_file` with `format=hashline` first and never invent or reuse a snapshot \
-tag after the file changes. Creation, deletion, and any controlled fallback are \
-advertised separately when available.";
+- For exhaustive literal matches (for example every occurrence before a \
+  rename), call the dedicated `grep` tool after `search` has located the \
+  primary definition; do not run grep through `shell`.";
 
 /// One cache for the whole executor: indexes are expensive to build and
 /// cheap to re-validate, so every session shares them. The cache locks

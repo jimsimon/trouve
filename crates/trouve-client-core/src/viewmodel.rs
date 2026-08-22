@@ -151,6 +151,12 @@ pub enum ChatItem {
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
     },
+    /// Output of a deterministic trouve slash command.
+    Command {
+        name: String,
+        arguments: String,
+        output: String,
+    },
     /// A child-agent transcript linked from its parent turn.
     Subagent {
         turn: u64,
@@ -298,8 +304,9 @@ pub struct ThreadViewModel {
     /// How long each finished turn took, in milliseconds — shown in the
     /// agent card header next to the token summary.
     pub turn_duration_ms: HashMap<u64, u64>,
-    /// Slash commands / skills the vendor harness accepts in prompts
-    /// (latest announcement wins) — prompt-box completions.
+    /// Trouve-owned slash commands / skills (latest announcement wins) —
+    /// prompt-box completions. Legacy vendor announcements are accepted when
+    /// replaying older logs.
     pub commands: Vec<trouve_protocol::CommandInfo>,
     /// Prompts waiting their turn, in run order (latest announcement wins).
     pub queue: Vec<trouve_protocol::QueuedPrompt>,
@@ -359,6 +366,15 @@ impl From<ThreadViewItem> for ChatItem {
                 turn,
                 content,
                 attachments,
+            },
+            ThreadViewItem::Command {
+                name,
+                arguments,
+                output,
+            } => Self::Command {
+                name,
+                arguments,
+                output,
             },
             ThreadViewItem::Subagent {
                 turn,
@@ -493,6 +509,22 @@ impl ThreadViewModel {
     /// it; a later thinking delta starts a fresh block).
     fn finish_thinking(&mut self) -> Option<usize> {
         self.thinking = false;
+        let idx = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::Thinking {
+                    complete: false,
+                    ..
+                }
+            )
+        })?;
+        if let ChatItem::Thinking { complete, .. } = &mut self.items[idx] {
+            *complete = true;
+        }
+        Some(idx)
+    }
+
+    fn split_thinking(&mut self) -> Option<usize> {
         let idx = self.items.iter().rposition(|item| {
             matches!(
                 item,
@@ -668,6 +700,23 @@ impl ThreadViewModel {
             Event::CommandsUpdated { commands } => {
                 self.commands = commands.clone();
                 None
+            }
+            Event::CommandCatalogUpdated { commands } => {
+                self.commands = commands.clone();
+                None
+            }
+            Event::CommandExecuted {
+                name,
+                arguments,
+                output,
+            } => {
+                self.split_thinking();
+                self.items.push(ChatItem::Command {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    output: output.clone(),
+                });
+                Some(self.items.len() - 1)
             }
             Event::QueueUpdated { prompts } => {
                 self.queue = prompts.clone();
@@ -1191,6 +1240,7 @@ mod tests {
                 ChatItem::ToolCall { .. } => "tool",
                 ChatItem::TurnStatus { .. } => "turn-status",
                 ChatItem::Questions { .. } => "questions",
+                ChatItem::Command { .. } => "command",
             })
             .collect::<Vec<_>>();
         let turn_state = vm.items.iter().find_map(|item| match item {
@@ -1756,6 +1806,81 @@ mod tests {
                 status: ToolCallStatus::AwaitingApproval,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn core_command_catalog_replaces_vendor_replay_data() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::CommandsUpdated {
+            commands: vec![trouve_protocol::CommandInfo {
+                name: "vendor-command".into(),
+                description: String::new(),
+                kind: trouve_protocol::CommandKind::Prompt,
+                usage: "/vendor-command".into(),
+            }],
+        }));
+        vm.apply(&env(Event::CommandCatalogUpdated {
+            commands: vec![trouve_protocol::CommandInfo {
+                name: "review".into(),
+                description: "Review changes".into(),
+                kind: trouve_protocol::CommandKind::Prompt,
+                usage: "/review".into(),
+            }],
+        }));
+
+        assert_eq!(vm.commands.len(), 1);
+        assert_eq!(vm.commands[0].name, "review");
+    }
+
+    #[test]
+    fn command_output_folds_into_replayable_chat_item() {
+        let mut vm = ThreadViewModel::new();
+        let changed = vm.apply(&env(Event::CommandExecuted {
+            name: "status".into(),
+            arguments: String::new(),
+            output: "Ready".into(),
+        }));
+        assert_eq!(changed, Some(0));
+        assert!(matches!(
+            vm.items.first(),
+            Some(ChatItem::Command { name, output, .. }) if name == "status" && output == "Ready"
+        ));
+    }
+
+    #[test]
+    fn command_output_does_not_finish_active_model_thinking() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 4,
+            text: "Still reasoning.".into(),
+        }));
+        vm.apply(&env(Event::CommandExecuted {
+            name: "status".into(),
+            arguments: String::new(),
+            output: "Ready".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 4,
+            text: "Continuing after the command.".into(),
+        }));
+
+        assert!(vm.thinking);
+        assert!(matches!(
+            vm.items.first(),
+            Some(ChatItem::Thinking { complete: true, .. })
+        ));
+        assert!(matches!(
+            vm.items.get(1),
+            Some(ChatItem::Command { name, .. }) if name == "status"
+        ));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::Thinking {
+                content,
+                complete: false,
+                ..
+            }) if content == "Continuing after the command."
         ));
     }
 

@@ -73,17 +73,17 @@ describe("chat find model", () => {
         answers: null,
       },
     ];
-    expect(chatFindUnitIds(structured, "parser.rs", false)).toEqual(["turn:0:tool:1"]);
-    expect(chatFindUnitIds(structured, "11", false)).toEqual(["turn:0:tool:1"]);
-    expect(chatFindUnitIds(structured, "false", false)).toEqual(["turn:0:tool:1"]);
+    expect(chatFindUnitIds(structured, "parser.rs", false)).toEqual(["standalone:tool:1"]);
+    expect(chatFindUnitIds(structured, "11", false)).toEqual(["standalone:tool:1"]);
+    expect(chatFindUnitIds(structured, "false", false)).toEqual(["standalone:tool:1"]);
     expect(chatFindUnitIds(structured, "which branch", false)).toEqual([
-      "turn:0:tool:1",
+      "standalone:tool:1",
     ]);
     expect(chatFindUnitIds(structured, "earlier tool output omitted", false)).toEqual([
-      "turn:0:tool:1",
+      "standalone:tool:1",
     ]);
     expect(chatFindUnitIds(structured, "the questions were skipped", false)).toEqual([
-      "turn:0:tool:1",
+      "standalone:tool:1",
     ]);
   });
 
@@ -141,14 +141,14 @@ describe("chat find model", () => {
     };
     const structured: ThreadChatItem[] = [tool];
 
-    expect(chatFindUnitIds(structured, "cached", false)).toEqual(["turn:0:tool:cached"]);
+    expect(chatFindUnitIds(structured, "cached", false)).toEqual(["standalone:tool:cached"]);
     const coldRevisionReads = revisionReads;
-    expect(chatFindUnitIds(structured, "projection", false)).toEqual(["turn:0:tool:cached"]);
+    expect(chatFindUnitIds(structured, "projection", false)).toEqual(["standalone:tool:cached"]);
     expect(reads).toBe(1);
     // Layout checks tool args once; the only other read is the single revision validation.
     expect(revisionReads - coldRevisionReads).toBe(2);
     tool.args = { needle: "Updated projection" };
-    expect(chatFindUnitIds(structured, "updated", false)).toEqual(["turn:0:tool:cached"]);
+    expect(chatFindUnitIds(structured, "updated", false)).toEqual(["standalone:tool:cached"]);
   });
 
   it("evicts old projections when the aggregate cache budget is reached", () => {

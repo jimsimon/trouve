@@ -15,6 +15,7 @@ import {
   THEME_NAMES,
 } from "../services/theme-controller.js";
 import { APPEARANCE_FONT_SIZES } from "../services/appearance-preferences.js";
+import type { ProtocolSkillsSettings } from "../services/protocol-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./cli-settings.js";
@@ -75,6 +76,11 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #notificationPending = false;
   #fontFamiliesRequested = false;
   #fontFamiliesLoading = false;
+  #skillsSettings: ProtocolSkillsSettings | undefined;
+  #skillsLoading = false;
+  #skillsLoadAttempted = false;
+  #skillsPending = false;
+  #skillsError = "";
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -109,6 +115,50 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   protected override updated(): void {
     if (settingsSection(this.section) === "appearance") {
       void this.#loadFontFamilies();
+    }
+    if (settingsSection(this.section) === "chat" && !this.#skillsLoadAttempted) {
+      void this.#loadSkillsSettings();
+    }
+  }
+
+  async #loadSkillsSettings(): Promise<void> {
+    const services = this.#services.value;
+    if (services === undefined || this.#skillsLoading) return;
+    this.#skillsLoadAttempted = true;
+    this.#skillsLoading = true;
+    this.#skillsError = "";
+    this.requestUpdate();
+    try {
+      this.#skillsSettings = await services.protocol.skillsSettings();
+    } catch {
+      this.#skillsError = "Built-in skill settings could not be loaded.";
+    } finally {
+      this.#skillsLoading = false;
+      if (this.isConnected) this.requestUpdate();
+    }
+  }
+
+  async #setBuiltinSkillsEnabled(enabled: boolean): Promise<void> {
+    const services = this.#services.value;
+    if (services === undefined || this.#skillsSettings === undefined || this.#skillsPending) return;
+    this.#skillsSettings = { builtin_skills_enabled: enabled };
+    this.#skillsPending = true;
+    this.#skillsError = "";
+    this.requestUpdate();
+    try {
+      await services.protocol.setSkillsSettings({ builtin_skills_enabled: enabled });
+    } catch {
+      try {
+        this.#skillsSettings = await services.protocol.skillsSettings();
+        this.#skillsError = "The save was not confirmed; the current setting was reloaded.";
+      } catch {
+        this.#skillsSettings = undefined;
+        this.#skillsLoadAttempted = false;
+        this.#skillsError = "The save outcome is unknown. Reload the setting before trying again.";
+      }
+    } finally {
+      this.#skillsPending = false;
+      this.requestUpdate();
     }
   }
 
@@ -358,6 +408,42 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                             </label>
                             <p class="settings-note">When off, started, completed, cancelled, and skipped TODO updates stay visible on the turn rail and separate collapsible tool-call groups.</p>
                           </div>
+                        </div>
+                        <div class="settings-subsection">
+                          <h2>Skills</h2>
+                          ${this.#skillsSettings === undefined
+                            ? html`
+                                <div class="settings-actions">
+                                  <span class="settings-note" role="status">${this.#skillsLoading
+                                    ? "Loading built-in skills…"
+                                    : this.#skillsError}</span>
+                                  ${this.#skillsLoading
+                                    ? nothing
+                                    : html`<button type="button" @click=${() => {
+                                        this.#skillsLoadAttempted = false;
+                                        void this.#loadSkillsSettings();
+                                      }}>Retry</button>`}
+                                </div>
+                              `
+                            : html`
+                                <label class="settings-toggle-row" for="settings-builtin-skills">
+                                  <input
+                                    id="settings-builtin-skills"
+                                    type="checkbox"
+                                    .checked=${this.#skillsSettings.builtin_skills_enabled}
+                                    ?disabled=${this.#skillsPending}
+                                    @change=${(event: Event) => void this.#setBuiltinSkillsEnabled(
+                                      (event.currentTarget as HTMLInputElement).checked,
+                                    )}
+                                  />
+                                  <span class="toggle-state">${this.#skillsSettings.builtin_skills_enabled ? "On" : "Off"}</span>
+                                  <span>Expose Trouve's built-in skills to agents and slash-command completion.</span>
+                                </label>
+                                <p class="settings-note">User and workspace skills remain available when built-in skills are off.</p>
+                              `}
+                          ${this.#skillsError === ""
+                            ? nothing
+                            : html`<p class="settings-note capability-note" role="alert">${this.#skillsError}</p>`}
                         </div>
                         <trouve-git-worktree-settings></trouve-git-worktree-settings>
                       </div>

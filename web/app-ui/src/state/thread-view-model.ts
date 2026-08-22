@@ -112,6 +112,13 @@ export type ThreadChatItem =
     }
   | {
       readonly id: string;
+      readonly kind: "command";
+      readonly name: string;
+      readonly arguments: string;
+      readonly output: string;
+    }
+  | {
+      readonly id: string;
       readonly kind: "subagent";
       readonly turn: number;
       readonly threadId: string;
@@ -428,6 +435,14 @@ export class ThreadViewModel {
           content: item.content,
           attachments: item.attachments,
         };
+      case "command":
+        return {
+          id,
+          kind: "command",
+          name: item.name,
+          arguments: item.arguments ?? "",
+          output: item.output,
+        };
       case "subagent":
         return {
           id,
@@ -618,6 +633,19 @@ export class ThreadViewModel {
         return true;
       case "thread.commands_updated":
         this.commands = envelope.commands;
+        return true;
+      case "thread.command_catalog_updated":
+        this.commands = envelope.commands;
+        return true;
+      case "thread.command_executed":
+        this.splitThinking();
+        this.appendItem({
+          id: `command:${envelope.cursor}`,
+          kind: "command",
+          name: envelope.name,
+          arguments: envelope.arguments ?? "",
+          output: envelope.output,
+        });
         return true;
       case "thread.queue_updated":
         this.replaceQueue(envelope.prompts);
@@ -1075,6 +1103,15 @@ export class ThreadViewModel {
       (candidate) => candidate.kind === "thinking" && !candidate.complete,
     );
     if (item?.kind !== "thinking") return wasThinking;
+    item.complete = true;
+    return true;
+  }
+
+  private splitThinking(): boolean {
+    const item = this.#findLast(
+      (candidate) => candidate.kind === "thinking" && !candidate.complete,
+    );
+    if (item?.kind !== "thinking") return false;
     item.complete = true;
     return true;
   }

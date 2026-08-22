@@ -163,6 +163,8 @@ const protocolValidators = {
   threadStatuses: componentArray(protocolSchemaId, "ThreadStatus"),
   queuedPrompts: componentArray(protocolSchemaId, "QueuedPrompt"),
   turnAccepted: componentRef(protocolSchemaId, "TurnAccepted"),
+  commandResult: componentRef(protocolSchemaId, "CommandResult"),
+  skillsSettings: componentRef(protocolSchemaId, "SkillsSettings"),
   usageSummary: componentRef(protocolSchemaId, "UsageSummary"),
   dirEntries: componentArray(protocolSchemaId, "DirEntry"),
   paths: { type: "array", items: { type: "string" } },

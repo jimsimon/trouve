@@ -107,7 +107,7 @@ EOF
         turn(
             tmp.path().to_path_buf(),
             Some("old-sess"),
-            BackendPermission::ReadOnly,
+            BackendPermission::Ask,
         )
     })
     .await;
@@ -160,16 +160,11 @@ EOF
             && usage.cost_usd.is_none()
     )));
 
-    // Flags: resume + read-only permission mapping + mode instructions.
-    // Read-only avoids `--permission-mode plan` (its interactive plan
-    // workflow prompt misfires headless); mutating built-ins are disallowed
-    // and everything else is denied through the approval gate.
+    // Flags: resume + mode instructions.
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert!(args.contains("--resume"), "{args}");
     assert!(args.contains("old-sess"), "{args}");
     assert!(!args.contains("--permission-mode"), "{args}");
-    assert!(args.contains("--disallowedTools"), "{args}");
-    assert!(args.contains("Write,Edit,MultiEdit,NotebookEdit"), "{args}");
     assert!(args.contains("--append-system-prompt"), "{args}");
     assert!(args.contains("--model"), "{args}");
     assert!(args.contains("--include-partial-messages"), "{args}");
@@ -183,6 +178,8 @@ async fn claude_adapter_reaps_persistent_process_before_cancelled_stream_closes(
         tmp.path(),
         "claude-cancel",
         r#"#!/bin/bash
+if [[ "$1" == "--version" ]]; then echo '2.1.201 (Claude Code)'; exit 0; fi
+if [[ "$1" == "--help" ]]; then echo '--setting-sources --settings --disable-slash-commands --no-chrome --prompt-suggestions --strict-mcp-config --tools'; exit 0; fi
 echo $$ > "$0.pid"
 IFS= read -r prompt
 : > "$0.prompt"
@@ -201,6 +198,10 @@ IFS= read -r keepalive
             BackendPermission::ReadOnly,
         );
         turn.cancel = cancel.clone();
+        turn.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
+            url: "http://127.0.0.1:1/internal/threads/th_cancel/mcp?approval=1".into(),
+            headers: Vec::new(),
+        });
         turn
     })
     .await;
@@ -278,7 +279,7 @@ EOF
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub));
     let mut stream = start_turn(&backend, || {
-        turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly)
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
     })
     .await;
 
@@ -619,9 +620,9 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
     let model = std::fs::read_to_string(format!("{stub}.model")).unwrap();
     assert!(model.contains("\"configId\":\"model\""), "{model}");
     assert!(model.contains("\"value\":\"test-model\""), "{model}");
-    // Mode instructions ride in the first prompt of a fresh session.
+    // Trouve instructions ride on every prompt so resumed sessions refresh.
     let prompt = std::fs::read_to_string(format!("{stub}.prompt")).unwrap();
-    assert!(prompt.contains("mode-instructions"), "{prompt}");
+    assert!(prompt.contains("trouve-instructions"), "{prompt}");
     assert!(prompt.contains("do the thing"), "{prompt}");
 
     // Our approval reply picked the allow-once option.
@@ -2153,13 +2154,16 @@ cat > /dev/null
 }
 
 #[tokio::test]
-async fn claude_adapter_wires_mcp_tool_bridge() {
+async fn claude_adapter_wires_supplemental_mcp_bridge() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
         tmp.path(),
         "claude",
         r#"#!/bin/bash
+if [[ "$1" == "--version" ]]; then echo '2.1.201 (Claude Code)'; exit 0; fi
+if [[ "$1" == "--help" ]]; then echo '--setting-sources --settings --disable-slash-commands --no-chrome --prompt-suggestions --strict-mcp-config --tools'; exit 0; fi
 printf '%s\n' "$@" > "$0.args"
+printf '%s\n' "$CLAUDE_CODE_DISABLE_CLAUDE_MDS" "$CLAUDE_CODE_DISABLE_AUTO_MEMORY" "$CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS" "$ENABLE_CLAUDEAI_MCP_SERVERS" > "$0.isolation"
 cat <<'EOF'
 {"type":"result","subtype":"success","session_id":"s","usage":{"input_tokens":1,"output_tokens":1}}
 EOF
@@ -2167,18 +2171,11 @@ EOF
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
     let mut stream = start_turn(&backend, || {
-        let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
+        let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
         t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
-            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=1&approval=1".into(),
-            bridge_tools: true,
-            disallowed_tools: vec!["Bash".into(), "Edit".into(), "Write".into()],
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=1".into(),
+            headers: vec![("Authorization".into(), "Bearer bridge-secret".into())],
         });
-        t.mcp_servers = vec![trouve_agents::McpServerLaunch {
-            name: "jira".into(),
-            command: "jira-mcp".into(),
-            args: vec!["--stdio".into()],
-            env: vec![("TOKEN".into(), "sekrit".into())],
-        }];
         t
     })
     .await;
@@ -2190,12 +2187,20 @@ EOF
     assert!(args.contains("--mcp-config"), "{args}");
     assert!(args.contains("--strict-mcp-config"), "{args}");
     assert!(args.contains("--disallowedTools"), "{args}");
-    assert!(args.contains("Bash,Edit,Write"), "{args}");
+    assert!(args.contains("Write,Edit,NotebookEdit"), "{args}");
     assert!(args.contains("--allowedTools"), "{args}");
     assert!(args.contains("mcp__trouve"), "{args}");
-    // Ask mode: Claude's permission requests route to the bridge's gate.
+    assert!(args.contains("--setting-sources"), "{args}");
+    assert!(args.contains("{\"disableAllHooks\":true}"), "{args}");
+    assert!(args.contains("--disable-slash-commands"), "{args}");
+    assert!(args.contains("--no-chrome"), "{args}");
+    assert!(args.contains("--prompt-suggestions"), "{args}");
+    assert!(args.contains("--tools"), "{args}");
+    assert!(args.contains("Bash,Edit,Write"), "{args}");
+    assert!(args.contains("Read,Glob,Grep"), "{args}");
+    let isolation = std::fs::read_to_string(format!("{stub}.isolation")).unwrap();
+    assert_eq!(isolation, "1\n1\n1\nfalse\n");
     assert!(args.contains("--permission-prompt-tool"), "{args}");
-    assert!(args.contains("mcp__trouve__approval_prompt"), "{args}");
 
     // The generated MCP config points at the engine's embedded HTTP MCP
     // endpoint for this thread.
@@ -2211,14 +2216,18 @@ EOF
     assert_eq!(config["mcpServers"]["trouve"]["type"], "http");
     assert_eq!(
         config["mcpServers"]["trouve"]["url"],
-        "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=1&approval=1"
+        "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=1"
+    );
+    assert_eq!(
+        config["mcpServers"]["trouve"]["headers"]["Authorization"],
+        "Bearer bridge-secret"
     );
     assert!(config["mcpServers"]["trouve"]["command"].is_null());
-    // User MCP servers ride along in the same config, but are not
-    // pre-allowed: their tools go through the normal permission path.
-    assert_eq!(config["mcpServers"]["jira"]["command"], "jira-mcp");
-    assert_eq!(config["mcpServers"]["jira"]["env"]["TOKEN"], "sekrit");
-    assert!(!args.contains("mcp__jira"), "{args}");
+    assert_eq!(
+        config["mcpServers"].as_object().unwrap().len(),
+        1,
+        "only Trouve may be mounted in optimized engine turns"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2240,12 +2249,40 @@ EOF
 }
 
 #[tokio::test]
-async fn claude_adapter_routes_yolo_through_gate_without_tool_bridge() {
+async fn claude_optimized_mode_rejects_uncertified_cli_versions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-old",
+        r#"#!/bin/bash
+if [[ "$1" == "--version" ]]; then echo '2.1.100 (Claude Code)'; exit 0; fi
+exit 1
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub));
+    let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
+    t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
+        url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=1".into(),
+        headers: Vec::new(),
+    });
+    match backend.run_turn(t).await {
+        Err(trouve_agents::BackendError::Protocol(message)) => {
+            assert!(message.contains("too old"), "{message}");
+        }
+        Err(other) => panic!("unexpected error: {other}"),
+        Ok(_) => panic!("uncertified CLI was accepted"),
+    }
+}
+
+#[tokio::test]
+async fn claude_adapter_routes_yolo_through_gate_with_native_tools() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
         tmp.path(),
         "claude",
         r#"#!/bin/bash
+if [[ "$1" == "--version" ]]; then echo '2.1.201 (Claude Code)'; exit 0; fi
+if [[ "$1" == "--help" ]]; then echo '--setting-sources --settings --disable-slash-commands --no-chrome --prompt-suggestions --strict-mcp-config --tools'; exit 0; fi
 printf '%s\n' "$@" > "$0.args"
 cat <<'EOF'
 {"type":"result","subtype":"success","session_id":"s","usage":{"input_tokens":1,"output_tokens":1}}
@@ -2257,9 +2294,8 @@ EOF
         let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Yolo);
         t.thread_id = "th_2".into();
         t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
-            url: "http://127.0.0.1:1/internal/threads/th_2/mcp?tools=0&approval=1".into(),
-            bridge_tools: false,
-            disallowed_tools: Vec::new(),
+            url: "http://127.0.0.1:1/internal/threads/th_2/mcp?approval=1".into(),
+            headers: Vec::new(),
         });
         t
     })
@@ -2268,19 +2304,16 @@ EOF
         ev.unwrap();
     }
 
-    // Approvals-only Yolo: Claude keeps its built-ins and trouve auto-allows
-    // normal permission requests, while retaining the worktree path guard.
-    // The read-only semantic search tools ride along pre-allowed.
+    // Optimized-native Yolo keeps Claude's core tools while Trouve
+    // auto-allows requests through the worktree path guard.
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert!(args.contains("--mcp-config"), "{args}");
     assert!(args.contains("--permission-prompt-tool"), "{args}");
     assert!(args.contains("mcp__trouve__approval_prompt"), "{args}");
     assert!(!args.contains("--dangerously-skip-permissions"), "{args}");
     assert!(!args.contains("--disallowedTools"), "{args}");
-    assert!(
-        args.contains("mcp__trouve__search,mcp__trouve__find_related"),
-        "{args}"
-    );
+    assert!(args.contains("Bash,Edit,Write"), "{args}");
+    assert!(args.contains("--disable-slash-commands"), "{args}");
     let _ = std::fs::remove_file(std::env::temp_dir().join("trouve-mcp-th_2.json"));
 }
 

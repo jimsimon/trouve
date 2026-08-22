@@ -1,9 +1,13 @@
 //! Tools and the `ToolExecutor` chokepoint (invariant 3).
 //!
-//! The agent loop never performs side effects itself: it gates each call
-//! through the permission layer and hands execution to a `ToolExecutor`.
+//! Trouve's native agent loop never performs side effects itself: it gates
+//! each call through the permission layer and hands execution to a
+//! `ToolExecutor`. Supplemental capabilities mounted into subscription CLIs
+//! return through this same boundary. Certified vendor-native core tools are
+//! the deliberate exception recorded by ADR 0043; their adapters normalize
+//! lifecycle and approval events without re-executing the operation here.
 //! Local mode uses [`LocalToolExecutor`]; cloud isolation later swaps in a
-//! container-backed implementation without touching the loop.
+//! container-backed implementation without touching the native loop.
 
 mod diff;
 mod edit_strategy;
@@ -14,13 +18,11 @@ mod hashline;
 mod patch;
 mod search;
 mod shell;
+mod skill;
 mod todo;
 mod web;
 
-pub use search::{
-    VENDOR_SEARCH_GUIDANCE, VENDOR_TOOL_BRIDGE_GUIDANCE, gc_index_store_in_background,
-    warm_index_in_background,
-};
+pub use search::{VENDOR_SEARCH_GUIDANCE, gc_index_store_in_background, warm_index_in_background};
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -619,7 +621,7 @@ impl BackgroundMutationLease {
 /// Execution context: everything a tool may touch. Mutation paths resolve
 /// inside the session worktree; explicitly registered host resources are
 /// additionally available to read-only filesystem tools.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ToolCtx {
     /// Cancellation for the turn that owns this call. Long-running tools
     /// must finish process/protocol cleanup before returning from it.
@@ -642,6 +644,9 @@ pub struct ToolCtx {
     /// Registered workspace repo root: its `.agents/.mcp.json` applies even
     /// before it is committed to the session branch.
     pub workspace_root: Option<PathBuf>,
+    /// Snapshot of the global built-in skill setting for this turn. User and
+    /// workspace skills are always available.
+    pub builtin_skills_enabled: bool,
     /// Model-specific editing policy used for both tool advertisement and
     /// execution enforcement.
     pub edit_strategy: EditStrategy,
@@ -650,6 +655,24 @@ pub struct ToolCtx {
     /// executors must leave it untouched.
     #[doc(hidden)]
     pub background_mutation_lease: Option<Arc<BackgroundMutationLease>>,
+}
+
+impl Default for ToolCtx {
+    fn default() -> Self {
+        Self {
+            cancel: Default::default(),
+            worktree: PathBuf::new(),
+            canonical_worktree: None,
+            read_only_roots: Arc::from([]),
+            thread_id: String::new(),
+            todos: Arc::new(Mutex::new(Vec::new())),
+            config_dir: None,
+            workspace_root: None,
+            builtin_skills_enabled: true,
+            edit_strategy: Default::default(),
+            background_mutation_lease: None,
+        }
+    }
 }
 
 impl ToolCtx {
@@ -772,16 +795,6 @@ pub trait ToolExecutor: Send + Sync {
     /// Tool specs visible from this context (built-ins + workspace MCP
     /// tools, hence async and context-dependent).
     async fn specs(&self, ctx: &ToolCtx) -> Vec<ToolSpec>;
-    /// Native specs without consulting or launching external MCP servers.
-    ///
-    /// This deliberately fails closed. A custom executor that only implements
-    /// [`Self::specs`] may perform external discovery while building that
-    /// catalog, so callers that disabled bridge tools must not reach it through
-    /// this default. Executors with a trusted static catalog opt in by
-    /// overriding this method.
-    async fn native_specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
-        Vec::new()
-    }
     /// `None` when the tool is unknown.
     fn tool_mutates(&self, name: &str) -> Option<bool>;
     /// Execute one call. Long-running implementations must observe
@@ -1575,6 +1588,13 @@ async fn run_review_command_with_timeout(
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachmentStage {
+    pub attachment: trouve_protocol::Attachment,
+    pub source: PathBuf,
+    pub relative_path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewDiffFile {
     pub path: String,
@@ -1718,6 +1738,7 @@ impl LocalToolExecutor {
             Arc::new(search::FindRelated {
                 cache: search_cache,
             }),
+            Arc::new(skill::LoadSkill),
         ];
         let built_in_specs = tools
             .iter()
@@ -2473,14 +2494,6 @@ impl ToolExecutor for LocalToolExecutor {
         specs
     }
 
-    async fn native_specs(&self, ctx: &ToolCtx) -> Vec<ToolSpec> {
-        self.built_in_specs
-            .iter()
-            .cloned()
-            .filter_map(|spec| edit_strategy::advertise(ctx.edit_strategy, spec))
-            .collect()
-    }
-
     fn tool_mutates(&self, name: &str) -> Option<bool> {
         if name.starts_with(crate::mcp::TOOL_PREFIX) {
             // MCP tools are external code: always treated as mutating so
@@ -3026,7 +3039,11 @@ impl ToolExecutor for LocalToolExecutor {
         .await?;
 
         // Retries and duplicate requests for an immutable revision can reuse
-        // objects already fetched into the shared review repository.
+        // objects already fetched into the shared review repository. Anchor
+        // both objects before returning so later git maintenance cannot prune
+        // commits that arrived only through a now-expired FETCH_HEAD.
+        let base_ref = "refs/remotes/origin/trouve-base";
+        let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
         let base_present = run(vec![
             "cat-file".into(),
             "-e".into(),
@@ -3041,7 +3058,20 @@ impl ToolExecutor for LocalToolExecutor {
         ])
         .await
         .is_ok();
-        if !base_present || !head_present {
+        if base_present && head_present {
+            run(vec![
+                "update-ref".into(),
+                base_ref.into(),
+                request.base_sha.clone(),
+            ])
+            .await?;
+            run(vec![
+                "update-ref".into(),
+                pull_ref.clone(),
+                request.head_sha.clone(),
+            ])
+            .await?;
+        } else {
             let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
             let fetch_args = vec![
                 "fetch".into(),
@@ -3701,27 +3731,6 @@ mod tests {
         assert_eq!(finalizes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    struct SpecsOnlyExecutor;
-
-    #[async_trait::async_trait]
-    impl ToolExecutor for SpecsOnlyExecutor {
-        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
-            vec![ToolSpec {
-                name: "external_discovery".into(),
-                description: "would require external discovery".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            }]
-        }
-
-        fn tool_mutates(&self, _name: &str) -> Option<bool> {
-            None
-        }
-
-        async fn execute(&self, _ctx: &ToolCtx, name: &str, _args: &Value) -> ToolResult {
-            ToolResult::error(format!("unknown tool: {name}"))
-        }
-    }
-
     #[test]
     fn path_resolution_rejects_escapes() {
         let dir = tempfile::tempdir().unwrap();
@@ -4043,15 +4052,15 @@ mod tests {
         assert_eq!(res.status, ToolStatus::Error);
     }
 
-    #[tokio::test]
-    async fn native_specs_fail_closed_for_specs_only_custom_executors() {
-        let ctx = ToolCtx {
-            worktree: std::env::temp_dir(),
-            ..Default::default()
-        };
+    #[test]
+    fn review_repository_locks_are_shared_only_within_one_repository() {
+        let executor = LocalToolExecutor::default();
+        let first = executor.review_repository_lock(Path::new("/reviews/owner/one"));
+        let same = executor.review_repository_lock(Path::new("/reviews/owner/one"));
+        let other = executor.review_repository_lock(Path::new("/reviews/owner/two"));
 
-        assert_eq!(SpecsOnlyExecutor.specs(&ctx).await.len(), 1);
-        assert!(SpecsOnlyExecutor.native_specs(&ctx).await.is_empty());
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[test]

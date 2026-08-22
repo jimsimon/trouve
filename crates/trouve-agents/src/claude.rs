@@ -23,12 +23,14 @@
 //! rate-limit windows. No user message is sent, so no model turn runs.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
+use sha2::Digest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
@@ -37,7 +39,8 @@ use trouve_protocol::{ModelInfo, Usage};
 use crate::process_env::{ProcessTreeChild, spawn_process_tree};
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, spawn_claude_login,
+    BackendStatus, BackendTurn, McpBridgeConfig, async_stream, binary_on_path, format_reset,
+    spawn_claude_login,
 };
 
 /// Most live processes kept at once; the least recently used is evicted.
@@ -46,6 +49,9 @@ const POOL_CAP: usize = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the reaper scans the pool.
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// First Claude Code release certified against the granular product-surface
+/// controls below. Older releases silently ignore some environment toggles.
+const MIN_OPTIMIZED_VERSION: (u64, u64, u64) = (2, 1, 201);
 
 pub struct ClaudeBackend {
     id: String,
@@ -57,6 +63,7 @@ pub struct ClaudeBackend {
     #[cfg(test)]
     injected_usage_cleanup_failure: std::sync::atomic::AtomicBool,
     catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
+    surface_probe: tokio::sync::OnceCell<()>,
 }
 
 impl ClaudeBackend {
@@ -69,6 +76,7 @@ impl ClaudeBackend {
             #[cfg(test)]
             injected_usage_cleanup_failure: std::sync::atomic::AtomicBool::new(false),
             catalog: Arc::new(trouve_providers::models_dev::ModelsDevCatalog::embedded()),
+            surface_probe: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -99,6 +107,71 @@ fn claude_is_logged_in(command: &str) -> bool {
         .and_then(std::process::Child::wait_with_output)
         .map(|output| output.status.success() && auth_status_is_logged_in(&output.stdout))
         .unwrap_or(false)
+}
+
+fn parse_cli_version(text: &str) -> Option<(u64, u64, u64)> {
+    text.split_whitespace().find_map(|token| {
+        let mut parts = token.trim_start_matches('v').split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        Some((major, minor, patch))
+    })
+}
+
+async fn certify_optimized_cli(command: &str) -> Result<(), String> {
+    let invoke = |arg: &'static str| async move {
+        let mut probe = Command::new(command);
+        probe.arg(arg).stdin(Stdio::null()).kill_on_drop(true);
+        tokio::time::timeout(Duration::from_secs(5), probe.output())
+            .await
+            .map_err(|_| format!("{command} {arg} timed out"))?
+            .map_err(|e| format!("cannot run {command} {arg}: {e}"))
+    };
+    let version_output = invoke("--version").await?;
+    if !version_output.status.success() {
+        return Err(format!("{command} --version failed"));
+    }
+    let version_text = String::from_utf8_lossy(&version_output.stdout);
+    let version = parse_cli_version(&version_text)
+        .ok_or_else(|| format!("cannot parse Claude Code version from {version_text:?}"))?;
+    if version < MIN_OPTIMIZED_VERSION {
+        return Err(format!(
+            "Claude Code {}.{}.{} is too old for Trouve's isolated capability surface; need at least {}.{}.{}",
+            version.0,
+            version.1,
+            version.2,
+            MIN_OPTIMIZED_VERSION.0,
+            MIN_OPTIMIZED_VERSION.1,
+            MIN_OPTIMIZED_VERSION.2,
+        ));
+    }
+    let help_output = invoke("--help").await?;
+    if !help_output.status.success() {
+        return Err(format!("{command} --help failed"));
+    }
+    let help = String::from_utf8_lossy(&help_output.stdout);
+    for required in [
+        "--setting-sources",
+        "--settings",
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--prompt-suggestions",
+        "--strict-mcp-config",
+        "--tools",
+    ] {
+        if !help.contains(required) {
+            return Err(format!(
+                "Claude Code {version_text:?} lacks required isolation control {required}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Live `claude` processes keyed by trouve thread id.
@@ -256,17 +329,34 @@ impl ClaudeProc {
 }
 
 /// Spawn-time configuration that must match for a process to be reused.
-fn config_fingerprint(turn: &BackendTurn) -> String {
-    let bridge = turn
-        .mcp_bridge
-        .as_ref()
-        .map(|b| format!("{}|{}|{:?}", b.url, b.bridge_tools, b.disallowed_tools));
+fn config_fingerprint(turn: &BackendTurn) -> Result<String, BackendError> {
+    let bridge = if let Some(bridge) = &turn.mcp_bridge {
+        let headers = canonical_bridge_headers(bridge)?;
+        let mut digest = sha2::Sha256::new();
+        for (name, value) in headers {
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        let header_fingerprint =
+            digest
+                .finalize()
+                .iter()
+                .fold(String::with_capacity(64), |mut output, byte| {
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                });
+        Some((&bridge.url, header_fingerprint))
+    } else {
+        None
+    };
     let servers: Vec<String> = turn
         .mcp_servers
         .iter()
         .map(|s| format!("{}|{}|{:?}|{:?}", s.name, s.command, s.args, s.env))
         .collect();
-    format!(
+    Ok(format!(
         "{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
         turn.worktree,
         turn.model,
@@ -276,7 +366,28 @@ fn config_fingerprint(turn: &BackendTurn) -> String {
         turn.tool_free,
         bridge,
         servers,
-    )
+    ))
+}
+
+fn canonical_bridge_headers(bridge: &McpBridgeConfig) -> Result<Vec<(&str, &str)>, BackendError> {
+    let mut headers: Vec<(&str, &str)> = bridge
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    headers.sort_unstable_by(|(left, _), (right, _)| {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    });
+    if let Some((name, _)) = headers
+        .windows(2)
+        .find(|pair| pair[0].0.eq_ignore_ascii_case(pair[1].0))
+        .map(|pair| pair[1])
+    {
+        return Err(BackendError::Protocol(format!(
+            "duplicate Trouve bridge header: {name}"
+        )));
+    }
+    Ok(headers)
 }
 
 /// Apply the model's reasoning control using Claude Code's current interface.
@@ -400,6 +511,28 @@ impl AgentBackend for ClaudeBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        if matches!(turn.permission, BackendPermission::ReadOnly)
+            && !turn.tool_free
+            && turn.mcp_bridge.is_none()
+        {
+            return Err(BackendError::Protocol(
+                "read-only Claude turns require Trouve's permission bridge".into(),
+            ));
+        }
+        if turn.mcp_bridge.is_some() && !turn.mcp_servers.is_empty() {
+            return Err(BackendError::Protocol(
+                "optimized Claude turns mount user MCP only through Trouve's capability bridge"
+                    .into(),
+            ));
+        }
+        if turn.mcp_bridge.is_some()
+            && let Err(message) = self
+                .surface_probe
+                .get_or_try_init(|| certify_optimized_cli(&self.command))
+                .await
+        {
+            return Err(BackendError::Protocol(message));
+        }
         self.start_reaper();
         let cancel = turn.cancel.clone();
         // Process acquisition may have to clean a stale tree. Do not cancel
@@ -761,7 +894,7 @@ impl ClaudeBackend {
         if cancel.is_cancelled() {
             return Err(BackendError::Cancelled);
         }
-        let fp = config_fingerprint(turn);
+        let fp = config_fingerprint(turn)?;
         let mut procs = self.pool.procs.lock().await;
         if cancel.is_cancelled() {
             return Err(BackendError::Cancelled);
@@ -841,40 +974,45 @@ impl ClaudeBackend {
         if turn.tool_free {
             cmd.args(["--tools", ""]);
         }
-        // MCP config: the trouve bridge plus any user-configured servers.
-        // The bridge has two roles, both optional:
-        //  - approval gate: in Ask mode, Claude's permission requests go to
-        //    the bridge's approval_prompt tool (trouve's approval flow)
-        //    instead of failing in headless print mode;
-        //  - tool bridge: Claude's built-ins stand down and trouve's
-        //    ToolExecutor serves tools (approvals then gate inside trouve,
-        //    so the bridged server is pre-allowed).
-        // User servers ride along un-allowlisted, so their tools flow
-        // through the normal permission path (approval_prompt in Ask mode).
+        // MCP config: normal engine turns mount only Trouve's supplemental
+        // capability bridge. Direct servers remain an adapter escape hatch.
         let mut mcp_servers = serde_json::Map::new();
-        for server in &turn.mcp_servers {
-            let env: serde_json::Map<String, serde_json::Value> = server
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            mcp_servers.insert(
-                server.name.clone(),
-                serde_json::json!({
-                    "command": server.command,
-                    "args": server.args,
-                    "env": env,
-                }),
-            );
-        }
-        if let Some(bridge) = &turn.mcp_bridge {
-            mcp_servers.insert(
-                "trouve".into(),
-                serde_json::json!({
-                    "type": "http",
-                    "url": bridge.url,
-                }),
-            );
+        if !turn.tool_free {
+            for server in &turn.mcp_servers {
+                let env: serde_json::Map<String, serde_json::Value> = server
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                mcp_servers.insert(
+                    server.name.clone(),
+                    serde_json::json!({
+                        "command": server.command,
+                        "args": server.args,
+                        "env": env,
+                    }),
+                );
+            }
+            if let Some(bridge) = &turn.mcp_bridge {
+                let headers: serde_json::Map<String, serde_json::Value> =
+                    canonical_bridge_headers(bridge)?
+                        .into_iter()
+                        .map(|(name, value)| {
+                            (
+                                name.to_string(),
+                                serde_json::Value::String(value.to_string()),
+                            )
+                        })
+                        .collect();
+                mcp_servers.insert(
+                    "trouve".into(),
+                    serde_json::json!({
+                        "type": "http",
+                        "url": bridge.url,
+                        "headers": headers,
+                    }),
+                );
+            }
         }
         if !mcp_servers.is_empty() {
             use std::io::Write as _;
@@ -893,29 +1031,44 @@ impl ClaudeBackend {
             cmd.arg("--strict-mcp-config");
             mcp_config_file = Some(file);
         }
-        if let Some(bridge) = &turn.mcp_bridge {
-            if bridge.bridge_tools {
-                if !bridge.disallowed_tools.is_empty() {
-                    cmd.args(["--disallowedTools", &bridge.disallowed_tools.join(",")]);
-                }
-                cmd.args(["--allowedTools", "mcp__trouve"]);
-            } else {
-                // Approvals-only: Claude keeps its built-ins, but trouve's
-                // read-only semantic search tools and the interactive
-                // question tool ride along on the bridge and are pre-allowed
-                // (they are gated inside trouve).
+        if turn.mcp_bridge.is_some() {
+            // Preserve Claude's model-optimized core execution dialect while
+            // removing its competing command/skill/agent/plugin surface.
+            // Trouve's explicit MCP server is the only supplemental source.
+            cmd.args(["--setting-sources", ""])
+                .args(["--settings", r#"{"disableAllHooks":true}"#])
+                .arg("--disable-slash-commands")
+                .arg("--no-chrome")
+                .args(["--prompt-suggestions", "false"])
+                .env("CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS", "1")
+                .env("CLAUDE_CODE_AUTO_CONNECT_IDE", "false")
+                .env("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1")
+                .env("CLAUDE_CODE_DISABLE_AGENT_VIEW", "1")
+                .env("CLAUDE_CODE_DISABLE_ARTIFACT", "1")
+                .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
+                .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
+                .env("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1")
+                .env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1")
+                .env("CLAUDE_CODE_DISABLE_CRON", "1")
+                .env("CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS", "1")
+                .env("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1")
+                .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                .env("CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", "1")
+                .env("CLAUDE_CODE_DISABLE_POLICY_SKILLS", "1")
+                .env("CLAUDE_CODE_DISABLE_WORKFLOWS", "1")
+                .env("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
+            if !turn.tool_free {
                 cmd.args([
-                    "--allowedTools",
-                    "mcp__trouve__search,mcp__trouve__find_related,mcp__trouve__ask_question",
-                ]);
+                    "--tools",
+                    "Bash,Edit,Write,NotebookEdit,Read,Glob,Grep,WebFetch,WebSearch",
+                ])
+                .args(["--allowedTools", "mcp__trouve"])
+                .args(["--permission-prompt-tool", "mcp__trouve__approval_prompt"]);
             }
-            // Even Yolo routes through the engine: it auto-approves normal
-            // calls but still enforces the session-worktree boundary.
-            cmd.args(["--permission-prompt-tool", "mcp__trouve__approval_prompt"]);
         }
         match turn.permission {
             BackendPermission::Yolo => {
-                // Direct backend use may have no embedded bridge. Preserve
+                // Direct adapter use may have no embedded bridge. Preserve
                 // Yolo semantics in that degraded case; normal engine turns
                 // have a bridge and auto-approve through its path guard.
                 if turn.mcp_bridge.is_none() {
@@ -930,13 +1083,7 @@ impl ClaudeBackend {
             // definite mutators are additionally unavailable outright, so
             // the model doesn't waste turns on doomed requests.
             BackendPermission::ReadOnly => {
-                let vendor_tools_stand_down = turn
-                    .mcp_bridge
-                    .as_ref()
-                    .is_some_and(|bridge| bridge.bridge_tools);
-                if !vendor_tools_stand_down {
-                    cmd.args(["--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit"]);
-                }
+                cmd.args(["--disallowedTools", "Write,Edit,NotebookEdit"]);
             }
             BackendPermission::Ask => {}
         }
@@ -1015,6 +1162,8 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
                         .map(|name| trouve_protocol::CommandInfo {
                             name: name.to_string(),
                             description: String::new(),
+                            kind: trouve_protocol::CommandKind::Prompt,
+                            usage: format!("/{name}"),
                         })
                         .collect(),
                 });
@@ -1608,6 +1757,58 @@ cat >/dev/null
     }
 
     #[test]
+    fn bridge_credentials_are_redacted_but_still_affect_process_reuse() {
+        let mut turn = turn("claude-fable-5", "thinking_level", "high");
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1/internal/threads/th_1/mcp".into(),
+            headers: vec![("Authorization".into(), "Bearer bridge-secret-a".into())],
+        });
+
+        let debug = format!("{turn:?}");
+        assert!(debug.contains("Authorization"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("bridge-secret-a"));
+
+        let first = config_fingerprint(&turn).unwrap();
+        assert!(!first.contains("bridge-secret-a"));
+        turn.mcp_bridge.as_mut().unwrap().headers[0].1 = "Bearer bridge-secret-b".into();
+        let second = config_fingerprint(&turn).unwrap();
+        assert!(!second.contains("bridge-secret-b"));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn equivalent_bridge_header_order_keeps_the_process_fingerprint() {
+        let mut turn = turn("claude-fable-5", "thinking_level", "high");
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1/internal/threads/th_1/mcp".into(),
+            headers: vec![
+                ("X-Trouve-Context".into(), "thread".into()),
+                ("Authorization".into(), "Bearer bridge-secret".into()),
+            ],
+        });
+
+        let first = config_fingerprint(&turn).unwrap();
+        turn.mcp_bridge.as_mut().unwrap().headers.reverse();
+        assert_eq!(first, config_fingerprint(&turn).unwrap());
+    }
+
+    #[test]
+    fn duplicate_bridge_header_names_are_rejected() {
+        let mut turn = turn("claude-fable-5", "thinking_level", "high");
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1/internal/threads/th_1/mcp".into(),
+            headers: vec![
+                ("Authorization".into(), "Bearer first".into()),
+                ("authorization".into(), "Bearer second".into()),
+            ],
+        });
+
+        let error = config_fingerprint(&turn).unwrap_err();
+        assert!(error.to_string().contains("duplicate Trouve bridge header"));
+    }
+
+    #[test]
     fn adaptive_models_use_cli_effort_flag() {
         let mut cmd = tokio::process::Command::new("claude");
         let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
@@ -1654,6 +1855,16 @@ cat >/dev/null
             .and_then(|(_, value)| value)
             .map(|value| value.to_string_lossy().into_owned());
         assert_eq!(disabled.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn parses_claude_cli_versions_for_surface_certification() {
+        assert_eq!(
+            parse_cli_version("2.1.201 (Claude Code)"),
+            Some((2, 1, 201))
+        );
+        assert_eq!(parse_cli_version("claude v3.0.4-beta"), Some((3, 0, 4)));
+        assert_eq!(parse_cli_version("unknown"), None);
     }
 
     fn rfc3339_in(secs: i64) -> String {

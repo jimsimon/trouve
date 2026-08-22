@@ -148,7 +148,21 @@ impl ThreadProjection {
                 });
                 self.indexes.open_compactions.insert(*turn, idx);
             }
-            Event::CommandsUpdated { commands } => self.snapshot.commands = commands.clone(),
+            Event::CommandsUpdated { commands } | Event::CommandCatalogUpdated { commands } => {
+                self.snapshot.commands = commands.clone();
+            }
+            Event::CommandExecuted {
+                name,
+                arguments,
+                output,
+            } => {
+                self.split_thinking();
+                self.push(ThreadViewItem::Command {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    output: output.clone(),
+                });
+            }
             Event::QueueUpdated { prompts } => self.snapshot.queue = prompts.clone(),
             Event::TodosUpdated { todos } => {
                 let turn = self.active_turn();
@@ -613,6 +627,19 @@ impl ThreadProjection {
         }
     }
 
+    /// Preserve the active-turn thinking state while closing its current
+    /// display block at an independent command boundary. A later delta starts
+    /// a new block after the command instead of being appended before it.
+    fn split_thinking(&mut self) {
+        if let Some(idx) = self.indexes.latest_thinking.take()
+            && let Some(ThreadViewItem::Thinking { turn, complete, .. }) =
+                self.snapshot.items.get_mut(idx)
+        {
+            *complete = true;
+            self.indexes.open_thinking.remove(turn);
+        }
+    }
+
     fn finish_progress(&mut self, turn: u64) {
         if let Some(idx) = self.indexes.open_progress.remove(&turn)
             && let Some(ThreadViewItem::Progress { complete, .. }) =
@@ -727,6 +754,7 @@ impl ThreadProjection {
                 }
                 ThreadViewItem::User { .. }
                 | ThreadViewItem::Steered { .. }
+                | ThreadViewItem::Command { .. }
                 | ThreadViewItem::Subagent { .. }
                 | ThreadViewItem::Assistant { .. }
                 | ThreadViewItem::TodoUpdate { .. }
@@ -1791,6 +1819,54 @@ mod tests {
         assert!(matches!(
             projection.snapshot.items.last(),
             Some(ThreadViewItem::Thinking { complete: true, .. })
+        ));
+    }
+
+    #[test]
+    fn deterministic_command_does_not_finish_an_active_model_thought() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantThinking {
+                turn: 4,
+                text: "Still reasoning.".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            5,
+            Event::CommandExecuted {
+                name: "status".into(),
+                arguments: String::new(),
+                output: "Ready".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            3,
+            10,
+            Event::AssistantThinking {
+                turn: 4,
+                text: "Continuing after the command.".into(),
+            },
+        ));
+
+        assert!(projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::Thinking { complete: true, .. })
+        ));
+        assert!(matches!(
+            projection.snapshot.items.get(1),
+            Some(ThreadViewItem::Command { name, .. }) if name == "status"
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::Thinking {
+                content,
+                complete: false,
+                ..
+            }) if content == "Continuing after the command."
         ));
     }
 
