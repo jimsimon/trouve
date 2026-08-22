@@ -184,23 +184,21 @@ export class TrouveModelOptionsEditor extends LitElement {
             <select
               aria-label=${control.label}
               aria-describedby=${descriptionId}
+              .value=${live(overridden ? String(control.selected) : "")}
               ?disabled=${this.disabled}
               @change=${(event: Event) => {
                 const select = event.currentTarget as HTMLSelectElement;
-                const selected = select.selectedOptions[0];
                 this.#emit(
                   control.key,
-                  selected?.dataset["modelDefault"] === "true"
-                    ? undefined
-                    : select.value === "true",
+                  select.value === "" ? undefined : select.value === "true",
                 );
               }}
             >
-              <option value="" data-model-default="true" .selected=${!overridden}>
+              <option value="" data-model-default="true">
                 Model default · ${control.selected ? "On" : "Off"}
               </option>
-              <option value="true" .selected=${overridden && control.selected}>On</option>
-              <option value="false" .selected=${overridden && !control.selected}>Off</option>
+              <option value="true">On</option>
+              <option value="false">Off</option>
             </select>
             ${control.description === ""
               ? nothing
