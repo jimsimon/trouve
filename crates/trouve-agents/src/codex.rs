@@ -1497,13 +1497,13 @@ fn turn_stream(
             _ = cancel.cancelled() => {
                 cancelled = true;
             }
-            _ = tx.closed() => {
-                client_gone = true;
-            }
             _ = overload_signal.wait() => {
                 route_overloaded = true;
             }
             _ = process_route => {}
+            _ = tx.closed() => {
+                client_gone = true;
+            }
             _ = close_signal.wait() => {
                 route_closed = true;
             }

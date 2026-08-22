@@ -1775,6 +1775,58 @@ cat > /dev/null
 }
 
 #[tokio::test]
+async fn codex_adapter_releases_completed_thread_when_queued_terminal_races_stream_drop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-terminal-drop",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # turn/start
+# Queue completion before acknowledging turn/start so it is already routed
+# when the exposed stream is returned to the caller.
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+IFS= read -r cleanup
+printf '%s\n' "$cleanup" > "$0.cleanup.tmp"
+mv "$0.cleanup.tmp" "$0.cleanup"
+if [[ "$cleanup" == *'"method":"thread/unsubscribe"'* ]]; then
+    echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+elif [[ "$cleanup" == *'"method":"turn/interrupt"'* ]]; then
+    echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+fi
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    drop(stream);
+
+    let deadline = std::time::Duration::from_secs(2);
+    let cleanup_path = std::path::PathBuf::from(format!("{stub}.cleanup"));
+    tokio::time::timeout(deadline, async {
+        while !cleanup_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queued terminal cleanup must reach the app-server");
+
+    let cleanup: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cleanup_path).unwrap()).unwrap();
+    assert_eq!(cleanup["method"], "thread/unsubscribe");
+    assert_eq!(cleanup["params"]["threadId"], "thr-1");
+}
+
+#[tokio::test]
 async fn codex_adapter_keeps_cancelled_stream_open_until_interrupt_is_acknowledged() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
