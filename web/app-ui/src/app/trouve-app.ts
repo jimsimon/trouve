@@ -57,6 +57,7 @@ import {
   MAX_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENTS,
+  PendingAttachmentOperations,
   pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
@@ -257,6 +258,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   );
   readonly #hostClient =
     deployment === "desktop" ? new HostClient(globalThis.location.origin) : undefined;
+  readonly #pendingVideoOpens = new PendingAttachmentOperations();
   readonly #desktopCoordinator = this.#hostClient === undefined
     ? undefined
     : new DesktopHostCoordinator(this.#hostClient, {
@@ -2566,8 +2568,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.requestUpdate();
         return;
       }
-      void this.#pendingVideoAttachment(event.detail)
-        .then((attachment) => host.openVideoAttachment(attachment))
+      const pending = this.#pendingVideoOpens.run(event.detail.source, async () => {
+        const attachment = await this.#pendingVideoAttachment(event.detail);
+        await host.openVideoAttachment(attachment);
+      });
+      if (pending === undefined) return;
+      void pending
         .catch((error: unknown) => {
           this.#shellNotice = error instanceof HostClientError && error.kind === "video-capacity"
             ? "Temporary video playback capacity is full. Restart trouve to open a different video."

@@ -102,7 +102,7 @@ impl VideoPlaybackCache {
     }
 
     fn open(&mut self, attachment: &NativeAttachment) -> Result<(), VideoAttachmentOpenError> {
-        self.open_with(attachment, |path| opener::open(path))
+        self.open_with(attachment, |path| opener::open_confirmed(path))
     }
 
     fn open_with<F>(

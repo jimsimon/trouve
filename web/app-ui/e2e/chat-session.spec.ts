@@ -1669,6 +1669,89 @@ test("lazy video thumbnails defer media requests until they approach the viewpor
   );
 });
 
+test("stale lazy-video observers cannot activate a replacement source", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.addInitScript(() => {
+    type ObserverRecord = {
+      readonly callback: IntersectionObserverCallback;
+      readonly observer: IntersectionObserver;
+      disconnected: boolean;
+    };
+    const observers: ObserverRecord[] = [];
+    class ControllableIntersectionObserver {
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+      readonly record: ObserverRecord;
+
+      constructor(callback: IntersectionObserverCallback) {
+        this.record = {
+          callback,
+          observer: this as unknown as IntersectionObserver,
+          disconnected: false,
+        };
+        observers.push(this.record);
+      }
+
+      disconnect(): void {
+        this.record.disconnected = true;
+      }
+
+      observe(): void {}
+      unobserve(): void {}
+      takeRecords(): IntersectionObserverEntry[] {
+        return [];
+      }
+    }
+    Object.defineProperty(globalThis, "IntersectionObserver", {
+      value: ControllableIntersectionObserver,
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, "__trouveVideoObservers", {
+      value: observers,
+      configurable: true,
+    });
+  });
+  await page.goto("/");
+
+  const state = await page.evaluate(async () => {
+    const preview = document.createElement("trouve-image-preview");
+    preview.source = "/v1/attachments/first-video";
+    preview.name = "first.mp4";
+    preview.mime = "video/mp4";
+    preview.video = true;
+    preview.lazy = true;
+    document.body.append(preview);
+    await preview.updateComplete;
+    preview.source = "/v1/attachments/second-video";
+    await preview.updateComplete;
+
+    const observers = (globalThis as typeof globalThis & {
+      __trouveVideoObservers: Array<{
+        callback: IntersectionObserverCallback;
+        observer: IntersectionObserver;
+        disconnected: boolean;
+      }>;
+    }).__trouveVideoObservers;
+    const first = observers[0];
+    const second = observers[1];
+    if (first === undefined || second === undefined) throw new Error("missing observers");
+    first.callback([{ isIntersecting: true } as IntersectionObserverEntry], first.observer);
+    await preview.updateComplete;
+    return {
+      observerCount: observers.length,
+      replacementDisconnected: second.disconnected,
+      source: preview.renderRoot.querySelector("video")?.getAttribute("src") ?? null,
+    };
+  });
+
+  expect(state).toEqual({
+    observerCount: 2,
+    replacementDisconnected: false,
+    source: null,
+  });
+});
+
 test("video thumbnails restore their media source after reconnecting", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/");

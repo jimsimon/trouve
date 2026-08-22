@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   isVideoMime,
+  PendingAttachmentOperations,
   pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "./attachments.js";
@@ -12,6 +13,24 @@ const attachment = (mime: string, data = "iVBORw0KGgo="): PendingAttachment => (
 });
 
 describe("pending attachment previews", () => {
+  it("coalesces duplicate attachment operations until the first settles", async () => {
+    const operations = new PendingAttachmentOperations();
+    let resolve!: () => void;
+    const first = operations.run("video-source", () => new Promise<void>((done) => {
+      resolve = done;
+    }));
+
+    expect(first).toBeDefined();
+    expect(operations.run("video-source", async () => {})).toBeUndefined();
+    const other = operations.run("other-source", async () => {});
+    expect(other).toBeDefined();
+    await other;
+    resolve();
+    await first;
+    await Promise.resolve();
+    expect(operations.run("video-source", async () => {})).toBeDefined();
+  });
+
   it("builds a local data URL for safely typed images", () => {
     const pending = attachment("image/PNG");
     expect(pendingAttachmentPreviewUrl(pending)).toBe(

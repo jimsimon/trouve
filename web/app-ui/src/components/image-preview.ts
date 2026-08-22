@@ -406,14 +406,16 @@ export class TrouveImagePreview extends LitElement {
     this.#releaseVideoPreview();
     if (!this.video || this.source === "") return;
     if (this.lazy && "IntersectionObserver" in globalThis) {
-      this.#videoObserver = new IntersectionObserver((entries) => {
+      const observer = new IntersectionObserver((entries) => {
+        if (this.#videoObserver !== observer) return;
         if (!entries.some((entry) => entry.isIntersecting)) return;
-        this.#videoObserver?.disconnect();
+        observer.disconnect();
         this.#videoObserver = undefined;
         this.#videoPreviewSource = this.source;
         this.requestUpdate();
       }, { rootMargin: "200px" });
-      this.#videoObserver.observe(this);
+      this.#videoObserver = observer;
+      observer.observe(this);
       return;
     }
     this.#videoPreviewSource = this.source;

@@ -9,6 +9,22 @@ export interface PendingAttachment {
   readonly size: number;
 }
 
+/** Coalesces repeated attachment actions until their first operation settles. */
+export class PendingAttachmentOperations {
+  readonly #pending = new Map<string, Promise<unknown>>();
+
+  run<T>(key: string, operation: () => Promise<T>): Promise<T> | undefined {
+    if (this.#pending.has(key)) return undefined;
+    const pending = operation();
+    this.#pending.set(key, pending);
+    const finish = (): void => {
+      if (this.#pending.get(key) === pending) this.#pending.delete(key);
+    };
+    void pending.then(finish, finish);
+    return pending;
+  }
+}
+
 const previewUrls = new WeakMap<PendingAttachment, string>();
 
 const PREVIEWABLE_VIDEO_MIMES = new Set([

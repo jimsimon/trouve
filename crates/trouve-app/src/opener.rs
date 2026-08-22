@@ -17,6 +17,15 @@ pub fn open(path: impl AsRef<OsStr>) -> Result<(), String> {
     enqueue(path.as_ref().to_owned())
 }
 
+/// Open a path and report whether the system launcher accepted it.
+///
+/// Video playback uses this completion-aware variant so a failed association
+/// does not look successful or retain an unusable cache entry. The launcher
+/// process is short-lived; the external player remains independent.
+pub fn open_confirmed(path: impl AsRef<OsStr>) -> Result<(), String> {
+    open_and_reap(path.as_ref()).map_err(|error| error.to_string())
+}
+
 fn enqueue(request: OsString) -> Result<(), String> {
     let Some(sender) = WORKER.get_or_init(start_worker) else {
         return Err("system opener worker is unavailable".into());
