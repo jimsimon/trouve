@@ -7598,7 +7598,6 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "trouve-process",
  "zip",
 ]
 
