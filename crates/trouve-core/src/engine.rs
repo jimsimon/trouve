@@ -1878,6 +1878,9 @@ pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     pub(crate) config_dir: Option<PathBuf>,
+    /// Repository identity is stable for a registered workspace. Cache it so
+    /// the frequently-read workspace list does not spawn Git on every poll.
+    workspace_list_cache: Mutex<HashMap<String, WorkspaceListItem>>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute newly released or account-specific live models.
@@ -2320,6 +2323,7 @@ impl Engine {
             store,
             data_dir,
             config_dir,
+            workspace_list_cache: Mutex::new(HashMap::new()),
             model_catalog,
             providers: RwLock::new(providers),
             injected_providers: Mutex::new(injected_providers),
@@ -7311,7 +7315,7 @@ impl Engine {
 
     // --- workspaces ---------------------------------------------------------
 
-    fn workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
+    fn resolve_workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
         let repository = Path::new(&workspace.path);
         let remote_identity = git::remote_url(repository, "origin")
             .and_then(|remote| crate::github::parse_remote(&remote));
@@ -7343,6 +7347,28 @@ impl Engine {
         }
     }
 
+    fn refresh_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
+        let item = Self::resolve_workspace_list_item(workspace);
+        self.workspace_list_cache
+            .lock()
+            .unwrap()
+            .insert(item.id.clone(), item.clone());
+        item
+    }
+
+    fn cached_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
+        if let Some(item) = self
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get(&workspace.id)
+            .cloned()
+        {
+            return item;
+        }
+        self.refresh_workspace_list_item(workspace)
+    }
+
     pub fn register_workspace(
         &self,
         path: &str,
@@ -7372,7 +7398,7 @@ impl Engine {
                     },
                 )?;
             }
-            return Ok(Self::workspace_list_item(existing));
+            return Ok(self.refresh_workspace_list_item(existing));
         }
         let workspace = Workspace {
             id: new_id("ws"),
@@ -7392,7 +7418,7 @@ impl Engine {
                 path: path_str,
             },
         )?;
-        Ok(Self::workspace_list_item(workspace))
+        Ok(self.refresh_workspace_list_item(workspace))
     }
 
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>, EngineError> {
@@ -7400,7 +7426,7 @@ impl Engine {
             .store
             .list_workspaces()?
             .into_iter()
-            .map(Self::workspace_list_item)
+            .map(|workspace| self.cached_workspace_list_item(workspace))
             .collect())
     }
 
@@ -7594,6 +7620,7 @@ impl Engine {
                 },
             )?;
         }
+        self.workspace_list_cache.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -21675,10 +21702,10 @@ default_permission_mode = "ask"
     }
 
     #[test]
-    fn workspace_list_items_share_normalized_remote_identity() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        for repository in [first.path(), second.path()] {
+    fn workspace_list_items_cache_normalized_remote_identity() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        for repository in [first_directory.path(), second_directory.path()] {
             let mut init = std::process::Command::new("git");
             init.args(["init", "-b", "main"]).arg(repository);
             assert!(trouve_process::output(&mut init).unwrap().status.success());
@@ -21704,15 +21731,31 @@ default_permission_mode = "ask"
             &Config::default(),
         );
         let first = engine
-            .register_workspace(first.path().to_str().unwrap(), Some("first clone".into()))
+            .register_workspace(
+                first_directory.path().to_str().unwrap(),
+                Some("first clone".into()),
+            )
             .unwrap();
         let second = engine
-            .register_workspace(second.path().to_str().unwrap(), Some("second clone".into()))
+            .register_workspace(
+                second_directory.path().to_str().unwrap(),
+                Some("second clone".into()),
+            )
             .unwrap();
 
         assert_eq!(first.repository_key, second.repository_key);
         assert_eq!(first.repository_name.as_deref(), Some("Widgets"));
         assert_eq!(second.repository_name.as_deref(), Some("Widgets"));
+
+        drop(first_directory);
+        drop(second_directory);
+        let listed = engine.list_workspaces().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .all(|workspace| workspace.repository_key == first.repository_key)
+        );
     }
 
     #[test]
