@@ -1,16 +1,18 @@
-import { css, html, LitElement, nothing } from "lit";
+import { css, html, LitElement, nothing, type PropertyValues } from "lit";
 
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 /**
- * A thumbnail that opens the complete, uncropped attachment in a modal image
- * viewer. The control is shared by durable and in-progress attachment chips so
- * their interaction stays consistent across every composer surface.
+ * A media thumbnail shared by durable and in-progress attachment chips.
+ * Images open in a gallery scoped to their nearest attachment list. Videos
+ * request external playback so the desktop app can use the system player.
  */
 export class TrouveImagePreview extends LitElement {
   static override properties = {
     source: { type: String },
     name: { type: String },
+    mime: { type: String },
+    video: { type: Boolean, reflect: true },
     lazy: { type: Boolean },
   };
 
@@ -41,13 +43,15 @@ export class TrouveImagePreview extends LitElement {
       outline: 2px solid var(--trouve-accent);
       outline-offset: 1px;
     }
-    .image-preview-trigger img {
+    .image-preview-trigger img,
+    .image-preview-trigger video {
       width: 100%;
       height: 100%;
       display: block;
       object-fit: cover;
       background: var(--trouve-code-bg);
     }
+    .image-preview-trigger video { pointer-events: none; }
     .image-preview-affordance {
       position: absolute;
       inset: 0;
@@ -86,7 +90,7 @@ export class TrouveImagePreview extends LitElement {
       min-width: 0;
       min-height: 38px;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       align-items: center;
       gap: 12px;
       border-bottom: 1px solid var(--trouve-border);
@@ -98,6 +102,12 @@ export class TrouveImagePreview extends LitElement {
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .image-preview-counter {
+      color: var(--trouve-text-dim);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
     .image-preview-close {
@@ -118,12 +128,41 @@ export class TrouveImagePreview extends LitElement {
       outline-offset: 1px;
     }
     .image-preview-viewport {
+      position: relative;
       max-width: calc(100vw - 34px);
       max-height: calc(100dvh - 72px);
       display: grid;
       place-items: center;
       overflow: auto;
       background: var(--trouve-code-bg);
+    }
+    .image-preview-navigation {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px;
+      pointer-events: none;
+    }
+    .image-preview-navigation button {
+      width: 36px;
+      height: 36px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(255, 255, 255, .28);
+      border-radius: 50%;
+      padding: 0;
+      color: white;
+      background: rgba(0, 0, 0, .58);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, .32);
+      cursor: pointer;
+      pointer-events: auto;
+    }
+    .image-preview-navigation button:hover { background: rgba(0, 0, 0, .76); }
+    .image-preview-navigation button:focus-visible {
+      outline: 2px solid var(--trouve-accent);
+      outline-offset: 2px;
     }
     .image-preview-full {
       width: auto;
@@ -140,69 +179,155 @@ export class TrouveImagePreview extends LitElement {
 
   source = "";
   name = "";
+  mime = "";
+  video = false;
   lazy = false;
   #viewerOpen = false;
+  #gallery: readonly { readonly source: string; readonly name: string }[] = [];
+  #galleryIndex = 0;
   #returnFocus: HTMLElement | undefined;
+  #videoPreviewSource = "";
+  #videoObserver: IntersectionObserver | undefined;
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    if (!this.hasUpdated) return;
+    this.#configureVideoPreview();
+    this.requestUpdate();
+  }
+
+  protected override willUpdate(changed: PropertyValues<this>): void {
+    super.willUpdate(changed);
+    if (
+      changed.has("source")
+      || changed.has("mime")
+      || changed.has("video")
+      || changed.has("lazy")
+    ) {
+      this.#configureVideoPreview();
+    }
+  }
+
+  override disconnectedCallback(): void {
+    this.#releaseVideoPreview();
+    super.disconnectedCallback();
+  }
 
   override render() {
     const label = this.name.trim() === "" ? "image attachment" : this.name;
+    const current = this.#gallery[this.#galleryIndex] ?? {
+      source: this.source,
+      name: label,
+    };
+    const multiple = this.#gallery.length > 1;
     return html`
       <button
         class="image-preview-trigger"
         type="button"
-        aria-label=${`View full-size image: ${label}`}
-        title=${`View full-size image: ${label}`}
+        aria-label=${this.video
+          ? `Open video in external player: ${label}`
+          : `View full-size image: ${label}`}
+        title=${this.video
+          ? `Open video in external player: ${label}`
+          : `View full-size image: ${label}`}
         @click=${this.#openViewer}
       >
-        <img
-          src=${this.source}
-          alt=${`Preview of ${label}`}
-          loading=${this.lazy ? "lazy" : nothing}
-          decoding="async"
-        />
+        ${this.video
+          ? html`<video
+              src=${this.#videoPreviewSource === "" ? nothing : this.#videoPreviewSource}
+              preload="metadata"
+              muted
+              playsinline
+              aria-hidden="true"
+            ></video>`
+          : html`<img
+              src=${this.source}
+              alt=${`Preview of ${label}`}
+              loading=${this.lazy ? "lazy" : nothing}
+              decoding="async"
+            />`}
         <span class="image-preview-affordance" aria-hidden="true">
-          ${fontAwesomeIcon("magnifying-glass")}
+          ${fontAwesomeIcon(this.video ? "play" : "magnifying-glass")}
         </span>
       </button>
-      <dialog
-        aria-label=${`Full-size preview of ${label}`}
-        @cancel=${this.#cancelViewer}
-        @close=${this.#viewerClosed}
-        @click=${this.#closeFromBackdrop}
-      >
-        ${this.#viewerOpen
-          ? html`
-              <figure>
-                <figcaption>
-                  <strong title=${label}>${label}</strong>
-                  <button
-                    class="image-preview-close"
-                    type="button"
-                    aria-label="Close image preview"
-                    title="Close"
-                    @click=${this.#closeViewer}
-                  >${fontAwesomeIcon("xmark")}</button>
-                </figcaption>
-                <div class="image-preview-viewport">
-                  <img
-                    class="image-preview-full"
-                    src=${this.source}
-                    alt=${`Full-size preview of ${label}`}
-                    decoding="async"
-                  />
-                </div>
-              </figure>
-            `
-          : nothing}
-      </dialog>
+      ${this.video
+        ? nothing
+        : html`<dialog
+            aria-label=${`Full-size preview of ${current.name}`}
+            @cancel=${this.#cancelViewer}
+            @close=${this.#viewerClosed}
+            @click=${this.#closeFromBackdrop}
+            @keydown=${this.#viewerKeydown}
+          >
+            ${this.#viewerOpen
+              ? html`
+                  <figure>
+                    <figcaption>
+                      <strong title=${current.name}>${current.name}</strong>
+                      ${multiple
+                        ? html`<span class="image-preview-counter" aria-live="polite">
+                            ${this.#galleryIndex + 1} of ${this.#gallery.length}
+                          </span>`
+                        : nothing}
+                      <button
+                        class="image-preview-close"
+                        type="button"
+                        aria-label="Close image preview"
+                        title="Close"
+                        @click=${this.#closeViewer}
+                      >${fontAwesomeIcon("xmark")}</button>
+                    </figcaption>
+                    <div class="image-preview-viewport">
+                      <img
+                        class="image-preview-full"
+                        src=${current.source}
+                        alt=${`Full-size preview of ${current.name}`}
+                        decoding="async"
+                      />
+                      ${multiple
+                        ? html`<nav class="image-preview-navigation" aria-label="Image gallery">
+                            <button
+                              type="button"
+                              aria-label="Previous image"
+                              title="Previous image"
+                              @click=${this.#previousImage}
+                            >${fontAwesomeIcon("arrow-left")}</button>
+                            <button
+                              type="button"
+                              aria-label="Next image"
+                              title="Next image"
+                              @click=${this.#nextImage}
+                            >${fontAwesomeIcon("arrow-right")}</button>
+                          </nav>`
+                        : nothing}
+                    </div>
+                  </figure>
+                `
+              : nothing}
+          </dialog>`}
     `;
   }
 
   readonly #openViewer = (event: Event): void => {
     if (this.source === "" || this.#viewerOpen) return;
+    if (this.video) {
+      this.dispatchEvent(new CustomEvent("trouve-open-video", {
+        detail: {
+          source: this.source,
+          name: this.name,
+          mime: this.mime,
+        },
+        bubbles: true,
+        composed: true,
+      }));
+      return;
+    }
     this.#returnFocus = event.currentTarget instanceof HTMLElement
       ? event.currentTarget
       : undefined;
+    const gallery = this.#imageGallery();
+    this.#gallery = gallery.items;
+    this.#galleryIndex = gallery.index;
     this.#viewerOpen = true;
     this.requestUpdate();
     void this.updateComplete.then(() => {
@@ -242,9 +367,71 @@ export class TrouveImagePreview extends LitElement {
     if (event.target === event.currentTarget) this.#closeViewer();
   };
 
+  readonly #previousImage = (): void => this.#moveGallery(-1);
+  readonly #nextImage = (): void => this.#moveGallery(1);
+
+  readonly #viewerKeydown = (event: KeyboardEvent): void => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    this.#moveGallery(event.key === "ArrowLeft" ? -1 : 1);
+  };
+
+  #moveGallery(delta: number): void {
+    if (this.#gallery.length < 2) return;
+    this.#galleryIndex = (
+      this.#galleryIndex + delta + this.#gallery.length
+    ) % this.#gallery.length;
+    this.requestUpdate();
+  }
+
+  #imageGallery(): {
+    readonly items: readonly { readonly source: string; readonly name: string }[];
+    readonly index: number;
+  } {
+    const attachmentList = this.closest(".attachment-list");
+    const previews = attachmentList === null
+      ? [this]
+      : [...attachmentList.querySelectorAll<TrouveImagePreview>("trouve-image-preview")];
+    const images = previews.filter((preview) => !preview.video && preview.source !== "");
+    return {
+      items: images.map((preview) => ({
+        source: preview.source,
+        name: preview.name.trim() === "" ? "image attachment" : preview.name,
+      })),
+      index: Math.max(0, images.indexOf(this)),
+    };
+  }
+
+  #configureVideoPreview(): void {
+    this.#releaseVideoPreview();
+    if (!this.video || this.source === "") return;
+    if (this.lazy && "IntersectionObserver" in globalThis) {
+      const observer = new IntersectionObserver((entries) => {
+        if (this.#videoObserver !== observer) return;
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        observer.disconnect();
+        this.#videoObserver = undefined;
+        this.#videoPreviewSource = this.source;
+        this.requestUpdate();
+      }, { rootMargin: "200px" });
+      this.#videoObserver = observer;
+      observer.observe(this);
+      return;
+    }
+    this.#videoPreviewSource = this.source;
+  }
+
+  #releaseVideoPreview(): void {
+    this.#videoObserver?.disconnect();
+    this.#videoObserver = undefined;
+    this.#videoPreviewSource = "";
+  }
+
   #finishClose(restoreFocus: boolean): void {
     const returnFocus = this.#returnFocus;
     this.#viewerOpen = false;
+    this.#gallery = [];
+    this.#galleryIndex = 0;
     this.#returnFocus = undefined;
     this.requestUpdate();
     if (restoreFocus && returnFocus?.isConnected === true) returnFocus.focus();
@@ -254,6 +441,14 @@ export class TrouveImagePreview extends LitElement {
 customElements.define("trouve-image-preview", TrouveImagePreview);
 
 declare global {
+  interface HTMLElementEventMap {
+    "trouve-open-video": CustomEvent<{
+      readonly source: string;
+      readonly name: string;
+      readonly mime: string;
+    }>;
+  }
+
   interface HTMLElementTagNameMap {
     "trouve-image-preview": TrouveImagePreview;
   }
