@@ -288,6 +288,20 @@ export interface CandidateRejection {
   reason: string;
 }
 
+export interface UnadjudicatedCandidate {
+  candidate_id: string;
+  task_id: string;
+  reviewer_id: string;
+  reviewer_name: string;
+  path: string;
+  line: number;
+  side: string;
+  severity: string;
+  confidence?: string;
+  title: string;
+  body: string;
+}
+
 export interface RoutingReason {
   source: RoutingSource;
   detail: string;
@@ -309,6 +323,7 @@ export interface JobDetail {
   findings: Finding[];
   themes?: ReviewTheme[];
   candidate_rejections?: CandidateRejection[];
+  unadjudicated_candidates?: UnadjudicatedCandidate[];
   routing_decisions?: RoutingDecision[];
   summary: string;
   prompt_for_agents: string;

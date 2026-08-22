@@ -161,6 +161,8 @@ dd { margin: 5px 0 0; }
 .candidate-rejection header span, .candidate-rejection > div { color: var(--muted); font-size: 11px; }
 .candidate-rejection p { margin: 8px 0; line-height: 1.5; }
 .candidate-rejection > div b { color: var(--text); }
+.candidate-decisions.unresolved { border-color: color-mix(in srgb, var(--amber) 55%, var(--line-soft)); }
+.candidate-unadjudicated { border-left-color: var(--amber); }
 .decision-note { padding: 11px 12px; border-radius: 7px; background: var(--surface-2); color: var(--muted); font-size: 12px; }
 .routing-decisions { margin-top: 13px; border: 1px solid var(--line-soft); border-radius: 8px; background: #0e131d; }
 .routing-decisions > summary { display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px; cursor: pointer; }
