@@ -7736,12 +7736,6 @@ impl Engine {
         item
     }
 
-    fn refresh_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
-        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
-        let _refresh = refresh_lock.lock().unwrap();
-        self.cache_workspace_list_item(Self::resolve_workspace_list_item(workspace))
-    }
-
     fn cached_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
         self.cached_workspace_list_item_with(workspace, Self::resolve_workspace_list_item)
     }
@@ -7777,11 +7771,11 @@ impl Engine {
         self.cache_workspace_list_item(resolve(workspace))
     }
 
-    pub fn register_workspace(
+    fn prepare_workspace_registration(
         &self,
         path: &str,
         name: Option<String>,
-    ) -> Result<WorkspaceListItem, EngineError> {
+    ) -> Result<(Workspace, WorkspaceListItem, bool), EngineError> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| EngineError::BadRequest(format!("invalid path {path}: {e}")))?;
         if !git::is_git_repo(&canonical) {
@@ -7792,21 +7786,8 @@ impl Engine {
         }
         let path_str = canonical.to_string_lossy().to_string();
         if let Some(existing) = self.store.workspace_by_path(&path_str)? {
-            if self.store.set_workspace_closed(&existing.id, false)? {
-                for session in self.store.list_sessions(Some(&existing.id))? {
-                    if !session.archived {
-                        self.terminals.reopen_session(&session.id);
-                    }
-                }
-                self.store.append_event(
-                    Scope::Server,
-                    Event::WorkspaceRegistered {
-                        workspace_id: existing.id.clone(),
-                        path: path_str,
-                    },
-                )?;
-            }
-            return Ok(self.refresh_workspace_list_item(existing));
+            let item = Self::resolve_workspace_list_item(existing.clone());
+            return Ok((existing, item, true));
         }
         let workspace = Workspace {
             id: new_id("ws"),
@@ -7818,15 +7799,85 @@ impl Engine {
             }),
             path: path_str.clone(),
         };
-        self.store.insert_workspace(&workspace)?;
-        self.store.append_event(
-            Scope::Server,
-            Event::WorkspaceRegistered {
-                workspace_id: workspace.id.clone(),
-                path: path_str,
-            },
-        )?;
-        Ok(self.refresh_workspace_list_item(workspace))
+        let item = Self::resolve_workspace_list_item(workspace.clone());
+        Ok((workspace, item, false))
+    }
+
+    fn commit_workspace_registration(
+        &self,
+        workspace: Workspace,
+        item: WorkspaceListItem,
+        existing: bool,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        if existing {
+            if self.store.set_workspace_closed(&workspace.id, false)? {
+                for session in self.store.list_sessions(Some(&workspace.id))? {
+                    if !session.archived {
+                        self.terminals.reopen_session(&session.id);
+                    }
+                }
+                self.store.append_event(
+                    Scope::Server,
+                    Event::WorkspaceRegistered {
+                        workspace_id: workspace.id.clone(),
+                        path: workspace.path,
+                    },
+                )?;
+            }
+        } else {
+            self.store.insert_workspace(&workspace)?;
+            self.store.append_event(
+                Scope::Server,
+                Event::WorkspaceRegistered {
+                    workspace_id: workspace.id.clone(),
+                    path: workspace.path,
+                },
+            )?;
+        }
+        Ok(self.cache_workspace_list_item(item))
+    }
+
+    pub fn register_workspace(
+        &self,
+        path: &str,
+        name: Option<String>,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        let (workspace, item, existing) = self.prepare_workspace_registration(path, name)?;
+        self.commit_workspace_registration(workspace, item, existing)
+    }
+
+    pub(crate) fn register_review_workspace(
+        &self,
+        path: &str,
+        name: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &Mutex<()>,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        self.register_review_workspace_with(path, name, cancel, commit_fence, || {})
+    }
+
+    fn register_review_workspace_with(
+        &self,
+        path: &str,
+        name: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &Mutex<()>,
+        before_commit: impl FnOnce(),
+    ) -> Result<WorkspaceListItem, EngineError> {
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let (workspace, item, existing) = self.prepare_workspace_registration(path, name)?;
+        before_commit();
+        let _commit = commit_fence.lock().unwrap();
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        self.commit_workspace_registration(workspace, item, existing)
     }
 
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>, EngineError> {
@@ -22469,6 +22520,34 @@ default_permission_mode = "ask"
         assert!(items.iter().all(|item| {
             item.repository_key.as_deref() == Some("remote:github.com/acme/widgets")
         }));
+    }
+
+    #[test]
+    fn cancelled_review_workspace_registration_does_not_commit() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let error = engine
+            .register_review_workspace_with(
+                repository.path().to_str().unwrap(),
+                Some("cancelled review".into()),
+                &cancel,
+                &Mutex::new(()),
+                || cancel.cancel(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().starts_with("stale:"));
+        assert!(engine.list_workspaces().unwrap().is_empty());
     }
 
     #[test]
