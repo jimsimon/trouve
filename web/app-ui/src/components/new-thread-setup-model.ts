@@ -120,13 +120,10 @@ export const newThreadModelOptionControls = (
     catalog.providers,
     { modeId: draft.modeId, modelId: draft.modelId },
   );
-  const options = {
-    ...(thinking === undefined || defaults.thinking === ""
-      ? {}
-      : { [thinking.key]: defaults.thinking }),
-    ...draft.modelOptions,
-  };
-  return modelOptionControls(model, options);
+  const inheritedOptions = thinking === undefined || defaults.thinking === ""
+    ? {}
+    : { [thinking.key]: defaults.thinking };
+  return modelOptionControls(model, draft.modelOptions, inheritedOptions);
 };
 
 /** Show the concrete server defaults instead of inheritance placeholders. */

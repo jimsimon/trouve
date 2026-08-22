@@ -47,6 +47,28 @@ test("model-option choices preserve selected state and scalar value types", asyn
         minimum: 4,
         maximum: 16,
       },
+      {
+        kind: "choice",
+        key: "tone",
+        label: "Tone",
+        description: "Optional response tone.",
+        overridden: true,
+        choices: [
+          { label: "Empty", value: "" },
+          { label: "Concise", value: "concise" },
+        ],
+        selectedIndex: 1,
+      },
+      {
+        kind: "text",
+        key: "instructions",
+        label: "Instructions",
+        description: "Additional model instructions.",
+        overridden: true,
+        scalarType: "string",
+        text: "Existing",
+        hint: "Optional instructions",
+      },
     ];
     const changes: unknown[] = [];
     editor.addEventListener("trouve-model-option-changed", (event) => {
@@ -60,7 +82,9 @@ test("model-option choices preserve selected state and scalar value types", asyn
   const editor = page.locator("#model-options-editor-fixture");
   const context = editor.getByLabel("Context window");
   const fast = editor.getByLabel("Fast mode");
-  const budget = editor.getByLabel("Thinking budget");
+  const budget = editor.getByRole("spinbutton", { name: "Thinking budget", exact: true });
+  const tone = editor.getByLabel("Tone");
+  const instructions = editor.getByRole("textbox", { name: "Instructions", exact: true });
   await expect(context).toHaveValue("1000000");
   await expect(fast).toHaveValue("false");
   await expect(budget).toHaveAttribute("aria-describedby", /model-option-description-/);
@@ -70,20 +94,33 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await budget.fill("3.5");
   await budget.press("Tab");
   await expect(budget).toHaveValue("8");
+  await tone.selectOption({ label: "Empty" });
+  await instructions.fill("");
+  await instructions.press("Tab");
+  await instructions.fill("   ");
+  await instructions.press("Tab");
 
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges,
   )).toEqual([
     { key: "context_window", value: 300_000 },
     { key: "fast", value: true },
+    { key: "tone", value: "" },
+    { key: "instructions", value: "" },
+    { key: "instructions", value: "   " },
   ]);
 
   await context.selectOption({ label: "Model default · 1M" });
+  await editor.getByLabel("Use model default for Instructions").click();
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges,
   )).toEqual([
     { key: "context_window", value: 300_000 },
     { key: "fast", value: true },
+    { key: "tone", value: "" },
+    { key: "instructions", value: "" },
+    { key: "instructions", value: "   " },
     { key: "context_window", value: undefined },
+    { key: "instructions", value: undefined },
   ]);
 });

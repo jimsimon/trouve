@@ -53,7 +53,7 @@ describe("root shell parity wiring", () => {
     expect(source).toContain('name="mode"');
     expect(source).toContain("<trouve-model-options-editor");
     expect(source).toContain(".controls=${newSessionModelOptions}");
-    expect(source).toContain("changeModelOption(\n                        this.#newSessionModelOptions,");
+    expect(source).toContain("applyNewSessionModelOptionChange({");
     expect(source).toContain('name="permission_mode"');
     expect(source).toContain(
       'this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current)',

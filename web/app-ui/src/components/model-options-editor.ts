@@ -45,7 +45,7 @@ export class TrouveModelOptionsEditor extends LitElement {
       gap: 8px;
     }
     * { box-sizing: border-box; }
-    label, .boolean-option {
+    label, .boolean-option, .text-option {
       min-width: 0;
       display: grid;
       align-content: start;
@@ -54,7 +54,8 @@ export class TrouveModelOptionsEditor extends LitElement {
       font-size: 10px;
       font-weight: 600;
     }
-    :host([compact]) label, :host([compact]) .boolean-option {
+    :host([compact]) label, :host([compact]) .boolean-option,
+    :host([compact]) .text-option {
       width: 118px;
       flex: none;
       gap: 2px;
@@ -83,6 +84,16 @@ export class TrouveModelOptionsEditor extends LitElement {
       border-color: var(--trouve-border);
     }
     button { cursor: pointer; }
+    .text-option-control {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 4px;
+    }
+    .reset-option {
+      width: 30px;
+      padding-inline: 4px;
+    }
     button[aria-pressed="true"] {
       border-color: var(--trouve-accent);
       color: var(--trouve-accent-tint);
@@ -134,18 +145,19 @@ export class TrouveModelOptionsEditor extends LitElement {
               ?disabled=${this.disabled}
               @change=${(event: Event) => {
                 const select = event.currentTarget as HTMLSelectElement;
-                if (select.value === "") {
+                const selected = select.selectedOptions[0];
+                if (selected?.dataset["modelDefault"] === "true") {
                   this.#emit(control.key, undefined);
                   return;
                 }
-                const choiceIndex = Number(select.selectedOptions[0]?.dataset["choiceIndex"]);
+                const choiceIndex = Number(selected?.dataset["choiceIndex"]);
                 const choice = Number.isInteger(choiceIndex)
                   ? control.choices[choiceIndex]
                   : undefined;
                 if (choice !== undefined) this.#emit(control.key, choice.value);
               }}
             >
-              <option value="" .selected=${!overridden}>
+              <option value="" data-model-default="true" .selected=${!overridden}>
                 Model default${control.selectedIndex < 0
                   ? ""
                   : ` · ${control.choices[control.selectedIndex]?.label ?? ""}`}
@@ -174,11 +186,17 @@ export class TrouveModelOptionsEditor extends LitElement {
               aria-describedby=${descriptionId}
               ?disabled=${this.disabled}
               @change=${(event: Event) => {
-                const value = (event.currentTarget as HTMLSelectElement).value;
-                this.#emit(control.key, value === "" ? undefined : value === "true");
+                const select = event.currentTarget as HTMLSelectElement;
+                const selected = select.selectedOptions[0];
+                this.#emit(
+                  control.key,
+                  selected?.dataset["modelDefault"] === "true"
+                    ? undefined
+                    : select.value === "true",
+                );
               }}
             >
-              <option value="" .selected=${!overridden}>
+              <option value="" data-model-default="true" .selected=${!overridden}>
                 Model default · ${control.selected ? "On" : "Off"}
               </option>
               <option value="true" .selected=${overridden && control.selected}>On</option>
@@ -191,61 +209,75 @@ export class TrouveModelOptionsEditor extends LitElement {
         `;
       }
       return html`
-        <label title=${this.compact ? control.description : nothing}>
+        <div class="text-option" title=${this.compact ? control.description : nothing}>
           <span class="option-label">${control.label}</span>
-          <input
-            aria-label=${control.label}
-            aria-describedby=${descriptionId}
-            type=${control.scalarType === "string" ? "text" : "number"}
-            step=${control.scalarType === "integer" ? "1" : "any"}
-            min=${control.minimum ?? nothing}
-            max=${control.maximum ?? nothing}
-            placeholder=${control.hint}
-            .value=${control.text}
-            ?disabled=${this.disabled}
-            @input=${(event: Event) =>
-              (event.currentTarget as HTMLInputElement).setCustomValidity("")}
-            @keydown=${(event: KeyboardEvent) => {
-              if (event.key !== "Tab" && event.key !== "Enter") return;
-              const input = event.currentTarget as HTMLInputElement;
-              if (!textInputValueIsValid(control, input.value.trim())) {
+          <div class="text-option-control">
+            <input
+              aria-label=${control.label}
+              aria-describedby=${descriptionId}
+              type=${control.scalarType === "string" ? "text" : "number"}
+              step=${control.scalarType === "integer" ? "1" : "any"}
+              min=${control.minimum ?? nothing}
+              max=${control.maximum ?? nothing}
+              placeholder=${control.hint}
+              .value=${control.text}
+              ?disabled=${this.disabled}
+              @input=${(event: Event) =>
+                (event.currentTarget as HTMLInputElement).setCustomValidity("")}
+              @keydown=${(event: KeyboardEvent) => {
+                if (event.key !== "Tab" && event.key !== "Enter") return;
+                const input = event.currentTarget as HTMLInputElement;
+                if (!textInputValueIsValid(control, input.value.trim())) {
+                  input.value = control.text;
+                }
+              }}
+              @blur=${(event: FocusEvent) => {
+                const input = event.currentTarget as HTMLInputElement;
+                if (!textInputValueIsValid(control, input.value.trim())) {
+                  input.value = control.text;
+                }
+              }}
+              @change=${(event: Event) => {
+                const input = event.currentTarget as HTMLInputElement;
+                const raw = control.scalarType === "string"
+                  ? input.value
+                  : input.value.trim();
+                if (control.scalarType === "string") {
+                  this.#emit(control.key, raw);
+                  return;
+                }
+                if (raw === "") {
+                  this.#emit(control.key, undefined);
+                  return;
+                }
+                const value = Number(raw);
+                const valid = textInputValueIsValid(control, raw);
+                if (valid) {
+                  input.setCustomValidity("");
+                  this.#emit(control.key, value);
+                  return;
+                }
                 input.value = control.text;
-              }
-            }}
-            @blur=${(event: FocusEvent) => {
-              const input = event.currentTarget as HTMLInputElement;
-              if (!textInputValueIsValid(control, input.value.trim())) {
-                input.value = control.text;
-              }
-            }}
-            @change=${(event: Event) => {
-              const input = event.currentTarget as HTMLInputElement;
-              const raw = input.value.trim();
-              if (raw === "") {
-                this.#emit(control.key, undefined);
-                return;
-              }
-              if (control.scalarType === "string") {
-                this.#emit(control.key, raw);
-                return;
-              }
-              const value = Number(raw);
-              const valid = textInputValueIsValid(control, raw);
-              if (valid) {
+                input.setCustomValidity(`Enter a valid ${control.scalarType} ${control.hint}.`);
+                input.reportValidity();
                 input.setCustomValidity("");
-                this.#emit(control.key, value);
-                return;
-              }
-              input.value = control.text;
-              input.setCustomValidity(`Enter a valid ${control.scalarType} ${control.hint}.`);
-              input.reportValidity();
-              input.setCustomValidity("");
-            }}
-          />
+              }}
+            />
+            ${control.overridden
+              ? html`<button
+                  class="reset-option"
+                  type="button"
+                  title="Use model default"
+                  aria-label=${`Use model default for ${control.label}`}
+                  ?disabled=${this.disabled}
+                  @click=${() => this.#emit(control.key, undefined)}
+                >↺</button>`
+              : nothing}
+          </div>
           ${control.description === ""
             ? nothing
             : html`<small id=${descriptionId}>${control.description}</small>`}
-        </label>
+        </div>
       `;
     });
   }

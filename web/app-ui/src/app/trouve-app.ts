@@ -113,6 +113,7 @@ import { AppStore } from "../state/app-store.js";
 import { createSignal, readSignal, withSignalTracking } from "../state/reactivity.js";
 import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
+  applyNewSessionModelOptionChange,
   beginNewSessionSubmission,
   beginNewSessionOptionLoad,
   canSubmitNewSession,
@@ -170,8 +171,6 @@ import {
 import { pickAndRegisterWorkspace } from "../components/workspace-settings-model.js";
 import { modelHealthPresentations } from "../components/model-health.js";
 import {
-  changeModelOption,
-  isThinkingModelOption,
   modelOptionControls,
   sanitizeModelOptions,
   type ModelOptionChangeDetail,
@@ -2775,12 +2774,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const newSessionThinkingOption = thinkingOption(effectiveNewSessionModelInfo);
     const newSessionModelOptions = modelOptionControls(
       effectiveNewSessionModelInfo,
-      {
-        ...(newSessionThinkingOption === undefined || this.#newSessionThinking === ""
-          ? {}
-          : { [newSessionThinkingOption.key]: this.#newSessionThinking }),
-        ...this.#newSessionModelOptions,
-      },
+      this.#newSessionModelOptions,
+      newSessionThinkingOption === undefined || this.#newSessionThinking === ""
+        ? {}
+        : { [newSessionThinkingOption.key]: this.#newSessionThinking },
     );
     const newSessionOptionsLoading = newSessionOptionsAreLoading(
       this.#newSessionOptionsLifecycle,
@@ -3386,28 +3383,39 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     @trouve-model-option-changed=${(
                       event: CustomEvent<ModelOptionChangeDetail>,
                     ) => {
-                      this.#newSessionModelOptions = changeModelOption(
-                        this.#newSessionModelOptions,
-                        event.detail,
+                      const defaults = resolveNewThreadDefaults(
+                        this.#newSessionModes,
+                        newSessionModels,
+                        this.#newSessionProviders,
+                        {
+                          modeId: this.#newSessionModeId,
+                          modelId: this.#newSessionModelId,
+                        },
                       );
+                      const inheritance = newThreadInheritanceForWorkspace(
+                        defaults,
+                        newSessionOptionsCatalogWorkspaceId(
+                          this.#newSessionOptionsLifecycle,
+                        ),
+                        this.#newSessionWorkspaceId,
+                      );
+                      const updated = applyNewSessionModelOptionChange({
+                        modelOptions: this.#newSessionModelOptions,
+                        thinking: this.#newSessionThinking,
+                        inheritedThinking: this.#newSessionInheritedThinking,
+                        change: event.detail,
+                        defaults: {
+                          thinking: defaults.thinking,
+                          inheritedThinking: inheritance.inheritedThinking,
+                        },
+                      });
+                      this.#newSessionModelOptions = updated.modelOptions;
+                      this.#newSessionThinking = updated.thinking;
+                      this.#newSessionInheritedThinking = updated.inheritedThinking;
                       this.#newSessionOptionEdits = {
                         ...this.#newSessionOptionEdits,
-                        thinking: true,
+                        thinking: updated.hasOverrides,
                       };
-                      if (isThinkingModelOption(event.detail.key)) {
-                        this.#newSessionThinking = event.detail.value === undefined
-                          ? resolveNewThreadDefaults(
-                              this.#newSessionModes,
-                              newSessionModels,
-                              this.#newSessionProviders,
-                              {
-                                modeId: this.#newSessionModeId,
-                                modelId: this.#newSessionModelId,
-                              },
-                            ).thinking
-                          : String(event.detail.value);
-                        this.#newSessionInheritedThinking = undefined;
-                      }
                       this.requestUpdate();
                     }}
                   ></trouve-model-options-editor>`}

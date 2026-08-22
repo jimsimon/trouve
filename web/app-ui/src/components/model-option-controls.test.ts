@@ -138,6 +138,12 @@ describe("model option controls", () => {
     }), { thinking_level: "high", reasoning_effort: "invalid" })[0]).toMatchObject({
       selectedIndex: 0,
     });
+    expect(modelOptionControls(model({
+      reasoning_effort: { enum: ["low", "high"], default: "low" },
+    }), {}, { thinking_level: "high" })[0]).toMatchObject({
+      selectedIndex: 1,
+      overridden: false,
+    });
     expect(sanitizeModelOptions(model({
       reasoning_effort: { enum: ["low", "high"] },
     }), { thinking_level: "high", reasoning_effort: "invalid" })).toEqual({

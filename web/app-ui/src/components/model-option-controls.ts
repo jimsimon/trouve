@@ -267,6 +267,7 @@ const validTextValue = (
 export const modelOptionControls = (
   model: ProtocolModelInfo | null | undefined,
   options: Readonly<Record<string, unknown>> | undefined,
+  inheritedOptions: Readonly<Record<string, unknown>> = {},
 ): readonly ModelOptionControl[] => {
   const schema = asRecord(model?.options_schema);
   const properties = asRecord(schema?.["properties"]);
@@ -291,7 +292,11 @@ export const modelOptionControls = (
     const description = typeof property["description"] === "string"
       ? property["description"]
       : "";
-    const stored = storedOption(current, key);
+    const explicit = storedOption(current, key);
+    const inherited = storedOption(inheritedOptions, key);
+    const stored = explicit.overridden
+      ? explicit
+      : { value: inherited.value, overridden: false };
     const selected = key === "thinking_budget_tokens"
       && typeof stored.value === "string"
       && stored.value.trim() !== ""

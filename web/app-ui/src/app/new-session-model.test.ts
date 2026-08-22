@@ -6,6 +6,7 @@ import type {
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
 import {
+  applyNewSessionModelOptionChange,
   beginNewSessionSubmission,
   beginNewSessionOptionLoad,
   canSubmitNewSession,
@@ -870,6 +871,37 @@ describe("new session model", () => {
       session_id: "session-1",
       mode: "code",
     });
+  });
+
+  it("restores inherited thinking provenance when an override returns to default", () => {
+    const reset = applyNewSessionModelOptionChange({
+      modelOptions: { effort: "low" },
+      thinking: "low",
+      inheritedThinking: undefined,
+      change: { key: "effort", value: undefined },
+      defaults: { thinking: "high", inheritedThinking: "high" },
+    });
+    expect(reset).toEqual({
+      modelOptions: {},
+      thinking: "high",
+      inheritedThinking: "high",
+      hasOverrides: false,
+    });
+
+    const modelInfo = model({
+      properties: {
+        effort: { type: "string", enum: ["low", "high"], default: "low" },
+      },
+    });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      thinking: reset.thinking,
+      ...(reset.inheritedThinking === undefined
+        ? {}
+        : { inheritedThinking: reset.inheritedThinking }),
+      modelOptions: reset.modelOptions,
+      modelInfo,
+    })).toEqual({ session_id: "session-1" });
   });
 
   it("omits empty fields and unadvertised thinking values", () => {
