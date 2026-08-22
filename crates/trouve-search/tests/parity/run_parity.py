@@ -11,7 +11,7 @@ Usage:
   python3 crates/trouve-search/tests/parity/run_parity.py --binary target/release/trouve-search \
       [--reference reference/semble] [--skip-search]
 
-The search comparison downloads the potion-code-16M model; pass --skip-search
+The search comparison downloads the potion-code-16M-v2 model; pass --skip-search
 for offline runs.
 """
 
@@ -132,9 +132,15 @@ def parity_tokenize(binary: Path, reference: Path) -> int:
 
 def parity_bm25(binary: Path, reference: Path) -> int:
     sys.path.insert(0, str(reference / "src"))
-    import bm25s  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
     from semble.tokens import tokenize  # noqa: PLC0415
+
+    try:
+        from semble.index.bm25 import BM25  # noqa: PLC0415
+    except ImportError:
+        # Semble <=0.5.1 used bm25s directly.
+        BM25 = None
+        import bm25s  # noqa: PLC0415
 
     docs: list[str] = []
     for path in sample_files(reference, limit=25):
@@ -142,8 +148,15 @@ def parity_bm25(binary: Path, reference: Path) -> int:
         docs.extend(text[i : i + 700] for i in range(0, min(len(text), 3500), 700))
     corpus_tokens = [tokenize(d) for d in docs]
 
-    retriever = bm25s.BM25()
-    retriever.index(corpus_tokens, show_progress=False)
+    if BM25 is None:
+        retriever = bm25s.BM25()
+        retriever.index(corpus_tokens, show_progress=False)
+    else:
+        retriever = BM25()
+        chunk_ids = [str(i) for i in range(len(corpus_tokens))]
+        for chunk_id, tokens in zip(chunk_ids, corpus_tokens, strict=True):
+            retriever.add_document(chunk_id, tokens)
+        retriever.set_doc_order(chunk_ids)
 
     queries = ["tokenize identifiers", "chunk boundary merge", "def search", "index cache"]
     failures = 0

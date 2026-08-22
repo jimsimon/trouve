@@ -7459,6 +7459,7 @@ dependencies = [
  "clap",
  "criterion",
  "dirs",
+ "fs4",
  "half",
  "hf-hub 0.5.0",
  "ignore",

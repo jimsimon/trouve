@@ -1,8 +1,9 @@
 //! BM25 sparse retrieval.
 //!
-//! Reimplementation of the parts of `bm25s` used by upstream Semble: the
-//! "lucene" scoring variant with k1=1.5, b=0.75, plus `enrich_for_bm25`
-//! from `semble/index/sparse.py`.
+//! Reimplementation of Semble's BM25 scoring: the "lucene" variant with
+//! k1=1.5, b=0.75, plus path enrichment from `semble/index/create.py`.
+//! Older Semble releases delegated scoring to `bm25s`; current releases use
+//! `semble/index/bm25.py`.
 //!
 //! Note that production indexing does not call [`enrich_for_bm25`]: it
 //! tokenizes chunk content and path enrichment separately (see
@@ -184,6 +185,14 @@ impl Bm25Index {
         }
     }
 
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.term_blob.owned_bytes()
+            + self.term_offsets.owned_bytes()
+            + self.posting_offsets.owned_bytes()
+            + self.postings.owned_bytes()
+            + self.doc_lengths.owned_bytes()
+    }
+
     /// Borrow the flat parts for serialization (snapshot save path).
     #[allow(clippy::type_complexity)]
     pub fn flat_parts(&self) -> (&[u8], &[u32], &[u64], &[Posting], &[u32]) {
@@ -217,7 +226,7 @@ impl Bm25Index {
 
     /// Return BM25 scores for all documents given query tokens; documents
     /// excluded by `mask` (when provided) score 0. Duplicate query tokens are
-    /// counted multiple times, matching `bm25s.get_scores`.
+    /// counted multiple times, matching Semble's `BM25.get_scores`.
     pub fn get_scores(&self, query_tokens: &[String], mask: Option<&[bool]>) -> Vec<f32> {
         let num_docs = self.num_docs();
         let mut scores = vec![0.0f32; num_docs];

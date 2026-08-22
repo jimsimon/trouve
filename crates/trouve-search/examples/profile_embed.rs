@@ -13,7 +13,7 @@ fn main() {
     let model_id = args
         .next()
         .or_else(|| std::env::var("TROUVE_MODEL_NAME").ok())
-        .unwrap_or_else(|| "minishlab/potion-code-16M".to_string());
+        .unwrap_or_else(|| trouve_search::utils::DEFAULT_MODEL_NAME.to_string());
 
     // Collect chunk texts the same way the indexer does.
     let index = {
