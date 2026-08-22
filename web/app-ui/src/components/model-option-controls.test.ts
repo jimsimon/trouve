@@ -262,6 +262,7 @@ describe("model option controls", () => {
     ]) expect(modelOptionTextValueIsValid(control, raw)).toBe(true);
     for (const raw of [
       "0.1234567890123456789",
+      "9007199254740993",
       "1e-324",
       "3e-324",
     ]) expect(modelOptionTextValueIsValid(control, raw)).toBe(false);
