@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  canRetryFinalEditor,
   codeReviewSettingsDraft,
   codeReviewSettingsRequest,
   codeReviewStatusClass,
@@ -150,25 +149,6 @@ describe("code-review dashboard model", () => {
     expect(safeCodeReviewHref("javascript:alert(1)")).toBeUndefined();
     expect(safeCodeReviewHref("/relative/pull/42")).toBeUndefined();
     expect(safeCodeReviewHref("https://user:secret@github.com/pull/42")).toBeUndefined();
-  });
-
-  it("offers scoped final-editor retry only after every reviewer finishes", () => {
-    expect(canRetryFinalEditor({
-      status: "failed",
-      progress: { completed_reviewers: 3, total_reviewers: 3 },
-    })).toBe(true);
-    expect(canRetryFinalEditor({
-      status: "cancelled",
-      progress: { completed_reviewers: 3, total_reviewers: 3 },
-    })).toBe(true);
-    expect(canRetryFinalEditor({
-      status: "failed",
-      progress: { completed_reviewers: 2, total_reviewers: 3 },
-    })).toBe(false);
-    expect(canRetryFinalEditor({
-      status: "succeeded",
-      progress: { completed_reviewers: 3, total_reviewers: 3 },
-    })).toBe(false);
   });
 
   it("converts minute settings to protocol seconds", () => {

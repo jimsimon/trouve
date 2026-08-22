@@ -2151,11 +2151,13 @@ impl Engine {
         let cursor = self
             .store
             .latest_event_cursor(&trouve_protocol::Scope::Server)?;
+        let (jobs, final_editor_retryable_job_ids) = self.store.code_review_dashboard_jobs(100)?;
         let dashboard = CodeReviewDashboard {
             app: self.github_app_status()?,
             reviewers: self.code_review_reviewer_catalog()?,
             repositories: self.store.list_code_review_repositories()?,
-            jobs: self.store.list_code_review_jobs(100)?,
+            jobs,
+            final_editor_retryable_job_ids,
         };
         Ok((cursor, dashboard))
     }

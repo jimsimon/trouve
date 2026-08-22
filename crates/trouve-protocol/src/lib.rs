@@ -296,7 +296,9 @@ pub use requests::*;
 // pull-request diff so clients can distinguish review-level comments.
 // 7.11: a failed or cancelled final review editor can be retried independently,
 // retaining successful reviewer task outputs (additive).
-pub const PROTOCOL_VERSION: &str = "7.11";
+// 7.12: code-review jobs expose the server-authoritative final-editor retry
+// capability derived from their latest durable task attempts (additive).
+pub const PROTOCOL_VERSION: &str = "7.12";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

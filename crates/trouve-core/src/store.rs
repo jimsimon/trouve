@@ -3106,6 +3106,7 @@ pub struct CodeReviewManualRequest {
 #[derive(Debug, Clone)]
 pub struct CodeReviewJobRecord {
     pub job: trouve_protocol::CodeReviewJob,
+    pub can_retry_final_editor: bool,
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub summary: String,
@@ -3251,6 +3252,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
+        can_retry_final_editor: r.get(56)?,
         prompt: r.get(12)?,
         reviewers,
         summary: r.get(36)?,
@@ -3272,7 +3274,37 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
-     review_published, blocking_review_cleanup_pending, publication_dispatched";
+     review_published, blocking_review_cleanup_pending, publication_dispatched, \
+     CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
+            AND code_review_jobs.session_id IS NULL \
+            AND EXISTS ( \
+              SELECT 1 FROM code_review_tasks AS coordinator \
+              WHERE coordinator.job_id = code_review_jobs.id \
+                AND coordinator.role = 'coordinator' \
+                AND coordinator.status IN ('failed', 'cancelled') \
+                AND NOT EXISTS ( \
+                  SELECT 1 FROM code_review_tasks AS newer_coordinator \
+                  WHERE newer_coordinator.job_id = coordinator.job_id \
+                    AND newer_coordinator.role = 'coordinator' \
+                    AND newer_coordinator.rowid > coordinator.rowid \
+                ) \
+            ) \
+            AND NOT EXISTS ( \
+              SELECT 1 FROM code_review_tasks AS reviewer \
+              WHERE reviewer.job_id = code_review_jobs.id \
+                AND reviewer.role = 'reviewer' \
+                AND reviewer.reviewer_id IS NOT NULL \
+                AND reviewer.status NOT IN ('succeeded', 'not_applicable', 'superseded') \
+                AND NOT EXISTS ( \
+                  SELECT 1 FROM code_review_tasks AS newer_reviewer \
+                  WHERE newer_reviewer.job_id = reviewer.job_id \
+                    AND newer_reviewer.role = 'reviewer' \
+                    AND newer_reviewer.reviewer_id = reviewer.reviewer_id \
+                    AND newer_reviewer.batch_index = reviewer.batch_index \
+                    AND newer_reviewer.rowid > reviewer.rowid \
+                ) \
+            ) \
+          THEN 1 ELSE 0 END AS can_retry_final_editor";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -8704,6 +8736,33 @@ impl Store {
         status: Option<&str>,
         repository: Option<&str>,
     ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
+        Ok(self
+            .list_code_review_job_records_filtered(limit, status, repository)?
+            .into_iter()
+            .map(|record| record.job)
+            .collect())
+    }
+
+    pub fn code_review_dashboard_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<trouve_protocol::CodeReviewJob>, Vec<String>)> {
+        let records = self.list_code_review_job_records_filtered(limit, None, None)?;
+        let retryable_job_ids = records
+            .iter()
+            .filter(|record| record.can_retry_final_editor)
+            .map(|record| record.job.id.clone())
+            .collect();
+        let jobs = records.into_iter().map(|record| record.job).collect();
+        Ok((jobs, retryable_job_ids))
+    }
+
+    fn list_code_review_job_records_filtered(
+        &self,
+        limit: usize,
+        status: Option<&str>,
+        repository: Option<&str>,
+    ) -> Result<Vec<CodeReviewJobRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs
@@ -8721,8 +8780,7 @@ impl Store {
             params![status, repository, limit as i64],
             row_to_code_review_job,
         )?;
-        let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(records.into_iter().map(|record| record.job).collect())
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn code_review_jobs_with_projection_errors(
@@ -22066,6 +22124,13 @@ mod tests {
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.personas[0].completed_batches, 3);
+        assert!(
+            !store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .can_retry_final_editor
+        );
         assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
         assert!(detail.tasks.iter().any(|task| task.id == "rvt_z_old"));
         assert!(detail.tasks.iter().any(|task| task.id == cancelled.id));
@@ -22101,6 +22166,16 @@ mod tests {
         store
             .finish_code_review_job(&queued.id, "failed", "", "final editor timed out")
             .unwrap();
+        assert!(
+            store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .can_retry_final_editor
+        );
+        let (dashboard_jobs, retryable_job_ids) = store.code_review_dashboard_jobs(100).unwrap();
+        assert!(dashboard_jobs.iter().any(|job| job.id == queued.id));
+        assert!(retryable_job_ids.contains(&queued.id));
 
         let editor_retry = store
             .retry_code_review_final_editor(&queued.id)
@@ -22221,6 +22296,20 @@ mod tests {
         store
             .finish_code_review_job(&queued.id, "failed", "", "retry failed")
             .unwrap();
+        assert!(
+            !store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .can_retry_final_editor
+        );
+        assert!(
+            !store
+                .code_review_dashboard_jobs(100)
+                .unwrap()
+                .1
+                .contains(&queued.id)
+        );
         let cancelled_router = store
             .code_review_tasks(&queued.id)
             .unwrap()
@@ -22344,6 +22433,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cancelled.job.status, "cancelled");
+        assert!(
+            store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .can_retry_final_editor
+        );
         assert_eq!(cancelled.updated_tasks.len(), 1);
         assert_eq!(cancelled.updated_tasks[0].id, queued_coordinator.id);
         assert_eq!(cancelled.updated_tasks[0].status, "cancelled");

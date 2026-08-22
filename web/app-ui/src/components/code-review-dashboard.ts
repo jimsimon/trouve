@@ -9,7 +9,6 @@ import type {
 } from "../services/protocol-client.js";
 import {
   canCancelCodeReviewJob,
-  canRetryFinalEditor,
   canRetryCodeReviewJob,
   CODE_REVIEW_STATUS_FILTERS,
   codeReviewSettingsDraft,
@@ -39,6 +38,7 @@ import "./code-review-configuration.js";
 
 const CODE_REVIEW_REFRESH_MS = 30_000;
 const CODE_REVIEW_RETRY_MS = 5_000;
+const RETRY_WHOLE_REVIEW_TITLE = "Starts a replacement review with current repository settings";
 
 interface PendingJobAction {
   readonly action: CodeReviewJobAction;
@@ -548,6 +548,9 @@ export class TrouveCodeReviewDashboard extends LitElement {
       this.#groupOrder,
     );
     const visibleRepositories = groups.map((group) => group.repository);
+    const finalEditorRetryableJobIds = new Set(
+      dashboard.final_editor_retryable_job_ids ?? [],
+    );
     const statusCounts = new Map<string, number>();
     for (const job of dashboard.jobs) {
       statusCounts.set(job.status, (statusCounts.get(job.status) ?? 0) + 1);
@@ -629,7 +632,8 @@ export class TrouveCodeReviewDashboard extends LitElement {
                         >${fontAwesomeIcon("arrow-down")}</button>
                       </span>
                     </header>
-                    <div class="job-list">${group.jobs.map((job) => this.#renderJob(job))}</div>
+                    <div class="job-list">${group.jobs.map((job) =>
+                      this.#renderJob(job, finalEditorRetryableJobIds))}</div>
                   </section>
                   ${dropTarget && this.#dropAfter ? placeholder : nothing}
                 `;
@@ -638,9 +642,9 @@ export class TrouveCodeReviewDashboard extends LitElement {
     `;
   }
 
-  #renderJob(job: ProtocolCodeReviewJob) {
+  #renderJob(job: ProtocolCodeReviewJob, finalEditorRetryableJobIds: ReadonlySet<string>) {
     const active = canCancelCodeReviewJob(job.status);
-    const finalEditorRetryable = canRetryFinalEditor(job);
+    const finalEditorRetryable = finalEditorRetryableJobIds.has(job.id);
     const progress = job.progress;
     const percent = Math.max(0, Math.min(100, progress?.percent ?? (active ? 0 : 100)));
     const pending = this.#pendingAction?.jobId === job.id ? this.#pendingAction : undefined;
@@ -683,14 +687,14 @@ export class TrouveCodeReviewDashboard extends LitElement {
             ${active
               ? html`
                   <button class="compact danger" type="button" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "cancel")}>${busy ? "Working…" : "Cancel"}</button>
-                  <button class="compact" type="button" title="Starts a replacement review with current repository settings" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>Cancel & retry</button>
+                  <button class="compact" type="button" title=${RETRY_WHOLE_REVIEW_TITLE} ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>Cancel & retry</button>
                 `
               : canRetryCodeReviewJob(job.status)
                 ? html`
                     ${finalEditorRetryable
                       ? html`<button class="compact" type="button" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "final-editor")}>${busy ? "Retrying…" : "Retry final editor"}</button>`
                       : nothing}
-                    <button class="compact" type="button" title="Starts a replacement review with current repository settings" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>${busy ? "Retrying…" : "Retry whole review"}</button>
+                    <button class="compact" type="button" title=${RETRY_WHOLE_REVIEW_TITLE} ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>${busy ? "Retrying…" : "Retry whole review"}</button>
                   `
                 : nothing}
           </div>

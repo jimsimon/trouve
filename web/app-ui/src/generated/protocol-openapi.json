@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.11"
+    "version": "7.12"
   },
   "paths": {
     "/v1/approvals": {
@@ -5542,6 +5542,13 @@
         "properties": {
           "app": {
             "$ref": "#/components/schemas/GithubAppStatus"
+          },
+          "final_editor_retryable_job_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Job ids for which the server will accept a scoped retry of the latest\nfailed or cancelled final-editor attempt while retaining reviewer output."
           },
           "jobs": {
             "type": "array",

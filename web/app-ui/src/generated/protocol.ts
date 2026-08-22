@@ -1970,6 +1970,11 @@ export interface components {
         };
         CodeReviewDashboard: {
             app: components["schemas"]["GithubAppStatus"];
+            /**
+             * @description Job ids for which the server will accept a scoped retry of the latest
+             *     failed or cancelled final-editor attempt while retaining reviewer output.
+             */
+            final_editor_retryable_job_ids?: string[];
             jobs: components["schemas"]["CodeReviewJob"][];
             repositories: components["schemas"]["CodeReviewRepository"][];
             reviewers: components["schemas"]["ReviewerProfile"][];
