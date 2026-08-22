@@ -22,9 +22,7 @@ const textInputValueIsValid = (
     && (raw === String(value)
       || raw.split(/[eE]/u)[0]!
         .replace(/\D/gu, "").replace(/^0+|0+$/gu, "").length <= 15)
-    && (!Number.isInteger(value)
-      ? control.scalarType !== "integer"
-      : Number.isSafeInteger(value))
+    && (control.scalarType !== "integer" || Number.isSafeInteger(value))
     && (control.minimum === undefined || value >= control.minimum)
     && (control.maximum === undefined || value <= control.maximum);
 };

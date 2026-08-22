@@ -232,6 +232,9 @@ describe("model option controls", () => {
     expect(sanitizeModelOptions(advertised, {
       editable_integer: 9_007_199_254_740_992,
     })).toEqual({});
+    expect(sanitizeModelOptions(model({
+      large_number: { type: "number" },
+    }), { large_number: 1e20 })).toEqual({ large_number: 1e20 });
   });
 
   it("applies and removes overrides without retaining a duplicate legacy key", () => {

@@ -265,8 +265,7 @@ const validTextValue = (
 ): boolean => {
   if (type === "string") return typeof value === "string";
   if (typeof value !== "number" || !Number.isFinite(value)) return false;
-  if (Number.isInteger(value) && !Number.isSafeInteger(value)) return false;
-  if (type === "integer" && !Number.isInteger(value)) return false;
+  if (type === "integer" && !Number.isSafeInteger(value)) return false;
   return (minimum === undefined || value >= minimum)
     && (maximum === undefined || value <= maximum);
 };
