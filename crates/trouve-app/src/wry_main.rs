@@ -10,6 +10,7 @@ fn version_requested() -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    web_preview::wait_for_update_relaunch_gate()?;
     if version_requested() {
         println!("trouve {}", env!("CARGO_PKG_VERSION"));
         return Ok(());

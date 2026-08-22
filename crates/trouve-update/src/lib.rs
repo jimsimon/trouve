@@ -8,6 +8,8 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -101,6 +103,57 @@ pub enum InstallProgress {
     Verifying,
     Extracting,
     Installing,
+}
+
+const INSTALL_CANCELLABLE: u8 = 0;
+const INSTALL_CANCELLED: u8 = 1;
+const INSTALL_COMMITTED: u8 = 2;
+
+/// Synchronizes a host cancellation request with the irreversible executable
+/// replacement commit point.
+#[derive(Debug, Default)]
+pub struct InstallCancellation {
+    state: AtomicU8,
+}
+
+impl InstallCancellation {
+    /// Request cancellation. Returns false once executable replacement has
+    /// committed, at which point the host must stay alive until installation
+    /// reports its terminal result.
+    pub fn request_cancel(&self) -> bool {
+        match self.state.compare_exchange(
+            INSTALL_CANCELLABLE,
+            INSTALL_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(INSTALL_CANCELLED) => true,
+            Err(INSTALL_COMMITTED) => false,
+            Err(_) => false,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == INSTALL_CANCELLED
+    }
+
+    fn commit_install(&self) -> Result<()> {
+        match self.state.compare_exchange(
+            INSTALL_CANCELLABLE,
+            INSTALL_COMMITTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(INSTALL_COMMITTED) => Ok(()),
+            Err(INSTALL_CANCELLED) => bail!("update cancelled"),
+            Err(_) => bail!("update cancellation state is invalid"),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_committed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == INSTALL_COMMITTED
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,22 +251,26 @@ pub async fn install_release_with_progress(
     release: &Release,
     progress: impl Fn(InstallProgress),
 ) -> Result<()> {
-    install_release_with_progress_and_cancel(release, progress, || false).await
+    install_release_with_progress_and_cancel(
+        release,
+        progress,
+        Arc::new(InstallCancellation::default()),
+    )
+    .await
 }
 
 /// Install a release while allowing a host to cancel before executable
-/// replacement. Cancellation is checked throughout downloads and between
-/// blocking extraction and installation.
+/// replacement. InstallCancellation atomically arbitrates cancellation
+/// against the executable replacement commit point.
 pub async fn install_release_with_progress_and_cancel(
     release: &Release,
     progress: impl Fn(InstallProgress),
-    cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    cancellation: Arc<InstallCancellation>,
 ) -> Result<()> {
     if cfg!(debug_assertions) {
         bail!("self-update is disabled for development builds");
     }
-    let cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new(cancelled);
-    ensure_not_cancelled(cancelled.as_ref())?;
+    ensure_not_cancelled(&cancellation)?;
     let client = client(env!("CARGO_PKG_VERSION"))?;
     progress(InstallProgress::FetchingChecksums);
     let checksum_text = download_text(
@@ -223,7 +280,7 @@ pub async fn install_release_with_progress_and_cancel(
         "release checksums",
     )
     .await?;
-    ensure_not_cancelled(cancelled.as_ref())?;
+    ensure_not_cancelled(&cancellation)?;
     let expected = checksum_for(&checksum_text, &release.artifact_name)?;
 
     let stage = tempfile::tempdir().context("creating update staging directory")?;
@@ -237,10 +294,10 @@ pub async fn install_release_with_progress_and_cancel(
         &archive_path,
         MAX_ARCHIVE_BYTES,
         &progress,
-        cancelled.as_ref(),
+        &cancellation,
     )
     .await?;
-    ensure_not_cancelled(cancelled.as_ref())?;
+    ensure_not_cancelled(&cancellation)?;
     progress(InstallProgress::Verifying);
     if actual != expected {
         bail!(
@@ -254,7 +311,7 @@ pub async fn install_release_with_progress_and_cancel(
     let binary_name = release.binary_name.clone();
     let archive_kind = release.archive_kind;
     let replacement_for_extract = replacement.clone();
-    ensure_not_cancelled(cancelled.as_ref())?;
+    ensure_not_cancelled(&cancellation)?;
     progress(InstallProgress::Extracting);
     tokio::task::spawn_blocking(move || {
         extract_binary(
@@ -267,11 +324,10 @@ pub async fn install_release_with_progress_and_cancel(
     .await
     .context("joining update extraction task")??;
 
-    ensure_not_cancelled(cancelled.as_ref())?;
+    ensure_not_cancelled(&cancellation)?;
     progress(InstallProgress::Installing);
-    let install_cancelled = std::sync::Arc::clone(&cancelled);
     tokio::task::spawn_blocking(move || {
-        ensure_not_cancelled(install_cancelled.as_ref())?;
+        cancellation.commit_install()?;
         self_replace::self_replace(&replacement).context("replacing the running executable")
     })
     .await
@@ -424,9 +480,9 @@ async fn download_file(
     destination: &Path,
     limit: u64,
     progress: &impl Fn(InstallProgress),
-    cancelled: &(impl Fn() -> bool + ?Sized),
+    cancellation: &InstallCancellation,
 ) -> Result<String> {
-    ensure_not_cancelled(cancelled)?;
+    ensure_not_cancelled(cancellation)?;
     let response = client
         .get(url)
         .timeout(Duration::from_secs(600))
@@ -452,7 +508,7 @@ async fn download_file(
     });
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        ensure_not_cancelled(cancelled)?;
+        ensure_not_cancelled(cancellation)?;
         let chunk = chunk.context("reading update archive")?;
         received = received
             .checked_add(chunk.len() as u64)
@@ -595,8 +651,8 @@ fn add_archive_entry_size(current: u64, entry_size: u64, limit: u64) -> Result<u
     Ok(expanded)
 }
 
-fn ensure_not_cancelled(cancelled: &(impl Fn() -> bool + ?Sized)) -> Result<()> {
-    if cancelled() {
+fn ensure_not_cancelled(cancellation: &InstallCancellation) -> Result<()> {
+    if cancellation.is_cancelled() {
         bail!("update cancelled");
     }
     Ok(())
@@ -807,12 +863,19 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_is_reported_before_installation() {
-        assert!(ensure_not_cancelled(&|| false).is_ok());
+    fn cancellation_and_install_commit_are_atomic() {
+        let cancelled = InstallCancellation::default();
+        assert!(cancelled.request_cancel());
         assert_eq!(
-            ensure_not_cancelled(&|| true).unwrap_err().to_string(),
+            cancelled.commit_install().unwrap_err().to_string(),
             "update cancelled"
         );
+
+        let committed = InstallCancellation::default();
+        committed.commit_install().unwrap();
+        assert!(committed.is_committed());
+        assert!(!committed.request_cancel());
+        assert!(!committed.is_cancelled());
     }
 
     #[test]

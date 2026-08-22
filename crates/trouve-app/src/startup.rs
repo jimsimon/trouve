@@ -3,10 +3,10 @@
 //! Product releases check and install before the embedded server and main
 //! frontend start. Development builds bypass this module entirely.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use tao::dpi::LogicalSize;
@@ -20,6 +20,9 @@ use wry::{NewWindowResponse, WebViewBuilder};
 use super::AppEvent;
 
 const UPDATE_RESTART_ENV: &str = "TROUVE_UPDATE_RESTARTED_VERSION";
+const UPDATE_RELAUNCH_GATE_ENV: &str = "TROUVE_UPDATE_RELAUNCH_GATE";
+const UPDATE_RELAUNCH_GATE_TIMEOUT: Duration = Duration::from_secs(120);
+const UPDATE_RELAUNCH_GATE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 const SPLASH_HTML: &str = r#"<!doctype html>
@@ -207,7 +210,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
         builder.build_gtk(container)?
     };
 
-    let mut preflight_cancel = Arc::new(AtomicBool::new(false));
+    let mut preflight_cancel = Arc::new(trouve_update::InstallCancellation::default());
     spawn_preflight(proxy.clone(), Arc::clone(&preflight_cancel));
     let mut result = None;
     let mut last_failure = String::new();
@@ -239,7 +242,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                 }
                 preflight_running = true;
                 last_failure.clear();
-                preflight_cancel = Arc::new(AtomicBool::new(false));
+                preflight_cancel = Arc::new(trouve_update::InstallCancellation::default());
                 render_stage(
                     &webview,
                     "Checking for updates…",
@@ -288,12 +291,21 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                 event: WindowEvent::CloseRequested,
                 ..
             } if window_id == window.id() => {
-                preflight_cancel.store(true, Ordering::Release);
-                result = Some(PreflightResult {
-                    exit_process: true,
-                    update_state: idle_state("Update cancelled."),
-                });
-                *control_flow = ControlFlow::Exit;
+                if !preflight_running || preflight_cancel.request_cancel() {
+                    result = Some(PreflightResult {
+                        exit_process: true,
+                        update_state: idle_state("Update cancelled."),
+                    });
+                    *control_flow = ControlFlow::Exit;
+                } else {
+                    render_stage(
+                        &webview,
+                        "Finishing installation…",
+                        "The update is being installed and trouve will restart when it is ready.",
+                        Some(100),
+                        false,
+                    );
+                }
             }
             _ => {}
         }
@@ -307,7 +319,10 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
     }))
 }
 
-fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>, cancelled: Arc<AtomicBool>) {
+fn spawn_preflight(
+    proxy: tao::event_loop::EventLoopProxy<AppEvent>,
+    cancelled: Arc<trouve_update::InstallCancellation>,
+) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -335,7 +350,7 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>, cancelled: 
                     return;
                 }
             };
-            if cancelled.load(Ordering::Acquire) {
+            if cancelled.is_cancelled() {
                 return;
             }
             let Some(release) = check.update else {
@@ -348,7 +363,7 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>, cancelled: 
                     },
                 );
                 std::thread::sleep(Duration::from_millis(250));
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.is_cancelled() {
                     return;
                 }
                 send(
@@ -365,11 +380,11 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>, cancelled: 
             let artifact = release.artifact_name.clone();
             let progress_proxy = proxy.clone();
             let progress_cancelled = Arc::clone(&cancelled);
-            let install_cancelled = Arc::clone(&cancelled);
+            let install_cancellation = Arc::clone(&cancelled);
             if let Err(error) = trouve_update::install_release_with_progress_and_cancel(
                 &release,
                 move |progress| {
-                    if progress_cancelled.load(Ordering::Acquire) {
+                    if progress_cancelled.is_cancelled() {
                         return;
                     }
                     let (status, detail, percent) = install_stage(&version, &artifact, progress);
@@ -382,18 +397,18 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>, cancelled: 
                         },
                     );
                 },
-                move || install_cancelled.load(Ordering::Acquire),
+                install_cancellation,
             )
             .await
             {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.is_cancelled() {
                     return;
                 }
                 send(&proxy, Event::Failed(format!("{error:#}")));
                 return;
             }
 
-            if cancelled.load(Ordering::Acquire) {
+            if cancelled.is_cancelled() {
                 return;
             }
             send(
@@ -405,7 +420,7 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>, cancelled: 
                 },
             );
             std::thread::sleep(Duration::from_millis(250));
-            if cancelled.load(Ordering::Acquire) {
+            if cancelled.is_cancelled() {
                 return;
             }
             match restart_updated_app(&release.version.to_string()) {
@@ -459,6 +474,114 @@ pub(crate) fn restart_updated_app(version: &str) -> Result<()> {
         .spawn()
         .with_context(|| format!("starting {}", executable.display()))?;
     Ok(())
+}
+
+/// Delay product initialization in a replacement process until the retiring
+/// desktop host has released its embedded server and database ownership.
+pub(crate) fn wait_for_update_relaunch_gate() -> Result<()> {
+    let gate = std::env::var_os(UPDATE_RELAUNCH_GATE_ENV);
+    // Called at process entry before worker threads exist.
+    unsafe {
+        std::env::remove_var(UPDATE_RELAUNCH_GATE_ENV);
+    }
+    let Some(gate) = gate else {
+        return Ok(());
+    };
+    wait_for_relaunch_gate(
+        &PathBuf::from(gate),
+        UPDATE_RELAUNCH_GATE_TIMEOUT,
+        UPDATE_RELAUNCH_GATE_POLL_INTERVAL,
+    )
+}
+
+fn wait_for_relaunch_gate(path: &Path, timeout: Duration, poll_interval: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while path
+        .try_exists()
+        .with_context(|| format!("checking update relaunch gate {}", path.display()))?
+    {
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for the previous trouve host to release update ownership"
+            );
+        }
+        std::thread::sleep(poll_interval);
+    }
+    Ok(())
+}
+
+pub(crate) struct UpdateRelaunchGate {
+    path: Option<PathBuf>,
+}
+
+impl UpdateRelaunchGate {
+    fn create() -> Result<Self> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "trouve-update-relaunch-{}-{nonce}.gate",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options
+            .open(&path)
+            .with_context(|| format!("creating update relaunch gate {}", path.display()))?;
+        Ok(Self { path: Some(path) })
+    }
+
+    pub fn release(mut self) -> Result<()> {
+        self.remove()?;
+        self.path = None;
+        Ok(())
+    }
+
+    fn remove(&self) -> Result<()> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(());
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("releasing update relaunch gate {}", path.display())),
+        }
+    }
+}
+
+impl Drop for UpdateRelaunchGate {
+    fn drop(&mut self) {
+        if let Err(error) = self.remove() {
+            tracing::warn!(%error, "cleaning up update relaunch gate failed");
+        }
+    }
+}
+
+/// Start the already-updated executable in a gated mode. Process creation is
+/// confirmed while the existing UI is recoverable; the child does not initialize
+/// its host until release is called after shutdown.
+pub(crate) fn prepare_updated_app_relaunch(version: &str) -> Result<UpdateRelaunchGate> {
+    let gate = UpdateRelaunchGate::create()?;
+    let gate_path = gate
+        .path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("update relaunch gate is unavailable"))?;
+    let executable = std::env::current_exe().context("locating the updated executable")?;
+    let mut command = std::process::Command::new(&executable);
+    command
+        .args(std::env::args_os().skip(1))
+        .env(UPDATE_RESTART_ENV, version)
+        .env(UPDATE_RELAUNCH_GATE_ENV, gate_path);
+    trouve_process::spawn(&mut command)
+        .with_context(|| format!("starting gated {}", executable.display()))?;
+    Ok(gate)
 }
 
 #[derive(Clone)]
@@ -805,6 +928,20 @@ mod tests {
         assert!(SPLASH_HTML.contains("aria-label=\"Update progress\""));
         assert!(SPLASH_HTML.contains("aria-label=\"Update recovery actions\" hidden"));
         assert!(SPLASH_HTML.contains("document.getElementById(\"retry\").focus()"));
+    }
+
+    #[test]
+    fn replacement_process_waits_for_host_ownership_handoff() {
+        let gate = UpdateRelaunchGate::create().unwrap();
+        let path = gate.path.as_ref().unwrap().clone();
+        let release_path = path.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::remove_file(release_path).unwrap();
+        });
+
+        wait_for_relaunch_gate(&path, Duration::from_secs(1), Duration::from_millis(1)).unwrap();
+        release.join().unwrap();
     }
 
     #[test]

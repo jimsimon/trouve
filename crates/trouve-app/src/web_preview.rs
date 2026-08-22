@@ -181,7 +181,12 @@ fn allow_unbundled_frontend(product_host: bool, debug_build: bool) -> bool {
 
 #[allow(dead_code)] // Used only by the explicit `trouve-web-preview` target.
 fn main() -> anyhow::Result<()> {
+    wait_for_update_relaunch_gate()?;
     run(false)
+}
+
+pub(crate) fn wait_for_update_relaunch_gate() -> anyhow::Result<()> {
+    startup::wait_for_update_relaunch_gate()
 }
 
 pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
@@ -215,6 +220,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let lifecycle = HostLifecycleHandle::default();
     let notification_lifecycle = lifecycle.clone();
     let sleep_inhibitor = Arc::new(Mutex::new(sleep::SleepInhibitor::default()));
+    let pending_update_relaunch = Arc::new(Mutex::new(None));
     let sleep_for_action = sleep_inhibitor.clone();
     let mut native_actions = HostNativeActions::default()
         .with_window_geometry()
@@ -293,6 +299,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
         let status_updates = updates.clone();
         let check_updates = updates.clone();
         let install_updates = updates.clone();
+        let pending_update_relaunch_for_action = Arc::clone(&pending_update_relaunch);
         let quit_proxy = event_loop.create_proxy();
         native_actions = native_actions.with_desktop_updater(
             move || Ok(status_updates.status()),
@@ -303,17 +310,22 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
             move || {
                 let updates = install_updates.clone();
                 let quit_proxy = quit_proxy.clone();
+                let pending_update_relaunch =
+                    Arc::clone(&pending_update_relaunch_for_action);
                 async move {
                     let mut state = updates.install_and_restart().await;
                     if state.phase == trouve_desktop_host::DesktopUpdatePhase::Restarting
                         && let Some(version) = state.available_version.clone()
                     {
-                        match startup::restart_updated_app(&version) {
-                            Ok(()) => {
+                        match startup::prepare_updated_app_relaunch(&version) {
+                            Ok(gate) => {
+                                *pending_update_relaunch
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
                                 let _ = quit_proxy.send_event(AppEvent::QuitNow);
                             }
                             Err(error) => {
-                                tracing::error!(%error, %version, "restarting after desktop update failed");
+                                tracing::error!(%error, %version, "preparing restart after desktop update failed");
                                 state = updates.restart_failed(&version, &format!("{error:#}"));
                             }
                         }
@@ -573,6 +585,13 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     drop(webview);
     drop(window);
     host.shutdown();
+    if let Some(gate) = pending_update_relaunch
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        gate.release()?;
+    }
     if exit_code != 0 {
         anyhow::bail!("desktop webview event loop exited with status {exit_code}");
     }
