@@ -587,6 +587,48 @@ fn opened_executable_identity(
     bail!("installed-version state is unsupported on this platform")
 }
 
+#[cfg(target_os = "linux")]
+fn opened_executable_is_executable(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    // libc does not currently expose Linux's AT_EACCESS constant. Using
+    // faccessat2 with AT_EMPTY_PATH binds the effective-credential and ACL
+    // check to the same open file that is compared below.
+    const AT_EACCESS: libc::c_int = 0x200;
+    // SAFETY: `file` owns a valid descriptor and the pathname is a static,
+    // NUL-terminated empty C string as required with AT_EMPTY_PATH.
+    unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            libc::X_OK,
+            libc::AT_EMPTY_PATH | AT_EACCESS,
+        ) == 0
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn opened_executable_is_executable(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    // `/dev/fd` resolves the already-open vnode, avoiding a second lookup of
+    // the mutable installation pathname. AT_EACCESS delegates ownership,
+    // groups, ACLs, and privilege semantics to the kernel.
+    let Ok(path) = std::ffi::CString::new(format!("/dev/fd/{}", file.as_raw_fd())) else {
+        return false;
+    };
+    // SAFETY: `path` is NUL-terminated and `faccessat` only reads it.
+    unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn opened_executable_is_executable(_file: &std::fs::File) -> bool {
+    // Unknown Unix hosts cannot safely infer effective-user and ACL access
+    // from mode bits alone. Conservatively perform the verified replacement.
+    false
+}
+
 fn installed_matches_replacement(
     installed_executable: &Path,
     replacement: &Path,
@@ -603,15 +645,8 @@ fn installed_matches_replacement(
         .metadata()
         .context("reading installed executable metadata for comparison")?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        // Be deliberately stricter than "some class can execute this file".
-        // The installed executable is a per-user artifact, so accepting only
-        // group/other execute permission could skip the replacement even
-        // though its owner cannot launch it on the next restart.
-        if installed_metadata.permissions().mode() & 0o100 == 0 {
-            return Ok(None);
-        }
+    if !opened_executable_is_executable(&installed) {
+        return Ok(None);
     }
     let opened_identity = opened_executable_identity(&installed, &installed_metadata)?;
     let mut replacement =
