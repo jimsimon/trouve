@@ -194,14 +194,24 @@ trouve-session-list { display: block; }
 .session-pr-badge.merged { color: var(--trouve-merged); }
 .session-pr-badge.closed { color: var(--trouve-err); }
 .thread-header { position: relative; z-index: 1; padding: 10px; border-bottom: 1px solid var(--trouve-border); background: var(--trouve-panel-bg); box-shadow: 0 1px 5px var(--trouve-scrim); }
-.thread-tab-header { z-index: 8; display: flex; align-items: center; gap: 6px; }
+.thread-tab-header { z-index: 8; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .thread-tabs { --thread-tab-width: 145px; height: 30px; display: flex; flex: 1 1 auto; align-items: stretch; gap: 6px; min-width: 0; overflow: hidden; }
 .thread-tabs button { width: var(--thread-tab-width); height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; flex: 0 0 var(--thread-tab-width); overflow: hidden; border: 0; border-radius: var(--trouve-radius); padding: 0 6px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 12px; white-space: nowrap; }
 .thread-tabs button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
 .thread-tabs button[aria-selected="true"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
 .thread-tab-tail { display: flex; align-items: stretch; gap: 6px; flex: none; }
-.thread-tab-header > .new-thread-tab { width: 30px; height: 30px; display: grid; place-items: center; flex: 0 0 30px; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 15px; }
-.thread-tab-header > .new-thread-tab:hover:not(:disabled), .thread-tab-header > .new-thread-tab:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.thread-tab-header > .new-thread-tab, .thread-tab-header > .chat-find-toggle { width: 30px; height: 30px; display: grid; place-items: center; flex: 0 0 30px; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 15px; }
+.thread-tab-header > .new-thread-tab:hover:not(:disabled), .thread-tab-header > .new-thread-tab:focus-visible, .thread-tab-header > .chat-find-toggle:hover:not(:disabled), .thread-tab-header > .chat-find-toggle:focus-visible, .thread-tab-header > .chat-find-toggle[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.chat-find-bar { flex: 1 0 100%; min-width: 0; display: flex; align-items: center; gap: 5px; }
+.chat-find-icon { flex: none; color: var(--trouve-text-dim); font-size: 12px; }
+.chat-find-input { height: 30px; min-width: 80px; flex: 1 1 auto; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 0 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font: inherit; font-size: 11px; }
+.chat-find-input:focus-visible { border-color: var(--trouve-focus); outline: 1px solid var(--trouve-focus); }
+.chat-find-bar button { width: 30px; height: 30px; display: grid; place-items: center; flex: none; border: 0; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-dim); background: var(--trouve-control-bg); font-size: 11px; }
+.chat-find-bar button:hover:not(:disabled), .chat-find-bar button:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.chat-find-bar button:disabled { opacity: .45; }
+.chat-find-bar .chat-find-case { width: 34px; font-size: 10px; font-weight: 700; }
+.chat-find-case[aria-pressed="true"] { color: var(--trouve-accent-tint); background: var(--trouve-accent-dim); }
+.chat-find-count { min-width: 58px; color: var(--trouve-text-dim); font-size: 10px; text-align: center; white-space: nowrap; }
 .thread-tab-item { position: relative; width: var(--thread-tab-width); height: 30px; flex: 0 0 var(--thread-tab-width); }
 .thread-tab-item > .thread-tab-main { width: 100%; height: 100%; flex: none; padding-inline-end: 25px; }
 .thread-tab-item > .thread-tab-close { position: absolute; z-index: 2; inset-block: 4px; inset-inline-end: 4px; width: 22px; height: 22px; min-width: 22px; display: grid; place-items: center; flex: none; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-dim); background: transparent; cursor: pointer; font-size: 10px; }
@@ -266,6 +276,8 @@ trouve-session-list { display: block; }
 .thread-options select.permission-yolo { border-color: var(--trouve-err); color: var(--trouve-err); font-weight: 700; }
 .thread-options > button:last-child { margin-left: auto; white-space: nowrap; }
 .chat-scroll-shell { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.chat-find-match { box-shadow: inset 2px 0 var(--trouve-accent-dim); }
+.chat-find-active { box-shadow: inset 3px 0 var(--trouve-accent); background: var(--trouve-accent-bg); }
 .chat-stream {
   width: 100%;
   height: 100%;
@@ -1158,8 +1170,15 @@ trouve-command-palette { display: contents; }
   .thread-tabs { --thread-tab-width: 128px; height: 42px; }
   .thread-tab-item { height: 42px; }
   .thread-tab-item > .thread-tab-close { inset-block: 10px; }
-  .thread-tab-header > .new-thread-tab, .thread-switcher-toggle { height: 42px; }
+  .thread-tab-header > .new-thread-tab, .thread-tab-header > .chat-find-toggle, .thread-switcher-toggle { height: 42px; }
+  .chat-find-bar { gap: 2px; }
+  .chat-find-icon { display: none; }
+  .chat-find-input { height: 44px; min-width: 0; }
+  .chat-find-bar button, .chat-find-bar .chat-find-case { width: 44px; height: 44px; }
+  .chat-find-count { min-width: 34px; }
+  .thread-switcher-toggle { width: 30px; justify-content: center; padding-inline: 0; }
   .thread-switcher-toggle-label { display: none; }
+  .thread-switcher-total { display: none; }
   .thread-switcher-panel { position: fixed; z-index: 40; inset: auto max(8px, env(safe-area-inset-right)) calc(58px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); width: auto; max-height: min(72dvh, 600px); border-radius: var(--trouve-radius) var(--trouve-radius) 0 0; }
   .thread-switcher-panel-header { padding: 10px; }
   .thread-switcher-search { height: 40px; font-size: 16px; }

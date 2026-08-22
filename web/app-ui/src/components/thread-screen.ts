@@ -68,6 +68,11 @@ import {
 } from "./chat-presentation.js";
 import { chatTurnControlState } from "./chat-turn-controls.js";
 import {
+  chatFindMatches,
+  reconcileChatFind,
+  stepChatFindIndex,
+} from "./chat-find-model.js";
+import {
   activityGroupSummary,
   buildChatLayout,
   isContextCompactionTool,
@@ -138,6 +143,8 @@ import {
   normalizeQuestionWizard,
   OTHER_OPTION_ID,
   pendingQuestionSummary,
+  QUESTION_SKIPPED_MESSAGE,
+  QUESTION_SKIPPED_STATUS,
   questionWizardAnswers,
   resolvedQuestionSummary,
   retreatQuestionWizard,
@@ -263,6 +270,13 @@ interface PendingMarkdownContextSelection {
 interface ChatDomAnchor {
   readonly id: string;
   readonly offset: number;
+}
+
+interface StoredChatFindState {
+  readonly open: boolean;
+  readonly query: string;
+  readonly caseSensitive: boolean;
+  readonly activeUnitId: string | undefined;
 }
 
 interface PendingHistoryPrepend {
@@ -498,6 +512,19 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #threadTabResizeObserver: ResizeObserver | undefined;
   #observedThreadTabs: HTMLElement | undefined;
   #pendingThreadTabFocus = "";
+  #chatFindOpen = false;
+  #chatFindQuery = "";
+  #chatFindCaseSensitive = false;
+  #chatFindUnitIds: readonly string[] = [];
+  #chatFindIncomplete = false;
+  #chatFindActiveIndex = -1;
+  #chatFindRestoredActiveUnitId: string | undefined;
+  #chatFindRefreshKey = "";
+  #chatFindRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  #chatFindLoadGeneration = 0;
+  #chatFindHistoryLoading = false;
+  #chatFindHistoryAbort: AbortController | undefined;
+  readonly #chatFindByThread = new Map<string, StoredChatFindState>();
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -577,6 +604,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#usagePending = false;
     }
     if (changed.has("threadId")) {
+      const previousThreadId = changed.get("threadId");
+      if (typeof previousThreadId === "string") {
+        this.#saveChatFindState(previousThreadId);
+      }
+      this.#restoreChatFindState(this.threadId);
       const newThreadRequest = this.#newThreadRequest;
       if (
         newThreadRequest !== undefined
@@ -703,6 +735,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
     this.#resizeComposer();
     this.#observeThreadWorkingSet();
+    if (this.#chatFindOpen) this.#scheduleChatFindRefresh(false, false);
+    this.#ensureChatFindHistoryLoading();
     if (this.#pendingThreadTabFocus !== "") {
       const threadId = this.#pendingThreadTabFocus;
       const tab = [...this.querySelectorAll<HTMLButtonElement>("[data-thread-tab-id]")]
@@ -882,6 +916,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     document.addEventListener("pointerdown", this.#dismissMarkdownContextMenuFromPointer, true);
     document.addEventListener("pointerup", this.#restoreMarkdownContextMenuSelectionFromPointer, true);
     document.addEventListener("keydown", this.#dismissMarkdownContextMenuFromKeyboard, true);
+    document.addEventListener("keydown", this.#chatFindGlobalKeydown, true);
     document.addEventListener("pointerdown", this.#dismissThreadSwitcherFromPointer, true);
     document.addEventListener("scroll", this.#dismissMarkdownContextMenu, true);
     globalThis.addEventListener("resize", this.#dismissMarkdownContextMenu);
@@ -893,6 +928,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     document.removeEventListener("pointerdown", this.#dismissMarkdownContextMenuFromPointer, true);
     document.removeEventListener("pointerup", this.#restoreMarkdownContextMenuSelectionFromPointer, true);
     document.removeEventListener("keydown", this.#dismissMarkdownContextMenuFromKeyboard, true);
+    document.removeEventListener("keydown", this.#chatFindGlobalKeydown, true);
     document.removeEventListener("pointerdown", this.#dismissThreadSwitcherFromPointer, true);
     document.removeEventListener("scroll", this.#dismissMarkdownContextMenu, true);
     globalThis.removeEventListener("resize", this.#dismissMarkdownContextMenu);
@@ -911,6 +947,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#disconnectHistoryObserver();
     this.#clearHistoryStatusTimer();
     this.#clearHistoryRetryTimer();
+    this.#clearChatFindRefresh();
+    this.#cancelChatFindHistoryLoading();
     this.#cancelHistoryAnchorCorrection();
     this.#parkedLayoutAnchor = undefined;
     this.#scrollIndicatorMetrics = undefined;
@@ -937,6 +975,291 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#pendingMarkdownContextSelection = undefined;
     this.#markdownContextMenuReturnFocus = undefined;
     super.disconnectedCallback();
+  }
+
+  #activeChatFindUnitId(): string | undefined {
+    return this.#chatFindRestoredActiveUnitId ?? (this.#chatFindActiveIndex < 0
+      ? undefined
+      : this.#chatFindUnitIds[this.#chatFindActiveIndex]);
+  }
+
+  #saveChatFindState(threadId = this.threadId, clearActive = false): void {
+    if (threadId === "") return;
+    this.#chatFindByThread.set(threadId, Object.freeze({
+      open: this.#chatFindOpen,
+      query: this.#chatFindQuery,
+      caseSensitive: this.#chatFindCaseSensitive,
+      activeUnitId: clearActive ? undefined : this.#activeChatFindUnitId(),
+    }));
+  }
+
+  #restoreChatFindState(threadId: string): void {
+    this.#clearChatFindRefresh();
+    this.#cancelChatFindHistoryLoading();
+    const state = this.#chatFindByThread.get(threadId);
+    this.#chatFindOpen = state?.open ?? false;
+    this.#chatFindQuery = state?.query ?? "";
+    this.#chatFindCaseSensitive = state?.caseSensitive ?? false;
+    this.#chatFindUnitIds = [];
+    this.#chatFindIncomplete = false;
+    this.#chatFindActiveIndex = -1;
+    this.#chatFindRestoredActiveUnitId = state?.activeUnitId;
+    this.#chatFindRefreshKey = "";
+  }
+
+  #clearChatFindRefresh(): void {
+    if (this.#chatFindRefreshTimer === undefined) return;
+    clearTimeout(this.#chatFindRefreshTimer);
+    this.#chatFindRefreshTimer = undefined;
+  }
+
+  #cancelChatFindHistoryLoading(): void {
+    this.#chatFindLoadGeneration += 1;
+    this.#chatFindHistoryAbort?.abort();
+    this.#chatFindHistoryAbort = undefined;
+    this.#chatFindHistoryLoading = false;
+  }
+
+  readonly #chatFindGlobalKeydown = (event: KeyboardEvent): void => {
+    if (event.key === "Escape" && document.querySelector("dialog[open]") !== null) return;
+    if (event.key === "Escape" && this.#threadSwitcherOpen) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.#closeThreadSwitcherAndRestoreFocus();
+      return;
+    }
+    if (event.key === "Escape" && this.#chatFindOpen) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.#closeChatFind();
+      return;
+    }
+    if (
+      event.key.toLowerCase() !== "f"
+      || event.altKey
+      || event.shiftKey
+      || (!event.ctrlKey && !event.metaKey)
+      || this.threadId === ""
+      || this.#newThreadSetupOpen
+      || document.querySelector("dialog[open]") !== null
+    ) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (this.#threadSwitcherOpen) {
+      this.#threadSwitcherOpen = false;
+      this.#threadSwitcherQuery = "";
+    }
+    this.#openChatFind();
+  };
+
+  readonly #openChatFind = (): void => {
+    if (this.threadId === "" || this.#newThreadSetupOpen) return;
+    this.#chatFindOpen = true;
+    this.#saveChatFindState();
+    this.#chatFindRefreshKey = "";
+    this.#scheduleChatFindRefresh(false, this.#chatFindQuery !== "");
+    this.requestUpdate();
+    void this.updateComplete.then(() => {
+      const input = this.querySelector<HTMLInputElement>(".chat-find-input");
+      input?.focus();
+      input?.select();
+    });
+    this.#ensureChatFindHistoryLoading();
+  };
+
+  #closeChatFind(): void {
+    this.#chatFindOpen = false;
+    this.#cancelChatFindHistoryLoading();
+    this.#clearChatFindRefresh();
+    this.#saveChatFindState();
+    this.requestUpdate();
+    void this.updateComplete.then(() => {
+      this.querySelector<HTMLButtonElement>(".chat-find-toggle")?.focus();
+    });
+  }
+
+  readonly #chatFindChanged = (event: InputEvent): void => {
+    this.#chatFindQuery = (event.currentTarget as HTMLInputElement).value;
+    if (this.#chatFindQuery.trim() === "") {
+      this.#cancelChatFindHistoryLoading();
+    }
+    this.#chatFindUnitIds = [];
+    this.#chatFindIncomplete = false;
+    this.#chatFindActiveIndex = -1;
+    this.#chatFindRestoredActiveUnitId = undefined;
+    this.#chatFindRefreshKey = "";
+    this.#scheduleChatFindRefresh(true, true);
+    this.#saveChatFindState(this.threadId, true);
+    this.requestUpdate();
+    this.#ensureChatFindHistoryLoading();
+  };
+
+  readonly #toggleChatFindCase = (): void => {
+    this.#chatFindCaseSensitive = !this.#chatFindCaseSensitive;
+    this.#chatFindUnitIds = [];
+    this.#chatFindIncomplete = false;
+    this.#chatFindActiveIndex = -1;
+    this.#chatFindRestoredActiveUnitId = undefined;
+    this.#chatFindRefreshKey = "";
+    this.#scheduleChatFindRefresh(true, true);
+    this.#saveChatFindState(this.threadId, true);
+    this.requestUpdate();
+  };
+
+  readonly #chatFindInputKeydown = (event: KeyboardEvent): void => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    this.#stepChatFind(event.shiftKey ? -1 : 1);
+  };
+
+  #stepChatFind(delta: number): void {
+    this.#chatFindRestoredActiveUnitId = undefined;
+    this.#chatFindActiveIndex = stepChatFindIndex(
+      this.#chatFindUnitIds.length,
+      this.#chatFindActiveIndex,
+      delta,
+    );
+    this.#saveChatFindState();
+    this.requestUpdate();
+    void this.updateComplete.then(() => this.#revealActiveChatFind());
+  }
+
+  #chatFindRevisionKey(): string {
+    const view = this.threadId === "" ? undefined : this.#store.value?.threadView(this.threadId);
+    return JSON.stringify([
+      this.threadId,
+      this.#chatFindQuery,
+      this.#chatFindCaseSensitive,
+      view?.cursor ?? -1,
+      view?.itemOffset ?? -1,
+      view?.totalItems ?? -1,
+    ]);
+  }
+
+  #scheduleChatFindRefresh(resetActive: boolean, reveal: boolean): void {
+    if (!this.#chatFindOpen || this.threadId === "") return;
+    // Find owns the complete-history paging loop. Reconcile once after it
+    // finishes instead of rescanning the growing transcript after every page.
+    if (this.#chatFindHistoryLoading) return;
+    const key = this.#chatFindRevisionKey();
+    if (!resetActive && key === this.#chatFindRefreshKey) return;
+    this.#chatFindRefreshKey = key;
+    this.#clearChatFindRefresh();
+    const threadId = this.threadId;
+    const activeUnitId = resetActive ? undefined : this.#activeChatFindUnitId();
+    this.#chatFindRefreshTimer = setTimeout(() => {
+      this.#chatFindRefreshTimer = undefined;
+      if (
+        !this.isConnected
+        || !this.#chatFindOpen
+        || this.threadId !== threadId
+        || this.#chatFindRevisionKey() !== key
+      ) return;
+      if (this.#chatFindHistoryLoading) {
+        this.#chatFindRefreshKey = "";
+        return;
+      }
+      const view = this.#store.value?.threadView(threadId);
+      if (view?.snapshotLoaded !== true) {
+        // Keep the restored active unit until the folded snapshot is ready.
+        // The store signal update will schedule a fresh reconciliation.
+        this.#chatFindRefreshKey = "";
+        return;
+      }
+      const matches = chatFindMatches(
+        view.items,
+        this.#chatFindQuery,
+        this.#chatFindCaseSensitive,
+      );
+      const reconciled = reconcileChatFind(
+        matches.unitIds,
+        activeUnitId,
+        resetActive,
+      );
+      this.#chatFindUnitIds = reconciled.unitIds;
+      this.#chatFindIncomplete = matches.incomplete;
+      this.#chatFindActiveIndex = reconciled.activeIndex;
+      const restoredActiveUnitId = this.#chatFindRestoredActiveUnitId;
+      const restorationPending = restoredActiveUnitId !== undefined
+        && !reconciled.unitIds.includes(restoredActiveUnitId)
+        && view.hasOlder
+        && view.itemOffset > 0
+        && this.#chatFindQuery.trim() !== "";
+      this.#chatFindRestoredActiveUnitId = restorationPending
+        ? restoredActiveUnitId
+        : undefined;
+      this.#saveChatFindState(threadId);
+      this.requestUpdate();
+      if (reveal) void this.updateComplete.then(() => this.#revealActiveChatFind());
+    }, 100);
+  }
+
+  #revealActiveChatFind(): void {
+    const unitId = this.#activeChatFindUnitId();
+    const viewport = this.querySelector<HTMLElement>(".chat-stream");
+    if (unitId === undefined || viewport === null) return;
+    try {
+      const correction = this.#virtualizer.restoreBookmark({ id: unitId, offset: 0 });
+      this.#setChatScrollTop(viewport, correction.scrollTop);
+      this.#emitChatPosition();
+      this.requestUpdate();
+    } catch {
+      // A concurrent history/stream update may replace the virtual item list;
+      // its scheduled refresh will retry against the new layout.
+    }
+  }
+
+  #ensureChatFindHistoryLoading(): void {
+    if (
+      !this.#chatFindOpen
+      || this.#chatFindHistoryLoading
+      || this.#chatFindQuery.trim() === ""
+      || this.threadId === ""
+      || this.#historyError !== ""
+    ) return;
+    const view = this.#store.value?.threadView(this.threadId);
+    if (view?.hasOlder === true && view.itemOffset > 0) {
+      void this.#loadAllHistoryForFind();
+    }
+  }
+
+  async #loadAllHistoryForFind(): Promise<void> {
+    if (this.#chatFindHistoryLoading || this.#chatFindQuery.trim() === "") return;
+    const generation = ++this.#chatFindLoadGeneration;
+    const threadId = this.threadId;
+    const abort = new AbortController();
+    this.#chatFindHistoryAbort = abort;
+    this.#chatFindHistoryLoading = true;
+    try {
+      while (
+        this.isConnected
+        && this.#chatFindOpen
+        && this.#chatFindQuery.trim() !== ""
+        && !abort.signal.aborted
+        && this.threadId === threadId
+        && generation === this.#chatFindLoadGeneration
+      ) {
+        const view = this.#store.value?.threadView(threadId);
+        if (view?.hasOlder !== true || view.itemOffset === 0 || this.#historyError !== "") break;
+        if (this.#historyLoading) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          continue;
+        }
+        const before = view.itemOffset;
+        await this.#loadOlderHistory(false, abort.signal);
+        const after = this.#store.value?.threadView(threadId)?.itemOffset ?? before;
+        if (after >= before) break;
+      }
+    } finally {
+      if (generation === this.#chatFindLoadGeneration) {
+        this.#chatFindHistoryAbort = undefined;
+        this.#chatFindHistoryLoading = false;
+        if (this.#chatFindOpen && this.threadId === threadId) {
+          this.#chatFindRefreshKey = "";
+          this.#scheduleChatFindRefresh(false, false);
+        }
+      }
+    }
   }
 
   #selectThreadWithKeyboard(
@@ -1443,6 +1766,69 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               `
             : nothing}
         </div>
+        <button
+          class="chat-find-toggle"
+          type="button"
+          aria-label="Find in chat"
+          title="Find in chat (Ctrl+F)"
+          aria-expanded=${this.#chatFindOpen ? "true" : "false"}
+          ?disabled=${this.threadId === "" || newThreadSetupOpen}
+          @click=${this.#openChatFind}
+        >${fontAwesomeIcon("magnifying-glass")}</button>
+        ${this.#chatFindOpen
+          ? html`<div class="chat-find-bar" role="search" aria-label="Find in chat">
+              ${fontAwesomeIcon("magnifying-glass", { className: "chat-find-icon" })}
+              <input
+                class="chat-find-input"
+                type="search"
+                aria-label="Search this chat"
+                placeholder="Find in chat…"
+                autocomplete="off"
+                .value=${this.#chatFindQuery}
+                @input=${this.#chatFindChanged}
+                @keydown=${this.#chatFindInputKeydown}
+              />
+              <button
+                class="chat-find-case"
+                type="button"
+                aria-label="Match case"
+                title="Match case"
+                aria-pressed=${this.#chatFindCaseSensitive ? "true" : "false"}
+                @click=${this.#toggleChatFindCase}
+              >Aa</button>
+              <span class="chat-find-count" role="status" aria-live="polite">${
+                this.#chatFindQuery === ""
+                  ? ""
+                  : this.#chatFindHistoryLoading
+                    ? "Searching history…"
+                  : this.#chatFindUnitIds.length === 0
+                    ? this.#chatFindIncomplete ? "No matches (partial search)" : "No matches"
+                    : `${this.#chatFindActiveIndex + 1} of ${this.#chatFindUnitIds.length}${
+                      this.#chatFindIncomplete ? " (partial search)" : ""
+                    }`
+              }</span>
+              <button
+                type="button"
+                aria-label="Previous match"
+                title="Previous match (Shift+Enter)"
+                ?disabled=${this.#chatFindUnitIds.length === 0}
+                @click=${() => this.#stepChatFind(-1)}
+              >${fontAwesomeIcon("arrow-up")}</button>
+              <button
+                type="button"
+                aria-label="Next match"
+                title="Next match (Enter)"
+                ?disabled=${this.#chatFindUnitIds.length === 0}
+                @click=${() => this.#stepChatFind(1)}
+              >${fontAwesomeIcon("arrow-down")}</button>
+              <button
+                type="button"
+                aria-label="Close find"
+                title="Close (Escape)"
+                @click=${this.#closeChatFind}
+              >${fontAwesomeIcon("xmark")}</button>
+            </div>`
+          : nothing}
       </header>
 
       ${newThreadSetupOpen
@@ -2052,6 +2438,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#syncQuestionWizards(items);
     const presentation = indexChatPresentation(items);
     const layout = buildChatLayout(items);
+    const chatFindMatchIds = new Set(this.#chatFindUnitIds);
+    const activeChatFindUnitId = this.#activeChatFindUnitId();
     let activeTurn: number | undefined;
     let waitingForCapacity = false;
     for (const [turn, state] of presentation.turnStates) {
@@ -2215,9 +2603,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 </div>`;
               }
               const unit = layout.units[item.unitIndex];
+              const chatFindMatch = this.#chatFindOpen && chatFindMatchIds.has(item.id);
+              const chatFindActive = chatFindMatch && item.id === activeChatFindUnitId;
               return unit === undefined
                 ? nothing
-                : html`<div data-virtual-id=${item.id} style=${style}>${this.#renderUnit(
+                : html`<div
+                    class=${chatFindActive
+                      ? "chat-find-match chat-find-active"
+                      : chatFindMatch ? "chat-find-match" : nothing}
+                    data-virtual-id=${item.id}
+                    style=${style}
+                    aria-current=${chatFindActive ? "true" : nothing}
+                  >${this.#renderUnit(
                     unit,
                     turnLabels,
                     turnModels,
@@ -4087,6 +4484,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       if (generation !== this.#historyGeneration || !this.isConnected) return;
       this.#historyError = "";
       this.requestUpdate();
+      this.#ensureChatFindHistoryLoading();
     }, CHAT_HISTORY_RETRY_DELAY_MS);
   }
 
@@ -4109,7 +4507,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }));
   }
 
-  async #loadOlderHistory(loadAll: boolean): Promise<void> {
+  async #loadOlderHistory(loadAll: boolean, signal?: AbortSignal): Promise<void> {
     if (this.#historyLoading || this.threadId === "") return;
     const store = this.#store.value;
     const services = this.#services.value;
@@ -4131,7 +4529,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       do {
         const view = store.threadView(threadId);
         if (!view.hasOlder || view.itemOffset === 0) break;
-        const page = await services.protocol.threadView(threadId, view.itemOffset);
+        const page = await services.protocol.threadView(
+          threadId,
+          view.itemOffset,
+          signal === undefined ? {} : { signal },
+        );
         if (!this.#isCurrentHistoryRequest(sessionId, threadId, generation)) return;
         const virtualWindow = this.#virtualizer.window();
         const viewport = this.querySelector<HTMLElement>(".chat-stream");
@@ -4146,7 +4548,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
       } while (loadAll);
     } catch {
-      if (this.#isCurrentHistoryRequest(sessionId, threadId, generation)) {
+      if (!signal?.aborted && this.#isCurrentHistoryRequest(sessionId, threadId, generation)) {
         this.#historyError = "Earlier messages could not be loaded.";
         this.#scheduleHistoryRetry();
       }
@@ -4419,10 +4821,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             >
               <header>
                 <strong>${item.title ?? "Questions"}</strong>
-                <span>${item.answers === null ? "Skipped" : "Answered"}</span>
+                <span>${item.answers === null ? QUESTION_SKIPPED_STATUS : "Answered"}</span>
               </header>
               ${item.answers === null
-                ? html`<p class="resolved-label">The questions were skipped.</p>`
+                ? html`<p class="resolved-label">${QUESTION_SKIPPED_MESSAGE}</p>`
                 : this.#renderQuestionSummary(summary)}
             </section>
           `;
@@ -5349,6 +5751,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     });
   };
 
+  #closeThreadSwitcherAndRestoreFocus(): void {
+    this.#threadSwitcherOpen = false;
+    this.#threadSwitcherQuery = "";
+    this.requestUpdate();
+    void this.updateComplete.then(() => {
+      this.querySelector<HTMLButtonElement>(".thread-switcher-toggle")?.focus();
+    });
+  }
+
   readonly #dismissThreadSwitcherFromPointer = (event: PointerEvent): void => {
     if (!this.#threadSwitcherOpen) return;
     const target = event.target;
@@ -5384,12 +5795,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     )];
     if (event.key === "Escape") {
       event.preventDefault();
-      this.#threadSwitcherOpen = false;
-      this.#threadSwitcherQuery = "";
-      this.requestUpdate();
-      void this.updateComplete.then(() => {
-        this.querySelector<HTMLButtonElement>(".thread-switcher-toggle")?.focus();
-      });
+      this.#closeThreadSwitcherAndRestoreFocus();
       return;
     }
     const target = event.target;

@@ -494,10 +494,14 @@ export class ProtocolClient {
     label: string,
     schemaName: Parameters<typeof validateResponse<T>>[0],
     validate: (loaded: ProtocolValidators) => ValidateFunction,
+    signal?: AbortSignal,
   ): Promise<ProtocolCursorSnapshot<T>> {
     let response: Response;
     try {
-      response = await this.#fetch(new URL(path, this.#baseUrl));
+      response = await this.#fetch(
+        new URL(path, this.#baseUrl),
+        signal === undefined ? undefined : { signal },
+      );
     } catch {
       throw new ProtocolClientError("request-failed", `${label} request failed`);
     }
@@ -1594,6 +1598,7 @@ export class ProtocolClient {
   async threadView(
     threadId: string,
     before?: number,
+    options: { readonly signal?: AbortSignal } = {},
   ): Promise<ProtocolCursorSnapshot<ProtocolThreadViewSnapshot>> {
     const { threadView } = await import("../generated/thread-view-validator.js");
     const query = new URLSearchParams({
@@ -1606,6 +1611,7 @@ export class ProtocolClient {
       "thread view",
       "ThreadViewSnapshot",
       () => threadView,
+      options.signal,
     );
   }
 

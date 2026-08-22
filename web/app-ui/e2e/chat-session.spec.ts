@@ -10,6 +10,7 @@ interface FixtureEvent extends Record<string, unknown> {
 
 interface ThreadViewFixture {
   readonly cursor?: number;
+  readonly status?: number;
   readonly snapshot: Record<string, unknown>;
 }
 
@@ -420,6 +421,7 @@ const installProtocolFixtures = async (
             beforeValue === null ? undefined : Number(beforeValue),
           );
       await route.fulfill({
+        status: fixture.status ?? 200,
         headers: { "x-trouve-event-cursor": String(fixture.cursor ?? 0) },
         json: fixture.snapshot,
       });
@@ -4787,6 +4789,459 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   // rows require that much data to fill the five-viewport buffer. It must
   // never issue duplicate requests for a boundary while doing so.
   expect(olderBoundaries).toHaveLength(requestedBoundaries.length);
+});
+
+test("find defaults to insensitive matching and restores separate thread state", async ({ page }) => {
+  await installProtocolFixtures(page, {
+    additionalThreads: [{
+      id: "th_find_second",
+      session_id: "se_1",
+      title: "Second find thread",
+      mode: "code",
+      model: "test/second",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:00:00Z",
+    }],
+    threadViewFixture: () => ({
+      cursor: 20,
+      snapshot: {
+        item_offset: 0,
+        total_items: 2,
+        has_older: false,
+        items: [
+          { kind: "user", turn: 1, content: "Build Agent Alpha", attachments: [] },
+          { kind: "user", turn: 2, content: "Agent Beta", attachments: [] },
+        ],
+      },
+    }),
+  });
+  await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture");
+  await replayHistory(page);
+
+  await page.keyboard.press("Control+f");
+  let find = page.getByRole("search", { name: "Find in chat" });
+  const matchCase = find.getByRole("button", { name: "Match case" });
+  if ((page.viewportSize()?.width ?? 1_280) <= 760) {
+    for (const label of ["Match case", "Previous match", "Next match", "Close find"]) {
+      const bounds = await find.getByRole("button", { name: label }).boundingBox();
+      expect(bounds?.width ?? 0).toBeGreaterThanOrEqual(44);
+      expect(bounds?.height ?? 0).toBeGreaterThanOrEqual(44);
+    }
+  }
+  await expect(find.getByRole("searchbox", { name: "Search this chat" })).toBeFocused();
+  await expect(matchCase).toHaveAttribute("aria-pressed", "false");
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("build");
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+  await matchCase.click();
+  await expect(find.getByRole("status")).toHaveText("No matches");
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("Build");
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+  await expect(page.locator(".chat-find-active")).toHaveCount(1);
+
+  await page.getByRole("tab", { name: "Second find thread", exact: true }).click();
+  await expect(find).toHaveCount(0);
+  await page.keyboard.press("Control+f");
+  find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("second-only");
+  await expect(find.getByRole("status")).toHaveText("No matches");
+
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
+  find = page.getByRole("search", { name: "Find in chat" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" })).toHaveValue("Build");
+  await expect(find.getByRole("button", { name: "Match case" }))
+    .toHaveAttribute("aria-pressed", "true");
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+
+  await find.getByRole("button", { name: "Match case" }).click();
+  const input = find.getByRole("searchbox", { name: "Search this chat" });
+  await input.fill("agent");
+  await expect(find.getByRole("status")).toHaveText("1 of 2");
+  await input.press("Enter");
+  await expect(find.getByRole("status")).toHaveText("2 of 2");
+  await page.evaluate(() => {
+    const input = document.querySelector<HTMLInputElement>(".chat-find-input");
+    const tab = document.querySelector<HTMLButtonElement>(
+      '[data-thread-tab-id="th_find_second"]',
+    );
+    if (input === null || tab === null) throw new Error("missing find debounce fixture");
+    input.value = "ag";
+    input.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      data: "ag",
+      inputType: "insertText",
+    }));
+    tab.click();
+  });
+  await expect(page).toHaveURL(/\/threads\/th_find_second$/u);
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
+  find = page.getByRole("search", { name: "Find in chat" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" })).toHaveValue("ag");
+  await expect(find.getByRole("status")).toHaveText("1 of 2");
+});
+
+test("find preserves its restored selection while an evicted thread reloads", async ({ page }) => {
+  const additionalThreads = Array.from({ length: 8 }, (_, index) => ({
+    id: `th_find_evict_${index + 1}`,
+    session_id: "se_1",
+    title: `Eviction thread ${index + 1}`,
+    mode: "code",
+    model: "test/eviction",
+    model_options: {},
+    permission_mode: "ask",
+    created_at: `2026-08-05T08:00:0${index}Z`,
+  }));
+  let snapshotLoads = 0;
+  let releaseReload = (): void => {};
+  const reloadReleased = new Promise<void>((resolve) => {
+    releaseReload = resolve;
+  });
+  await installProtocolFixtures(page, {
+    additionalThreads,
+    threadViewFixture: async (before) => {
+      if (before !== undefined) throw new Error(`unexpected history boundary ${before}`);
+      snapshotLoads += 1;
+      if (snapshotLoads > 1) await reloadReleased;
+      return {
+        cursor: 20,
+        snapshot: {
+          item_offset: 0,
+          total_items: 2,
+          has_older: false,
+          items: [
+            { kind: "user", turn: 1, content: "Restore needle first", attachments: [] },
+            { kind: "user", turn: 2, content: "Restore needle second", attachments: [] },
+          ],
+        },
+      };
+    },
+  });
+  await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture");
+  await expect(page.getByText("Restore needle second", { exact: true })).toBeVisible();
+
+  await page.keyboard.press("Control+f");
+  let find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("restore needle");
+  await expect(find.getByRole("status")).toHaveText("1 of 2");
+  await find.getByRole("searchbox", { name: "Search this chat" }).press("Enter");
+  await expect(find.getByRole("status")).toHaveText("2 of 2");
+
+  for (const thread of additionalThreads) {
+    await page.getByRole("button", { name: "Threads (9)" }).click();
+    await page.getByRole("treeitem", { name: new RegExp(thread.title, "u") }).click();
+    await expect(page).toHaveURL(new RegExp(`/threads/${thread.id}$`, "u"));
+  }
+  await page.getByRole("button", { name: "Threads (9)" }).click();
+  await page.getByRole("treeitem", { name: /Chat rendering/u }).click();
+  await expect.poll(() => snapshotLoads).toBe(2);
+  await page.waitForTimeout(200);
+  find = page.getByRole("search", { name: "Find in chat" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" }))
+    .toHaveValue("restore needle");
+
+  releaseReload();
+  await expect(find.getByRole("status")).toHaveText("2 of 2");
+  await expect(page.locator(".chat-find-active"))
+    .toContainText("Restore needle second");
+});
+
+test("find shortcuts coordinate focus with the thread switcher", async ({ page }) => {
+  await installProtocolFixtures(page, { additionalThreads: [{
+    id: "th_find_shortcut_second",
+    session_id: "se_1",
+    title: "Shortcut second thread",
+    mode: "code",
+    model: "test/second",
+    model_options: {},
+    permission_mode: "ask",
+    created_at: "2026-08-05T08:00:00Z",
+  }] });
+  await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture");
+  await replayHistory(page);
+
+  await page.keyboard.press("Control+f");
+  let find = page.getByRole("search", { name: "Find in chat" });
+  const threads = page.getByRole("button", { name: "Threads (2)" });
+  await threads.click();
+  const switcher = page.getByRole("dialog", { name: "Threads" });
+  const threadSearch = switcher.getByRole("searchbox", { name: "Search threads" });
+  await expect(threadSearch).toBeFocused();
+  await threadSearch.press("Escape");
+  await expect(switcher).toHaveCount(0);
+  await expect(find).toBeVisible();
+  await expect(threads).toBeFocused();
+
+  await threads.click();
+  await threadSearch.press("Control+k");
+  const commandSearch = page.getByRole("combobox", {
+    name: "Search commands, sessions, and threads",
+  });
+  await expect(commandSearch).toBeFocused();
+  await commandSearch.press("Escape");
+  await expect(commandSearch).toHaveCount(0);
+  await expect(switcher).toBeVisible();
+  await expect(threadSearch).toBeFocused();
+
+  await find.getByRole("searchbox", { name: "Search this chat" }).focus();
+  await page.keyboard.press("Escape");
+  await expect(switcher).toHaveCount(0);
+  await expect(find).toBeVisible();
+  await expect(threads).toBeFocused();
+
+  await find.getByRole("button", { name: "Close find" }).click();
+  await threads.click();
+  await expect(threadSearch).toBeFocused();
+  await threadSearch.press("Control+k");
+  await expect(commandSearch).toBeFocused();
+  await commandSearch.press("Control+f");
+  await expect(commandSearch).toBeFocused();
+  await expect(find).toHaveCount(0);
+  await commandSearch.press("Escape");
+  await expect(threadSearch).toBeFocused();
+  await threadSearch.press("Control+f");
+  await expect(switcher).toHaveCount(0);
+  find = page.getByRole("search", { name: "Find in chat" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" })).toBeFocused();
+});
+
+test("find cancels history paging and resumes it when restored", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis, "IntersectionObserver", {
+      configurable: true,
+      value: class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    });
+  });
+  const historyPage = (start: number, content: string, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 4,
+    has_older: hasOlder,
+    items: [{
+      kind: "user",
+      turn: 1_000 + start,
+      content,
+      attachments: [],
+    }],
+  });
+  let olderRequests = 0;
+  let olderResponses = 0;
+  const requestsByBoundary = new Map<number, number>();
+  let releaseFirstPage = (): void => {};
+  let releaseSecondPage = (): void => {};
+  const firstPageReleased = new Promise<void>((resolve) => {
+    releaseFirstPage = resolve;
+  });
+  const secondPageReleased = new Promise<void>((resolve) => {
+    releaseSecondPage = resolve;
+  });
+  await installProtocolFixtures(page, {
+    additionalThreads: [{
+      id: "th_find_restore_second",
+      session_id: "se_1",
+      title: "Restore second thread",
+      mode: "code",
+      model: "test/second",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:00:00Z",
+    }],
+    threadViewFixture: async (before) => {
+      if (before === undefined) {
+        return { snapshot: historyPage(3, "Recent prompt", true) };
+      }
+      olderRequests += 1;
+      const boundaryAttempt = (requestsByBoundary.get(before) ?? 0) + 1;
+      requestsByBoundary.set(before, boundaryAttempt);
+      if (before === 3) {
+        if (boundaryAttempt === 1) await firstPageReleased;
+        olderResponses += 1;
+        return { snapshot: historyPage(2, "Later middle prompt", true) };
+      }
+      if (before === 2) {
+        if (boundaryAttempt === 1) await secondPageReleased;
+        olderResponses += 1;
+        return { snapshot: historyPage(1, "Earlier middle prompt", true) };
+      }
+      if (before === 1) {
+        olderResponses += 1;
+        return { snapshot: historyPage(0, "Older restored-only needle", false) };
+      }
+      throw new Error(`unexpected history boundary ${before}`);
+    },
+  });
+  await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture");
+  await replayHistory(page);
+
+  await page.keyboard.press("Control+f");
+  let find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("restored-only needle");
+  await expect.poll(() => olderRequests).toBe(1);
+  await find.getByRole("button", { name: "Close find" }).click();
+  await page.keyboard.press("Control+f");
+  await expect.poll(() => requestsByBoundary.get(3)).toBe(2);
+  await expect.poll(() => requestsByBoundary.get(2)).toBe(1);
+  releaseFirstPage();
+  await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(2);
+  await page.getByRole("tab", { name: "Restore second thread", exact: true }).click();
+  await expect(find).toHaveCount(0);
+  releaseSecondPage();
+  await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(3);
+  expect(requestsByBoundary.get(1) ?? 0).toBe(0);
+
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
+  find = page.getByRole("search", { name: "Find in chat" });
+  await expect(find.getByRole("searchbox", { name: "Search this chat" }))
+    .toHaveValue("restored-only needle");
+  await expect.poll(() => requestsByBoundary.get(2)).toBe(2);
+  await expect.poll(() => requestsByBoundary.get(1)).toBe(1);
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+});
+
+test("find waits for a query and stops paging when it is cleared", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis, "IntersectionObserver", {
+      configurable: true,
+      value: class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    });
+  });
+  const historyPage = (start: number, content: string, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 3,
+    has_older: hasOlder,
+    items: [{
+      kind: "user",
+      turn: 1_000 + start,
+      content,
+      attachments: [],
+    }],
+  });
+  let olderRequests = 0;
+  let olderResponses = 0;
+  let releaseOlderPage = (): void => {};
+  const olderPageReleased = new Promise<void>((resolve) => {
+    releaseOlderPage = resolve;
+  });
+  await installProtocolFixtures(page, { threadViewFixture: async (before) => {
+    if (before === undefined) return { snapshot: historyPage(2, "Recent prompt", true) };
+    olderRequests += 1;
+    if (before === 2) {
+      await olderPageReleased;
+      olderResponses += 1;
+      return { snapshot: historyPage(1, "Middle prompt", true) };
+    }
+    if (before === 1) return { snapshot: historyPage(0, "Oldest needle", false) };
+    throw new Error(`unexpected history boundary ${before}`);
+  } });
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.getByRole("button", { name: "Find in chat" }).click();
+  const find = page.getByRole("search", { name: "Find in chat" });
+  await page.waitForTimeout(200);
+  expect(olderRequests).toBe(0);
+  const input = find.getByRole("searchbox", { name: "Search this chat" });
+  await input.fill("oldest needle");
+  await expect.poll(() => olderRequests).toBe(1);
+  await input.fill("");
+  releaseOlderPage();
+  await expect.poll(() => olderResponses).toBe(1);
+  await page.waitForTimeout(200);
+  expect(olderRequests).toBe(1);
+});
+
+test("find reconciles once after automatic history paging completes", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis, "IntersectionObserver", {
+      configurable: true,
+      value: class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    });
+  });
+  const historyPage = (start: number, content: string, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 3,
+    has_older: hasOlder,
+    items: [{
+      kind: "user",
+      turn: 1_000 + start,
+      content,
+      attachments: [],
+    }],
+  });
+  let olderRequests = 0;
+  let releaseOldestPage = (): void => {};
+  const oldestPageReleased = new Promise<void>((resolve) => {
+    releaseOldestPage = resolve;
+  });
+  await installProtocolFixtures(page, { threadViewFixture: async (before) => {
+    if (before === undefined) return { snapshot: historyPage(2, "Recent prompt", true) };
+    olderRequests += 1;
+    if (before === 2) {
+      return { snapshot: historyPage(1, "Intermediate needle", true) };
+    }
+    if (before === 1) {
+      await oldestPageReleased;
+      return { snapshot: historyPage(0, "Oldest prompt", false) };
+    }
+    throw new Error(`unexpected history boundary ${before}`);
+  } });
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.getByRole("button", { name: "Find in chat" }).click();
+  const find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("intermediate needle");
+  await expect.poll(() => olderRequests).toBe(2);
+  await expect(find.getByRole("status")).toHaveText("Searching history…");
+  await page.waitForTimeout(250);
+  await expect(find.getByRole("status")).toHaveText("Searching history…");
+
+  releaseOldestPage();
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
+});
+
+test("find retries a failed history page and discovers its older match", async ({ page }) => {
+  const historyPage = (start: number, content: string, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 2,
+    has_older: hasOlder,
+    items: [{
+      kind: "user",
+      turn: 1_000 + start,
+      content,
+      attachments: [],
+    }],
+  });
+  let olderRequests = 0;
+  await installProtocolFixtures(page, { threadViewFixture: (before) => {
+    if (before === undefined) {
+      return { snapshot: historyPage(1, "Recent prompt", true) };
+    }
+    if (before !== 1) throw new Error(`unexpected history boundary ${before}`);
+    olderRequests += 1;
+    if (olderRequests === 1) {
+      return {
+        status: 503,
+        snapshot: { code: "temporarily_unavailable", message: "retry this page" },
+      };
+    }
+    return { snapshot: historyPage(0, "Older retry-only needle", false) };
+  } });
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.getByRole("button", { name: "Find in chat" }).click();
+  const find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("retry-only needle");
+  await expect.poll(() => olderRequests, { timeout: 5_000 }).toBe(2);
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
 });
 
 test("keeps the visible turn fixed when a prepended row lays out during wheel scrolling", async ({
