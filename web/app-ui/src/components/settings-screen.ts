@@ -79,23 +79,13 @@ const DESKTOP_UPDATE_BUSY_POLL_MS = 500;
 const DESKTOP_UPDATE_IDLE_POLL_MS = 30_000;
 const DESKTOP_UPDATE_RECONCILIATION_MAX_BACKOFF_EXPONENT = 6;
 
-const desktopUpdateStateFingerprint = (
-  state: DesktopUpdateState | undefined,
-): string => JSON.stringify(state === undefined
-  ? null
-  : [
-      state.currentVersion,
-      state.availableVersion,
-      state.phase,
-      state.message,
-      state.progressPercent,
-    ]);
-
 export const desktopUpdateConfirmsInstallAction = (
   baseline: DesktopUpdateState | undefined,
   state: DesktopUpdateState,
 ): boolean => desktopUpdateIsBusy(state)
-  || desktopUpdateStateFingerprint(state) !== desktopUpdateStateFingerprint(baseline);
+  || baseline === undefined
+  || state.phase !== baseline.phase
+  || state.message !== baseline.message;
 
 export const desktopUpdatePollIntervalMs = (
   state: DesktopUpdateState | undefined,
@@ -103,13 +93,12 @@ export const desktopUpdatePollIntervalMs = (
 ): number => {
   if (desktopUpdateIsBusy(state)) return DESKTOP_UPDATE_BUSY_POLL_MS;
   if (installReconciliationAttempt === undefined) return DESKTOP_UPDATE_IDLE_POLL_MS;
-  const exponent = Math.min(
-    Math.max(installReconciliationAttempt, 0),
-    DESKTOP_UPDATE_RECONCILIATION_MAX_BACKOFF_EXPONENT,
-  );
   return Math.min(
     DESKTOP_UPDATE_IDLE_POLL_MS,
-    DESKTOP_UPDATE_BUSY_POLL_MS * (2 ** exponent),
+    DESKTOP_UPDATE_BUSY_POLL_MS << Math.min(
+      installReconciliationAttempt,
+      DESKTOP_UPDATE_RECONCILIATION_MAX_BACKOFF_EXPONENT,
+    ),
   );
 };
 
