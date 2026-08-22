@@ -134,6 +134,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
         providers: [],
       },
       "GET /v1/models": [],
+      "GET /v1/team-templates": [],
       "GET /v1/persona-infos": [
         {
           origin: "builtin",
