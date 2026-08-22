@@ -77,6 +77,26 @@ TROUVE_APP_UI_DIST="$PWD/web/app-ui/dist/desktop" \
   cargo build --release -p trouve-app
 ```
 
+## Updates
+
+Packaged desktop releases check for verified GitHub release updates before the
+main Wry/Lit window opens. When an update is available, a startup splash shows
+download, verification, and installation progress, then opens the updated app.
+Automatic startup updates can be disabled in **Settings → General**.
+
+While trouve is already open it only checks for availability: it never
+restarts active work automatically. An **Update** badge leads to the explicit
+**Install and restart** action in General settings, or the update can wait for
+the next natural launch. All local Cargo builds—including `cargo run -p
+trouve-app` and `cargo build --release -p trouve-app`—and web preview hosts do
+not perform self-update checks; only binaries marked by the official release
+workflow may update themselves.
+
+Official direct `trouve-server` and `trouve-search` binary installations may replace
+their on-disk executable in the background without restarting the running
+process. Use their `update` commands for manual control, or set
+`TROUVE_DISABLE_AUTO_UPDATE=1` to disable automatic checks for any component.
+
 ## Development
 
 The main workspace checks are:

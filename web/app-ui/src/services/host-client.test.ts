@@ -19,7 +19,7 @@ import {
 import type { HostPreferences } from "./host-client.js";
 
 const validCapabilities = {
-  bridge_version: 8,
+  bridge_version: 15,
   clipboard_image: true,
   close_confirmation: true,
   directory_picker: true,
@@ -33,6 +33,7 @@ const validCapabilities = {
   open_local_file: true,
   persistent_preferences: true,
   reveal_local_file: true,
+  self_update: true,
   sleep_inhibition: true,
   user_attention: true,
   visibility: true,
@@ -78,13 +79,34 @@ describe("HostClient", () => {
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await expect(client.bootstrap()).resolves.toMatchObject({
       kind: "desktop",
-      bridgeVersion: 8,
+      bridgeVersion: 15,
       directoryPicker: true,
       lifecycleEvents: true,
+      selfUpdate: true,
     });
     expect(client.systemFontFamilies()).toEqual(["Noto Sans", "Zed Sans"]);
     expect(client.mutationHeaders()).toEqual({
       "x-trouve-host-csrf": "a".repeat(64),
+    });
+  });
+
+  it("accepts legacy bootstrap payloads without self-update", async () => {
+    const legacyCapabilities: Record<string, unknown> = {
+      ...validCapabilities,
+      bridge_version: 13,
+    };
+    delete legacyCapabilities.self_update;
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        capabilities: legacyCapabilities,
+        csrf_token: "o".repeat(64),
+      }),
+    );
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+
+    await expect(client.bootstrap()).resolves.toMatchObject({
+      bridgeVersion: 13,
+      selfUpdate: false,
     });
   });
 
@@ -115,6 +137,109 @@ describe("HostClient", () => {
     await client.bootstrap();
     await expect(client.putPreferences(preferences)).resolves.toEqual(preferences);
     expect(requests.at(-1)?.headers.get("x-trouve-host-csrf")).toBe("b".repeat(64));
+  });
+
+  it("reads update status and authenticates explicit update actions", async () => {
+    const requests: Request[] = [];
+    const update = {
+      available_version: "4.1.0",
+      current_version: "4.0.0",
+      message: "Version 4.1.0 is ready to install.",
+      phase: "available",
+      progress_percent: null,
+    } as const;
+    const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      if (request.url.endsWith("/capabilities")) {
+        return Response.json({ capabilities: validCapabilities, csrf_token: "u".repeat(64) });
+      }
+      return Response.json(update);
+    });
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+    await client.bootstrap();
+
+    await expect(client.getDesktopUpdate()).resolves.toEqual({
+      availableVersion: "4.1.0",
+      currentVersion: "4.0.0",
+      message: "Version 4.1.0 is ready to install.",
+      phase: "available",
+      progressPercent: undefined,
+    });
+    await client.checkDesktopUpdate();
+    await client.installDesktopUpdate();
+
+    expect(requests.at(-2)?.url).toContain("/update/check");
+    expect(requests.at(-1)?.url).toContain("/update/install");
+    expect(requests.at(-2)?.headers.get("x-trouve-host-csrf")).toBe("u".repeat(64));
+    expect(requests.at(-1)?.headers.get("x-trouve-host-csrf")).toBe("u".repeat(64));
+  });
+
+  it("aborts a desktop update request that exceeds its deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        if (request.url.endsWith("/capabilities")) {
+          return Response.json({
+            capabilities: validCapabilities,
+            csrf_token: "t".repeat(64),
+          });
+        }
+        return await new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener(
+            "abort",
+            () => reject(request.signal.reason),
+            { once: true },
+          );
+        });
+      });
+      const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+      await client.bootstrap();
+
+      const assertion = expect(client.getDesktopUpdate()).rejects.toMatchObject({
+        kind: "request-failed",
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds a stalled desktop install acknowledgement", async () => {
+    vi.useFakeTimers();
+    try {
+      let installRequest: Request | undefined;
+      const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        if (request.url.endsWith("/capabilities")) {
+          return Response.json({
+            capabilities: validCapabilities,
+            csrf_token: "i".repeat(64),
+          });
+        }
+        installRequest = request;
+        return await new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener(
+            "abort",
+            () => reject(request.signal.reason),
+            { once: true },
+          );
+        });
+      });
+      const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+      await client.bootstrap();
+
+      const installation = expect(client.installDesktopUpdate()).rejects.toMatchObject({
+        kind: "request-failed",
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(installRequest?.signal.aborted).toBe(true);
+      await installation;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("gates close acknowledgement on the independently versioned bridge", async () => {
@@ -165,14 +290,18 @@ describe("HostClient", () => {
       if (request.url.endsWith("/capabilities")) {
         return Response.json({ capabilities: validCapabilities, csrf_token: "c".repeat(64) });
       }
+      if (request.method === "GET") return Response.json(preferences);
       writes += 1;
       if (writes === 1) await firstBlocked;
-      const value = await request.clone().json() as HostPreferences;
+      const { preferences: value } = await request.clone().json() as {
+        preferences: HostPreferences;
+      };
       writtenPreferences.push(value);
       return Response.json(value);
     });
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await client.bootstrap();
+    await client.getPreferences();
 
     const first = client.putPreferences(preferences);
     const second = client.putPreferences({
@@ -210,8 +339,11 @@ describe("HostClient", () => {
       if (request.url.endsWith("/capabilities")) {
         return Response.json({ capabilities: validCapabilities, csrf_token: "r".repeat(64) });
       }
+      if (request.method === "GET") return Response.json(preferences);
       writes += 1;
-      const value = await request.clone().json() as HostPreferences;
+      const { preferences: value } = await request.clone().json() as {
+        preferences: HostPreferences;
+      };
       written.push(value);
       if (writes === 1) {
         await firstBlocked;
@@ -228,6 +360,7 @@ describe("HostClient", () => {
     });
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await client.bootstrap();
+    await client.getPreferences();
 
     const first = client.putPreferences(preferences);
     const queued = client.putPreferences({
@@ -263,6 +396,7 @@ describe("HostClient", () => {
     });
     const written: HostPreferences[] = [];
     let putCount = 0;
+    let getCount = 0;
     const latest: HostPreferences = {
       ...preferences,
       appearance: { ...preferences.appearance, font_size: 17 },
@@ -272,9 +406,14 @@ describe("HostClient", () => {
       if (request.url.endsWith("/capabilities")) {
         return Response.json({ capabilities: validCapabilities, csrf_token: "f".repeat(64) });
       }
-      if (request.method === "GET") return Response.json(latest);
+      if (request.method === "GET") {
+        getCount += 1;
+        return Response.json(getCount === 1 ? preferences : latest);
+      }
       putCount += 1;
-      const value = await request.clone().json() as HostPreferences;
+      const { preferences: value } = await request.clone().json() as {
+        preferences: HostPreferences;
+      };
       written.push(value);
       if (putCount === 1) {
         await firstBlocked;
@@ -284,6 +423,7 @@ describe("HostClient", () => {
     });
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await client.bootstrap();
+    await client.getPreferences();
 
     const first = client.putPreferences(preferences);
     const queued = client.putPreferences({ ...preferences, navigation_width: 333 });
@@ -723,6 +863,7 @@ describe("HostClient", () => {
   it("maps and updates all host-backed presentation preferences", () => {
     expect(generalPreferencesFromHost(preferences)).toEqual({
       preventSleepWhileRunning: true,
+      automaticUpdates: true,
     });
     expect(chatPreferencesFromHost(preferences)).toEqual({
       collapseSequentialToolCalls: true,
@@ -769,6 +910,7 @@ describe("HostClient", () => {
     });
     let next = withHostGeneralPreferences(preferences, {
       preventSleepWhileRunning: false,
+      automaticUpdates: false,
     });
     next = withHostChatPreferences(next, {
       collapseSequentialToolCalls: true,
@@ -798,6 +940,7 @@ describe("HostClient", () => {
       pinnedThreadTabs: ["th-1"],
     });
     expect(next.general?.prevent_sleep_while_running).toBe(false);
+    expect(next.general?.automatic_updates).toBe(false);
     expect(next.chat?.collapse_sequential_tool_calls).toBe(true);
     expect(next.chat?.collapse_thinking_with_tools).toBe(true);
     expect(next.chat?.collapse_compaction_with_tools).toBe(true);

@@ -701,6 +701,42 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(/\.settings-about-card \{[^}]*display:\s*grid/s);
   });
 
+  it("keeps desktop update controls in General rather than About", () => {
+    const general = settings.indexOf('<h1 id="settings-title">General</h1>');
+    const automaticUpdates = settings.indexOf('id="settings-automatic-updates"');
+    const about = settings.indexOf('<h1 id="settings-title">About</h1>');
+    expect(general).toBeGreaterThan(-1);
+    expect(automaticUpdates).toBeGreaterThan(general);
+    expect(automaticUpdates).toBeLessThan(about);
+    expect(settings).toContain("Install v${this.#desktopUpdateState?.availableVersion");
+  });
+
+  it("keeps desktop update polling scoped to the connected settings lifecycle", () => {
+    expect(settings).toContain("this.#desktopUpdateGeneration += 1;");
+    expect(settings).toContain("this.#desktopUpdateActionPending = false;");
+    expect(settings).toContain(
+      "if (!this.isConnected || completionGeneration !== this.#desktopUpdateGeneration) return;",
+    );
+    expect(settings.indexOf("completionGeneration !==")).toBeLessThan(
+      settings.lastIndexOf("this.#desktopUpdateActionPending = false;"),
+    );
+    expect(settings).toContain(
+      "if (!this.isConnected || this.#desktopUpdatePollIntervalMs === intervalMs) return;",
+    );
+    expect(settings).toContain("this.#startDesktopUpdatePolling(DESKTOP_UPDATE_IDLE_POLL_MS);");
+    expect(settings).toContain("this.#stopDesktopUpdatePolling();");
+  });
+
+  it("orders app-level desktop update publications and announces coarse settings phases", () => {
+    expect(shell).toContain("const generation = ++this.#desktopUpdateGeneration;");
+    expect(shell).toContain("if (generation === this.#desktopUpdateGeneration)");
+    expect(shell).toContain("&& !this.#desktopUpdateActionPending");
+    expect(settings).toContain("?disabled=${!currentCapabilities.selfUpdate}");
+    expect(settings).toContain('role="status" aria-live="polite" aria-atomic="true"');
+    expect(settings).toContain('class="visually-hidden" role="alert"');
+    expect(settings).toContain(": `Update ${state.phase}.`;");
+  });
+
   it("ships every current semantic palette from the generated source", () => {
     expect([...themes.matchAll(/\[data-theme="([^"]+)"\]/g)].map((match) => match[1])).toEqual([
       "dark",

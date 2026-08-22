@@ -1,6 +1,7 @@
 import createClient, { type Client } from "openapi-fetch";
 
 import {
+  desktopUpdateState,
   hostBootstrap,
   hostLifecycleBatch,
   hostPreferences,
@@ -49,6 +50,7 @@ type PickFilesResponseWire = HostComponents["schemas"]["PickFilesResponse"];
 type ReadClipboardImageResponseWire =
   HostComponents["schemas"]["ReadClipboardImageResponse"];
 export type HostPreferences = HostComponents["schemas"]["HostPreferences"];
+type HostPreferencesUpdate = HostComponents["schemas"]["HostPreferencesUpdate"];
 export type HostCloseDecision = HostComponents["schemas"]["CloseDecision"];
 export type HostLocalFileAction = HostComponents["schemas"]["LocalFileAction"];
 
@@ -95,6 +97,25 @@ export interface NativeNotificationRequest {
   readonly threadId: string | undefined;
 }
 
+export type DesktopUpdatePhase =
+  | "disabled"
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "verifying"
+  | "installing"
+  | "restarting"
+  | "error";
+
+export interface DesktopUpdateState {
+  readonly currentVersion: string;
+  readonly availableVersion: string | undefined;
+  readonly phase: DesktopUpdatePhase;
+  readonly message: string;
+  readonly progressPercent: number | undefined;
+}
+
 export interface WatchHostLifecycleOptions {
   readonly after?: number;
   readonly waitMs?: number;
@@ -120,11 +141,15 @@ const HOST_USER_ATTENTION_PATH =
   "/__trouve/host/v1/request-user-attention" as const;
 const HOST_LOCAL_FILE_ACTION_PATH =
   "/__trouve/host/v1/local-file-action" as const;
+const HOST_DESKTOP_UPDATE_PATH = "/__trouve/host/v1/update" as const;
+const HOST_DESKTOP_UPDATE_CHECK_PATH = "/__trouve/host/v1/update/check" as const;
+const HOST_DESKTOP_UPDATE_INSTALL_PATH = "/__trouve/host/v1/update/install" as const;
 const CSRF_HEADER = "x-trouve-host-csrf";
 const DIRECTORY_PICKER_BRIDGE_VERSION = 3;
 const NATIVE_ATTACHMENT_BRIDGE_VERSION = 4;
 const NATIVE_LIFECYCLE_BRIDGE_VERSION = 5;
 const CLOSE_ACKNOWLEDGEMENT_BRIDGE_VERSION = 13;
+const SELF_UPDATE_BRIDGE_VERSION = 14;
 const MAX_LIFECYCLE_WAIT_MS = 25_000;
 const MAX_LIFECYCLE_EVENTS = 128;
 const MAX_HOST_ID_BYTES = 256;
@@ -136,6 +161,7 @@ type HostSchemaName =
   | "HostBootstrap"
   | "HostPreferences"
   | "HostLifecycleBatch"
+  | "DesktopUpdateState"
   | "PickDirectoryResponse"
   | "PickFilesResponse"
   | "ReadClipboardImageResponse";
@@ -144,6 +170,7 @@ const schemaValidators = new Map<HostSchemaName, ValidateFunction>([
   ["HostBootstrap", hostBootstrap],
   ["HostPreferences", hostPreferences],
   ["HostLifecycleBatch", hostLifecycleBatch],
+  ["DesktopUpdateState", desktopUpdateState],
   ["PickDirectoryResponse", pickDirectoryResponse],
   ["PickFilesResponse", pickFilesResponse],
   ["ReadClipboardImageResponse", readClipboardImageResponse],
@@ -216,7 +243,38 @@ export const mapHostCapabilities = (
     occlusion: wire.occlusion && hasLifecycleBridge,
     persistentPreferences: wire.persistent_preferences,
     installable: wire.installable,
+    selfUpdate:
+      (wire.self_update ?? false) &&
+      wire.bridge_version != null &&
+      wire.bridge_version >= SELF_UPDATE_BRIDGE_VERSION,
   });
+};
+
+const normalizeDesktopUpdateState = (
+  wire: HostComponents["schemas"]["DesktopUpdateState"],
+): DesktopUpdateState => Object.freeze({
+  currentVersion: wire.current_version,
+  availableVersion: wire.available_version ?? undefined,
+  phase: wire.phase,
+  message: wire.message,
+  progressPercent: wire.progress_percent ?? undefined,
+});
+
+const DESKTOP_UPDATE_REQUEST_TIMEOUT_MS = 30_000;
+
+const withDesktopUpdateDeadline = async <T>(
+  request: (signal: AbortSignal) => Promise<T>,
+): Promise<T> => {
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(
+    () => controller.abort(),
+    DESKTOP_UPDATE_REQUEST_TIMEOUT_MS,
+  );
+  try {
+    return await request(controller.signal);
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
 };
 
 const samePreferenceValue = (left: unknown, right: unknown): boolean =>
@@ -282,6 +340,11 @@ const rebaseHostPreferenceChanges = (
         baseline.general?.prevent_sleep_while_running ?? true,
         incoming.general?.prevent_sleep_while_running ?? true,
         saved.general?.prevent_sleep_while_running ?? true,
+      ),
+      automatic_updates: rebasePreferenceLeaf(
+        baseline.general?.automatic_updates ?? true,
+        incoming.general?.automatic_updates ?? true,
+        saved.general?.automatic_updates ?? true,
       ),
     },
     chat: {
@@ -401,11 +464,13 @@ export class HostClient {
   #userAttentionAvailable = false;
   #openLocalFileAvailable = false;
   #revealLocalFileAvailable = false;
+  #selfUpdateAvailable = false;
   #fontFamilies: readonly string[] = Object.freeze([]);
   #notificationSequence = 0;
   readonly #notificationActivations = new Map<string, () => void>();
   #preferenceWriteRunning = false;
   #pendingPreferenceWrite: PendingPreferenceWrite | undefined;
+  #preferenceBaseline: HostPreferences | undefined;
 
   constructor(baseUrl: string, fetchImplementation: typeof fetch = globalThis.fetch) {
     this.#client = createClient<HostPaths>({ baseUrl, fetch: fetchImplementation });
@@ -438,6 +503,7 @@ export class HostClient {
     this.#userAttentionAvailable = capabilities.userAttention;
     this.#openLocalFileAvailable = capabilities.openLocalFile;
     this.#revealLocalFileAvailable = capabilities.revealLocalFile;
+    this.#selfUpdateAvailable = capabilities.selfUpdate;
     return capabilities;
   }
 
@@ -809,6 +875,82 @@ export class HostClient {
     );
   }
 
+  async getDesktopUpdate(): Promise<DesktopUpdateState> {
+    this.#nativeActionToken(
+      this.#selfUpdateAvailable,
+      "desktop self-update is unavailable",
+    );
+    let result;
+    try {
+      result = await withDesktopUpdateDeadline((signal) =>
+        this.#client.GET(HOST_DESKTOP_UPDATE_PATH, { signal })
+      );
+    } catch {
+      throw new HostClientError("request-failed", "desktop update status failed");
+    }
+    if (result.data === undefined || !result.response.ok) {
+      throw new HostClientError("request-failed", "desktop update status failed");
+    }
+    return normalizeDesktopUpdateState(
+      validate<HostComponents["schemas"]["DesktopUpdateState"]>(
+        "DesktopUpdateState",
+        result.data,
+      ),
+    );
+  }
+
+  async checkDesktopUpdate(): Promise<DesktopUpdateState> {
+    return this.#runDesktopUpdateAction(
+      HOST_DESKTOP_UPDATE_CHECK_PATH,
+      "desktop update check failed",
+    );
+  }
+
+  async installDesktopUpdate(): Promise<DesktopUpdateState> {
+    return this.#runDesktopUpdateAction(
+      HOST_DESKTOP_UPDATE_INSTALL_PATH,
+      "desktop update installation failed",
+    );
+  }
+
+  async #runDesktopUpdateAction(
+    path: typeof HOST_DESKTOP_UPDATE_CHECK_PATH | typeof HOST_DESKTOP_UPDATE_INSTALL_PATH,
+    failureMessage: string,
+  ): Promise<DesktopUpdateState> {
+    const csrfToken = this.#nativeActionToken(
+      this.#selfUpdateAvailable,
+      "desktop self-update is unavailable",
+    );
+    let result;
+    try {
+      result = await withDesktopUpdateDeadline((signal) =>
+        path === HOST_DESKTOP_UPDATE_CHECK_PATH
+          ? this.#client.POST(HOST_DESKTOP_UPDATE_CHECK_PATH, {
+              headers: { [CSRF_HEADER]: csrfToken },
+              signal,
+            })
+          : this.#client.POST(HOST_DESKTOP_UPDATE_INSTALL_PATH, {
+              headers: { [CSRF_HEADER]: csrfToken },
+              signal,
+            })
+      );
+    } catch {
+      throw new HostClientError("request-failed", failureMessage);
+    }
+    if (result.response.status === 409) {
+      throw new HostClientError("action-busy", "a desktop update action is already running");
+    }
+    if (result.data === undefined || !result.response.ok) {
+      throw new HostClientError("request-failed", failureMessage);
+    }
+    return normalizeDesktopUpdateState(
+      validate<HostComponents["schemas"]["DesktopUpdateState"]>(
+        "DesktopUpdateState",
+        result.data,
+      ),
+    );
+  }
+
   async getPreferences(): Promise<HostPreferences> {
     let result;
     try {
@@ -819,7 +961,9 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop preferences request failed");
     }
-    return validate<HostPreferences>("HostPreferences", result.data);
+    const preferences = validate<HostPreferences>("HostPreferences", result.data);
+    this.#preferenceBaseline = preferences;
+    return preferences;
   }
 
   putPreferences(preferences: HostPreferences): Promise<HostPreferences> {
@@ -892,10 +1036,12 @@ export class HostClient {
         "desktop host must bootstrap before preference writes",
       );
     }
+    const baseline = this.#preferenceBaseline ?? await this.getPreferences();
+    const update: HostPreferencesUpdate = { baseline, preferences };
     let result;
     try {
       result = await this.#client.PUT(HOST_PREFERENCES_PATH, {
-        body: preferences,
+        body: update,
         headers: { [CSRF_HEADER]: this.#csrfToken },
       });
     } catch {
@@ -904,7 +1050,9 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop preference update failed");
     }
-    return validate<HostPreferences>("HostPreferences", result.data);
+    const saved = validate<HostPreferences>("HostPreferences", result.data);
+    this.#preferenceBaseline = saved;
+    return saved;
   }
 
   mutationHeaders(): Readonly<Record<string, string>> {
@@ -1094,6 +1242,9 @@ export const generalPreferencesFromHost = (
   preventSleepWhileRunning:
     preferences.general?.prevent_sleep_while_running ??
     DEFAULT_GENERAL_PREFERENCES.preventSleepWhileRunning,
+  automaticUpdates:
+    preferences.general?.automatic_updates ??
+    DEFAULT_GENERAL_PREFERENCES.automaticUpdates,
 });
 
 export const chatPreferencesFromHost = (
@@ -1162,7 +1313,10 @@ export const withHostGeneralPreferences = (
   general: GeneralPreferences,
 ): HostPreferences => ({
   ...preferences,
-  general: { prevent_sleep_while_running: general.preventSleepWhileRunning },
+  general: {
+    prevent_sleep_while_running: general.preventSleepWhileRunning,
+    automatic_updates: general.automaticUpdates,
+  },
 });
 
 export const withHostChatPreferences = (

@@ -73,6 +73,7 @@ import {
   withHostResumePreferences,
   withHostWorkspaceOrder,
   workspaceOrderFromHost,
+  type DesktopUpdateState,
   type HostPendingCloseRequest,
   type HostPreferences,
 } from "../services/host-client.js";
@@ -102,6 +103,7 @@ import {
   type ProtocolSubscriptionHealth,
 } from "../services/protocol-client.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
+import { ConfirmedWriteTracker } from "../services/confirmed-write-tracker.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
 import { ModelCatalogController } from "../services/model-catalog-controller.js";
 import {
@@ -201,6 +203,7 @@ const INSPECTION_PANELS = [
 const GITHUB_REFRESH_INTERVAL_MS = 30_000;
 const SLEEP_ACTIVITY_RECONCILE_INTERVAL_MS = 15_000;
 const AUTOMATIC_RETRY_MS = 5_000;
+const DESKTOP_UPDATE_STATUS_INTERVAL_MS = 30_000;
 
 const INSPECTION_PANEL_LABELS: Readonly<Record<
   InspectionPanel,
@@ -329,6 +332,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           }, onActivate?: () => void) =>
             this.#hostClient!.showNativeNotification(request, onActivate),
           requestUserAttention: () => this.#hostClient!.requestUserAttention(),
+          getDesktopUpdate: () => this.#readDesktopUpdateStatus(),
+          checkDesktopUpdate: () => this.#runDesktopUpdateAction("check"),
+          installDesktopUpdate: () => this.#runDesktopUpdateAction("install"),
         });
   readonly #services: AppServices = Object.freeze({
     deployment,
@@ -379,7 +385,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   );
   readonly #threadIngress = createBrowserThreadIngress(this.#protocolClient, this.#store);
   #hostPreferences: HostPreferences | undefined;
-  #hostPreferenceWriteGeneration = 0;
+  readonly #hostPreferenceWrites = new ConfirmedWriteTracker<HostPreferences>();
   #browserFontFamilies: Promise<readonly string[]> | undefined;
   #hostLoadStarted = false;
   #hostError = false;
@@ -458,6 +464,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #sleepActivityReconcilePending = false;
   #protocolRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #hostRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #desktopUpdateStatusTimer: ReturnType<typeof setInterval> | undefined;
+  #desktopUpdateState: DesktopUpdateState | undefined;
+  #desktopUpdateGeneration = 0;
+  #desktopUpdateActionPending = false;
+  #desktopUpdateReadPending: Promise<DesktopUpdateState> | undefined;
   #routeRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #navigationWidth = 260;
   #inspectionWidth = 460;
@@ -530,6 +541,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       if (!this.#hostLoadStarted) {
         void this.#startDesktopHost();
       } else if (this.#hostPreferences !== undefined && !this.#hostError) {
+        this.#startDesktopUpdateStatusPolling();
         this.#startProtocolIngress();
       }
     } else {
@@ -574,6 +586,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#sleepActivityReconcilePending = false;
     this.#flushResumePreferences();
     this.#desktopCoordinator?.stop();
+    this.#desktopUpdateGeneration += 1;
+    this.#desktopUpdateActionPending = false;
+    this.#stopDesktopUpdateStatusPolling();
     this.#browserWakeLock?.stop();
     this.#clearAutomaticRetryTimers();
     if (this.#connectivityNoticeTimer !== undefined) {
@@ -801,14 +816,88 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   async #loadDesktopHost(): Promise<void> {
     const host = this.#hostClient;
     if (host === undefined) return;
-    this.#capabilities.update(await host.bootstrap());
+    const capabilities = await host.bootstrap();
+    this.#capabilities.update(capabilities);
     this.#systemFontFamilies.set(host.systemFontFamilies());
     const preferences = await host.getPreferences();
     this.#hostPreferences = preferences;
+    this.#hostPreferenceWrites.load(preferences);
     this.#applyHostPreferences(preferences);
     if (isThemePreference(preferences.appearance.theme)) {
       this.#theme.setPreference(preferences.appearance.theme);
     }
+    if (this.isConnected && capabilities.selfUpdate) {
+      this.#startDesktopUpdateStatusPolling();
+    }
+  }
+
+  async #readDesktopUpdateStatus(): Promise<DesktopUpdateState> {
+    if (this.#desktopUpdateReadPending !== undefined) {
+      return this.#desktopUpdateReadPending;
+    }
+    const host = this.#hostClient;
+    if (host === undefined) throw new Error("desktop host is unavailable");
+    const generation = this.#desktopUpdateGeneration;
+    const pending = host.getDesktopUpdate();
+    this.#desktopUpdateReadPending = pending;
+    try {
+      const state = await pending;
+      if (
+        this.isConnected
+        && generation === this.#desktopUpdateGeneration
+        && !this.#desktopUpdateActionPending
+      ) {
+        this.#desktopUpdateState = state;
+        this.requestUpdate();
+      }
+      return state;
+    } finally {
+      if (this.#desktopUpdateReadPending === pending) {
+        this.#desktopUpdateReadPending = undefined;
+      }
+    }
+  }
+
+  async #runDesktopUpdateAction(
+    action: "check" | "install",
+  ): Promise<DesktopUpdateState> {
+    const generation = ++this.#desktopUpdateGeneration;
+    this.#desktopUpdateActionPending = true;
+    try {
+      const state = action === "check"
+        ? await this.#hostClient!.checkDesktopUpdate()
+        : await this.#hostClient!.installDesktopUpdate();
+      if (generation === this.#desktopUpdateGeneration) {
+        this.#desktopUpdateState = state;
+        this.requestUpdate();
+      }
+      return state;
+    } finally {
+      if (generation === this.#desktopUpdateGeneration) {
+        this.#desktopUpdateGeneration += 1;
+        this.#desktopUpdateActionPending = false;
+      }
+    }
+  }
+
+  #startDesktopUpdateStatusPolling(): void {
+    if (
+      !this.isConnected
+      || this.#hostClient === undefined
+      || !readSignal(this.#capabilities.current).selfUpdate
+      || this.#desktopUpdateStatusTimer !== undefined
+    ) return;
+    void this.#readDesktopUpdateStatus().catch(() => {});
+    this.#desktopUpdateStatusTimer = globalThis.setInterval(() => {
+      if (!this.isConnected || globalThis.document?.visibilityState === "hidden") return;
+      void this.#readDesktopUpdateStatus().catch(() => {});
+    }, DESKTOP_UPDATE_STATUS_INTERVAL_MS);
+  }
+
+  #stopDesktopUpdateStatusPolling(): void {
+    if (this.#desktopUpdateStatusTimer === undefined) return;
+    globalThis.clearInterval(this.#desktopUpdateStatusTimer);
+    this.#desktopUpdateStatusTimer = undefined;
   }
 
   #loadSystemFontFamilies(): Promise<readonly string[]> {
@@ -929,12 +1018,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const host = this.#hostClient;
     if (host === undefined) return;
     this.#hostPreferences = preferences;
-    const generation = ++this.#hostPreferenceWriteGeneration;
+    const generation = this.#hostPreferenceWrites.begin();
     void host.putPreferences(preferences).then((saved) => {
+      // Every successful host response advances the authoritative rollback
+      // point, even when a newer optimistic edit is already queued.
+      const current = this.#hostPreferenceWrites.succeed(generation, saved);
       // HostClient coalesces queued writes, so only the newest caller may
       // adopt its response. An older request can finish after a newer local
       // edit was submitted; applying that response would erase the edit.
-      if (generation !== this.#hostPreferenceWriteGeneration) return;
+      if (!current) return;
       this.#hostPreferences = saved;
       this.#applyHostPreferences(saved);
       if (isThemePreference(saved.appearance.theme)) {
@@ -942,8 +1034,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       }
       this.requestUpdate();
     }).catch(() => {
-      if (generation !== this.#hostPreferenceWriteGeneration || !reportError) return;
-      this.#shellNotice = "Desktop preferences could not be saved.";
+      const failed = this.#hostPreferenceWrites.fail(generation);
+      if (!failed.current) return;
+      const confirmed = failed.confirmed;
+      if (confirmed !== undefined) {
+        this.#hostPreferences = confirmed;
+        this.#applyHostPreferences(confirmed);
+      }
+      if (reportError) {
+        this.#shellNotice = "Desktop preferences could not be saved.";
+      }
       this.requestUpdate();
     });
   }
@@ -2788,7 +2888,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           <div class="primary-links" aria-label="Application sections">
             <button type="button" aria-current=${route.kind === "reviews" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "reviews" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("code-pull-request")}<strong>Pull Requests</strong></button>
             <button type="button" aria-current=${route.kind === "automations" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "automations" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("stopwatch")}<strong>Automations</strong></button>
-            <button type="button" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "settings" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("gear", { className: "settings-link-icon" })}<strong>Settings</strong></button>
+            <button class=${this.#desktopUpdateState?.phase === "available" ? "has-update" : ""} type="button" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate(this.#desktopUpdateState?.phase === "available" ? { kind: "settings", section: "general" } : { kind: "settings" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("gear", { className: "settings-link-icon" })}<strong>Settings</strong>${this.#desktopUpdateState?.phase === "available" ? html`<span class="update-badge">Update</span>` : nothing}</button>
           </div>
           <div class="workspace-list-heading">
             <strong>Workspaces</strong>
@@ -3508,7 +3608,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             <button type="button" aria-pressed=${this.#mobilePane === "thread"} @click=${() => this.#showMobilePane("thread")}>Chat</button>
             <button type="button" aria-pressed=${this.#mobilePane === "inspection"} @click=${() => this.#showMobilePane("inspection")}>Inspect</button>
             <button type="button" aria-pressed=${route.kind === "reviews"} @click=${() => { this.#showMobilePane("thread"); this.#router.navigate({ kind: "reviews" }); }}>Reviews</button>
-            <button type="button" @click=${() => { this.#showMobilePane("thread"); this.#router.navigate({ kind: "settings" }); }}>Settings</button>
+            <button type="button" @click=${() => { this.#showMobilePane("thread"); this.#router.navigate(this.#desktopUpdateState?.phase === "available" ? { kind: "settings", section: "general" } : { kind: "settings" }); }}>Settings${this.#desktopUpdateState?.phase === "available" ? html`<span class="mobile-update-dot" aria-label="Update available"> •</span>` : nothing}</button>
           </nav>
         </footer>
       </main>

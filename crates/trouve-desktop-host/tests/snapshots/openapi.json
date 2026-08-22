@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "13"
+    "version": "15"
   },
   "paths": {
     "/__trouve/host/v1/capabilities": {
@@ -328,7 +328,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/HostPreferences"
+                "$ref": "#/components/schemas/HostPreferencesUpdate"
               }
             }
           },
@@ -432,6 +432,93 @@
             "description": ""
           },
           "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/update": {
+      "get": {
+        "tags": [],
+        "operationId": "get_desktop_update",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopUpdateState"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/update/check": {
+      "post": {
+        "tags": [],
+        "operationId": "check_desktop_update",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopUpdateState"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/update/install": {
+      "post": {
+        "tags": [],
+        "operationId": "install_desktop_update",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopUpdateState"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
             "description": ""
           },
           "500": {
@@ -575,10 +662,67 @@
           }
         }
       },
+      "DesktopUpdatePhase": {
+        "type": "string",
+        "description": "Ephemeral state of the native desktop updater. This is deliberately host\nbridge state rather than durable harness protocol state.",
+        "enum": [
+          "disabled",
+          "idle",
+          "checking",
+          "available",
+          "downloading",
+          "verifying",
+          "installing",
+          "restarting",
+          "error"
+        ]
+      },
+      "DesktopUpdateState": {
+        "type": "object",
+        "description": "Bounded, presentation-ready updater state exposed to the Lit desktop UI.",
+        "required": [
+          "current_version",
+          "available_version",
+          "phase",
+          "message",
+          "progress_percent"
+        ],
+        "properties": {
+          "available_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_version": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/DesktopUpdatePhase"
+          },
+          "progress_percent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Whole-number download/install progress. `None` means indeterminate.",
+            "maximum": 100,
+            "minimum": 0
+          }
+        }
+      },
       "GeneralPreferences": {
         "type": "object",
         "description": "General desktop-only behavior persisted by the stable native host rather\nthan by an ephemeral loopback browser origin.",
         "properties": {
+          "automatic_updates": {
+            "type": "boolean",
+            "description": "Check and install verified desktop updates before the product UI starts."
+          },
           "prevent_sleep_while_running": {
             "type": "boolean"
           }
@@ -678,6 +822,10 @@
           },
           "reveal_local_file": {
             "type": "boolean"
+          },
+          "self_update": {
+            "type": "boolean",
+            "description": "The native product host can check, verify, install, and restart into\nrepository release updates. Preview hosts and PWAs leave this false."
           },
           "sleep_inhibition": {
             "type": "boolean"
@@ -937,6 +1085,22 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "HostPreferencesUpdate": {
+        "type": "object",
+        "description": "A client's desired preference snapshot paired with the exact snapshot it\nedited. The gateway rebases only intentional field changes onto the latest\npersisted state, so stale windows cannot overwrite newer unrelated edits.",
+        "required": [
+          "baseline",
+          "preferences"
+        ],
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/HostPreferences"
+          },
+          "preferences": {
+            "$ref": "#/components/schemas/HostPreferences"
           }
         }
       },

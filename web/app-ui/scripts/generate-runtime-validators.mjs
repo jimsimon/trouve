@@ -255,6 +255,7 @@ const hostSource = generateModule({
     hostBootstrap: componentRef(hostSchemaId, "HostBootstrap"),
     hostPreferences: componentRef(hostSchemaId, "HostPreferences"),
     hostLifecycleBatch: componentRef(hostSchemaId, "HostLifecycleBatch"),
+    desktopUpdateState: componentRef(hostSchemaId, "DesktopUpdateState"),
     pickDirectoryResponse: componentRef(hostSchemaId, "PickDirectoryResponse"),
     pickFilesResponse: componentRef(hostSchemaId, "PickFilesResponse"),
     readClipboardImageResponse: componentRef(hostSchemaId, "ReadClipboardImageResponse"),

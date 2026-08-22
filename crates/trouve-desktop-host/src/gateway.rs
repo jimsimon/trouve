@@ -23,11 +23,12 @@ use utoipa::{OpenApi, ToSchema};
 #[cfg(test)]
 use crate::AssetManifest;
 use crate::{
-    Asset, AssetLookup, CloseDecision, ExternalHttpsUrl, FrontendSource, GatewayOrigin,
-    HostCapabilities, HostKind, HostLifecycleEnvelope, HostLifecycleState, HostNativeActions,
-    HostPreferences, HostValidationError, LocalFileAction, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES,
-    MAX_NATIVE_ATTACHMENTS, MAX_SYSTEM_FONT_FAMILIES, NativeAttachment, NativeNotification,
-    system_font_families, valid_session_relative_path, validate_native_attachment,
+    Asset, AssetLookup, CloseDecision, DesktopUpdatePhase, DesktopUpdateState, ExternalHttpsUrl,
+    FrontendSource, GatewayOrigin, HostCapabilities, HostKind, HostLifecycleEnvelope,
+    HostLifecycleState, HostNativeActions, HostPreferences, HostValidationError, LocalFileAction,
+    MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS, MAX_SYSTEM_FONT_FAMILIES,
+    NativeAttachment, NativeNotification, system_font_families, valid_session_relative_path,
+    validate_native_attachment,
 };
 
 pub const HOST_API_PREFIX: &str = "/__trouve/host/v1";
@@ -46,6 +47,9 @@ const NATIVE_NOTIFICATION_PATH: &str = "/__trouve/host/v1/native-notification";
 const USER_ATTENTION_PATH: &str = "/__trouve/host/v1/request-user-attention";
 const LOCAL_FILE_ACTION_PATH: &str = "/__trouve/host/v1/local-file-action";
 const OPEN_HTTPS_URL_PATH: &str = "/__trouve/host/v1/open-https-url";
+const DESKTOP_UPDATE_PATH: &str = "/__trouve/host/v1/update";
+const DESKTOP_UPDATE_CHECK_PATH: &str = "/__trouve/host/v1/update/check";
+const DESKTOP_UPDATE_INSTALL_PATH: &str = "/__trouve/host/v1/update/install";
 const MAX_NATIVE_PATH_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -115,6 +119,15 @@ pub struct SleepInhibitionRequest {
     pub active: bool,
 }
 
+/// A client's desired preference snapshot paired with the exact snapshot it
+/// edited. The gateway rebases only intentional field changes onto the latest
+/// persisted state, so stale windows cannot overwrite newer unrelated edits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct HostPreferencesUpdate {
+    pub baseline: HostPreferences,
+    pub preferences: HostPreferences,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NativeNotificationRequest {
     pub notification_id: String,
@@ -173,12 +186,16 @@ struct LifecycleQuery {
         send_native_notification,
         request_user_attention,
         local_file_action,
-        open_https_url
+        open_https_url,
+        get_desktop_update,
+        check_desktop_update,
+        install_desktop_update
     ),
     components(schemas(
         HostBootstrap,
         HostCapabilities,
         HostPreferences,
+        HostPreferencesUpdate,
         PickDirectoryResponse,
         AttachmentPayload,
         PickFilesResponse,
@@ -199,6 +216,8 @@ struct LifecycleQuery {
         crate::AppearancePreferences,
         crate::ChatPreferences,
         crate::GeneralPreferences,
+        crate::DesktopUpdatePhase,
+        crate::DesktopUpdateState,
         crate::NotificationPreferences,
         crate::HostKind,
         crate::WindowGeometry
@@ -242,10 +261,6 @@ struct GatewayState {
     capabilities: HostCapabilities,
     font_families: Arc<[String]>,
     preferences: Arc<tokio::sync::Mutex<HostPreferences>>,
-    /// Snapshot last presented to this gateway's web client. Incoming PUTs
-    /// are full snapshots, so this baseline identifies which top-level fields
-    /// the client actually changed before merging with another process.
-    preference_baseline: Arc<tokio::sync::Mutex<HostPreferences>>,
     preference_path: Option<Arc<PathBuf>>,
     csrf_token: Arc<str>,
     protocol_upstream: Option<Url>,
@@ -254,6 +269,7 @@ struct GatewayState {
     native_actions: HostNativeActions,
     native_picker_permit: Arc<tokio::sync::Semaphore>,
     clipboard_image_permit: Arc<tokio::sync::Semaphore>,
+    desktop_update_permit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Whether a configured protocol upstream is owned by this desktop app.
@@ -341,6 +357,7 @@ impl HostGateway {
             capabilities.window_geometry = false;
             capabilities.visibility = false;
             capabilities.occlusion = false;
+            capabilities.self_update = false;
         }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -354,8 +371,7 @@ impl HostGateway {
                 frontend: Arc::new(frontend.into()),
                 capabilities,
                 font_families: system_font_families(),
-                preferences: Arc::new(tokio::sync::Mutex::new(preferences.clone())),
-                preference_baseline: Arc::new(tokio::sync::Mutex::new(preferences)),
+                preferences: Arc::new(tokio::sync::Mutex::new(preferences)),
                 preference_path: None,
                 csrf_token: fresh_token().into(),
                 protocol_upstream: None,
@@ -364,6 +380,7 @@ impl HostGateway {
                 native_actions: HostNativeActions::default(),
                 native_picker_permit: Arc::new(tokio::sync::Semaphore::new(1)),
                 clipboard_image_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+                desktop_update_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             },
         })
     }
@@ -398,6 +415,7 @@ impl HostGateway {
         self.state.capabilities.sleep_inhibition = self.state.native_actions.can_inhibit_sleep();
         self.state.capabilities.visibility = self.state.native_actions.can_report_visibility();
         self.state.capabilities.occlusion = self.state.native_actions.can_report_occlusion();
+        self.state.capabilities.self_update = self.state.native_actions.can_self_update();
         // Only the app-owned embedded/elected server is known to share this
         // process's filesystem namespace. An explicit upstream can be a
         // loopback tunnel or container port-forward, so fail closed for every
@@ -466,6 +484,9 @@ impl HostGateway {
             .route(USER_ATTENTION_PATH, post(request_user_attention))
             .route(LOCAL_FILE_ACTION_PATH, post(local_file_action))
             .route(OPEN_HTTPS_URL_PATH, post(open_https_url))
+            .route(DESKTOP_UPDATE_PATH, get(get_desktop_update))
+            .route(DESKTOP_UPDATE_CHECK_PATH, post(check_desktop_update))
+            .route(DESKTOP_UPDATE_INSTALL_PATH, post(install_desktop_update))
             .route("/v1/{*path}", any(proxy_protocol))
             .fallback(any(serve_frontend))
             .with_state(self.state.clone())
@@ -603,7 +624,7 @@ impl HostGateway {
         let mut capabilities = capabilities;
         capabilities.persistent_preferences = preference_path.is_some();
         let preferences = match preference_path.as_deref() {
-            Some(path) => load_preferences(path, preferences)?,
+            Some(path) => load_host_preferences(path, preferences)?,
             None => preferences,
         };
         let mut gateway = Self::new(origin, frontend, capabilities, preferences)?
@@ -695,7 +716,6 @@ async fn get_preferences(
 ) -> Result<Response, GatewayRejection> {
     validate_read(&state, &headers)?;
     let preferences = state.preferences.lock().await.clone();
-    *state.preference_baseline.lock().await = preferences.clone();
     let mut response = Json(preferences).into_response();
     response
         .headers_mut()
@@ -707,7 +727,7 @@ async fn get_preferences(
 #[utoipa::path(
     put,
     path = "/__trouve/host/v1/preferences",
-    request_body = HostPreferences,
+    request_body = HostPreferencesUpdate,
     responses((status = 200, body = HostPreferences), (status = 400))
 )]
 async fn put_preferences(
@@ -718,20 +738,21 @@ async fn put_preferences(
     let bytes = axum::body::to_bytes(request.into_body(), 64 * 1024)
         .await
         .map_err(|_| GatewayRejection::InvalidPreferences)?;
-    let mut preferences: HostPreferences =
+    let update: HostPreferencesUpdate =
         serde_json::from_slice(&bytes).map_err(|_| GatewayRejection::InvalidPreferences)?;
+    let client_baseline = update.baseline;
+    let mut preferences = update.preferences;
     // Serialize persistence and the in-memory replacement as one ordered
     // operation. Concurrent resize/theme writes can no longer complete out
     // of order or leave disk and memory on different versions.
     let mut current = state.preferences.lock().await;
-    let mut baseline = state.preference_baseline.lock().await;
     // Geometry is owned by the native window adapter. A web-client PUT is a
     // snapshot replacement for web-owned fields, so preserve a resize that
     // happened after the client read that snapshot.
     preferences.geometry = current.geometry.clone();
+    validate_preferences(&client_baseline).map_err(|_| GatewayRejection::InvalidPreferences)?;
     validate_preferences(&preferences).map_err(|_| GatewayRejection::InvalidPreferences)?;
     if let Some(path) = state.preference_path.clone() {
-        let client_baseline = baseline.clone();
         let incoming = preferences.clone();
         preferences = tokio::task::spawn_blocking(move || {
             merge_and_persist_preferences(&path, &client_baseline, &incoming, false)
@@ -739,10 +760,9 @@ async fn put_preferences(
         .await
         .map_err(|_| GatewayRejection::Internal)?
         .map_err(|_| GatewayRejection::Internal)?;
+    } else {
+        preferences = merge_preference_changes(&current, &client_baseline, &preferences, false);
     }
-    // Advance this client's baseline to what it submitted, while serving the
-    // merged snapshot so the frontend immediately learns concurrent changes.
-    *baseline = preferences.clone();
     *current = preferences.clone();
     let mut response = Json(preferences).into_response();
     response
@@ -750,6 +770,108 @@ async fn put_preferences(
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     apply_security_headers(response.headers_mut());
     Ok(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/__trouve/host/v1/update",
+    responses(
+        (status = 200, body = DesktopUpdateState),
+        (status = 403),
+        (status = 404),
+        (status = 500)
+    )
+)]
+async fn get_desktop_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Result<Response, GatewayRejection> {
+    validate_read(&state, &headers)?;
+    require_desktop_updater(&state)?;
+    let update = state
+        .native_actions
+        .desktop_update_status()
+        .map_err(|_| GatewayRejection::Internal)?;
+    json_no_store(update)
+}
+
+#[utoipa::path(
+    post,
+    path = "/__trouve/host/v1/update/check",
+    responses((status = 200, body = DesktopUpdateState), (status = 403), (status = 404), (status = 409), (status = 500))
+)]
+async fn check_desktop_update(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+) -> Result<Response, GatewayRejection> {
+    validate_mutation(&state, request.headers())?;
+    require_desktop_updater(&state)?;
+    require_empty_action_body(request).await?;
+    let _permit = state
+        .desktop_update_permit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| GatewayRejection::Busy)?;
+    let update = state
+        .native_actions
+        .check_desktop_update()
+        .await
+        .map_err(|_| GatewayRejection::Internal)?;
+    json_no_store(update)
+}
+
+#[utoipa::path(
+    post,
+    path = "/__trouve/host/v1/update/install",
+    responses((status = 200, body = DesktopUpdateState), (status = 403), (status = 404), (status = 409), (status = 500))
+)]
+async fn install_desktop_update(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+) -> Result<Response, GatewayRejection> {
+    validate_mutation(&state, request.headers())?;
+    require_desktop_updater(&state)?;
+    require_empty_action_body(request).await?;
+    let permit = state
+        .desktop_update_permit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| GatewayRejection::Busy)?;
+    // Installation is a host-owned operation. Return an explicit in-progress
+    // acknowledgement promptly; clients then poll the authoritative status
+    // endpoint instead of tying native replacement to an HTTP connection.
+    let update = state
+        .native_actions
+        .desktop_update_status()
+        .map_err(|_| GatewayRejection::Internal)?;
+    let accepted = DesktopUpdateState {
+        phase: DesktopUpdatePhase::Installing,
+        message: update.available_version.as_ref().map_or_else(
+            || "Update installation started.".into(),
+            |version| format!("Installing version {version}…"),
+        ),
+        progress_percent: None,
+        ..update
+    };
+    let native_actions = state.native_actions.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(error) = native_actions.install_desktop_update().await {
+            tracing::error!(%error, "desktop update operation failed");
+        }
+    });
+    json_no_store(accepted)
+}
+
+fn require_desktop_updater(state: &GatewayState) -> Result<(), GatewayRejection> {
+    if state.capabilities.kind == HostKind::Desktop
+        && state.capabilities.self_update
+        && state.native_actions.can_self_update()
+    {
+        Ok(())
+    } else {
+        Err(GatewayRejection::Missing)
+    }
 }
 
 #[utoipa::path(
@@ -1251,7 +1373,10 @@ fn json_no_store<T: Serialize>(value: T) -> Result<Response, GatewayRejection> {
     Ok(response)
 }
 
-fn load_preferences(
+/// Read and validate persisted desktop preferences without starting the
+/// gateway. The product updater uses this before any server or main window is
+/// created.
+pub fn load_host_preferences(
     path: &Path,
     fallback: HostPreferences,
 ) -> Result<HostPreferences, HostGatewayError> {
@@ -1298,7 +1423,8 @@ fn merge_and_persist_preferences(
         .open(lock_path)?;
     lock.lock_exclusive()?;
     let result = (|| {
-        let latest = load_preferences(path, baseline.clone()).map_err(std::io::Error::other)?;
+        let latest =
+            load_host_preferences(path, baseline.clone()).map_err(std::io::Error::other)?;
         let merged = merge_preference_changes(&latest, baseline, incoming, include_geometry);
         validate_preferences(&merged).map_err(std::io::Error::other)?;
         persist_preferences(path, &merged)?;
@@ -1333,6 +1459,7 @@ fn merge_preference_changes(
     merge_leaf!(appearance.font_size);
     merge_leaf!(appearance.reduce_motion);
     merge_leaf!(general.prevent_sleep_while_running);
+    merge_leaf!(general.automatic_updates);
     merge_leaf!(chat.collapse_sequential_tool_calls);
     merge_leaf!(chat.collapse_thinking_with_tools);
     merge_leaf!(chat.collapse_compaction_with_tools);
@@ -1812,6 +1939,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::DesktopUpdatePhase;
 
     fn asset(content_type: &str, bytes: &'static [u8], immutable: bool) -> Asset {
         Asset {
@@ -1938,7 +2066,11 @@ mod tests {
             .await
             .unwrap();
         let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
-        let body = serde_json::to_vec(&HostPreferences::default()).unwrap();
+        let body = serde_json::to_vec(&HostPreferencesUpdate {
+            baseline: HostPreferences::default(),
+            preferences: HostPreferences::default(),
+        })
+        .unwrap();
 
         let rejected = app
             .clone()
@@ -2323,6 +2455,150 @@ mod tests {
             assert_eq!(body, "host gateway failure");
             assert!(!body.contains("secret"));
         }
+    }
+
+    #[tokio::test]
+    async fn desktop_update_status_and_actions_are_capability_and_csrf_scoped() {
+        let status = DesktopUpdateState {
+            current_version: "4.0.0".into(),
+            available_version: Some("4.1.0".into()),
+            phase: DesktopUpdatePhase::Available,
+            message: "Version 4.1.0 is ready to install.".into(),
+            progress_percent: None,
+        };
+        let operation_status = Arc::new(Mutex::new(status.clone()));
+        let status_reader = Arc::clone(&operation_status);
+        let checked = status.clone();
+        let installed = DesktopUpdateState {
+            phase: DesktopUpdatePhase::Restarting,
+            message: "Restarting into version 4.1.0…".into(),
+            progress_percent: Some(100),
+            ..status.clone()
+        };
+        let install_started = Arc::new(tokio::sync::Notify::new());
+        let install_release = Arc::new(tokio::sync::Notify::new());
+        let install_status = Arc::clone(&operation_status);
+        let install_started_for_action = Arc::clone(&install_started);
+        let install_release_for_action = Arc::clone(&install_release);
+        let app = gateway()
+            .with_native_actions(HostNativeActions::default().with_desktop_updater(
+                move || Ok(status_reader.lock().unwrap().clone()),
+                move || {
+                    let checked = checked.clone();
+                    async move { Ok(checked) }
+                },
+                move || {
+                    let installed = installed.clone();
+                    let install_status = Arc::clone(&install_status);
+                    let install_started = Arc::clone(&install_started_for_action);
+                    let install_release = Arc::clone(&install_release_for_action);
+                    async move {
+                        install_status.lock().unwrap().phase = DesktopUpdatePhase::Installing;
+                        install_started.notify_one();
+                        install_release.notified().await;
+                        *install_status.lock().unwrap() = installed.clone();
+                        Ok(installed)
+                    }
+                },
+            ))
+            .router();
+        let bootstrap_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        assert!(bootstrap.capabilities.self_update);
+
+        let current = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(DESKTOP_UPDATE_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json::<DesktopUpdateState>(current).await, status);
+
+        let missing_proof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(DESKTOP_UPDATE_CHECK_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_proof.status(), StatusCode::FORBIDDEN);
+
+        let checked = app
+            .clone()
+            .oneshot(action_request(
+                DESKTOP_UPDATE_CHECK_PATH,
+                &bootstrap.csrf_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json::<DesktopUpdateState>(checked).await, status);
+        let accepted = app
+            .clone()
+            .oneshot(action_request(
+                DESKTOP_UPDATE_INSTALL_PATH,
+                &bootstrap.csrf_token,
+            ))
+            .await
+            .unwrap();
+        let accepted = response_json::<DesktopUpdateState>(accepted).await;
+        assert_eq!(accepted.phase, DesktopUpdatePhase::Installing);
+        assert_eq!(accepted.message, "Installing version 4.1.0…");
+        tokio::time::timeout(Duration::from_secs(1), install_started.notified())
+            .await
+            .unwrap();
+        let busy = app
+            .clone()
+            .oneshot(action_request(
+                DESKTOP_UPDATE_INSTALL_PATH,
+                &bootstrap.csrf_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+        install_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let current = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(DESKTOP_UPDATE_PATH)
+                            .header(HOST, "127.0.0.1:43127")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if response_json::<DesktopUpdateState>(current).await.phase
+                    == DesktopUpdatePhase::Restarting
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3598,7 +3874,7 @@ mod tests {
             ["ready-to-merge", "drafts"]
         );
 
-        let mut updated = loaded;
+        let mut updated = loaded.clone();
         updated.appearance.theme = "colorblind-dark".into();
         updated.chat.collapse_sequential_tool_calls = false;
         updated.chat.collapse_thinking_with_tools = false;
@@ -3606,26 +3882,29 @@ mod tests {
             .put(format!("{origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &origin)
             .header(CSRF_HEADER, bootstrap.csrf_token)
-            .json(&updated)
+            .json(&HostPreferencesUpdate {
+                baseline: loaded,
+                preferences: updated,
+            })
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            load_preferences(&path, HostPreferences::default())
+            load_host_preferences(&path, HostPreferences::default())
                 .unwrap()
                 .appearance
                 .theme,
             "colorblind-dark"
         );
         assert!(
-            !load_preferences(&path, HostPreferences::default())
+            !load_host_preferences(&path, HostPreferences::default())
                 .unwrap()
                 .chat
                 .collapse_thinking_with_tools
         );
         assert!(
-            !load_preferences(&path, HostPreferences::default())
+            !load_host_preferences(&path, HostPreferences::default())
                 .unwrap()
                 .chat
                 .collapse_sequential_tool_calls
@@ -3654,7 +3933,7 @@ mod tests {
         persist_preferences(&path, &second).unwrap();
 
         assert_eq!(
-            load_preferences(&path, HostPreferences::default()).unwrap(),
+            load_host_preferences(&path, HostPreferences::default()).unwrap(),
             second
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -3698,7 +3977,7 @@ mod tests {
             .into()
         );
         assert_eq!(
-            load_preferences(&path, HostPreferences::default()).unwrap(),
+            load_host_preferences(&path, HostPreferences::default()).unwrap(),
             second
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -3764,6 +4043,7 @@ mod tests {
             .json()
             .await
             .unwrap();
+        let first_baseline = first_snapshot.clone();
         let mut second_snapshot: HostPreferences = client
             .get(format!("{second_origin}{PREFERENCES_PATH}"))
             .send()
@@ -3772,13 +4052,17 @@ mod tests {
             .json()
             .await
             .unwrap();
+        let second_baseline = second_snapshot.clone();
 
         first_snapshot.appearance.theme = "light".into();
         let first_response = client
             .put(format!("{first_origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &first_origin)
             .header(CSRF_HEADER, first_bootstrap.csrf_token)
-            .json(&first_snapshot)
+            .json(&HostPreferencesUpdate {
+                baseline: first_baseline,
+                preferences: first_snapshot,
+            })
             .send()
             .await
             .unwrap();
@@ -3794,7 +4078,10 @@ mod tests {
             .put(format!("{second_origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &second_origin)
             .header(CSRF_HEADER, &second_bootstrap.csrf_token)
-            .json(&second_snapshot)
+            .json(&HostPreferencesUpdate {
+                baseline: second_baseline,
+                preferences: second_snapshot,
+            })
             .send()
             .await
             .unwrap();
@@ -3804,15 +4091,17 @@ mod tests {
         assert_eq!(merged.navigation_width, 318.0);
 
         // HostClient rebases queued intent onto this merged response before
-        // sending it. Mirror that wire contract here; raw stale snapshots are
-        // indistinguishable from intentional reversions at the gateway.
+        // pairing it with the new baseline for the next request.
         queued_second_snapshot.appearance = merged.appearance.clone();
         queued_second_snapshot.resume = merged.resume.clone();
         let queued_response = client
             .put(format!("{second_origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &second_origin)
             .header(CSRF_HEADER, &second_bootstrap.csrf_token)
-            .json(&queued_second_snapshot)
+            .json(&HostPreferencesUpdate {
+                baseline: merged,
+                preferences: queued_second_snapshot,
+            })
             .send()
             .await
             .unwrap();
@@ -3822,12 +4111,88 @@ mod tests {
         assert_eq!(merged.navigation_width, 318.0);
         assert_eq!(merged.inspection_width, 512.0);
         assert_eq!(
-            load_preferences(&path, HostPreferences::default()).unwrap(),
+            load_host_preferences(&path, HostPreferences::default()).unwrap(),
             merged
         );
 
         first_task.abort();
         second_task.abort();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn one_gateway_rebases_each_window_against_its_own_baseline() {
+        let path = temporary_preference_path("same-gateway-window-baselines");
+        let assets = AssetManifest::new([(
+            "/index.html".into(),
+            asset("text/html", b"<html></html>", false),
+        )])
+        .unwrap();
+        let (address, server) = HostGateway::bind_loopback(
+            "127.0.0.1:0".parse().unwrap(),
+            assets,
+            HostCapabilities::desktop(),
+            HostPreferences::default(),
+            None,
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+        let task = tokio::spawn(server);
+        let client = reqwest::Client::new();
+        let origin = format!("http://{address}");
+        let bootstrap: HostBootstrap = client
+            .get(format!("{origin}{CAPABILITIES_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let first_baseline: HostPreferences = client
+            .get(format!("{origin}{PREFERENCES_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let second_baseline = first_baseline.clone();
+
+        let mut first_preferences = first_baseline.clone();
+        first_preferences.appearance.theme = "light".into();
+        let first_response = client
+            .put(format!("{origin}{PREFERENCES_PATH}"))
+            .header(ORIGIN, &origin)
+            .header(CSRF_HEADER, &bootstrap.csrf_token)
+            .json(&HostPreferencesUpdate {
+                baseline: first_baseline,
+                preferences: first_preferences,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+
+        let mut second_preferences = second_baseline.clone();
+        second_preferences.general.automatic_updates = false;
+        let second_response = client
+            .put(format!("{origin}{PREFERENCES_PATH}"))
+            .header(ORIGIN, &origin)
+            .header(CSRF_HEADER, &bootstrap.csrf_token)
+            .json(&HostPreferencesUpdate {
+                baseline: second_baseline,
+                preferences: second_preferences,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let merged: HostPreferences = second_response.json().await.unwrap();
+        assert_eq!(merged.appearance.theme, "light");
+        assert!(!merged.general.automatic_updates);
+
+        task.abort();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -3851,6 +4216,26 @@ mod tests {
         let merged = merge_and_persist_preferences(&path, &baseline, &native, true).unwrap();
         assert_eq!(merged.appearance.theme, "light");
         assert_eq!(merged.geometry, native.geometry);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn automatic_update_preference_is_merged_and_persisted() {
+        let path = temporary_preference_path("automatic-updates");
+        let baseline = HostPreferences::default();
+        persist_preferences(&path, &baseline).unwrap();
+
+        let mut incoming = baseline.clone();
+        incoming.general.automatic_updates = false;
+        let merged = merge_and_persist_preferences(&path, &baseline, &incoming, false).unwrap();
+
+        assert!(!merged.general.automatic_updates);
+        assert!(
+            !load_host_preferences(&path, HostPreferences::default())
+                .unwrap()
+                .general
+                .automatic_updates
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -3887,7 +4272,8 @@ mod tests {
             .unwrap();
         assert!(bootstrap.capabilities.window_geometry);
 
-        let mut frontend_update = preferences.snapshot().await;
+        let frontend_baseline = preferences.snapshot().await;
+        let mut frontend_update = frontend_baseline.clone();
         frontend_update.appearance.theme = "light".into();
         frontend_update.navigation_width = 318.0;
         let geometry = crate::WindowGeometry {
@@ -3908,14 +4294,17 @@ mod tests {
             .put(format!("{origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &origin)
             .header(CSRF_HEADER, bootstrap.csrf_token)
-            .json(&frontend_update)
+            .json(&HostPreferencesUpdate {
+                baseline: frontend_baseline,
+                preferences: frontend_update,
+            })
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let returned: HostPreferences = response.json().await.unwrap();
         assert_eq!(returned.geometry, Some(geometry.clone()));
-        let stored = load_preferences(&path, HostPreferences::default()).unwrap();
+        let stored = load_host_preferences(&path, HostPreferences::default()).unwrap();
         assert_eq!(stored.geometry, Some(geometry));
         assert_eq!(stored.appearance.theme, "light");
         assert_eq!(stored.navigation_width, 318.0);

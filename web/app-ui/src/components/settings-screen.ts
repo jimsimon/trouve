@@ -15,6 +15,10 @@ import {
   THEME_NAMES,
 } from "../services/theme-controller.js";
 import { APPEARANCE_FONT_SIZES } from "../services/appearance-preferences.js";
+import {
+  HostClientError,
+  type DesktopUpdateState,
+} from "../services/host-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./cli-settings.js";
@@ -61,6 +65,58 @@ const sectionLabel = (section: SettingsSection): string => {
   return `${section[0]?.toUpperCase()}${section.slice(1)}`;
 };
 
+const desktopUpdateIsBusy = (state: DesktopUpdateState | undefined): boolean =>
+  state !== undefined
+  && [
+    "checking",
+    "downloading",
+    "verifying",
+    "installing",
+    "restarting",
+  ].includes(state.phase);
+
+const DESKTOP_UPDATE_BUSY_POLL_MS = 500;
+const DESKTOP_UPDATE_IDLE_POLL_MS = 30_000;
+const DESKTOP_UPDATE_RECONCILIATION_MAX_BACKOFF_EXPONENT = 6;
+
+export const desktopUpdateConfirmsInstallAction = (
+  baseline: DesktopUpdateState | undefined,
+  state: DesktopUpdateState,
+): boolean => desktopUpdateIsBusy(state)
+  || baseline === undefined
+  || state.phase !== baseline.phase
+  || state.message !== baseline.message;
+
+export const desktopUpdatePollIntervalMs = (
+  state: DesktopUpdateState | undefined,
+  installReconciliationAttempt?: number,
+): number => {
+  if (desktopUpdateIsBusy(state)) return DESKTOP_UPDATE_BUSY_POLL_MS;
+  if (installReconciliationAttempt === undefined) return DESKTOP_UPDATE_IDLE_POLL_MS;
+  return Math.min(
+    DESKTOP_UPDATE_IDLE_POLL_MS,
+    DESKTOP_UPDATE_BUSY_POLL_MS << Math.min(
+      installReconciliationAttempt,
+      DESKTOP_UPDATE_RECONCILIATION_MAX_BACKOFF_EXPONENT,
+    ),
+  );
+};
+
+const desktopUpdatePhaseAnnouncement = (
+  state: DesktopUpdateState | undefined,
+  loading: boolean,
+): string => state === undefined
+  ? (loading ? "Loading update status." : "")
+  : `Update ${state.phase}.`;
+
+export const desktopUpdateCanRetryInstall = (state: DesktopUpdateState | undefined): boolean =>
+  state?.phase === "error"
+  && state.availableVersion !== undefined
+  && (
+    state.message.startsWith("Update installation failed:")
+    || state.message.includes("is installed, but trouve could not restart:")
+  );
+
 export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   static override properties = {
     section: { type: String },
@@ -75,6 +131,18 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #notificationPending = false;
   #fontFamiliesRequested = false;
   #fontFamiliesLoading = false;
+  #desktopUpdateState: DesktopUpdateState | undefined;
+  #desktopUpdateLoading = false;
+  #desktopUpdateActionPending = false;
+  #desktopUpdateError = "";
+  #desktopUpdatePollTimer: ReturnType<typeof setInterval> | undefined;
+  #desktopUpdatePollIntervalMs: number | undefined;
+  #desktopUpdateGeneration = 0;
+  #desktopUpdateInitialAttempted = false;
+  #desktopUpdateInstallReconciliation: {
+    baseline: DesktopUpdateState | undefined;
+    attempt: number;
+  } | undefined;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -99,10 +167,17 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   override connectedCallback(): void {
     super.connectedCallback();
     globalThis.addEventListener("focus", this.#refreshWebNotificationCapability);
+    this.#desktopUpdateInitialAttempted = false;
+    queueMicrotask(() => void this.#loadDesktopUpdate(true));
   }
 
   override disconnectedCallback(): void {
     globalThis.removeEventListener("focus", this.#refreshWebNotificationCapability);
+    this.#desktopUpdateGeneration += 1;
+    this.#desktopUpdateLoading = false;
+    this.#desktopUpdateActionPending = false;
+    this.#desktopUpdateInstallReconciliation = undefined;
+    this.#stopDesktopUpdatePolling();
     super.disconnectedCallback();
   }
 
@@ -110,6 +185,151 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     if (settingsSection(this.section) === "appearance") {
       void this.#loadFontFamilies();
     }
+    if (
+      settingsSection(this.section) === "general"
+      && this.#desktopUpdateState === undefined
+      && !this.#desktopUpdateInitialAttempted
+      && !this.#desktopUpdateLoading
+    ) {
+      void this.#loadDesktopUpdate(true);
+    }
+  }
+
+  async #loadDesktopUpdate(silent: boolean): Promise<void> {
+    const capabilities = this.#capabilities.value;
+    const action = this.#services.value?.nativeHost?.getDesktopUpdate;
+    if (
+      capabilities === undefined
+      || !readSignal(capabilities.current).selfUpdate
+      || action === undefined
+      || this.#desktopUpdateLoading
+    ) return;
+    const generation = this.#desktopUpdateGeneration;
+    this.#desktopUpdateInitialAttempted = true;
+    this.#desktopUpdateLoading = true;
+    try {
+      const state = await action();
+      if (generation !== this.#desktopUpdateGeneration) return;
+      this.#desktopUpdateError = "";
+      let installReconciliationAttempt: number | undefined;
+      const reconciliation = this.#desktopUpdateInstallReconciliation;
+      if (reconciliation !== undefined) {
+        if (desktopUpdateConfirmsInstallAction(reconciliation.baseline, state)) {
+          this.#desktopUpdateInstallReconciliation = undefined;
+          this.#desktopUpdateState = state;
+        } else {
+          // Retain the explicit installing acknowledgement in the UI while
+          // the authoritative endpoint still returns the pre-action snapshot.
+          installReconciliationAttempt = reconciliation.attempt;
+          reconciliation.attempt += 1;
+        }
+      } else {
+        this.#desktopUpdateState = state;
+      }
+      this.#startDesktopUpdatePolling(desktopUpdatePollIntervalMs(
+        state,
+        installReconciliationAttempt,
+      ));
+    } catch {
+      if (
+        generation === this.#desktopUpdateGeneration
+        && (!silent || this.#desktopUpdateState === undefined)
+      ) {
+        this.#desktopUpdateError = "Update status could not be loaded.";
+      }
+      if (generation === this.#desktopUpdateGeneration) {
+        const reconciliation = this.#desktopUpdateInstallReconciliation;
+        const installReconciliationAttempt = reconciliation?.attempt;
+        if (reconciliation !== undefined) reconciliation.attempt += 1;
+        this.#startDesktopUpdatePolling(desktopUpdatePollIntervalMs(
+          undefined,
+          installReconciliationAttempt,
+        ));
+      }
+    } finally {
+      if (generation !== this.#desktopUpdateGeneration) return;
+      this.#desktopUpdateLoading = false;
+      if (this.isConnected) this.requestUpdate();
+    }
+  }
+
+  async #runDesktopUpdateAction(): Promise<void> {
+    const nativeHost = this.#services.value?.nativeHost;
+    const installing = this.#desktopUpdateState?.phase === "available"
+      || desktopUpdateCanRetryInstall(this.#desktopUpdateState);
+    const action = installing
+      ? nativeHost?.installDesktopUpdate
+      : nativeHost?.checkDesktopUpdate;
+    if (action === undefined || this.#desktopUpdateActionPending) return;
+    this.#desktopUpdateGeneration += 1;
+    const actionGeneration = this.#desktopUpdateGeneration;
+    this.#desktopUpdateActionPending = true;
+    if (installing) {
+      this.#desktopUpdateInstallReconciliation = {
+        baseline: this.#desktopUpdateState,
+        attempt: 0,
+      };
+    }
+    this.#desktopUpdateError = "";
+    this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
+    this.requestUpdate();
+    let keepPolling = false;
+    let completionGeneration = actionGeneration;
+    try {
+      const state = await action();
+      if (actionGeneration !== this.#desktopUpdateGeneration || !this.isConnected) return;
+      this.#desktopUpdateGeneration += 1;
+      completionGeneration = this.#desktopUpdateGeneration;
+      this.#desktopUpdateState = state;
+      // Install POST acknowledges a host-owned background operation. Poll the
+      // authoritative status immediately even if its first snapshot still
+      // shows the previously available release.
+      keepPolling = installing;
+    } catch (error) {
+      if (actionGeneration !== this.#desktopUpdateGeneration || !this.isConnected) return;
+      if (error instanceof HostClientError && error.kind === "action-busy") {
+        // This request was not accepted. Reconcile once immediately, but do
+        // not retain install acknowledgement polling for someone else's work.
+        this.#desktopUpdateInstallReconciliation = undefined;
+        keepPolling = true;
+      } else {
+        if (installing) this.#desktopUpdateInstallReconciliation = undefined;
+        this.#desktopUpdateError = installing
+          ? "The update could not be installed. You can try again without leaving the app."
+          : "The update check could not be completed.";
+      }
+    } finally {
+      if (!this.isConnected || completionGeneration !== this.#desktopUpdateGeneration) return;
+      this.#desktopUpdateActionPending = false;
+      if (
+        keepPolling
+        || this.#desktopUpdateInstallReconciliation !== undefined
+        || desktopUpdateIsBusy(this.#desktopUpdateState)
+      ) {
+        this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
+        void this.#loadDesktopUpdate(true);
+      } else {
+        this.#startDesktopUpdatePolling(DESKTOP_UPDATE_IDLE_POLL_MS);
+      }
+      this.requestUpdate();
+    }
+  }
+
+  #startDesktopUpdatePolling(intervalMs: number): void {
+    if (!this.isConnected || this.#desktopUpdatePollIntervalMs === intervalMs) return;
+    this.#stopDesktopUpdatePolling();
+    this.#desktopUpdatePollIntervalMs = intervalMs;
+    this.#desktopUpdatePollTimer = globalThis.setInterval(
+      () => void this.#loadDesktopUpdate(true),
+      intervalMs,
+    );
+  }
+
+  #stopDesktopUpdatePolling(): void {
+    if (this.#desktopUpdatePollTimer === undefined) return;
+    globalThis.clearInterval(this.#desktopUpdatePollTimer);
+    this.#desktopUpdatePollTimer = undefined;
+    this.#desktopUpdatePollIntervalMs = undefined;
   }
 
   async #loadFontFamilies(): Promise<void> {
@@ -219,6 +439,14 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     const generalPreferences = readSignal(services.generalPreferences);
     const chatPreferences = readSignal(services.chatPreferences);
     const notificationPreferences = readSignal(services.notificationPreferences);
+    const updatePhase = this.#desktopUpdateState?.phase;
+    const updateBusy = this.#desktopUpdateActionPending
+      || this.#desktopUpdateInstallReconciliation !== undefined
+      || updatePhase === "checking"
+      || updatePhase === "downloading"
+      || updatePhase === "verifying"
+      || updatePhase === "installing"
+      || updatePhase === "restarting";
     const routeSection = this.section;
     return html`
       <div class="settings-screen">
@@ -262,6 +490,70 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                         : html`<p class="settings-note capability-note">${services.deployment === "pwa"
                           ? "Wake lock depends on browser and device support in the installed PWA."
                           : "This preview host does not currently expose sleep inhibition; the preference is retained."}</p>`}
+                      ${services.deployment === "desktop"
+                        ? html`
+                            <div class="settings-subsection">
+                              <h2>Updates</h2>
+                              <label class="settings-check compact" for="settings-automatic-updates">
+                                <input
+                                  id="settings-automatic-updates"
+                                  type="checkbox"
+                                  .checked=${generalPreferences.automaticUpdates}
+                                  ?disabled=${!currentCapabilities.selfUpdate}
+                                  @change=${(event: Event) => services.setGeneralPreferences({
+                                    automaticUpdates:
+                                      (event.currentTarget as HTMLInputElement).checked,
+                                  })}
+                                />
+                                <span>Automatically update before opening trouve</span>
+                              </label>
+                              <p class="settings-note">When enabled, startup checks, downloads, verifies, and installs a release before the main window opens. Updates found while you are using trouve wait for this button or a later restart.</p>
+                              ${currentCapabilities.selfUpdate
+                                ? html`
+                                    <section class="desktop-update-card" aria-label="Desktop update status">
+                                      <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+                                        ${desktopUpdatePhaseAnnouncement(
+                                          this.#desktopUpdateState,
+                                          this.#desktopUpdateLoading,
+                                        )}
+                                      </p>
+                                      ${this.#desktopUpdateState?.phase === "error"
+                                        ? html`<p class="visually-hidden" role="alert">${this.#desktopUpdateState.message}</p>`
+                                        : nothing}
+                                      <div class="desktop-update-heading">
+                                        <strong>${this.#desktopUpdateState?.message
+                                          ?? (this.#desktopUpdateLoading ? "Loading update status…" : "Ready to check for updates")}</strong>
+                                        <span class="desktop-update-version">v${this.#desktopUpdateState?.currentVersion ?? __TROUVE_FRONTEND_VERSION__}</span>
+                                      </div>
+                                      ${this.#desktopUpdateState?.progressPercent === undefined
+                                        ? nothing
+                                        : html`<progress
+                                            max="100"
+                                            .value=${this.#desktopUpdateState.progressPercent}
+                                            aria-label="Update progress"
+                                          ></progress>`}
+                                      ${this.#desktopUpdateError === ""
+                                        ? nothing
+                                        : html`<p class="settings-note" role="alert">${this.#desktopUpdateError}</p>`}
+                                      <div class="settings-actions">
+                                        <button
+                                          type="button"
+                                          ?disabled=${updateBusy || this.#desktopUpdateLoading}
+                                          @click=${() => void this.#runDesktopUpdateAction()}
+                                        >${updatePhase === "available"
+                                            ? `Install v${this.#desktopUpdateState?.availableVersion ?? "update"} and restart`
+                                            : updateBusy
+                                              ? "Updating…"
+                                              : updatePhase === "error"
+                                                ? "Try again"
+                                                : "Check for updates"}</button>
+                                      </div>
+                                    </section>
+                                  `
+                                : html`<p class="settings-note capability-note">Self-update is unavailable in development, web-preview, and package-managed installations. The automatic-update preference is retained for a supported packaged release.</p>`}
+                            </div>
+                          `
+                        : nothing}
                     </div>
                   `
                 : active === "providers"
@@ -519,6 +811,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                                 ["Visibility state", currentCapabilities.visibility],
                                 ["Occlusion state", currentCapabilities.occlusion],
                                 ["Installable", currentCapabilities.installable],
+                                ["Self-update", currentCapabilities.selfUpdate],
                               ].map(
                                 ([label, value]) => html`<div><dt>${label}</dt><dd>${typeof value === "boolean" ? (value ? "Available" : "Unavailable") : value}</dd></div>`,
                               )}

@@ -26,6 +26,7 @@ import type { AppRouter } from "../router/app-router.js";
 import type { ProtocolClient } from "../services/protocol-client.js";
 import type { PendingAttachment } from "../services/attachments.js";
 import type {
+  DesktopUpdateState,
   HostCloseDecision,
   HostLifecycleBatch,
   HostLocalFileAction,
@@ -67,6 +68,11 @@ export interface NativeHostActions {
     relativePath: string,
     action: HostLocalFileAction,
   ) => Promise<void>;
+  /** Desktop release updater. Runtime checks never restart the active app. */
+  readonly getDesktopUpdate?: () => Promise<DesktopUpdateState>;
+  readonly checkDesktopUpdate?: () => Promise<DesktopUpdateState>;
+  /** Installs and restarts only after an explicit user action. */
+  readonly installDesktopUpdate?: () => Promise<DesktopUpdateState>;
 }
 
 export interface AppServices {

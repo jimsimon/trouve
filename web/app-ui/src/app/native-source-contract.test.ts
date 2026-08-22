@@ -20,6 +20,7 @@ const auditedSources = [
   "crates/trouve-app/src/native_notification.rs",
   "crates/trouve-app/src/opener.rs",
   "crates/trouve-app/src/sleep.rs",
+  "crates/trouve-app/src/startup.rs",
   "crates/trouve-app/src/web_preview.rs",
   "crates/trouve-app/src/web_preview_support.rs",
   "crates/trouve-app/src/wry_main.rs",
