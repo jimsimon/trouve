@@ -190,6 +190,36 @@ describe("model option controls", () => {
     })).toEqual({ fast: true });
   });
 
+  it("does not expose or serialize integers the browser cannot preserve", () => {
+    const unsafeChoices = JSON.parse(`{
+      "type": "integer",
+      "enum": [9007199254740992, 9007199254740994]
+    }`) as Record<string, unknown>;
+    const collapsedChoices = JSON.parse(`{
+      "type": "integer",
+      "enum": [9007199254740992, 9007199254740993]
+    }`) as Record<string, unknown>;
+    const advertised = model({
+      unsafe_choices: unsafeChoices,
+      collapsed_choices: collapsedChoices,
+      editable_integer: { type: "integer" },
+    });
+
+    expect(modelOptionControls(advertised, {})).toEqual([{
+      kind: "text",
+      key: "editable_integer",
+      label: "Editable integer",
+      description: "",
+      overridden: false,
+      scalarType: "integer",
+      text: "",
+      hint: "value",
+    }]);
+    expect(sanitizeModelOptions(advertised, {
+      editable_integer: 9_007_199_254_740_992,
+    })).toEqual({});
+  });
+
   it("applies and removes overrides without retaining a duplicate legacy key", () => {
     expect(changeModelOption(
       { thinking_level: "low", fast: true },
