@@ -142,6 +142,7 @@ describe("new thread setup model", () => {
       key: "thinking_budget_tokens",
       kind: "text",
       text: "16384",
+      overridden: false,
     });
 
     const detail = createNewThreadSetupSubmission({

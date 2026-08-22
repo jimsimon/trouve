@@ -4,7 +4,12 @@ import type {
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
-import { sanitizeModelOptions } from "../components/model-option-controls.js";
+import {
+  changeModelOption,
+  isThinkingModelOption,
+  sanitizeModelOptions,
+  type ModelOptionChangeDetail,
+} from "../components/model-option-controls.js";
 
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
 export const NEW_SESSION_TITLE_FALLBACK = "New session";
@@ -505,6 +510,39 @@ export const createNewThreadOptionEdits = (): NewThreadOptionEdits => ({
   thinking: false,
   permission: false,
 });
+
+/** Apply an editor change while keeping the displayed effective thinking
+ * value separate from whether the request contains an explicit override. */
+export const applyNewSessionModelOptionChange = (input: {
+  readonly modelOptions: Readonly<Record<string, unknown>>;
+  readonly thinking: string;
+  readonly inheritedThinking: string | undefined;
+  readonly change: ModelOptionChangeDetail;
+  readonly defaults: Pick<ResolvedNewThreadDefaults, "thinking" | "inheritedThinking">;
+}): {
+  readonly modelOptions: Readonly<Record<string, unknown>>;
+  readonly thinking: string;
+  readonly inheritedThinking: string | undefined;
+  readonly hasOverrides: boolean;
+} => {
+  const modelOptions = changeModelOption(input.modelOptions, input.change);
+  const thinkingChange = isThinkingModelOption(input.change.key);
+  const resetThinking = thinkingChange && input.change.value === undefined;
+  return {
+    modelOptions,
+    thinking: !thinkingChange
+      ? input.thinking
+      : resetThinking
+        ? input.defaults.thinking
+        : String(input.change.value),
+    inheritedThinking: !thinkingChange
+      ? input.inheritedThinking
+      : resetThinking
+        ? input.defaults.inheritedThinking
+        : undefined,
+    hasOverrides: Object.keys(modelOptions).length > 0,
+  };
+};
 
 export const createNewSessionOptionsLifecycle = (): NewSessionOptionsLifecycle => ({
   status: "unloaded",

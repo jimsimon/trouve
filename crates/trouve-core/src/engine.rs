@@ -1478,15 +1478,124 @@ const UNSUPPORTED_MODEL_OPTION_SCHEMA_KEYWORDS: [&str; 13] = [
     "else",
 ];
 
-fn advertised_bound(property: &serde_json::Value, key: &str) -> Result<Option<f64>, ()> {
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ExactJsonNumber {
+    negative: bool,
+    digits: String,
+    exponent: i64,
+}
+
+impl ExactJsonNumber {
+    fn parse(number: &serde_json::Number) -> Option<Self> {
+        let text = number.to_string();
+        let (negative, unsigned) = text
+            .strip_prefix('-')
+            .map_or((false, text.as_str()), |value| (true, value));
+        let (coefficient, explicit_exponent) = unsigned
+            .find('e')
+            .or_else(|| unsigned.find('E'))
+            .map_or(Some((unsigned, 0_i64)), |index| {
+                Some((
+                    &unsigned[..index],
+                    unsigned[index + 1..].parse::<i64>().ok()?,
+                ))
+            })?;
+        let mut coefficient_parts = coefficient.split('.');
+        let whole = coefficient_parts.next()?;
+        let fraction = coefficient_parts.next().unwrap_or_default();
+        if whole.is_empty()
+            || coefficient_parts.next().is_some()
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|digit| digit.is_ascii_digit())
+        {
+            return None;
+        }
+        let mut digits = String::with_capacity(whole.len() + fraction.len());
+        digits.push_str(whole);
+        digits.push_str(fraction);
+        let Some(first_nonzero) = digits.find(|digit| digit != '0') else {
+            return Some(Self {
+                negative: false,
+                digits: "0".into(),
+                exponent: 0,
+            });
+        };
+        digits = digits[first_nonzero..].to_owned();
+        let mut exponent = explicit_exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+        while digits.ends_with('0') {
+            digits.pop();
+            exponent = exponent.checked_add(1)?;
+        }
+        Some(Self {
+            negative,
+            digits,
+            exponent,
+        })
+    }
+
+    fn compare(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let magnitude = self.compare_magnitude(other)?;
+        Some(match (self.negative, other.negative) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => magnitude.reverse(),
+            (false, false) => magnitude,
+        })
+    }
+
+    fn compare_magnitude(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self.digits.as_str() == "0", other.digits.as_str() == "0") {
+            (true, true) => return Some(std::cmp::Ordering::Equal),
+            (true, false) => return Some(std::cmp::Ordering::Less),
+            (false, true) => return Some(std::cmp::Ordering::Greater),
+            (false, false) => {}
+        }
+        let own_order = i64::try_from(self.digits.len())
+            .ok()?
+            .checked_add(self.exponent)?;
+        let other_order = i64::try_from(other.digits.len())
+            .ok()?
+            .checked_add(other.exponent)?;
+        let order = own_order.cmp(&other_order);
+        if order != std::cmp::Ordering::Equal {
+            return Some(order);
+        }
+        let width = self.digits.len().max(other.digits.len());
+        for index in 0..width {
+            let own = self.digits.as_bytes().get(index).copied().unwrap_or(b'0');
+            let other = other.digits.as_bytes().get(index).copied().unwrap_or(b'0');
+            let order = own.cmp(&other);
+            if order != std::cmp::Ordering::Equal {
+                return Some(order);
+            }
+        }
+        Some(std::cmp::Ordering::Equal)
+    }
+}
+
+fn advertised_bound(
+    property: &serde_json::Value,
+    key: &str,
+) -> Result<Option<ExactJsonNumber>, ()> {
     match property.get(key) {
         None => Ok(None),
-        Some(value) => value
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .ok_or(())
-            .map(Some),
+        Some(serde_json::Value::Number(number)) => {
+            ExactJsonNumber::parse(number).ok_or(()).map(Some)
+        }
+        Some(_) => Err(()),
     }
+}
+
+fn json_number_is_integer(number: &serde_json::Number) -> bool {
+    const MAX_SAFE_FLOAT_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+    number.as_i64().is_some()
+        || number.as_u64().is_some()
+        || number.as_f64().is_some_and(|number| {
+            number.is_finite() && number.fract() == 0.0 && number.abs() <= MAX_SAFE_FLOAT_INTEGER
+        })
 }
 
 fn schema_scalar(value: &serde_json::Value) -> bool {
@@ -1498,10 +1607,28 @@ fn schema_scalar(value: &serde_json::Value) -> bool {
 
 fn schema_scalar_id(value: &serde_json::Value) -> Option<String> {
     match value {
-        serde_json::Value::Number(number) => {
-            number.as_f64().map(|number| format!("number:{number}"))
-        }
+        serde_json::Value::Number(number) => ExactJsonNumber::parse(number).map(|number| {
+            format!(
+                "number:{}{}e{}",
+                if number.negative { "-" } else { "" },
+                number.digits,
+                number.exponent
+            )
+        }),
         _ => schema_scalar(value).then(|| format!("{}:{value}", value_type_name(value))),
+    }
+}
+
+fn schema_scalars_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
+            ExactJsonNumber::parse(left)
+                .zip(ExactJsonNumber::parse(right))
+                .is_some_and(|(left, right)| {
+                    left.compare(&right) == Some(std::cmp::Ordering::Equal)
+                })
+        }
+        _ => left == right,
     }
 }
 
@@ -1546,11 +1673,11 @@ fn valid_choice_values(property: &serde_json::Value) -> Option<Vec<&serde_json::
                 (AdvertisedScalarType::Supported("string"), Some(value)) => !value.is_string(),
                 (AdvertisedScalarType::Supported("boolean"), Some(value)) => !value.is_boolean(),
                 (AdvertisedScalarType::Supported("number"), Some(value)) => {
-                    !value.as_f64().is_some_and(f64::is_finite)
+                    value.as_number().and_then(ExactJsonNumber::parse).is_none()
                 }
-                (AdvertisedScalarType::Supported("integer"), Some(value)) => !value
-                    .as_f64()
-                    .is_some_and(|number| number.is_finite() && number.fract() == 0.0),
+                (AdvertisedScalarType::Supported("integer"), Some(value)) => {
+                    !value.as_number().is_some_and(json_number_is_integer)
+                }
                 (AdvertisedScalarType::Supported(_), None) => true,
                 (AdvertisedScalarType::Supported(_), Some(_)) => true,
             }
@@ -1611,6 +1738,7 @@ fn validate_model_options(
                 "model option {key} uses unsupported advertised constraints"
             )));
         }
+        let scalar_type = schema_scalar_type(property);
         let minimum = advertised_bound(property, "minimum").map_err(|()| {
             EngineError::BadRequest(format!(
                 "model option {key} has a malformed advertised minimum"
@@ -1621,6 +1749,27 @@ fn validate_model_options(
                 "model option {key} has a malformed advertised maximum"
             ))
         })?;
+        if (minimum.is_some() || maximum.is_some())
+            && !matches!(
+                scalar_type,
+                AdvertisedScalarType::Supported("number" | "integer")
+            )
+        {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} advertises numeric bounds without a numeric scalar type"
+            )));
+        }
+        if minimum
+            .as_ref()
+            .zip(maximum.as_ref())
+            .is_some_and(|(minimum, maximum)| {
+                minimum.compare(maximum) == Some(std::cmp::Ordering::Greater)
+            })
+        {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} has an inverted advertised numeric range"
+            )));
+        }
         if !matches!(
             value,
             serde_json::Value::String(_)
@@ -1639,17 +1788,20 @@ fn validate_model_options(
                 "model option {key} has a malformed advertised choice schema"
             )));
         }
-        let matches_choice = choice_values
-            .as_ref()
-            .is_some_and(|values| values.contains(&value));
-        let scalar_type = schema_scalar_type(property);
+        let matches_choice = choice_values.as_ref().is_some_and(|values| {
+            values
+                .iter()
+                .any(|candidate| schema_scalars_equal(candidate, value))
+        });
         let typed = match scalar_type {
             AdvertisedScalarType::Supported("string") => value.is_string(),
             AdvertisedScalarType::Supported("boolean") => value.is_boolean(),
-            AdvertisedScalarType::Supported("number") => value.as_f64().is_some_and(f64::is_finite),
-            AdvertisedScalarType::Supported("integer") => value
-                .as_f64()
-                .is_some_and(|number| number.is_finite() && number.fract() == 0.0),
+            AdvertisedScalarType::Supported("number") => {
+                value.as_number().and_then(ExactJsonNumber::parse).is_some()
+            }
+            AdvertisedScalarType::Supported("integer") => {
+                value.as_number().is_some_and(json_number_is_integer)
+            }
             _ => false,
         };
         let valid_type = match scalar_type {
@@ -1672,13 +1824,19 @@ fn validate_model_options(
                 "model option {key} is not one of its advertised values"
             )));
         }
-        if let Some(number) = value.as_f64() {
-            if minimum.is_some_and(|minimum| number < minimum) {
+        if let Some(number) = value.as_number().and_then(ExactJsonNumber::parse) {
+            if minimum
+                .as_ref()
+                .is_some_and(|minimum| number.compare(minimum) == Some(std::cmp::Ordering::Less))
+            {
                 return Err(EngineError::BadRequest(format!(
                     "model option {key} is below its advertised minimum"
                 )));
             }
-            if maximum.is_some_and(|maximum| number > maximum) {
+            if maximum
+                .as_ref()
+                .is_some_and(|maximum| number.compare(maximum) == Some(std::cmp::Ordering::Greater))
+            {
                 return Err(EngineError::BadRequest(format!(
                     "model option {key} is above its advertised maximum"
                 )));
@@ -25278,6 +25436,19 @@ default_permission_mode = "ask"
                         "minimum": 4,
                         "maximum": 16
                     },
+                    "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                    },
+                    "large_budget": {
+                        "type": "integer",
+                        "maximum": 9007199254740992_u64
+                    },
+                    "large_choice": {
+                        "type": "integer",
+                        "enum": [9007199254740992_u64, 9007199254740993_u64]
+                    },
                     "fast": {"type": "boolean"},
                     "context": {
                         "oneOf": [
@@ -25312,6 +25483,15 @@ default_permission_mode = "ask"
         let valid = serde_json::Map::from_iter([
             ("effort".into(), serde_json::json!("high")),
             ("budget".into(), serde_json::json!(8)),
+            ("temperature".into(), serde_json::json!(0.4)),
+            (
+                "large_budget".into(),
+                serde_json::json!(9007199254740992_u64),
+            ),
+            (
+                "large_choice".into(),
+                serde_json::json!(9007199254740993_u64),
+            ),
             ("fast".into(), serde_json::json!(true)),
             ("context".into(), serde_json::json!("long")),
             ("mixed".into(), serde_json::json!(1)),
@@ -25342,6 +25522,7 @@ default_permission_mode = "ask"
             serde_json::json!({"budget": 4.5}),
             serde_json::json!({"budget": 3}),
             serde_json::json!({"budget": 17}),
+            serde_json::json!({"large_budget": 9007199254740993_u64}),
             serde_json::json!({"fast": {"nested": true}}),
             serde_json::json!({"locked": "override"}),
             serde_json::json!({"constant": "override"}),
@@ -25355,6 +25536,13 @@ default_permission_mode = "ask"
                 "{invalid} should be rejected"
             );
         }
+
+        let rounded_fractional: serde_json::Value =
+            serde_json::from_str(r#"{"large_budget":9007199254740992.5}"#).unwrap();
+        assert!(
+            validate_model_options(rounded_fractional.as_object().unwrap(), &model).is_err(),
+            "an unsafe floating-point integer must not pass integer validation"
+        );
     }
 
     #[tokio::test]
