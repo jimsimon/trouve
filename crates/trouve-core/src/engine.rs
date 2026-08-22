@@ -7526,10 +7526,20 @@ impl Engine {
         path: &str,
         name: Option<String>,
     ) -> Result<WorkspaceListItem, EngineError> {
+        self.register_workspace_with(path, name, || {})
+    }
+
+    fn register_workspace_with(
+        &self,
+        path: &str,
+        name: Option<String>,
+        after_prepare: impl FnOnce(),
+    ) -> Result<WorkspaceListItem, EngineError> {
         let canonical = Self::canonical_workspace_registration_path(path)?;
         let registration_lock = self.workspace_registration_lock(&canonical);
         let _registration = registration_lock.lock().unwrap();
         let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
+        after_prepare();
         let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
         let _refresh = refresh_lock.lock().unwrap();
         let item = Self::resolve_workspace_list_item(
@@ -21969,29 +21979,58 @@ default_permission_mode = "ask"
             data.path().to_path_buf(),
             &Config::default(),
         ));
-        let start = Arc::new(std::sync::Barrier::new(3));
-        let handles = (0..2)
-            .map(|index| {
-                let engine = Arc::clone(&engine);
-                let repository_path = repository.path().to_path_buf();
-                let start = Arc::clone(&start);
-                std::thread::spawn(move || {
-                    start.wait();
-                    engine.register_workspace(
-                        repository_path.to_str().unwrap(),
-                        Some(format!("concurrent registration {index}")),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        start.wait();
-        let registrations = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap().unwrap())
-            .collect::<Vec<_>>();
+        let repository_path = repository.path().to_path_buf();
+        let (first_prepared_tx, first_prepared_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_engine = Arc::clone(&engine);
+        let first_path = repository_path.clone();
+        let first = std::thread::spawn(move || {
+            first_engine.register_workspace_with(
+                first_path.to_str().unwrap(),
+                Some("first registration".into()),
+                || {
+                    first_prepared_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            )
+        });
+        first_prepared_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let (second_prepared_tx, second_prepared_rx) = std::sync::mpsc::channel();
+        let second_engine = Arc::clone(&engine);
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            second_engine.register_workspace_with(
+                repository_path.to_str().unwrap(),
+                Some("second registration".into()),
+                || second_prepared_tx.send(()).unwrap(),
+            )
+        });
+        second_started_rx.recv().unwrap();
+        assert_eq!(
+            second_prepared_rx.recv_timeout(Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        release_first_tx.send(()).unwrap();
+
+        let registrations = [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
 
         assert_eq!(registrations[0].id, registrations[1].id);
         assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        assert_eq!(
+            engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|envelope| matches!(envelope.event, Event::WorkspaceRegistered { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
