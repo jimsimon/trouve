@@ -1055,21 +1055,23 @@ export class ProtocolClient {
     );
   }
 
-  knownProviders(): Promise<readonly ProtocolKnownProvider[]> {
+  knownProviders(signal?: AbortSignal): Promise<readonly ProtocolKnownProvider[]> {
     return this.#validatedJson(
       "/v1/providers/known",
       "known provider",
       "KnownProvider[]",
       (loaded) => loaded.knownProviders,
+      signal === undefined ? {} : { signal },
     );
   }
 
-  subscriptionHealth(): Promise<readonly ProtocolSubscriptionHealth[]> {
+  subscriptionHealth(signal?: AbortSignal): Promise<readonly ProtocolSubscriptionHealth[]> {
     return this.#validatedJson(
       "/v1/subscriptions",
       "subscription health",
       "SubscriptionHealth[]",
       (loaded) => loaded.subscriptions,
+      signal === undefined ? {} : { signal },
     );
   }
 

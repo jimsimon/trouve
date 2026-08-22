@@ -26,8 +26,8 @@ const PROVIDER_RETRY_MS = 5_000;
 const CUSTOM_PROVIDER = "__custom__";
 const DEFAULT_LOGIN_POLL_MS = 1_000;
 const DEFAULT_LOGIN_POLL_ATTEMPTS = 180;
-const PRESETS_ERROR = "Provider presets could not be loaded. Retrying automatically.";
-const USAGE_ERROR = "Providers loaded, but subscription usage is unavailable.";
+const PRESETS_ERROR = "Provider presets unavailable. Retrying.";
+const USAGE_ERROR = "Subscription usage unavailable.";
 export const validatedHttpsUrl = (value: string): string | undefined => {
   try {
     const url = new URL(value);
@@ -910,7 +910,7 @@ export class TrouveProviderSettings extends LitElement {
 
   #loadKnownProviders(services: AppServices): void {
     if (this.#knownProvidersPending !== undefined) return;
-    const request = services.protocol.knownProviders();
+    const request = services.protocol.knownProviders(AbortSignal.timeout(PROVIDER_REFRESH_MS));
     this.#knownProvidersPending = request;
     void request.then((knownProviders) => {
       if (services !== this.#services.value || !this.isConnected) return;
@@ -940,7 +940,7 @@ export class TrouveProviderSettings extends LitElement {
       ) this.#setNotice(PRESETS_ERROR, true);
       this.#scheduleRetry();
       this.requestUpdate();
-    }).then(() => {
+    }).finally(() => {
       if (this.#knownProvidersPending === request) this.#knownProvidersPending = undefined;
     });
   }

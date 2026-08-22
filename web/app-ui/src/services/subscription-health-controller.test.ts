@@ -85,4 +85,23 @@ describe("SubscriptionHealthController", () => {
     now += 30_000;
     await expect(controller.refresh()).resolves.toEqual([health("recovered")]);
   });
+
+  it("aborts a stalled probe and allows a forced replacement", async () => {
+    const subscriptionHealth = vi.fn((signal?: AbortSignal) =>
+      new Promise<readonly ProtocolSubscriptionHealth[]>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      })
+    );
+    const controller = new SubscriptionHealthController(
+      { subscriptionHealth },
+      { requestTimeoutMs: 5 },
+    );
+
+    await expect(controller.refresh()).rejects.toThrow("aborted");
+    expect(controller.loading.get()).toBe(false);
+
+    subscriptionHealth.mockResolvedValueOnce([health("recovered")]);
+    await expect(controller.refresh("force")).resolves.toEqual([health("recovered")]);
+    expect(subscriptionHealth).toHaveBeenCalledTimes(2);
+  });
 });
