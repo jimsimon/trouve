@@ -2240,13 +2240,28 @@ pub fn workspace_repository_sources(
         // Keep all filesystem traversal inside the bounded Git child. The
         // workspace root is canonical at registration, so joining Git's
         // relative result is stable without an unbounded canonicalize call.
-        if common.is_absolute() {
+        let common = if common.is_absolute() {
             common
         } else {
             repo.join(common)
-        }
+        };
+        normalize_path_lexically(&common)
     });
     (remote_url, common_directory)
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Remove an unpersisted immutable checkpoint anchor only while it still names
@@ -3493,6 +3508,15 @@ mod tests {
 
         assert_eq!(sources, (None, None));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn lexical_path_normalization_collapses_relative_common_directory_segments() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            normalize_path_lexically(&root.path().join("nested/../.git")),
+            root.path().join(".git")
+        );
     }
 
     #[test]

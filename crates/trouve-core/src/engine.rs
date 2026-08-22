@@ -7330,13 +7330,10 @@ impl Engine {
 
     // --- workspaces ---------------------------------------------------------
 
-    fn resolve_workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
+    fn resolve_workspace_list_item(workspace: Workspace, timeout: Duration) -> WorkspaceListItem {
         let repository = Path::new(&workspace.path);
-        let (remote_url, common_directory) = git::workspace_repository_sources(
-            repository,
-            "origin",
-            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
-        );
+        let (remote_url, common_directory) =
+            git::workspace_repository_sources(repository, "origin", timeout);
         let remote_identity = remote_url.and_then(|remote| crate::github::parse_remote(&remote));
         let (repository_key, repository_name) = if let Some((host, owner, name)) = remote_identity {
             (
@@ -7365,6 +7362,16 @@ impl Engine {
         }
     }
 
+    fn fallback_workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
+        WorkspaceListItem {
+            repository_key: Some(format!("workspace:{}", workspace.id)),
+            repository_name: Some(workspace.name.clone()),
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+        }
+    }
+
     fn workspace_list_refresh_lock(&self, workspace_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.workspace_list_refresh_locks.lock().unwrap();
         locks.retain(|_, lock| lock.strong_count() > 0);
@@ -7387,46 +7394,66 @@ impl Engine {
         item
     }
 
-    fn cached_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
-        self.cached_workspace_list_item_with(workspace, Self::resolve_workspace_list_item)
+    fn cached_workspace_list_item(
+        &self,
+        workspace: Workspace,
+        request_deadline: Instant,
+    ) -> WorkspaceListItem {
+        self.cached_workspace_list_item_with(
+            workspace,
+            request_deadline,
+            Self::resolve_workspace_list_item,
+        )
     }
 
     fn cached_workspace_list_item_with(
         &self,
         workspace: Workspace,
-        resolve: impl FnOnce(Workspace) -> WorkspaceListItem,
+        request_deadline: Instant,
+        resolve: impl FnOnce(Workspace, Duration) -> WorkspaceListItem,
     ) -> WorkspaceListItem {
         let cached = self
             .workspace_list_cache
             .lock()
             .unwrap()
             .get(&workspace.id)
-            .filter(|entry| entry.refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL)
-            .map(|entry| entry.item.clone());
-        if let Some(cached) = cached {
-            return cached;
+            .map(|entry| (entry.item.clone(), entry.refreshed_at));
+        if let Some((cached, refreshed_at)) = &cached
+            && refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL
+        {
+            return cached.clone();
         }
 
         let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
-        let _refresh = refresh_lock.lock().unwrap();
-        if let Some(cached) = self
+        let Ok(_refresh) = refresh_lock.try_lock() else {
+            return cached
+                .map(|(item, _)| item)
+                .unwrap_or_else(|| Self::fallback_workspace_list_item(workspace));
+        };
+        let cached = self
             .workspace_list_cache
             .lock()
             .unwrap()
             .get(&workspace.id)
-            .filter(|entry| entry.refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL)
-            .map(|entry| entry.item.clone())
+            .map(|entry| (entry.item.clone(), entry.refreshed_at));
+        if let Some((cached, refreshed_at)) = &cached
+            && refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL
         {
-            return cached;
+            return cached.clone();
         }
-        self.cache_workspace_list_item(resolve(workspace))
+        let Some(remaining) = request_deadline.checked_duration_since(Instant::now()) else {
+            return cached
+                .map(|(item, _)| item)
+                .unwrap_or_else(|| Self::fallback_workspace_list_item(workspace));
+        };
+        self.cache_workspace_list_item(resolve(workspace, remaining))
     }
 
     fn prepare_workspace_registration(
         &self,
         path: &str,
         name: Option<String>,
-    ) -> Result<(Workspace, WorkspaceListItem, bool), EngineError> {
+    ) -> Result<(Workspace, bool), EngineError> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| EngineError::BadRequest(format!("invalid path {path}: {e}")))?;
         if !git::is_git_repo(&canonical) {
@@ -7437,8 +7464,7 @@ impl Engine {
         }
         let path_str = canonical.to_string_lossy().to_string();
         if let Some(existing) = self.store.workspace_by_path(&path_str)? {
-            let item = Self::resolve_workspace_list_item(existing.clone());
-            return Ok((existing, item, true));
+            return Ok((existing, true));
         }
         let workspace = Workspace {
             id: new_id("ws"),
@@ -7450,8 +7476,7 @@ impl Engine {
             }),
             path: path_str.clone(),
         };
-        let item = Self::resolve_workspace_list_item(workspace.clone());
-        Ok((workspace, item, false))
+        Ok((workspace, false))
     }
 
     fn commit_workspace_registration(
@@ -7493,7 +7518,13 @@ impl Engine {
         path: &str,
         name: Option<String>,
     ) -> Result<WorkspaceListItem, EngineError> {
-        let (workspace, item, existing) = self.prepare_workspace_registration(path, name)?;
+        let (workspace, existing) = self.prepare_workspace_registration(path, name)?;
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        let item = Self::resolve_workspace_list_item(
+            workspace.clone(),
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
         self.commit_workspace_registration(workspace, item, existing)
     }
 
@@ -7520,7 +7551,13 @@ impl Engine {
                 "stale: review workspace registration was cancelled".into(),
             ));
         }
-        let (workspace, item, existing) = self.prepare_workspace_registration(path, name)?;
+        let (workspace, existing) = self.prepare_workspace_registration(path, name)?;
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        let item = Self::resolve_workspace_list_item(
+            workspace.clone(),
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
         before_commit();
         let _commit = commit_fence.lock().unwrap();
         if cancel.is_cancelled() {
@@ -7532,11 +7569,12 @@ impl Engine {
     }
 
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>, EngineError> {
+        let request_deadline = Instant::now() + WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT;
         Ok(self
             .store
             .list_workspaces()?
             .into_iter()
-            .map(|workspace| self.cached_workspace_list_item(workspace))
+            .map(|workspace| self.cached_workspace_list_item(workspace, request_deadline))
             .collect())
     }
 
@@ -21912,6 +21950,19 @@ default_permission_mode = "ask"
             name: "single flight".into(),
             path: data.path().to_string_lossy().into_owned(),
         };
+        engine.workspace_list_cache.lock().unwrap().insert(
+            workspace.id.clone(),
+            WorkspaceListCacheEntry {
+                item: WorkspaceListItem {
+                    id: workspace.id.clone(),
+                    name: workspace.name.clone(),
+                    path: workspace.path.clone(),
+                    repository_key: Some("remote:github.com/acme/widgets".into()),
+                    repository_name: Some("widgets".into()),
+                },
+                refreshed_at: Instant::now() - WORKSPACE_LIST_CACHE_TTL,
+            },
+        );
         let start = Arc::new(std::sync::Barrier::new(3));
         let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handles = (0..2)
@@ -21922,17 +21973,21 @@ default_permission_mode = "ask"
                 let resolutions = Arc::clone(&resolutions);
                 std::thread::spawn(move || {
                     start.wait();
-                    engine.cached_workspace_list_item_with(workspace, move |workspace| {
-                        resolutions.fetch_add(1, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(50));
-                        WorkspaceListItem {
-                            id: workspace.id,
-                            name: workspace.name,
-                            path: workspace.path,
-                            repository_key: Some("remote:github.com/acme/widgets".into()),
-                            repository_name: Some("widgets".into()),
-                        }
-                    })
+                    engine.cached_workspace_list_item_with(
+                        workspace,
+                        Instant::now() + Duration::from_secs(1),
+                        move |workspace, _timeout| {
+                            resolutions.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(50));
+                            WorkspaceListItem {
+                                id: workspace.id,
+                                name: workspace.name,
+                                path: workspace.path,
+                                repository_key: Some("remote:github.com/acme/widgets".into()),
+                                repository_name: Some("widgets".into()),
+                            }
+                        },
+                    )
                 })
             })
             .collect::<Vec<_>>();
@@ -21946,6 +22001,49 @@ default_permission_mode = "ask"
         assert!(items.iter().all(|item| {
             item.repository_key.as_deref() == Some("remote:github.com/acme/widgets")
         }));
+    }
+
+    #[test]
+    fn workspace_list_identity_refreshes_share_one_request_deadline() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first = Workspace {
+            id: "ws_budget_first".into(),
+            name: "first".into(),
+            path: data.path().join("first").to_string_lossy().into_owned(),
+        };
+        let second = Workspace {
+            id: "ws_budget_second".into(),
+            name: "second".into(),
+            path: data.path().join("second").to_string_lossy().into_owned(),
+        };
+        let resolutions = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let first_item =
+            engine.cached_workspace_list_item_with(first, deadline, |workspace, remaining| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(remaining + Duration::from_millis(10));
+                Engine::fallback_workspace_list_item(workspace)
+            });
+        let second_item =
+            engine.cached_workspace_list_item_with(second, deadline, |workspace, _remaining| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Engine::fallback_workspace_list_item(workspace)
+            });
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first_item.repository_key.as_deref(),
+            Some("workspace:ws_budget_first")
+        );
+        assert_eq!(
+            second_item.repository_key.as_deref(),
+            Some("workspace:ws_budget_second")
+        );
     }
 
     #[test]
