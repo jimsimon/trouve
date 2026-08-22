@@ -842,14 +842,6 @@ fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
         tx.commit()?;
         return Ok(());
     }
-    let phase_migration_applied = tx
-        .query_row(
-            "SELECT 1 FROM store_migrations WHERE id = ?1",
-            [PHASE_MIGRATION_ID],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
     let had_phase_column = tx.query_row(
         "SELECT EXISTS (
            SELECT 1 FROM pragma_table_info('command_execution_requests')
@@ -864,7 +856,6 @@ fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
                ADD COLUMN side_effect_started INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
-    let phase_values_authoritative = phase_migration_applied && had_phase_column;
     let had_error_kind = tx.query_row(
         "SELECT EXISTS (
            SELECT 1 FROM pragma_table_info('command_execution_requests')
@@ -906,20 +897,10 @@ fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
             "ALTER TABLE command_execution_requests
                ADD COLUMN writer_generation INTEGER NOT NULL DEFAULT 0;",
         )?;
-        if phase_values_authoritative {
-            // A completed phase migration makes every stored phase value
-            // authoritative. This also upgrades receipts written by the
-            // phase-aware revision before per-row provenance was introduced.
-            tx.execute(
-                "UPDATE command_execution_requests SET writer_generation = 1",
-                [],
-            )?;
-        }
-    }
-    if !had_writer_generation && !phase_values_authoritative {
-        // Without either row provenance or the completed phase marker, a
-        // zero may be a legacy receipt left by an interrupted additive
-        // migration. Preserve at-most-once execution over retry liveness.
+        // No global marker can prove which binary wrote an individual row:
+        // an older process may insert after a schema migration. Receipts that
+        // predate per-row provenance therefore remain generation zero and
+        // uncertain, even when the phase-v1 marker exists.
         tx.execute(
             "UPDATE command_execution_requests
              SET side_effect_started = 1
@@ -17350,7 +17331,7 @@ mod tests {
     }
 
     #[test]
-    fn command_execution_migration_preserves_phase_aware_unstarted_claim() {
+    fn command_execution_migration_keeps_pre_provenance_receipts_uncertain() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("phase-aware-command-execution.sqlite3");
         let store = Store::open(&database).unwrap();
@@ -17380,9 +17361,55 @@ mod tests {
 
         let store = Store::open(&database).unwrap();
         let pending = store
-            .command_execution("phase-aware-command")
+            .claim_command_execution(
+                "phase-aware-command",
+                "th_phase_aware_command",
+                "phase-aware-fingerprint",
+            )
             .unwrap()
-            .expect("phase-aware claim remains durable");
+            .expect("pre-provenance receipt must remain uncertain");
+        assert!(pending.side_effect_started);
+        assert_eq!(pending.writer_generation, 0);
+    }
+
+    #[test]
+    fn command_execution_migration_preserves_current_per_row_provenance() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data
+            .path()
+            .join("current-command-execution-provenance.sqlite3");
+        let store = Store::open(&database).unwrap();
+        seed_thread(&store, "th_current_command");
+        assert!(
+            store
+                .claim_command_execution(
+                    "current-command",
+                    "th_current_command",
+                    "current-fingerprint",
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        let current = Connection::open(&database).unwrap();
+        current
+            .execute(
+                "DELETE FROM store_migrations
+                 WHERE id IN (
+                   'command-execution-side-effect-phase-v1',
+                   'command-execution-writer-generation-v2'
+                 )",
+                [],
+            )
+            .unwrap();
+        drop(current);
+
+        let store = Store::open(&database).unwrap();
+        let pending = store
+            .command_execution("current-command")
+            .unwrap()
+            .expect("current receipt remains durable");
         assert!(!pending.side_effect_started);
         assert_eq!(
             pending.writer_generation,
@@ -17391,13 +17418,13 @@ mod tests {
         assert!(
             store
                 .claim_command_execution(
-                    "phase-aware-command",
-                    "th_phase_aware_command",
-                    "phase-aware-fingerprint",
+                    "current-command",
+                    "th_current_command",
+                    "current-fingerprint",
                 )
                 .unwrap()
                 .is_none(),
-            "known-unstarted phase-aware claims remain safely reclaimable"
+            "per-row provenance is sufficient without a global marker"
         );
     }
 
