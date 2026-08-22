@@ -31,6 +31,7 @@ pub fn review_inspection_tools() -> Vec<String> {
         "search",
         "find_related",
         "git_diff",
+        "web_search",
         "web_fetch",
         "todo_write",
         "spawn_thread",
@@ -78,6 +79,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
                 // Codex full-bridge turns disable native network access.
                 // Keep legitimate read-only research available through the
                 // permission-gated ToolExecutor path.
+                "web_search".into(),
                 "web_fetch".into(),
                 "todo_write".into(),
                 // Delegation is orchestration rather than a worktree
@@ -137,6 +139,7 @@ pub fn fallback_persona() -> AgentPersona {
             "grep".into(),
             "search".into(),
             "find_related".into(),
+            "web_search".into(),
             "web_fetch".into(),
             "todo_write".into(),
         ],
@@ -643,6 +646,12 @@ mod tests {
         for id in ["plan", "review"] {
             let persona = find_persona(&personas, id).unwrap();
             assert!(persona.read_only);
+            assert!(
+                persona
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| tool == "web_search")
+            );
             assert!(persona.allowed_tools.iter().any(|tool| tool == "web_fetch"));
             assert!(
                 persona

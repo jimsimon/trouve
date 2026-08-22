@@ -26,7 +26,7 @@ use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
 use crate::config::{Config, ProviderConfig};
 use crate::permissions::{
-    ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
+    ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate_tool,
 };
 use crate::store::{
     ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
@@ -13348,11 +13348,12 @@ impl Engine {
         // modes. Anything else the vendor asks about is treated as mutating
         // (it only asks for things it considers mutating).
         let mutates = self.backend_tool_mutates(tool);
-        let decision = gate(
+        let decision = gate_tool(
             thread.permission_mode,
             effective_read_only,
             mutates,
             &self.approvals.allow_list(&session.id),
+            tool,
             &key,
         );
         match decision {
@@ -13799,11 +13800,12 @@ impl Engine {
         let decision = if known.is_none() || !allowed_by_mode {
             Gate::Deny
         } else {
-            gate(
+            gate_tool(
                 thread.permission_mode,
                 mode.read_only,
                 mutates,
                 &self.approvals.allow_list(&session.id),
+                &call.name,
                 &key,
             )
         };
