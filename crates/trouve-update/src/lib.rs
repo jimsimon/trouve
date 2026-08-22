@@ -24,22 +24,9 @@ const MAX_CHECKSUM_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = MAX_BINARY_BYTES + 64 * 1024 * 1024;
-const VERSION_MARKER_PREFIX: &[u8] = b"\0TROUVE_UPDATE_VERSION[";
-const VERSION_MARKER_SUFFIX: &[u8] = b"]TROUVE\0";
-const MAX_VERSION_TEXT_BYTES: usize = 128;
-const VERSION_SCAN_CHUNK_BYTES: usize = 64 * 1024;
-const MAX_VERSION_MARKER_BYTES: usize =
-    VERSION_MARKER_PREFIX.len() + MAX_VERSION_TEXT_BYTES + VERSION_MARKER_SUFFIX.len();
-
-// Every first-party release binary links this crate. Keeping the release
-// version inside the executable makes the installed file itself authoritative
-// without a writable sidecar or a child process.
-#[used]
-static EMBEDDED_UPDATE_VERSION_MARKER: &str = concat!(
-    "\0TROUVE_UPDATE_VERSION[",
-    env!("CARGO_PKG_VERSION"),
-    "]TROUVE\0"
-);
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_VERSION_OUTPUT_BYTES: usize = 4096;
 
 /// Set this to a truthy value to disable startup/background updates. Manual
 /// update commands and the desktop's explicit update button still work.
@@ -348,7 +335,7 @@ pub async fn install_latest(component: Component, current_version: &str) -> Resu
     let lock = acquire_update_lock(None).await?;
     let current = Version::parse(current_version)
         .with_context(|| format!("invalid current version {current_version:?}"))?;
-    let observed = installed_binary_version(&lock.executable, None)
+    let observed = installed_binary_version(&lock.executable, component.display_name(), None)
         .await
         .filter(|installed| installed > &current)
         .unwrap_or(current);
@@ -398,9 +385,17 @@ pub async fn install_release_with_progress_and_cancel(
     }
     ensure_not_cancelled(&cancellation)?;
     let lock = acquire_update_lock(Some(Arc::clone(&cancellation))).await?;
-    if installed_binary_version(&lock.executable, Some(Arc::clone(&cancellation)))
-        .await
-        .is_some_and(|installed| installed >= release.version)
+    let binary_name = release
+        .binary_name
+        .strip_suffix(".exe")
+        .unwrap_or(&release.binary_name);
+    if installed_binary_version(
+        &lock.executable,
+        binary_name,
+        Some(Arc::clone(&cancellation)),
+    )
+    .await
+    .is_some_and(|installed| installed >= release.version)
     {
         return Ok(());
     }
@@ -409,83 +404,134 @@ pub async fn install_release_with_progress_and_cancel(
 
 async fn installed_binary_version(
     executable: &Path,
+    binary_name: &str,
     cancellation: Option<Arc<InstallCancellation>>,
 ) -> Option<Version> {
     let executable = executable.to_owned();
-    tokio::task::spawn_blocking(move || probe_binary_version(&executable, cancellation.as_deref()))
-        .await
-        .ok()?
-        .ok()
+    let binary_name = binary_name.to_owned();
+    tokio::task::spawn_blocking(move || {
+        probe_binary_version(&executable, &binary_name, cancellation.as_deref())
+    })
+    .await
+    .ok()?
+    .ok()
 }
 
 fn probe_binary_version(
     executable: &Path,
+    binary_name: &str,
     cancellation: Option<&InstallCancellation>,
 ) -> Result<Version> {
-    std::hint::black_box(EMBEDDED_UPDATE_VERSION_MARKER);
-    let mut executable_file = std::fs::File::open(executable)
-        .with_context(|| format!("opening installed executable {}", executable.display()))?;
-    let mut buffer = [0_u8; VERSION_SCAN_CHUNK_BYTES];
-    let mut window = Vec::with_capacity(VERSION_SCAN_CHUNK_BYTES + MAX_VERSION_MARKER_BYTES);
-    let mut observed = None;
-    let mut total = 0_u64;
-    loop {
-        if let Some(cancellation) = cancellation {
-            ensure_not_cancelled(cancellation)?;
-        }
-        let read = executable_file
-            .read(&mut buffer)
-            .with_context(|| format!("reading installed executable {}", executable.display()))?;
-        if read == 0 {
-            break;
-        }
-        total = total
-            .checked_add(read as u64)
-            .ok_or_else(|| anyhow!("installed executable size overflow"))?;
-        if total > MAX_BINARY_BYTES {
-            bail!("installed executable exceeds the version-probe size limit");
-        }
-        window.extend_from_slice(&buffer[..read]);
-        collect_embedded_versions(&window, &mut observed)?;
-        if window.len() > MAX_VERSION_MARKER_BYTES {
-            window.drain(..window.len() - MAX_VERSION_MARKER_BYTES);
-        }
+    if let Some(cancellation) = cancellation {
+        ensure_not_cancelled(cancellation)?;
     }
-    observed.ok_or_else(|| anyhow!("installed executable has no embedded release version"))
-}
-
-fn collect_embedded_versions(bytes: &[u8], observed: &mut Option<Version>) -> Result<()> {
-    let mut offset = 0;
-    while let Some(relative) = find_bytes(&bytes[offset..], VERSION_MARKER_PREFIX) {
-        let version_start = offset + relative + VERSION_MARKER_PREFIX.len();
-        let candidate_end = bytes
-            .len()
-            .min(version_start + MAX_VERSION_TEXT_BYTES + VERSION_MARKER_SUFFIX.len());
-        if let Some(relative_end) =
-            find_bytes(&bytes[version_start..candidate_end], VERSION_MARKER_SUFFIX)
-        {
-            let version_end = version_start + relative_end;
-            if let Ok(text) = std::str::from_utf8(&bytes[version_start..version_end])
-                && let Ok(version) = Version::parse(text)
-            {
-                if observed
-                    .as_ref()
-                    .is_some_and(|existing| existing != &version)
-                {
-                    bail!("installed executable contains conflicting release versions");
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = trouve_process::spawn(&mut command)
+        .with_context(|| format!("probing installed executable {}", executable.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("installed executable version output was not captured"))?;
+    let (output_sender, output_receiver) = std::sync::mpsc::sync_channel(1);
+    let output_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(MAX_VERSION_OUTPUT_BYTES + 1);
+        let result = stdout
+            .take((MAX_VERSION_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = output_sender.send(result);
+    });
+    let deadline = std::time::Instant::now() + VERSION_PROBE_TIMEOUT;
+    let mut output = None;
+    let mut status = None;
+    loop {
+        if cancellation.is_some_and(InstallCancellation::is_cancelled) {
+            terminate_version_probe(&mut child);
+            let _ = output_reader.join();
+            bail!("update cancelled");
+        }
+        if output.is_none() {
+            match output_receiver.try_recv() {
+                Ok(Ok(bytes)) if bytes.len() > MAX_VERSION_OUTPUT_BYTES => {
+                    terminate_version_probe(&mut child);
+                    let _ = output_reader.join();
+                    bail!("installed executable version output exceeds the limit");
                 }
-                *observed = Some(version);
+                Ok(Ok(bytes)) => output = Some(bytes),
+                Ok(Err(error)) => {
+                    terminate_version_probe(&mut child);
+                    let _ = output_reader.join();
+                    return Err(error).context("reading installed executable version output");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    terminate_version_probe(&mut child);
+                    let _ = output_reader.join();
+                    bail!("installed executable version output reader stopped");
+                }
             }
         }
-        offset = version_start;
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(next) => status = next,
+                Err(error) => {
+                    terminate_version_probe(&mut child);
+                    let _ = output_reader.join();
+                    return Err(error).context("waiting for installed executable version probe");
+                }
+            }
+        }
+        if status.is_some() && output.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            terminate_version_probe(&mut child);
+            let _ = output_reader.join();
+            bail!("installed executable version probe timed out");
+        }
+        std::thread::sleep(VERSION_PROBE_POLL_INTERVAL);
     }
-    Ok(())
+    let _ = output_reader.join();
+    if !status.is_some_and(|status| status.success()) {
+        bail!("installed executable version probe failed");
+    }
+    parse_binary_version(&output.unwrap_or_default(), binary_name)
+        .ok_or_else(|| anyhow!("installed executable returned an invalid version"))
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|candidate| candidate == needle)
+fn parse_binary_version(output: &[u8], binary_name: &str) -> Option<Version> {
+    let line = std::str::from_utf8(output).ok()?.lines().next()?.trim();
+    let version = line.strip_prefix(binary_name)?.trim();
+    Version::parse(version).ok()
+}
+
+fn terminate_version_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        // The probe is placed in its own process group under the shared launch
+        // boundary, so helpers inheriting stdout cannot outlive cleanup.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut taskkill = std::process::Command::new("taskkill");
+        taskkill.args(["/F", "/T", "/PID", &child.id().to_string()]);
+        let _ = trouve_process::status(&mut taskkill);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 async fn install_release_locked(
@@ -1119,56 +1165,59 @@ mod tests {
     }
 
     #[test]
-    fn installed_version_is_read_from_the_executable_across_chunk_boundaries() {
+    fn installed_version_requires_exact_executable_output() {
+        assert_eq!(
+            parse_binary_version(b"trouve-search 4.1.0\n", "trouve-search"),
+            Some(Version::parse("4.1.0").unwrap())
+        );
+        assert_eq!(
+            parse_binary_version(b"trouve 99.0.0\n", "trouve-search"),
+            None
+        );
+        assert_eq!(
+            parse_binary_version(b"trouve-search 4.1.0 forged\n", "trouve-search"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    fn version_probe_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("trouve-search");
-        let mut bytes = vec![b'x'; VERSION_SCAN_CHUNK_BYTES - 10];
-        bytes.extend_from_slice(VERSION_MARKER_PREFIX);
-        bytes.extend_from_slice(b"4.1.0");
-        bytes.extend_from_slice(VERSION_MARKER_SUFFIX);
-        std::fs::write(&executable, bytes).unwrap();
-
-        assert_eq!(
-            probe_binary_version(&executable, None).unwrap(),
-            Version::parse("4.1.0").unwrap()
-        );
+        std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (temp, executable)
     }
 
+    #[cfg(unix)]
     #[test]
-    fn installed_version_probe_is_cancellable() {
-        let cancellation = InstallCancellation::default();
-        assert!(cancellation.request_cancel());
-        let error = probe_binary_version(&std::env::current_exe().unwrap(), Some(&cancellation))
-            .unwrap_err();
+    fn installed_version_probe_is_cancellable_and_reaps_helpers() {
+        let (_temp, executable) = version_probe_script("sleep 30");
+        let cancellation = Arc::new(InstallCancellation::default());
+        let request = Arc::clone(&cancellation);
+        let requester = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(request.request_cancel());
+        });
+        let started = std::time::Instant::now();
+        let error =
+            probe_binary_version(&executable, "trouve-search", Some(&cancellation)).unwrap_err();
+        requester.join().unwrap();
         assert!(error.to_string().contains("update cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn embedded_version_text_is_bounded_and_unambiguous() {
-        let mut oversized = VERSION_MARKER_PREFIX.to_vec();
-        oversized.extend_from_slice(b"1.0.0+");
-        oversized.extend(std::iter::repeat_n(b'a', MAX_VERSION_TEXT_BYTES));
-        oversized.extend_from_slice(VERSION_MARKER_SUFFIX);
-        let mut observed = None;
-        collect_embedded_versions(&oversized, &mut observed).unwrap();
-        assert_eq!(observed, None);
-
-        let mut conflicting = Vec::new();
-        for version in [b"4.0.0".as_slice(), b"4.1.0".as_slice()] {
-            conflicting.extend_from_slice(VERSION_MARKER_PREFIX);
-            conflicting.extend_from_slice(version);
-            conflicting.extend_from_slice(VERSION_MARKER_SUFFIX);
-        }
-        let error = collect_embedded_versions(&conflicting, &mut None).unwrap_err();
-        assert!(error.to_string().contains("conflicting release versions"));
-    }
-
-    #[test]
-    fn current_binary_contains_one_embedded_release_version() {
-        assert_eq!(
-            probe_binary_version(&std::env::current_exe().unwrap(), None).unwrap(),
-            Version::parse(env!("CARGO_PKG_VERSION")).unwrap()
-        );
+    fn installed_version_probe_rejects_output_while_it_crosses_the_bound() {
+        let body = "printf 'trouve-search 4.1.0\\n'; i=0; while [ \"$i\" -lt 5000 ]; do printf x; i=$((i + 1)); done; sleep 30";
+        let (_temp, executable) = version_probe_script(body);
+        let started = std::time::Instant::now();
+        let error = probe_binary_version(&executable, "trouve-search", None).unwrap_err();
+        assert!(error.to_string().contains("exceeds the limit"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

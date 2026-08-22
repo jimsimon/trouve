@@ -7589,6 +7589,7 @@ dependencies = [
  "fs4",
  "futures",
  "hex",
+ "libc",
  "reqwest",
  "rustls 0.23.42",
  "self-replace",
@@ -7598,6 +7599,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "trouve-process",
  "zip",
 ]
 
