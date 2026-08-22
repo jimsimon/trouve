@@ -41,3 +41,30 @@ pub fn release_unused_memory() {
         let _ = unsafe { malloc_trim(0) };
     }
 }
+
+/// Schedule allocator-page release without adding its potentially expensive
+/// glibc arena scan to a foreground search request. Concurrent requests
+/// coalesce behind one process-wide trim worker.
+pub fn release_unused_memory_in_background() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static TRIM_RUNNING: AtomicBool = AtomicBool::new(false);
+        if TRIM_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("trouve-memory-trim".into())
+            .spawn(|| {
+                release_unused_memory();
+                TRIM_RUNNING.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            TRIM_RUNNING.store(false, Ordering::Release);
+        }
+    }
+}

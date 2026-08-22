@@ -230,7 +230,7 @@ impl IndexCache {
             // Index assembly has large parallel scratch buffers. Returning
             // pages here prevents a long-lived MCP server from retaining the
             // build's high-water mark after buffers and evicted indexes drop.
-            crate::release_unused_memory();
+            crate::release_unused_memory_in_background();
         }
         result
     }
