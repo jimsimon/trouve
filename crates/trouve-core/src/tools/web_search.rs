@@ -232,8 +232,7 @@ impl SessionCleanupWorker {
                                     response,
                                 } => {
                                     let Ok(Ok(response)) =
-                                        tokio::time::timeout(SESSION_CLEANUP_TIMEOUT, response)
-                                            .await
+                                        tokio::time::timeout(SEARCH_TIMEOUT, response).await
                                     else {
                                         pending.fetch_sub(1, Ordering::Release);
                                         return;
@@ -1710,7 +1709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_initialization_returns_while_lifecycle_work_is_bounded() {
+    async fn cancelled_initialization_returns_before_delayed_session_cleanup() {
         let body =
             r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
         let (endpoint, _, requests) = capturing_mock_server_with_delays(
@@ -1718,7 +1717,7 @@ mod tests {
             body,
             Duration::ZERO,
             Duration::ZERO,
-            Duration::from_secs(30),
+            Duration::from_millis(300),
             true,
             None,
         )
@@ -1752,12 +1751,24 @@ mod tests {
         assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
         assert_eq!(result.result["error"], "search cancelled");
         tokio::time::timeout(Duration::from_secs(1), async {
+            while !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.method == "DELETE")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delayed initialization must retain its session cleanup path");
+        tokio::time::timeout(Duration::from_secs(1), async {
             while tool.cleanup.pending.load(Ordering::Acquire) != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("stalled initialization lifecycle work must time out");
+        .expect("delayed initialization cleanup must remain bounded");
     }
 
     #[tokio::test]
