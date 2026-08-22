@@ -82,13 +82,13 @@ pub fn gate(
             Gate::Allow
         };
     }
-    // web_fetch mutates nothing, but fetching a model-chosen URL is an
+    // Web tools mutate nothing, but sending a model-chosen URL or query is an
     // outbound side channel (prompt-injection exfiltration of anything the
-    // ungated read tools can see), so it requires approval in every
+    // ungated read tools can see), so they require approval in every
     // non-yolo mode — including read-only modes, where research is
     // legitimate but silent exfiltration is not. "Always approve" unlocks
     // the session via the allow-list.
-    if key == "web_fetch" {
+    if matches!(key, "web_fetch" | "web_search") {
         return if allow_list.contains(key) {
             Gate::Allow
         } else {
@@ -424,7 +424,7 @@ mod tests {
             gate(PermissionMode::AllowList, false, true, &listed, "shell:rm"),
             Gate::NeedsApproval
         );
-        // Yolo runs everything (non-read-only), including MCP and web_fetch.
+        // Yolo runs everything (non-read-only), including MCP and web tools.
         assert_eq!(
             gate(PermissionMode::Yolo, false, true, &empty, "shell:rm"),
             Gate::Allow
@@ -437,12 +437,18 @@ mod tests {
             gate(PermissionMode::Yolo, false, false, &empty, "web_fetch"),
             Gate::Allow
         );
-        // Yolo skips the web_fetch prompt even in read-only modes (it
-        // mutates nothing, so the read-only deny does not apply).
         assert_eq!(
-            gate(PermissionMode::Yolo, true, false, &empty, "web_fetch"),
+            gate(PermissionMode::Yolo, false, false, &empty, "web_search"),
             Gate::Allow
         );
+        // Yolo skips web-tool prompts even in read-only modes (they mutate
+        // nothing, so the read-only deny does not apply).
+        for web_tool in ["web_fetch", "web_search"] {
+            assert_eq!(
+                gate(PermissionMode::Yolo, true, false, &empty, web_tool),
+                Gate::Allow
+            );
+        }
         // MCP servers need first-use approval in ask/allow-list …
         assert_eq!(
             gate(PermissionMode::Ask, false, true, &empty, "mcp:jira"),
@@ -471,18 +477,19 @@ mod tests {
             gate(PermissionMode::AllowList, true, true, &empty, "mcp:jira"),
             Gate::Deny
         );
-        // web_fetch needs approval in non-yolo modes (exfiltration channel),
+        // Web tools need approval in non-yolo modes (exfiltration channels),
         // read-only modes included, until allow-listed for the session.
-        assert_eq!(
-            gate(PermissionMode::Ask, true, false, &empty, "web_fetch"),
-            Gate::NeedsApproval
-        );
-        let mut web_listed = HashSet::new();
-        web_listed.insert("web_fetch".to_string());
-        assert_eq!(
-            gate(PermissionMode::Ask, true, false, &web_listed, "web_fetch"),
-            Gate::Allow
-        );
+        for web_tool in ["web_fetch", "web_search"] {
+            assert_eq!(
+                gate(PermissionMode::Ask, true, false, &empty, web_tool),
+                Gate::NeedsApproval
+            );
+            let web_listed = HashSet::from([web_tool.to_string()]);
+            assert_eq!(
+                gate(PermissionMode::Ask, true, false, &web_listed, web_tool),
+                Gate::Allow
+            );
+        }
     }
 
     #[test]

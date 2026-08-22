@@ -15,6 +15,8 @@ const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const CACHE_CAPACITY: usize = 256;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_RETURN_CHARS: usize = 48 * 1024;
+const MAX_SEARCH_ERROR_CHARS: usize = 8 * 1024;
+const MAX_PROVIDER_ERROR_CHARS: usize = 3 * 1024;
 const MAX_QUERY_CHARS: usize = 2_000;
 const MIN_PROVIDER_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -27,6 +29,71 @@ enum ProviderKind {
 enum SearchError {
     Cancelled,
     Failed(String),
+}
+
+/// Incrementally assembles complete SSE events from arbitrary byte chunks.
+#[derive(Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+    data_lines: Vec<String>,
+}
+
+impl SseDecoder {
+    /// Consume a network chunk and return every complete event it finishes.
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.buffer.drain(..=newline).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = String::from_utf8(line)
+                .map_err(|_| "provider returned non-UTF-8 SSE content".to_owned())?;
+            self.process_line(&line, &mut events);
+        }
+        Ok(events)
+    }
+
+    /// Flush the final unterminated line and event at end of stream.
+    fn finish(&mut self) -> Result<Vec<String>, String> {
+        let mut events = Vec::new();
+        if !self.buffer.is_empty() {
+            if self.buffer.last() == Some(&b'\r') {
+                self.buffer.pop();
+            }
+            let line = String::from_utf8(std::mem::take(&mut self.buffer))
+                .map_err(|_| "provider returned non-UTF-8 SSE content".to_owned())?;
+            self.process_line(&line, &mut events);
+        }
+        self.dispatch(&mut events);
+        Ok(events)
+    }
+
+    /// Apply one decoded SSE line to the current event.
+    fn process_line(&mut self, line: &str, events: &mut Vec<String>) {
+        if line.is_empty() {
+            self.dispatch(events);
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        if field == "data" {
+            self.data_lines
+                .push(value.strip_prefix(' ').unwrap_or(value).to_owned());
+        }
+    }
+
+    /// Emit the current event when it contains at least one data field.
+    fn dispatch(&mut self, events: &mut Vec<String>) {
+        if !self.data_lines.is_empty() {
+            events.push(self.data_lines.join("\n"));
+            self.data_lines.clear();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -167,6 +234,9 @@ impl WebSearch {
         let client = reqwest::Client::builder()
             .timeout(SEARCH_TIMEOUT)
             .user_agent(concat!("trouve-agent/", env!("CARGO_PKG_VERSION")))
+            // Provider endpoints are fixed. Never let a provider pivot the
+            // request to an unvalidated host or private network.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("static web search client configuration is valid");
         Self {
@@ -252,8 +322,21 @@ impl WebSearch {
             )));
         }
 
+        let is_event_stream = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+            });
         let mut response = response;
         let mut bytes = Vec::new();
+        let mut response_bytes = 0usize;
+        let mut sse_decoder = is_event_stream.then(SseDecoder::default);
+        let mut last_sse_error = None;
         loop {
             let chunk = tokio::select! {
                 biased;
@@ -263,16 +346,51 @@ impl WebSearch {
             let Some(chunk) = chunk else {
                 break;
             };
-            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            response_bytes = response_bytes.saturating_add(chunk.len());
+            if response_bytes > MAX_RESPONSE_BYTES {
                 return Err(SearchError::Failed(
                     "provider response exceeded 1 MiB".into(),
                 ));
             }
-            bytes.extend_from_slice(&chunk);
+            if let Some(decoder) = &mut sse_decoder {
+                for event in decoder.push(&chunk).map_err(SearchError::Failed)? {
+                    match extract_mcp_sse_event(&event) {
+                        Ok(Some(result)) => {
+                            return result.map_err(|error| {
+                                SearchError::Failed(bounded_error(&error, MAX_PROVIDER_ERROR_CHARS))
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => last_sse_error = Some(error),
+                    }
+                }
+            } else {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        if let Some(mut decoder) = sse_decoder {
+            for event in decoder.finish().map_err(SearchError::Failed)? {
+                match extract_mcp_sse_event(&event) {
+                    Ok(Some(result)) => {
+                        return result.map_err(|error| {
+                            SearchError::Failed(bounded_error(&error, MAX_PROVIDER_ERROR_CHARS))
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => last_sse_error = Some(error),
+                }
+            }
+            return Err(SearchError::Failed(bounded_error(
+                last_sse_error
+                    .as_deref()
+                    .unwrap_or("provider returned no MCP result"),
+                MAX_PROVIDER_ERROR_CHARS,
+            )));
         }
         let body = String::from_utf8(bytes)
             .map_err(|_| SearchError::Failed("provider returned non-UTF-8 content".to_string()))?;
-        extract_mcp_text(&body).map_err(SearchError::Failed)
+        extract_mcp_text(&body)
+            .map_err(|error| SearchError::Failed(bounded_error(&error, MAX_PROVIDER_ERROR_CHARS)))
     }
 }
 
@@ -383,14 +501,18 @@ impl Tool for WebSearch {
                     return ToolResult::error("search cancelled");
                 }
                 Err(SearchError::Failed(error)) => {
-                    failures.push(format!("{}: {error}", provider.name));
+                    failures.push(format!(
+                        "{}: {}",
+                        provider.name,
+                        bounded_error(&error, MAX_PROVIDER_ERROR_CHARS)
+                    ));
                 }
             }
         }
 
-        ToolResult::error(format!(
-            "all web search providers failed ({})",
-            failures.join("; ")
+        ToolResult::error(bounded_error(
+            &format!("all web search providers failed ({})", failures.join("; ")),
+            MAX_SEARCH_ERROR_CHARS,
         ))
     }
 }
@@ -413,24 +535,45 @@ fn extract_mcp_text(body: &str) -> Result<String, String> {
         return extract_mcp_value(&value);
     }
 
+    let mut decoder = SseDecoder::default();
+    let mut events = decoder.push(body.as_bytes())?;
+    events.extend(decoder.finish()?);
     let mut last_error = None;
-    for line in body.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        match serde_json::from_str::<Value>(data) {
-            Ok(value) => match extract_mcp_value(&value) {
-                Ok(text) => return Ok(text),
-                Err(error) => last_error = Some(error),
-            },
-            Err(error) => last_error = Some(format!("invalid SSE JSON: {error}")),
+    for event in events {
+        match extract_mcp_sse_event(&event) {
+            Ok(Some(Ok(text))) => return Ok(text),
+            Ok(Some(Err(error))) => return Err(error),
+            Ok(None) => {}
+            Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or_else(|| "provider returned no MCP result".into()))
+}
+
+/// Parse one SSE data payload, ignoring notifications and unrelated call ids.
+fn extract_mcp_sse_event(data: &str) -> Result<Option<Result<String, String>>, String> {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
+    }
+    let value = serde_json::from_str::<Value>(data)
+        .map_err(|error| format!("invalid SSE JSON: {error}"))?;
+    if value.get("id").and_then(Value::as_u64) != Some(1) {
+        return Ok(None);
+    }
+    Ok(Some(extract_mcp_value(&value)))
+}
+
+/// Bound untrusted provider text while preserving UTF-8 character boundaries.
+fn bounded_error(message: &str, max_chars: usize) -> String {
+    const SUFFIX: &str = "… [truncated]";
+    if message.chars().count() <= max_chars {
+        return message.to_owned();
+    }
+    let keep = max_chars.saturating_sub(SUFFIX.chars().count());
+    let mut bounded: String = message.chars().take(keep).collect();
+    bounded.push_str(SUFFIX);
+    bounded
 }
 
 fn extract_mcp_value(value: &Value) -> Result<String, String> {
@@ -558,6 +701,76 @@ mod tests {
         assert_eq!(extract_mcp_text(json).unwrap(), "one");
         let sse = format!("event: message\ndata: {json}\n\n");
         assert_eq!(extract_mcp_text(&sse).unwrap(), "one");
+        let multiline_sse = concat!(
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\n",
+            "data: \"id\":1,\"result\":{\"content\":[{\"type\":\"text\",",
+            "\"text\":\"multi-line\"}]}}\n\n",
+        );
+        assert_eq!(extract_mcp_text(multiline_sse).unwrap(), "multi-line");
+    }
+
+    #[tokio::test]
+    async fn returns_an_sse_result_without_waiting_for_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await;
+            let event = concat!(
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{",
+                "\"content\":[{\"type\":\"text\",\"text\":\"streamed\"}]}}\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n{event}"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tool.run(&ToolCtx::default(), &json!({"query": "streaming result"})),
+        )
+        .await
+        .expect("a complete SSE response should not wait for connection close");
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(result.result["content"], "streamed");
+    }
+
+    #[tokio::test]
+    async fn provider_redirects_are_not_followed() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"private target"}]}}"#;
+        let (target, target_calls) = mock_server("200 OK", body).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
+
+        let result = tool
+            .run(&ToolCtx::default(), &json!({"query": "redirect attempt"}))
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            result.result["error"]
+                .as_str()
+                .unwrap()
+                .contains("HTTP 302")
+        );
+        assert_eq!(target_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -800,6 +1013,36 @@ mod tests {
                 .count(),
             MAX_RETURN_CHARS
         );
+    }
+
+    #[tokio::test]
+    async fn bounds_provider_and_aggregate_errors() {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "isError": true,
+                "content": [{"type": "text", "text": "x".repeat(64 * 1024)}],
+            },
+        })
+        .to_string();
+        let (parallel, _) = mock_server("200 OK", body.clone()).await;
+        let (exa, _) = mock_server("200 OK", body).await;
+        let tool = WebSearch::new(
+            vec![SearchProvider::parallel(parallel), SearchProvider::exa(exa)],
+            Duration::ZERO,
+        );
+
+        let result = tool
+            .run(&ToolCtx::default(), &json!({"query": "large errors"}))
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        let error = result.result["error"].as_str().unwrap();
+        assert!(error.chars().count() <= MAX_SEARCH_ERROR_CHARS);
+        assert!(error.contains("parallel:"));
+        assert!(error.contains("exa:"));
+        assert!(error.contains("[truncated]"));
     }
 
     #[tokio::test]
