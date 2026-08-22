@@ -1924,13 +1924,14 @@ async fn reap_idle_connections(
         keys.into_iter()
             .filter_map(|key| {
                 let entry = state.entries.get_mut(&key)?;
+                let was_reusable = entry.reusable;
                 entry.reusable = false;
-                Some((key, entry.clone()))
+                Some((key, entry.clone(), was_reusable))
             })
             .collect::<Vec<_>>()
     };
 
-    for (key, entry) in quarantined {
+    for (key, entry, was_reusable) in quarantined {
         match entry.connection.terminate().await {
             Ok(()) => {
                 let mut state = connections.lock().await;
@@ -1941,7 +1942,7 @@ async fn reap_idle_connections(
                 }
                 logs.push(
                     &key.1,
-                    if entry.reusable {
+                    if was_reusable {
                         "idle connection reaped"
                     } else {
                         "quarantined connection reaped on retry"
@@ -4107,6 +4108,14 @@ for line in sys.stdin:
             manager.connections.lock().await.entries.is_empty(),
             "quarantined idle cleanup was not retried"
         );
+        assert!(
+            manager
+                .logs()
+                .lines("fake")
+                .last()
+                .is_some_and(|line| line.ends_with("quarantined connection reaped on retry")),
+            "retry cleanup was not classified in the lifecycle log"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -4840,6 +4849,22 @@ for line in sys.stdin:
         assert!(
             manager.connections.lock().await.entries.is_empty(),
             "the unreferenced idle connection remained cached"
+        );
+        assert!(
+            manager
+                .logs()
+                .lines("single-flight")
+                .last()
+                .is_some_and(|line| line.ends_with("idle connection reaped")),
+            "ordinary idle cleanup was misclassified in the lifecycle log"
+        );
+        assert!(
+            manager
+                .logs()
+                .lines("single-flight")
+                .last()
+                .is_some_and(|line| line.ends_with("idle connection reaped")),
+            "ordinary idle cleanup was misclassified in the lifecycle log"
         );
     }
 
