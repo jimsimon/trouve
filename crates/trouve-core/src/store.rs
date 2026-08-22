@@ -777,6 +777,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
+    migrate_legacy_command_execution_claims(conn)?;
     preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
@@ -806,6 +807,52 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_session_summary_projection(conn)?;
     migrate_thread_status_projection(conn)?;
     recover_interrupted_session_summaries(conn)?;
+    Ok(())
+}
+
+/// Command receipts created before execution phases were persisted cannot
+/// prove whether their side effect ran before a crash. Preserve incomplete
+/// legacy claims as uncertain so an upgrade can never replay their mutation.
+/// The durable marker makes the backfill atomic and repeat-safe even if a
+/// process stops immediately after the additive column migration.
+fn migrate_legacy_command_execution_claims(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "command-execution-side-effect-phase-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE command_execution_requests
+         SET side_effect_started = 1
+         WHERE result IS NULL AND error_kind IS NULL",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -17133,6 +17180,47 @@ mod tests {
 
         store.delete_session("se_q").unwrap();
         assert!(store.command_execution("command-once").unwrap().is_none());
+    }
+
+    #[test]
+    fn command_execution_migration_preserves_legacy_incomplete_claim_as_uncertain() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("legacy-command-execution.sqlite3");
+        let store = Store::open(&database).unwrap();
+        seed_thread(&store, "th_legacy_command");
+        drop(store);
+
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DELETE FROM store_migrations
+                  WHERE id = 'command-execution-side-effect-phase-v1';
+                 DROP TABLE command_execution_requests;
+                 CREATE TABLE command_execution_requests (
+                   idempotency_key TEXT PRIMARY KEY,
+                   thread_id TEXT NOT NULL REFERENCES threads(id),
+                   request_fingerprint TEXT NOT NULL,
+                   result TEXT,
+                   created_at TEXT NOT NULL,
+                   completed_at TEXT
+                 );
+                 INSERT INTO command_execution_requests
+                        (idempotency_key, thread_id, request_fingerprint, created_at)
+                 VALUES ('legacy-command', 'th_legacy_command', 'legacy-fingerprint',
+                         '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let store = Store::open(&database).unwrap();
+        let legacy_claim = store
+            .claim_command_execution("legacy-command", "th_legacy_command", "legacy-fingerprint")
+            .unwrap()
+            .expect("legacy incomplete claim must remain uncertain");
+        assert!(legacy_claim.side_effect_started);
+        assert!(legacy_claim.result.is_none());
+        assert!(legacy_claim.failure.is_none());
     }
 
     #[test]

@@ -373,8 +373,10 @@ export const commandRetryForSubmission = (
   threadId: string,
   name: string | undefined,
   argumentsText: string,
+  requestWillBeSent: boolean,
   createKey: () => string,
 ): CommandRetry | undefined => {
+  if (!requestWillBeSent) return previous;
   if (name === undefined) return undefined;
   if (
     previous?.threadId === threadId
@@ -7064,16 +7066,19 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           && command.kind === "action")
       : undefined;
     const commandArguments = commandMatch?.[2]?.trim() ?? "";
+    const requestWillBeSent = actionCommand === undefined || attachments.length === 0;
     const commandRetry = commandRetryForSubmission(
       this.#commandRetry,
       threadId,
       actionCommand?.name,
       commandArguments,
+      requestWillBeSent,
       () => globalThis.crypto.randomUUID(),
     );
-    // Any distinct submission expires an earlier retry identity.
+    // Any distinct valid submission expires an earlier retry identity. Local
+    // validation failures preserve the prior request's recovery key.
     this.#commandRetry = commandRetry;
-    if (actionCommand !== undefined && attachments.length > 0) {
+    if (!requestWillBeSent) {
       this.#requestError = "Trouve action commands do not accept attachments.";
       this.requestUpdate();
       return;

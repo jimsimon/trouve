@@ -16,21 +16,28 @@ describe("commandRetryForSubmission", () => {
   it("reuses the key only for an exact retry", () => {
     const createKey = vi.fn(() => "new-key");
 
-    expect(commandRetryForSubmission(prior, "th_1", "new", "", createKey)).toBe(prior);
+    expect(commandRetryForSubmission(prior, "th_1", "new", "", true, createKey)).toBe(prior);
     expect(createKey).not.toHaveBeenCalled();
   });
 
   it("expires the key for unrelated submissions", () => {
     const createKey = vi.fn(() => "new-key");
 
-    expect(commandRetryForSubmission(prior, "th_1", undefined, "", createKey)).toBeUndefined();
-    expect(commandRetryForSubmission(prior, "th_1", "status", "", createKey)).toMatchObject({
+    expect(commandRetryForSubmission(prior, "th_1", undefined, "", true, createKey)).toBeUndefined();
+    expect(commandRetryForSubmission(prior, "th_1", "status", "", true, createKey)).toMatchObject({
       name: "status",
       idempotencyKey: "new-key",
     });
-    expect(commandRetryForSubmission(prior, "th_2", "new", "", createKey)).toMatchObject({
+    expect(commandRetryForSubmission(prior, "th_2", "new", "", true, createKey)).toMatchObject({
       threadId: "th_2",
       idempotencyKey: "new-key",
     });
+  });
+
+  it("preserves the prior key when local validation rejects the request", () => {
+    const createKey = vi.fn(() => "new-key");
+
+    expect(commandRetryForSubmission(prior, "th_1", "redo", "", false, createKey)).toBe(prior);
+    expect(createKey).not.toHaveBeenCalled();
   });
 });
