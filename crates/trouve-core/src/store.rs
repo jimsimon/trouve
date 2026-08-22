@@ -10321,8 +10321,8 @@ impl Store {
              JOIN code_review_jobs job ON job.id = rejection.job_id
              WHERE job.repository = ?1 AND job.pull_number = ?2
                AND job.id != ?3 AND job.status = 'succeeded'
-             ORDER BY job.completed_at DESC, rejection.created_at DESC,
-                      job.publication_order DESC, job.created_at DESC, job.id DESC,
+             ORDER BY job.publication_order DESC, job.completed_at DESC,
+                      rejection.created_at DESC, job.created_at DESC, job.id DESC,
                       rejection.candidate_id DESC
              LIMIT ?4",
         )?;
@@ -22002,10 +22002,13 @@ mod tests {
             .unwrap();
             conn.execute(
                 "UPDATE code_review_jobs
-                 SET completed_at = '2026-08-22T00:00:00Z',
+                 SET completed_at = CASE id
+                         WHEN ?1 THEN '2026-08-22T00:00:00Z'
+                         ELSE '2026-08-21T23:59:58Z'
+                     END,
                      created_at = CASE id
                          WHEN ?1 THEN '2026-08-21T23:59:59Z'
-                         ELSE '2026-08-21T23:59:58Z'
+                         ELSE '2026-08-21T23:59:57Z'
                      END
                  WHERE id IN (?1, ?2)",
                 params![first.id, second.id],
@@ -22013,7 +22016,10 @@ mod tests {
             .unwrap();
             conn.execute(
                 "UPDATE code_review_candidate_rejections
-                 SET created_at = '2026-08-22T00:00:00Z'
+                 SET created_at = CASE job_id
+                         WHEN ?1 THEN '2026-08-22T00:00:00Z'
+                         ELSE '2026-08-21T23:59:56Z'
+                     END
                  WHERE job_id IN (?1, ?2)",
                 params![first.id, second.id],
             )
