@@ -50,6 +50,7 @@ import {
 import type { CliInfo, CliInstallStatus } from "./cli";
 import {
   defaultThinkingSelection,
+  modelCatalogStatusMessage,
   modelForSelection,
   modelSelectionValue,
   supplementalModelSelection,
@@ -3062,6 +3063,7 @@ function SettingsPage({
   reviewPersonaInfo?: PersonaInfo;
   onChanged: () => void;
 }) {
+  const modelCatalogStatus = modelCatalogStatusMessage(modelsLoaded, modelsError);
   return (
     <section>
       <PageHeader
@@ -3087,9 +3089,9 @@ function SettingsPage({
           onChanged={onChanged}
         />
       </div>
-      {!modelsLoaded && (
+      {modelCatalogStatus && (
         <p class="error-text" role="status">
-          {modelsError || "Model choices are still loading. Model settings remain disabled."}
+          {modelCatalogStatus}
         </p>
       )}
     </section>

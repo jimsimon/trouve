@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { ProtocolModelInfo } from "./protocol-client.js";
-import { ModelCatalogController } from "./model-catalog-controller.js";
+import {
+  ModelCatalogController,
+  modelForSelection,
+  modelSelectionValue,
+} from "./model-catalog-controller.js";
 import { readSignal } from "../state/reactivity.js";
 
 const model = (id: string): ProtocolModelInfo => ({
@@ -21,6 +25,25 @@ const deferred = <T>() => {
   });
   return { promise, resolve, reject };
 };
+
+describe("model selection compatibility", () => {
+  const models = [
+    {
+      ...model("auto/gpt-5.6-sol"),
+      routes: [{ provider_id: "codex", provider_model: "gpt-5.6-sol" }],
+    },
+  ];
+
+  it("maps legacy bare automatic ids to the namespaced catalog entry", () => {
+    expect(modelForSelection(models, "gpt-5.6-sol")?.id).toBe("auto/gpt-5.6-sol");
+    expect(modelSelectionValue(models, "gpt-5.6-sol")).toBe("auto/gpt-5.6-sol");
+  });
+
+  it("resolves concrete pins through automatic route metadata", () => {
+    expect(modelForSelection(models, "codex/gpt-5.6-sol")?.id).toBe("auto/gpt-5.6-sol");
+    expect(modelSelectionValue(models, "codex/gpt-5.6-sol")).toBe("codex/gpt-5.6-sol");
+  });
+});
 
 describe("ModelCatalogController", () => {
   it("returns the static snapshot before adopting live Cursor discovery", async () => {

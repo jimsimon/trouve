@@ -4,6 +4,7 @@ import type {
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
+import { modelForSelection } from "../services/model-catalog-controller.js";
 
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
 export const NEW_SESSION_TITLE_FALLBACK = "New session";
@@ -446,8 +447,8 @@ export const mergeNewSessionModelCatalogs = (
   const staticById = new Map(staticModels.map((model) => [model.id, model]));
   const merged = liveModels.map((model) => staticById.get(model.id) ?? model);
   const preserved = nonEmpty(preservedModelId);
-  if (preserved !== undefined && !merged.some((model) => model.id === preserved)) {
-    const metadata = staticById.get(preserved);
+  if (preserved !== undefined && modelForSelection(merged, preserved) === undefined) {
+    const metadata = modelForSelection(staticModels, preserved);
     if (metadata !== undefined) merged.push(metadata);
   }
   return merged
@@ -470,11 +471,10 @@ export const resolveNewThreadDefaults = (
     ?? modes[0];
   const resolvedModelId = resolveNewSessionModel(overrides.modelId, mode, providers);
   const automaticModelId = models.find((candidate) => candidate.id === "cursor/default")?.id;
-  const modelId = resolvedModelId !== undefined
-      && models.some((candidate) => candidate.id === resolvedModelId)
-    ? resolvedModelId
-    : automaticModelId ?? models[0]?.id ?? "";
-  const model = models.find((candidate) => candidate.id === modelId);
+  const resolvedModel = modelForSelection(models, resolvedModelId);
+  const modelId = resolvedModel?.id
+    ?? automaticModelId ?? models[0]?.id ?? "";
+  const model = modelForSelection(models, modelId);
   const option = thinkingOption(model);
   const inheritedThinking = canonicalThinkingSelection(
     option,
@@ -603,7 +603,7 @@ export const snapshotNewSessionSubmission = (
     edits: Object.freeze({ ...input.edits }),
     inheritedThinking: input.inheritedThinking,
     inheritedPermissionMode: input.inheritedPermissionMode,
-    modelInfo: input.selectableModels.find((model) => model.id === effectiveModel),
+    modelInfo: modelForSelection(input.selectableModels, effectiveModel),
     optionsAuthoritative: input.optionsAuthoritative,
   });
 };
@@ -627,10 +627,12 @@ export const reconcileNewThreadDefaults = (
     providers,
     { modeId },
   );
-  const keepModel = edits.model
-    && selectableModels.some((model) => model.id === selections.modelId);
+  const selectedModel = edits.model
+    ? modelForSelection(selectableModels, selections.modelId)
+    : undefined;
+  const keepModel = selectedModel !== undefined;
   const modelId = keepModel
-    ? selections.modelId
+    ? selectedModel.id
     : modeDefaults.modelId;
   const refreshed = resolveNewThreadDefaults(
     modes,
@@ -639,7 +641,7 @@ export const reconcileNewThreadDefaults = (
     { modeId, modelId },
   );
   const option = thinkingOption(
-    selectableModels.find((model) => model.id === refreshed.modelId),
+    modelForSelection(selectableModels, refreshed.modelId),
   );
   const keepThinking = edits.thinking
     && thinkingSelectionIsValid(option, selections.thinking);

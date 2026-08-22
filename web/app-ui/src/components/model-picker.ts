@@ -1,6 +1,7 @@
 import { html, LitElement, nothing, type PropertyValues } from "lit";
 
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
+import { modelSelectionValue } from "../services/model-catalog-controller.js";
 import {
   filteredModelIndices,
   type ModelHealthPresentation,
@@ -48,8 +49,9 @@ export class TrouveModelPicker extends LitElement {
   protected override willUpdate(changed: PropertyValues<this>): void {
     if (changed.has("disabled") && this.disabled) this.#open = false;
     if (changed.has("models") || changed.has("value")) {
+      const selection = modelSelectionValue(this.models, this.value);
       const selected = this.#matches().findIndex(
-        (index) => (index === -1 ? "" : this.models[index]?.id) === this.value,
+        (index) => (index === -1 ? "" : this.models[index]?.id) === selection,
       );
       this.#activeMatch = Math.max(0, selected);
     }
@@ -81,7 +83,8 @@ export class TrouveModelPicker extends LitElement {
   }
 
   override render() {
-    const selectedIndex = this.models.findIndex((model) => model.id === this.value);
+    const selection = modelSelectionValue(this.models, this.value);
+    const selectedIndex = this.models.findIndex((model) => model.id === selection);
     const selected = this.models[selectedIndex];
     const selectedHealth = this.health[selectedIndex];
     const matches = this.#matches();
@@ -140,7 +143,7 @@ export class TrouveModelPicker extends LitElement {
                         id=${`${this.#listId}-${index}`}
                         type="button"
                         role="option"
-                        aria-selected=${modelId === this.value ? "true" : "false"}
+                        aria-selected=${modelId === selection ? "true" : "false"}
                         class=${matchIndex === this.#activeMatch ? "active" : ""}
                         title=${health?.detail ?? modelId}
                         @mousedown=${(event: MouseEvent) => event.preventDefault()}

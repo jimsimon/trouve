@@ -27,6 +27,11 @@ const CUSTOM_PROVIDER = "__custom__";
 const DEFAULT_LOGIN_POLL_MS = 1_000;
 const DEFAULT_LOGIN_POLL_ATTEMPTS = 180;
 
+interface ProviderLoadResult {
+  readonly providerStateLoaded: boolean;
+  readonly healthLoaded: boolean;
+}
+
 export const validatedHttpsUrl = (value: string): string | undefined => {
   try {
     const url = new URL(value);
@@ -856,9 +861,11 @@ export class TrouveProviderSettings extends LitElement {
     `;
   }
 
-  async #load(forceHealth = true): Promise<boolean> {
+  async #load(forceHealth = true): Promise<ProviderLoadResult> {
     const services = this.#services.value;
-    if (services === undefined) return false;
+    if (services === undefined) {
+      return { providerStateLoaded: false, healthLoaded: false };
+    }
     this.#clearRetry();
     const generation = ++this.#loadGeneration;
     this.#loading = true;
@@ -868,7 +875,9 @@ export class TrouveProviderSettings extends LitElement {
       services.protocol.knownProviders(),
       services.subscriptionHealth.refresh(forceHealth ? "force" : "if-stale"),
     ]);
-    if (generation !== this.#loadGeneration || !this.isConnected) return false;
+    if (generation !== this.#loadGeneration || !this.isConnected) {
+      return { providerStateLoaded: false, healthLoaded: false };
+    }
     this.#loading = false;
     if (providers.status === "fulfilled") this.#providers = providers.value;
     if (knownProviders.status === "fulfilled") this.#knownProviders = knownProviders.value;
@@ -899,9 +908,20 @@ export class TrouveProviderSettings extends LitElement {
       this.#apiPresetId = api[0]?.id ?? CUSTOM_PROVIDER;
     }
     this.requestUpdate();
-    return providers.status === "fulfilled"
-      && knownProviders.status === "fulfilled"
-      && health.status === "fulfilled";
+    // Provider state is authoritative for mutations. Subscription usage is an
+    // independent enhancement and must not make a committed provider change
+    // look as though it is still saving or failed.
+    const providerStateLoaded = providers.status === "fulfilled"
+      && knownProviders.status === "fulfilled";
+    if (providerStateLoaded && this.#busy === "provider-order-sync") {
+      this.#busy = "";
+      this.#setNotice("Automatic routing priority was reloaded from the server.", false);
+      this.requestUpdate();
+    }
+    return {
+      providerStateLoaded,
+      healthLoaded: health.status === "fulfilled",
+    };
   }
 
   #scheduleRetry(): void {
@@ -1025,18 +1045,34 @@ export class TrouveProviderSettings extends LitElement {
     this.#busy = "provider-order";
     this.#setNotice("Saving automatic routing priority…", false);
     this.requestUpdate();
+    let orderConfirmed = true;
     try {
       await services.protocol.setProviderOrder({ provider_ids: [...providerIds] });
       this.#providers = { ...providers, provider_order: [...providerIds] };
       this.requestUpdate();
       const loaded = await this.#load(false);
-      if (loaded) {
-        this.#setNotice("Automatic routing priority was updated.", false);
+      if (loaded.providerStateLoaded) {
+        this.#setNotice(
+          loaded.healthLoaded
+            ? "Automatic routing priority was updated."
+            : "Automatic routing priority was updated. Subscription usage is unavailable; retrying automatically.",
+          false,
+        );
       }
     } catch {
-      this.#setNotice("Automatic routing priority could not be saved.", true);
+      // The response may have been lost after the server committed the PUT.
+      // Re-read the authoritative order while the controls remain disabled so
+      // the next move is never based on an optimistic or stale snapshot.
+      const loaded = await this.#load(false);
+      orderConfirmed = loaded.providerStateLoaded;
+      this.#setNotice(
+        loaded.providerStateLoaded
+          ? "Automatic routing priority could not be saved."
+          : "Automatic routing priority could not be saved or confirmed. Retrying automatically.",
+        true,
+      );
     } finally {
-      this.#busy = "";
+      this.#busy = orderConfirmed ? "" : "provider-order-sync";
       this.requestUpdate();
       await this.updateComplete;
       this.#restoreRoutingFocus(providerId, direction);

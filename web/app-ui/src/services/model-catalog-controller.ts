@@ -3,6 +3,46 @@ import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
 
 export type ModelCatalogFreshness = "if-stale" | "force";
 
+export interface ModelSelectionCatalogEntry {
+  readonly id: string;
+  readonly routes?: readonly {
+    readonly provider_id: string;
+    readonly provider_model: string;
+  }[];
+}
+
+/** Resolve current ids, pre-auto-namespace bare ids, and concrete route pins. */
+export const modelForSelection = <T extends ModelSelectionCatalogEntry>(
+  models: readonly T[],
+  selection: string | null | undefined,
+): T | undefined => {
+  if (!selection) return undefined;
+  const exact = models.find((model) => model.id === selection);
+  if (exact !== undefined) return exact;
+  if (!selection.includes("/")) {
+    const automatic = models.find((model) => model.id === `auto/${selection}`);
+    if (automatic !== undefined) return automatic;
+  }
+  return models.find((model) => model.routes?.some(
+    (route) => `${route.provider_id}/${route.provider_model}` === selection,
+  ));
+};
+
+/** Canonical picker value for a persisted selection. */
+export const modelSelectionValue = (
+  models: readonly ModelSelectionCatalogEntry[],
+  selection: string | null | undefined,
+): string => {
+  if (!selection) return "";
+  if (
+    !selection.includes("/")
+    && models.some((model) => model.id === `auto/${selection}`)
+  ) {
+    return `auto/${selection}`;
+  }
+  return selection;
+};
+
 const DEFAULT_LIVE_TTL_MS = 300_000;
 
 interface ModelCatalogProtocol {

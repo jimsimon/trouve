@@ -822,6 +822,38 @@ fn routed_model_info(
     }
 }
 
+fn routed_model_catalog(candidates: Vec<ModelCandidate>) -> Vec<trouve_protocol::RoutedModelInfo> {
+    let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
+    for candidate in candidates {
+        grouped
+            .entry(candidate.concrete_selection_id())
+            .or_default()
+            .push(candidate.clone());
+        if let Some(id) = candidate.automatic_selection_id() {
+            grouped.entry(id).or_default().push(candidate);
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(id, candidates)| routed_model_info(id, candidates))
+        .collect()
+}
+
+fn compatibility_model_catalog(candidates: Vec<ModelCandidate>) -> Vec<trouve_protocol::ModelInfo> {
+    routed_model_catalog(candidates)
+        .into_iter()
+        .map(|model| trouve_protocol::ModelInfo {
+            id: model.id,
+            display_name: model.display_name,
+            context_window: model.context_window,
+            supports_tools: model.supports_tools,
+            input_price_per_mtok: model.input_price_per_mtok,
+            output_price_per_mtok: model.output_price_per_mtok,
+            options_schema: model.options_schema,
+        })
+        .collect()
+}
+
 fn subscription_health_rank(health: &trouve_protocol::SubscriptionHealth) -> (u8, i64) {
     match health.status.as_str() {
         "ok" => match health
@@ -839,7 +871,10 @@ fn subscription_health_rank(health: &trouve_protocol::SubscriptionHealth) -> (u8
     }
 }
 
-fn native_attempt_failure(error: trouve_providers::ProviderError) -> RouteAttemptFailure {
+fn native_attempt_failure(
+    error: trouve_providers::ProviderError,
+    side_effect_started: bool,
+) -> RouteAttemptFailure {
     let kind = if error.is_capacity_exhausted() {
         RouteFailureKind::Capacity
     } else if matches!(&error, trouve_providers::ProviderError::Auth(_)) {
@@ -850,7 +885,7 @@ fn native_attempt_failure(error: trouve_providers::ProviderError) -> RouteAttemp
     RouteAttemptFailure {
         kind,
         message: format!("provider error: {error}"),
-        safe_to_retry: true,
+        safe_to_retry: !side_effect_started,
     }
 }
 
@@ -874,6 +909,21 @@ fn backend_attempt_failure(
         message: format!("backend error: {error}"),
         safe_to_retry: !side_effect_started,
     }
+}
+
+fn backend_permission_policy(tools_enabled: bool, persona_read_only: bool) -> BackendPermission {
+    if !tools_enabled || persona_read_only {
+        BackendPermission::ReadOnly
+    } else {
+        // Always request a pre-execution callback. Trouve's gate still
+        // auto-approves Yolo calls, while the callback acquires the session
+        // mutation lane and supplies creator provenance.
+        BackendPermission::Ask
+    }
+}
+
+fn backend_strict_tool_free_policy(tools_enabled: bool, supports_tool_free_turns: bool) -> bool {
+    !tools_enabled && supports_tool_free_turns
 }
 
 /// Codex collaborators inherit the root thread's MCP URL. Stable Codex sends
@@ -1573,23 +1623,9 @@ impl TurnScheduler {
                 _ = tokio::time::sleep(cooldown) => {}
             }
         }
-        let mut permits = Vec::with_capacity(if background { 2 } else { 1 });
-        if background {
-            permits.push(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                permit = self.background.clone().acquire_owned() => {
-                    permit.map_err(|_| anyhow!("background turn scheduler closed"))?
-                }
-            });
-        }
-        permits.push(tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("turn cancelled"),
-            permit = self.all.clone().acquire_owned() => {
-                permit.map_err(|_| anyhow!("turn scheduler closed"))?
-            }
-        });
+        // Provider gates come first so a route waiting on saturated provider
+        // capacity never consumes a global slot needed by another provider.
+        let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
         if background {
             permits.push(tokio::select! {
                 biased;
@@ -1606,19 +1642,6 @@ impl TurnScheduler {
                 permit.map_err(|_| anyhow!("provider turn scheduler closed"))?
             }
         });
-        Ok(TurnCapacityGuard {
-            _permits: permits,
-            wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-        })
-    }
-
-    async fn acquire_global(
-        &self,
-        background: bool,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<TurnCapacityGuard> {
-        let started = Instant::now();
-        let mut permits = Vec::with_capacity(if background { 2 } else { 1 });
         if background {
             permits.push(tokio::select! {
                 biased;
@@ -1633,41 +1656,6 @@ impl TurnScheduler {
             _ = cancel.cancelled() => bail!("turn cancelled"),
             permit = self.all.clone().acquire_owned() => {
                 permit.map_err(|_| anyhow!("turn scheduler closed"))?
-            }
-        });
-        Ok(TurnCapacityGuard {
-            _permits: permits,
-            wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-        })
-    }
-
-    async fn acquire_provider(
-        &self,
-        model: &str,
-        background: bool,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<TurnCapacityGuard> {
-        let started = Instant::now();
-        let provider = self.provider(model);
-        // Routed callers filter provider backoff before taking global or
-        // session capacity. Never sleep here while those broader permits are
-        // held; a concurrent outcome can only make this route less preferred
-        // on the following turn.
-        let mut permits = Vec::with_capacity(if background { 2 } else { 1 });
-        if background {
-            permits.push(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                permit = provider.background.clone().acquire_owned() => {
-                    permit.map_err(|_| anyhow!("provider background scheduler closed"))?
-                }
-            });
-        }
-        permits.push(tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("turn cancelled"),
-            permit = provider.all.clone().acquire_owned() => {
-                permit.map_err(|_| anyhow!("provider turn scheduler closed"))?
             }
         });
         Ok(TurnCapacityGuard {
@@ -1832,7 +1820,7 @@ fn validate_persona_id(id: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn validate_model_selection(model: &str) -> Result<(), EngineError> {
+pub(crate) fn validate_model_selection(model: &str) -> Result<(), EngineError> {
     if model.trim().is_empty() {
         return Err(EngineError::BadRequest("model must not be empty".into()));
     }
@@ -3291,33 +3279,7 @@ impl Engine {
         // paint. Their route metadata arrives from `/v1/model-routes`, but
         // exposing the ids here prevents a configured `auto/<model>` default
         // from being reconciled away while live discovery is still pending.
-        let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
-        for candidate in self.available_model_candidates().await {
-            grouped
-                .entry(candidate.concrete_selection_id())
-                .or_default()
-                .push(candidate.clone());
-            if let Some(id) = candidate.automatic_selection_id() {
-                grouped.entry(id).or_default().push(candidate);
-            }
-        }
-        let mut models: Vec<_> = grouped
-            .into_iter()
-            .map(|(id, candidates)| {
-                let routed = routed_model_info(id, candidates);
-                trouve_protocol::ModelInfo {
-                    id: routed.id,
-                    display_name: routed.display_name,
-                    context_window: routed.context_window,
-                    supports_tools: routed.supports_tools,
-                    input_price_per_mtok: routed.input_price_per_mtok,
-                    output_price_per_mtok: routed.output_price_per_mtok,
-                    options_schema: routed.options_schema,
-                }
-            })
-            .collect();
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        models
+        compatibility_model_catalog(self.available_model_candidates().await)
     }
 
     /// Model-selector catalog for current clients. Shared hosted models have
@@ -3325,21 +3287,7 @@ impl Engine {
     /// user-configured local endpoints, and transport-owned models expose only
     /// concrete entries. `/models` remains the compatibility catalog.
     pub async fn list_model_routes(&self) -> Vec<trouve_protocol::RoutedModelInfo> {
-        let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
-        for candidate in self.refresh_model_candidates().await {
-            grouped
-                .entry(candidate.concrete_selection_id())
-                .or_default()
-                .push(candidate.clone());
-            if let Some(id) = candidate.automatic_selection_id() {
-                grouped.entry(id).or_default().push(candidate);
-            }
-        }
-
-        grouped
-            .into_iter()
-            .map(|(id, candidates)| routed_model_info(id, candidates))
-            .collect()
+        routed_model_catalog(self.refresh_model_candidates().await)
     }
 
     async fn available_model_candidates(&self) -> Vec<ModelCandidate> {
@@ -3403,14 +3351,7 @@ impl Engine {
     /// call this after painting list_models, then replace the static snapshot
     /// when this richer result arrives.
     pub async fn refresh_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        let mut models: Vec<_> = self
-            .refresh_model_candidates()
-            .await
-            .into_iter()
-            .map(|candidate| candidate.info)
-            .collect();
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        models
+        compatibility_model_catalog(self.refresh_model_candidates().await)
     }
 
     async fn refresh_model_candidates(&self) -> Vec<ModelCandidate> {
@@ -3951,7 +3892,8 @@ impl Engine {
         }
         {
             let mut config = self.config.lock().unwrap();
-            let entry = config.providers.entry(id.to_string()).or_default();
+            let mut next = config.clone();
+            let entry = next.providers.entry(id.to_string()).or_default();
             entry.kind = req.kind.clone();
             if let Some(base_url) = req.base_url.clone().filter(|url| !url.is_empty()) {
                 entry.base_url = Some(base_url);
@@ -3992,12 +3934,13 @@ impl Engine {
                     entry.query_params = req.query_params.clone();
                 }
             }
-            if !config.provider_order.is_empty()
-                && !config.provider_order.iter().any(|provider| provider == id)
+            if !next.provider_order.is_empty()
+                && !next.provider_order.iter().any(|provider| provider == id)
             {
-                config.provider_order.push(id.to_string());
+                next.provider_order.push(id.to_string());
             }
-            self.persist_config(&config);
+            self.persist_config_result(&next)?;
+            *config = next;
         }
         let route_cleanup = self.store.clear_route_health(id);
         self.reload_providers();
@@ -4029,12 +3972,14 @@ impl Engine {
         let _provider_guard = provider_lock.lock().unwrap();
         let secret_names = {
             let mut config = self.config.lock().unwrap();
-            let removed = config
+            let mut next = config.clone();
+            let removed = next
                 .providers
                 .remove(id)
                 .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
-            config.provider_order.retain(|provider| provider != id);
-            self.persist_config(&config);
+            next.provider_order.retain(|provider| provider != id);
+            self.persist_config_result(&next)?;
+            *config = next;
             removed.secret_names
         };
         let _ = self
@@ -4072,14 +4017,11 @@ impl Engine {
                 )));
             }
         }
-        let next = {
-            let config = self.config.lock().unwrap();
-            let mut next = config.clone();
-            next.provider_order = provider_ids.to_vec();
-            next
-        };
+        let mut config = self.config.lock().unwrap();
+        let mut next = config.clone();
+        next.provider_order = provider_ids.to_vec();
         self.persist_config_result(&next)?;
-        self.config.lock().unwrap().provider_order = provider_ids.to_vec();
+        *config = next;
         Ok(())
     }
 
@@ -12952,7 +12894,8 @@ impl Engine {
         // tools. Keep those turns restricted (no mounted MCP tools and
         // read-only permission), but reserve strict tool-use rejection for
         // backends that can actually guarantee a tool-free surface.
-        let strict_tool_free = !tools_enabled && backend.supports_tool_free_turns();
+        let strict_tool_free =
+            backend_strict_tool_free_policy(tools_enabled, backend.supports_tool_free_turns());
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
@@ -13020,14 +12963,7 @@ impl Engine {
         }
 
         let effective_read_only = !tools_enabled || mode.read_only;
-        let permission = if effective_read_only {
-            BackendPermission::ReadOnly
-        } else {
-            // Always request a pre-execution callback. Trouve's gate still
-            // auto-approves Yolo calls, while the callback acquires the
-            // session mutation lane and supplies creator provenance.
-            BackendPermission::Ask
-        };
+        let permission = backend_permission_policy(tools_enabled, mode.read_only);
 
         let mcp_bridge = tools_enabled
             .then(|| self.mcp_bridge_for(&thread.model, &thread.id))
@@ -21881,6 +21817,114 @@ default_permission_mode = "ask"
     }
 
     #[test]
+    fn compatibility_catalog_includes_automatic_and_pinned_routes() {
+        let models = compatibility_model_catalog(vec![
+            test_model_candidate("openai", "shared", true),
+            test_model_candidate("codex", "shared", true),
+        ]);
+        let ids = models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["auto/shared", "codex/shared", "openai/shared"]);
+    }
+
+    #[test]
+    fn native_failure_is_not_retryable_after_a_side_effect() {
+        let retryable = native_attempt_failure(
+            trouve_providers::ProviderError::Request("connection reset".into()),
+            false,
+        );
+        assert!(retryable.safe_to_retry);
+
+        let unsafe_to_retry = native_attempt_failure(
+            trouve_providers::ProviderError::Api("HTTP 429 Too Many Requests".into()),
+            true,
+        );
+        assert_eq!(unsafe_to_retry.kind, RouteFailureKind::Capacity);
+        assert!(!unsafe_to_retry.safe_to_retry);
+    }
+
+    #[test]
+    fn backend_policy_keeps_mutations_behind_callbacks_and_tool_free_guards() {
+        assert!(matches!(
+            backend_permission_policy(true, false),
+            BackendPermission::Ask
+        ));
+        assert!(matches!(
+            backend_permission_policy(false, false),
+            BackendPermission::ReadOnly
+        ));
+        assert!(backend_strict_tool_free_policy(false, true));
+        assert!(!backend_strict_tool_free_policy(false, false));
+        assert!(!backend_strict_tool_free_policy(true, true));
+    }
+
+    #[test]
+    fn terminal_routed_failure_records_accrued_usage() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "workspace".into(),
+            name: "workspace".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "session".into(),
+            workspace_id: workspace.id,
+            title: "routing".into(),
+            branch: "main".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "thread".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "auto/shared".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &Config::default());
+        let mut accounting = TurnAccounting {
+            usage: Usage {
+                input_tokens: 17,
+                cached_input_tokens: 3,
+                output_tokens: 5,
+                cost_usd: Some(0.25),
+                ..Usage::default()
+            },
+            context_input_tokens: 20,
+            cost_known: true,
+        };
+
+        engine
+            .record_routed_usage(&session.id, &thread.id, 4, &mut accounting, false)
+            .unwrap();
+
+        let summary = engine
+            .store
+            .usage_summary(crate::store::UsageScope::Thread("thread"))
+            .unwrap();
+        assert_eq!(summary.turns, 1);
+        assert_eq!(summary.input_tokens, 17);
+        assert_eq!(summary.cached_input_tokens, 3);
+        assert_eq!(summary.output_tokens, 5);
+        assert_eq!(summary.cost_usd, 0.25);
+    }
+
+    #[test]
     fn backend_capacity_failure_after_a_side_effect_never_fails_over() {
         let failure = backend_attempt_failure(
             BackendError::Protocol("HTTP 429 Too Many Requests".into()),
@@ -21928,6 +21972,95 @@ default_permission_mode = "ask"
             engine.config.lock().unwrap().provider_order,
             vec!["first", "second"]
         );
+    }
+
+    #[test]
+    fn failed_provider_upsert_preserves_config_and_route_health() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_route_failure("provider", "shared", 10, 30)
+            .unwrap();
+        let config = Config {
+            providers: BTreeMap::from([("provider".into(), ProviderConfig::default())]),
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Engine::new(store, data.path().into(), &config)
+            // Saving TOML to a directory is guaranteed to fail.
+            .with_config_file(Some(data.path().to_path_buf()));
+
+        assert!(
+            engine
+                .upsert_provider(
+                    "provider",
+                    &UpsertProviderRequest {
+                        kind: "openai-compat".into(),
+                        ..Default::default()
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().providers["provider"].kind,
+            ProviderConfig::default().kind
+        );
+        assert!(
+            engine
+                .store
+                .route_health()
+                .unwrap()
+                .contains_key(&("provider".into(), "shared".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_wait_does_not_reserve_global_capacity() {
+        let scheduler = Arc::new(TurnScheduler {
+            all: Arc::new(tokio::sync::Semaphore::new(2)),
+            background: Arc::new(tokio::sync::Semaphore::new(1)),
+            provider_all_limit: 1,
+            provider_background_limit: 1,
+            providers: Mutex::new(HashMap::new()),
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = scheduler
+            .acquire("busy/shared", false, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(scheduler.all.available_permits(), 1);
+
+        let waiting_scheduler = Arc::clone(&scheduler);
+        let waiting_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_scheduler
+                .acquire("busy/shared", false, &waiting_cancel)
+                .await
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            scheduler.all.available_permits(),
+            1,
+            "a provider waiter consumed the remaining global permit"
+        );
+
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.acquire("idle/shared", false, &cancel),
+        )
+        .await
+        .expect("an idle provider should still receive global capacity")
+        .unwrap();
+        drop(other);
+
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

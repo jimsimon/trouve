@@ -73,20 +73,11 @@ impl Engine {
             guard = session_lifecycle.read() => guard,
         };
         let background = self.store.is_code_review_thread(&thread.id)?;
-        let capacity_started = Instant::now();
-        let turn_capacity = self
-            .turn_scheduler
-            .acquire_global(background, &cancel)
-            .await?;
         let first_route_capacity = self
             .turn_scheduler
-            .acquire_provider(&capacity_model, background, &cancel)
+            .acquire(&capacity_model, background, &cancel)
             .await?;
-        let capacity_wait_ms = capacity_started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
+        let capacity_wait_ms = first_route_capacity.wait_ms;
         if background {
             self.store
                 .set_code_review_task_provider_wait(&thread.id, capacity_wait_ms)?;
@@ -100,8 +91,6 @@ impl Engine {
             },
         )?;
 
-        let _turn_capacity = turn_capacity;
-
         let has_native = candidates
             .iter()
             .any(|candidate| matches!(candidate.executor, ModelExecutor::Native(_)));
@@ -111,8 +100,6 @@ impl Engine {
             .filter(|window| *window > 0)
             .min()
             .unwrap_or(first_route.info.context_window);
-        let history_before = self.store.messages(&thread.id)?;
-
         if !prompt_persisted.load(Ordering::Acquire) {
             let mut shell_options = self.store.thread_model_options(&thread.id)?;
             normalize_thinking_option(&mut shell_options, Some(&first_route.info));
@@ -173,6 +160,11 @@ impl Engine {
         {
             tracing::warn!("compaction failed for {}: {error}", thread.id);
         }
+        // The first backend attempt must see the same post-compaction
+        // transcript as native execution. Capture it before adding this
+        // turn's user message, which is carried separately in the backend
+        // prompt.
+        let history_before = self.store.messages(&thread.id)?;
 
         // Materialization stays behind ToolExecutor and happens once before
         // any cross-adapter handoff, so every route sees the same safe paths.
@@ -244,14 +236,7 @@ impl Engine {
             Path::new(&workspace.path),
         );
         let stored_model_options = self.store.thread_model_options(&thread.id)?;
-        let permission = if mode.read_only {
-            BackendPermission::ReadOnly
-        } else {
-            match thread.permission_mode {
-                trouve_protocol::PermissionMode::Yolo => BackendPermission::Yolo,
-                _ => BackendPermission::Ask,
-            }
-        };
+        let permission = backend_permission_policy(tools_enabled, mode.read_only);
         let github_repository = self.github_repository_for_session(&session).ok();
         let mut recorded_prs = if github_repository.is_some() {
             self.recorded_session_pr_numbers(&session.id)?
@@ -268,7 +253,7 @@ impl Engine {
                 let capacity_model = format!("{}/{}", route.provider_id, route.provider_model);
                 route_capacity = Some(
                     self.turn_scheduler
-                        .acquire_provider(&capacity_model, background, &cancel)
+                        .acquire(&capacity_model, background, &cancel)
                         .await?,
                 );
             }
@@ -328,14 +313,7 @@ impl Engine {
                             &route.provider_model,
                         )?;
                     }
-                    accounting.finalize_cost();
-                    self.store.record_usage(
-                        &session.id,
-                        &thread.id,
-                        turn,
-                        &accounting.usage,
-                        accounting.context_input_tokens,
-                    )?;
+                    self.record_routed_usage(&session.id, &thread.id, turn, &mut accounting, true)?;
                     let checkpoint_id = if concurrent_child {
                         None
                     } else {
@@ -353,19 +331,13 @@ impl Engine {
                     return Ok(());
                 }
                 RouteAttemptResult::Cancelled => {
-                    accounting.finalize_cost();
-                    if accounting.usage.input_tokens > 0
-                        || accounting.usage.output_tokens > 0
-                        || accounting.usage.cached_input_tokens > 0
-                    {
-                        self.store.record_usage(
-                            &session.id,
-                            &thread.id,
-                            turn,
-                            &accounting.usage,
-                            accounting.context_input_tokens,
-                        )?;
-                    }
+                    self.record_routed_usage(
+                        &session.id,
+                        &thread.id,
+                        turn,
+                        &mut accounting,
+                        false,
+                    )?;
                     return Ok(());
                 }
                 RouteAttemptResult::Failed(failure) => {
@@ -388,6 +360,13 @@ impl Engine {
                     );
                     let has_next = route_index + 1 < candidates.len();
                     if !failure.safe_to_retry {
+                        self.record_routed_usage(
+                            &session.id,
+                            &thread.id,
+                            turn,
+                            &mut accounting,
+                            false,
+                        )?;
                         if automatic_model_name(&thread.model).is_some() && has_next {
                             bail!(
                                 "automatic model {} failed on {}/{} and cannot safely switch providers: {}",
@@ -405,6 +384,13 @@ impl Engine {
                         );
                     }
                     if !has_next {
+                        self.record_routed_usage(
+                            &session.id,
+                            &thread.id,
+                            turn,
+                            &mut accounting,
+                            false,
+                        )?;
                         let untried = total_candidates.saturating_sub(attempted_candidates);
                         if automatic_model_name(&thread.model).is_some() {
                             if untried == 0 {
@@ -449,7 +435,34 @@ impl Engine {
             }
         }
 
+        self.record_routed_usage(&session.id, &thread.id, turn, &mut accounting, false)?;
         bail!("no model route completed the turn")
+    }
+
+    pub(super) fn record_routed_usage(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        turn: u64,
+        accounting: &mut TurnAccounting,
+        record_empty: bool,
+    ) -> Result<()> {
+        accounting.finalize_cost();
+        if record_empty
+            || accounting.usage.input_tokens > 0
+            || accounting.usage.output_tokens > 0
+            || accounting.usage.cached_input_tokens > 0
+            || accounting.usage.cost_usd.is_some()
+        {
+            self.store.record_usage(
+                session_id,
+                thread_id,
+                turn,
+                &accounting.usage,
+                accounting.context_input_tokens,
+            )?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -493,6 +506,7 @@ impl Engine {
                     .into(),
             ));
         }
+        let mut side_effect_started = false;
 
         while *iterations_left > 0 {
             if cancel.is_cancelled() {
@@ -569,7 +583,10 @@ impl Engine {
                         })?,
                     )?;
                 }
-                return Ok(RouteAttemptResult::Failed(native_attempt_failure(error)));
+                return Ok(RouteAttemptResult::Failed(native_attempt_failure(
+                    error,
+                    side_effect_started,
+                )));
             }
 
             if cancel.is_cancelled() {
@@ -623,6 +640,15 @@ impl Engine {
             if tool_calls.is_empty() {
                 return Ok(RouteAttemptResult::Completed);
             }
+            // Classify before dispatch: after a mutation-capable call begins,
+            // its outcome may be unknown if the next provider request fails.
+            // Engine-served read/question helpers are the only calls outside
+            // ToolExecutor that are known not to change durable state.
+            side_effect_started |= tool_calls.iter().any(|call| match call.name.as_str() {
+                "ask_question" | "search_transcript" | "spawn_output" => false,
+                "spawn_thread" | "spawn_session" => true,
+                _ => self.executor.tool_mutates(&call.name) != Some(false),
+            });
             // Keep the same read-only concurrency and mutation barriers used
             // by concrete-model turns. Route failover must not change tool
             // scheduling semantics merely because the model was automatic.
@@ -651,6 +677,7 @@ impl Engine {
             system,
             &model_options,
             accounting,
+            side_effect_started,
             cancel,
         )
         .await
@@ -665,6 +692,7 @@ impl Engine {
         system: &str,
         model_options: &serde_json::Map<String, serde_json::Value>,
         accounting: &mut TurnAccounting,
+        side_effect_started: bool,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<RouteAttemptResult> {
         let ModelExecutor::Native(provider) = &route.executor else {
@@ -751,7 +779,10 @@ impl Engine {
                     })?,
                 )?;
             }
-            return Ok(RouteAttemptResult::Failed(native_attempt_failure(error)));
+            return Ok(RouteAttemptResult::Failed(native_attempt_failure(
+                error,
+                side_effect_started,
+            )));
         }
         if text.trim().is_empty() {
             text = format!(
@@ -800,6 +831,11 @@ impl Engine {
             unreachable!("backend route helper received a native provider")
         };
         let effective_read_only = !tools_enabled || mode.read_only;
+        // Backends that can remove every native tool must honor the strict
+        // tool-free contract. Others remain usable for read/search activity,
+        // but run read-only with no mounted MCP servers.
+        let strict_tool_free =
+            backend_strict_tool_free_policy(tools_enabled, backend.supports_tool_free_turns());
         let scope = Scope::Thread(thread.id.clone());
         let backend_id = &route.provider_id;
         let payloads = if retrying {
@@ -884,7 +920,7 @@ impl Engine {
             attachments: attachments.to_vec(),
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
-            tool_free: !tools_enabled,
+            tool_free: strict_tool_free,
             mcp_bridge,
             mcp_servers,
         };
@@ -1081,6 +1117,14 @@ impl Engine {
                         }
                         continue;
                     }
+                    if strict_tool_free {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        side_effect_started = true;
+                        backend_error = Some(BackendError::Protocol(format!(
+                            "backend requested tool {tool} during a tool-free turn"
+                        )));
+                        break;
+                    }
                     side_effect_started = true;
                     open_tools.insert(call_id.clone());
                     tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
@@ -1201,8 +1245,36 @@ impl Engine {
                 BackendEvent::CollaboratorEvent {
                     session_id,
                     turn_id,
-                    event,
+                    mut event,
                 } => {
+                    if strict_tool_free {
+                        event = match event {
+                            BackendCollaboratorEvent::ToolStarted { tool, .. } => {
+                                side_effect_started = true;
+                                backend_error = Some(BackendError::Protocol(format!(
+                                    "backend collaborator requested tool {tool} during a tool-free turn"
+                                )));
+                                break;
+                            }
+                            BackendCollaboratorEvent::ApprovalNeeded {
+                                tool, responder, ..
+                            } => {
+                                let _ = responder.send(false);
+                                backend_error = Some(BackendError::Protocol(format!(
+                                    "backend collaborator requested approval for {tool} during a tool-free turn"
+                                )));
+                                break;
+                            }
+                            event => event,
+                        };
+                    }
+                    if matches!(
+                        &event,
+                        BackendCollaboratorEvent::ToolStarted { .. }
+                            | BackendCollaboratorEvent::ApprovalNeeded { .. }
+                    ) {
+                        side_effect_started = true;
+                    }
                     if !collaborators.contains_key(&session_id) {
                         let parent_session_id = active_vendor_session
                             .as_deref()
@@ -1369,6 +1441,14 @@ impl Engine {
                     args,
                     responder,
                 } => {
+                    if strict_tool_free {
+                        let _ = responder.send(false);
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        backend_error = Some(BackendError::Protocol(format!(
+                            "backend requested approval for {tool} during a tool-free turn"
+                        )));
+                        break;
+                    }
                     side_effect_started = true;
                     open_tools.insert(call_id.clone());
                     if !segment.is_empty() {

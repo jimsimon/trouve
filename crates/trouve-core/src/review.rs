@@ -29,7 +29,7 @@ use trouve_protocol::{
 };
 
 use crate::config::GithubReviewAppConfig;
-use crate::engine::{Engine, EngineError};
+use crate::engine::{Engine, EngineError, validate_model_selection};
 use crate::store::{
     CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewJobRetryOutcome, CodeReviewManualRequest,
     CodeReviewModelTiming, CodeReviewTaskMetrics, NewCodeReviewFinding,
@@ -2815,6 +2815,9 @@ impl Engine {
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .map(str::to_string);
+            if let Some(model) = model.as_deref() {
+                validate_model_selection(model)?;
+            }
             let thinking_level = reviewer_override
                 .thinking_level
                 .as_deref()
@@ -2941,6 +2944,9 @@ impl Engine {
         if request.model.is_some() && model.is_none() {
             return Err(EngineError::BadRequest("model cannot be empty".into()));
         }
+        if let Some(model) = model.as_deref() {
+            validate_model_selection(model)?;
+        }
         if request.mode != CodeReviewMode::Off && model.is_none() {
             return Err(EngineError::BadRequest(
                 "enabled code review requires an explicit repository model".into(),
@@ -2966,6 +2972,9 @@ impl Engine {
             return Err(EngineError::BadRequest(
                 "router model cannot be empty".into(),
             ));
+        }
+        if let Some(router_model) = router_model.as_deref() {
+            validate_model_selection(router_model)?;
         }
         let router_thinking_level = request
             .router_thinking_level
@@ -20522,6 +20531,24 @@ mod tests {
                 "expected {expected:?}, got {error}"
             );
         }
+
+        let mut invalid = request();
+        invalid.model = Some("auto/default".into());
+        rejected(&engine, invalid, "automatic model selection must name").await;
+
+        let mut invalid = request();
+        invalid.router_model = Some("auto/default".into());
+        rejected(&engine, invalid, "automatic model selection must name").await;
+
+        let mut invalid = request();
+        invalid.reviewer_overrides = Some(vec![ReviewerOverride {
+            reviewer_id: "security".into(),
+            model: Some("auto/default".into()),
+            thinking_level: None,
+            prompt_mode: ReviewerPromptMode::Inherit,
+            prompt: String::new(),
+        }]);
+        rejected(&engine, invalid, "automatic model selection must name").await;
 
         let mut invalid = request();
         invalid.reviewer_ids = Some(Vec::new());

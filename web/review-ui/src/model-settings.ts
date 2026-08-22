@@ -74,6 +74,18 @@ export function supplementalModelSelection(
   };
 }
 
+export function modelCatalogStatusMessage(
+  loaded: boolean,
+  error: string,
+): string | undefined {
+  if (error) {
+    return loaded ? `Model choices may be stale: ${error}` : error;
+  }
+  return loaded
+    ? undefined
+    : "Model choices are still loading. Model settings remain disabled.";
+}
+
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>

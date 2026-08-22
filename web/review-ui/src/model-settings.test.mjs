@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   defaultThinkingSelection,
+  modelCatalogStatusMessage,
   modelForSelection,
   modelSelectionValue,
   supplementalModelSelection,
@@ -10,6 +11,15 @@ import {
   thinkingOptions,
   thinkingSelectionIsValid,
 } from "./model-settings.ts";
+
+test("model catalog status keeps refresh failures visible after initial load", () => {
+  assert.equal(
+    modelCatalogStatusMessage(true, "refresh failed"),
+    "Model choices may be stale: refresh failed",
+  );
+  assert.equal(modelCatalogStatusMessage(true, ""), undefined);
+  assert.match(modelCatalogStatusMessage(false, "") ?? "", /still loading/u);
+});
 
 test("automatic aliases and provider pins resolve to their exact picker rows", () => {
   const route = (provider_id) => ({ provider_id, provider_model: "gpt-5.6-sol" });
