@@ -19375,7 +19375,10 @@ mod tests {
 
     struct StartupTestBackend;
 
-    struct EventFailureUsageBackend;
+    struct EventFailureUsageBackend {
+        cleanup_started: Arc<tokio::sync::Semaphore>,
+        cleanup_release: Arc<tokio::sync::Semaphore>,
+    }
 
     #[async_trait::async_trait]
     impl AgentBackend for ListedTestBackend {
@@ -19488,29 +19491,63 @@ mod tests {
 
         async fn run_turn(
             &self,
-            _turn: BackendTurn,
+            turn: BackendTurn,
         ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
-            Ok(futures::stream::iter(vec![
-                Ok(BackendEvent::Completed {
-                    usage: Usage {
-                        input_tokens: 23,
-                        cached_input_tokens: 4,
-                        output_tokens: 7,
-                        cost_usd: Some(0.5),
-                        ..Usage::default()
+            let cleanup_started = self.cleanup_started.clone();
+            let cleanup_release = self.cleanup_release.clone();
+            let (events, stream) = futures::channel::mpsc::unbounded::<
+                Result<BackendEvent, trouve_agents::BackendError>,
+            >();
+            tokio::spawn(async move {
+                let (responder, decision) = tokio::sync::oneshot::channel();
+                if events
+                    .unbounded_send(Ok(BackendEvent::ApprovalNeeded {
+                        call_id: "approved-mutation".into(),
+                        tool: "vendor-write".into(),
+                        args: serde_json::json!({}),
+                        responder,
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+                if decision.await != Ok(true) {
+                    return;
+                }
+                let emitted = [
+                    BackendEvent::Completed {
+                        usage: Usage {
+                            input_tokens: 23,
+                            cached_input_tokens: 4,
+                            output_tokens: 7,
+                            cost_usd: Some(0.5),
+                            ..Usage::default()
+                        },
                     },
-                }),
-                Ok(BackendEvent::CollaboratorStarted {
-                    session_id: "invalid-child".into(),
-                    parent_session_id: "root".into(),
-                    name: Some("Invalid child".into()),
-                    prompt: Some("Trigger event projection failure".into()),
-                    model: Some("auto/".into()),
-                    thinking_level: None,
-                    access: BackendCollaboratorAccess::Inherit,
-                }),
-            ])
-            .boxed())
+                    BackendEvent::CollaboratorStarted {
+                        session_id: "invalid-child".into(),
+                        parent_session_id: "root".into(),
+                        name: Some("Invalid child".into()),
+                        prompt: Some("Trigger event projection failure".into()),
+                        model: Some("auto/".into()),
+                        thinking_level: None,
+                        access: BackendCollaboratorAccess::Inherit,
+                    },
+                ];
+                for event in emitted {
+                    if events.unbounded_send(Ok(event)).is_err() {
+                        return;
+                    }
+                }
+                turn.cancel.cancelled().await;
+                cleanup_started.add_permits(1);
+                cleanup_release
+                    .acquire_owned()
+                    .await
+                    .expect("cleanup release semaphore remains open")
+                    .forget();
+            });
+            Ok(stream.boxed())
         }
     }
 
@@ -20865,6 +20902,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let thread =
             routing_test_thread(&store, data.path(), "event_processing_usage", "auto/shared");
+        let cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
         let engine = Arc::new(
             Engine::new(
                 store.clone(),
@@ -20874,12 +20913,30 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .with_backend("event-failure-backend", Arc::new(EventFailureUsageBackend)),
+            .with_backend(
+                "event-failure-backend",
+                Arc::new(EventFailureUsageBackend {
+                    cleanup_started: cleanup_started.clone(),
+                    cleanup_release: cleanup_release.clone(),
+                }),
+            ),
         );
 
         engine
             .send_message(&thread.id, "Trigger event failure".into(), Vec::new())
             .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), cleanup_started.acquire())
+            .await
+            .expect("backend cleanup should start after event processing fails")
+            .expect("cleanup semaphore remains open")
+            .forget();
+        let mutation_lane = engine.tool_execution_lock(&thread.session_id);
+        assert!(
+            mutation_lane.clone().try_write_owned().is_err(),
+            "approved mutation permit was released before backend cleanup acknowledged"
+        );
+        cleanup_release.add_permits(1);
 
         let failure = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -20922,6 +20979,10 @@ mod tests {
         assert_eq!(summary.output_tokens, 7);
         assert_eq!(summary.cost_usd, 0.5);
         assert!(store.route_health().unwrap().is_empty());
+        assert!(
+            mutation_lane.try_write_owned().is_ok(),
+            "mutation permit should be released after backend cleanup"
+        );
     }
 
     #[tokio::test]

@@ -1073,8 +1073,12 @@ impl Engine {
             Vec::new()
         };
         let model_options = model_options_for_schema(stored_model_options, &route.info);
+        // A routed attempt needs its own cancellation boundary. Provider
+        // failover must be able to stop and acknowledge one vendor process
+        // without cancelling the user-visible turn or its later routes.
+        let attempt_cancel = cancel.child_token();
         let backend_turn = BackendTurn {
-            cancel: cancel.clone(),
+            cancel: attempt_cancel.clone(),
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
             session: vendor_session,
@@ -1743,6 +1747,27 @@ impl Engine {
         if let Err(error) = event_loop_result {
             attempt_error = Some(error);
         }
+        let abort_backend = attempt_error.is_some()
+            || backend_error.is_some()
+            || cancel.is_cancelled()
+            || backend_cancelled;
+        // Resolve outstanding approval futures first so a vendor cannot stay
+        // blocked on an engine responder while its attempt is being stopped.
+        // Already-granted mutation permits remain held in their maps.
+        deny_pending_backend_approvals(
+            &mut pending_backend_approvals,
+            &mut backend_approval_cancels,
+            &mut collaborators,
+        )
+        .await;
+        if abort_backend {
+            attempt_cancel.cancel();
+            // BackendTurn's contract keeps the producer alive until process
+            // cleanup is acknowledged. Drain the bounded output to observe
+            // that producer completion before releasing mutation ownership
+            // or allowing another route to touch the same worktree.
+            while stream.next().await.is_some() {}
+        }
         drop(stream);
         backend_mutation_permits.clear();
         flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
@@ -1758,12 +1783,6 @@ impl Engine {
             }
             collaborator_claims.release(&collaborator.thread.id);
         }
-        deny_pending_backend_approvals(
-            &mut pending_backend_approvals,
-            &mut backend_approval_cancels,
-            &mut collaborators,
-        )
-        .await;
         accounting.add_backend(&attempt_usage);
 
         if attempt_error.is_some() || backend_error.is_some() {
