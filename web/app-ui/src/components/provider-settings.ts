@@ -26,6 +26,8 @@ const PROVIDER_RETRY_MS = 5_000;
 const CUSTOM_PROVIDER = "__custom__";
 const DEFAULT_LOGIN_POLL_MS = 1_000;
 const DEFAULT_LOGIN_POLL_ATTEMPTS = 180;
+const ROUTING_UPDATED_WITHOUT_USAGE =
+  "Automatic routing priority was updated. Subscription usage is unavailable; retrying automatically.";
 
 interface ProviderLoadResult {
   readonly providerStateLoaded: boolean;
@@ -891,6 +893,7 @@ export class TrouveProviderSettings extends LitElement {
     } else if (
       this.#notice === "Provider settings could not be loaded. Retrying automatically."
       || this.#notice === "Providers loaded, but subscription usage is unavailable."
+      || this.#notice === ROUTING_UPDATED_WITHOUT_USAGE
     ) {
       this.#setNotice("", false);
     }
@@ -1055,7 +1058,7 @@ export class TrouveProviderSettings extends LitElement {
         this.#setNotice(
           loaded.healthLoaded
             ? "Automatic routing priority was updated."
-            : "Automatic routing priority was updated. Subscription usage is unavailable; retrying automatically.",
+            : ROUTING_UPDATED_WITHOUT_USAGE,
           false,
         );
       }
