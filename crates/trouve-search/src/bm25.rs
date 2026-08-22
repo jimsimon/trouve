@@ -184,6 +184,14 @@ impl Bm25Index {
         }
     }
 
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.term_blob.owned_bytes()
+            + self.term_offsets.owned_bytes()
+            + self.posting_offsets.owned_bytes()
+            + self.postings.owned_bytes()
+            + self.doc_lengths.owned_bytes()
+    }
+
     /// Borrow the flat parts for serialization (snapshot save path).
     #[allow(clippy::type_complexity)]
     pub fn flat_parts(&self) -> (&[u8], &[u32], &[u64], &[Posting], &[u32]) {

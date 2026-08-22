@@ -56,6 +56,7 @@ impl BuildStats {
 }
 
 pub struct TrouveIndex {
+    cache_identity: IndexIdentity,
     model: Arc<EmbeddingModel>,
     pub chunks: Vec<Chunk>,
     dense: DenseIndex,
@@ -65,6 +66,21 @@ pub struct TrouveIndex {
     file_sizes: HashMap<String, usize>,
     content: Vec<ContentType>,
     pub build_stats: BuildStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct IndexIdentity {
+    store_identity: String,
+    manifest_hash: [u8; 32],
+}
+
+impl IndexIdentity {
+    fn new(store_identity: &str, manifest_hash: [u8; 32]) -> Self {
+        Self {
+            store_identity: store_identity.to_string(),
+            manifest_hash,
+        }
+    }
 }
 
 impl TrouveIndex {
@@ -117,6 +133,7 @@ impl TrouveIndex {
         // Fast path 1: identical manifest -> mmap the assembled snapshot and
         // skip per-file store reads and index reconstruction entirely.
         let manifest_hash = manifest_digest(&manifest, &content, &model.model_id);
+        let cache_identity = IndexIdentity::new(&store_identity, manifest_hash);
         let snapshot_dir = store.root().join("snapshots");
         let content_strs: Vec<String> = content.iter().map(|c| c.as_str().to_string()).collect();
         if let Some(snap) = snapshot::load(&snapshot_dir, &manifest_hash, &model.model_id) {
@@ -127,7 +144,13 @@ impl TrouveIndex {
                 files_computed: 0,
                 chunks_total: snap.chunks.len(),
             };
-            return Ok(Self::from_loaded(snap, model, content, stats));
+            return Ok(Self::from_loaded(
+                snap,
+                model,
+                content,
+                stats,
+                cache_identity,
+            ));
         }
 
         // Fast path 2: patch the newest compatible snapshot. Only changed
@@ -144,7 +167,13 @@ impl TrouveIndex {
                 &manifest_hash,
                 &content_strs,
             ) {
-                return Ok(Self::from_loaded(snap, model, content, stats));
+                return Ok(Self::from_loaded(
+                    snap,
+                    model,
+                    content,
+                    stats,
+                    cache_identity,
+                ));
             }
         }
 
@@ -316,6 +345,7 @@ impl TrouveIndex {
             model,
             content,
             stats,
+            cache_identity,
         ))
     }
 
@@ -325,6 +355,7 @@ impl TrouveIndex {
         model: Arc<EmbeddingModel>,
         content: Vec<ContentType>,
         build_stats: BuildStats,
+        cache_identity: IndexIdentity,
     ) -> TrouveIndex {
         let (file_mapping, language_mapping) = populate_mappings(&snap.chunks);
         let mut file_sizes: HashMap<String, usize> = HashMap::new();
@@ -332,6 +363,7 @@ impl TrouveIndex {
             *file_sizes.entry(chunk.file_path.clone()).or_insert(0) += chunk.content.len();
         }
         TrouveIndex {
+            cache_identity,
             model,
             chunks: snap.chunks,
             dense: snap.dense,
@@ -342,6 +374,59 @@ impl TrouveIndex {
             content,
             build_stats,
         }
+    }
+
+    pub(crate) fn cache_identity(&self) -> &IndexIdentity {
+        &self.cache_identity
+    }
+
+    /// Approximate uniquely-owned heap storage retained by this index.
+    ///
+    /// File-backed dense/BM25 snapshot buffers and the process-global
+    /// embedding model are excluded. The estimate is intentionally
+    /// conservative for hash-table control bytes and allocator rounding.
+    pub fn estimated_heap_bytes(&self) -> usize {
+        fn string_bytes(value: &String) -> usize {
+            value.capacity()
+        }
+
+        fn mapping_bytes(mapping: &HashMap<String, Vec<usize>>) -> usize {
+            mapping.capacity()
+                * (std::mem::size_of::<String>() + std::mem::size_of::<Vec<usize>>() + 1)
+                + mapping
+                    .iter()
+                    .map(|(key, values)| {
+                        string_bytes(key) + values.capacity() * std::mem::size_of::<usize>()
+                    })
+                    .sum::<usize>()
+        }
+
+        let chunks = self.chunks.capacity() * std::mem::size_of::<Chunk>()
+            + self
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    chunk.content.capacity()
+                        + chunk.file_path.capacity()
+                        + chunk
+                            .language
+                            .as_ref()
+                            .map_or(0, std::string::String::capacity)
+                })
+                .sum::<usize>();
+        let file_sizes = self.file_sizes.capacity()
+            * (std::mem::size_of::<String>() + std::mem::size_of::<usize>() + 1)
+            + self.file_sizes.keys().map(string_bytes).sum::<usize>();
+
+        std::mem::size_of::<Self>()
+            + self.cache_identity.store_identity.capacity()
+            + chunks
+            + self.dense.estimated_heap_bytes()
+            + self.bm25.estimated_heap_bytes()
+            + mapping_bytes(&self.file_mapping)
+            + mapping_bytes(&self.language_mapping)
+            + file_sizes
+            + self.content.capacity() * std::mem::size_of::<ContentType>()
     }
 
     /// Build by patching the newest compatible snapshot: unchanged files are

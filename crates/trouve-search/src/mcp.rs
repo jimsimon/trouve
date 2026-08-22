@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -22,6 +22,7 @@ use crate::utils::{format_results, is_git_url, resolve_chunk};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const CACHE_MAX_SIZE: usize = 10;
+const CACHE_MAX_HEAP_BYTES: usize = 512 * 1024 * 1024;
 const MAX_TOOL_TOP_K: u64 = 100;
 const MAX_TOOL_SNIPPET_LINES: u64 = 1_000;
 /// Don't re-validate a repo sooner than this many times the last build's duration.
@@ -38,7 +39,7 @@ const INSTRUCTIONS: &str = "Instant code search for any local git repository. Ca
     root as `repo`.";
 
 struct BuiltIndex {
-    index: TrouveIndex,
+    index: Arc<TrouveIndex>,
     built_at: Instant,
     build_duration: Duration,
 }
@@ -49,6 +50,8 @@ struct BuiltIndex {
 struct RepoEntry {
     last_used: Mutex<Instant>,
     built: RwLock<Option<BuiltIndex>>,
+    #[cfg(test)]
+    retained_heap_override: Mutex<Option<(usize, usize)>>,
 }
 
 /// Lock, ignoring poisoning: a panicked call must not wedge every later
@@ -83,6 +86,8 @@ fn index_is_fresh(index: &BuiltIndex) -> bool {
 pub struct IndexCache {
     content: Vec<ContentType>,
     entries: Mutex<HashMap<String, Arc<RepoEntry>>>,
+    shared_indexes: Mutex<HashMap<crate::index::IndexIdentity, Weak<TrouveIndex>>>,
+    max_heap_bytes: usize,
 }
 
 impl IndexCache {
@@ -90,6 +95,8 @@ impl IndexCache {
         IndexCache {
             content,
             entries: Mutex::new(HashMap::new()),
+            shared_indexes: Mutex::new(HashMap::new()),
+            max_heap_bytes: CACHE_MAX_HEAP_BYTES,
         }
     }
 
@@ -103,7 +110,7 @@ impl IndexCache {
     /// Look up or create the repo's entry, holding the map lock only for
     /// that. Eviction removes the LRU entry from the map; in-flight calls
     /// keep their `Arc` alive until they finish.
-    fn entry(&self, repo: &str) -> Result<Arc<RepoEntry>, String> {
+    fn entry(&self, repo: &str) -> Result<(String, Arc<RepoEntry>), String> {
         if is_git_url(repo) {
             return Err(format!(
                 "Remote git URLs are not supported; only local directory paths are accepted as \
@@ -114,7 +121,7 @@ impl IndexCache {
         let mut entries = lock_unpoisoned(&self.entries);
         if let Some(entry) = entries.get(&key) {
             *lock_unpoisoned(&entry.last_used) = Instant::now();
-            return Ok(Arc::clone(entry));
+            return Ok((key, Arc::clone(entry)));
         }
         if entries.len() >= CACHE_MAX_SIZE {
             // Evict the least-recently-used entry nobody is using. The map
@@ -134,9 +141,47 @@ impl IndexCache {
         let entry = Arc::new(RepoEntry {
             last_used: Mutex::new(Instant::now()),
             built: RwLock::new(None),
+            #[cfg(test)]
+            retained_heap_override: Mutex::new(None),
         });
-        entries.insert(key, Arc::clone(&entry));
-        Ok(entry)
+        entries.insert(key.clone(), Arc::clone(&entry));
+        Ok((key, entry))
+    }
+
+    fn intern_index(&self, index: TrouveIndex) -> Arc<TrouveIndex> {
+        let identity = index.cache_identity().clone();
+        let mut shared = lock_unpoisoned(&self.shared_indexes);
+        shared.retain(|_, index| index.strong_count() > 0);
+        if let Some(existing) = shared.get(&identity).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let index = Arc::new(index);
+        shared.insert(identity, Arc::downgrade(&index));
+        index
+    }
+
+    /// Enforce both the entry-count guardrail and a process-heap budget.
+    /// In-flight entries are never evicted.
+    fn trim(&self) -> bool {
+        let mut entries = lock_unpoisoned(&self.entries);
+        let mut removed = false;
+        loop {
+            let heap_bytes = retained_heap_bytes(&entries);
+            if entries.len() <= CACHE_MAX_SIZE && heap_bytes <= self.max_heap_bytes {
+                break;
+            }
+            let Some(lru) = entries
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(entry) == 1)
+                .min_by_key(|(_, entry)| *lock_unpoisoned(&entry.last_used))
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            entries.remove(&lru);
+            removed = true;
+        }
+        removed
     }
 
     /// Run `f` against the repo's up-to-date index, (re)building it first
@@ -144,32 +189,72 @@ impl IndexCache {
     /// revalidation is exclusive, so parallel tool calls against one repo do
     /// not queue behind each other after the initial build.
     fn with_index<R>(&self, repo: &str, f: impl FnOnce(&TrouveIndex) -> R) -> Result<R, String> {
-        let entry = self.entry(repo)?;
+        let (_, entry) = self.entry(repo)?;
         let mut f = Some(f);
-        {
-            let built = read_unpoisoned(&entry.built);
-            if let Some(cached) = built.as_ref().filter(|cached| index_is_fresh(cached)) {
-                return Ok(f.take().expect("query closure is available")(&cached.index));
+        let mut rebuilt = false;
+        let result = (|| {
+            let cached = {
+                let built = read_unpoisoned(&entry.built);
+                built
+                    .as_ref()
+                    .filter(|cached| index_is_fresh(cached))
+                    .map(|cached| Arc::clone(&cached.index))
+            };
+            let index = if let Some(cached) = cached {
+                cached
+            } else {
+                let mut built = write_unpoisoned(&entry.built);
+                // A different caller may have completed revalidation while this one
+                // waited for the write lock.
+                if !built.as_ref().is_some_and(index_is_fresh) {
+                    let start = Instant::now();
+                    let index = TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
+                        .map_err(|e| format!("Failed to index {repo:?}: {e}"))?;
+                    let index = self.intern_index(index);
+                    *built = Some(BuiltIndex {
+                        index,
+                        built_at: Instant::now(),
+                        build_duration: start.elapsed(),
+                    });
+                    rebuilt = true;
+                }
+                Arc::clone(&built.as_ref().expect("index was built").index)
+            };
+            Ok(f.take().expect("query closure is available")(&index))
+        })();
+
+        // Every caller trims after releasing its entry reference. This lets
+        // the last call in a concurrent burst restore both cache limits.
+        drop(entry);
+        let evicted = self.trim();
+        if evicted {
+            lock_unpoisoned(&self.shared_indexes).retain(|_, index| index.strong_count() > 0);
+        }
+        if rebuilt || evicted {
+            // Index assembly has large parallel scratch buffers. Returning
+            // pages here prevents a long-lived MCP server from retaining the
+            // build's high-water mark after buffers and evicted indexes drop.
+            crate::release_unused_memory_in_background();
+        }
+        result
+    }
+}
+
+fn retained_heap_bytes(entries: &HashMap<String, Arc<RepoEntry>>) -> usize {
+    let mut unique = HashMap::<usize, usize>::new();
+    for entry in entries.values() {
+        if let Some(built) = read_unpoisoned(&entry.built).as_ref() {
+            unique
+                .entry(Arc::as_ptr(&built.index) as usize)
+                .or_insert_with(|| built.index.estimated_heap_bytes());
+        } else {
+            #[cfg(test)]
+            if let Some((identity, heap_bytes)) = *lock_unpoisoned(&entry.retained_heap_override) {
+                unique.entry(identity).or_insert(heap_bytes);
             }
         }
-
-        let mut built = write_unpoisoned(&entry.built);
-        // A different caller may have completed revalidation while this one
-        // waited for the write lock.
-        if !built.as_ref().is_some_and(index_is_fresh) {
-            let start = Instant::now();
-            let index = TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
-                .map_err(|e| format!("Failed to index {repo:?}: {e}"))?;
-            *built = Some(BuiltIndex {
-                index,
-                built_at: Instant::now(),
-                build_duration: start.elapsed(),
-            });
-        }
-        Ok(f.take().expect("query closure is available")(
-            &built.as_ref().expect("index was built").index,
-        ))
     }
+    unique.values().sum()
 }
 
 fn tool_definitions() -> Value {
@@ -457,6 +542,69 @@ mod tests {
             let err = cache.entry(repo).err().unwrap();
             assert!(err.contains("not supported"), "repo: {repo}, got: {err}");
         }
+    }
+
+    #[test]
+    fn entry_cache_evicts_the_oldest_idle_worktree_at_capacity() {
+        let cache = test_cache();
+        for index in 0..=CACHE_MAX_SIZE {
+            drop(
+                cache
+                    .entry(&format!("/definitely-missing/repo-{index}"))
+                    .unwrap(),
+            );
+        }
+        let entries = lock_unpoisoned(&cache.entries);
+        assert_eq!(entries.len(), CACHE_MAX_SIZE);
+        assert!(!entries.contains_key("/definitely-missing/repo-0"));
+        assert!(entries.contains_key(&format!("/definitely-missing/repo-{CACHE_MAX_SIZE}")));
+    }
+
+    #[test]
+    fn concurrent_entries_trim_after_the_last_active_call() {
+        const RETAINED_BYTES: usize = 128;
+        let cache = Arc::new(IndexCache {
+            content: vec![ContentType::Code],
+            entries: Mutex::new(HashMap::new()),
+            shared_indexes: Mutex::new(HashMap::new()),
+            max_heap_bytes: RETAINED_BYTES,
+        });
+        let worker_count = CACHE_MAX_SIZE + 4;
+        let barrier = Arc::new(std::sync::Barrier::new(worker_count + 1));
+        let workers = (0..worker_count)
+            .map(|index| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let (_, entry) = cache
+                        .entry(&format!("/definitely-missing/concurrent-repo-{index}"))
+                        .unwrap();
+                    let identity = if index < 2 { 1 } else { index };
+                    *lock_unpoisoned(&entry.retained_heap_override) =
+                        Some((identity, RETAINED_BYTES));
+                    barrier.wait();
+                    barrier.wait();
+                    drop(entry);
+                    cache.trim();
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        assert_eq!(
+            retained_heap_bytes(&lock_unpoisoned(&cache.entries)),
+            (worker_count - 1) * RETAINED_BYTES,
+            "shared indexes must only count once toward the heap budget"
+        );
+        barrier.wait();
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let entries = lock_unpoisoned(&cache.entries);
+        assert!(entries.len() <= CACHE_MAX_SIZE);
+        assert!(entries.len() < worker_count);
+        assert!(retained_heap_bytes(&entries) <= cache.max_heap_bytes);
     }
 
     #[test]

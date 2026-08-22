@@ -643,6 +643,10 @@ impl BackendEventBuffer {
 }
 
 impl BackendEventSender {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.buffer.state.lock().unwrap().output_closed
+    }
+
     /// Wait until the consumer drops the exposed backend event stream.
     pub(crate) async fn closed(&self) {
         loop {
