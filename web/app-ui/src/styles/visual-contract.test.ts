@@ -643,6 +643,9 @@ describe("Trouve visual contract", () => {
       /@media \(max-width: 760px\)[\s\S]*\.thread-tabs \{[^}]*--thread-tab-width:\s*128px[^}]*height:\s*42px/,
     );
     expect(app).toMatch(
+      /@media \(max-width: 760px\)[\s\S]*\.chat-find-bar button, \.chat-find-bar \.chat-find-case \{[^}]*width:\s*44px[^}]*height:\s*44px/,
+    );
+    expect(app).toMatch(
       /@media \(max-width: 760px\)[\s\S]*\.thread-switcher-panel \{[^}]*position:\s*fixed[^}]*max-height:\s*min\(72dvh, 600px\)/,
     );
   });
