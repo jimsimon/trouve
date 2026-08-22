@@ -26,7 +26,10 @@ const MAX_PROVIDER_ERROR_CHARS: usize = 3 * 1024;
 const MAX_QUERY_CHARS: usize = 2_000;
 const MIN_PROVIDER_INTERVAL: Duration = Duration::from_millis(250);
 const PROVIDER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
-const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
+const SESSION_CLEANUP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const SESSION_CLEANUP_OVERALL_TIMEOUT: Duration = Duration::from_secs(7);
+const SESSION_CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
+const SESSION_CLEANUP_MAX_ATTEMPTS: u32 = 3;
 const SESSION_CLEANUP_CONCURRENCY: usize = 8;
 const SESSION_CLEANUP_CAPACITY: usize = 64;
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
@@ -193,6 +196,67 @@ struct SessionCleanupJob {
     protocol_version: String,
 }
 
+#[derive(Clone, Copy)]
+struct SessionCleanupPolicy {
+    attempt_timeout: Duration,
+    overall_timeout: Duration,
+    retry_delay: Duration,
+    max_attempts: u32,
+}
+
+impl Default for SessionCleanupPolicy {
+    fn default() -> Self {
+        Self {
+            attempt_timeout: SESSION_CLEANUP_ATTEMPT_TIMEOUT,
+            overall_timeout: SESSION_CLEANUP_OVERALL_TIMEOUT,
+            retry_delay: SESSION_CLEANUP_RETRY_DELAY,
+            max_attempts: SESSION_CLEANUP_MAX_ATTEMPTS,
+        }
+    }
+}
+
+async fn cleanup_provider_session(
+    client: &reqwest::Client,
+    request: &SessionCleanupJob,
+    policy: SessionCleanupPolicy,
+) -> bool {
+    let started = Instant::now();
+    let attempts = policy.max_attempts.max(1);
+    for attempt in 0..attempts {
+        let remaining = policy.overall_timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+        let result = client
+            .delete(&request.endpoint)
+            .timeout(policy.attempt_timeout.min(remaining))
+            .header(MCP_PROTOCOL_VERSION_HEADER, &request.protocol_version)
+            .header(MCP_SESSION_ID_HEADER, &request.session_id)
+            .send()
+            .await;
+        match result {
+            Ok(response) if response.status().is_success() => return true,
+            Ok(response)
+                if !response.status().is_server_error()
+                    && response.status() != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                return false;
+            }
+            Ok(_) | Err(_) => {}
+        }
+        if attempt + 1 == attempts {
+            break;
+        }
+        let delay = policy.retry_delay.saturating_mul(attempt + 1);
+        if delay >= policy.overall_timeout.saturating_sub(started.elapsed()) {
+            break;
+        }
+        tokio::time::sleep(delay).await;
+    }
+    false
+}
+
 struct SessionCleanupWorker {
     sender: Option<tokio::sync::mpsc::Sender<SessionCleanupJob>>,
     recovery_sender: Option<tokio::sync::mpsc::UnboundedSender<PendingInitializationJob>>,
@@ -201,7 +265,12 @@ struct SessionCleanupWorker {
 }
 
 impl SessionCleanupWorker {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_policy(SessionCleanupPolicy::default())
+    }
+
+    fn with_policy(policy: SessionCleanupPolicy) -> Self {
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<SessionCleanupJob>(SESSION_CLEANUP_CAPACITY);
         // Header recovery must never consume DELETE admission. Its ingress is
@@ -236,13 +305,12 @@ impl SessionCleanupWorker {
                         let client = client.clone();
                         let pending = worker_pending.clone();
                         cleanups.spawn(async move {
-                            let _ = client
-                                .delete(request.endpoint)
-                                .timeout(SESSION_CLEANUP_TIMEOUT)
-                                .header(MCP_PROTOCOL_VERSION_HEADER, request.protocol_version)
-                                .header(MCP_SESSION_ID_HEADER, request.session_id)
-                                .send()
-                                .await;
+                            if !cleanup_provider_session(&client, &request, policy).await {
+                                tracing::warn!(
+                                    endpoint = %request.endpoint,
+                                    "web search provider session cleanup did not complete within its retry budget"
+                                );
+                            }
                             pending.fetch_sub(1, Ordering::Release);
                         });
                     }
@@ -573,6 +641,20 @@ impl WebSearch {
         min_provider_interval: Duration,
         handoff_timeout: Duration,
     ) -> Self {
+        Self::new_with_cleanup_policy(
+            providers,
+            min_provider_interval,
+            handoff_timeout,
+            SessionCleanupPolicy::default(),
+        )
+    }
+
+    fn new_with_cleanup_policy(
+        providers: Vec<SearchProvider>,
+        min_provider_interval: Duration,
+        handoff_timeout: Duration,
+        cleanup_policy: SessionCleanupPolicy,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(SEARCH_TIMEOUT)
             .user_agent(concat!("trouve-agent/", env!("CARGO_PKG_VERSION")))
@@ -587,7 +669,7 @@ impl WebSearch {
             cache: Mutex::new(SearchCache::default()),
             query_locks: Mutex::new(HashMap::new()),
             dispatcher: ProviderDispatcher::new(min_provider_interval, handoff_timeout),
-            cleanup: SessionCleanupWorker::new(),
+            cleanup: SessionCleanupWorker::with_policy(cleanup_policy),
         }
     }
 
@@ -1167,6 +1249,15 @@ mod tests {
         }
     }
 
+    fn fast_cleanup_policy() -> SessionCleanupPolicy {
+        SessionCleanupPolicy {
+            attempt_timeout: Duration::from_millis(40),
+            overall_timeout: Duration::from_millis(250),
+            retry_delay: Duration::from_millis(10),
+            max_attempts: 3,
+        }
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         at: Instant,
@@ -1176,11 +1267,17 @@ mod tests {
         protocol_version: Option<String>,
     }
 
-    async fn capturing_mock_server_with_delays(
+    #[derive(Clone, Copy)]
+    struct MockCleanupBehavior {
+        response_delay: Duration,
+        delay_only_on_first_attempt: bool,
+    }
+
+    async fn capturing_mock_server_with_cleanup_behavior(
         status: &'static str,
         body: impl Into<String>,
         response_delay: Duration,
-        cleanup_response_delay: Duration,
+        cleanup: MockCleanupBehavior,
         initialization_response_delay: Duration,
         stateful_initialization: bool,
         initialization_body: Option<String>,
@@ -1188,19 +1285,22 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let body = body.into();
         tokio::spawn({
             let calls = calls.clone();
+            let cleanup_calls = cleanup_calls.clone();
             let requests = requests.clone();
             let initialization_body = initialization_body.clone();
             async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let calls = calls.clone();
+                    let cleanup_calls = cleanup_calls.clone();
                     let requests = requests.clone();
                     let body = body.clone();
                     let initialization_body = initialization_body.clone();
-                    let cleanup_response_delay = cleanup_response_delay;
+                    let cleanup = cleanup;
                     tokio::spawn(async move {
                         let mut request = Vec::new();
                         let mut buffer = [0; 4096];
@@ -1272,7 +1372,10 @@ mod tests {
                         });
 
                         let response = if method == "DELETE" {
-                            tokio::time::sleep(cleanup_response_delay).await;
+                            let cleanup_call = cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                            if !cleanup.delay_only_on_first_attempt || cleanup_call == 0 {
+                                tokio::time::sleep(cleanup.response_delay).await;
+                            }
                             "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_owned()
                         } else if status != "200 OK" {
                             calls.fetch_add(1, Ordering::SeqCst);
@@ -1330,6 +1433,30 @@ mod tests {
             }
         });
         (format!("http://{address}/mcp"), calls, requests)
+    }
+
+    async fn capturing_mock_server_with_delays(
+        status: &'static str,
+        body: impl Into<String>,
+        response_delay: Duration,
+        cleanup_response_delay: Duration,
+        initialization_response_delay: Duration,
+        stateful_initialization: bool,
+        initialization_body: Option<String>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<CapturedRequest>>>) {
+        capturing_mock_server_with_cleanup_behavior(
+            status,
+            body,
+            response_delay,
+            MockCleanupBehavior {
+                response_delay: cleanup_response_delay,
+                delay_only_on_first_attempt: false,
+            },
+            initialization_response_delay,
+            stateful_initialization,
+            initialization_body,
+        )
+        .await
     }
 
     async fn capturing_mock_server_with_initialization(
@@ -2116,6 +2243,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_session_cleanup_within_a_bounded_deadline() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"result"}]}}"#;
+        let (endpoint, _, requests) = capturing_mock_server_with_cleanup_behavior(
+            "200 OK",
+            body,
+            Duration::ZERO,
+            MockCleanupBehavior {
+                response_delay: Duration::from_millis(75),
+                delay_only_on_first_attempt: true,
+            },
+            Duration::ZERO,
+            true,
+            None,
+        )
+        .await;
+        let tool = WebSearch::new_with_cleanup_policy(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::ZERO,
+            PROVIDER_HANDOFF_TIMEOUT,
+            fast_cleanup_policy(),
+        );
+
+        let result = tool
+            .run(
+                &ToolCtx::default(),
+                &json!({"query": "retry delayed session cleanup"}),
+            )
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.method == "DELETE")
+                    .count()
+                    >= 2
+                    && tool.cleanup.pending.load(Ordering::Acquire) == 0
+            }),
+        )
+        .await
+        .expect("cleanup must retry and complete within its overall deadline");
+    }
+
+    #[tokio::test]
     async fn cancellation_returns_while_lifecycle_cleanup_remains_drainable() {
         let body =
             r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"late"}]}}"#;
@@ -2129,9 +2305,11 @@ mod tests {
             None,
         )
         .await;
-        let tool = Arc::new(WebSearch::new(
+        let tool = Arc::new(WebSearch::new_with_cleanup_policy(
             vec![SearchProvider::parallel(endpoint)],
             Duration::ZERO,
+            PROVIDER_HANDOFF_TIMEOUT,
+            fast_cleanup_policy(),
         ));
         let ctx = ToolCtx::default();
         let cancel = ctx.cancel.clone();
