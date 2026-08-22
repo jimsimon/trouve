@@ -1703,12 +1703,13 @@ function JobDetailPane({
                 const coordinatorRetryBlocked =
                   group.id === "coordinator" && finalEditorRetryBlocked;
                 const retryable =
-                  job.status === "failed" &&
-                  (group.persona
-                    ? ["failed", "cancelled", "queued", "running"].includes(group.status)
+                  group.persona
+                    ? job.status === "failed" &&
+                      ["failed", "cancelled", "queued", "running"].includes(group.status)
                     : group.id === "coordinator" &&
+                      ["failed", "cancelled"].includes(job.status) &&
                       ["failed", "cancelled"].includes(group.status) &&
-                      !coordinatorRetryBlocked);
+                      !coordinatorRetryBlocked;
                 const retrying = group.persona
                   ? busy === `persona:${group.persona.reviewer_id}`
                   : group.id === "coordinator" && busy === "final-editor";
@@ -1752,7 +1753,7 @@ function JobDetailPane({
                           {retrying ? "Retrying…" : group.persona ? "Retry all" : "Retry"}
                         </button>
                       )}
-                      {job.status === "failed" &&
+                      {["failed", "cancelled"].includes(job.status) &&
                         group.id === "coordinator" &&
                         ["failed", "cancelled"].includes(group.status) &&
                         coordinatorRetryBlocked && (

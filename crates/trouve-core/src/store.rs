@@ -3610,7 +3610,19 @@ fn cancel_active_code_review_tasks(
     }
     tx.execute(
         "UPDATE code_review_tasks
-         SET status = 'cancelled', completed_at = ?2, error = ?3
+         SET status = 'cancelled', completed_at = ?2, error = ?3,
+             model_elapsed_ms = CASE
+               WHEN status != 'running' OR model_started_at IS NULL THEN model_elapsed_ms
+               ELSE model_elapsed_ms + MAX(
+                 0,
+                 CAST(
+                   (julianday(?2) - MAX(
+                     julianday(model_started_at),
+                     julianday(COALESCE(last_progress_at, model_started_at))
+                   )) * 86400000 AS INTEGER
+                 )
+               )
+             END
          WHERE job_id = ?1 AND status IN ('queued', 'running')
            AND (?4 IS NULL OR reviewer_id = ?4)",
         params![job_id, completed_at, error, reviewer_id],
@@ -9823,8 +9835,8 @@ impl Store {
         }))
     }
 
-    /// Resume a failed job at its final editing phase while retaining all
-    /// successful reviewer task outputs.
+    /// Resume a failed or cancelled job at its final editing phase while
+    /// retaining all successful reviewer task outputs.
     pub fn retry_code_review_final_editor(
         &self,
         id: &str,
@@ -9842,8 +9854,10 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
-        if old.job.status != "failed" {
-            anyhow::bail!("the final review editor can only be retried after the review job fails");
+        if !matches!(old.job.status.as_str(), "failed" | "cancelled") {
+            anyhow::bail!(
+                "the final review editor can only be retried after the review job fails or is cancelled"
+            );
         }
         if old.job.session_id.is_some() {
             anyhow::bail!("review session cleanup is still pending; retry shortly");
@@ -9916,7 +9930,7 @@ impl Store {
             "UPDATE code_review_jobs
              SET status = 'queued', started_at = NULL, completed_at = NULL,
                  error = '', cancel_requested = 0, publication_claimed = 0
-             WHERE id = ?1 AND status = 'failed'",
+             WHERE id = ?1 AND status IN ('failed', 'cancelled')",
             params![id],
         )?;
         if updated == 0 {
@@ -22183,17 +22197,40 @@ mod tests {
             })
             .unwrap();
         store
+            .start_code_review_task(
+                &leftover_router.id,
+                "se_router_leftover",
+                "th_router_leftover",
+                "provider/default",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_tasks
+                 SET model_started_at = '2026-01-01T00:00:00Z',
+                     last_progress_at = '2026-01-01T00:00:10Z',
+                     model_elapsed_ms = 5000
+                 WHERE id = ?1",
+                [&leftover_router.id],
+            )
+            .unwrap();
+        store
             .finish_code_review_job(&queued.id, "failed", "", "retry failed")
             .unwrap();
-        assert_eq!(
-            store
-                .code_review_tasks(&queued.id)
-                .unwrap()
-                .into_iter()
-                .find(|task| task.id == leftover_router.id)
-                .unwrap()
-                .status,
-            "cancelled"
+        let cancelled_router = store
+            .code_review_tasks(&queued.id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == leftover_router.id)
+            .unwrap();
+        assert_eq!(cancelled_router.status, "cancelled");
+        assert!(
+            cancelled_router.model_elapsed_ms > 5_000,
+            "cancelling a running task must finalize its unpersisted model interval"
         );
 
         let error = store
@@ -22311,6 +22348,10 @@ mod tests {
         assert_eq!(cancelled.updated_tasks[0].id, queued_coordinator.id);
         assert_eq!(cancelled.updated_tasks[0].status, "cancelled");
         assert_eq!(
+            cancelled.updated_tasks[0].model_elapsed_ms, 0,
+            "queued task cancellation must not accrue model time"
+        );
+        assert_eq!(
             store
                 .code_review_tasks(&queued.id)
                 .unwrap()
@@ -22320,6 +22361,18 @@ mod tests {
                 .status,
             "cancelled"
         );
+        let editor_retry = store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(editor_retry.job.id, queued.id);
+        assert_eq!(editor_retry.job.status, "queued");
+        assert_eq!(editor_retry.updated_tasks.len(), 1);
+        assert_eq!(
+            editor_retry.updated_tasks[0].role,
+            trouve_protocol::CodeReviewTaskRole::Coordinator
+        );
+        assert_eq!(editor_retry.updated_tasks[0].status, "queued");
     }
 
     #[tokio::test]

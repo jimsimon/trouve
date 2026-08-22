@@ -1265,11 +1265,11 @@ export class ProtocolClient {
     await this.#mutation("/v1/code-review/refresh", "refresh code reviews", "POST");
   }
 
-  async retryCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
+  retryCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
     return this.#mutateCodeReviewJob(jobId, "retry", "retry code review");
   }
 
-  async retryCodeReviewFinalEditor(jobId: string): Promise<ProtocolCodeReviewJob> {
+  retryCodeReviewFinalEditor(jobId: string): Promise<ProtocolCodeReviewJob> {
     return this.#mutateCodeReviewJob(
       jobId,
       "final-editor/retry",
@@ -1277,7 +1277,7 @@ export class ProtocolClient {
     );
   }
 
-  async cancelCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
+  cancelCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
     return this.#mutateCodeReviewJob(jobId, "cancel", "cancel code review");
   }
 
