@@ -14,6 +14,7 @@ const WORKER_TIMEOUT: Duration = Duration::from_secs(12);
 const HANDOFF_CONFIRMATION_INTERVAL: Duration = Duration::from_secs(2);
 const LAUNCHER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LAUNCHER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const LAUNCHER_REAPER_BATCH_SIZE: usize = 64;
 const DISPATCH_QUEUED: u8 = 0;
 const DISPATCH_ENTERED: u8 = 1;
 const DISPATCH_CANCELLED: u8 = 2;
@@ -293,32 +294,57 @@ fn start_launcher_reaper() -> Option<Sender<std::process::Child>> {
 fn supervise_launchers(receiver: Receiver<std::process::Child>) {
     let mut children = Vec::new();
     loop {
+        let mut intake_remaining = LAUNCHER_REAPER_BATCH_SIZE;
         match receiver.recv_timeout(LAUNCHER_REAPER_POLL_INTERVAL) {
-            Ok(child) => children.push(child),
+            Ok(child) => {
+                children.push(SupervisedLauncher::new(child));
+                intake_remaining -= 1;
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        while let Ok(child) = receiver.try_recv() {
-            children.push(child);
-        }
+        drain_ready(&receiver, intake_remaining, |child| {
+            children.push(SupervisedLauncher::new(child))
+        });
         poll_launchers(&mut children);
     }
 }
 
-fn poll_launchers(children: &mut Vec<std::process::Child>) {
-    children.retain_mut(|child| match child.try_wait() {
+fn drain_ready<T>(receiver: &Receiver<T>, limit: usize, mut accept: impl FnMut(T)) {
+    for _ in 0..limit {
+        let Ok(value) = receiver.try_recv() else {
+            return;
+        };
+        accept(value);
+    }
+}
+
+struct SupervisedLauncher {
+    child: std::process::Child,
+    inspection_error_reported: bool,
+}
+
+impl SupervisedLauncher {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child,
+            inspection_error_reported: false,
+        }
+    }
+}
+
+fn poll_launchers(children: &mut Vec<SupervisedLauncher>) {
+    children.retain_mut(|launcher| match launcher.child.try_wait() {
         Ok(Some(_)) => false,
         Ok(None) => true,
         Err(error) => {
-            // An inspection failure leaves ownership ambiguous. A blocking
-            // wait is the only portable way to avoid dropping an unreaped
-            // child; this rare fallback does not affect the normal polling
-            // path for other launchers.
-            tracing::warn!(%error, "could not inspect system launcher in reaper");
-            if let Err(error) = child.wait() {
-                tracing::warn!(%error, "could not reap system launcher");
+            // Keep retrying this child without blocking progress for other
+            // launchers. A later successful poll will still collect it.
+            if !launcher.inspection_error_reported {
+                tracing::warn!(%error, "could not inspect system launcher in reaper");
+                launcher.inspection_error_reported = true;
             }
-            false
+            true
         }
     });
 }
@@ -440,7 +466,10 @@ mod tests {
         let long_id = long_child.id();
         let mut short_command = std::process::Command::new("true");
         let short_child = trouve_process::spawn(&mut short_command).unwrap();
-        let mut children = vec![long_child, short_child];
+        let mut children = vec![
+            SupervisedLauncher::new(long_child),
+            SupervisedLauncher::new(short_child),
+        ];
         let deadline = Instant::now() + Duration::from_secs(1);
 
         while children.len() > 1 && Instant::now() < deadline {
@@ -450,12 +479,28 @@ mod tests {
 
         let remaining_ids = children
             .iter()
-            .map(std::process::Child::id)
+            .map(|launcher| launcher.child.id())
             .collect::<Vec<_>>();
-        for mut child in children {
-            child.kill().unwrap();
-            child.wait().unwrap();
+        for mut launcher in children {
+            launcher.child.kill().unwrap();
+            launcher.child.wait().unwrap();
         }
         assert_eq!(remaining_ids, vec![long_id]);
+    }
+
+    #[test]
+    fn reaper_intake_batch_is_bounded_before_the_next_poll() {
+        let (sender, receiver) = channel();
+        for value in 0..=LAUNCHER_REAPER_BATCH_SIZE {
+            sender.send(value).unwrap();
+        }
+        let mut accepted = Vec::new();
+
+        drain_ready(&receiver, LAUNCHER_REAPER_BATCH_SIZE, |value| {
+            accepted.push(value);
+        });
+
+        assert_eq!(accepted.len(), LAUNCHER_REAPER_BATCH_SIZE);
+        assert_eq!(receiver.try_recv(), Ok(LAUNCHER_REAPER_BATCH_SIZE));
     }
 }
