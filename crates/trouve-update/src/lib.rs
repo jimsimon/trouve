@@ -24,6 +24,7 @@ const MAX_CHECKSUM_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = MAX_BINARY_BYTES + 64 * 1024 * 1024;
+const BINARY_COMPARE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_INSTALLED_VERSION_BYTES: u64 = 128;
 const UPDATE_STATE_DIRECTORY: &str = "updates";
 
@@ -421,7 +422,7 @@ fn installed_binary_version_at(state_root: &Path, executable: &Path) -> Option<V
 }
 
 fn record_installed_version(state_root: &Path, executable: &Path, version: &Version) -> Result<()> {
-    verify_private_update_state_root(state_root)?;
+    prepare_private_update_state_root(state_root)?;
     let identity = executable_identity(executable)?;
     let state = update_state_path(state_root, executable, &identity);
     let text = format!("{version}\n");
@@ -528,6 +529,13 @@ fn executable_identity(executable: &Path) -> Result<String> {
     let metadata = file
         .metadata()
         .with_context(|| format!("reading executable identity {}", executable.display()))?;
+    opened_executable_identity(&file, &metadata)
+}
+
+fn opened_executable_identity(
+    _file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Result<String> {
     if !metadata.is_file() {
         bail!("updated executable is not a regular file");
     }
@@ -553,7 +561,7 @@ fn executable_identity(executable: &Path) -> Result<String> {
 
         let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
         let succeeded =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+            unsafe { GetFileInformationByHandle(_file.as_raw_handle().cast(), &mut information) };
         if succeeded == 0 {
             return Err(std::io::Error::last_os_error())
                 .context("querying installed executable file identity");
@@ -568,6 +576,56 @@ fn executable_identity(executable: &Path) -> Result<String> {
     }
     #[cfg(not(any(unix, windows)))]
     bail!("installed-version state is unsupported on this platform")
+}
+
+fn installed_matches_replacement(
+    installed_executable: &Path,
+    replacement: &Path,
+    cancellation: &InstallCancellation,
+) -> Result<bool> {
+    ensure_not_cancelled(cancellation)?;
+    let mut installed = std::fs::File::open(installed_executable).with_context(|| {
+        format!(
+            "opening installed executable {} for comparison",
+            installed_executable.display()
+        )
+    })?;
+    let installed_metadata = installed
+        .metadata()
+        .context("reading installed executable metadata for comparison")?;
+    let opened_identity = opened_executable_identity(&installed, &installed_metadata)?;
+    let mut replacement =
+        std::fs::File::open(replacement).context("opening verified replacement for comparison")?;
+    let replacement_metadata = replacement
+        .metadata()
+        .context("reading verified replacement metadata for comparison")?;
+    if !replacement_metadata.is_file()
+        || installed_metadata.len() != replacement_metadata.len()
+        || installed_metadata.len() > MAX_BINARY_BYTES
+    {
+        return Ok(false);
+    }
+
+    let mut installed_chunk = [0_u8; BINARY_COMPARE_CHUNK_BYTES];
+    let mut replacement_chunk = [0_u8; BINARY_COMPARE_CHUNK_BYTES];
+    let mut remaining = installed_metadata.len();
+    while remaining > 0 {
+        ensure_not_cancelled(cancellation)?;
+        let chunk = usize::try_from(remaining.min(BINARY_COMPARE_CHUNK_BYTES as u64))
+            .context("converting executable comparison chunk size")?;
+        installed
+            .read_exact(&mut installed_chunk[..chunk])
+            .context("reading installed executable for comparison")?;
+        replacement
+            .read_exact(&mut replacement_chunk[..chunk])
+            .context("reading verified replacement for comparison")?;
+        if installed_chunk[..chunk] != replacement_chunk[..chunk] {
+            return Ok(false);
+        }
+        remaining -= chunk as u64;
+    }
+    ensure_not_cancelled(cancellation)?;
+    Ok(executable_identity(installed_executable).ok().as_ref() == Some(&opened_identity))
 }
 
 async fn install_release_locked(
@@ -633,15 +691,38 @@ async fn install_release_locked(
     ensure_not_cancelled(&cancellation)?;
     progress(InstallProgress::Installing);
     let installed_executable = installed_executable.to_owned();
+    let state_root = update_state_root();
+    let version = release.version.clone();
+    let comparison_executable = installed_executable.clone();
+    let comparison_replacement = replacement.clone();
+    let comparison_state_root = state_root.clone();
+    let comparison_version = version.clone();
+    let comparison_cancellation = Arc::clone(&cancellation);
+    let already_installed = tokio::task::spawn_blocking(move || {
+        let matches = installed_matches_replacement(
+            &comparison_executable,
+            &comparison_replacement,
+            &comparison_cancellation,
+        )
+        .unwrap_or(false);
+        ensure_not_cancelled(&comparison_cancellation)?;
+        if matches && let Some(state_root) = comparison_state_root {
+            let _ =
+                record_installed_version(&state_root, &comparison_executable, &comparison_version);
+        }
+        Ok::<_, anyhow::Error>(matches)
+    })
+    .await
+    .context("joining installed executable comparison task")??;
+    if already_installed {
+        return Ok(());
+    }
+
     let installed_parent = installed_executable
         .parent()
         .ok_or_else(|| anyhow!("updated executable path has no parent"))?
         .to_owned();
-    let state_root =
-        update_state_root().ok_or_else(|| anyhow!("locating per-user update-state directory"))?;
-    let version = release.version.clone();
     tokio::task::spawn_blocking(move || {
-        prepare_private_update_state_root(&state_root)?;
         sync_directory(&installed_parent)
             .context("syncing installation directory before replacement")?;
         cancellation.commit_install()?;
@@ -649,7 +730,9 @@ async fn install_release_locked(
         // This is deduplication metadata, not part of the replacement commit.
         // Publish it only for the final path identity, and never turn a
         // successful executable replacement into an update failure.
-        let _ = record_installed_version(&state_root, &installed_executable, &version);
+        if let Some(state_root) = state_root {
+            let _ = record_installed_version(&state_root, &installed_executable, &version);
+        }
         sync_directory(&installed_parent).context("syncing installed executable directory")
     })
     .await
@@ -1244,6 +1327,27 @@ mod tests {
         assert_eq!(installed_binary_version_at(&state_root, &executable), None);
         std::fs::write(&state, vec![b'x'; MAX_INSTALLED_VERSION_BYTES as usize + 1]).unwrap();
         assert_eq!(installed_binary_version_at(&state_root, &executable), None);
+    }
+
+    #[test]
+    fn verified_content_fallback_skips_only_an_exact_installed_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("trouve");
+        let replacement = temp.path().join("new-trouve");
+        let cancellation = InstallCancellation::default();
+        std::fs::write(&executable, b"verified release bytes").unwrap();
+        std::fs::write(&replacement, b"verified release bytes").unwrap();
+        assert!(installed_matches_replacement(&executable, &replacement, &cancellation).unwrap());
+
+        std::fs::write(&replacement, b"different release data").unwrap();
+        assert!(!installed_matches_replacement(&executable, &replacement, &cancellation).unwrap());
+        assert!(cancellation.request_cancel());
+        assert!(
+            installed_matches_replacement(&executable, &replacement, &cancellation)
+                .unwrap_err()
+                .to_string()
+                .contains("update cancelled")
+        );
     }
 
     #[test]
