@@ -5240,14 +5240,22 @@ impl Engine {
                                         &coordinator_candidates,
                                         &diff_files,
                                     );
+                                    merge_coordinator_adjudication_repair(
+                                        &mut validated,
+                                        repaired_output,
+                                        &missing_adjudications,
+                                    );
                                     if unadjudicated_candidate_ids(
-                                        &repaired_output,
+                                        &validated,
                                         &coordinator_candidates,
                                     )
                                     .is_empty()
                                     {
-                                        turn.output = repaired.output;
-                                        validated = repaired_output;
+                                        tracing::debug!(
+                                            job_id = %job.id,
+                                            candidate_ids = ?missing_adjudications,
+                                            "coordinator adjudication repair completed"
+                                        );
                                     } else {
                                         tracing::warn!(
                                             job_id = %job.id,
@@ -5359,9 +5367,6 @@ impl Engine {
             .await
             .context("refreshing GitHub App credentials before publication")?;
         self.revalidate_code_review_publication(&api, &job).await?;
-        if !self.store.claim_code_review_publication(&job.id)? {
-            bail!("stale: review was cancelled or replaced before publication");
-        }
         let candidate_count = candidates.len() as u64;
         let stored_findings = parsed
             .findings
@@ -5496,6 +5501,9 @@ impl Engine {
         ensure_review_current(superseded)?;
         self.revalidate_code_review_publication(&api, &job).await?;
         ensure_review_current(superseded)?;
+        if !self.store.claim_code_review_publication(&job.id)? {
+            bail!("stale: review was cancelled or replaced before publication");
+        }
         // Only findings that can produce a visible inline comment may make
         // the GitHub verdict blocking. Suppressed or unplaceable findings
         // remain available in the durable report without creating an
@@ -11494,6 +11502,34 @@ fn unadjudicated_candidate_ids(
         })
         .map(|candidate| candidate.candidate_id.clone())
         .collect()
+}
+
+/// Applies a bounded repair without allowing it to rewrite decisions or
+/// metadata that the first coordinator response already settled.
+fn merge_coordinator_adjudication_repair(
+    output: &mut ReviewOutput,
+    repaired: ReviewOutput,
+    unadjudicated_candidate_ids: &[String],
+) {
+    let unadjudicated = unadjudicated_candidate_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    output
+        .findings
+        .extend(repaired.findings.into_iter().filter(|finding| {
+            !finding.source_candidate_ids.is_empty()
+                && finding
+                    .source_candidate_ids
+                    .iter()
+                    .all(|candidate_id| unadjudicated.contains(candidate_id.as_str()))
+        }));
+    output.rejected_candidates.extend(
+        repaired
+            .rejected_candidates
+            .into_iter()
+            .filter(|rejection| unadjudicated.contains(rejection.candidate_id.as_str())),
+    );
 }
 
 fn append_unadjudicated_summary(summary: &mut String, count: usize) {
@@ -20213,6 +20249,69 @@ mod tests {
         assert!(prompt.contains("Adjudicate each affected candidate exactly once"));
         assert!(prompt.contains("do not call tools"));
         assert!(prompt.contains("category without an explanation is not an adjudication"));
+    }
+
+    #[test]
+    fn coordinator_adjudication_repair_only_adds_missing_decisions() {
+        let finding = |candidate_id: &str, title: &str| ReviewFinding {
+            path: "src/lib.rs".into(),
+            line: 3,
+            side: "RIGHT".into(),
+            outside_diff: false,
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: title.into(),
+            body: format!("body for {candidate_id}"),
+            evidence: test_review_evidence(),
+            origin: Default::default(),
+            source_candidate_ids: vec![candidate_id.into()],
+        };
+        let theme = |root_cause: &str| ReviewTheme {
+            theme_id: "theme-1".into(),
+            root_cause: root_cause.into(),
+            recommendation: "Keep the original recommendation".into(),
+            source_candidate_ids: vec!["candidate-a".into()],
+            previous_finding_ids: vec!["finding-old".into()],
+            observation_kind: Default::default(),
+        };
+        let mut output = ReviewOutput {
+            summary: "Original summary".into(),
+            findings: vec![finding("candidate-a", "Keep A")],
+            rejected_candidates: vec![ReviewCandidateRejection {
+                candidate_id: "candidate-c".into(),
+                reason: "false_positive: already settled".into(),
+            }],
+            resolved_finding_ids: vec!["finding-old".into()],
+            themes: vec![theme("Original root cause")],
+        };
+        let repaired = ReviewOutput {
+            summary: "Rewritten summary".into(),
+            findings: vec![
+                finding("candidate-b", "Add B"),
+                ReviewFinding {
+                    source_candidate_ids: vec!["candidate-a".into(), "candidate-b".into()],
+                    ..finding("candidate-b", "Do not replace A")
+                },
+            ],
+            rejected_candidates: vec![ReviewCandidateRejection {
+                candidate_id: "candidate-a".into(),
+                reason: "false_positive: reverses the prior decision".into(),
+            }],
+            resolved_finding_ids: vec!["different-finding".into()],
+            themes: vec![theme("Rewritten root cause")],
+        };
+
+        merge_coordinator_adjudication_repair(&mut output, repaired, &["candidate-b".into()]);
+
+        assert_eq!(output.summary, "Original summary");
+        assert_eq!(output.findings.len(), 2);
+        assert_eq!(output.findings[0].source_candidate_ids, ["candidate-a"]);
+        assert_eq!(output.findings[1].source_candidate_ids, ["candidate-b"]);
+        assert_eq!(output.rejected_candidates.len(), 1);
+        assert_eq!(output.rejected_candidates[0].candidate_id, "candidate-c");
+        assert_eq!(output.resolved_finding_ids, ["finding-old"]);
+        assert_eq!(output.themes.len(), 1);
+        assert_eq!(output.themes[0].root_cause, "Original root cause");
     }
 
     #[test]
