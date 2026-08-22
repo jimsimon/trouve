@@ -2814,20 +2814,7 @@ fn provider_auth_kind(pc: &ProviderConfig) -> String {
 /// `localhost.attacker.example` and mislabel them as offline-capable
 /// keyless endpoints.
 fn is_loopback_base_url(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // IPv6 hosts come back bracketed; IpAddr parsing wants them bare.
-    host.trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+    trouve_providers::catalog::endpoint_is_loopback(url)
 }
 
 fn restore_secret_snapshot(
@@ -20814,7 +20801,7 @@ mod tests {
                 providers: BTreeMap::from([(
                     "openai".into(),
                     ProviderConfig {
-                        base_url: Some("http://127.0.0.1:9/v1".into()),
+                        base_url: Some("http://[::ffff:127.0.0.1]:9/v1".into()),
                         ..Default::default()
                     },
                 )]),
@@ -24880,6 +24867,7 @@ default_permission_mode = "ask"
             "http://127.0.0.1:8080/v1",
             "https://127.1.2.3", // whole 127/8 block is loopback
             "http://[::1]:8000",
+            "http://[::ffff:127.0.0.1]:8000",
         ] {
             assert!(is_loopback_base_url(url), "should be loopback: {url}");
         }
