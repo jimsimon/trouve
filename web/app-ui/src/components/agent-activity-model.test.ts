@@ -86,6 +86,20 @@ describe("agent activity presentation", () => {
     });
   });
 
+  it("uses snapshot metadata when the active marker is outside the item window", () => {
+    const startedAt = "2026-07-31T16:00:00.000Z";
+    expect(presentation({
+      items: [prompt(3)],
+      turnModels: new Map([[2, "openai/o3"], [3, "codex/gpt-5.6-sol"]]),
+      turnStartedAt: new Map([[3, startedAt]]),
+      nowMs: Date.parse(startedAt) + 42_000,
+    })).toEqual({
+      label: "Waiting for first response from gpt-5.6-sol · 42s",
+      detail: "The turn is running, but no model output has arrived yet.",
+      announcementLabel: "Waiting for first response from gpt-5.6-sol…",
+    });
+  });
+
   it("describes each durable running phase", () => {
     const marker = status(3, { kind: "running" });
     const model = new Map([[3, "openai/o3"]]);

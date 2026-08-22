@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 const source = readFileSync(new URL("./thread-screen.ts", import.meta.url), "utf8");
+const agentActivitySource = readFileSync(
+  new URL("./agent-activity.ts", import.meta.url),
+  "utf8",
+);
 
 const section = (start: string, end: string): string => {
   const startAt = source.indexOf(start);
@@ -179,40 +183,26 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(currentScope).toContain('(route.threadId ?? "") === threadId');
   });
 
-  it("refreshes elapsed activity only while the visible thread is running", () => {
-    const syncActivity = section(
-      "#syncActivityRefresh(): void {",
-      "\n  #clearActivityRefresh(): void {",
-    );
-    const clearActivity = section(
-      "#clearActivityRefresh(): void {",
-      "\n  #selectThreadWithKeyboard(",
-    );
-    expect(syncActivity).toContain("threadView(this.threadId)?.turnRunning");
-    expect(syncActivity).toContain("this.#activityNowMs = Date.now();");
-    expect(syncActivity).toContain("globalThis.setInterval");
-    expect(syncActivity).toContain("this.isConnected");
-    expect(syncActivity).toContain("this.requestUpdate();");
-    expect(clearActivity).toContain("globalThis.clearInterval");
-    expect(disconnected).toContain("this.#clearActivityRefresh();");
+  it("delegates elapsed activity updates to an isolated component", () => {
+    expect(source).toContain('import "./agent-activity.js";');
+    expect(source).not.toContain("#activityRefreshTimer");
+    expect(source).toContain("nowMs: Date.now()");
+    expect(source).toContain("this.#renderActivityRow(item.presentation, liveActivityInput)");
+    expect(agentActivitySource).toContain("globalThis.setInterval");
+    expect(agentActivitySource).toContain("() => this.requestUpdate()");
+    expect(agentActivitySource).toContain("override disconnectedCallback(): void");
+    expect(agentActivitySource).toContain("this.#stopClock();");
   });
 
   it("keeps timer-only activity text outside polite announcements", () => {
-    const activityRow = section(
-      "#renderActivityRow(activity: AgentActivityPresentation)",
-      "\n  #renderTransientActivityNode(",
-    );
-    const transientActivity = section(
-      "#renderTransientActivityNode(activity: AgentActivityPresentation)",
-      "\n  #renderCompactionMarker(",
-    );
-    for (const renderer of [activityRow, transientActivity]) {
-      expect(renderer).toContain("activity.announcementLabel");
-      expect(renderer).toContain('class="visually-hidden"');
-      expect(renderer).toContain('role="status"');
-      expect(renderer).toContain('aria-live="polite"');
-      expect(renderer).toContain('aria-atomic="true"');
-      expect(renderer).toContain('aria-hidden="true"');
-    }
+    expect(source.match(/<trouve-agent-activity/gu)).toHaveLength(2);
+    expect(source.match(/\.presentation=\$\{activity\}/gu)).toHaveLength(2);
+    expect(source.match(/\.input=\$\{activityInput\}/gu)).toHaveLength(2);
+    expect(agentActivitySource).toContain("activity.announcementLabel");
+    expect(agentActivitySource).toContain('class="visually-hidden"');
+    expect(agentActivitySource).toContain('role="status"');
+    expect(agentActivitySource).toContain('aria-live="polite"');
+    expect(agentActivitySource).toContain('aria-atomic="true"');
+    expect(agentActivitySource).toContain('aria-hidden="true"');
   });
 });

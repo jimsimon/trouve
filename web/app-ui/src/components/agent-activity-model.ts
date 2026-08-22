@@ -111,6 +111,13 @@ export const runningAgentActivity = (
     start = index + 1;
     break;
   }
+  if (turn === undefined) {
+    for (const metadata of [input.turnModels, input.turnStartedAt]) {
+      for (const candidate of metadata.keys()) {
+        if (turn === undefined || candidate > turn) turn = candidate;
+      }
+    }
+  }
   const current = input.items.slice(start);
   const model = runningModelName(input.turnModels, turn);
 
