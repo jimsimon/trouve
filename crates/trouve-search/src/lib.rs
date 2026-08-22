@@ -75,6 +75,14 @@ fn drain_memory_trim_requests(state: &std::sync::atomic::AtomicU8, mut trim: imp
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
+fn release_memory_trim_worker_claim(state: &std::sync::atomic::AtomicU8) {
+    use std::sync::atomic::Ordering;
+
+    // Leave TRIM_DIRTY set so a later scheduling request retries the worker.
+    state.fetch_and(!TRIM_RUNNING, Ordering::Release);
+}
+
 /// Schedule allocator-page release without adding its potentially expensive
 /// glibc arena scan to a foreground search request. Concurrent requests
 /// coalesce behind one process-wide trim worker.
@@ -103,14 +111,16 @@ pub fn release_unused_memory_in_background() {
             .name("trouve-memory-trim".into())
             .spawn(|| drain_memory_trim_requests(&TRIM_STATE, release_unused_memory));
         if spawned.is_err() {
-            drain_memory_trim_requests(&TRIM_STATE, release_unused_memory);
+            release_memory_trim_worker_claim(&TRIM_STATE);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TRIM_DIRTY, TRIM_RUNNING, drain_memory_trim_requests};
+    use super::{
+        TRIM_DIRTY, TRIM_RUNNING, drain_memory_trim_requests, release_memory_trim_worker_claim,
+    };
     use std::sync::atomic::{AtomicU8, Ordering};
 
     #[test]
@@ -127,5 +137,14 @@ mod tests {
 
         assert_eq!(trims, 2);
         assert_eq!(state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failed_worker_spawn_preserves_trim_for_an_async_retry() {
+        let state = AtomicU8::new(TRIM_RUNNING | TRIM_DIRTY);
+
+        release_memory_trim_worker_claim(&state);
+
+        assert_eq!(state.load(Ordering::Acquire), TRIM_DIRTY);
     }
 }
