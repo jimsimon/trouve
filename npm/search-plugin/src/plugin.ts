@@ -222,6 +222,14 @@ const MAX_SNIPPET_LINES = tool.schema
       "more, up to the full chunk.",
   )
 
+const CONTENT = tool.schema
+  .enum(["code", "docs", "config", "all"])
+  .optional()
+  .describe(
+    "What to search: code, docs (documentation and prose), config (YAML/TOML/etc.), or all. " +
+      "Omit to use the plugin-configured content.",
+  )
+
 /** Minimum interval between background index warms. */
 const WARM_INTERVAL_MS = 60_000
 
@@ -300,6 +308,7 @@ export const TrouvePlugin: Plugin = async (input, options) => {
           repo: REPO,
           top_k: TOP_K,
           max_snippet_lines: MAX_SNIPPET_LINES,
+          content: CONTENT,
         },
         async execute(args, context) {
           try {
@@ -308,6 +317,7 @@ export const TrouvePlugin: Plugin = async (input, options) => {
               repo: args.repo ?? context.worktree,
               top_k: args.top_k ?? 5,
               max_snippet_lines: args.max_snippet_lines ?? 10,
+              content: args.content,
             })
           } catch (error) {
             return errorText(error)
@@ -327,6 +337,7 @@ export const TrouvePlugin: Plugin = async (input, options) => {
           repo: REPO,
           top_k: TOP_K,
           max_snippet_lines: MAX_SNIPPET_LINES,
+          content: CONTENT,
         },
         async execute(args, context) {
           try {
@@ -336,6 +347,7 @@ export const TrouvePlugin: Plugin = async (input, options) => {
               repo: args.repo ?? context.worktree,
               top_k: args.top_k ?? 5,
               max_snippet_lines: args.max_snippet_lines ?? 10,
+              content: args.content,
             })
           } catch (error) {
             return errorText(error)

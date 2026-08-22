@@ -27,6 +27,11 @@ Options:
 { "plugin": [["@trouve-ai/search-plugin", { "content": "all", "warm": true }]] }
 ```
 
+The configured `content` value is the default for indexing and background
+warming. Both native tools also accept `content: "code" | "docs" |
+"config" | "all"` per call; each project/content combination is cached
+separately.
+
 ## Claude Code
 
 ```text
