@@ -9312,95 +9312,110 @@ fn redact_public_secrets(text: &str) -> String {
         Value { authorization: bool },
     }
 
-    enum SecretLabel {
-        Bare {
-            authorization: bool,
-        },
-        Separated {
-            authorization: bool,
-            value_start: usize,
-            value_end: usize,
-        },
+    const SECRET_LABELS: &[(&str, bool)] = &[
+        ("authorization", true),
+        ("password", false),
+        ("api_key", false),
+        ("apikey", false),
+        ("secret", false),
+        ("token", false),
+    ];
+
+    #[derive(Clone, Copy)]
+    struct SecretFragment {
+        authorization: bool,
+        label_start: usize,
+        value_start: usize,
+        value_end: usize,
     }
 
     fn wrapper(character: char) -> bool {
         !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.' | ':' | '=')
     }
 
-    fn secret_label(token: &str) -> Option<SecretLabel> {
+    fn bare_secret_label(token: &str) -> Option<bool> {
         let trimmed_start = token.trim_start_matches(wrapper);
         let core = trimmed_start.trim_end_matches(wrapper);
         let lower = core.to_ascii_lowercase();
-        let token_lower = token.to_ascii_lowercase();
-        let mut first_separated = None;
-        for (label, authorization) in [
-            ("authorization", true),
-            ("password", false),
-            ("api_key", false),
-            ("apikey", false),
-            ("secret", false),
-            ("token", false),
-        ] {
-            if lower == label {
-                return Some(SecretLabel::Bare { authorization });
+        SECRET_LABELS
+            .iter()
+            .find_map(|(label, authorization)| (lower == *label).then_some(*authorization))
+    }
+
+    fn secret_fragments(token: &str) -> Vec<SecretFragment> {
+        let lower = token.to_ascii_lowercase();
+        let mut fragments = Vec::new();
+        let mut index = 0;
+        let mut url_query = token.starts_with('&');
+        while index < token.len() {
+            let character = token[index..]
+                .chars()
+                .next()
+                .expect("token index remains in bounds");
+            if character == '?' {
+                url_query = true;
+                index += character.len_utf8();
+                continue;
+            }
+            if character == '#' {
+                url_query = false;
+                index += character.len_utf8();
+                continue;
             }
 
-            let mut search_start = 0;
-            while let Some(relative) = token_lower[search_start..].find(label) {
-                let label_start = search_start + relative;
-                let label_end = label_start + label.len();
-                let valid_boundary = label_start == 0
-                    || token[..label_start]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|character| {
-                            !character.is_ascii_alphanumeric() && character != '_'
-                        });
-                let separator = token_lower.as_bytes().get(label_end).copied();
-                if valid_boundary && matches!(separator, Some(b':' | b'=')) {
-                    let mut value_start = label_end + 1;
-                    let value_quote = token[value_start..]
-                        .chars()
-                        .next()
-                        .filter(|character| matches!(character, '\'' | '"'));
-                    if let Some(quote) = value_quote {
-                        value_start += quote.len_utf8();
-                    }
-                    let quote = value_quote.or_else(|| {
-                        token[..label_start]
-                            .chars()
-                            .next_back()
-                            .filter(|character| matches!(character, '\'' | '"'))
-                    });
-                    let url_query = quote.is_none()
-                        && (token[..label_start].contains("://")
-                            || token[..label_start].contains('?')
-                            || token[..label_start].starts_with('&'));
-                    let value_end = token[value_start..]
-                        .char_indices()
-                        .find_map(|(offset, character)| {
-                            let closes_quote = quote == Some(character);
-                            let ends_fragment = url_query && matches!(character, '&' | '#');
-                            (closes_quote || ends_fragment).then_some(value_start + offset)
-                        })
-                        .unwrap_or(token.len());
-                    let candidate = SecretLabel::Separated {
-                        authorization,
-                        value_start,
-                        value_end,
-                    };
-                    if first_separated
-                        .as_ref()
-                        .is_none_or(|(first_start, _)| label_start < *first_start)
-                    {
-                        first_separated = Some((label_start, candidate));
-                    }
-                    break;
-                }
-                search_start = label_start + 1;
+            let valid_boundary = index == 0
+                || token[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|previous| !previous.is_ascii_alphanumeric() && previous != '_');
+            let matched = valid_boundary.then(|| {
+                SECRET_LABELS.iter().find_map(|(label, authorization)| {
+                    let label_end = index + label.len();
+                    lower[index..]
+                        .starts_with(label)
+                        .then(|| lower.as_bytes().get(label_end).copied())
+                        .flatten()
+                        .filter(|separator| matches!(separator, b':' | b'='))
+                        .map(|_| (*label, *authorization, label_end))
+                })
+            });
+            let Some((_, authorization, label_end)) = matched.flatten() else {
+                index += character.len_utf8();
+                continue;
+            };
+
+            let mut value_start = label_end + 1;
+            let value_quote = token[value_start..]
+                .chars()
+                .next()
+                .filter(|candidate| matches!(candidate, '\'' | '"'));
+            if let Some(quote) = value_quote {
+                value_start += quote.len_utf8();
             }
+            let quote = value_quote.or_else(|| {
+                token[..index]
+                    .chars()
+                    .next_back()
+                    .filter(|candidate| matches!(candidate, '\'' | '"'))
+            });
+            let value_end = token[value_start..]
+                .char_indices()
+                .find_map(|(offset, candidate)| {
+                    let closes_quote = quote == Some(candidate);
+                    let ends_query_value =
+                        quote.is_none() && url_query && matches!(candidate, '&' | '#');
+                    (closes_quote || ends_query_value).then_some(value_start + offset)
+                })
+                .unwrap_or(token.len());
+            fragments.push(SecretFragment {
+                authorization,
+                label_start: index,
+                value_start,
+                value_end,
+            });
+            index = value_end.max(index + character.len_utf8());
         }
-        first_separated.map(|(_, label)| label)
+        fragments
     }
 
     fn separator(token: &str) -> bool {
@@ -9440,45 +9455,46 @@ fn redact_public_secrets(text: &str) -> String {
             return;
         }
 
-        match secret_label(token) {
-            Some(SecretLabel::Bare { authorization }) => {
-                output.push_str(token);
-                *pending = PendingSecret::Separator { authorization };
-            }
-            Some(SecretLabel::Separated {
-                authorization,
-                value_start,
-                value_end,
-            }) => {
-                let value = &token[value_start..value_end];
-                if value.is_empty() {
-                    output.push_str(&token[..value_end]);
-                    *pending = if value_end == token.len() {
-                        PendingSecret::Value { authorization }
-                    } else {
-                        PendingSecret::None
-                    };
-                } else if authorization && authorization_scheme(value) {
-                    output.push_str(&token[..value_end]);
-                    *pending = if value_end == token.len() {
-                        PendingSecret::Value {
-                            authorization: false,
-                        }
-                    } else {
-                        PendingSecret::None
-                    };
-                } else {
-                    output.push_str(&token[..value_start]);
-                    output.push_str("[REDACTED]");
-                    *pending = PendingSecret::None;
-                }
-                if value_end < token.len() {
-                    push_token(output, &token[value_end..], pending);
-                }
-            }
-            None if public_secret_like_token(token) => output.push_str("[REDACTED]"),
-            None => output.push_str(token),
+        if let Some(authorization) = bare_secret_label(token) {
+            output.push_str(token);
+            *pending = PendingSecret::Separator { authorization };
+            return;
         }
+
+        let fragments = secret_fragments(token);
+        if fragments.is_empty() {
+            if public_secret_like_token(token) {
+                output.push_str("[REDACTED]");
+            } else {
+                output.push_str(token);
+            }
+            return;
+        }
+
+        let mut cursor = 0;
+        for fragment in fragments {
+            debug_assert!(fragment.label_start >= cursor);
+            output.push_str(&token[cursor..fragment.value_start]);
+            let value = &token[fragment.value_start..fragment.value_end];
+            if value.is_empty() {
+                if fragment.value_end == token.len() {
+                    *pending = PendingSecret::Value {
+                        authorization: fragment.authorization,
+                    };
+                }
+            } else if fragment.authorization && authorization_scheme(value) {
+                output.push_str(value);
+                if fragment.value_end == token.len() {
+                    *pending = PendingSecret::Value {
+                        authorization: false,
+                    };
+                }
+            } else {
+                output.push_str("[REDACTED]");
+            }
+            cursor = fragment.value_end;
+        }
+        output.push_str(&token[cursor..]);
     }
 
     let mut output = String::with_capacity(text.len());
@@ -20345,6 +20361,19 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret));
         }
+    }
+
+    #[test]
+    fn public_secret_redaction_scans_many_query_fragments_iteratively() {
+        let count = 4_096;
+        let query = (0..count)
+            .map(|index| format!("token=value-{index}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let rendered = redact_public_secrets(&format!("https://host.test/path?{query}"));
+
+        assert_eq!(rendered.matches("[REDACTED]").count(), count);
+        assert!(!rendered.contains("value-"));
     }
 
     #[test]
