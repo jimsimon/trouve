@@ -438,15 +438,17 @@ const normalizedNumberToken = (raw: string): string => {
   }`;
 };
 
-export const modelOptionTextValueIsValid = (
+export const modelOptionTextValue = (
   control: TextModelOptionControl,
   raw: string,
-): boolean => {
-  if (raw === "" || control.scalarType === "string") return true;
+): ModelOptionValue | undefined | null => {
+  if (control.scalarType === "string") return raw;
+  if (raw === "") return undefined;
   const value = Number(raw);
-  // String(value) is the finite numeric token JSON.stringify sends on the wire.
-  return normalizedNumberToken(raw) === normalizedNumberToken(String(value))
-    && modelOptionValueIsValid(control, value);
+  return normalizedNumberToken(raw) === normalizedNumberToken(JSON.stringify(value)!)
+      && modelOptionValueIsValid(control, value)
+    ? value
+    : null;
 };
 
 /** Keep only values represented by the selected model's supported scalar

@@ -6,7 +6,7 @@ import {
   modelOptionControls,
   modelOptionLabel,
   modelSelectorLabel,
-  modelOptionTextValueIsValid,
+  modelOptionTextValue,
   sanitizeModelOptions,
 } from "./model-option-controls.js";
 
@@ -259,13 +259,13 @@ describe("model option controls", () => {
       "1e20",
       "0.10000000000000000",
       "5e-324",
-    ]) expect(modelOptionTextValueIsValid(control, raw)).toBe(true);
+    ]) expect(modelOptionTextValue(control, raw)).not.toBeNull();
     for (const raw of [
       "0.1234567890123456789",
       "9007199254740993",
       "1e-324",
       "3e-324",
-    ]) expect(modelOptionTextValueIsValid(control, raw)).toBe(false);
+    ]) expect(modelOptionTextValue(control, raw)).toBeNull();
   });
 
   it("applies and removes overrides without retaining a duplicate legacy key", () => {
