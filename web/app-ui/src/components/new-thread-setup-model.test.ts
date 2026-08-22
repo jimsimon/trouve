@@ -225,6 +225,34 @@ describe("new thread setup model", () => {
     });
   });
 
+  it("clears options when a selected model disappears during reconciliation", () => {
+    const staleCatalog: NewThreadSetupCatalog = {
+      modes: [mode("code")],
+      models: [
+        model("provider/retired", "effort", ["low", "high"], "low"),
+        model("provider/replacement", "effort", ["low", "high"], "low"),
+      ],
+      providers: { ...providers, default_model: "provider/retired" },
+    };
+    const refreshedCatalog: NewThreadSetupCatalog = {
+      ...staleCatalog,
+      models: [model("provider/replacement", "effort", ["low", "high"], "low")],
+      providers: { ...providers, default_model: "provider/replacement" },
+    };
+    const draft = {
+      ...createInitialNewThreadDraft(staleCatalog),
+      modelOptions: { effort: "high" },
+    };
+
+    expect(reconcileNewThreadDraft(draft, refreshedCatalog, {
+      ...createNewThreadSetupEdits(),
+      model: true,
+    })).toMatchObject({
+      modelId: "provider/replacement",
+      modelOptions: {},
+    });
+  });
+
   it("restores refreshed inheritance after an untouched catalog retry", () => {
     const staleCatalog: NewThreadSetupCatalog = {
       ...catalog,
