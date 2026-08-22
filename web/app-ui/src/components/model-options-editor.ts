@@ -1,4 +1,5 @@
 import { css, html, LitElement, nothing } from "lit";
+import { live } from "lit/directives/live.js";
 
 import {
   type ModelOptionChangeDetail,
@@ -157,7 +158,7 @@ export class TrouveModelOptionsEditor extends LitElement {
                 if (choice !== undefined) this.#emit(control.key, choice.value);
               }}
             >
-              <option value="" data-model-default="true" .selected=${!overridden}>
+              <option value="" data-model-default="true" .selected=${live(!overridden)}>
                 Model default${control.selectedIndex < 0
                   ? ""
                   : ` · ${control.choices[control.selectedIndex]?.label ?? ""}`}
@@ -166,7 +167,7 @@ export class TrouveModelOptionsEditor extends LitElement {
                 html`<option
                   value=${String(choice.value)}
                   data-choice-index=${String(index)}
-                  .selected=${overridden && index === control.selectedIndex}
+                  .selected=${live(overridden && index === control.selectedIndex)}
                 >${choice.label}</option>`
               )}
             </select>
@@ -196,11 +197,11 @@ export class TrouveModelOptionsEditor extends LitElement {
                 );
               }}
             >
-              <option value="" data-model-default="true" .selected=${!overridden}>
+              <option value="" data-model-default="true" .selected=${live(!overridden)}>
                 Model default · ${control.selected ? "On" : "Off"}
               </option>
-              <option value="true" .selected=${overridden && control.selected}>On</option>
-              <option value="false" .selected=${overridden && !control.selected}>Off</option>
+              <option value="true" .selected=${live(overridden && control.selected)}>On</option>
+              <option value="false" .selected=${live(overridden && !control.selected)}>Off</option>
             </select>
             ${control.description === ""
               ? nothing

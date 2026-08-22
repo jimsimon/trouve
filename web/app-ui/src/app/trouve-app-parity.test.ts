@@ -61,17 +61,18 @@ describe("root shell parity wiring", () => {
   });
 
   it("keeps async new-session defaults synchronized with native select options", () => {
-    expect(source).toContain(".selected=${mode.id === this.#newSessionModeId}");
+    expect(source).toContain('import { live } from "lit/directives/live.js"');
+    expect(source).toContain(".selected=${live(mode.id === this.#newSessionModeId)}");
     expect(source).toContain("const newSessionModelOptions = modelOptionControls(");
     expect(source).toContain(".controls=${newSessionModelOptions}");
     expect(source).toContain(
-      '.selected=${this.#newSessionPermissionMode === "ask"}',
+      '.selected=${live(this.#newSessionPermissionMode === "ask")}',
     );
     expect(source).toContain(
-      '.selected=${this.#newSessionPermissionMode === "allow_list"}',
+      '.selected=${live(this.#newSessionPermissionMode === "allow_list")}',
     );
     expect(source).toContain(
-      '.selected=${this.#newSessionPermissionMode === "yolo"}',
+      '.selected=${live(this.#newSessionPermissionMode === "yolo")}',
     );
     expect(source).toContain("this.#modelCatalog.staticModels()");
     expect(source).toContain("readSignal(this.#modelCatalog.staticCurrent)");

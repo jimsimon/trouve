@@ -1,5 +1,6 @@
 import { ContextProvider } from "@lit/context";
 import { html, LitElement, nothing } from "lit";
+import { live } from "lit/directives/live.js";
 import { repeat } from "lit/directives/repeat.js";
 
 import {
@@ -3287,7 +3288,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     : this.#newSessionModes.map(
                         (mode) => html`<option
                           value=${mode.id}
-                          .selected=${mode.id === this.#newSessionModeId}
+                          .selected=${live(mode.id === this.#newSessionModeId)}
                         >${mode.display_name}</option>`,
                       )}
                 </select>
@@ -3369,9 +3370,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     this.requestUpdate();
                   }}
                 >
-                  <option value="ask" .selected=${this.#newSessionPermissionMode === "ask"}>Ask</option>
-                  <option value="allow_list" .selected=${this.#newSessionPermissionMode === "allow_list"}>Allow list</option>
-                  <option value="yolo" .selected=${this.#newSessionPermissionMode === "yolo"}>Yolo</option>
+                  <option value="ask" .selected=${live(this.#newSessionPermissionMode === "ask")}>Ask</option>
+                  <option value="allow_list" .selected=${live(this.#newSessionPermissionMode === "allow_list")}>Allow list</option>
+                  <option value="yolo" .selected=${live(this.#newSessionPermissionMode === "yolo")}>Yolo</option>
                 </select>
               </label>
               ${newSessionModelOptions.length === 0
