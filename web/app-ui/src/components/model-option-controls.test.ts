@@ -235,6 +235,13 @@ describe("model option controls", () => {
     expect(sanitizeModelOptions(model({
       large_number: { type: "number" },
     }), { large_number: 1e20 })).toEqual({ large_number: 1e20 });
+    expect(modelOptionControls(model({
+      explicit_number: { type: "number" },
+      default_number: { type: "number", default: 1e20 },
+    }), { explicit_number: 1e20 })).toMatchObject([
+      { key: "explicit_number", overridden: true, text: "100000000000000000000" },
+      { key: "default_number", overridden: false, text: "100000000000000000000" },
+    ]);
   });
 
   it("applies and removes overrides without retaining a duplicate legacy key", () => {

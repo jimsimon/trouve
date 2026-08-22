@@ -216,8 +216,9 @@ const choiceValues = (
     : undefined;
 };
 
-const optionText = (value: unknown): string =>
-  typeof value === "string" ? value : scalar(value) ? String(value) : "";
+const optionText = (value: unknown, type?: ModelOptionScalarType): string =>
+  type === "number" && Number.isFinite(value as number)
+    || scalar(value) ? String(value) : "";
 
 const optionHint = (property: Readonly<Record<string, unknown>>): string => {
   const examples = property["examples"];
@@ -395,7 +396,7 @@ export const modelOptionControls = (
       description,
       overridden: explicitValue !== undefined,
       scalarType: type,
-      text: optionText(value),
+      text: optionText(value, type),
       hint: optionHint(property),
       ...(minimum === undefined ? {} : { minimum }),
       ...(maximum === undefined ? {} : { maximum }),

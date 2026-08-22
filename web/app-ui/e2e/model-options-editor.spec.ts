@@ -98,6 +98,14 @@ test("model-option choices preserve selected state and scalar value types", asyn
     editor.addEventListener("trouve-model-option-changed", (event) => {
       const detail = (event as CustomEvent<{ key: string; value: unknown }>).detail;
       changes.push(detail);
+      if (detail.key === "temperature" && detail.value === 1e20) {
+        editor.controls = editor.controls.map((control) => {
+          const option = control as Record<string, unknown>;
+          return option["key"] === detail.key
+            ? { ...option, text: String(detail.value) }
+            : control;
+        });
+      }
       if (detail.key === "instructions" && detail.value === undefined) {
         editor.controls = editor.controls.map((control) => {
           const option = control as Record<string, unknown>;
@@ -136,6 +144,7 @@ test("model-option choices preserve selected state and scalar value types", asyn
       .modelOptionChanges as { value: unknown }[];
     return changes.map(({ value }) => Object.is(value, -0) ? "-0" : value);
   })).toEqual([1, 1_000, "-0", 1e20]);
+  await expect(temperature).toHaveValue("100000000000000000000");
   await page.evaluate(() => {
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges?.splice(0);
   });
