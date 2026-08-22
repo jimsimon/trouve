@@ -75,40 +75,79 @@ fn drain_memory_trim_requests(state: &std::sync::atomic::AtomicU8, mut trim: imp
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
+fn schedule_memory_trim(
+    state: &'static std::sync::atomic::AtomicU8,
+    pool: Option<&rayon::ThreadPool>,
+    trim: fn(),
+) {
+    use std::sync::atomic::Ordering;
+
+    let Some(pool) = pool else {
+        return;
+    };
+    let mut current = state.fetch_or(TRIM_DIRTY, Ordering::AcqRel) | TRIM_DIRTY;
+    loop {
+        if current & TRIM_RUNNING != 0 {
+            return;
+        }
+        match state.compare_exchange(
+            current,
+            current | TRIM_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+    pool.spawn(move || drain_memory_trim_requests(state, trim));
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn memory_trim_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::{Mutex, OnceLock};
+
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    static INITIALIZING: Mutex<()> = Mutex::new(());
+    if let Some(pool) = POOL.get() {
+        return Some(pool);
+    }
+
+    let _initializing = INITIALIZING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(pool) = POOL.get() {
+        return Some(pool);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .thread_name(|_| "trouve-memory-trim".into())
+        .build()
+        .ok()?;
+    let _ = POOL.set(pool);
+    POOL.get()
+}
+
 /// Schedule allocator-page release without adding its potentially expensive
 /// glibc arena scan to a foreground search request. Concurrent requests
 /// coalesce behind one process-wide trim worker.
 pub fn release_unused_memory_in_background() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::atomic::AtomicU8;
 
         static TRIM_STATE: AtomicU8 = AtomicU8::new(0);
-        let mut current = TRIM_STATE.fetch_or(TRIM_DIRTY, Ordering::AcqRel) | TRIM_DIRTY;
-        loop {
-            if current & TRIM_RUNNING != 0 {
-                return;
-            }
-            match TRIM_STATE.compare_exchange(
-                current,
-                current | TRIM_RUNNING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-        // Index construction already uses Rayon's persistent worker pool.
-        // Queue trimming there so scheduling cannot fall back to a synchronous
-        // allocator scan when a per-request OS thread cannot be created.
-        rayon::spawn(|| drain_memory_trim_requests(&TRIM_STATE, release_unused_memory));
+        // Initialize the fallible executor before claiming pending work. A
+        // resource-constrained caller can then return without panicking or
+        // leaving a permanently running scheduler state; later calls retry.
+        schedule_memory_trim(&TRIM_STATE, memory_trim_pool(), release_unused_memory);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TRIM_DIRTY, TRIM_RUNNING, drain_memory_trim_requests};
+    use super::{TRIM_DIRTY, TRIM_RUNNING, drain_memory_trim_requests, schedule_memory_trim};
     use std::sync::atomic::{AtomicU8, Ordering};
 
     #[test]
@@ -125,5 +164,15 @@ mod tests {
 
         assert_eq!(trims, 2);
         assert_eq!(state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn unavailable_trim_executor_does_not_claim_or_run_work() {
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        STATE.store(0, Ordering::Release);
+
+        schedule_memory_trim(&STATE, None, || panic!("trim ran without an executor"));
+
+        assert_eq!(STATE.load(Ordering::Acquire), 0);
     }
 }
