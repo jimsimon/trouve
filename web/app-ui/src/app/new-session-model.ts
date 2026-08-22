@@ -523,7 +523,7 @@ export const applyNewSessionModelOptionChange = (input: {
   readonly modelOptions: Readonly<Record<string, unknown>>;
   readonly thinking: string;
   readonly inheritedThinking: string | undefined;
-  readonly hasOverrides: boolean;
+  readonly thinkingEdit: boolean;
 } => {
   const modelOptions = changeModelOption(input.modelOptions, input.change);
   const thinkingChange = isThinkingModelOption(input.change.key);
@@ -540,7 +540,7 @@ export const applyNewSessionModelOptionChange = (input: {
       : resetThinking
         ? input.defaults.inheritedThinking
         : undefined,
-    hasOverrides: Object.keys(modelOptions).length > 0,
+    thinkingEdit: Object.keys(modelOptions).some(isThinkingModelOption),
   };
 };
 

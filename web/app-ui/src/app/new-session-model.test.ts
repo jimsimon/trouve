@@ -885,7 +885,7 @@ describe("new session model", () => {
       modelOptions: {},
       thinking: "high",
       inheritedThinking: "high",
-      hasOverrides: false,
+      thinkingEdit: false,
     });
 
     const modelInfo = model({
@@ -902,6 +902,54 @@ describe("new session model", () => {
       modelOptions: reset.modelOptions,
       modelInfo,
     })).toEqual({ session_id: "session-1" });
+  });
+
+  it("keeps unrelated model options without pinning reset thinking across refreshes", () => {
+    const reset = applyNewSessionModelOptionChange({
+      modelOptions: { effort: "low", temperature: 0.7 },
+      thinking: "low",
+      inheritedThinking: undefined,
+      change: { key: "effort", value: undefined },
+      defaults: { thinking: "high", inheritedThinking: "high" },
+    });
+    expect(reset).toEqual({
+      modelOptions: { temperature: 0.7 },
+      thinking: "high",
+      inheritedThinking: "high",
+      thinkingEdit: false,
+    });
+
+    const modelInfo = model({
+      properties: {
+        effort: { type: "string", enum: ["low", "high"], default: "low" },
+        temperature: { type: "number", minimum: 0, maximum: 1 },
+      },
+    });
+    const refreshed = reconcileNewThreadDefaults(
+      {
+        modeId: "code",
+        modelId: modelInfo.id,
+        thinking: reset.thinking,
+        permissionMode: "ask",
+      },
+      [{ ...mode(modelInfo.id), default_thinking_level: "low" }],
+      [modelInfo],
+      providers(modelInfo.id),
+      { ...createNewThreadOptionEdits(), thinking: reset.thinkingEdit },
+    );
+    expect(refreshed).toMatchObject({ thinking: "low", inheritedThinking: "low" });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      thinking: refreshed.thinking,
+      ...(refreshed.inheritedThinking === undefined
+        ? {}
+        : { inheritedThinking: refreshed.inheritedThinking }),
+      modelOptions: reset.modelOptions,
+      modelInfo,
+    })).toEqual({
+      session_id: "session-1",
+      model_options: { temperature: 0.7 },
+    });
   });
 
   it("omits empty fields and unadvertised thinking values", () => {

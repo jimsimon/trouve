@@ -9,6 +9,19 @@ use utoipa::ToSchema;
 
 use crate::{CallId, CheckpointId, SessionId, ThreadId, WorkspaceId};
 
+fn deserialize_optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Number>::deserialize(deserializer)?
+        .map(|number| {
+            number.as_f64().ok_or_else(|| {
+                <D::Error as serde::de::Error>::custom("number is outside the finite f64 range")
+            })
+        })
+        .transpose()
+}
+
 /// Which stream an event belongs to. Cursors are monotonic per scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -181,7 +194,11 @@ pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_input_tokens: Option<u64>,
     /// Estimated cost in USD, when list pricing for the model is known.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_f64"
+    )]
     pub cost_usd: Option<f64>,
     /// The model's context window as reported live by the provider during
     /// the turn. Authoritative over any static catalog value.
@@ -804,6 +821,24 @@ mod tests {
                 supports_steering: false,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn usage_cost_roundtrips_through_internally_tagged_events() {
+        let event = Event::TurnUsageUpdated {
+            turn: 1,
+            usage: Usage {
+                cost_usd: Some(0.000_02),
+                ..Usage::default()
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Event::TurnUsageUpdated { usage, .. }
+                if usage.cost_usd == Some(0.000_02)
         ));
     }
 

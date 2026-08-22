@@ -3414,7 +3414,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       this.#newSessionInheritedThinking = updated.inheritedThinking;
                       this.#newSessionOptionEdits = {
                         ...this.#newSessionOptionEdits,
-                        thinking: updated.hasOverrides,
+                        thinking: updated.thinkingEdit,
                       };
                       this.requestUpdate();
                     }}
