@@ -2227,6 +2227,23 @@ mod tests {
         assert_eq!(missing_proof.status(), StatusCode::FORBIDDEN);
         assert!(opened.lock().unwrap().is_empty());
 
+        let wrong_size = app
+            .clone()
+            .oneshot(json_action_request(
+                OPEN_VIDEO_ATTACHMENT_PATH,
+                &bootstrap.csrf_token,
+                AttachmentPayload {
+                    name: "clip.mp4".into(),
+                    mime: "video/mp4".into(),
+                    data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+                    size_bytes: 4,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_size.status(), StatusCode::BAD_REQUEST);
+        assert!(opened.lock().unwrap().is_empty());
+
         let accepted = app
             .clone()
             .oneshot(

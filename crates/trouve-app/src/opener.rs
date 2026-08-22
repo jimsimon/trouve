@@ -29,13 +29,15 @@ pub fn open(path: impl AsRef<OsStr>) -> Result<(), String> {
 /// hand playback off promptly; the external player remains independent.
 pub async fn open_confirmed(path: impl AsRef<OsStr>) -> Result<(), String> {
     let path = path.as_ref().to_owned();
-    let mut worker = tokio::task::spawn_blocking(move || open_and_reap(&path));
-    match tokio::time::timeout(WORKER_TIMEOUT, &mut worker).await {
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    let mut worker = tokio::task::spawn_blocking(move || open_and_reap_until(&path, deadline));
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut worker).await {
         Ok(Ok(result)) => result.map_err(|error| error.to_string()),
         Ok(Err(error)) => Err(format!("system opener worker was interrupted: {error}")),
         Err(_) => {
-            // This cancels a queued blocking task. A task that has already
-            // started is independently bounded by `LAUNCHER_TIMEOUT` below.
+            // This cancels a queued blocking task. A task already inside the
+            // synchronous process-launch boundary observes the same absolute
+            // deadline as soon as that boundary returns and reaps any child.
             worker.abort();
             Err("system opener worker timed out".to_string())
         }
@@ -77,16 +79,31 @@ fn start_worker() -> Option<SyncSender<OsString>> {
 }
 
 fn open_and_reap(path: &OsStr) -> std::io::Result<()> {
+    open_and_reap_until(path, Instant::now() + LAUNCHER_TIMEOUT)
+}
+
+fn open_and_reap_until(path: &OsStr, deadline: Instant) -> std::io::Result<()> {
+    try_opener_candidates(open::commands(path), deadline, wait_for_launcher)
+}
+
+fn try_opener_candidates<I, F>(commands: I, deadline: Instant, mut wait: F) -> std::io::Result<()>
+where
+    I: IntoIterator<Item = std::process::Command>,
+    F: FnMut(&mut std::process::Command, Instant) -> std::io::Result<std::process::ExitStatus>,
+{
     let mut last_error = None;
-    for mut command in open::commands(path) {
+    for mut command in commands {
+        if Instant::now() >= deadline {
+            return Err(launcher_timeout_error());
+        }
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        match wait_for_launcher(&mut command, LAUNCHER_TIMEOUT) {
+        match wait(&mut command, deadline) {
             Ok(status) if status.success() => return Ok(()),
             Ok(status) => {
-                return Err(std::io::Error::other(format!(
+                last_error = Some(std::io::Error::other(format!(
                     "launcher {command:?} failed with {status:?}"
                 )));
             }
@@ -104,10 +121,9 @@ fn open_and_reap(path: &OsStr) -> std::io::Result<()> {
 
 fn wait_for_launcher(
     command: &mut std::process::Command,
-    timeout: Duration,
+    deadline: Instant,
 ) -> std::io::Result<std::process::ExitStatus> {
     let mut child = trouve_process::spawn(command)?;
-    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -121,11 +137,63 @@ fn wait_for_launcher(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "system launcher timed out",
-            ));
+            return Err(launcher_timeout_error());
         }
         std::thread::sleep(LAUNCHER_POLL_INTERVAL);
+    }
+}
+
+fn launcher_timeout_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "system launcher timed out")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
+
+    #[test]
+    fn opener_falls_back_after_a_nonzero_launcher_exit() {
+        let commands = [
+            std::process::Command::new("first"),
+            std::process::Command::new("second"),
+        ];
+        let mut attempts = 0;
+        let result =
+            try_opener_candidates(commands, Instant::now() + Duration::from_secs(1), |_, _| {
+                attempts += 1;
+                Ok(exit_status(if attempts == 1 { 1 } else { 0 }))
+            });
+
+        assert!(result.is_ok());
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn opener_stops_immediately_after_a_timeout() {
+        let commands = [
+            std::process::Command::new("first"),
+            std::process::Command::new("second"),
+        ];
+        let mut attempts = 0;
+        let result =
+            try_opener_candidates(commands, Instant::now() + Duration::from_secs(1), |_, _| {
+                attempts += 1;
+                Err(launcher_timeout_error())
+            });
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(attempts, 1);
     }
 }

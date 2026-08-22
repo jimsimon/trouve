@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  base64DecodedByteLength,
   isVideoMime,
   PendingAttachmentOperations,
   pendingAttachmentPreviewUrl,
@@ -13,6 +14,13 @@ const attachment = (mime: string, data = "iVBORw0KGgo="): PendingAttachment => (
 });
 
 describe("pending attachment previews", () => {
+  it("derives padded base64 sizes without decoding the payload", () => {
+    expect(base64DecodedByteLength("dmlkZW8=")).toBe(5);
+    expect(base64DecodedByteLength("YQ==")).toBe(1);
+    expect(base64DecodedByteLength("")).toBeUndefined();
+    expect(base64DecodedByteLength("YQ=")).toBeUndefined();
+  });
+
   it("coalesces duplicate attachment operations until the first settles", async () => {
     const operations = new PendingAttachmentOperations();
     let resolve!: () => void;

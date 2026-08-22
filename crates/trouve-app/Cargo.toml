@@ -29,6 +29,7 @@ web-preview = ["dep:tao", "dep:trouve-desktop-host", "dep:wry"]
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+fs4.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tempfile.workspace = true

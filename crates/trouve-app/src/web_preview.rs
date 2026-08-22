@@ -15,7 +15,7 @@ mod sleep;
 mod web_preview_support;
 
 use std::cell::RefCell;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::web_preview_support::WebPreviewHost;
+use fs4::fs_std::FileExt as _;
 use rfd::AsyncFileDialog;
 use sha2::{Digest as _, Sha256};
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -63,6 +64,10 @@ const MAX_CLIPBOARD_RGBA_BYTES: usize = 64 * 1024 * 1024;
 const CLOSE_CONFIRMATION_GRACE: Duration = Duration::from_secs(5);
 const MAX_VIDEO_PLAYBACK_CACHE_FILES: usize = 8;
 const MAX_VIDEO_PLAYBACK_CACHE_BYTES: usize = 4 * MAX_NATIVE_ATTACHMENT_BYTES;
+const VIDEO_PLAYBACK_DIRECTORY_PREFIX: &str = "trouve-video-";
+const VIDEO_PLAYBACK_OWNER_LOCK: &str = ".owner.lock";
+const MAX_STALE_VIDEO_DIRECTORIES_PER_STARTUP: usize = 64;
+const STALE_VIDEO_DIRECTORY_MIN_AGE: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
 struct VideoPlaybackCacheEntry {
@@ -88,6 +93,7 @@ struct VideoMaterializationError {
 
 #[derive(Debug)]
 struct VideoPlaybackCache {
+    _owner_lock: File,
     directory: tempfile::TempDir,
     entries: Vec<VideoPlaybackCacheEntry>,
     pending_cleanup: Vec<PathBuf>,
@@ -107,8 +113,29 @@ impl VideoPlaybackCache {
     /// Successful launches stay retained until the host exits so an external
     /// player can keep reading for as long as playback lasts.
     fn with_limits(max_files: usize, max_bytes: usize) -> std::io::Result<Self> {
+        Self::with_limits_in(&std::env::temp_dir(), max_files, max_bytes)
+    }
+
+    fn with_limits_in(
+        parent: &std::path::Path,
+        max_files: usize,
+        max_bytes: usize,
+    ) -> std::io::Result<Self> {
+        cleanup_stale_video_directories(parent)?;
+
+        let directory = tempfile::Builder::new()
+            .prefix(VIDEO_PLAYBACK_DIRECTORY_PREFIX)
+            .tempdir_in(parent)?;
+        let owner_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join(VIDEO_PLAYBACK_OWNER_LOCK))?;
+        owner_lock.lock_exclusive()?;
+
         Ok(Self {
-            directory: tempfile::Builder::new().prefix("trouve-video-").tempdir()?,
+            _owner_lock: owner_lock,
+            directory,
             entries: Vec::new(),
             pending_cleanup: Vec::new(),
             next_sequence: 0,
@@ -303,6 +330,57 @@ impl VideoPlaybackCache {
         }
         result
     }
+}
+
+fn cleanup_stale_video_directories(parent: &std::path::Path) -> std::io::Result<()> {
+    cleanup_stale_video_directories_with_age(parent, STALE_VIDEO_DIRECTORY_MIN_AGE)
+}
+
+fn cleanup_stale_video_directories_with_age(
+    parent: &std::path::Path,
+    minimum_age: Duration,
+) -> std::io::Result<()> {
+    let mut inspected = 0usize;
+    for entry in std::fs::read_dir(parent)? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .is_some_and(|name| name.starts_with(VIDEO_PLAYBACK_DIRECTORY_PREFIX))
+            || !entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+        {
+            continue;
+        }
+        if inspected >= MAX_STALE_VIDEO_DIRECTORIES_PER_STARTUP {
+            break;
+        }
+        inspected += 1;
+
+        let old_enough = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age >= minimum_age);
+        if !old_enough {
+            continue;
+        }
+
+        let Ok(owner_lock) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path().join(VIDEO_PLAYBACK_OWNER_LOCK))
+        else {
+            // Directories created by versions without ownership locks are
+            // ambiguous and must not be removed while that version may run.
+            continue;
+        };
+        if !owner_lock.try_lock_exclusive().unwrap_or(false) {
+            continue;
+        }
+        drop(owner_lock);
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+    Ok(())
 }
 
 struct VideoPlaybackLeaseGuard {
@@ -1115,6 +1193,40 @@ mod close_confirmation_tests {
         NativeAttachment::new(name, "video/mp4", bytes.to_vec()).unwrap()
     }
 
+    fn video_file_count(directory: &std::path::Path) -> usize {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != VIDEO_PLAYBACK_OWNER_LOCK)
+            .count()
+    }
+
+    #[test]
+    fn video_playback_startup_removes_stale_owned_directories_only() {
+        let parent = tempfile::tempdir().unwrap();
+        let active =
+            VideoPlaybackCache::with_limits_in(parent.path(), 2, MAX_NATIVE_ATTACHMENT_BYTES)
+                .unwrap();
+        let active_path = active.directory.path().to_owned();
+        let stale_path = parent.path().join("trouve-video-stale");
+        std::fs::create_dir(&stale_path).unwrap();
+        File::create(stale_path.join(VIDEO_PLAYBACK_OWNER_LOCK)).unwrap();
+        let legacy_path = parent.path().join("trouve-video-legacy");
+        std::fs::create_dir(&legacy_path).unwrap();
+
+        cleanup_stale_video_directories(parent.path()).unwrap();
+        assert!(stale_path.exists());
+        cleanup_stale_video_directories_with_age(parent.path(), Duration::ZERO).unwrap();
+        let replacement =
+            VideoPlaybackCache::with_limits_in(parent.path(), 2, MAX_NATIVE_ATTACHMENT_BYTES)
+                .unwrap();
+
+        assert!(active_path.exists());
+        assert!(!stale_path.exists());
+        assert!(legacy_path.exists());
+        assert_ne!(replacement.directory.path(), active_path);
+    }
+
     #[test]
     fn video_playback_cache_reuses_identical_attachments() {
         let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
@@ -1149,10 +1261,7 @@ mod close_confirmation_tests {
             Err(VideoAttachmentOpenError::Failed("no system player".into()))
         );
         assert!(cache.entries.is_empty());
-        assert_eq!(
-            std::fs::read_dir(cache.directory.path()).unwrap().count(),
-            0
-        );
+        assert_eq!(video_file_count(cache.directory.path()), 0);
     }
 
     #[test]
@@ -1184,10 +1293,7 @@ mod close_confirmation_tests {
                 VideoAttachmentOpenError::Failed("injected materialization failure".into())
             );
             assert_eq!(cache.pending_cleanup.len(), 1);
-            assert_eq!(
-                std::fs::read_dir(cache.directory.path()).unwrap().count(),
-                1
-            );
+            assert_eq!(video_file_count(cache.directory.path()), 1);
             assert_eq!(
                 cache
                     .prepare_with_storage(
@@ -1198,19 +1304,13 @@ mod close_confirmation_tests {
                     .unwrap_err(),
                 VideoAttachmentOpenError::Failed("temporary video cleanup is still pending".into(),)
             );
-            assert_eq!(
-                std::fs::read_dir(cache.directory.path()).unwrap().count(),
-                1
-            );
+            assert_eq!(video_file_count(cache.directory.path()), 1);
 
             let lease = cache.prepare(&attachment).unwrap();
             cache.complete(lease, Ok(())).unwrap();
             assert!(cache.pending_cleanup.is_empty());
             assert_eq!(cache.entries.len(), 1);
-            assert_eq!(
-                std::fs::read_dir(cache.directory.path()).unwrap().count(),
-                1
-            );
+            assert_eq!(video_file_count(cache.directory.path()), 1);
         }
     }
 
@@ -1253,12 +1353,7 @@ mod close_confirmation_tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            std::fs::read_dir(cache.lock().unwrap().directory.path())
-                .unwrap()
-                .count(),
-            0
-        );
+        assert_eq!(video_file_count(cache.lock().unwrap().directory.path()), 0);
 
         open_video_attachment_with(
             Arc::clone(&cache),
@@ -1313,10 +1408,7 @@ mod close_confirmation_tests {
                 .is_err()
         );
         assert_eq!(cache.entries.len(), 2);
-        assert_eq!(
-            std::fs::read_dir(cache.directory.path()).unwrap().count(),
-            2
-        );
+        assert_eq!(video_file_count(cache.directory.path()), 2);
     }
 
     #[test]

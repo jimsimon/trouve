@@ -52,6 +52,7 @@ import {
 import { queryBrowserSystemFontFamilies } from "../services/system-fonts.js";
 import {
   AttachmentEncodingError,
+  base64DecodedByteLength,
   encodeAttachment,
   isVideoMime,
   MAX_ATTACHMENT_BYTES,
@@ -185,6 +186,7 @@ import "../components/thread-screen.js";
 import "../components/model-picker.js";
 
 const SESSION_TITLE_TIMEOUT_MS = 48_000;
+const VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 const deployment =
   import.meta.env.MODE === "pwa"
@@ -2619,16 +2621,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const prefix = `data:${mime};base64,`;
     if (!detail.source.startsWith(prefix)) return undefined;
     const data = detail.source.slice(prefix.length);
-    try {
-      const size = globalThis.atob(data).length;
-      if (size < 1 || size > MAX_ATTACHMENT_BYTES) return undefined;
-      return {
-        upload: { name: detail.name, mime, data },
-        size,
-      };
-    } catch {
-      return undefined;
-    }
+    const size = base64DecodedByteLength(data);
+    if (size === undefined || size > MAX_ATTACHMENT_BYTES) return undefined;
+    return {
+      upload: { name: detail.name, mime, data },
+      size,
+    };
   }
 
   #protocolVideoUrl(source: string): URL | undefined {
@@ -2656,12 +2654,23 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (encoded !== undefined) return encoded;
     const url = this.#protocolVideoUrl(detail.source);
     if (url === undefined) throw new Error("invalid video attachment source");
-    const response = await globalThis.fetch(url, {
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-    if (!response.ok) throw new Error("video attachment download failed");
-    const blob = await response.blob();
+    const abort = new AbortController();
+    const timeout = globalThis.setTimeout(
+      () => abort.abort(),
+      VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS,
+    );
+    let blob: Blob;
+    try {
+      const response = await globalThis.fetch(url, {
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: abort.signal,
+      });
+      if (!response.ok) throw new Error("video attachment download failed");
+      blob = await response.blob();
+    } finally {
+      globalThis.clearTimeout(timeout);
+    }
     return encodeAttachment(
       new File([blob], detail.name, { type: detail.mime }),
       detail.name,

@@ -7302,6 +7302,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "dirs",
+ "fs4",
  "keepawake",
  "mime_guess",
  "notify-rust",

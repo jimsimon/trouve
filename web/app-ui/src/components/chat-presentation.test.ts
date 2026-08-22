@@ -98,7 +98,8 @@ describe("chat presentation", () => {
     expect(isImageAttachment({ mime: "IMAGE/PNG" })).toBe(true);
     expect(isImageAttachment({ mime: "application/pdf" })).toBe(false);
     expect(isVideoAttachment({ mime: "VIDEO/MP4" })).toBe(true);
-    expect(isVideoAttachment({ mime: "video/svg+xml" })).toBe(false);
+    expect(isVideoAttachment({ mime: "video/mpeg" })).toBe(false);
+    expect(isVideoAttachment({ mime: "application/pdf" })).toBe(false);
     expect(formatAttachmentBytes(900)).toBe("900 B");
     expect(formatAttachmentBytes(1_025)).toBe("2 KB");
     expect(formatAttachmentBytes(2 * 1_024 * 1_024)).toBe("2.0 MB");

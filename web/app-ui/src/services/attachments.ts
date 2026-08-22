@@ -27,7 +27,7 @@ export class PendingAttachmentOperations {
 
 const previewUrls = new WeakMap<PendingAttachment, string>();
 
-const PREVIEWABLE_VIDEO_MIMES = new Set([
+export const PREVIEWABLE_VIDEO_MIMES: ReadonlySet<string> = new Set([
   "video/mp4",
   "video/webm",
   "video/ogg",
@@ -38,6 +38,16 @@ const PREVIEWABLE_VIDEO_MIMES = new Set([
 
 export const isVideoMime = (mime: string): boolean =>
   PREVIEWABLE_VIDEO_MIMES.has(mime.toLowerCase());
+
+/** Return the decoded byte length of canonical padded base64 without
+ * allocating its binary representation. Alphabet validation remains with the
+ * consumer that performs the single required decode. */
+export const base64DecodedByteLength = (data: string): number | undefined => {
+  if (data.length === 0 || data.length % 4 !== 0) return undefined;
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  const size = (data.length / 4) * 3 - padding;
+  return size > 0 ? size : undefined;
+};
 
 /** A CSP-compatible local preview for media that has already been encoded for
  * upload. Files and malformed MIME types deliberately have no URL. */
