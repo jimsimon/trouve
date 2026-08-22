@@ -51,6 +51,36 @@ impl Engine {
             .cloned()
             .unwrap_or_else(personas::fallback_persona);
 
+        // Accept the turn durably before automatic route discovery or
+        // capacity acquisition. If either setup step fails, the dispatcher
+        // can now publish a visible TurnFailed for the accepted user message.
+        if !prompt_persisted.load(Ordering::Acquire) {
+            let shell_options = self.store.thread_model_options(&thread.id)?;
+            let thinking_level = resolved_thinking_level(&shell_options, None);
+            self.store
+                .append_events_async(
+                    scope.clone(),
+                    vec![
+                        Event::TurnStarted {
+                            turn,
+                            mode: thread.mode.clone(),
+                            model: thread.model.clone(),
+                            thinking_level,
+                            // A later failover may select an adapter without
+                            // steering, so advertise conservatively.
+                            supports_steering: false,
+                        },
+                        Event::UserMessage {
+                            turn,
+                            content: prompt.content.clone(),
+                            attachments: prompt.attachments.clone(),
+                        },
+                    ],
+                )
+                .await?;
+            prompt_persisted.store(true, Ordering::Release);
+        }
+
         let mut candidates = tokio::select! {
             biased;
             _ = cancel.cancelled() => bail!("turn cancelled"),
@@ -58,10 +88,12 @@ impl Engine {
                 candidates.map_err(|error| anyhow!(error.to_string()))?
             }
         };
+        anyhow::ensure!(!candidates.is_empty(), "model route disappeared");
+        let selection_info = model_info_for_routed_selection(routed_model_info(
+            thread.model.clone(),
+            candidates.clone(),
+        ));
         let total_candidates = candidates.len();
-        candidates.truncate(MAX_ROUTE_ATTEMPTS_PER_TURN);
-        let first_route = candidates.first().context("model route disappeared")?;
-        let capacity_model = format!("{}/{}", first_route.provider_id, first_route.provider_model);
         let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
         // Session lifecycle always precedes turn/provider capacity. Concrete
         // and automatic routes therefore share one lock order and cannot
@@ -73,10 +105,29 @@ impl Engine {
             guard = session_lifecycle.read() => guard,
         };
         let background = self.store.is_code_review_thread(&thread.id)?;
-        let first_route_capacity = self
-            .turn_scheduler
-            .acquire(&capacity_model, background, &cancel)
-            .await?;
+        let mut first_candidate = 0;
+        let first_route_capacity = loop {
+            let route = candidates.get(first_candidate).with_context(|| {
+                format!(
+                    "no provider is currently able to run {}; every eligible route is cooling down",
+                    thread.model
+                )
+            })?;
+            let capacity_model = format!("{}/{}", route.provider_id, route.provider_model);
+            if let Some(capacity) = self
+                .turn_scheduler
+                .acquire_routed(&capacity_model, background, &cancel)
+                .await?
+            {
+                break capacity;
+            }
+            first_candidate += 1;
+        };
+        if first_candidate > 0 {
+            candidates.drain(..first_candidate);
+        }
+        candidates.truncate(MAX_ROUTE_ATTEMPTS_PER_TURN);
+        let first_route = candidates.first().context("model route disappeared")?;
         let capacity_wait_ms = first_route_capacity.wait_ms;
         if background {
             self.store
@@ -100,35 +151,6 @@ impl Engine {
             .filter(|window| *window > 0)
             .min()
             .unwrap_or(first_route.info.context_window);
-        if !prompt_persisted.load(Ordering::Acquire) {
-            let mut shell_options = self.store.thread_model_options(&thread.id)?;
-            normalize_thinking_option(&mut shell_options, Some(&first_route.info));
-            let thinking_level = resolved_thinking_level(&shell_options, Some(&first_route.info));
-            // A later failover may select an adapter without steering. Until
-            // routed turns share the concrete steering queue, advertise the
-            // capability conservatively for the whole turn.
-            let supports_steering = false;
-            self.store
-                .append_events_async(
-                    scope.clone(),
-                    vec![
-                        Event::TurnStarted {
-                            turn,
-                            mode: thread.mode.clone(),
-                            model: thread.model.clone(),
-                            thinking_level,
-                            supports_steering,
-                        },
-                        Event::UserMessage {
-                            turn,
-                            content: prompt.content.clone(),
-                            attachments: prompt.attachments.clone(),
-                        },
-                    ],
-                )
-                .await?;
-            prompt_persisted.store(true, Ordering::Release);
-        }
         self.store.append_event(
             scope.clone(),
             Event::ModelRouteSelected {
@@ -235,7 +257,10 @@ impl Engine {
             self.config_dir.as_deref(),
             Path::new(&workspace.path),
         );
-        let stored_model_options = self.store.thread_model_options(&thread.id)?;
+        let stored_model_options = model_options_for_schema(
+            &self.store.thread_model_options(&thread.id)?,
+            &selection_info,
+        );
         let permission = backend_permission_policy(tools_enabled, mode.read_only);
         let github_repository = self.github_repository_for_session(&session).ok();
         let mut recorded_prs = if github_repository.is_some() {
@@ -245,19 +270,41 @@ impl Engine {
         };
         let mut accounting = TurnAccounting::default();
         let mut native_iterations_left = MAX_ITERATIONS;
-        let attempted_candidates = candidates.len();
         let mut route_capacity = Some(first_route_capacity);
+        let mut attempted_candidates = 0usize;
+        let mut failover_reason = None;
+        let mut last_failure = None::<(String, String, String)>;
 
         for (route_index, route) in candidates.iter().enumerate() {
             if route_index > 0 {
+                // Never reserve the next provider while the previous route's
+                // provider/global permits are still live (global limit 1 is a
+                // supported configuration).
+                drop(route_capacity.take());
                 let capacity_model = format!("{}/{}", route.provider_id, route.provider_model);
-                route_capacity = Some(
-                    self.turn_scheduler
-                        .acquire(&capacity_model, background, &cancel)
-                        .await?,
-                );
+                let Some(capacity) = self
+                    .turn_scheduler
+                    .acquire_routed(&capacity_model, background, &cancel)
+                    .await?
+                else {
+                    continue;
+                };
+                route_capacity = Some(capacity);
+                self.store.append_event(
+                    scope.clone(),
+                    Event::ModelRouteSelected {
+                        turn,
+                        model: thread.model.clone(),
+                        provider_id: route.provider_id.clone(),
+                        provider_model: route.provider_model.clone(),
+                        reason: failover_reason
+                            .unwrap_or(trouve_protocol::ModelRouteReason::RouteFailover),
+                    },
+                )?;
             }
             let retrying = route_index > 0;
+            attempted_candidates += 1;
+            let attempt_started_at = chrono::Utc::now().timestamp_micros();
             let result = match &route.executor {
                 ModelExecutor::Native(_) => {
                     self.run_native_route(
@@ -288,6 +335,7 @@ impl Engine {
                         &backend_content,
                         &backend_attachments,
                         &history_before,
+                        &stored_model_options,
                         retrying,
                         permission,
                         github_repository.as_ref(),
@@ -304,8 +352,11 @@ impl Engine {
             match result {
                 RouteAttemptResult::Completed => {
                     self.turn_scheduler.record_outcome(&route.provider_id, None);
-                    self.store
-                        .record_route_success(&route.provider_id, &route.provider_model)?;
+                    self.store.record_route_success(
+                        &route.provider_id,
+                        &route.provider_model,
+                        attempt_started_at,
+                    )?;
                     if automatic_model_name(&thread.model).is_some() {
                         self.store.set_thread_route_affinity(
                             &thread.id,
@@ -341,6 +392,11 @@ impl Engine {
                     return Ok(());
                 }
                 RouteAttemptResult::Failed(failure) => {
+                    last_failure = Some((
+                        route.provider_id.clone(),
+                        route.provider_model.clone(),
+                        failure.message.clone(),
+                    ));
                     self.turn_scheduler
                         .record_outcome(&route.provider_id, Some(&failure.message));
                     let (base, max) = failure.kind.cooldown();
@@ -383,6 +439,7 @@ impl Engine {
                             failure.message,
                         );
                     }
+                    failover_reason = Some(failure.kind.failover_reason());
                     if !has_next {
                         self.record_routed_usage(
                             &session.id,
@@ -420,23 +477,25 @@ impl Engine {
                             failure.message,
                         );
                     }
-                    let next = &candidates[route_index + 1];
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::ModelRouteSelected {
-                            turn,
-                            model: thread.model.clone(),
-                            provider_id: next.provider_id.clone(),
-                            provider_model: next.provider_model.clone(),
-                            reason: failure.kind.failover_reason(),
-                        },
-                    )?;
                 }
             }
         }
 
         self.record_routed_usage(&session.id, &thread.id, turn, &mut accounting, false)?;
-        bail!("no model route completed the turn")
+        if let Some((provider_id, provider_model, message)) = last_failure {
+            bail!(
+                "no provider is currently able to run {}; tried {} route(s). Last error from {}/{}: {}",
+                thread.model,
+                attempted_candidates,
+                provider_id,
+                provider_model,
+                message,
+            );
+        }
+        bail!(
+            "no provider is currently able to run {}; every remaining route is cooling down",
+            thread.model
+        )
     }
 
     pub(super) fn record_routed_usage(
@@ -487,8 +546,7 @@ impl Engine {
             unreachable!("native route helper received a backend")
         };
         let scope = Scope::Thread(thread.id.clone());
-        let mut model_options = stored_model_options.clone();
-        normalize_thinking_option(&mut model_options, Some(&route.info));
+        let model_options = model_options_for_schema(stored_model_options, &route.info);
         // Keep one sanitized transcript in memory for the provider tool loop.
         // Every assistant/tool message is still persisted immediately, then
         // appended here for the next iteration without re-reading and
@@ -525,6 +583,7 @@ impl Engine {
                 Ok(stream) => {
                     let mut stream = trouve_providers::coalesce_event_stream(stream);
                     let mut error = None;
+                    let mut completed = false;
                     loop {
                         let event = tokio::select! {
                             biased;
@@ -555,9 +614,15 @@ impl Engine {
                             Ok(ProviderEvent::Reasoning(block)) => reasoning.push(block),
                             Ok(ProviderEvent::ToolCall(call)) => tool_calls.push(call),
                             Ok(ProviderEvent::Completed { usage }) => {
+                                completed = true;
                                 accounting.add_native(&self.model_catalog, route, &usage);
                             }
                         }
+                    }
+                    if error.is_none() && !cancel.is_cancelled() && !completed {
+                        error = Some(trouve_providers::ProviderError::Request(
+                            "provider stream ended before a completion event".into(),
+                        ));
                     }
                     error
                 }
@@ -719,6 +784,7 @@ impl Engine {
             Ok(stream) => {
                 let mut stream = trouve_providers::coalesce_event_stream(stream);
                 let mut error = None;
+                let mut completed = false;
                 loop {
                     let event = tokio::select! {
                         biased;
@@ -744,6 +810,7 @@ impl Engine {
                         }
                         Ok(ProviderEvent::Reasoning(block)) => reasoning.push(block),
                         Ok(ProviderEvent::Completed { usage }) => {
+                            completed = true;
                             accounting.add_native(&self.model_catalog, route, &usage);
                         }
                         Ok(ProviderEvent::ToolCall(_)) => {}
@@ -752,6 +819,11 @@ impl Engine {
                             break;
                         }
                     }
+                }
+                if error.is_none() && !cancel.is_cancelled() && !completed {
+                    error = Some(trouve_providers::ProviderError::Request(
+                        "provider stream ended before a completion event".into(),
+                    ));
                 }
                 error
             }
@@ -838,6 +910,7 @@ impl Engine {
         initial_content: &str,
         attachments: &[trouve_agents::TurnAttachment],
         history_before: &[serde_json::Value],
+        stored_model_options: &serde_json::Map<String, serde_json::Value>,
         retrying: bool,
         permission: BackendPermission,
         github_repository: Option<&(String, String, String)>,
@@ -862,6 +935,9 @@ impl Engine {
         } else {
             history_before.to_vec()
         };
+        let submitted_transcript_messages =
+            u64::try_from(payloads.len().saturating_add(usize::from(!retrying)))
+                .context("backend transcript length exceeds u64")?;
         let resume = if tools_enabled {
             self.store.backend_session(&thread.id, backend_id)?
         } else {
@@ -926,8 +1002,7 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let mut model_options = self.store.thread_model_options(&thread.id)?;
-        normalize_thinking_option(&mut model_options, Some(&route.info));
+        let model_options = model_options_for_schema(stored_model_options, &route.info);
         let backend_turn = BackendTurn {
             cancel: cancel.clone(),
             thread_id: thread.id.clone(),
@@ -961,6 +1036,7 @@ impl Engine {
         let mut backend_error = None;
         let mut approval_error = None;
         let mut backend_cancelled = false;
+        let mut backend_completed = false;
         let mut open_tools = HashSet::new();
         let mut side_effect_started = false;
         let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
@@ -979,7 +1055,8 @@ impl Engine {
         let mut suppressed_bridge_calls = HashSet::new();
         let mut persisted = Vec::new();
         let mut persist_deadline = None;
-        loop {
+        let event_loop_result: Result<()> = async {
+          loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
             let input = tokio::select! {
                 biased;
@@ -998,7 +1075,14 @@ impl Engine {
                 event = stream.next() => BackendLoopInput::Event(event),
             };
             let event = match input {
-                BackendLoopInput::Event(None) => break,
+                BackendLoopInput::Event(None) => {
+                    if !backend_completed && !cancel.is_cancelled() {
+                        backend_error = Some(BackendError::Protocol(
+                            "backend stream ended before a completion event".into(),
+                        ));
+                    }
+                    break;
+                }
                 BackendLoopInput::Approval(outcome) => {
                     let BackendApprovalOutcome {
                         owner_thread_id,
@@ -1086,8 +1170,12 @@ impl Engine {
                         .map_err(anyhow::Error::msg)?;
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        self.store
-                            .set_backend_session(&thread.id, backend_id, &session_id)?;
+                        self.store.set_backend_session_at_watermark(
+                            &thread.id,
+                            backend_id,
+                            &session_id,
+                            submitted_transcript_messages,
+                        )?;
                     }
                 }
                 BackendEvent::TextDelta(delta) => {
@@ -1124,7 +1212,9 @@ impl Engine {
                     tool,
                     mut args,
                 } => {
-                    if trouve_bridge_wrapper_call(&tool, &args).is_some() {
+                    if let Some((nested_tool, _)) = trouve_bridge_wrapper_call(&tool, &args) {
+                        side_effect_started |=
+                            self.executor.tool_mutates(nested_tool) != Some(false);
                         if suppressed_bridge_calls.insert(call_id.clone())
                             && let Some(vendor_thread_id) = active_vendor_session.as_deref()
                         {
@@ -1518,6 +1608,7 @@ impl Engine {
                     let _ = responder.send(answers);
                 }
                 BackendEvent::Completed { usage } => {
+                    backend_completed = true;
                     attempt_usage.input_tokens += usage.input_tokens;
                     attempt_usage.output_tokens += usage.output_tokens;
                     attempt_usage.cached_input_tokens += usage.cached_input_tokens;
@@ -1549,6 +1640,12 @@ impl Engine {
             {
                 persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
             }
+          }
+          Ok(())
+        }
+        .await;
+        if let Err(error) = event_loop_result {
+            approval_error = Some(error);
         }
         drop(stream);
         backend_mutation_permits.clear();
@@ -1577,11 +1674,7 @@ impl Engine {
         .await;
         accounting.add_backend(&attempt_usage);
 
-        if let Some(error) = approval_error {
-            return Err(error);
-        }
-
-        if let Some(error) = backend_error {
+        if approval_error.is_some() || backend_error.is_some() {
             if !segment.is_empty() {
                 persisted.push(Event::AssistantMessage {
                     turn,
@@ -1592,13 +1685,13 @@ impl Engine {
                 self.store.append_message(
                     &thread.id,
                     &serde_json::to_value(Message::Assistant {
-                        content: text,
+                        content: text.clone(),
                         tool_calls: Vec::new(),
                         reasoning: Vec::new(),
                     })?,
                 )?;
             }
-            for call_id in open_tools {
+            for call_id in open_tools.drain() {
                 persisted.push(Event::ToolCompleted {
                     call_id,
                     status: ToolStatus::Aborted,
@@ -1613,6 +1706,13 @@ impl Engine {
                 let seen = self.store.messages(&thread.id)?.len() as u64;
                 self.store.mark_backend_seen(&thread.id, backend_id, seen)?;
             }
+        }
+
+        if let Some(error) = approval_error {
+            return Err(error);
+        }
+
+        if let Some(error) = backend_error {
             return Ok(RouteAttemptResult::Failed(backend_attempt_failure(
                 error,
                 side_effect_started,

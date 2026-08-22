@@ -200,7 +200,16 @@ impl Config {
 
     pub fn load_from(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
+            Ok(text) => toml::from_str(&text).map(|mut config: Self| {
+                // Older hand-edited configs may contain duplicate routing
+                // priorities. Keep the first occurrence so routing and the
+                // settings response consume one canonical order.
+                let mut seen = std::collections::HashSet::new();
+                config
+                    .provider_order
+                    .retain(|provider| seen.insert(provider.clone()));
+                config
+            }).unwrap_or_else(|e| {
                 // A malformed file must not silently become defaults: the
                 // very next persisted setting change would then rewrite
                 // config.toml from that default snapshot, destroying the
@@ -308,5 +317,20 @@ mod tests {
         assert_eq!(cfg.code_review_timeout_seconds, Some(1_200));
         assert_eq!(cfg.code_review_reviewer_timeout_seconds, Some(720));
         assert_eq!(cfg.code_review_coordinator_timeout_seconds, Some(360));
+    }
+
+    #[test]
+    fn provider_order_is_canonicalized_when_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "provider_order = [\"first\", \"second\", \"first\", \"third\", \"second\"]\n",
+        )
+        .unwrap();
+
+        let config = Config::load_from(&path);
+
+        assert_eq!(config.provider_order, ["first", "second", "third"]);
     }
 }

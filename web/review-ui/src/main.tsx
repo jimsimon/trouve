@@ -16,6 +16,7 @@ import {
   getJob,
   getJobs,
   getKnownProviders,
+  getModelRoutes,
   getPersonaInfos,
   getModels,
   getProviders,
@@ -369,6 +370,7 @@ function App() {
     reloadRequested: boolean;
   }>({ promise: null, reloadRequested: false });
   const configurationLoadRef = useRef<Promise<void> | null>(null);
+  const modelRouteLoadRef = useRef<Promise<void> | null>(null);
 
   const loadDashboard = useCallback((quiet = false): Promise<void> => {
     const state = dashboardLoadRef.current;
@@ -405,6 +407,21 @@ function App() {
     return request;
   }, []);
 
+  const loadModelRoutes = useCallback((): Promise<void> => {
+    if (modelRouteLoadRef.current) return modelRouteLoadRef.current;
+    const request = getModelRoutes()
+      .then((models) => setModelCatalog({ models, loaded: true, error: "" }))
+      .catch((cause) => {
+        const error = cause instanceof Error ? cause.message : String(cause);
+        setModelCatalog((current) => ({ ...current, error }));
+      });
+    modelRouteLoadRef.current = request;
+    void request.finally(() => {
+      if (modelRouteLoadRef.current === request) modelRouteLoadRef.current = null;
+    });
+    return request;
+  }, []);
+
   const loadConfiguration = useCallback((): Promise<void> => {
     if (configurationLoadRef.current) return configurationLoadRef.current;
     const request = (async (): Promise<void> => {
@@ -419,7 +436,13 @@ function App() {
       if (settingsResult?.status === "fulfilled") setReviewSettings(settingsResult.value);
       if (personaResult?.status === "fulfilled") setPersonaInfos(personaResult.value);
       if (modelResult?.status === "fulfilled") {
-        setModelCatalog({ models: modelResult.value, loaded: true, error: "" });
+        // Paint the static catalog immediately. Keep a richer live route
+        // snapshot during later refreshes until its replacement arrives.
+        setModelCatalog((current) =>
+          current.loaded
+            ? current
+            : { models: modelResult.value, loaded: true, error: "" },
+        );
       } else if (modelResult?.status === "rejected") {
         const error = modelResult.reason instanceof Error
           ? modelResult.reason.message
@@ -429,7 +452,10 @@ function App() {
         // configured model disappeared.
         setModelCatalog((current) => ({ ...current, error }));
       }
-      const errors = results
+      // Live provider/CLI discovery can be slow or unavailable. It enriches
+      // the already usable static picker without holding configuration open.
+      void loadModelRoutes();
+      const errors = [providerResult, settingsResult, personaResult]
         .filter((result): result is PromiseRejectedResult => result.status === "rejected")
         .map(({ reason }) => (reason instanceof Error ? reason.message : String(reason)));
       setConfigurationError(errors.join("; "));
@@ -439,7 +465,7 @@ function App() {
       if (configurationLoadRef.current === request) configurationLoadRef.current = null;
     });
     return request;
-  }, []);
+  }, [loadModelRoutes]);
 
   useEffect(() => {
     const onHash = (): void => setRoute(routeFromHash());
@@ -479,6 +505,14 @@ function App() {
     }, AUTOMATIC_RETRY_MS);
     return () => window.clearInterval(timer);
   }, [configurationError, loadConfiguration, needsConfiguration]);
+
+  useEffect(() => {
+    if (!needsConfiguration || !modelCatalog.error) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void loadModelRoutes();
+    }, AUTOMATIC_RETRY_MS);
+    return () => window.clearInterval(timer);
+  }, [loadModelRoutes, modelCatalog.error, needsConfiguration]);
 
   useEffect(() => {
     if (serverEventAfter === null) return;
@@ -2568,7 +2602,7 @@ function RepositoryEditor({
         <div class="action-row">
           <button
             type="submit"
-            disabled={busy || !modelsLoaded || reviewerPolicyInvalid || reviewModelInvalid}
+            disabled={busy || reviewerPolicyInvalid || reviewModelInvalid}
           >
             {busy ? "Saving…" : "Save repository"}
           </button>
@@ -2752,7 +2786,7 @@ function ReviewerEditor({
         </small>
       </label>
       <div class="action-row">
-        <button type="submit" disabled={busy || !modelsLoaded}>
+        <button type="submit" disabled={busy}>
           {busy ? "Saving…" : reviewer ? "Save persona" : "Create persona"}
         </button>
         {reviewer && !reviewer.built_in && (

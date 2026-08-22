@@ -677,7 +677,7 @@ export class TrouveProviderSettings extends LitElement {
                   data-provider-id=${providerId}
                   data-direction="-1"
                   aria-disabled=${this.#busy !== "" ? "true" : "false"}
-                  ?disabled=${index === 0}
+                  ?disabled=${this.#busy !== "" || index === 0}
                   @click=${() => void this.#moveProvider(providerId, -1)}
                 >${fontAwesomeIcon("arrow-up")}</button>
                 <button
@@ -687,7 +687,7 @@ export class TrouveProviderSettings extends LitElement {
                   data-provider-id=${providerId}
                   data-direction="1"
                   aria-disabled=${this.#busy !== "" ? "true" : "false"}
-                  ?disabled=${index + 1 === order.length}
+                  ?disabled=${this.#busy !== "" || index + 1 === order.length}
                   @click=${() => void this.#moveProvider(providerId, 1)}
                 >${fontAwesomeIcon("arrow-down")}</button>
               </div>

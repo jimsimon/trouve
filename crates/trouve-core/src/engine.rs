@@ -822,6 +822,20 @@ fn routed_model_info(
     }
 }
 
+fn model_info_for_routed_selection(
+    routed: trouve_protocol::RoutedModelInfo,
+) -> trouve_protocol::ModelInfo {
+    trouve_protocol::ModelInfo {
+        id: routed.id,
+        display_name: routed.display_name,
+        context_window: routed.context_window,
+        supports_tools: routed.supports_tools,
+        input_price_per_mtok: routed.input_price_per_mtok,
+        output_price_per_mtok: routed.output_price_per_mtok,
+        options_schema: routed.options_schema,
+    }
+}
+
 fn routed_model_catalog(candidates: Vec<ModelCandidate>) -> Vec<trouve_protocol::RoutedModelInfo> {
     let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
     for candidate in candidates {
@@ -1623,6 +1637,43 @@ impl TurnScheduler {
                 _ = tokio::time::sleep(cooldown) => {}
             }
         }
+        self.acquire_permits(provider, background, cancel, started)
+            .await
+    }
+
+    /// Acquire a route for automatic failover without waiting out a provider
+    /// cooldown. A route can enter backoff after candidate ranking, so this
+    /// last-moment check turns that race into immediate selection of another
+    /// provider rather than a hidden sleep.
+    async fn acquire_routed(
+        &self,
+        model: &str,
+        background: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Option<TurnCapacityGuard>> {
+        let started = Instant::now();
+        let provider = self.provider(model);
+        if provider
+            .backoff
+            .lock()
+            .unwrap()
+            .until
+            .is_some_and(|until| until > Instant::now())
+        {
+            return Ok(None);
+        }
+        self.acquire_permits(provider, background, cancel, started)
+            .await
+            .map(Some)
+    }
+
+    async fn acquire_permits(
+        &self,
+        provider: ProviderTurnCapacity,
+        background: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+        started: Instant,
+    ) -> Result<TurnCapacityGuard> {
         // Provider gates come first so a route waiting on saturated provider
         // capacity never consumes a global slot needed by another provider.
         let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
@@ -2013,6 +2064,47 @@ fn normalize_thinking_option(
     if let Some(selected) = selected {
         options.insert(key.into(), serde_json::Value::String(selected));
     }
+}
+
+fn portable_thinking_options(
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    // Native keys are explicit thread choices and therefore win over the
+    // canonical inherited key when both exist.
+    let selected = THINKING_OPTION_KEYS[1..]
+        .iter()
+        .find_map(|key| options.get(*key).and_then(thinking_value))
+        .or_else(|| {
+            options
+                .get("thinking_budget_tokens")
+                .and_then(thinking_value)
+        })
+        .or_else(|| options.get("thinking_level").and_then(thinking_value));
+    selected
+        .map(|selected| {
+            serde_json::Map::from_iter([(
+                "thinking_level".into(),
+                serde_json::Value::String(selected),
+            )])
+        })
+        .unwrap_or_default()
+}
+
+fn model_options_for_schema(
+    options: &serde_json::Map<String, serde_json::Value>,
+    model: &trouve_protocol::ModelInfo,
+) -> serde_json::Map<String, serde_json::Value> {
+    let thinking = portable_thinking_options(options);
+    let mut filtered = options.clone();
+    for key in THINKING_OPTION_KEYS {
+        filtered.remove(key);
+    }
+    filtered.remove("thinking_budget_tokens");
+    filtered.extend(thinking);
+    normalize_thinking_option(&mut filtered, Some(model));
+    let properties = model.options_schema["properties"].as_object();
+    filtered.retain(|key, _| properties.is_some_and(|properties| properties.contains_key(key)));
+    filtered
 }
 
 fn thinking_value(value: &serde_json::Value) -> Option<String> {
@@ -2644,6 +2736,27 @@ fn is_loopback_base_url(url: &str) -> bool {
         .trim_end_matches(']')
         .parse::<std::net::IpAddr>()
         .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn restore_secret_snapshot(
+    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    snapshot: &[(String, Option<String>)],
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for (key, value) in snapshot.iter().rev() {
+        let result = match value {
+            Some(value) => secrets.set(key, value),
+            None => secrets.delete(key),
+        };
+        if let Err(error) = result {
+            failures.push(format!("{key}: {error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
 }
 
 /// Build the provider registry from config + zero-config env defaults.
@@ -3772,6 +3885,24 @@ impl Engine {
                 });
             }
         }
+        // Programmatically injected agent backends are routable even when
+        // they do not have a config-file entry. Project them into the same
+        // provider identity list used by routing priority settings.
+        for (id, backend) in self.backends.read().unwrap().iter() {
+            if !config.providers.contains_key(id) && !infos.iter().any(|info| info.id == *id) {
+                let status = backend.status();
+                infos.push(ProviderInfo {
+                    id: id.clone(),
+                    kind: "agent-backend".into(),
+                    base_url: None,
+                    settings: Default::default(),
+                    has_credentials: status.installed && status.has_credentials,
+                    auth: "cli".into(),
+                    category: "subscription".into(),
+                    experimental: false,
+                });
+            }
+        }
         infos.sort_by(|a, b| a.id.cmp(&b.id));
         let configured_ids: HashSet<&str> = infos.iter().map(|info| info.id.as_str()).collect();
         let mut provider_order = Vec::with_capacity(infos.len());
@@ -3876,19 +4007,38 @@ impl Engine {
         }
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().unwrap();
-        if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-            self.secrets
-                .set(&trouve_providers::secrets::api_key_secret(id), key)
-                .map_err(EngineError::Internal)?;
+        let mut secret_updates = Vec::new();
+        if let Some(value) = req.api_key.as_deref().filter(|value| !value.is_empty()) {
+            secret_updates.push((
+                trouve_providers::secrets::api_key_secret(id),
+                value.to_string(),
+            ));
         }
-        for (name, value) in req
-            .secret_values
+        secret_updates.extend(
+            req.secret_values
+                .iter()
+                .filter(|(_, value)| !value.is_empty())
+                .map(|(name, value)| {
+                    (
+                        trouve_providers::secrets::provider_secret(id, name),
+                        value.clone(),
+                    )
+                }),
+        );
+        let secret_snapshot = secret_updates
             .iter()
-            .filter(|(_, value)| !value.is_empty())
-        {
-            self.secrets
-                .set(&trouve_providers::secrets::provider_secret(id, name), value)
-                .map_err(EngineError::Internal)?;
+            .map(|(key, _)| Ok((key.clone(), self.secrets.get(key)?)))
+            .collect::<Result<Vec<_>>>()
+            .map_err(EngineError::Internal)?;
+        for (key, value) in &secret_updates {
+            if let Err(error) = self.secrets.set(key, value) {
+                if let Err(rollback) = restore_secret_snapshot(&self.secrets, &secret_snapshot) {
+                    return Err(EngineError::Internal(anyhow!(
+                        "updating provider secrets failed: {error:#}; restoring prior secrets also failed: {rollback:#}"
+                    )));
+                }
+                return Err(EngineError::Internal(error));
+            }
         }
         {
             let mut config = self.config.lock().unwrap();
@@ -3939,12 +4089,23 @@ impl Engine {
             {
                 next.provider_order.push(id.to_string());
             }
-            self.persist_config_result(&next)?;
+            if let Err(error) = self.persist_config_result(&next) {
+                if let Err(rollback) = restore_secret_snapshot(&self.secrets, &secret_snapshot) {
+                    return Err(EngineError::Internal(anyhow!(
+                        "persisting provider config failed: {error}; restoring prior secrets also failed: {rollback:#}"
+                    )));
+                }
+                return Err(error);
+            }
             *config = next;
+            self.reload_providers_from_config(&config);
         }
-        let route_cleanup = self.store.clear_route_health(id);
-        self.reload_providers();
-        route_cleanup.map_err(EngineError::Internal)?;
+        if let Err(error) = self.store.clear_route_health(id) {
+            tracing::warn!(
+                provider = id,
+                "failed to clear stale route health: {error:#}"
+            );
+        }
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
         let pc = config.providers.get(id).cloned().unwrap_or_default();
@@ -3980,6 +4141,7 @@ impl Engine {
             next.provider_order.retain(|provider| provider != id);
             self.persist_config_result(&next)?;
             *config = next;
+            self.reload_providers_from_config(&config);
             removed.secret_names
         };
         let _ = self
@@ -3993,17 +4155,26 @@ impl Engine {
                 .secrets
                 .delete(&trouve_providers::secrets::provider_secret(id, &name));
         }
-        let route_cleanup = self.store.clear_route_health(id);
-        self.reload_providers();
-        route_cleanup.map_err(EngineError::Internal)
+        if let Err(error) = self.store.clear_route_health(id) {
+            tracing::warn!(
+                provider = id,
+                "failed to clear stale route health: {error:#}"
+            );
+        }
+        Ok(())
     }
 
     /// Replace the explicit provider preference prefix. Omitted providers
     /// remain routable after the listed entries.
     pub fn set_provider_order(&self, provider_ids: &[String]) -> Result<(), EngineError> {
+        // Hold the same config boundary used by provider CRUD while deriving
+        // routable identities and committing the order. Provider CRUD updates
+        // registries before releasing this lock, so a concurrent delete can
+        // never leave its stale id in a newly persisted order.
+        let mut config = self.config.lock().unwrap();
         let mut known: HashSet<String> = self.providers.read().unwrap().keys().cloned().collect();
         known.extend(self.backends.read().unwrap().keys().cloned());
-        known.extend(self.config.lock().unwrap().providers.keys().cloned());
+        known.extend(config.providers.keys().cloned());
         let mut seen = HashSet::new();
         for id in provider_ids {
             if !known.contains(id) {
@@ -4017,7 +4188,6 @@ impl Engine {
                 )));
             }
         }
-        let mut config = self.config.lock().unwrap();
         let mut next = config.clone();
         next.provider_order = provider_ids.to_vec();
         self.persist_config_result(&next)?;
@@ -5564,13 +5734,17 @@ impl Engine {
     /// CRUD), preserving programmatically injected providers.
     fn reload_providers(&self) {
         let config = self.config.lock().unwrap().clone();
-        let mut rebuilt = build_all_providers(&config, &self.secrets, &self.model_catalog);
+        self.reload_providers_from_config(&config);
+    }
+
+    fn reload_providers_from_config(&self, config: &Config) {
+        let mut rebuilt = build_all_providers(config, &self.secrets, &self.model_catalog);
         for (id, p) in self.injected_providers.lock().unwrap().iter() {
             rebuilt.insert(id.clone(), p.clone());
         }
         *self.providers.write().unwrap() = rebuilt;
         let mut backends =
-            build_all_backends(&config, &self.secrets, &self.data_dir, &self.model_catalog);
+            build_all_backends(config, &self.secrets, &self.data_dir, &self.model_catalog);
         for (id, b) in self.injected_backends.lock().unwrap().iter() {
             backends.insert(id.clone(), b.clone());
         }
@@ -9274,11 +9448,21 @@ impl Engine {
         if let Some(model) = req.model.as_deref() {
             validate_model_selection(model)?;
         }
+        let inherited_model_options = req
+            .model
+            .as_deref()
+            .filter(|model| *model != thread.model)
+            .filter(|_| req.model_options.is_none())
+            .map(|_| portable_thinking_options(&thread.model_options));
+        let model_options = req
+            .model_options
+            .as_ref()
+            .or(inherited_model_options.as_ref());
         self.store.update_thread_with_event(
             id,
             req.mode.as_deref(),
             req.model.as_deref(),
-            req.model_options.as_ref(),
+            model_options,
             req.permission_mode,
             Event::ThreadUpdated {
                 thread_id: id.to_string(),
@@ -12905,9 +13089,12 @@ impl Engine {
         // A vendor session retains the tools it was created with. Restricted
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
+        let mut submitted_transcript_messages = 0;
         let (resume, handoff) = if tools_enabled {
             let resume = self.store.backend_session(&thread.id, backend_id)?;
             let payloads = self.store.messages(&thread.id)?;
+            submitted_transcript_messages = u64::try_from(payloads.len().saturating_add(1))
+                .context("backend transcript length exceeds u64")?;
             let unseen = match &resume {
                 // A compaction can shrink the transcript below the watermark;
                 // handing off the fresh summary again covers that.
@@ -13472,8 +13659,12 @@ impl Engine {
                         .map_err(anyhow::Error::msg)?;
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        self.store
-                            .set_backend_session(&thread.id, backend_id, &session_id)?;
+                        self.store.set_backend_session_at_watermark(
+                            &thread.id,
+                            backend_id,
+                            &session_id,
+                            submitted_transcript_messages,
+                        )?;
                     }
                 }
                 BackendEvent::TextDelta(delta) => {
@@ -18708,6 +18899,42 @@ mod tests {
         live_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    struct ListedTestBackend;
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ListedTestBackend {
+        fn id(&self) -> &str {
+            "listed-backend"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "listed-backend/shared",
+                "Listed backend model",
+            )]
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        async fn start_login(
+            &self,
+        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+            unreachable!("provider-list test never starts login")
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+            unreachable!("provider-list test never starts a turn")
+        }
+    }
+
     #[async_trait::async_trait]
     impl Provider for StallingCatalogProvider {
         fn id(&self) -> &str {
@@ -19865,6 +20092,33 @@ mod tests {
                 .any(|model| model.id == "catalog-test/live")
         );
         assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn provider_list_projects_programmatically_injected_backends() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                provider_order: vec!["listed-backend".into()],
+                ..Default::default()
+            },
+        )
+        .with_backend("listed-backend", Arc::new(ListedTestBackend));
+
+        let listed = engine.list_providers();
+        let backend = listed
+            .providers
+            .iter()
+            .find(|provider| provider.id == "listed-backend")
+            .expect("injected backend should be exposed as a provider identity");
+        assert_eq!(backend.kind, "agent-backend");
+        assert_eq!(backend.auth, "cli");
+        assert_eq!(backend.category, "subscription");
+        assert!(backend.has_credentials);
+        assert_eq!(listed.provider_order.first().unwrap(), "listed-backend");
     }
 
     #[tokio::test]
@@ -21994,9 +22248,16 @@ default_permission_mode = "ask"
             local_enabled: Some(false),
             ..Default::default()
         };
-        let engine = Engine::new(store, data.path().into(), &config)
+        let secrets: Arc<dyn trouve_providers::secrets::SecretStore> = Arc::new(
+            trouve_providers::secrets::FileStore::new(data.path().join("secrets.json")),
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("provider");
+        let named_secret = trouve_providers::secrets::provider_secret("provider", "tenant");
+        secrets.set(&api_key, "old-key").unwrap();
+        let mut engine = Engine::new(store, data.path().into(), &config)
             // Saving TOML to a directory is guaranteed to fail.
             .with_config_file(Some(data.path().to_path_buf()));
+        engine.secrets = secrets.clone();
 
         assert!(
             engine
@@ -22004,6 +22265,8 @@ default_permission_mode = "ask"
                     "provider",
                     &UpsertProviderRequest {
                         kind: "openai-compat".into(),
+                        api_key: Some("new-key".into()),
+                        secret_values: BTreeMap::from([("tenant".into(), "new-tenant".into())]),
                         ..Default::default()
                     },
                 )
@@ -22020,6 +22283,8 @@ default_permission_mode = "ask"
                 .unwrap()
                 .contains_key(&("provider".into(), "shared".into()))
         );
+        assert_eq!(secrets.get(&api_key).unwrap().as_deref(), Some("old-key"));
+        assert_eq!(secrets.get(&named_secret).unwrap(), None);
     }
 
     #[tokio::test]
@@ -22069,6 +22334,29 @@ default_permission_mode = "ask"
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn routed_capacity_skips_a_provider_that_enters_backoff() {
+        let scheduler = TurnScheduler {
+            all: Arc::new(tokio::sync::Semaphore::new(1)),
+            background: Arc::new(tokio::sync::Semaphore::new(1)),
+            provider_all_limit: 1,
+            provider_background_limit: 1,
+            providers: Mutex::new(HashMap::new()),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        scheduler.record_outcome("busy", Some("429 rate limit"));
+
+        let capacity = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            scheduler.acquire_routed("busy/shared", false, &cancel),
+        )
+        .await
+        .expect("automatic routing must not sleep through provider backoff")
+        .unwrap();
+
+        assert!(capacity.is_none());
     }
 
     #[test]
@@ -22229,6 +22517,79 @@ default_permission_mode = "ask"
         assert_eq!(schema["properties"]["thinking_level"]["default"], "medium");
         assert!(schema.pointer("/properties/reasoning_effort").is_none());
         assert!(schema.pointer("/properties/provider_only").is_none());
+    }
+
+    #[test]
+    fn routed_options_are_filtered_through_shared_and_route_schemas() {
+        let shared = trouve_protocol::ModelInfo {
+            id: "auto/shared".into(),
+            display_name: "Shared".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "thinking_level": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    },
+                    "fast": {"type": "boolean"}
+                }
+            }),
+        };
+        let route = trouve_protocol::ModelInfo {
+            id: "provider/shared".into(),
+            display_name: "Shared".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    },
+                    "fast": {"type": "boolean"},
+                    "provider_only": {"type": "string"}
+                }
+            }),
+        };
+        let stored = serde_json::Map::from_iter([
+            ("reasoning_effort".into(), serde_json::json!("high")),
+            ("fast".into(), serde_json::json!(true)),
+            ("provider_only".into(), serde_json::json!("stale")),
+            ("removed".into(), serde_json::json!(true)),
+        ]);
+
+        let shared_options = model_options_for_schema(&stored, &shared);
+        assert_eq!(shared_options["thinking_level"], "high");
+        assert_eq!(shared_options["fast"], true);
+        assert!(!shared_options.contains_key("provider_only"));
+        assert!(!shared_options.contains_key("removed"));
+
+        let route_options = model_options_for_schema(&shared_options, &route);
+        assert_eq!(route_options["reasoning_effort"], "high");
+        assert_eq!(route_options["fast"], true);
+        assert!(!route_options.contains_key("provider_only"));
+    }
+
+    #[test]
+    fn model_change_retains_only_portable_thinking() {
+        let stored = serde_json::Map::from_iter([
+            ("effort".into(), serde_json::json!("high")),
+            ("provider_only".into(), serde_json::json!(true)),
+        ]);
+
+        assert_eq!(
+            portable_thinking_options(&stored),
+            serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))])
+        );
     }
 
     #[test]

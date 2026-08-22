@@ -4,6 +4,7 @@ import {
   boundedSubscriptionUsage,
   filteredModelIndices,
   modelHealthPresentation,
+  modelHealthPresentations,
   subscriptionUsageTone,
 } from "./model-health.js";
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
@@ -53,6 +54,44 @@ describe("model health presentation", () => {
     expect(subscriptionUsageTone(90)).toBe("error");
     expect(boundedSubscriptionUsage(-20)).toBe(0);
     expect(boundedSubscriptionUsage(120)).toBe(100);
+  });
+
+  it("uses the healthiest concrete route for an automatic model", () => {
+    const model = {
+      id: "auto/gpt-5.6-sol",
+      display_name: "GPT-5.6 Sol",
+      context_window: 128_000,
+      options_schema: {},
+      supports_tools: true,
+      routes: [
+        { provider_id: "codex", provider_model: "gpt-5.6-sol" },
+        { provider_id: "cursor", provider_model: "gpt-5.6-sol" },
+      ],
+    };
+    const presentations = modelHealthPresentations([model], [
+      {
+        provider_id: "codex",
+        status: "unavailable",
+        plan: "",
+        windows: [],
+        credits: "",
+        note: "login required",
+      },
+      {
+        provider_id: "cursor",
+        status: "ok",
+        plan: "pro",
+        windows: [{ label: "Monthly", used_percent: 25, resets: "" }],
+        credits: "",
+        note: "",
+      },
+    ]);
+
+    expect(presentations[0]).toMatchObject({
+      summary: "Pro · 25% used",
+      tone: "ok",
+    });
+    expect(presentations[0]?.detail).toContain("cursor · Pro");
   });
 
   it("ranks prefix, contained, and subsequence model matches with a DOM bound", () => {
