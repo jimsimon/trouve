@@ -15,10 +15,8 @@ mod sleep;
 mod web_preview_support;
 
 use std::cell::RefCell;
-use std::collections::{VecDeque, hash_map::DefaultHasher};
 use std::fs::File;
 use std::future::Future;
-use std::hash::{Hash as _, Hasher as _};
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -27,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::web_preview_support::WebPreviewHost;
 use rfd::AsyncFileDialog;
+use sha2::{Digest as _, Sha256};
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -64,24 +63,21 @@ const MAX_CLIPBOARD_RGBA_BYTES: usize = 64 * 1024 * 1024;
 const CLOSE_CONFIRMATION_GRACE: Duration = Duration::from_secs(5);
 const MAX_VIDEO_PLAYBACK_CACHE_FILES: usize = 8;
 const MAX_VIDEO_PLAYBACK_CACHE_BYTES: usize = 4 * MAX_NATIVE_ATTACHMENT_BYTES;
-const VIDEO_PLAYBACK_CACHE_RETENTION: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
 struct VideoPlaybackCacheEntry {
     path: PathBuf,
-    fingerprint: u64,
+    identity: [u8; 32],
     size: usize,
-    retain_until: Instant,
 }
 
 #[derive(Debug)]
 struct VideoPlaybackCache {
     directory: tempfile::TempDir,
-    entries: VecDeque<VideoPlaybackCacheEntry>,
+    entries: Vec<VideoPlaybackCacheEntry>,
     next_sequence: u64,
     max_files: usize,
     max_bytes: usize,
-    retention: Duration,
 }
 
 impl VideoPlaybackCache {
@@ -89,22 +85,18 @@ impl VideoPlaybackCache {
         Self::with_limits(
             MAX_VIDEO_PLAYBACK_CACHE_FILES,
             MAX_VIDEO_PLAYBACK_CACHE_BYTES,
-            VIDEO_PLAYBACK_CACHE_RETENTION,
         )
     }
 
-    fn with_limits(
-        max_files: usize,
-        max_bytes: usize,
-        retention: Duration,
-    ) -> std::io::Result<Self> {
+    /// Successful launches stay retained until the host exits so an external
+    /// player can keep reading for as long as playback lasts.
+    fn with_limits(max_files: usize, max_bytes: usize) -> std::io::Result<Self> {
         Ok(Self {
             directory: tempfile::Builder::new().prefix("trouve-video-").tempdir()?,
-            entries: VecDeque::new(),
+            entries: Vec::new(),
             next_sequence: 0,
             max_files,
             max_bytes,
-            retention,
         })
     }
 
@@ -119,18 +111,11 @@ impl VideoPlaybackCache {
         let extension = attachment
             .video_extension()
             .ok_or_else(|| "unsupported video attachment type".to_string())?;
-        let now = Instant::now();
-        let fingerprint = video_attachment_fingerprint(extension, attachment.bytes());
-        if let Some(entry) = self.entries.iter_mut().find(|entry| {
-            entry.fingerprint == fingerprint
-                && entry.size == attachment.bytes().len()
-                && std::fs::read(&entry.path).is_ok_and(|bytes| bytes == attachment.bytes())
-        }) {
-            entry.retain_until = now + self.retention;
+        let identity = video_attachment_identity(extension, attachment.bytes());
+        if let Some(entry) = self.entries.iter().find(|entry| entry.identity == identity) {
             return open(&entry.path);
         }
 
-        self.prune_expired(now);
         let retained_bytes = self
             .entries
             .iter()
@@ -140,7 +125,10 @@ impl VideoPlaybackCache {
             .checked_add(attachment.bytes().len())
             .ok_or_else(|| "video playback cache size overflowed".to_string())?;
         if self.entries.len() >= self.max_files || next_bytes > self.max_bytes {
-            return Err("video playback cache is full; retry after an earlier player opens".into());
+            return Err(
+                "video playback cache is full; restart the app before opening another distinct video"
+                    .into(),
+            );
         }
 
         let sequence = self.next_sequence;
@@ -150,11 +138,10 @@ impl VideoPlaybackCache {
             .path()
             .join(format!("{sequence}.{extension}"));
         std::fs::write(&path, attachment.bytes()).map_err(|error| error.to_string())?;
-        self.entries.push_back(VideoPlaybackCacheEntry {
+        self.entries.push(VideoPlaybackCacheEntry {
             path: path.clone(),
-            fingerprint,
+            identity,
             size: attachment.bytes().len(),
-            retain_until: now + self.retention,
         });
         let result = open(&path);
         if result.is_err() && remove_temporary_video(&path) {
@@ -162,18 +149,15 @@ impl VideoPlaybackCache {
         }
         result
     }
-
-    fn prune_expired(&mut self, now: Instant) {
-        self.entries
-            .retain(|entry| now < entry.retain_until || !remove_temporary_video(&entry.path));
-    }
 }
 
-fn video_attachment_fingerprint(extension: &str, bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    extension.hash(&mut hasher);
-    bytes.hash(&mut hasher);
-    hasher.finish()
+fn video_attachment_identity(extension: &str, bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((extension.len() as u64).to_le_bytes());
+    hasher.update(extension.as_bytes());
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    hasher.finalize().into()
 }
 
 fn remove_temporary_video(path: &std::path::Path) -> bool {
@@ -850,12 +834,7 @@ mod close_confirmation_tests {
 
     #[test]
     fn video_playback_cache_reuses_identical_attachments() {
-        let mut cache = VideoPlaybackCache::with_limits(
-            2,
-            MAX_NATIVE_ATTACHMENT_BYTES,
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
         let attachment = video_attachment("demo.mp4", b"video");
         let mut opened = Vec::new();
 
@@ -879,12 +858,7 @@ mod close_confirmation_tests {
 
     #[test]
     fn video_playback_cache_removes_failed_new_launches() {
-        let mut cache = VideoPlaybackCache::with_limits(
-            2,
-            MAX_NATIVE_ATTACHMENT_BYTES,
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
         let attachment = video_attachment("demo.mp4", b"video");
 
         assert_eq!(
@@ -900,12 +874,7 @@ mod close_confirmation_tests {
 
     #[test]
     fn video_playback_cache_bounds_distinct_retained_files() {
-        let mut cache = VideoPlaybackCache::with_limits(
-            2,
-            MAX_NATIVE_ATTACHMENT_BYTES,
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
         for bytes in [b"first".as_slice(), b"second".as_slice()] {
             cache
                 .open_with(&video_attachment("demo.mp4", bytes), |_| Ok(()))
@@ -925,22 +894,18 @@ mod close_confirmation_tests {
     }
 
     #[test]
-    fn video_playback_cache_evicts_expired_files() {
-        let mut cache =
-            VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES, Duration::ZERO)
-                .unwrap();
+    fn video_playback_cache_retains_successful_files_for_the_host_lifetime() {
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
         cache
             .open_with(&video_attachment("first.mp4", b"first"), |_| Ok(()))
             .unwrap();
+        let first_path = cache.entries[0].path.clone();
         cache
             .open_with(&video_attachment("second.mp4", b"second"), |_| Ok(()))
             .unwrap();
 
-        assert_eq!(cache.entries.len(), 1);
-        assert_eq!(
-            std::fs::read(cache.entries[0].path.clone()).unwrap(),
-            b"second"
-        );
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(std::fs::read(first_path).unwrap(), b"first");
     }
 
     #[test]

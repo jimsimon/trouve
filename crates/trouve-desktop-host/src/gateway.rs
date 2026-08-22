@@ -1815,11 +1815,11 @@ fn apply_security_headers_with_development_websocket(
 ) -> Result<(), GatewayRejection> {
     let content_security_policy = development_websocket_origin.map_or_else(
         || {
-            "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self' blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'".to_owned()
+            "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self' blob: data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'".to_owned()
         },
         |websocket_origin| {
             format!(
-                "default-src 'self'; base-uri 'none'; connect-src 'self' {websocket_origin}; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self' blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+                "default-src 'self'; base-uri 'none'; connect-src 'self' {websocket_origin}; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self' blob: data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
             )
         },
     );
@@ -3500,7 +3500,7 @@ mod tests {
             response.headers()["content-security-policy"]
                 .to_str()
                 .unwrap()
-                .contains("media-src 'self' blob:")
+                .contains("media-src 'self' blob: data:")
         );
 
         let shell = app

@@ -1,6 +1,5 @@
 import { css, html, LitElement, nothing, type PropertyValues } from "lit";
 
-import { isVideoMime, MAX_ATTACHMENT_BYTES } from "../services/attachments.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 /**
@@ -188,8 +187,14 @@ export class TrouveImagePreview extends LitElement {
   #galleryIndex = 0;
   #returnFocus: HTMLElement | undefined;
   #videoPreviewSource = "";
-  #videoObjectUrl = "";
   #videoObserver: IntersectionObserver | undefined;
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    if (!this.hasUpdated) return;
+    this.#configureVideoPreview();
+    this.requestUpdate();
+  }
 
   protected override willUpdate(changed: PropertyValues<this>): void {
     super.willUpdate(changed);
@@ -405,42 +410,19 @@ export class TrouveImagePreview extends LitElement {
         if (!entries.some((entry) => entry.isIntersecting)) return;
         this.#videoObserver?.disconnect();
         this.#videoObserver = undefined;
-        this.#videoPreviewSource = this.#materializeVideoSource();
+        this.#videoPreviewSource = this.source;
         this.requestUpdate();
       }, { rootMargin: "200px" });
       this.#videoObserver.observe(this);
       return;
     }
-    this.#videoPreviewSource = this.#materializeVideoSource();
-  }
-
-  #materializeVideoSource(): string {
-    if (!this.source.startsWith("data:")) return this.source;
-    const encoded = /^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/u.exec(this.source);
-    if (encoded === null || !isVideoMime(encoded[1] ?? "")) return "";
-    try {
-      const binary = globalThis.atob(encoded[2] ?? "");
-      if (binary.length === 0 || binary.length > MAX_ATTACHMENT_BYTES) return "";
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) {
-        bytes[index] = binary.charCodeAt(index);
-      }
-      this.#videoObjectUrl = URL.createObjectURL(new Blob(
-        [bytes.buffer as ArrayBuffer],
-        { type: this.mime.toLowerCase() },
-      ));
-      return this.#videoObjectUrl;
-    } catch {
-      return "";
-    }
+    this.#videoPreviewSource = this.source;
   }
 
   #releaseVideoPreview(): void {
     this.#videoObserver?.disconnect();
     this.#videoObserver = undefined;
     this.#videoPreviewSource = "";
-    if (this.#videoObjectUrl !== "") URL.revokeObjectURL(this.#videoObjectUrl);
-    this.#videoObjectUrl = "";
   }
 
   #finishClose(restoreFocus: boolean): void {

@@ -1510,7 +1510,10 @@ test("pending media and file attachments reuse submitted chip geometry", async (
   const file = attachments.locator(".file-attachment");
   await expect(image.locator("img")).toHaveAttribute("src", /^data:image\/png;base64,/u);
   await expect(image).toContainText("image/png");
-  await expect(video.locator("video")).toHaveAttribute("src", /^blob:/u);
+  await expect(video.locator("video")).toHaveAttribute(
+    "src",
+    /^data:video\/mp4;base64,/u,
+  );
   await expect(video).toContainText("video/mp4");
   await expect(file.locator('[data-font-awesome-icon="file"]')).toBeVisible();
   await expect(file).toContainText("text/plain");
@@ -1663,6 +1666,62 @@ test("lazy video thumbnails defer media requests until they approach the viewpor
   await expect(preview.locator("video")).toHaveAttribute(
     "src",
     "/v1/attachments/att_lazy_video",
+  );
+});
+
+test("video thumbnails restore their media source after reconnecting", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.evaluate(() => {
+    const pending = document.createElement("trouve-image-preview");
+    pending.id = "reconnect-pending-video";
+    pending.source = "data:video/mp4;base64,dmlkZW8=";
+    pending.name = "pending.mp4";
+    pending.mime = "video/mp4";
+    pending.video = true;
+
+    const durable = document.createElement("trouve-image-preview");
+    durable.id = "reconnect-durable-video";
+    durable.source = "/v1/attachments/att_reconnect_video";
+    durable.name = "durable.mp4";
+    durable.mime = "video/mp4";
+    durable.video = true;
+    durable.lazy = true;
+    durable.style.position = "fixed";
+    durable.style.top = "0";
+
+    document.body.append(pending, durable);
+  });
+
+  const pending = page.locator("#reconnect-pending-video");
+  const durable = page.locator("#reconnect-durable-video");
+  await expect(pending.locator("video")).toHaveAttribute(
+    "src",
+    "data:video/mp4;base64,dmlkZW8=",
+  );
+  await expect(durable.locator("video")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_reconnect_video",
+  );
+
+  await page.evaluate(() => {
+    const pending = document.querySelector("#reconnect-pending-video");
+    const durable = document.querySelector("#reconnect-durable-video");
+    if (pending === null || durable === null) throw new Error("missing video previews");
+    pending.remove();
+    durable.remove();
+    document.body.append(pending, durable);
+  });
+
+  await expect(pending.locator("video")).toHaveAttribute(
+    "src",
+    "data:video/mp4;base64,dmlkZW8=",
+  );
+  await expect(durable.locator("video")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_reconnect_video",
   );
 });
 
