@@ -71,6 +71,9 @@ const MAX_SESSION_PR_HEAD_MOVED_ATTEMPTS: u32 = 12;
 const MAX_SESSION_PR_REQUEST_ATTEMPTS: u32 = 48;
 const SESSION_PR_AUTH_RETRY_SECONDS: i64 = 30;
 const SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+/// Repository identity changes rarely, but Git remotes remain mutable outside
+/// trouve. Revalidate periodically without spawning Git on every list poll.
+const WORKSPACE_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
 const PR_VERIFICATION_FAILURE_AUTH: &str = "authentication";
 const PR_VERIFICATION_FAILURE_CONTENTION: &str = "contention";
 const PR_VERIFICATION_FAILURE_EVIDENCE: &str = "evidence";
@@ -1932,6 +1935,10 @@ struct GlobalDefaults {
     thinking_level: Option<String>,
     permission_mode: trouve_protocol::PermissionMode,
 }
+struct WorkspaceListCacheEntry {
+    item: WorkspaceListItem,
+    refreshed_at: Instant,
+}
 
 #[derive(Clone, Copy)]
 struct AutomatedReviewToolBudget {
@@ -2028,9 +2035,9 @@ pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     pub(crate) config_dir: Option<PathBuf>,
-    /// Repository identity is stable for a registered workspace. Cache it so
-    /// the frequently-read workspace list does not spawn Git on every poll.
-    workspace_list_cache: Mutex<HashMap<String, WorkspaceListItem>>,
+    /// Cache repository identity so frequent workspace-list polls normally
+    /// avoid Git while still observing external remote changes within a bound.
+    workspace_list_cache: Mutex<HashMap<String, WorkspaceListCacheEntry>>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute newly released or account-specific live models.
@@ -7698,24 +7705,25 @@ impl Engine {
 
     fn refresh_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
         let item = Self::resolve_workspace_list_item(workspace);
-        self.workspace_list_cache
-            .lock()
-            .unwrap()
-            .insert(item.id.clone(), item.clone());
+        self.workspace_list_cache.lock().unwrap().insert(
+            item.id.clone(),
+            WorkspaceListCacheEntry {
+                item: item.clone(),
+                refreshed_at: Instant::now(),
+            },
+        );
         item
     }
 
     fn cached_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
-        if let Some(item) = self
+        let cached = self
             .workspace_list_cache
             .lock()
             .unwrap()
             .get(&workspace.id)
-            .cloned()
-        {
-            return item;
-        }
-        self.refresh_workspace_list_item(workspace)
+            .filter(|entry| entry.refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL)
+            .map(|entry| entry.item.clone());
+        cached.unwrap_or_else(|| self.refresh_workspace_list_item(workspace))
     }
 
     pub fn register_workspace(
@@ -22321,14 +22329,45 @@ default_permission_mode = "ask"
         assert_eq!(first.repository_name.as_deref(), Some("Widgets"));
         assert_eq!(second.repository_name.as_deref(), Some("Widgets"));
 
+        let mut remote = std::process::Command::new("git");
+        remote.arg("-C").arg(second_directory.path()).args([
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:Acme/Other.git",
+        ]);
+        assert!(
+            trouve_process::output(&mut remote)
+                .unwrap()
+                .status
+                .success()
+        );
+        engine
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get_mut(&second.id)
+            .unwrap()
+            .refreshed_at = Instant::now() - WORKSPACE_LIST_CACHE_TTL;
+
+        let listed = engine.list_workspaces().unwrap();
+        let refreshed = listed
+            .iter()
+            .find(|workspace| workspace.id == second.id)
+            .unwrap();
+        assert_ne!(refreshed.repository_key, first.repository_key);
+        assert_eq!(refreshed.repository_name.as_deref(), Some("Other"));
+
         drop(first_directory);
         drop(second_directory);
-        let listed = engine.list_workspaces().unwrap();
-        assert_eq!(listed.len(), 2);
-        assert!(
-            listed
+        let cached = engine.list_workspaces().unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(
+            cached
                 .iter()
-                .all(|workspace| workspace.repository_key == first.repository_key)
+                .find(|workspace| workspace.id == second.id)
+                .and_then(|workspace| workspace.repository_name.as_deref()),
+            Some("Other")
         );
     }
 
