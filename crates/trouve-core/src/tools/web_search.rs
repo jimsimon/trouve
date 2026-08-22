@@ -176,22 +176,22 @@ impl ProviderDispatcher {
     }
 }
 
-enum SessionCleanupJob {
-    PendingInitialization {
-        endpoint: String,
-        protocol_version: String,
-        response: ProviderResponseFuture,
-    },
-    Established {
-        endpoint: String,
-        session_id: String,
-        protocol_version: String,
-    },
+struct PendingInitializationJob {
+    endpoint: String,
+    protocol_version: String,
+    response: ProviderResponseFuture,
+}
+
+struct SessionCleanupJob {
+    endpoint: String,
+    session_id: String,
+    protocol_version: String,
 }
 
 struct SessionCleanupWorker {
     sender: Option<tokio::sync::mpsc::Sender<SessionCleanupJob>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    recovery_sender: Option<tokio::sync::mpsc::UnboundedSender<PendingInitializationJob>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
 }
 
@@ -199,9 +199,15 @@ impl SessionCleanupWorker {
     fn new() -> Self {
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<SessionCleanupJob>(SESSION_CLEANUP_CAPACITY);
+        // Header recovery must never consume DELETE admission. Its ingress is
+        // drained immediately into deadline-bounded futures; production input
+        // is itself bounded by the dispatch interval (at most roughly
+        // SEARCH_TIMEOUT / MIN_PROVIDER_INTERVAL live recoveries per tool).
+        let (recovery_sender, mut recovery_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<PendingInitializationJob>();
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = pending.clone();
-        let thread = std::thread::Builder::new()
+        let cleanup_thread = std::thread::Builder::new()
             .name("trouve-web-search-cleanup".into())
             .stack_size(256 * 1024)
             .spawn(move || {
@@ -225,40 +231,11 @@ impl SessionCleanupWorker {
                         let client = client.clone();
                         let pending = worker_pending.clone();
                         cleanups.spawn(async move {
-                            let (endpoint, session_id, protocol_version) = match request {
-                                SessionCleanupJob::PendingInitialization {
-                                    endpoint,
-                                    protocol_version,
-                                    response,
-                                } => {
-                                    let Ok(Ok(response)) =
-                                        tokio::time::timeout(SEARCH_TIMEOUT, response).await
-                                    else {
-                                        pending.fetch_sub(1, Ordering::Release);
-                                        return;
-                                    };
-                                    let Some(session_id) = response
-                                        .headers()
-                                        .get(MCP_SESSION_ID_HEADER)
-                                        .and_then(|value| value.to_str().ok())
-                                        .map(str::to_owned)
-                                    else {
-                                        pending.fetch_sub(1, Ordering::Release);
-                                        return;
-                                    };
-                                    (endpoint, session_id, protocol_version)
-                                }
-                                SessionCleanupJob::Established {
-                                    endpoint,
-                                    session_id,
-                                    protocol_version,
-                                } => (endpoint, session_id, protocol_version),
-                            };
                             let _ = client
-                                .delete(endpoint)
+                                .delete(request.endpoint)
                                 .timeout(SESSION_CLEANUP_TIMEOUT)
-                                .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
-                                .header(MCP_SESSION_ID_HEADER, session_id)
+                                .header(MCP_PROTOCOL_VERSION_HEADER, request.protocol_version)
+                                .header(MCP_SESSION_ID_HEADER, request.session_id)
                                 .send()
                                 .await;
                             pending.fetch_sub(1, Ordering::Release);
@@ -268,9 +245,56 @@ impl SessionCleanupWorker {
                 });
             })
             .expect("web search cleanup worker must start");
+        let recovery_cleanup_sender = sender.clone();
+        let recovery_pending = pending.clone();
+        let recovery_thread = std::thread::Builder::new()
+            .name("trouve-web-search-session-recovery".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("web search session recovery runtime must start");
+                runtime.block_on(async move {
+                    let mut recoveries = tokio::task::JoinSet::new();
+                    while let Some(job) = recovery_receiver.recv().await {
+                        let cleanup_sender = recovery_cleanup_sender.clone();
+                        let pending = recovery_pending.clone();
+                        recoveries.spawn(async move {
+                            let Ok(Ok(response)) =
+                                tokio::time::timeout(SEARCH_TIMEOUT, job.response).await
+                            else {
+                                pending.fetch_sub(1, Ordering::Release);
+                                return;
+                            };
+                            let Some(session_id) = response
+                                .headers()
+                                .get(MCP_SESSION_ID_HEADER)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned)
+                            else {
+                                pending.fetch_sub(1, Ordering::Release);
+                                return;
+                            };
+                            let Ok(permit) = cleanup_sender.reserve_owned().await else {
+                                pending.fetch_sub(1, Ordering::Release);
+                                return;
+                            };
+                            permit.send(SessionCleanupJob {
+                                endpoint: job.endpoint,
+                                session_id,
+                                protocol_version: job.protocol_version,
+                            });
+                        });
+                    }
+                    while recoveries.join_next().await.is_some() {}
+                });
+            })
+            .expect("web search session recovery worker must start");
         Self {
             sender: Some(sender),
-            thread: Some(thread),
+            recovery_sender: Some(recovery_sender),
+            threads: vec![cleanup_thread, recovery_thread],
             pending,
         }
     }
@@ -302,15 +326,26 @@ impl SessionCleanupWorker {
         self.pending.fetch_add(1, Ordering::AcqRel);
         permit.send(job);
     }
+
+    fn recover(&self, job: PendingInitializationJob) {
+        let Some(sender) = &self.recovery_sender else {
+            return;
+        };
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        if sender.send(job).is_err() {
+            self.pending.fetch_sub(1, Ordering::Release);
+        }
+    }
 }
 
 impl Drop for SessionCleanupWorker {
     fn drop(&mut self) {
-        // Closing the bounded queue asks the independently-owned worker thread
-        // to drain. Detaching its handle keeps tool/engine destruction
-        // nonblocking while the thread survives Tokio runtime shutdown.
+        // Close recovery admission first. Its independently-owned thread keeps
+        // the cleanup queue alive until every handed-off initialization reaches
+        // its request deadline and any discovered session is queued for DELETE.
+        drop(self.recovery_sender.take());
         drop(self.sender.take());
-        drop(self.thread.take());
+        self.threads.clear();
     }
 }
 
@@ -635,14 +670,12 @@ impl WebSearch {
                 // The caller remains promptly cancellable while independently
                 // bounded lifecycle work captures and closes any session that
                 // the handed-off initialization created.
-                self.cleanup.send(
-                    cleanup_permit,
-                    SessionCleanupJob::PendingInitialization {
-                        endpoint: provider.endpoint.clone(),
-                        protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
-                        response,
-                    },
-                );
+                drop(cleanup_permit);
+                self.cleanup.recover(PendingInitializationJob {
+                    endpoint: provider.endpoint.clone(),
+                    protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
+                    response,
+                });
                 return Err(SearchError::Cancelled);
             }
             Err(error) => return Err(error),
@@ -733,7 +766,7 @@ impl WebSearch {
         };
         self.cleanup.send(
             permit,
-            SessionCleanupJob::Established {
+            SessionCleanupJob {
                 endpoint: provider.endpoint.clone(),
                 session_id,
                 protocol_version: session.protocol_version,
@@ -1750,6 +1783,20 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
         assert_eq!(result.result["error"], "search cancelled");
+        let capacity_cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::new();
+        for _ in 0..SESSION_CLEANUP_CAPACITY {
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                tool.cleanup.reserve(&capacity_cancel),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permits.push(permit),
+                _ => panic!("pending header recovery must not consume teardown admission"),
+            }
+        }
+        drop(permits);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !requests
                 .lock()
