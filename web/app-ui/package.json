@@ -62,9 +62,9 @@
     "unified": "^11.0.5"
   },
   "devDependencies": {
-    "@axe-core/playwright": "4.12.1",
+    "@axe-core/playwright": "4.13.0",
     "@lit-labs/ssr": "4.1.0",
-    "@playwright/test": "1.62.0",
+    "@playwright/test": "1.62.1",
     "@types/node": "^24.0.0",
     "ajv": "8.20.0",
     "openapi-typescript": "7.13.0",
