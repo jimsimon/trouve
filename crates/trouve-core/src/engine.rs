@@ -7798,14 +7798,22 @@ impl Engine {
         self.cache_workspace_list_item(resolve(workspace, remaining))
     }
 
-    fn prepare_workspace_registration(
-        &self,
-        path: &str,
-        name: Option<String>,
-    ) -> Result<(Workspace, bool), EngineError> {
+    fn canonical_workspace_registration_path(path: &str) -> Result<PathBuf, EngineError> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| EngineError::BadRequest(format!("invalid path {path}: {e}")))?;
-        if !git::is_git_repo(&canonical) {
+        Ok(canonical)
+    }
+
+    fn workspace_registration_lock(&self, canonical: &Path) -> Arc<Mutex<()>> {
+        self.workspace_list_refresh_lock(&format!("registration:{}", canonical.to_string_lossy()))
+    }
+
+    fn prepare_workspace_registration(
+        &self,
+        canonical: &Path,
+        name: Option<String>,
+    ) -> Result<(Workspace, bool), EngineError> {
+        if !git::is_git_repo(canonical) {
             return Err(EngineError::BadRequest(format!(
                 "{} is not a git repository",
                 canonical.display()
@@ -7867,7 +7875,10 @@ impl Engine {
         path: &str,
         name: Option<String>,
     ) -> Result<WorkspaceListItem, EngineError> {
-        let (workspace, existing) = self.prepare_workspace_registration(path, name)?;
+        let canonical = Self::canonical_workspace_registration_path(path)?;
+        let registration_lock = self.workspace_registration_lock(&canonical);
+        let _registration = registration_lock.lock().unwrap();
+        let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
         let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
         let _refresh = refresh_lock.lock().unwrap();
         let item = Self::resolve_workspace_list_item(
@@ -7900,7 +7911,15 @@ impl Engine {
                 "stale: review workspace registration was cancelled".into(),
             ));
         }
-        let (workspace, existing) = self.prepare_workspace_registration(path, name)?;
+        let canonical = Self::canonical_workspace_registration_path(path)?;
+        let registration_lock = self.workspace_registration_lock(&canonical);
+        let _registration = registration_lock.lock().unwrap();
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
         let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
         let _refresh = refresh_lock.lock().unwrap();
         let item = Self::resolve_workspace_list_item(
@@ -22509,6 +22528,44 @@ default_permission_mode = "ask"
                 .and_then(|workspace| workspace.repository_name.as_deref()),
             Some("Other")
         );
+    }
+
+    #[test]
+    fn concurrent_first_workspace_registrations_share_one_workspace() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|index| {
+                let engine = Arc::clone(&engine);
+                let repository_path = repository.path().to_path_buf();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    engine.register_workspace(
+                        repository_path.to_str().unwrap(),
+                        Some(format!("concurrent registration {index}")),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let registrations = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(registrations[0].id, registrations[1].id);
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
     }
 
     #[test]
