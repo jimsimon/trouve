@@ -138,9 +138,14 @@ impl ProviderDispatcher {
             biased;
             acknowledged = &mut acknowledged_rx => {
                 if acknowledged.is_err() {
-                    return Err(SearchError::Failed(
-                        "provider request ended before outbound body handoff".into(),
-                    ));
+                    return match send.await {
+                        Ok(_) => Err(SearchError::Failed(
+                            "provider request ended before outbound body handoff".into(),
+                        )),
+                        Err(error) => Err(SearchError::Failed(format!(
+                            "request failed: {error}"
+                        ))),
+                    };
                 }
                 None
             },
@@ -1156,6 +1161,12 @@ mod tests {
 
     use super::*;
 
+    async fn wait_for(mut predicate: impl FnMut() -> bool) {
+        while !predicate() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         at: Instant,
@@ -1456,11 +1467,10 @@ mod tests {
             .await;
 
         assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while requests.lock().unwrap().len() < 4 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| requests.lock().unwrap().len() >= 4),
+        )
         .await
         .unwrap();
         let requests = requests.lock().unwrap();
@@ -1521,16 +1531,16 @@ mod tests {
                 .unwrap()
                 .contains("initialization omitted protocol version")
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|request| request.method == "DELETE")
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+            }),
+        )
         .await
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1670,11 +1680,10 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while requests.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| !requests.lock().unwrap().is_empty()),
+        )
         .await
         .unwrap();
         first_cancel.cancel();
@@ -1682,16 +1691,16 @@ mod tests {
             first.await.unwrap().status,
             trouve_protocol::ToolStatus::Error
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|request| request.method == "DELETE")
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+            }),
+        )
         .await
         .expect("a cancelled handed-off initialization must be cleaned up");
 
@@ -1707,25 +1716,25 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| {
-                    request
-                        .body
-                        .as_ref()
-                        .and_then(|body| body.get("method"))
-                        .and_then(Value::as_str)
-                        == Some("initialize")
-                })
-                .count()
-                < 2
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| {
+                        request
+                            .body
+                            .as_ref()
+                            .and_then(|body| body.get("method"))
+                            .and_then(Value::as_str)
+                            == Some("initialize")
+                    })
+                    .count()
+                    >= 2
+            }),
+        )
         .await
         .unwrap();
         let observed_spacing = {
@@ -1779,11 +1788,10 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while requests.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| !requests.lock().unwrap().is_empty()),
+        )
         .await
         .unwrap();
 
@@ -1808,23 +1816,22 @@ mod tests {
             }
         }
         drop(permits);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|request| request.method == "DELETE")
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+            }),
+        )
         .await
         .expect("delayed initialization must retain its session cleanup path");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while tool.cleanup.pending.load(Ordering::Acquire) != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| tool.cleanup.pending.load(Ordering::Acquire) == 0),
+        )
         .await
         .expect("delayed initialization cleanup must remain bounded");
     }
@@ -1899,9 +1906,10 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let tool_calls = requests
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
                     .lock()
                     .unwrap()
                     .iter()
@@ -1913,13 +1921,10 @@ mod tests {
                             .and_then(Value::as_str)
                             == Some("tools/call")
                     })
-                    .count();
-                if tool_calls >= 1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+                    .count()
+                    >= 1
+            }),
+        )
         .await
         .unwrap();
 
@@ -1935,9 +1940,10 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let tool_calls = requests
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
                     .lock()
                     .unwrap()
                     .iter()
@@ -1949,13 +1955,10 @@ mod tests {
                             .and_then(Value::as_str)
                             == Some("tools/call")
                     })
-                    .count();
-                if tool_calls >= 2 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+                    .count()
+                    >= 2
+            }),
+        )
         .await
         .expect("a stalled first response must not hold the dispatch gate");
 
@@ -2097,11 +2100,10 @@ mod tests {
             let tool = tool.clone();
             async move { tool.run(&ctx, &json!({"query": "cancel in flight"})).await }
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while calls.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for(|| calls.load(Ordering::SeqCst) != 0),
+        )
         .await
         .unwrap();
         cancel.cancel();
@@ -2140,18 +2142,19 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !requests.lock().unwrap().iter().any(|request| {
-                request
-                    .body
-                    .as_ref()
-                    .and_then(|body| body.get("method"))
-                    .and_then(Value::as_str)
-                    == Some("tools/call")
-            }) {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests.lock().unwrap().iter().any(|request| {
+                    request
+                        .body
+                        .as_ref()
+                        .and_then(|body| body.get("method"))
+                        .and_then(Value::as_str)
+                        == Some("tools/call")
+                })
+            }),
+        )
         .await
         .unwrap();
 
@@ -2162,16 +2165,16 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
         assert_eq!(result.result["error"], "search cancelled");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|request| request.method == "DELETE")
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+            }),
+        )
         .await
         .expect("the lifecycle worker must dispatch cleanup");
 
@@ -2182,11 +2185,10 @@ mod tests {
             drop_started.elapsed() < Duration::from_millis(100),
             "dropping the owner must only signal its independent cleanup drain"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while pending.load(Ordering::Acquire) != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| pending.load(Ordering::Acquire) == 0),
+        )
         .await
         .expect("the detached lifecycle worker must finish its bounded drain");
     }
