@@ -2,7 +2,9 @@
 
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel,
+};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -11,7 +13,7 @@ const LAUNCHER_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKER_TIMEOUT: Duration = Duration::from_secs(12);
 const HANDOFF_CONFIRMATION_INTERVAL: Duration = Duration::from_secs(2);
 const LAUNCHER_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const LAUNCHER_REAPER_WORKERS: usize = 8;
+const LAUNCHER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DISPATCH_QUEUED: u8 = 0;
 const DISPATCH_ENTERED: u8 = 1;
 const DISPATCH_CANCELLED: u8 = 2;
@@ -278,33 +280,47 @@ fn launcher_reaper() -> Result<&'static Sender<std::process::Child>, OpenAttempt
 
 fn start_launcher_reaper() -> Option<Sender<std::process::Child>> {
     let (sender, receiver) = channel::<std::process::Child>();
-    let receiver = Arc::new(std::sync::Mutex::new(receiver));
-    let mut workers = 0usize;
-    for index in 0..LAUNCHER_REAPER_WORKERS {
-        let receiver = Arc::clone(&receiver);
-        if std::thread::Builder::new()
-            .name(format!("trouve-opener-reaper-{index}"))
-            .spawn(move || {
-                loop {
-                    let received = {
-                        let Ok(receiver) = receiver.lock() else {
-                            tracing::warn!("system launcher reaper lock was poisoned");
-                            return;
-                        };
-                        receiver.recv()
-                    };
-                    let Ok(mut child) = received else { return };
-                    if let Err(error) = child.wait() {
-                        tracing::warn!(%error, "could not reap system launcher");
-                    }
-                }
-            })
-            .is_ok()
-        {
-            workers += 1;
+    std::thread::Builder::new()
+        .name("trouve-opener-reaper".into())
+        .spawn(move || supervise_launchers(receiver))
+        .map(|_| sender)
+        .map_err(|error| {
+            tracing::warn!(%error, "could not start system launcher reaper");
+        })
+        .ok()
+}
+
+fn supervise_launchers(receiver: Receiver<std::process::Child>) {
+    let mut children = Vec::new();
+    loop {
+        match receiver.recv_timeout(LAUNCHER_REAPER_POLL_INTERVAL) {
+            Ok(child) => children.push(child),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
         }
+        while let Ok(child) = receiver.try_recv() {
+            children.push(child);
+        }
+        poll_launchers(&mut children);
     }
-    (workers > 0).then_some(sender)
+}
+
+fn poll_launchers(children: &mut Vec<std::process::Child>) {
+    children.retain_mut(|child| match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            // An inspection failure leaves ownership ambiguous. A blocking
+            // wait is the only portable way to avoid dropping an unreaped
+            // child; this rare fallback does not affect the normal polling
+            // path for other launchers.
+            tracing::warn!(%error, "could not inspect system launcher in reaper");
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "could not reap system launcher");
+            }
+            false
+        }
+    });
 }
 
 fn reap_launcher_in_background(child: std::process::Child, reaper: &Sender<std::process::Child>) {
@@ -413,5 +429,33 @@ mod tests {
 
         dispatch.enter_launch().unwrap();
         assert!(!dispatch.cancel_if_queued());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaper_poll_collects_a_later_exit_while_an_earlier_launcher_is_live() {
+        let mut long_command = std::process::Command::new("sleep");
+        long_command.arg("2");
+        let long_child = trouve_process::spawn(&mut long_command).unwrap();
+        let long_id = long_child.id();
+        let mut short_command = std::process::Command::new("true");
+        let short_child = trouve_process::spawn(&mut short_command).unwrap();
+        let mut children = vec![long_child, short_child];
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        while children.len() > 1 && Instant::now() < deadline {
+            poll_launchers(&mut children);
+            std::thread::sleep(LAUNCHER_POLL_INTERVAL);
+        }
+
+        let remaining_ids = children
+            .iter()
+            .map(std::process::Child::id)
+            .collect::<Vec<_>>();
+        for mut child in children {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(remaining_ids, vec![long_id]);
     }
 }
