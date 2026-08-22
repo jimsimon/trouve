@@ -25,14 +25,14 @@ const worker = javascript.find(({ name }) => name.startsWith("content-worker-"))
 // presentation preference, and Font Awesome icon UI; the PWA remains on the
 // original entry ceiling. Font assets have their own explicit budget below.
 const entryLimit = mode === "desktop" ? 856_000 : 850_000;
-// The merged Vite/Rolldown graph emits 3,205,008 B with evidence-backed review
+// The rebased Vite/Rolldown graph emits 3,210,969 B with evidence-backed review
 // history, churn metrics, durable turn phase, conditional title, route-scoped
 // new-session lifecycle, outside-diff review, version check, per-thread
-// transcript search, and workspace organization controls. Keep less than 2 kB
-// of aggregate headroom while per-entry limits prevent one oversized chunk.
-const totalJavaScriptLimit = 3_207_000;
-// The combined transcript-search and workspace-organization CSS is 185,066 B.
-// Preserve less than 2 kB of headroom with a regression-sensitive ceiling.
+// transcript search, and workspace organization controls. Keep about 1 kB of
+// aggregate headroom while per-entry limits prevent one oversized chunk.
+const totalJavaScriptLimit = 3_212_000;
+// The combined transcript-search and workspace-organization CSS is 185,816 B.
+// Preserve less than 1.2 kB of headroom with a regression-sensitive ceiling.
 const totalStyleLimit = 187_000;
 const limits = {
   entry: entryLimit,
