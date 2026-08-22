@@ -2399,7 +2399,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentGeneration += 1;
     this.#newSessionModelOptions = {};
-    this.#newSessionAttachmentGeneration += 1;
     this.#newSessionAttachmentPending = false;
     this.#newSessionPreferredBaseRef = "";
     form.reset();

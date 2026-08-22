@@ -1948,12 +1948,6 @@ fn normalize_thinking_option(
         if let Some(model) = model
             && let Some((minimum, maximum)) = advertised_thinking_budget(model)
         {
-            // An explicit native budget wins over a legacy/inherited canonical
-            // value, just as native enum options do below.
-            if options.contains_key("thinking_budget_tokens") {
-                options.remove("thinking_level");
-                return;
-            }
             let selected = canonical
                 .as_str()
                 .and_then(parse_thinking_budget)

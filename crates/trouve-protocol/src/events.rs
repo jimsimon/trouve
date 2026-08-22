@@ -25,6 +25,19 @@ where
         .transpose()
 }
 
+fn serialize_optional_f64<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(value) if value.is_finite() => serializer.serialize_some(value),
+        Some(_) => Err(<S::Error as serde::ser::Error>::custom(
+            "number is outside the finite f64 range",
+        )),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Which stream an event belongs to. Cursors are monotonic per scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -200,6 +213,7 @@ pub struct Usage {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_f64",
         deserialize_with = "deserialize_optional_f64"
     )]
     pub cost_usd: Option<f64>,
@@ -854,6 +868,17 @@ mod tests {
             )
             .is_err()
         );
+
+        for cost_usd in [f64::INFINITY, f64::NAN] {
+            let invalid = Event::TurnUsageUpdated {
+                turn: 1,
+                usage: Usage {
+                    cost_usd: Some(cost_usd),
+                    ..Usage::default()
+                },
+            };
+            assert!(serde_json::to_string(&invalid).is_err());
+        }
     }
 
     #[test]
