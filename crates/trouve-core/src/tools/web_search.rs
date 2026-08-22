@@ -291,7 +291,17 @@ impl WebSearch {
         &self,
         cancel: &tokio_util::sync::CancellationToken,
         request: reqwest::RequestBuilder,
+        rate_limited: bool,
     ) -> Result<reqwest::Response, SearchError> {
+        if !rate_limited {
+            return tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(SearchError::Cancelled),
+                response = request.send() => response
+                    .map_err(|error| SearchError::Failed(format!("request failed: {error}"))),
+            };
+        }
+
         let mut last_request = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(SearchError::Cancelled),
@@ -313,19 +323,29 @@ impl WebSearch {
             return Err(SearchError::Cancelled);
         }
 
-        // Keep the gate through the first response headers so another task
-        // cannot reserve a later slot and dispatch ahead of this request.
-        // Once send() is polled, cancellation may race an already-started
-        // request, so that attempt must still consume its provider slot.
+        // Poll send once while holding the gate. That begins this request in
+        // reservation order without retaining the global gate while a remote
+        // endpoint stalls before its response headers.
         let attempted_at = Instant::now();
-        let response = tokio::select! {
-            biased;
-            response = request.send() => response
-                .map_err(|error| SearchError::Failed(format!("request failed: {error}"))),
-            _ = cancel.cancelled() => Err(SearchError::Cancelled),
-        };
+        let mut send = Box::pin(request.send());
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(send.as_mut(), cx))
+        })
+        .await;
         *last_request = Some(attempted_at);
-        response
+        drop(last_request);
+
+        let response = match first_poll {
+            std::task::Poll::Ready(response) => response,
+            std::task::Poll::Pending => {
+                tokio::select! {
+                    biased;
+                    response = send => response,
+                    _ = cancel.cancelled() => return Err(SearchError::Cancelled),
+                }
+            }
+        };
+        response.map_err(|error| SearchError::Failed(format!("request failed: {error}")))
     }
 
     fn provider_request(
@@ -373,7 +393,11 @@ impl WebSearch {
             },
         });
         let response = self
-            .send_provider_request(&ctx.cancel, self.provider_request(provider, &body, None))
+            .send_provider_request(
+                &ctx.cancel,
+                self.provider_request(provider, &body, None),
+                true,
+            )
             .await?;
         let session_id = response
             .headers()
@@ -384,19 +408,37 @@ impl WebSearch {
                 })
             })
             .transpose()?;
-        let value = self.read_mcp_response(ctx, response, 0).await?;
-        let protocol_version = value
+        let mut session = McpSession {
+            id: session_id,
+            protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
+        };
+        let value = match self.read_mcp_response(ctx, response, 0).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.close_provider_session(provider, &session);
+                return Err(error);
+            }
+        };
+        if value.get("error").is_some() {
+            let error = extract_mcp_value(&value)
+                .expect_err("an MCP error response cannot contain a successful tool result");
+            self.close_provider_session(provider, &session);
+            return Err(SearchError::Failed(bounded_error(
+                &error,
+                MAX_PROVIDER_ERROR_CHARS,
+            )));
+        }
+        let Some(protocol_version) = value
             .pointer("/result/protocolVersion")
             .and_then(Value::as_str)
             .filter(|version| !version.is_empty())
-            .ok_or_else(|| {
-                SearchError::Failed("provider initialization omitted protocol version".into())
-            })?
-            .to_owned();
-        let session = McpSession {
-            id: session_id,
-            protocol_version,
+        else {
+            self.close_provider_session(provider, &session);
+            return Err(SearchError::Failed(
+                "provider initialization omitted protocol version".into(),
+            ));
         };
+        session.protocol_version = protocol_version.to_owned();
         let initialized = json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -406,6 +448,7 @@ impl WebSearch {
             .send_provider_request(
                 &ctx.cancel,
                 self.provider_request(provider, &initialized, Some(&session)),
+                false,
             )
             .await;
         match response {
@@ -415,31 +458,33 @@ impl WebSearch {
                     "provider rejected MCP initialization with HTTP {}",
                     response.status()
                 ));
-                self.close_provider_session(provider, &session).await;
+                self.close_provider_session(provider, &session);
                 Err(error)
             }
             Err(error) => {
-                self.close_provider_session(provider, &session).await;
+                self.close_provider_session(provider, &session);
                 Err(error)
             }
         }
     }
 
-    async fn close_provider_session(&self, provider: &SearchProvider, session: &McpSession) {
+    fn close_provider_session(&self, provider: &SearchProvider, session: &McpSession) {
         let Some(id) = &session.id else {
             return;
         };
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let request = self
-            .client
-            .delete(&provider.endpoint)
-            .timeout(Duration::from_secs(2))
-            .header(
-                MCP_PROTOCOL_VERSION_HEADER,
-                session.protocol_version.as_str(),
-            )
-            .header(MCP_SESSION_ID_HEADER, id);
-        let _ = self.send_provider_request(&cancel, request).await;
+        let client = self.client.clone();
+        let endpoint = provider.endpoint.clone();
+        let protocol_version = session.protocol_version.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let _ = client
+                .delete(endpoint)
+                .timeout(Duration::from_secs(2))
+                .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
+                .header(MCP_SESSION_ID_HEADER, id)
+                .send()
+                .await;
+        });
     }
 
     async fn call_provider(
@@ -463,6 +508,7 @@ impl WebSearch {
             .send_provider_request(
                 &ctx.cancel,
                 self.provider_request(provider, &body, Some(&session)),
+                false,
             )
             .await
         {
@@ -476,7 +522,7 @@ impl WebSearch {
                 }),
             Err(error) => Err(error),
         };
-        self.close_provider_session(provider, &session).await;
+        self.close_provider_session(provider, &session);
         result
     }
 
@@ -812,10 +858,11 @@ mod tests {
         protocol_version: Option<String>,
     }
 
-    async fn capturing_mock_server_with_delay(
+    async fn capturing_mock_server_with_initialization(
         status: &'static str,
         body: impl Into<String>,
         response_delay: Duration,
+        initialization_body: Option<String>,
     ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<CapturedRequest>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -825,11 +872,13 @@ mod tests {
         tokio::spawn({
             let calls = calls.clone();
             let requests = requests.clone();
+            let initialization_body = initialization_body.clone();
             async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let calls = calls.clone();
                     let requests = requests.clone();
                     let body = body.clone();
+                    let initialization_body = initialization_body.clone();
                     tokio::spawn(async move {
                         let mut request = Vec::new();
                         let mut buffer = [0; 4096];
@@ -910,16 +959,18 @@ mod tests {
                             )
                         } else if rpc_method.as_deref() == Some("initialize") {
                             calls.fetch_add(1, Ordering::SeqCst);
-                            let initialized = json!({
-                                "jsonrpc": "2.0",
-                                "id": 0,
-                                "result": {
-                                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                                    "capabilities": {"tools": {}},
-                                    "serverInfo": {"name": "mock-search", "version": "1"},
-                                },
-                            })
-                            .to_string();
+                            let initialized = initialization_body.unwrap_or_else(|| {
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 0,
+                                    "result": {
+                                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                                        "capabilities": {"tools": {}},
+                                        "serverInfo": {"name": "mock-search", "version": "1"},
+                                    },
+                                })
+                                .to_string()
+                            });
                             format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{initialized}",
                                 initialized.len()
@@ -950,6 +1001,14 @@ mod tests {
             }
         });
         (format!("http://{address}/mcp"), calls, requests)
+    }
+
+    async fn capturing_mock_server_with_delay(
+        status: &'static str,
+        body: impl Into<String>,
+        response_delay: Duration,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<CapturedRequest>>>) {
+        capturing_mock_server_with_initialization(status, body, response_delay, None).await
     }
 
     async fn mock_server_with_delay(
@@ -1061,6 +1120,13 @@ mod tests {
             .await;
 
         assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().len() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].body.as_ref().unwrap()["method"], "initialize");
@@ -1087,6 +1153,61 @@ mod tests {
         assert_eq!(requests[2].session_id.as_deref(), Some("test-session"));
         assert_eq!(requests[3].method, "DELETE");
         assert_eq!(requests[3].session_id.as_deref(), Some("test-session"));
+    }
+
+    #[tokio::test]
+    async fn initialization_failures_tear_down_allocated_sessions() {
+        let invalid_initialization = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {},
+        })
+        .to_string();
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
+        let (endpoint, calls, requests) = capturing_mock_server_with_initialization(
+            "200 OK",
+            body,
+            Duration::ZERO,
+            Some(invalid_initialization),
+        )
+        .await;
+        let tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
+
+        let result = tool
+            .run(&ToolCtx::default(), &json!({"query": "bad initialization"}))
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            result.result["error"]
+                .as_str()
+                .unwrap()
+                .contains("initialization omitted protocol version")
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.method == "DELETE")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let requests = requests.lock().unwrap();
+        let cleanup = requests
+            .iter()
+            .find(|request| request.method == "DELETE")
+            .unwrap();
+        assert_eq!(cleanup.session_id.as_deref(), Some("test-session"));
+        assert_eq!(
+            cleanup.protocol_version.as_deref(),
+            Some(MCP_PROTOCOL_VERSION)
+        );
     }
 
     #[tokio::test]
@@ -1161,12 +1282,100 @@ mod tests {
         assert_eq!(first.status, trouve_protocol::ToolStatus::Ok);
         assert_eq!(second.status, trouve_protocol::ToolStatus::Ok);
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 8);
+        let initialization_times: Vec<Instant> = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("method"))
+                    .and_then(Value::as_str)
+                    == Some("initialize")
+            })
+            .map(|request| request.at)
+            .collect();
+        assert_eq!(initialization_times.len(), 2);
         assert!(
-            requests
-                .windows(2)
-                .all(|pair| { pair[1].at.duration_since(pair[0].at) >= Duration::from_millis(30) })
+            initialization_times[1].duration_since(initialization_times[0])
+                >= Duration::from_millis(30)
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_response_headers_do_not_block_later_dispatches() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"late"}]}}"#;
+        let (endpoint, calls, requests) =
+            capturing_mock_server_with_delay("200 OK", body, Duration::from_secs(30)).await;
+        let tool = Arc::new(WebSearch::new(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::from_millis(40),
+        ));
+        let first_ctx = ToolCtx {
+            thread_id: "thread-a".into(),
+            ..Default::default()
+        };
+        let first_cancel = first_ctx.cancel.clone();
+        let first = tokio::spawn({
+            let tool = tool.clone();
+            async move {
+                tool.run(&first_ctx, &json!({"query": "first stalled query"}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let tool_calls = requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| {
+                        request
+                            .body
+                            .as_ref()
+                            .and_then(|body| body.get("method"))
+                            .and_then(Value::as_str)
+                            == Some("tools/call")
+                    })
+                    .count();
+                if tool_calls >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second_ctx = ToolCtx {
+            thread_id: "thread-b".into(),
+            ..Default::default()
+        };
+        let second_cancel = second_ctx.cancel.clone();
+        let second = tokio::spawn({
+            let tool = tool.clone();
+            async move {
+                tool.run(&second_ctx, &json!({"query": "second stalled query"}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a stalled first response must not hold the dispatch gate");
+
+        first_cancel.cancel();
+        second_cancel.cancel();
+        let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("cancellation must not wait for session cleanup");
+        assert_eq!(first.unwrap().status, trouve_protocol::ToolStatus::Error);
+        assert_eq!(second.unwrap().status, trouve_protocol::ToolStatus::Error);
     }
 
     #[tokio::test]
@@ -1304,7 +1513,7 @@ mod tests {
         .await
         .unwrap();
         cancel.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(2), running)
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
             .await
             .unwrap()
             .unwrap();
