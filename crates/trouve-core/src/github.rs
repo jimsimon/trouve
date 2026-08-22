@@ -966,7 +966,7 @@ fn dashboard_search_queries(viewer: &str, merged_since: DateTime<Utc>) -> Dashbo
         merged: format!("is:pr is:merged merged:>={cutoff} involves:{viewer}"),
         // Keep closed, unmerged summaries in the durable account snapshot so
         // their sessions retain red badges and the dashboard can list them.
-        closed: format!("is:pr is:closed is:unmerged involves:{viewer}"),
+        closed: format!("is:pr is:closed is:unmerged involves:{viewer} sort:updated-desc"),
     }
 }
 
@@ -4003,7 +4003,10 @@ mod tests {
             queries.merged,
             "is:pr is:merged merged:>=2026-07-20T12:34:56+00:00 involves:alice"
         );
-        assert_eq!(queries.closed, "is:pr is:closed is:unmerged involves:alice");
+        assert_eq!(
+            queries.closed,
+            "is:pr is:closed is:unmerged involves:alice sort:updated-desc"
+        );
         assert!(DASHBOARD_SEARCH_QUERY.contains("closed: search"));
         assert!(DASHBOARD_SEARCH_QUERY.contains("@include(if: $includeClosed)"));
     }

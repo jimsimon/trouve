@@ -122,7 +122,7 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     "code-merge", "tint", "No merges.",
   ),
   pullRequestGroup(
-    "closed", "Closed", "Unmerged PRs.",
+    "closed", "Closed", "Latest 300 unmerged PRs.",
     "code-pull-request", "danger", "No closed PRs.",
   ),
 ]);
