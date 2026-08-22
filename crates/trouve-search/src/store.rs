@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when the chunking algorithm, tokenizer, embedding semantics, or
 /// entry layout change incompatibly. v2: padding-free (batch-independent)
-/// embeddings. v3: flat token storage in entries.
-pub const STORE_VERSION: u32 = 3;
+/// embeddings. v3: flat token storage in entries. v4: Vue and Clojure
+/// tree-sitter chunking.
+pub const STORE_VERSION: u32 = 4;
 
 const STORE_KEY_LENGTH: usize = 16;
 const STORE_IDENTITY_FILE: &str = "identity.json";

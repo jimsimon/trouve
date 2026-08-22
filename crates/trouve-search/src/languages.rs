@@ -528,6 +528,19 @@ mod tests {
         assert_eq!(detect_language(&PathBuf::from("foo.py")), Some("python"));
         assert_eq!(detect_language(&PathBuf::from("foo.RS")), Some("rust"));
         assert_eq!(detect_language(&PathBuf::from("a/b/foo.tsx")), Some("tsx"));
+        assert_eq!(
+            detect_language(&PathBuf::from("src/core.clj")),
+            Some("clojure")
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("src/core.cljc")),
+            Some("clojure")
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("src/core.cljs")),
+            Some("clojure")
+        );
+        assert_eq!(detect_language(&PathBuf::from("src/App.vue")), Some("vue"));
         assert_eq!(detect_language(&PathBuf::from("foo.unknownext")), None);
         assert_eq!(detect_language(&PathBuf::from("Makefile")), None);
     }

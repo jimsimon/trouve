@@ -41,6 +41,7 @@ APPROVED_LICENSES = {
     "BSD-3-Clause OR MIT OR Apache-2.0",
     "BSD-3-Clause/MIT",
     "BSL-1.0",
+    "CC0-1.0",
     "CC0-1.0 OR Apache-2.0",
     "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
     "CC0-1.0 OR MIT-0 OR Apache-2.0",

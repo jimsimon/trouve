@@ -33,6 +33,7 @@ fn language_for(name: &str) -> Option<Language> {
         "astro" => tree_sitter_astro_next::LANGUAGE,
         "bash" | "zsh" => tree_sitter_bash::LANGUAGE,
         "c" => tree_sitter_c::LANGUAGE,
+        "clojure" => tree_sitter_clojure_orchard::LANGUAGE,
         "cmake" => tree_sitter_cmake::LANGUAGE,
         "cpp" => tree_sitter_cpp::LANGUAGE,
         "csharp" => tree_sitter_c_sharp::LANGUAGE,
@@ -89,6 +90,7 @@ fn language_for(name: &str) -> Option<Language> {
         "tsx" => tree_sitter_typescript::LANGUAGE_TSX,
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         "typst" => codebook_tree_sitter_typst::LANGUAGE,
+        "vue" => tree_sitter_vue_next::LANGUAGE,
         "xml" => tree_sitter_xml::LANGUAGE_XML,
         "yaml" => tree_sitter_yaml::LANGUAGE,
         "zig" => tree_sitter_zig::LANGUAGE,
@@ -563,6 +565,7 @@ mod tests {
         for lang in [
             "asciidoc",
             "astro",
+            "clojure",
             "heex",
             "ini",
             "jinja2",
@@ -572,6 +575,7 @@ mod tests {
             "scss",
             "starlark",
             "typst",
+            "vue",
             "zsh",
         ] {
             assert!(is_supported_language(lang), "expected grammar for {lang}");
@@ -585,6 +589,10 @@ mod tests {
             (
                 "astro",
                 "---\nconst title = \"Hello\";\n---\n<h1>{title}</h1>\n",
+            ),
+            (
+                "clojure",
+                "(ns example.core)\n\n(defn greet [name]\n  (str \"Hello, \" name))\n",
             ),
             ("heex", "<div :if={@user}>\n  <%= @user.name %>\n</div>\n"),
             ("ini", "[server]\nhost = localhost\nport = 8080\n"),
@@ -613,6 +621,10 @@ mod tests {
                 "typst",
                 "#set heading(numbering: \"1.\")\n= Heading\nHello, *world*!\n",
             ),
+            (
+                "vue",
+                "<template>\n  <main>{{ message }}</main>\n</template>\n<script>\nexport default { data() { return { message: \"Hello\" }; } };\n</script>\n<style>\nmain { color: red; }\n</style>\n",
+            ),
             ("zsh", "greet() {\n  print \"hello $1\"\n}\n"),
         ];
 
@@ -630,6 +642,33 @@ mod tests {
 
             let chunks = chunk_source(&source.repeat(30), "sample", Some(lang));
             assert!(!chunks.is_empty(), "no chunks for {lang}");
+        }
+    }
+
+    #[test]
+    fn vue_and_html_grammars_parse_in_the_same_binary() {
+        let samples = [
+            (
+                "html",
+                "<!doctype html>\n<html><body><main>Hello</main></body></html>\n",
+            ),
+            (
+                "vue",
+                "<template>\n  <main>{{ message }}</main>\n</template>\n<script>\nexport default { data() { return { message: \"Hello\" }; } };\n</script>\n",
+            ),
+        ];
+
+        for (language, source) in samples {
+            let grammar = language_for(language).expect("grammar should be bundled");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&grammar)
+                .expect("grammar should match the tree-sitter ABI");
+            let tree = parser.parse(source, None).expect("source should parse");
+            assert!(
+                !tree.root_node().has_error(),
+                "sample should parse without errors for {language}"
+            );
         }
     }
 }
