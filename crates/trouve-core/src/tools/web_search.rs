@@ -257,35 +257,46 @@ impl SessionCleanupWorker {
                     .expect("web search session recovery runtime must start");
                 runtime.block_on(async move {
                     let mut recoveries = tokio::task::JoinSet::new();
-                    while let Some(job) = recovery_receiver.recv().await {
-                        let cleanup_sender = recovery_cleanup_sender.clone();
-                        let pending = recovery_pending.clone();
-                        recoveries.spawn(async move {
-                            let Ok(Ok(response)) =
-                                tokio::time::timeout(SEARCH_TIMEOUT, job.response).await
-                            else {
-                                pending.fetch_sub(1, Ordering::Release);
-                                return;
-                            };
-                            let Some(session_id) = response
-                                .headers()
-                                .get(MCP_SESSION_ID_HEADER)
-                                .and_then(|value| value.to_str().ok())
-                                .map(str::to_owned)
-                            else {
-                                pending.fetch_sub(1, Ordering::Release);
-                                return;
-                            };
-                            let Ok(permit) = cleanup_sender.reserve_owned().await else {
-                                pending.fetch_sub(1, Ordering::Release);
-                                return;
-                            };
-                            permit.send(SessionCleanupJob {
-                                endpoint: job.endpoint,
-                                session_id,
-                                protocol_version: job.protocol_version,
-                            });
-                        });
+                    loop {
+                        tokio::select! {
+                            biased;
+                            completed = recoveries.join_next(), if !recoveries.is_empty() => {
+                                let _ = completed;
+                            }
+                            job = recovery_receiver.recv() => {
+                                let Some(job) = job else {
+                                    break;
+                                };
+                                let cleanup_sender = recovery_cleanup_sender.clone();
+                                let pending = recovery_pending.clone();
+                                recoveries.spawn(async move {
+                                    let Ok(Ok(response)) =
+                                        tokio::time::timeout(SEARCH_TIMEOUT, job.response).await
+                                    else {
+                                        pending.fetch_sub(1, Ordering::Release);
+                                        return;
+                                    };
+                                    let Some(session_id) = response
+                                        .headers()
+                                        .get(MCP_SESSION_ID_HEADER)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned)
+                                    else {
+                                        pending.fetch_sub(1, Ordering::Release);
+                                        return;
+                                    };
+                                    let Ok(permit) = cleanup_sender.reserve_owned().await else {
+                                        pending.fetch_sub(1, Ordering::Release);
+                                        return;
+                                    };
+                                    permit.send(SessionCleanupJob {
+                                        endpoint: job.endpoint,
+                                        session_id,
+                                        protocol_version: job.protocol_version,
+                                    });
+                                });
+                            }
+                        }
                     }
                     while recoveries.join_next().await.is_some() {}
                 });
