@@ -80,7 +80,8 @@ const DESKTOP_UPDATE_IDLE_POLL_MS = 30_000;
 
 export const desktopUpdatePollIntervalMs = (
   state: DesktopUpdateState | undefined,
-): number => desktopUpdateIsBusy(state)
+  installAcknowledgementOutstanding = false,
+): number => installAcknowledgementOutstanding || desktopUpdateIsBusy(state)
   ? DESKTOP_UPDATE_BUSY_POLL_MS
   : DESKTOP_UPDATE_IDLE_POLL_MS;
 
@@ -121,6 +122,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #desktopUpdatePollIntervalMs: number | undefined;
   #desktopUpdateGeneration = 0;
   #desktopUpdateInitialAttempted = false;
+  #desktopUpdateInstallAcknowledgementOutstanding = false;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -154,6 +156,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     this.#desktopUpdateGeneration += 1;
     this.#desktopUpdateLoading = false;
     this.#desktopUpdateActionPending = false;
+    this.#desktopUpdateInstallAcknowledgementOutstanding = false;
     this.#stopDesktopUpdatePolling();
     super.disconnectedCallback();
   }
@@ -189,7 +192,16 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       if (generation !== this.#desktopUpdateGeneration) return;
       this.#desktopUpdateState = state;
       this.#desktopUpdateError = "";
-      this.#startDesktopUpdatePolling(desktopUpdatePollIntervalMs(state));
+      if (
+        this.#desktopUpdateInstallAcknowledgementOutstanding
+        && state.phase !== "available"
+      ) {
+        this.#desktopUpdateInstallAcknowledgementOutstanding = false;
+      }
+      this.#startDesktopUpdatePolling(desktopUpdatePollIntervalMs(
+        state,
+        this.#desktopUpdateInstallAcknowledgementOutstanding,
+      ));
     } catch {
       if (
         generation === this.#desktopUpdateGeneration
@@ -198,7 +210,11 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
         this.#desktopUpdateError = "Update status could not be loaded.";
       }
       if (generation === this.#desktopUpdateGeneration) {
-        this.#startDesktopUpdatePolling(DESKTOP_UPDATE_IDLE_POLL_MS);
+        this.#startDesktopUpdatePolling(
+          this.#desktopUpdateInstallAcknowledgementOutstanding
+            ? DESKTOP_UPDATE_BUSY_POLL_MS
+            : DESKTOP_UPDATE_IDLE_POLL_MS,
+        );
       }
     } finally {
       if (generation !== this.#desktopUpdateGeneration) return;
@@ -218,6 +234,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     this.#desktopUpdateGeneration += 1;
     const actionGeneration = this.#desktopUpdateGeneration;
     this.#desktopUpdateActionPending = true;
+    if (installing) this.#desktopUpdateInstallAcknowledgementOutstanding = true;
     this.#desktopUpdateError = "";
     this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
     this.requestUpdate();
@@ -238,6 +255,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       if (error instanceof HostClientError && error.kind === "action-busy") {
         keepPolling = true;
       } else {
+        if (installing) this.#desktopUpdateInstallAcknowledgementOutstanding = false;
         this.#desktopUpdateError = installing
           ? "The update could not be installed. You can try again without leaving the app."
           : "The update check could not be completed.";
@@ -245,7 +263,11 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     } finally {
       if (!this.isConnected || completionGeneration !== this.#desktopUpdateGeneration) return;
       this.#desktopUpdateActionPending = false;
-      if (keepPolling || desktopUpdateIsBusy(this.#desktopUpdateState)) {
+      if (
+        keepPolling
+        || this.#desktopUpdateInstallAcknowledgementOutstanding
+        || desktopUpdateIsBusy(this.#desktopUpdateState)
+      ) {
         this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
         void this.#loadDesktopUpdate(true);
       } else {

@@ -52,4 +52,11 @@ describe("desktop update status polling", () => {
       phase: "idle",
     })).toBe(30_000);
   });
+
+  it("keeps polling quickly while an install acknowledgement is not yet authoritative", () => {
+    expect(desktopUpdatePollIntervalMs({
+      ...updateState("Version 4.1.0 is ready to install.", "4.1.0"),
+      phase: "available",
+    }, true)).toBe(500);
+  });
 });

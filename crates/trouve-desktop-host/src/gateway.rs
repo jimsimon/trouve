@@ -23,9 +23,9 @@ use utoipa::{OpenApi, ToSchema};
 #[cfg(test)]
 use crate::AssetManifest;
 use crate::{
-    Asset, AssetLookup, CloseDecision, DesktopUpdateState, ExternalHttpsUrl, FrontendSource,
-    GatewayOrigin, HostCapabilities, HostKind, HostLifecycleEnvelope, HostLifecycleState,
-    HostNativeActions, HostPreferences, HostValidationError, LocalFileAction,
+    Asset, AssetLookup, CloseDecision, DesktopUpdatePhase, DesktopUpdateState, ExternalHttpsUrl,
+    FrontendSource, GatewayOrigin, HostCapabilities, HostKind, HostLifecycleEnvelope,
+    HostLifecycleState, HostNativeActions, HostPreferences, HostValidationError, LocalFileAction,
     MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS, MAX_SYSTEM_FONT_FAMILIES,
     NativeAttachment, NativeNotification, system_font_families, valid_session_relative_path,
     validate_native_attachment,
@@ -837,13 +837,22 @@ async fn install_desktop_update(
         .clone()
         .try_acquire_owned()
         .map_err(|_| GatewayRejection::Busy)?;
-    // Installation is a host-owned operation. Acknowledge its start promptly
-    // and let clients observe the authoritative state through the status
+    // Installation is a host-owned operation. Return an explicit in-progress
+    // acknowledgement promptly; clients then poll the authoritative status
     // endpoint instead of tying native replacement to an HTTP connection.
     let update = state
         .native_actions
         .desktop_update_status()
         .map_err(|_| GatewayRejection::Internal)?;
+    let accepted = DesktopUpdateState {
+        phase: DesktopUpdatePhase::Installing,
+        message: update.available_version.as_ref().map_or_else(
+            || "Update installation started.".into(),
+            |version| format!("Installing version {version}…"),
+        ),
+        progress_percent: None,
+        ..update
+    };
     let native_actions = state.native_actions.clone();
     tokio::spawn(async move {
         let _permit = permit;
@@ -851,7 +860,7 @@ async fn install_desktop_update(
             tracing::error!(%error, "desktop update operation failed");
         }
     });
-    json_no_store(update)
+    json_no_store(accepted)
 }
 
 fn require_desktop_updater(state: &GatewayState) -> Result<(), GatewayRejection> {
@@ -2551,10 +2560,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(
-            response_json::<DesktopUpdateState>(accepted).await.phase,
-            DesktopUpdatePhase::Available
-        );
+        let accepted = response_json::<DesktopUpdateState>(accepted).await;
+        assert_eq!(accepted.phase, DesktopUpdatePhase::Installing);
+        assert_eq!(accepted.message, "Installing version 4.1.0…");
         tokio::time::timeout(Duration::from_secs(1), install_started.notified())
             .await
             .unwrap();

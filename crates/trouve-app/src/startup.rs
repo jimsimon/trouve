@@ -5,6 +5,7 @@
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,7 @@ const UPDATE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const RUNTIME_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const RUNTIME_INSTALL_CANCEL_GRACE: Duration = Duration::from_secs(30);
+const RUNTIME_INSTALL_POST_COMMIT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SPLASH_HTML: &str = r#"<!doctype html>
 <html lang="en">
@@ -1120,20 +1122,54 @@ impl UpdateManager {
 
     pub async fn install_and_restart(&self) -> DesktopUpdateState {
         let cancellation = Arc::new(trouve_update::InstallCancellation::default());
+        let restart_handoff_abandoned = Arc::new(AtomicBool::new(false));
+        let manager = self.clone();
+        let install_cancellation = Arc::clone(&cancellation);
+        let install_restart_handoff = Arc::clone(&restart_handoff_abandoned);
+        let watchdog_cancellation = Arc::clone(&cancellation);
         match await_runtime_install(
-            self.install_and_restart_inner(Arc::clone(&cancellation)),
-            cancellation,
+            async move {
+                manager
+                    .install_and_restart_inner(install_cancellation, install_restart_handoff)
+                    .await
+            },
+            move || watchdog_cancellation.request_cancel(),
             RUNTIME_INSTALL_TIMEOUT,
             RUNTIME_INSTALL_CANCEL_GRACE,
+            RUNTIME_INSTALL_POST_COMMIT_HANDOFF_TIMEOUT,
         )
         .await
         {
-            Some(update) => update,
-            None => {
+            RuntimeInstallOutcome::Completed(update) => update,
+            RuntimeInstallOutcome::PreCommitTimedOut => {
                 let update = state(
                     DesktopUpdatePhase::Error,
                     self.available_version(),
                     "Update installation stopped after exceeding its time limit. You can try again without leaving the app.",
+                    None,
+                );
+                self.set_state(update.clone());
+                update
+            }
+            RuntimeInstallOutcome::PostCommitTimedOut => {
+                restart_handoff_abandoned.store(true, Ordering::Release);
+                let update = state(
+                    DesktopUpdatePhase::Error,
+                    self.available_version(),
+                    "The update replaced, or may have replaced, the executable but did not finish reporting before restart. Keep using this window and restart trouve manually after the update operation settles.",
+                    None,
+                );
+                self.set_state(update.clone());
+                update
+            }
+            RuntimeInstallOutcome::TaskFailed(error) => {
+                let update = state(
+                    DesktopUpdatePhase::Error,
+                    self.available_version(),
+                    &format!(
+                        "Update installation stopped unexpectedly: {}",
+                        concise_error(&error)
+                    ),
                     None,
                 );
                 self.set_state(update.clone());
@@ -1145,6 +1181,7 @@ impl UpdateManager {
     async fn install_and_restart_inner(
         &self,
         cancellation: Arc<trouve_update::InstallCancellation>,
+        restart_handoff_abandoned: Arc<AtomicBool>,
     ) -> DesktopUpdateState {
         let _action = self.action.lock().await;
         let release = match self.release() {
@@ -1189,12 +1226,23 @@ impl UpdateManager {
         }
 
         let version = release.version.to_string();
-        let update = state(
-            DesktopUpdatePhase::Restarting,
-            Some(version.clone()),
-            &format!("Version {version} is installed. Restarting…"),
-            Some(100),
-        );
+        let update = if restart_handoff_abandoned.load(Ordering::Acquire) {
+            state(
+                DesktopUpdatePhase::Error,
+                Some(version.clone()),
+                &format!(
+                    "Version {version} is installed, but the automatic restart handoff timed out. Keep using this window or restart manually."
+                ),
+                Some(100),
+            )
+        } else {
+            state(
+                DesktopUpdatePhase::Restarting,
+                Some(version.clone()),
+                &format!("Version {version} is installed. Restarting…"),
+                Some(100),
+            )
+        };
         self.set_state(update.clone());
         update
     }
@@ -1266,25 +1314,49 @@ impl UpdateManager {
     }
 }
 
+enum RuntimeInstallOutcome<T> {
+    Completed(T),
+    PreCommitTimedOut,
+    PostCommitTimedOut,
+    TaskFailed(String),
+}
+
+fn runtime_install_join_result<T>(
+    result: Result<T, tokio::task::JoinError>,
+) -> RuntimeInstallOutcome<T> {
+    match result {
+        Ok(update) => RuntimeInstallOutcome::Completed(update),
+        Err(error) => RuntimeInstallOutcome::TaskFailed(error.to_string()),
+    }
+}
+
 async fn await_runtime_install<T>(
-    install: impl std::future::Future<Output = T>,
-    cancellation: Arc<trouve_update::InstallCancellation>,
+    install: impl std::future::Future<Output = T> + Send + 'static,
+    request_cancel: impl FnOnce() -> bool,
     operation_timeout: Duration,
     cancellation_grace: Duration,
-) -> Option<T> {
-    tokio::pin!(install);
+    post_commit_handoff_timeout: Duration,
+) -> RuntimeInstallOutcome<T>
+where
+    T: Send + 'static,
+{
+    let mut install = tokio::spawn(install);
     tokio::select! {
-        update = &mut install => Some(update),
+        update = &mut install => runtime_install_join_result(update),
         () = tokio::time::sleep(operation_timeout) => {
-            if !cancellation.request_cancel() {
-                // Executable replacement has committed. Dropping the future
-                // now could strand a successful install before its bounded
-                // relaunch handoff, so let that terminal path finish.
-                return Some(install.await);
+            if !request_cancel() {
+                // Executable replacement has committed. Keep its task alive so
+                // it retains the update lock and recovery ownership, but bound
+                // how long the HTTP operation waits for restart handoff.
+                return match tokio::time::timeout(post_commit_handoff_timeout, &mut install).await {
+                    Ok(update) => runtime_install_join_result(update),
+                    Err(_) => RuntimeInstallOutcome::PostCommitTimedOut,
+                };
             }
-            tokio::time::timeout(cancellation_grace, install)
-                .await
-                .ok()
+            match tokio::time::timeout(cancellation_grace, &mut install).await {
+                Ok(update) => runtime_install_join_result(update),
+                Err(_) => RuntimeInstallOutcome::PreCommitTimedOut,
+            }
         }
     }
 }
@@ -1602,14 +1674,40 @@ mod tests {
     #[tokio::test]
     async fn runtime_install_watchdog_cancels_a_stalled_precommit_operation() {
         let cancellation = Arc::new(trouve_update::InstallCancellation::default());
+        let watchdog_cancellation = Arc::clone(&cancellation);
         let result = await_runtime_install(
             std::future::pending::<()>(),
-            Arc::clone(&cancellation),
+            move || watchdog_cancellation.request_cancel(),
+            Duration::from_millis(5),
             Duration::from_millis(5),
             Duration::from_millis(5),
         )
         .await;
-        assert!(result.is_none());
+        assert!(matches!(result, RuntimeInstallOutcome::PreCommitTimedOut));
         assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn runtime_install_watchdog_bounds_postcommit_handoff_without_aborting_recovery() {
+        let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+        let (completed, wait_for_completion) = tokio::sync::oneshot::channel::<()>();
+        let result = await_runtime_install(
+            async move {
+                let _ = wait_for_release.await;
+                let _ = completed.send(());
+            },
+            || false,
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(matches!(result, RuntimeInstallOutcome::PostCommitTimedOut));
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), wait_for_completion)
+            .await
+            .expect("detached recovery task did not finish")
+            .expect("detached recovery task dropped its completion signal");
     }
 }
