@@ -1272,6 +1272,7 @@ impl BridgeEchoTracker {
         vendor_call_id: &str,
         tool: &str,
         args: &serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<String> {
         // Reject ordinary vendor-native tools synchronously. Only a
         // bridge-shaped lifecycle is eligible for the bounded reorder grace.
@@ -1286,11 +1287,14 @@ impl BridgeEchoTracker {
             if let Some(call_id) = self.try_claim(thread_id, turn, vendor_call_id, tool, args) {
                 return Some(call_id);
             }
-            if tokio::time::timeout_at(deadline.into(), changed.as_mut())
-                .await
-                .is_err()
-            {
-                return None;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return None,
+                result = tokio::time::timeout_at(deadline.into(), changed.as_mut()) => {
+                    if result.is_err() {
+                        return None;
+                    }
+                }
             }
         }
     }
@@ -1303,6 +1307,13 @@ struct RawVendorToolCall {
     call_id: String,
     tool: String,
     args: serde_json::Value,
+    card_durable: bool,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+enum RawVendorToolMatch {
+    Durable(String),
+    Publishing(Arc<tokio::sync::Notify>),
 }
 
 #[derive(Default)]
@@ -1332,7 +1343,7 @@ impl RawVendorToolCalls {
         }
     }
 
-    fn register(
+    fn begin_publishing(
         &self,
         thread_id: &str,
         turn: u64,
@@ -1350,30 +1361,54 @@ impl RawVendorToolCalls {
             call_id: call_id.to_string(),
             tool: canonical_vendor_tool(tool).to_string(),
             args: args.clone(),
+            card_durable: false,
+            changed: Arc::new(tokio::sync::Notify::new()),
         });
     }
 
+    fn mark_card_durable(&self, thread_id: &str, turn: u64, call_id: &str) -> bool {
+        let mut calls = self.calls.lock().unwrap();
+        let Some(call) = calls.iter_mut().find(|call| {
+            call.thread_id == thread_id && call.turn == turn && call.call_id == call_id
+        }) else {
+            return false;
+        };
+        call.card_durable = true;
+        call.changed.notify_waiters();
+        true
+    }
+
     fn complete(&self, thread_id: &str, turn: u64, call_id: &str) {
-        self.calls.lock().unwrap().retain(|call| {
+        let mut calls = self.calls.lock().unwrap();
+        for call in calls.iter().filter(|call| {
+            call.thread_id == thread_id && call.turn == turn && call.call_id == call_id
+        }) {
+            call.changed.notify_waiters();
+        }
+        calls.retain(|call| {
             call.thread_id != thread_id || call.turn != turn || call.call_id != call_id
         });
     }
 
     fn clear_turn(&self, thread_id: &str, turn: u64) {
-        self.calls
-            .lock()
-            .unwrap()
-            .retain(|call| call.thread_id != thread_id || call.turn != turn);
+        let mut calls = self.calls.lock().unwrap();
+        for call in calls
+            .iter()
+            .filter(|call| call.thread_id == thread_id && call.turn == turn)
+        {
+            call.changed.notify_waiters();
+        }
+        calls.retain(|call| call.thread_id != thread_id || call.turn != turn);
     }
 
-    fn newest_exact(
+    fn newest_exact_state(
         &self,
         thread_id: &str,
         turn: u64,
         tool: &str,
         args: &serde_json::Value,
         excluded: &HashSet<String>,
-    ) -> Option<String> {
+    ) -> Option<RawVendorToolMatch> {
         let tool = canonical_vendor_tool(tool);
         self.calls
             .lock()
@@ -1387,7 +1422,46 @@ impl RawVendorToolCalls {
                     && call.args == *args
                     && !excluded.contains(&call.call_id)
             })
-            .map(|call| call.call_id.clone())
+            .map(|call| {
+                if call.card_durable {
+                    RawVendorToolMatch::Durable(call.call_id.clone())
+                } else {
+                    RawVendorToolMatch::Publishing(Arc::clone(&call.changed))
+                }
+            })
+    }
+
+    async fn newest_exact(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        tool: &str,
+        args: &serde_json::Value,
+        excluded: &HashSet<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<String> {
+        loop {
+            match self.newest_exact_state(thread_id, turn, tool, args, excluded)? {
+                RawVendorToolMatch::Durable(call_id) => return Some(call_id),
+                RawVendorToolMatch::Publishing(changed) => {
+                    // Arm before re-reading so durable publication or failed
+                    // turn cleanup cannot race between lookup and suspension.
+                    let notified = changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    match self.newest_exact_state(thread_id, turn, tool, args, excluded) {
+                        Some(RawVendorToolMatch::Durable(call_id)) => return Some(call_id),
+                        None => return None,
+                        Some(RawVendorToolMatch::Publishing(_)) => {}
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return None,
+                        _ = notified.as_mut() => {}
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -12398,7 +12472,9 @@ impl Engine {
             .last_turn(thread_id)
             .map_err(EngineError::Internal)?;
         let scope = Scope::Thread(thread.id.clone());
-        let matched = self.open_vendor_call(&thread.id, turn, tool, args);
+        let matched = self
+            .open_vendor_call(&thread.id, turn, tool, args, &ctx.cancel)
+            .await;
         let synthetic = matched.is_none();
         let call_id = matched.unwrap_or_else(|| new_id("appr"));
         // `gate_backend_approval` creates a missing tool card and batches it
@@ -12445,12 +12521,13 @@ impl Engine {
     /// request refers to. Identity uses the lossless provider payload; the
     /// canonical projection is presentation-only and must never authorize a
     /// different operation that happens to render the same way.
-    fn open_vendor_call(
+    async fn open_vendor_call(
         &self,
         thread_id: &str,
         turn: u64,
         tool: &str,
         args: &serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<String> {
         let events = self
             .store
@@ -12463,7 +12540,8 @@ impl Engine {
             }
         }
         self.raw_vendor_tool_calls
-            .newest_exact(thread_id, turn, tool, args, &gated)
+            .newest_exact(thread_id, turn, tool, args, &gated, cancel)
+            .await
     }
 
     /// Whether a `tool.requested` card already exists for this call in the
@@ -12496,7 +12574,6 @@ impl Engine {
         turn: u64,
         call_id: &str,
         tool: &str,
-        args: &serde_json::Value,
     ) -> bool {
         if !self.tool_card_exists(thread_id, turn, call_id) {
             tracing::error!(
@@ -12508,9 +12585,21 @@ impl Engine {
             );
             return false;
         }
-        self.raw_vendor_tool_calls
-            .register(thread_id, turn, call_id, tool, args);
-        true
+        if self
+            .raw_vendor_tool_calls
+            .mark_card_durable(thread_id, turn, call_id)
+        {
+            true
+        } else {
+            tracing::error!(
+                thread_id,
+                turn,
+                call_id,
+                tool,
+                "durable vendor tool card had no pending approval identity"
+            );
+            false
+        }
     }
 
     /// Normalize a todo list from trouve's canonical shape or a supported
@@ -13279,6 +13368,13 @@ impl Engine {
                 tool,
                 args,
             } => {
+                self.raw_vendor_tool_calls.begin_publishing(
+                    &collaborator.thread.id,
+                    turn,
+                    &call_id,
+                    &tool,
+                    &args,
+                );
                 collaborator
                     .tool_started_at
                     .insert(call_id.clone(), Instant::now());
@@ -13311,13 +13407,7 @@ impl Engine {
                     &mut collaborator.persisted,
                 )
                 .await?;
-                self.expose_persisted_vendor_call(
-                    &collaborator.thread.id,
-                    turn,
-                    &call_id,
-                    &tool,
-                    &args,
-                );
+                self.expose_persisted_vendor_call(&collaborator.thread.id, turn, &call_id, &tool);
             }
             BackendCollaboratorEvent::ToolOutput { call_id, chunk } => collaborator
                 .persisted
@@ -13746,12 +13836,14 @@ impl Engine {
         let mut ignored_bridge_call_ids = HashSet::new();
         // Some CLIs announce an MCP lifecycle immediately before dispatching
         // its loopback HTTP request. Resolve that small transport reorder in
-        // parallel with the backend stream, retaining any same-call follow-up
-        // events until the trusted request either correlates or times out.
+        // parallel with the backend stream, retaining every successor event
+        // until the trusted request either correlates or times out.
         let mut pending_bridge_echo_claims = futures::stream::FuturesUnordered::new();
-        let mut pending_bridge_echo_events = HashMap::<String, VecDeque<BackendEvent>>::new();
+        let mut pending_bridge_echo_ids = HashSet::new();
+        let mut deferred_backend_events = VecDeque::<BackendEvent>::new();
         let mut replay_backend_events = VecDeque::<BackendEvent>::new();
         let mut released_bridge_call_ids = HashSet::new();
+        let mut pending_backend_error = None;
         let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
         let mut backend_approval_cancels =
             HashMap::<String, tokio_util::sync::CancellationToken>::new();
@@ -13767,11 +13859,13 @@ impl Engine {
             if backend_stream_ended
                 && pending_bridge_echo_claims.is_empty()
                 && replay_backend_events.is_empty()
+                && pending_backend_error.is_none()
             {
                 break;
             }
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
             let steer_reserved = !backend_stream_ended
+                && pending_bridge_echo_ids.is_empty()
                 && active_vendor_session.is_some()
                 && !cancel.is_cancelled()
                 && reserve_ready_steer_after_event_budget(
@@ -13781,6 +13875,8 @@ impl Engine {
                 );
             let input = if let Some(event) = replay_backend_events.pop_front() {
                 BackendLoopInput::Event(Some(Ok(event)))
+            } else if let Some(error) = pending_backend_error.take() {
+                BackendLoopInput::Event(Some(Err(error)))
             } else if pending_steer_lane.is_some() {
                 // Poll lane acquisition ahead of the backend stream so a
                 // continuously-ready stream cannot starve it. If the lane is
@@ -13864,7 +13960,9 @@ impl Engine {
                     &mut steer_rx,
                     &mut pending_steer,
                     active_vendor_session.is_some(),
-                ), if !cancel.is_cancelled() && !backend_stream_ended => {
+                ), if !cancel.is_cancelled()
+                    && !backend_stream_ended
+                    && pending_bridge_echo_ids.is_empty() => {
                     let Some(command) = steer else {
                         steer_rx = None;
                         continue;
@@ -14013,19 +14111,14 @@ impl Engine {
                     vendor_call_id,
                     canonical_call_id,
                 } => {
-                    let buffered = pending_bridge_echo_events
-                        .remove(&vendor_call_id)
-                        .unwrap_or_default();
+                    pending_bridge_echo_ids.remove(&vendor_call_id);
                     if canonical_call_id.is_some() {
                         ignored_bridge_call_ids.insert(vendor_call_id);
-                        for event in buffered {
-                            if let BackendEvent::ApprovalNeeded { responder, .. } = event {
-                                let _ = responder.send(true);
-                            }
-                        }
                     } else {
                         released_bridge_call_ids.insert(vendor_call_id);
-                        replay_backend_events.extend(buffered);
+                    }
+                    if pending_bridge_echo_ids.is_empty() {
+                        replay_backend_events.append(&mut deferred_backend_events);
                     }
                     consecutive_backend_events = 0;
                     continue;
@@ -14103,8 +14196,37 @@ impl Engine {
                         consecutive_backend_events = consecutive_backend_events.saturating_add(1);
                         event
                     }
-                    Err(BackendError::Cancelled) if cancel.is_cancelled() => break,
+                    Err(BackendError::Cancelled) if cancel.is_cancelled() => {
+                        if !pending_bridge_echo_ids.is_empty() {
+                            // Cancellation can make both the provider stream
+                            // and the correlation futures ready together. Do
+                            // not rely on select branch order: release the
+                            // claims and replay every event already observed
+                            // before honoring the terminal cancellation.
+                            pending_bridge_echo_claims.clear();
+                            released_bridge_call_ids.extend(pending_bridge_echo_ids.drain());
+                            replay_backend_events.append(&mut deferred_backend_events);
+                            pending_backend_error = Some(BackendError::Cancelled);
+                            backend_stream_ended = true;
+                            consecutive_backend_events = 0;
+                            continue;
+                        }
+                        break;
+                    }
                     Err(error) => {
+                        if !pending_bridge_echo_ids.is_empty() {
+                            // Preserve every lifecycle and transcript event
+                            // already observed before surfacing the terminal
+                            // stream failure. No later trusted request can be
+                            // relied on once its owning stream has failed.
+                            pending_bridge_echo_claims.clear();
+                            released_bridge_call_ids.extend(pending_bridge_echo_ids.drain());
+                            replay_backend_events.append(&mut deferred_backend_events);
+                            pending_backend_error = Some(error);
+                            backend_stream_ended = true;
+                            consecutive_backend_events = 0;
+                            continue;
+                        }
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                         for collaborator in collaborators.values_mut() {
@@ -14133,17 +14255,11 @@ impl Engine {
                     }
                 },
             };
-            let buffered_call_id = match &event {
-                BackendEvent::ToolStarted { call_id, .. }
-                | BackendEvent::ToolOutput { call_id, .. }
-                | BackendEvent::ToolCompleted { call_id, .. }
-                | BackendEvent::ApprovalNeeded { call_id, .. } => Some(call_id.clone()),
-                _ => None,
-            };
-            if let Some(call_id) = buffered_call_id
-                && let Some(buffered) = pending_bridge_echo_events.get_mut(&call_id)
-            {
-                buffered.push_back(event);
+            if !pending_bridge_echo_ids.is_empty() {
+                // Keep consuming the vendor stream, but preserve its complete
+                // event order behind the unresolved wrapper. Replaying only
+                // same-call events would let later text overtake the tool.
+                deferred_backend_events.push_back(event);
                 consecutive_backend_events = 0;
                 continue;
             }
@@ -14238,29 +14354,6 @@ impl Engine {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
-                    tool_started_at.insert(call_id.clone(), Instant::now());
-                    let could_create = could_request_pull_request_creation(&tool, &args);
-                    let mut creation_request = PullRequestCreationRequest::Rejected;
-                    if could_create {
-                        if let Some((_, owner, repo)) = &github_repository {
-                            creation_request =
-                                classify_pull_request_creation(&tool, &args, owner, repo);
-                        } else {
-                            let repository = self
-                                .github_repository_for_session(session)
-                                .context("discovering repository for pull request creator")?;
-                            let (_, owner, repo) = &repository;
-                            creation_request =
-                                classify_pull_request_creation(&tool, &args, owner, repo);
-                            if !matches!(creation_request, PullRequestCreationRequest::Rejected) {
-                                github_repository = Some(repository);
-                            }
-                        }
-                    }
-                    tool_calls.insert(
-                        call_id.clone(),
-                        (tool.clone(), args.clone(), creation_request),
-                    );
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -14289,17 +14382,19 @@ impl Engine {
                         // wait for that trusted correlation while this stream
                         // continues to service unrelated events.
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        pending_bridge_echo_events.insert(
-                            call_id.clone(),
-                            VecDeque::from([BackendEvent::ToolStarted {
-                                call_id: call_id.clone(),
-                                tool: tool.clone(),
-                                args: args.clone(),
-                            }]),
-                        );
+                        deferred_backend_events.push_back(BackendEvent::ToolStarted {
+                            call_id: call_id.clone(),
+                            tool: tool.clone(),
+                            args: args.clone(),
+                        });
+                        // A wrapper encountered while replaying must also
+                        // retain every already-buffered successor behind it.
+                        deferred_backend_events.append(&mut replay_backend_events);
+                        pending_bridge_echo_ids.insert(call_id.clone());
                         let engine = Arc::clone(self);
                         let owner_thread_id = thread.id.clone();
                         let vendor_call_id = call_id.clone();
+                        let turn_cancel = cancel.clone();
                         pending_bridge_echo_claims.push(
                             async move {
                                 let canonical_call_id = engine
@@ -14310,6 +14405,7 @@ impl Engine {
                                         &vendor_call_id,
                                         &tool,
                                         &args,
+                                        &turn_cancel,
                                     )
                                     .await;
                                 (vendor_call_id, canonical_call_id)
@@ -14318,6 +14414,31 @@ impl Engine {
                         );
                         continue;
                     }
+                    self.raw_vendor_tool_calls
+                        .begin_publishing(&thread.id, turn, &call_id, &tool, &args);
+                    tool_started_at.insert(call_id.clone(), Instant::now());
+                    let could_create = could_request_pull_request_creation(&tool, &args);
+                    let mut creation_request = PullRequestCreationRequest::Rejected;
+                    if could_create {
+                        if let Some((_, owner, repo)) = &github_repository {
+                            creation_request =
+                                classify_pull_request_creation(&tool, &args, owner, repo);
+                        } else {
+                            let repository = self
+                                .github_repository_for_session(session)
+                                .context("discovering repository for pull request creator")?;
+                            let (_, owner, repo) = &repository;
+                            creation_request =
+                                classify_pull_request_creation(&tool, &args, owner, repo);
+                            if !matches!(creation_request, PullRequestCreationRequest::Rejected) {
+                                github_repository = Some(repository);
+                            }
+                        }
+                    }
+                    tool_calls.insert(
+                        call_id.clone(),
+                        (tool.clone(), args.clone(), creation_request),
+                    );
                     let (display_tool, mut display_args) = normalize_vendor_tool_call(&tool, &args);
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
@@ -14338,7 +14459,7 @@ impl Engine {
                         call_id: call_id.clone(),
                     });
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    self.expose_persisted_vendor_call(&thread.id, turn, &call_id, &tool, &args);
+                    self.expose_persisted_vendor_call(&thread.id, turn, &call_id, &tool);
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
                     if suppressed_bridge_calls.contains(&call_id)
@@ -19895,10 +20016,11 @@ mod tests {
         assert!(trouve_bridge_wrapper_call("commandExecution", &args).is_none());
     }
 
-    #[test]
-    fn raw_vendor_tool_identity_keeps_lossless_approval_correlation() {
+    #[tokio::test]
+    async fn raw_vendor_tool_identity_keeps_lossless_approval_correlation() {
         let tracker = RawVendorToolCalls::default();
         let _turn = tracker.begin_turn("thread", 4);
+        let cancel = tokio_util::sync::CancellationToken::new();
         let first = serde_json::json!({
             "command": "cargo test",
             "cwd": "/worktree/a",
@@ -19909,45 +20031,75 @@ mod tests {
             "cwd": "/worktree/b",
             "env": { "FEATURE": "two" }
         });
-        tracker.register("thread", 4, "call-a", "Bash", &first);
-        tracker.register("thread", 4, "call-b", "Bash", &second);
+        tracker.begin_publishing("thread", 4, "call-a", "Bash", &first);
+        assert!(tracker.mark_card_durable("thread", 4, "call-a"));
+        tracker.begin_publishing("thread", 4, "call-b", "Bash", &second);
+        assert!(tracker.mark_card_durable("thread", 4, "call-b"));
 
         assert_eq!(
-            tracker.newest_exact("thread", 4, "shell", &first, &HashSet::new()),
+            tracker
+                .newest_exact("thread", 4, "shell", &first, &HashSet::new(), &cancel)
+                .await,
             Some("call-a".into())
         );
         assert_eq!(
-            tracker.newest_exact(
-                "thread",
-                4,
-                "shell",
-                &serde_json::json!({ "command": "cargo test" }),
-                &HashSet::new(),
-            ),
+            tracker
+                .newest_exact(
+                    "thread",
+                    4,
+                    "shell",
+                    &serde_json::json!({ "command": "cargo test" }),
+                    &HashSet::new(),
+                    &cancel,
+                )
+                .await,
             None,
             "display-equivalent arguments must not authorize another operation"
         );
         assert_eq!(
-            tracker.newest_exact(
-                "thread",
-                4,
-                "shell",
-                &first,
-                &HashSet::from(["call-a".into()]),
-            ),
+            tracker
+                .newest_exact(
+                    "thread",
+                    4,
+                    "shell",
+                    &first,
+                    &HashSet::from(["call-a".into()]),
+                    &cancel,
+                )
+                .await,
             None
         );
     }
 
-    #[test]
-    fn vendor_calls_are_exposed_only_after_their_card_is_durable() {
+    #[tokio::test]
+    async fn vendor_calls_are_exposed_only_after_their_card_is_durable() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
-        let engine = Engine::new(store.clone(), data.path().to_path_buf(), &Config::default());
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
         let args = serde_json::json!({ "command": "cargo test" });
+        engine
+            .raw_vendor_tool_calls
+            .begin_publishing("thread", 4, "call-a", "Bash", &args);
+        let waiting_engine = Arc::clone(&engine);
+        let waiting_args = args.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_engine
+                .open_vendor_call("thread", 4, "shell", &waiting_args, &waiting_cancel)
+                .await
+        });
 
-        assert!(!engine.expose_persisted_vendor_call("thread", 4, "call-a", "Bash", &args,));
-        assert_eq!(engine.open_vendor_call("thread", 4, "shell", &args), None);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "approval must wait for the durable card"
+        );
+        assert!(!engine.expose_persisted_vendor_call("thread", 4, "call-a", "Bash"));
 
         store
             .append_event(
@@ -19961,9 +20113,12 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(engine.expose_persisted_vendor_call("thread", 4, "call-a", "Bash", &args,));
+        assert!(engine.expose_persisted_vendor_call("thread", 4, "call-a", "Bash"));
         assert_eq!(
-            engine.open_vendor_call("thread", 4, "shell", &args),
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("durable card publication did not release approval matching")
+                .unwrap(),
             Some("call-a".into())
         );
     }
@@ -19975,6 +20130,8 @@ mod tests {
         let args = serde_json::json!({ "path": "README.md" });
         let waiting_tracker = Arc::clone(&tracker);
         let waiting_args = args.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting_cancel = cancel.clone();
         let waiter = tokio::spawn(async move {
             waiting_tracker
                 .claim_after_dispatch(
@@ -19983,6 +20140,7 @@ mod tests {
                     "vendor-call",
                     "mcp__trouve__read_file",
                     &waiting_args,
+                    &waiting_cancel,
                 )
                 .await
         });
@@ -19994,11 +20152,36 @@ mod tests {
         );
         tracker.register("thread", 8, "canonical-call", "read_file", &args);
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(100), waiter)
+            tokio::time::timeout(Duration::from_secs(1), waiter)
                 .await
                 .expect("trusted request did not wake the deferred correlation")
                 .unwrap(),
             Some("canonical-call".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_bridge_claim_stops_promptly_on_turn_cancellation() {
+        let tracker = BridgeEchoTracker::default();
+        let _turn = tracker.begin_turn("thread", 8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let args = serde_json::json!({ "path": "README.md" });
+        let claim = tracker.claim_after_dispatch(
+            "thread",
+            8,
+            "vendor-call",
+            "mcp__trouve__read_file",
+            &args,
+            &cancel,
+        );
+        tokio::pin!(claim);
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), claim)
+                .await
+                .expect("cancelled bridge claim waited for the reorder deadline")
+                .is_none()
         );
     }
 
