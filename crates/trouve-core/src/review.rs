@@ -9346,19 +9346,27 @@ fn redact_public_secrets(text: &str) -> String {
         let lower = token.to_ascii_lowercase();
         let mut fragments = Vec::new();
         let mut index = 0;
-        let mut url_query = token.starts_with('&');
+        let url_core = lower.trim_start_matches(wrapper);
+        let structured_url = url_core.starts_with("http://")
+            || url_core.starts_with("https://")
+            || url_core.starts_with("www.");
+        let mut url_parameters = token.starts_with('&');
         while index < token.len() {
             let character = token[index..]
                 .chars()
                 .next()
                 .expect("token index remains in bounds");
             if character == '?' {
-                url_query = true;
+                url_parameters = true;
                 index += character.len_utf8();
                 continue;
             }
             if character == '#' {
-                url_query = false;
+                // URI fragments can carry `&`-separated fields too. Keep
+                // parsing their delimiters for a known URL while retaining
+                // conservative whole-tail redaction for arbitrary text such
+                // as `password=secret#suffix`.
+                url_parameters |= structured_url;
                 index += character.len_utf8();
                 continue;
             }
@@ -9403,7 +9411,7 @@ fn redact_public_secrets(text: &str) -> String {
                 .find_map(|(offset, candidate)| {
                     let closes_quote = quote == Some(candidate);
                     let ends_query_value =
-                        quote.is_none() && url_query && matches!(candidate, '&' | '#');
+                        quote.is_none() && url_parameters && matches!(candidate, '&' | '#');
                     (closes_quote || ends_query_value).then_some(value_start + offset)
                 })
                 .unwrap_or(token.len());
@@ -9416,6 +9424,32 @@ fn redact_public_secrets(text: &str) -> String {
             index = value_end.max(index + character.len_utf8());
         }
         fragments
+    }
+
+    fn push_unlabeled_span(output: &mut String, span: &str) {
+        let mut start = 0;
+        for (index, character) in span.char_indices() {
+            // Fragment spans can contain several URL components. Check each
+            // component without splitting characters (`+` and `/`) that are
+            // valid inside the existing high-entropy token heuristic.
+            if !matches!(character, '&' | '?' | '#') {
+                continue;
+            }
+            let candidate = &span[start..index];
+            if public_secret_like_token(candidate) {
+                output.push_str("[REDACTED]");
+            } else {
+                output.push_str(candidate);
+            }
+            output.push(character);
+            start = index + character.len_utf8();
+        }
+        let candidate = &span[start..];
+        if public_secret_like_token(candidate) {
+            output.push_str("[REDACTED]");
+        } else {
+            output.push_str(candidate);
+        }
     }
 
     fn separator(token: &str) -> bool {
@@ -9463,18 +9497,14 @@ fn redact_public_secrets(text: &str) -> String {
 
         let fragments = secret_fragments(token);
         if fragments.is_empty() {
-            if public_secret_like_token(token) {
-                output.push_str("[REDACTED]");
-            } else {
-                output.push_str(token);
-            }
+            push_unlabeled_span(output, token);
             return;
         }
 
         let mut cursor = 0;
         for fragment in fragments {
             debug_assert!(fragment.label_start >= cursor);
-            output.push_str(&token[cursor..fragment.value_start]);
+            push_unlabeled_span(output, &token[cursor..fragment.value_start]);
             let value = &token[fragment.value_start..fragment.value_end];
             if value.is_empty() {
                 if fragment.value_end == token.len() {
@@ -9494,7 +9524,7 @@ fn redact_public_secrets(text: &str) -> String {
             }
             cursor = fragment.value_end;
         }
-        output.push_str(&token[cursor..]);
+        push_unlabeled_span(output, &token[cursor..]);
     }
 
     let mut output = String::with_capacity(text.len());
@@ -20374,6 +20404,42 @@ mod tests {
 
         assert_eq!(rendered.matches("[REDACTED]").count(), count);
         assert!(!rendered.contains("value-"));
+    }
+
+    #[test]
+    fn public_secret_redaction_preserves_url_fragment_fields() {
+        let rendered = redact_public_secrets(
+            "https://host.test/path?mode=ok#section&api_key=secret&note=keep",
+        );
+
+        assert_eq!(
+            rendered,
+            "https://host.test/path?mode=ok#section&api_key=[REDACTED]&note=keep"
+        );
+    }
+
+    #[test]
+    fn public_secret_redaction_checks_unlabeled_suffix_components() {
+        let rendered =
+            redact_public_secrets("https://host.test/path?token=secret&mode=ok&ghp_super_secret");
+
+        assert_eq!(
+            rendered,
+            "https://host.test/path?token=[REDACTED]&mode=ok&[REDACTED]"
+        );
+        assert!(!rendered.contains("ghp_super_secret"));
+
+        let rendered = redact_public_secrets("https://host.test/path?mode=ok&ghp_super_secret");
+        assert_eq!(rendered, "https://host.test/path?mode=ok&[REDACTED]");
+
+        let high_entropy = format!("{}Z", "Aa1/".repeat(12));
+        let rendered = redact_public_secrets(&format!(
+            "https://host.test/path?token=secret&mode=ok&{high_entropy}"
+        ));
+        assert_eq!(
+            rendered,
+            "https://host.test/path?token=[REDACTED]&mode=ok&[REDACTED]"
+        );
     }
 
     #[test]
