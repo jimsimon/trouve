@@ -196,7 +196,9 @@ CREATE TABLE IF NOT EXISTS events (
   scope_kind TEXT NOT NULL,
   scope_id TEXT NOT NULL,
   ts TEXT NOT NULL,
-  payload TEXT NOT NULL
+  payload TEXT NOT NULL,
+  event_type TEXT,
+  event_turn INTEGER
 );
 CREATE INDEX IF NOT EXISTS events_scope ON events (scope_kind, scope_id, cursor);
 CREATE TABLE IF NOT EXISTS thread_view_cache (
@@ -298,6 +300,7 @@ CREATE TABLE IF NOT EXISTS team_deliveries (
   recipient_member_id TEXT NOT NULL REFERENCES team_members(id),
   queued_prompt_id TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT 'queued',
+  turn INTEGER,
   created_at TEXT NOT NULL,
   UNIQUE(message_id, recipient_member_id)
 );
@@ -653,6 +656,15 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'solo'",
     "ALTER TABLE team_messages ADD COLUMN idempotency_key TEXT",
     "ALTER TABLE team_messages ADD COLUMN request_fingerprint TEXT",
+    "ALTER TABLE team_deliveries ADD COLUMN turn INTEGER",
+    "ALTER TABLE events ADD COLUMN event_type TEXT",
+    "ALTER TABLE events ADD COLUMN event_turn INTEGER",
+    "UPDATE events
+       SET event_type = json_extract(payload, '$.type'),
+           event_turn = json_extract(payload, '$.turn')
+       WHERE event_type IS NULL",
+    "CREATE INDEX IF NOT EXISTS events_scope_type_turn
+       ON events (scope_kind, scope_id, event_type, event_turn, cursor)",
     "CREATE UNIQUE INDEX IF NOT EXISTS team_messages_idempotency
        ON team_messages (session_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
@@ -2763,15 +2775,25 @@ fn recover_process_state(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "UPDATE team_deliveries
-         SET status = CASE
-           WHEN EXISTS (
+         SET status = 'reserved'
+         WHERE status = 'running'
+           AND EXISTS (
              SELECT 1 FROM queued_prompts
              WHERE id = team_deliveries.queued_prompt_id
-           )
-             THEN 'queued'
-           ELSE 'interrupted'
-         END
-         WHERE status = 'running'",
+           )",
+        [],
+    )?;
+    // A current-schema running delivery without its outbox prompt may still
+    // have a completed assistant turn to project into the canonical timeline.
+    // Leave it recoverable for the engine. Legacy rows have no recorded turn
+    // and cannot be reconciled safely.
+    conn.execute(
+        "UPDATE team_deliveries SET status = 'interrupted'
+         WHERE status = 'running' AND turn IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM queued_prompts
+             WHERE id = team_deliveries.queued_prompt_id
+           )",
         [],
     )?;
     conn.execute(
@@ -4260,6 +4282,26 @@ pub(crate) struct TeamPromptDelivery {
     pub recipient_member_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TeamDeliveryState {
+    pub session_id: String,
+    pub recipient_member_id: String,
+    pub thread_id: String,
+    pub prompt_id: String,
+    pub status: String,
+    pub turn: Option<u64>,
+    pub prompt_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistedTurnState {
+    Missing,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 impl ArtifactCleanupJob {
     pub(crate) fn claim(&self) -> Option<ArtifactCleanupClaim> {
         self.claim_token.as_ref().map(|token| ArtifactCleanupClaim {
@@ -4317,6 +4359,7 @@ enum StoreMutation {
         idempotency_key: Option<String>,
         request_fingerprint: Option<String>,
         deliveries: Vec<TeamPromptDelivery>,
+        completed_delivery_prompt_id: Option<String>,
     },
     SetTeamStatus {
         session_id: String,
@@ -4329,6 +4372,7 @@ enum StoreMutation {
         turns_used: u64,
         status: TeamStatus,
         current_prompt_id: String,
+        turn: u64,
     },
     SetTeamMemberState {
         member_id: String,
@@ -5089,7 +5133,23 @@ fn apply_store_mutation(
             idempotency_key,
             request_fingerprint,
             deliveries,
+            completed_delivery_prompt_id,
         } => {
+            if let Some(prompt_id) = completed_delivery_prompt_id {
+                let completed = conn.execute(
+                    "UPDATE team_deliveries SET status = 'completed'
+                     WHERE queued_prompt_id = ?1 AND status IN ('running', 'reserved')",
+                    params![prompt_id],
+                )?;
+                anyhow::ensure!(
+                    completed == 1,
+                    "team delivery {prompt_id} is no longer awaiting canonical output"
+                );
+                conn.execute(
+                    "DELETE FROM queued_prompts WHERE id = ?1",
+                    params![prompt_id],
+                )?;
+            }
             insert_team_message_row(
                 conn,
                 message,
@@ -5128,6 +5188,7 @@ fn apply_store_mutation(
             turns_used,
             status,
             current_prompt_id,
+            turn,
         } => {
             anyhow::ensure!(
                 *turns_used == expected_turns.saturating_add(1),
@@ -5147,6 +5208,15 @@ fn apply_store_mutation(
             if updated == 0 {
                 return Ok(StoreMutationOutcome::SkipAndRollback);
             }
+            let reserved = conn.execute(
+                "UPDATE team_deliveries SET status = 'running', turn = ?2
+                 WHERE queued_prompt_id = ?1 AND status = 'queued'",
+                params![current_prompt_id, *turn as i64],
+            )?;
+            anyhow::ensure!(
+                reserved == 1,
+                "team delivery {current_prompt_id} changed while reserving its turn"
+            );
             if *status == TeamStatus::Paused {
                 conn.execute(
                     "UPDATE team_deliveries SET status = 'cancelled'
@@ -5457,7 +5527,10 @@ fn insert_event_batch<'a>(
         }
         let (kind, id) = scope_cols(&event.scope);
         tx.execute(
-            "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO events
+               (scope_kind, scope_id, ts, payload, event_type, event_turn)
+             VALUES (?1, ?2, ?3, ?4,
+                     json_extract(?4, '$.type'), json_extract(?4, '$.turn'))",
             params![kind, id, event.ts.to_rfc3339(), event.payload],
         )?;
         let source_cursor = tx.last_insert_rowid() as u64;
@@ -5482,8 +5555,10 @@ fn insert_event_batch<'a>(
             };
             let payload = serde_json::to_string(&derived)?;
             tx.execute(
-                "INSERT INTO events (scope_kind, scope_id, ts, payload)
-                 VALUES ('server', '', ?1, ?2)",
+                "INSERT INTO events
+                   (scope_kind, scope_id, ts, payload, event_type, event_turn)
+                 VALUES ('server', '', ?1, ?2,
+                         json_extract(?2, '$.type'), json_extract(?2, '$.turn'))",
                 params![event.ts.to_rfc3339(), payload],
             )?;
             published.push(EventEnvelope {
@@ -5495,8 +5570,10 @@ fn insert_event_batch<'a>(
             if let Some(notification) = change.notification {
                 let payload = serde_json::to_string(&notification)?;
                 tx.execute(
-                    "INSERT INTO events (scope_kind, scope_id, ts, payload)
-                     VALUES ('server', '', ?1, ?2)",
+                    "INSERT INTO events
+                       (scope_kind, scope_id, ts, payload, event_type, event_turn)
+                     VALUES ('server', '', ?1, ?2,
+                             json_extract(?2, '$.type'), json_extract(?2, '$.turn'))",
                     params![event.ts.to_rfc3339(), payload],
                 )?;
                 published.push(EventEnvelope {
@@ -5518,8 +5595,10 @@ fn insert_event_batch<'a>(
                 let derived = Event::ThreadStatusUpdated { status };
                 let payload = serde_json::to_string(&derived)?;
                 tx.execute(
-                    "INSERT INTO events (scope_kind, scope_id, ts, payload)
-                     VALUES ('server', '', ?1, ?2)",
+                    "INSERT INTO events
+                       (scope_kind, scope_id, ts, payload, event_type, event_turn)
+                     VALUES ('server', '', ?1, ?2,
+                             json_extract(?2, '$.type'), json_extract(?2, '$.turn'))",
                     params![event.ts.to_rfc3339(), payload],
                 )?;
                 published.push(EventEnvelope {
@@ -6711,23 +6790,48 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events
-             WHERE scope_kind = 'thread' AND scope_id = ?1 ORDER BY cursor",
+             WHERE scope_kind = 'thread' AND scope_id = ?1
+               AND event_type = 'assistant.message' AND event_turn = ?2
+             ORDER BY cursor",
         )?;
-        let rows = stmt.query_map(params![thread_id], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![thread_id, turn as i64], |r| r.get::<_, String>(0))?;
         let mut content = String::new();
         let mut found = false;
         for payload in rows {
             if let Ok(Event::AssistantMessage {
-                turn: event_turn,
-                content: segment,
+                content: segment, ..
             }) = serde_json::from_str::<Event>(&payload?)
-                && event_turn == turn
             {
                 content.push_str(&segment);
                 found = true;
             }
         }
         Ok(found.then_some(content))
+    }
+
+    pub(crate) fn persisted_turn_state(
+        &self,
+        thread_id: &str,
+        turn: u64,
+    ) -> Result<PersistedTurnState> {
+        let conn = self.conn.lock().unwrap();
+        let event_type = conn
+            .query_row(
+                "SELECT event_type FROM events
+                 WHERE scope_kind = 'thread' AND scope_id = ?1 AND event_turn = ?2
+                 ORDER BY cursor DESC LIMIT 1",
+                params![thread_id, turn as i64],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(match event_type.as_deref() {
+            None => PersistedTurnState::Missing,
+            Some("turn.completed") => PersistedTurnState::Completed,
+            Some("turn.failed") => PersistedTurnState::Failed,
+            Some("turn.cancelled") => PersistedTurnState::Cancelled,
+            Some(_) => PersistedTurnState::Running,
+        })
     }
 
     /// Live subscription to all events; callers filter by scope.
@@ -7498,6 +7602,7 @@ impl Store {
         message: &TeamMessage,
         idempotency_key: Option<&str>,
         request_fingerprint: Option<&str>,
+        completed_delivery_prompt_id: Option<&str>,
         deliveries: Vec<TeamPromptDelivery>,
         events: Vec<(Scope, Event)>,
     ) -> Result<Vec<EventEnvelope>> {
@@ -7508,6 +7613,7 @@ impl Store {
                 idempotency_key: idempotency_key.map(str::to_owned),
                 request_fingerprint: request_fingerprint.map(str::to_owned),
                 deliveries,
+                completed_delivery_prompt_id: completed_delivery_prompt_id.map(str::to_owned),
             },
         )?;
         self.append_pending_events(pending)
@@ -7577,11 +7683,12 @@ impl Store {
         &self,
         session_id: &str,
         expected_turns: u64,
-        turns_used: u64,
         status: TeamStatus,
         current_prompt_id: &str,
+        turn: u64,
         events: Vec<(Scope, Event)>,
     ) -> Result<bool> {
+        let turns_used = expected_turns.saturating_add(1);
         let pending = serialize_lifecycle_events(
             events,
             StoreMutation::ConsumeTeamTurn {
@@ -7590,6 +7697,7 @@ impl Store {
                 turns_used,
                 status,
                 current_prompt_id: current_prompt_id.to_string(),
+                turn,
             },
         )?;
         Ok(!self
@@ -7639,26 +7747,115 @@ impl Store {
         Ok(())
     }
 
-    pub fn team_delivery_for_prompt(
+    pub(crate) fn team_delivery_for_prompt(
         &self,
         prompt_id: &str,
-    ) -> Result<Option<(String, String, String)>> {
+    ) -> Result<Option<TeamDeliveryState>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT session_id, message_id, recipient_member_id
-             FROM team_deliveries WHERE queued_prompt_id = ?1",
+            "SELECT team_deliveries.session_id,
+                    team_deliveries.recipient_member_id,
+                    team_members.thread_id,
+                    team_deliveries.queued_prompt_id,
+                    team_deliveries.status,
+                    team_deliveries.turn,
+                    EXISTS (
+                      SELECT 1 FROM queued_prompts
+                      WHERE id = team_deliveries.queued_prompt_id
+                    )
+             FROM team_deliveries
+             JOIN team_members ON team_members.id = team_deliveries.recipient_member_id
+             WHERE team_deliveries.queued_prompt_id = ?1",
             params![prompt_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |row| {
+                Ok(TeamDeliveryState {
+                    session_id: row.get(0)?,
+                    recipient_member_id: row.get(1)?,
+                    thread_id: row.get(2)?,
+                    prompt_id: row.get(3)?,
+                    status: row.get(4)?,
+                    turn: row.get::<_, Option<i64>>(5)?.map(|turn| turn as u64),
+                    prompt_exists: row.get(6)?,
+                })
+            },
         )
         .optional()
         .map_err(Into::into)
     }
 
+    pub(crate) fn recoverable_team_deliveries(&self) -> Result<Vec<TeamDeliveryState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT team_deliveries.session_id,
+                    team_deliveries.recipient_member_id,
+                    team_members.thread_id,
+                    team_deliveries.queued_prompt_id,
+                    team_deliveries.status,
+                    team_deliveries.turn,
+                    EXISTS (
+                      SELECT 1 FROM queued_prompts
+                      WHERE id = team_deliveries.queued_prompt_id
+                    )
+             FROM team_deliveries
+             JOIN team_members ON team_members.id = team_deliveries.recipient_member_id
+             WHERE team_deliveries.status IN ('reserved', 'running')
+             ORDER BY team_deliveries.created_at, team_deliveries.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TeamDeliveryState {
+                session_id: row.get(0)?,
+                recipient_member_id: row.get(1)?,
+                thread_id: row.get(2)?,
+                prompt_id: row.get(3)?,
+                status: row.get(4)?,
+                turn: row.get::<_, Option<i64>>(5)?.map(|turn| turn as u64),
+                prompt_exists: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn thread_has_reserved_team_delivery(&self, thread_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM team_deliveries
+                 JOIN team_members ON team_members.id = team_deliveries.recipient_member_id
+                 JOIN queued_prompts ON queued_prompts.id = team_deliveries.queued_prompt_id
+                 WHERE team_members.thread_id = ?1 AND team_deliveries.status = 'reserved'
+                 LIMIT 1",
+                params![thread_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub(crate) fn start_reserved_team_delivery(&self, prompt_id: &str, turn: u64) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE team_deliveries SET status = 'running', turn = ?2
+             WHERE queued_prompt_id = ?1 AND status = 'reserved'",
+            params![prompt_id, turn as i64],
+        )?;
+        Ok(updated == 1)
+    }
+
     pub fn set_team_delivery_status(&self, prompt_id: &str, status: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
             "UPDATE team_deliveries SET status = ?2 WHERE queued_prompt_id = ?1",
             params![prompt_id, status],
         )?;
+        anyhow::ensure!(updated == 1, "team delivery {prompt_id} no longer exists");
+        if matches!(status, "completed" | "failed" | "cancelled" | "interrupted") {
+            tx.execute(
+                "DELETE FROM queued_prompts WHERE id = ?1",
+                params![prompt_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -8400,14 +8597,33 @@ impl Store {
     }
 
     /// Permanently consume a claimed prompt after its user message is
-    /// durable in the event log and provider transcript.
+    /// durable in the event log and provider transcript. A running team
+    /// delivery keeps its claimed row as a recoverable outbox until the
+    /// canonical team message and delivery completion commit together.
     pub fn finish_queued_prompt(&self, id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let n = conn.execute(
-            "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 1",
-            params![id],
-        )?;
-        Ok(n > 0)
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let retained = tx
+            .query_row(
+                "SELECT 1 FROM queued_prompts
+                 JOIN team_deliveries ON team_deliveries.queued_prompt_id = queued_prompts.id
+                 WHERE queued_prompts.id = ?1 AND queued_prompts.claimed = 1
+                   AND team_deliveries.status = 'running'",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let deleted = if retained {
+            0
+        } else {
+            tx.execute(
+                "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 1",
+                params![id],
+            )?
+        };
+        tx.commit()?;
+        Ok(retained || deleted > 0)
     }
 
     // --- attachments ------------------------------------------------------
@@ -15125,6 +15341,72 @@ mod tests {
             store.assistant_message("th_segments", 7).unwrap(),
             Some("@coder inspect and report".into())
         );
+        let query_plan = store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT payload FROM events
+                 WHERE scope_kind = 'thread' AND scope_id = ?1
+                   AND event_type = 'assistant.message' AND event_turn = ?2
+                 ORDER BY cursor",
+            )
+            .unwrap()
+            .query_map(params!["th_segments", 7_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            query_plan
+                .iter()
+                .any(|detail| detail.contains("events_scope_type_turn")),
+            "turn-scoped assistant lookup must use its bounded index: {query_plan:?}"
+        );
+    }
+
+    #[test]
+    fn event_lookup_metadata_migrates_and_backfills_legacy_databases() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("legacy-event-metadata.sqlite3");
+        drop(Store::open(&database).unwrap());
+
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "DROP TABLE events;
+                 CREATE TABLE events (
+                   cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                   scope_kind TEXT NOT NULL,
+                   scope_id TEXT NOT NULL,
+                   ts TEXT NOT NULL,
+                   payload TEXT NOT NULL
+                 );
+                 INSERT INTO events (scope_kind, scope_id, ts, payload)
+                 VALUES (
+                   'thread', 'th_legacy', '2000-01-01T00:00:00Z',
+                   '{\"type\":\"assistant.message\",\"turn\":9,\"content\":\"recovered\"}'
+                 );",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let reopened = Store::open(&database).unwrap();
+        assert_eq!(
+            reopened.assistant_message("th_legacy", 9).unwrap(),
+            Some("recovered".into())
+        );
+        let (event_type, event_turn): (String, i64) = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT event_type, event_turn FROM events WHERE cursor = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event_type, "assistant.message");
+        assert_eq!(event_turn, 9);
     }
 
     #[test]
@@ -17846,7 +18128,12 @@ mod tests {
                 .state,
             TeamMemberState::Queued
         );
-        store.cancel_pending_team_deliveries("se_q").unwrap();
+        let recovered = store.team_delivery_for_prompt(&queued.id).unwrap().unwrap();
+        assert_eq!(recovered.status, "reserved");
+        assert!(recovered.prompt_exists);
+        store
+            .set_team_delivery_status(&queued.id, "failed")
+            .unwrap();
         assert!(store.queued_prompts("th_coder").unwrap().is_empty());
 
         assert_eq!(
@@ -17891,9 +18178,9 @@ mod tests {
                 .consume_team_turn_with_events(
                     "se_q",
                     1,
-                    2,
                     TeamStatus::Paused,
                     &current.id,
+                    2,
                     vec![(
                         Scope::Session("se_q".into()),
                         Event::TeamStatusChanged {
@@ -17929,8 +18216,134 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert!(delivery_states.contains(&(current.id.clone(), "queued".into())));
+        assert!(delivery_states.contains(&(current.id.clone(), "running".into())));
         assert!(delivery_states.contains(&(stranded.id.clone(), "cancelled".into())));
+        assert!(store.finish_queued_prompt(&current.id).unwrap());
+        assert!(store.queued_prompt_thread(&current.id).unwrap().is_some());
+        let output = TeamMessage {
+            id: "msg_output".into(),
+            session_id: "se_q".into(),
+            author_member_id: Some(orchestrator.id.clone()),
+            author_handle: orchestrator.handle.clone(),
+            author_kind: TeamAuthorKind::Agent,
+            content: "final result".into(),
+            mentions: Vec::new(),
+            created_at,
+        };
+        store
+            .append_team_message_with_events(
+                &output,
+                None,
+                None,
+                Some(&current.id),
+                Vec::new(),
+                vec![(
+                    Scope::Session("se_q".into()),
+                    Event::TeamMessagePosted {
+                        message: output.clone(),
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(store.queued_prompt_thread(&current.id).unwrap().is_none());
+        assert_eq!(
+            store
+                .team_delivery_for_prompt(&current.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+
+        let recovery_source = TeamMessage {
+            id: "msg_recovery_source".into(),
+            session_id: "se_q".into(),
+            author_member_id: None,
+            author_handle: "you".into(),
+            author_kind: TeamAuthorKind::Human,
+            content: "recover this output".into(),
+            mentions: Vec::new(),
+            created_at,
+        };
+        store.insert_team_message(&recovery_source).unwrap();
+        let recovery_prompt = store
+            .enqueue_prompt(&coder.thread_id, "recoverable delivery", &[])
+            .unwrap();
+        store
+            .insert_team_delivery("se_q", &recovery_source.id, &coder.id, &recovery_prompt.id)
+            .unwrap();
+        store
+            .claim_queued_prompt(&coder.thread_id)
+            .unwrap()
+            .unwrap();
+        store
+            .set_team_delivery_status(&recovery_prompt.id, "running")
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE team_deliveries SET turn = 11 WHERE queued_prompt_id = ?1",
+                params![recovery_prompt.id],
+            )
+            .unwrap();
+        assert!(store.finish_queued_prompt(&recovery_prompt.id).unwrap());
+        store
+            .append_events(
+                Scope::Thread(coder.thread_id.clone()),
+                vec![
+                    Event::AssistantMessage {
+                        turn: 11,
+                        content: "recovered result".into(),
+                    },
+                    Event::TurnCompleted {
+                        turn: 11,
+                        usage: Default::default(),
+                        checkpoint_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        recover_process_state(&store.conn.lock().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .team_delivery_for_prompt(&recovery_prompt.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "reserved"
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(crate::engine::Engine::new(
+            store.clone(),
+            data.path().into(),
+            &crate::config::Config::default(),
+        ));
+        engine.recover_team_deliveries().unwrap();
+        assert_eq!(
+            store
+                .team_delivery_for_prompt(&recovery_prompt.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert!(
+            store
+                .queued_prompt_thread(&recovery_prompt.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .team("se_q")
+                .unwrap()
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| message.content == "recovered result")
+        );
         assert_eq!(store.consume_team_turn("se_q").unwrap(), None);
         let team = store.team("se_q").unwrap().unwrap();
         assert_eq!(team.turns_used, 2);

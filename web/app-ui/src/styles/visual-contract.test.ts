@@ -68,6 +68,22 @@ describe("Trouve visual contract", () => {
     expect(shell).toContain("@keydown=");
   });
 
+  it("keeps new-session focus order aligned with its visual order", () => {
+    const promptOrder = numberFrom(
+      app,
+      /\.new-session-prompt \{ order: (\d+);/,
+      "new-session prompt order",
+    );
+    const optionsOrder = numberFrom(
+      app,
+      /\.new-session-screen \.dialog-option-grid \{ order: (\d+);/,
+      "new-session option order",
+    );
+    expect(promptOrder).toBeLessThan(optionsOrder);
+    expect(app).toContain(".new-session-screen .pending-attachments { order: 7;");
+    expect(app).toContain(".new-session-screen .new-session-attachment { order: 9;");
+  });
+
   it("uses the system UI font and sizes the custom-element host", () => {
     expect(tokens).toContain("--trouve-font-sans: system-ui");
     expect(tokens).not.toContain("Inter");

@@ -15,7 +15,7 @@ import type {
   ProtocolTeamStatus,
 } from "../services/protocol-client.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
-import { latestTeamSnapshot } from "./team-screen-model.js";
+import { latestTeamSnapshot, TeamRefreshCoordinator } from "./team-screen-model.js";
 
 const TEAM_EVENT_PREFIX = "team.";
 const TEAM_LOAD_RETRY_MS = 5_000;
@@ -187,13 +187,13 @@ export class TrouveTeamScreen extends LitElement {
       margin: 0 auto;
       padding: 0;
       list-style: none;
+    }
     .timeline-note {
       width: min(860px, 100%);
       margin: 0 auto 12px;
       color: var(--trouve-text-dim);
       font-size: 10px;
       text-align: center;
-    }
     }
     .message {
       display: grid;
@@ -301,7 +301,7 @@ export class TrouveTeamScreen extends LitElement {
   #team: ProtocolTeam | undefined;
   #loading = false;
   #pending = false;
-  #refreshPending = false;
+  readonly #refreshes = new TeamRefreshCoordinator();
   #draft = "";
   #draftIdempotencyKey = "";
   #error = "";
@@ -311,10 +311,16 @@ export class TrouveTeamScreen extends LitElement {
     return this.sessionId || this.#sessionScope.value?.sessionId || "";
   }
 
+  override connectedCallback(): void {
+    super.connectedCallback();
+    this.requestUpdate();
+  }
+
   override disconnectedCallback(): void {
     this.#generation += 1;
     this.#stream?.close();
     this.#stream = undefined;
+    this.#observedServices = undefined;
     this.#clearLoadRetry();
     super.disconnectedCallback();
   }
@@ -449,6 +455,7 @@ export class TrouveTeamScreen extends LitElement {
   async #open(services: AppServices | undefined, sessionId: string): Promise<void> {
     this.#clearLoadRetry();
     const generation = ++this.#generation;
+    this.#refreshes.reset();
     this.#stream?.close();
     this.#stream = undefined;
     this.#team = undefined;
@@ -489,12 +496,8 @@ export class TrouveTeamScreen extends LitElement {
   }
 
   #scheduleRefresh(generation: number): void {
-    if (this.#refreshPending || generation !== this.#generation) return;
-    this.#refreshPending = true;
-    queueMicrotask(() => {
-      this.#refreshPending = false;
-      void this.#refresh(generation);
-    });
+    if (generation !== this.#generation) return;
+    this.#refreshes.request(() => this.#refresh(generation));
   }
 
   async #refresh(generation = this.#generation): Promise<void> {
@@ -563,7 +566,9 @@ export class TrouveTeamScreen extends LitElement {
     this.requestUpdate();
     try {
       const team = await services.protocol.setTeamStatus(sessionId, action);
-      if (this.#isCurrent(generation, services, sessionId)) this.#team = team;
+      if (this.#isCurrent(generation, services, sessionId)) {
+        this.#team = latestTeamSnapshot(this.#team, team);
+      }
     } catch {
       if (this.#isCurrent(generation, services, sessionId)) {
         this.#error = `The team could not be ${action === "pause" ? "paused" : action === "resume" ? "resumed" : action === "complete" ? "completed" : "cancelled"}.`;

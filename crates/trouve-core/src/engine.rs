@@ -32,7 +32,7 @@ use crate::permissions::{
     ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
 };
 use crate::store::{
-    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
+    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PersistedTurnState, PromptAcceptance,
     SessionPrVerificationIntent, Store, TeamPromptDelivery,
 };
 use crate::tools::{
@@ -8101,6 +8101,110 @@ impl Engine {
         Ok(())
     }
 
+    /// Reconcile delivery outboxes left by an interrupted process, then
+    /// restart every team queue that is allowed to make progress. Completed
+    /// turns are projected into the canonical timeline before their delivery
+    /// is terminalized; incomplete reserved turns are failed and retried
+    /// without consuming the team's automatic-turn budget again.
+    pub fn recover_team_deliveries(self: &Arc<Self>) -> Result<(), EngineError> {
+        for delivery in self.store.recoverable_team_deliveries()? {
+            let member = self
+                .store
+                .team_member_by_thread(&delivery.thread_id)?
+                .filter(|member| member.id == delivery.recipient_member_id)
+                .ok_or_else(|| {
+                    EngineError::Internal(anyhow!(
+                        "team delivery {} lost recipient {}",
+                        delivery.prompt_id,
+                        delivery.recipient_member_id
+                    ))
+                })?;
+            if self
+                .store
+                .team(&delivery.session_id)?
+                .is_some_and(|team| team.status == TeamStatus::Cancelled)
+            {
+                self.store
+                    .set_team_delivery_status(&delivery.prompt_id, "cancelled")?;
+                self.set_team_member_state_and_emit(&member, TeamMemberState::Idle)?;
+                continue;
+            }
+            let state = delivery
+                .turn
+                .map(|turn| self.store.persisted_turn_state(&delivery.thread_id, turn))
+                .transpose()?
+                .unwrap_or(PersistedTurnState::Missing);
+            match state {
+                PersistedTurnState::Completed => {
+                    let content = self
+                        .store
+                        .assistant_message(
+                            &delivery.thread_id,
+                            delivery.turn.expect("completed delivery has a turn"),
+                        )?
+                        .unwrap_or_default();
+                    if content.trim().is_empty() {
+                        self.store
+                            .set_team_delivery_status(&delivery.prompt_id, "completed")?;
+                    } else {
+                        self.append_team_message(
+                            &delivery.session_id,
+                            Some(&member),
+                            content,
+                            None,
+                            Some(&delivery.prompt_id),
+                        )?;
+                    }
+                }
+                PersistedTurnState::Failed => self
+                    .store
+                    .set_team_delivery_status(&delivery.prompt_id, "failed")?,
+                PersistedTurnState::Cancelled => self
+                    .store
+                    .set_team_delivery_status(&delivery.prompt_id, "cancelled")?,
+                PersistedTurnState::Running if delivery.prompt_exists => {
+                    self.store.append_event(
+                        Scope::Thread(delivery.thread_id.clone()),
+                        Event::TurnFailed {
+                            turn: delivery.turn.expect("running delivery has a turn"),
+                            error: "turn interrupted by server restart".into(),
+                        },
+                    )?;
+                }
+                PersistedTurnState::Missing if delivery.prompt_exists => {}
+                PersistedTurnState::Running | PersistedTurnState::Missing => self
+                    .store
+                    .set_team_delivery_status(&delivery.prompt_id, "interrupted")?,
+            }
+            if self
+                .store
+                .team_delivery_for_prompt(&delivery.prompt_id)?
+                .is_some_and(|delivery| {
+                    matches!(
+                        delivery.status.as_str(),
+                        "completed" | "failed" | "cancelled" | "interrupted"
+                    )
+                })
+            {
+                let state = if self.store.queued_prompts(&delivery.thread_id)?.is_empty() {
+                    TeamMemberState::Idle
+                } else {
+                    TeamMemberState::Queued
+                };
+                self.set_team_member_state_and_emit(&member, state)?;
+            }
+        }
+
+        for session in self.store.list_sessions(None)? {
+            if session.kind == SessionKind::Team
+                && let Some(team) = self.store.team(&session.id)?
+            {
+                self.dispatch_active_team_queues(&team);
+            }
+        }
+        Ok(())
+    }
+
     pub fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<Session>, EngineError> {
         let mut sessions = self.store.list_sessions(workspace_id)?;
         let active = self.active_threads.lock().unwrap();
@@ -8355,15 +8459,20 @@ impl Engine {
     }
 
     fn dispatch_active_team_queues(self: &Arc<Self>, team: &Team) {
-        if team.status != TeamStatus::Active {
+        if team.status == TeamStatus::Cancelled {
             return;
         }
         for member in &team.members {
-            if self
+            let queued = self
                 .store
                 .queued_prompts(&member.thread_id)
-                .is_ok_and(|prompts| !prompts.is_empty())
-            {
+                .is_ok_and(|prompts| !prompts.is_empty());
+            let may_run = team.status == TeamStatus::Active
+                || self
+                    .store
+                    .thread_has_reserved_team_delivery(&member.thread_id)
+                    .unwrap_or(false);
+            if queued && may_run {
                 let _ = self.dispatch_queue(&member.thread_id);
             }
         }
@@ -8394,27 +8503,23 @@ impl Engine {
         }
         let idempotency_key =
             Self::validated_idempotency_key(req.idempotency_key.as_deref(), "team message")?;
-        self.append_team_message(
-            session_id,
-            None,
-            "you",
-            TeamAuthorKind::Human,
-            content,
-            idempotency_key.as_deref(),
-        )
+        self.append_team_message(session_id, None, content, idempotency_key.as_deref(), None)
     }
 
     fn append_team_message(
         self: &Arc<Self>,
         session_id: &str,
         author: Option<&TeamMember>,
-        author_handle: &str,
-        author_kind: TeamAuthorKind,
         content: String,
         idempotency_key: Option<&str>,
+        completed_delivery_prompt_id: Option<&str>,
     ) -> Result<TeamMessage, EngineError> {
         let _team_mutation = self.team_mutations.lock().unwrap();
         let team = self.get_team(session_id)?;
+        let (author_handle, author_kind) = author
+            .map_or(("you", TeamAuthorKind::Human), |member| {
+                (member.handle.as_str(), TeamAuthorKind::Agent)
+            });
         let request_fingerprint =
             serde_json::to_string(&content).map_err(|error| EngineError::Internal(error.into()))?;
         if let Some(key) = idempotency_key
@@ -8533,6 +8638,7 @@ impl Engine {
             &message,
             idempotency_key,
             idempotency_key.map(|_| request_fingerprint.as_str()),
+            completed_delivery_prompt_id,
             deliveries,
             events,
         ) {
@@ -8551,6 +8657,17 @@ impl Engine {
                 drop(_team_mutation);
                 self.dispatch_active_team_queues(&team);
                 return Ok(existing);
+            }
+            if let Some(prompt_id) = completed_delivery_prompt_id
+                && self
+                    .store
+                    .team_delivery_for_prompt(prompt_id)?
+                    .is_some_and(|delivery| delivery.status == "completed")
+            {
+                drop(_queue_mutation);
+                drop(_team_mutation);
+                self.dispatch_active_team_queues(&team);
+                return Ok(message);
             }
             return Err(error.into());
         }
@@ -10489,67 +10606,82 @@ impl Engine {
                     return Ok(());
                 }
             };
-            if delivery.is_some() {
-                let budget = match (|| -> Result<Option<(u64, TeamStatus)>> {
-                    let _team_mutation = self.team_mutations.lock().unwrap();
-                    let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
-                    let Some(team) = self.store.team(&thread.session_id)? else {
-                        return Ok(None);
-                    };
-                    if team.status != TeamStatus::Active || team.turns_used >= team.max_turns {
-                        return Ok(None);
-                    }
-                    let turns_used = team.turns_used + 1;
-                    let status = if turns_used >= team.max_turns {
-                        TeamStatus::Paused
-                    } else {
-                        TeamStatus::Active
-                    };
-                    let mut events = vec![(
-                        Scope::Session(thread.session_id.clone()),
-                        Event::TeamStatusChanged { status, turns_used },
-                    )];
-                    if status == TeamStatus::Paused {
-                        for member in &team.members {
-                            events.push((
-                                Scope::Thread(member.thread_id.clone()),
-                                Event::QueueUpdated {
-                                    prompts: Vec::new(),
-                                },
-                            ));
-                            let is_current_member = team_member
-                                .as_ref()
-                                .is_some_and(|current| current.id == member.id);
-                            if member.state == TeamMemberState::Queued && !is_current_member {
-                                let mut member = member.clone();
-                                member.state = TeamMemberState::Idle;
-                                events.push((
-                                    Scope::Session(thread.session_id.clone()),
-                                    Event::TeamMemberUpdated { member },
-                                ));
-                            }
+            if let Some(delivery) = &delivery {
+                let scheduled = if delivery.status == "reserved" {
+                    match self.store.start_reserved_team_delivery(&prompt.id, turn) {
+                        Ok(scheduled) => scheduled,
+                        Err(error) => {
+                            tracing::warn!(
+                                "reserved team turn for {} remains queued: {error}",
+                                thread.session_id
+                            );
+                            false
                         }
                     }
-                    let consumed = self.store.consume_team_turn_with_events(
-                        &thread.session_id,
-                        team.turns_used,
-                        turns_used,
-                        status,
-                        &prompt.id,
-                        events,
-                    )?;
-                    Ok(consumed.then_some((turns_used, status)))
-                })() {
-                    Ok(budget) => budget,
-                    Err(error) => {
-                        tracing::warn!(
-                            "team turn for {} remains queued: {error}",
-                            thread.session_id
-                        );
-                        None
+                } else {
+                    match (|| -> Result<bool> {
+                        if delivery.status != "queued" {
+                            return Ok(false);
+                        }
+                        let _team_mutation = self.team_mutations.lock().unwrap();
+                        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
+                        let Some(team) = self.store.team(&thread.session_id)? else {
+                            return Ok(false);
+                        };
+                        if team.status != TeamStatus::Active || team.turns_used >= team.max_turns {
+                            return Ok(false);
+                        }
+                        let turns_used = team.turns_used + 1;
+                        let status = if turns_used >= team.max_turns {
+                            TeamStatus::Paused
+                        } else {
+                            TeamStatus::Active
+                        };
+                        let mut events = vec![(
+                            Scope::Session(thread.session_id.clone()),
+                            Event::TeamStatusChanged { status, turns_used },
+                        )];
+                        if status == TeamStatus::Paused {
+                            for member in &team.members {
+                                events.push((
+                                    Scope::Thread(member.thread_id.clone()),
+                                    Event::QueueUpdated {
+                                        prompts: Vec::new(),
+                                    },
+                                ));
+                                let is_current_member = team_member
+                                    .as_ref()
+                                    .is_some_and(|current| current.id == member.id);
+                                if member.state == TeamMemberState::Queued && !is_current_member {
+                                    let mut member = member.clone();
+                                    member.state = TeamMemberState::Idle;
+                                    events.push((
+                                        Scope::Session(thread.session_id.clone()),
+                                        Event::TeamMemberUpdated { member },
+                                    ));
+                                }
+                            }
+                        }
+                        self.store.consume_team_turn_with_events(
+                            &thread.session_id,
+                            team.turns_used,
+                            status,
+                            &prompt.id,
+                            turn,
+                            events,
+                        )
+                    })() {
+                        Ok(scheduled) => scheduled,
+                        Err(error) => {
+                            tracing::warn!(
+                                "team turn for {} remains queued: {error}",
+                                thread.session_id
+                            );
+                            false
+                        }
                     }
                 };
-                let Some((_turns_used, _status)) = budget else {
+                if !scheduled {
                     let _ = self.store.release_queued_prompt(&prompt.id);
                     let _ = self.emit_queue(&thread.id);
                     if let Some(member) = &team_member {
@@ -10566,8 +10698,7 @@ impl Engine {
                     }
                     let _ = self.release_thread(&thread.id);
                     return Ok(());
-                };
-                let _ = self.store.set_team_delivery_status(&prompt.id, "running");
+                }
                 if let Some(member) = &team_member {
                     let _ = self.set_team_member_state_and_emit(member, TeamMemberState::Running);
                 }
@@ -10699,32 +10830,27 @@ impl Engine {
             } else {
                 false
             };
-            if delivery.is_some() && !cancelled && !resume_after_failure {
-                let _ = self.store.set_team_delivery_status(&prompt.id, "completed");
-            }
-            if let Some(member) = &team_member {
-                match self.store.assistant_message(&thread.id, turn) {
-                    Ok(Some(content)) if !content.trim().is_empty() => {
-                        if let Err(error) = self.append_team_message(
+            if !cancelled && !resume_after_failure {
+                if let Some(member) = &team_member {
+                    let content = self.store.assistant_message(&thread.id, turn)?;
+                    if let Some(content) = content.filter(|content| !content.trim().is_empty()) {
+                        self.append_team_message(
                             &thread.session_id,
                             Some(member),
-                            &member.handle,
-                            TeamAuthorKind::Agent,
                             content,
                             None,
-                        ) {
-                            tracing::warn!(
-                                "failed to route output from team member @{}: {error}",
-                                member.handle
-                            );
-                        }
+                            delivery.as_ref().map(|_| prompt.id.as_str()),
+                        )?;
+                    } else if delivery.is_some() {
+                        self.store
+                            .set_team_delivery_status(&prompt.id, "completed")?;
                     }
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(
-                        "failed to fold output from team member @{}: {error}",
-                        member.handle
-                    ),
+                } else if delivery.is_some() {
+                    self.store
+                        .set_team_delivery_status(&prompt.id, "completed")?;
                 }
+            }
+            if let Some(member) = &team_member {
                 let next_state = if self
                     .store
                     .queued_prompts(&thread.id)

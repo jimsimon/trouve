@@ -2329,14 +2329,35 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             : { permission_mode: memberDefaults.permission_mode }),
         });
         createdSessionId = team.session_id;
+        // Team creation is authoritative even if the eventual-consistency
+        // session listing is temporarily unavailable. Seed enough metadata
+        // to route this navigation to the team screen immediately; a later
+        // projection refresh replaces the provisional branch/worktree fields.
+        session = {
+          id: team.session_id,
+          workspace_id: submittedCreateRequest.workspaceId,
+          title: submittedCreateRequest.title,
+          branch: "",
+          worktree_path: "",
+          base_ref: submittedCreateRequest.baseRef,
+          kind: "team",
+          team_member_count: team.members.length,
+          archived: false,
+          active: true,
+          created_at: team.created_at,
+        };
+        this.#store.upsertSessionMetadata(session);
+        const refreshNotice = "Team created; its session details will refresh automatically.";
         try {
           const sessions = await this.#protocolClient.sessions();
-          session = sessions.find((candidate) => candidate.id === team.session_id);
-          if (session === undefined) {
-            this.#shellNotice = "Team created; its session details will refresh automatically.";
+          const authoritative = sessions.find((candidate) => candidate.id === team.session_id);
+          if (authoritative === undefined) {
+            this.#shellNotice = refreshNotice;
+          } else {
+            session = authoritative;
           }
         } catch {
-          this.#shellNotice = "Team created; its session details will refresh automatically.";
+          this.#shellNotice = refreshNotice;
         }
       } else {
         session = await this.#protocolClient.createSession({
@@ -3206,6 +3227,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       ? "team"
                       : "solo";
                   if (this.#newSessionKind === "team") {
+                    this.#newSessionAttachmentGeneration += 1;
                     this.#newSessionAttachments = [];
                     this.#newSessionAttachmentPending = false;
                   }
