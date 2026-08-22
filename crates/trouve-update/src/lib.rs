@@ -605,7 +605,11 @@ fn installed_matches_replacement(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if installed_metadata.permissions().mode() & 0o111 == 0 {
+        // Be deliberately stricter than "some class can execute this file".
+        // The installed executable is a per-user artifact, so accepting only
+        // group/other execute permission could skip the replacement even
+        // though its owner cannot launch it on the next restart.
+        if installed_metadata.permissions().mode() & 0o100 == 0 {
             return Ok(None);
         }
     }
@@ -1373,6 +1377,12 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
+            assert!(
+                installed_matches_replacement(&executable, &replacement, &cancellation)
+                    .unwrap()
+                    .is_none()
+            );
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o401)).unwrap();
             assert!(
                 installed_matches_replacement(&executable, &replacement, &cancellation)
                     .unwrap()
