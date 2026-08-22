@@ -236,6 +236,103 @@ test.beforeEach(async ({ page }) => {
   await installProtocolFixtures(page);
 });
 
+test("new-session selects stay synchronized with asynchronously loaded defaults", async ({ page }) => {
+  await page.route("**/v1/providers", async (route) => {
+    await route.fulfill({
+      json: {
+        default_model: "test/default",
+        default_permission_mode: "yolo",
+        default_thinking_level: "high",
+        providers: [],
+      },
+    });
+  });
+  await page.route("**/v1/models", async (route) => {
+    await route.fulfill({
+      json: [
+        {
+          id: "test/first",
+          display_name: "First model",
+          context_window: 128_000,
+          supports_tools: true,
+          options_schema: {},
+        },
+        {
+          id: "test/default",
+          display_name: "Default model",
+          context_window: 128_000,
+          supports_tools: true,
+          options_schema: {
+            type: "object",
+            properties: {
+              reasoning_effort: {
+                type: "string",
+                enum: ["low", "high"],
+                default: "low",
+              },
+            },
+          },
+        },
+      ],
+    });
+  });
+  await page.route("**/v1/personas**", async (route) => {
+    await route.fulfill({
+      json: [
+        {
+          id: "maintainability",
+          display_name: "Software Architect",
+          group: "reviewer",
+          system_prompt: "Review architecture.",
+          read_only: true,
+        },
+        {
+          id: "code",
+          display_name: "Engineer",
+          group: "general",
+          system_prompt: "Implement the request.",
+        },
+      ],
+    });
+  });
+  await page.route("**/v1/workspaces/ws_1/branches", async (route) => {
+    await route.fulfill({ json: { branches: ["main"], head: "main" } });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "New session in trouve" }).click();
+
+  const screen = page.locator("#new-session-screen");
+  const persona = screen.locator('select[name="mode"]');
+  const thinking = screen.locator('select[name="thinking"]');
+  const permission = screen.locator('select[name="permission_mode"]');
+  await expect(persona).toHaveValue("code");
+  await expect(thinking).toHaveValue("high");
+  await expect(permission).toHaveValue("yolo");
+  await expect(screen.getByText("Unattended execution (YOLO) is dangerous"))
+    .toBeVisible();
+
+  // Reproduce the browser-side drift caused when option lists are replaced
+  // after Lit cached the state value. A later render must repair the DOM even
+  // though the application state itself has not changed.
+  await screen.locator('select[name="mode"], select[name="thinking"], select[name="permission_mode"]')
+    .evaluateAll((selects) => {
+      for (const select of selects) (select as HTMLSelectElement).selectedIndex = 0;
+    });
+  await page.locator("trouve-app").evaluate(async (app) => {
+    const reactive = app as HTMLElement & {
+      requestUpdate(): void;
+      readonly updateComplete: Promise<unknown>;
+    };
+    reactive.requestUpdate();
+    await reactive.updateComplete;
+  });
+
+  await expect(persona).toHaveValue("code");
+  await expect(thinking).toHaveValue("high");
+  await expect(permission).toHaveValue("yolo");
+});
+
 test("session navigation uses compact one-line rows without branch names", async ({ page }, testInfo) => {
   await page.goto("/");
   if (testInfo.project.name.startsWith("mobile")) {
