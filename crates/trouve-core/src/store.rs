@@ -2886,11 +2886,54 @@ fn scoped_code_review_theme_id(
     theme_id: &str,
     existing_theme_ids: &HashSet<String>,
 ) -> String {
-    if existing_theme_ids.contains(theme_id) {
+    let scope_prefix = format!("{repository}#{pull_number}:");
+    if existing_theme_ids.contains(theme_id) || theme_id.starts_with(&scope_prefix) {
         theme_id.to_owned()
     } else {
-        format!("{repository}#{pull_number}:{theme_id}")
+        format!("{scope_prefix}{theme_id}")
     }
+}
+
+fn staged_code_review_theme_ids(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT theme_id FROM code_review_theme_observations WHERE job_id = ?1
+         UNION
+         SELECT theme_id FROM code_review_finding_themes WHERE linked_by_job_id = ?1
+         UNION
+         SELECT link.theme_id
+         FROM code_review_finding_themes link
+         JOIN code_review_findings finding ON finding.id = link.finding_id
+         WHERE finding.job_id = ?1",
+    )?;
+    Ok(stmt
+        .query_map(params![job_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn delete_orphan_code_review_themes(
+    tx: &rusqlite::Transaction<'_>,
+    theme_ids: Vec<String>,
+) -> Result<()> {
+    for theme_id in theme_ids {
+        tx.execute(
+            "DELETE FROM code_review_themes
+             WHERE id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_theme_observations WHERE theme_id = ?1
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_finding_themes WHERE theme_id = ?1
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_theme_transitions WHERE theme_id = ?1
+               )",
+            params![theme_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn publish_code_review_theme_observations(
@@ -10193,23 +10236,15 @@ impl Store {
             params![job_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let mut existing_theme_ids = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM code_review_themes
-                 WHERE repository = ?1 AND pull_number = ?2",
-            )?;
-            stmt.query_map(params![repository, pull_number], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<HashSet<_>>>()?
-        };
+        let replaced_theme_ids = staged_code_review_theme_ids(&tx, job_id)?;
         tx.execute(
             "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
             params![job_id],
         )?;
         tx.execute(
             "DELETE FROM code_review_finding_themes
-             WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
+             WHERE linked_by_job_id = ?1
+                OR finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
             params![job_id],
         )?;
         tx.execute(
@@ -10235,6 +10270,17 @@ impl Store {
              WHERE job_id = ?1",
             params![job_id],
         )?;
+        delete_orphan_code_review_themes(&tx, replaced_theme_ids)?;
+        let mut existing_theme_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM code_review_themes
+                 WHERE repository = ?1 AND pull_number = ?2",
+            )?;
+            stmt.query_map(params![repository, pull_number], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<HashSet<_>>>()?
+        };
         let now = chrono::Utc::now().to_rfc3339();
         let mut scoped_theme_ids = HashMap::<String, String>::new();
         for theme in themes {
@@ -10256,13 +10302,7 @@ impl Store {
                          first_seen_head, last_seen_head, resolved_head, recurrence_count,
                          created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6, '', 0, ?7, ?7)
-                 ON CONFLICT(id) DO UPDATE SET
-                     root_cause = excluded.root_cause,
-                     recommendation = excluded.recommendation
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM code_review_theme_observations existing
-                     WHERE existing.theme_id = excluded.id AND existing.published != 0
-                 )",
+                 ON CONFLICT(id) DO NOTHING",
                 params![
                     theme_id,
                     repository,
@@ -10454,20 +10494,7 @@ impl Store {
             tx.commit()?;
             return Ok(false);
         }
-        let affected_theme_ids = {
-            let mut stmt = tx.prepare(
-                "SELECT theme_id FROM code_review_theme_observations WHERE job_id = ?1
-                 UNION
-                 SELECT theme_id FROM code_review_finding_themes WHERE linked_by_job_id = ?1
-                 UNION
-                 SELECT link.theme_id
-                 FROM code_review_finding_themes link
-                 JOIN code_review_findings finding ON finding.id = link.finding_id
-                 WHERE finding.job_id = ?1",
-            )?;
-            stmt.query_map(params![job_id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let affected_theme_ids = staged_code_review_theme_ids(&tx, job_id)?;
         tx.execute(
             "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
             params![job_id],
@@ -10512,19 +10539,7 @@ impl Store {
         if reset == 0 {
             return Ok(false);
         }
-        for theme_id in affected_theme_ids {
-            tx.execute(
-                "DELETE FROM code_review_themes
-                 WHERE id = ?1
-                   AND NOT EXISTS (
-                     SELECT 1 FROM code_review_theme_observations WHERE theme_id = ?1
-                   )
-                   AND NOT EXISTS (
-                     SELECT 1 FROM code_review_finding_themes WHERE theme_id = ?1
-                   )",
-                params![theme_id],
-            )?;
-        }
+        delete_orphan_code_review_themes(&tx, affected_theme_ids)?;
         tx.commit()?;
         Ok(true)
     }
@@ -21283,6 +21298,33 @@ mod tests {
             store.claim_code_review_job().unwrap().unwrap().job.id,
             current.id
         );
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_review_themes
+                    (id, repository, pull_number, root_cause, recommendation, status,
+                     first_seen_head, last_seen_head, resolved_head, recurrence_count,
+                     created_at, updated_at)
+                 VALUES ('transition-theme', ?1, ?2, 'original root cause',
+                         'original recommendation', 'open', ?3, ?3, '', 0, ?4, ?4)",
+                params![
+                    current.repository,
+                    current.pull_number as i64,
+                    current.head_sha,
+                    now,
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO code_review_theme_transitions
+                    (theme_id, job_id, status, last_seen_head, resolved_head,
+                     recurrence_count, transitioned_at)
+                 VALUES ('transition-theme', ?1, 'open', ?2, '', 0, ?3)",
+                params![current.id, current.head_sha, now],
+            )
+            .unwrap();
+        }
         let findings = [NewCodeReviewFinding {
             path: "src/lib.rs".into(),
             line: 7,
@@ -21295,16 +21337,25 @@ mod tests {
             sources: Vec::new(),
         }];
         let finding_details = [NewCodeReviewFindingDetails {
-            theme_ids: vec!["staged-theme".into()],
+            theme_ids: vec!["staged-theme".into(), "transition-theme".into()],
             ..Default::default()
         }];
-        let themes = [NewCodeReviewTheme {
-            id: "staged-theme".into(),
-            root_cause: "staged root cause".into(),
-            recommendation: "staged recommendation".into(),
-            observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
-            previous_finding_ids: Vec::new(),
-        }];
+        let themes = [
+            NewCodeReviewTheme {
+                id: "staged-theme".into(),
+                root_cause: "staged root cause".into(),
+                recommendation: "staged recommendation".into(),
+                observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                previous_finding_ids: Vec::new(),
+            },
+            NewCodeReviewTheme {
+                id: "transition-theme".into(),
+                root_cause: "rejected replacement root cause".into(),
+                recommendation: "rejected replacement recommendation".into(),
+                observation_kind: trouve_protocol::CodeReviewThemeObservationKind::Continuation,
+                previous_finding_ids: Vec::new(),
+            },
+        ];
         let rejections = [trouve_protocol::CodeReviewCandidateRejection {
             candidate_id: "rejected".into(),
             task_id: "task".into(),
@@ -21393,8 +21444,27 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let retained_theme: (String, String) = conn
+            .query_row(
+                "SELECT root_cause, recommendation FROM code_review_themes
+                 WHERE id = 'transition-theme'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let transitions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_review_theme_transitions
+                 WHERE theme_id = 'transition-theme'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(observations, 0);
         assert_eq!(orphan_themes, 0);
+        assert_eq!(retained_theme.0, "original root cause");
+        assert_eq!(retained_theme.1, "original recommendation");
+        assert_eq!(transitions, 1);
     }
 
     #[test]

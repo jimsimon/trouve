@@ -4289,7 +4289,7 @@ impl Engine {
             Ok(Err(error)) if cancellation_requested => {
                 ("cancelled", String::new(), error.to_string())
             }
-            Ok(Err(error)) if error.to_string().starts_with("stale:") => {
+            Ok(Err(error)) if code_review_error_is_stale(&error) => {
                 ("stale", String::new(), error.to_string())
             }
             Ok(Err(error)) => ("failed", String::new(), format!("{error:#}")),
@@ -5549,10 +5549,17 @@ impl Engine {
             }
         }
         if !self.store.claim_code_review_publication(&job.id)? {
-            let discarded = self
-                .store
-                .discard_unaccepted_code_review_result(&job.id)
-                .context("discarding staged review result after publication claim rejection")?;
+            let discarded = match self.store.discard_unaccepted_code_review_result(&job.id) {
+                Ok(discarded) => discarded,
+                Err(discard_error) => {
+                    return Err(anyhow!(
+                        "stale: review was cancelled or replaced before publication"
+                    ))
+                    .context(format!(
+                        "discarding staged review result after publication claim rejection: {discard_error:#}"
+                    ));
+                }
+            };
             if !discarded {
                 bail!("stale: review changed and its staged result could not be discarded");
             }
@@ -9372,7 +9379,8 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
     // Only terminal review outcomes expose coordinator-authored results. A
     // queued or running job may hold a staged result while its live revision
     // is revalidated; cancelled and stale jobs never accepted that result.
-    let expose_results = matches!(job.status.as_str(), "succeeded" | "failed");
+    let expose_results = job.status == "succeeded"
+        || (job.status == "failed" && !detail.unadjudicated_candidates.is_empty());
     let result_summary = if expose_results {
         detail.summary.as_str()
     } else {
@@ -10163,6 +10171,12 @@ fn ensure_review_current(superseded: &CancellationToken) -> Result<()> {
         bail!("stale: review was superseded by a newer revision or review configuration");
     }
     Ok(())
+}
+
+fn code_review_error_is_stale(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("stale:"))
 }
 
 async fn acquire_review_publication_lock<'a>(
@@ -14417,6 +14431,64 @@ mod tests {
         assert!(!body.contains("Obsolete coordinator summary"));
         assert!(!body.contains("Obsolete finding title"));
         assert!(!body.contains("Apply the obsolete fix"));
+    }
+
+    #[test]
+    fn stale_error_classification_survives_cleanup_context() {
+        let error = Err::<(), _>(anyhow!(
+            "stale: pull request head changed before publication"
+        ))
+        .context("discarding staged review result failed")
+        .unwrap_err();
+
+        assert!(code_review_error_is_stale(&error));
+        assert!(!code_review_error_is_stale(&anyhow!(
+            "revalidating pull request before publication: request timed out"
+        )));
+    }
+
+    #[test]
+    fn ordinary_failed_lifecycle_comment_never_exposes_staged_results() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:failed-staging");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .save_code_review_result(
+                &queued.id,
+                "Unaccepted coordinator summary.",
+                "Apply the unaccepted fix.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Unaccepted finding title".into(),
+                    body: "This result never passed live revision validation.".into(),
+                    prompt_for_agents: "Apply the unaccepted finding.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &queued.id,
+                "failed",
+                "",
+                "discarding staged review result failed",
+            )
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        let body = render_lifecycle_comment(&detail);
+
+        assert!(body.starts_with("## ❌ Trouve Code Review — Failed"));
+        assert!(body.contains("**Error:** discarding staged review result failed"));
+        assert!(!body.contains("Unaccepted coordinator summary"));
+        assert!(!body.contains("Unaccepted finding title"));
+        assert!(!body.contains("Apply the unaccepted fix"));
     }
 
     #[test]
