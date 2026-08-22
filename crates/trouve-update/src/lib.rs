@@ -21,6 +21,7 @@ const CHECKSUM_ASSET: &str = "SHA256SUMS";
 const MAX_CHECKSUM_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARCHIVE_EXPANDED_BYTES: u64 = MAX_BINARY_BYTES + 64 * 1024 * 1024;
 
 /// Set this to a truthy value to disable startup/background updates. Manual
 /// update commands and the desktop's explicit update button still work.
@@ -197,9 +198,22 @@ pub async fn install_release_with_progress(
     release: &Release,
     progress: impl Fn(InstallProgress),
 ) -> Result<()> {
+    install_release_with_progress_and_cancel(release, progress, || false).await
+}
+
+/// Install a release while allowing a host to cancel before executable
+/// replacement. Cancellation is checked throughout downloads and between
+/// blocking extraction and installation.
+pub async fn install_release_with_progress_and_cancel(
+    release: &Release,
+    progress: impl Fn(InstallProgress),
+    cancelled: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<()> {
     if cfg!(debug_assertions) {
         bail!("self-update is disabled for development builds");
     }
+    let cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new(cancelled);
+    ensure_not_cancelled(cancelled.as_ref())?;
     let client = client(env!("CARGO_PKG_VERSION"))?;
     progress(InstallProgress::FetchingChecksums);
     let checksum_text = download_text(
@@ -209,6 +223,7 @@ pub async fn install_release_with_progress(
         "release checksums",
     )
     .await?;
+    ensure_not_cancelled(cancelled.as_ref())?;
     let expected = checksum_for(&checksum_text, &release.artifact_name)?;
 
     let stage = tempfile::tempdir().context("creating update staging directory")?;
@@ -222,8 +237,10 @@ pub async fn install_release_with_progress(
         &archive_path,
         MAX_ARCHIVE_BYTES,
         &progress,
+        cancelled.as_ref(),
     )
     .await?;
+    ensure_not_cancelled(cancelled.as_ref())?;
     progress(InstallProgress::Verifying);
     if actual != expected {
         bail!(
@@ -237,6 +254,7 @@ pub async fn install_release_with_progress(
     let binary_name = release.binary_name.clone();
     let archive_kind = release.archive_kind;
     let replacement_for_extract = replacement.clone();
+    ensure_not_cancelled(cancelled.as_ref())?;
     progress(InstallProgress::Extracting);
     tokio::task::spawn_blocking(move || {
         extract_binary(
@@ -249,8 +267,11 @@ pub async fn install_release_with_progress(
     .await
     .context("joining update extraction task")??;
 
+    ensure_not_cancelled(cancelled.as_ref())?;
     progress(InstallProgress::Installing);
+    let install_cancelled = std::sync::Arc::clone(&cancelled);
     tokio::task::spawn_blocking(move || {
+        ensure_not_cancelled(install_cancelled.as_ref())?;
         self_replace::self_replace(&replacement).context("replacing the running executable")
     })
     .await
@@ -403,7 +424,9 @@ async fn download_file(
     destination: &Path,
     limit: u64,
     progress: &impl Fn(InstallProgress),
+    cancelled: &(impl Fn() -> bool + ?Sized),
 ) -> Result<String> {
+    ensure_not_cancelled(cancelled)?;
     let response = client
         .get(url)
         .timeout(Duration::from_secs(600))
@@ -429,6 +452,7 @@ async fn download_file(
     });
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
+        ensure_not_cancelled(cancelled)?;
         let chunk = chunk.context("reading update archive")?;
         received = received
             .checked_add(chunk.len() as u64)
@@ -477,8 +501,16 @@ fn extract_binary(
                 .with_context(|| format!("opening {}", archive_path.display()))?;
             let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive_file));
             let mut written = None;
+            let mut expanded_bytes = 0_u64;
             for entry in archive.entries().context("reading update tar archive")? {
                 let mut entry = entry.context("reading update tar entry")?;
+                expanded_bytes = add_archive_entry_size(
+                    expanded_bytes,
+                    entry
+                        .header()
+                        .size()
+                        .context("reading update tar entry size")?,
+                )?;
                 let path = entry.path().context("reading update tar entry path")?;
                 if path != Path::new(binary_name) && path != packaged_binary {
                     continue;
@@ -534,6 +566,23 @@ fn copy_limited(reader: &mut impl Read, writer: &mut impl Write) -> Result<u64> 
         bail!("update binary exceeds the {MAX_BINARY_BYTES}-byte limit");
     }
     Ok(written)
+}
+
+fn add_archive_entry_size(current: u64, entry_size: u64) -> Result<u64> {
+    let expanded = current
+        .checked_add(entry_size)
+        .ok_or_else(|| anyhow!("update archive expanded byte count overflow"))?;
+    if expanded > MAX_ARCHIVE_EXPANDED_BYTES {
+        bail!("update archive expands beyond the {MAX_ARCHIVE_EXPANDED_BYTES}-byte limit");
+    }
+    Ok(expanded)
+}
+
+fn ensure_not_cancelled(cancelled: &(impl Fn() -> bool + ?Sized)) -> Result<()> {
+    if cancelled() {
+        bail!("update cancelled");
+    }
+    Ok(())
 }
 
 fn make_executable(path: &Path) -> Result<()> {
@@ -696,6 +745,23 @@ mod tests {
         let output = temp.path().join("new-trouve");
         extract_binary(&archive_path, ArchiveKind::TarGz, "trouve", &output).unwrap();
         assert_eq!(std::fs::read(output).unwrap(), payload);
+    }
+
+    #[test]
+    fn expanded_archive_budget_counts_every_tar_entry() {
+        let remaining = MAX_ARCHIVE_EXPANDED_BYTES - 1;
+        assert_eq!(add_archive_entry_size(0, remaining).unwrap(), remaining);
+        let error = add_archive_entry_size(remaining, 2).unwrap_err();
+        assert!(error.to_string().contains("expands beyond"));
+    }
+
+    #[test]
+    fn cancellation_is_reported_before_installation() {
+        assert!(ensure_not_cancelled(&|| false).is_ok());
+        assert_eq!(
+            ensure_not_cancelled(&|| true).unwrap_err().to_string(),
+            "update cancelled"
+        );
     }
 
     #[test]

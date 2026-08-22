@@ -58,9 +58,6 @@ pub(crate) enum AppEvent {
         request_id: u64,
         decision: CloseDecision,
     },
-    RestartAfterUpdate {
-        version: String,
-    },
     QuitNow,
 }
 
@@ -296,7 +293,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
         let status_updates = updates.clone();
         let check_updates = updates.clone();
         let install_updates = updates.clone();
-        let restart_proxy = event_loop.create_proxy();
+        let quit_proxy = event_loop.create_proxy();
         native_actions = native_actions.with_desktop_updater(
             move || Ok(status_updates.status()),
             move || {
@@ -305,13 +302,21 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
             },
             move || {
                 let updates = install_updates.clone();
-                let restart_proxy = restart_proxy.clone();
+                let quit_proxy = quit_proxy.clone();
                 async move {
-                    let state = updates.install_and_restart().await;
+                    let mut state = updates.install_and_restart().await;
                     if state.phase == trouve_desktop_host::DesktopUpdatePhase::Restarting
                         && let Some(version) = state.available_version.clone()
                     {
-                        let _ = restart_proxy.send_event(AppEvent::RestartAfterUpdate { version });
+                        match startup::restart_updated_app(&version) {
+                            Ok(()) => {
+                                let _ = quit_proxy.send_event(AppEvent::QuitNow);
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, %version, "restarting after desktop update failed");
+                                state = updates.restart_failed(&version, &format!("{error:#}"));
+                            }
+                        }
                     }
                     Ok(state)
                 }
@@ -422,8 +427,6 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let geometry_updates_for_events = geometry_updates.clone();
     let mut geometry_save_deadline: Option<Instant> = None;
     let mut close_confirmation = CloseConfirmationWatchdog::default();
-    let restart_after_shutdown = Arc::new(Mutex::new(None::<String>));
-    let restart_after_events = restart_after_shutdown.clone();
     let exit_code = event_loop.run_return(move |event, _, control_flow| {
         *control_flow = control_flow_for_pending_deadlines(
             geometry_save_deadline,
@@ -494,12 +497,6 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 if close_confirmation.resolve(request_id, decision) {
                     *control_flow = ControlFlow::Exit;
                 }
-            }
-            Event::UserEvent(AppEvent::RestartAfterUpdate { version }) => {
-                *restart_after_events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version);
-                *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(AppEvent::QuitNow) => *control_flow = ControlFlow::Exit,
             Event::WindowEvent {
@@ -576,13 +573,6 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     drop(webview);
     drop(window);
     host.shutdown();
-    if let Some(version) = restart_after_shutdown
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-    {
-        startup::restart_updated_app(&version)?;
-    }
     if exit_code != 0 {
         anyhow::bail!("desktop webview event loop exited with status {exit_code}");
     }

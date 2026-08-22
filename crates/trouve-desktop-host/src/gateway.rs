@@ -1432,6 +1432,7 @@ fn merge_preference_changes(
     merge_leaf!(appearance.font_size);
     merge_leaf!(appearance.reduce_motion);
     merge_leaf!(general.prevent_sleep_while_running);
+    merge_leaf!(general.automatic_updates);
     merge_leaf!(chat.collapse_sequential_tool_calls);
     merge_leaf!(chat.collapse_thinking_with_tools);
     merge_leaf!(chat.collapse_compaction_with_tools);
@@ -4044,6 +4045,26 @@ mod tests {
         let merged = merge_and_persist_preferences(&path, &baseline, &native, true).unwrap();
         assert_eq!(merged.appearance.theme, "light");
         assert_eq!(merged.geometry, native.geometry);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn automatic_update_preference_is_merged_and_persisted() {
+        let path = temporary_preference_path("automatic-updates");
+        let baseline = HostPreferences::default();
+        persist_preferences(&path, &baseline).unwrap();
+
+        let mut incoming = baseline.clone();
+        incoming.general.automatic_updates = false;
+        let merged = merge_and_persist_preferences(&path, &baseline, &incoming, false).unwrap();
+
+        assert!(!merged.general.automatic_updates);
+        assert!(
+            !load_host_preferences(&path, HostPreferences::default())
+                .unwrap()
+                .general
+                .automatic_updates
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -365,23 +365,33 @@ pub(crate) fn spawn_auto_update() {
         return;
     }
     std::thread::spawn(|| {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        else {
-            return;
-        };
-        if let Ok(trouve_update::UpdateStatus::Updated { from, to }) =
-            runtime.block_on(trouve_update::install_latest(
-                trouve_update::Component::Search,
-                env!("CARGO_PKG_VERSION"),
-            ))
         {
-            eprintln!(
-                "trouve-search {to} installed over {from}; new processes will use the update"
-            );
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("trouve-search automatic update runtime failed: {error}");
+                return;
+            }
+        };
+        if let Some(message) = auto_update_message(runtime.block_on(trouve_update::install_latest(
+            trouve_update::Component::Search,
+            env!("CARGO_PKG_VERSION"),
+        ))) {
+            eprintln!("{message}");
         }
     });
+}
+
+fn auto_update_message(result: anyhow::Result<trouve_update::UpdateStatus>) -> Option<String> {
+    match result {
+        Ok(trouve_update::UpdateStatus::Updated { from, to }) => Some(format!(
+            "trouve-search {to} installed over {from}; new processes will use the update"
+        )),
+        Ok(trouve_update::UpdateStatus::UpToDate { .. }) => None,
+        Err(error) => Some(format!("trouve-search automatic update failed: {error:#}")),
+    }
 }
 
 fn run_debug(command: DebugCommand) -> ExitCode {
@@ -439,5 +449,17 @@ fn run_debug(command: DebugCommand) -> ExitCode {
             println!("{}", serde_json::to_string(&scores).unwrap());
             ExitCode::SUCCESS
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_update_failures_are_reported() {
+        let message = auto_update_message(Err(anyhow::anyhow!("network unavailable"))).unwrap();
+        assert!(message.contains("automatic update failed"));
+        assert!(message.contains("network unavailable"));
     }
 }

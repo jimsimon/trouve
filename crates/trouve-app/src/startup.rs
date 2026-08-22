@@ -4,6 +4,7 @@
 //! frontend start. Development builds bypass this module entirely.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,8 +43,8 @@ progress { width: 100%; height: 7px; appearance: none; border: 0; border-radius:
 progress::-webkit-progress-bar { background: #2b3142; }
 progress::-webkit-progress-value { background: linear-gradient(90deg, #7775ff, #91a4ff); }
 progress::-moz-progress-bar { background: linear-gradient(90deg, #7775ff, #91a4ff); }
-.actions { display: none; justify-content: center; gap: 10px; margin-top: 20px; }
-.actions.visible { display: flex; }
+.actions { display: flex; justify-content: center; gap: 10px; margin-top: 20px; }
+.actions[hidden] { display: none; }
 button { border: 1px solid #46506a; border-radius: 7px; padding: 8px 14px; color: #e8ecf7;
   background: #252b3a; font: inherit; cursor: pointer; }
 button.primary { border-color: #7478ff; background: #6266df; color: white; }
@@ -53,23 +54,30 @@ button.primary { border-color: #7478ff; background: #6266df; color: white; }
 <body>
 <main>
   <div class="logo" aria-hidden="true">t</div>
-  <h1 id="status">Checking for updates…</h1>
-  <p id="detail">Contacting the stable release channel</p>
-  <progress id="progress"></progress>
-  <div id="actions" class="actions">
-    <button class="primary" onclick="location.href='https://startup.trouve/retry'">Retry</button>
+  <section id="announcement" role="status" aria-live="polite" aria-atomic="true">
+    <h1 id="status">Checking for updates…</h1>
+    <p id="detail">Contacting the stable release channel</p>
+  </section>
+  <progress id="progress" max="100" aria-label="Update progress"></progress>
+  <div id="actions" class="actions" role="group" aria-label="Update recovery actions" hidden>
+    <button id="retry" class="primary" onclick="location.href='https://startup.trouve/retry'">Retry</button>
     <button onclick="location.href='https://startup.trouve/continue'">Open trouve</button>
   </div>
   <div class="version">trouve v__VERSION__</div>
 </main>
 <script>
 window.__trouveStage = (status, detail, progress, failed) => {
+  const announcement = document.getElementById("announcement");
+  announcement.setAttribute("aria-live", failed ? "assertive" : "polite");
   document.getElementById("status").textContent = status;
   document.getElementById("detail").textContent = detail;
   const bar = document.getElementById("progress");
   if (progress === null) bar.removeAttribute("value");
   else bar.value = progress;
-  document.getElementById("actions").classList.toggle("visible", failed);
+  const actions = document.getElementById("actions");
+  const revealActions = failed && actions.hidden;
+  actions.hidden = !failed;
+  if (revealActions) requestAnimationFrame(() => document.getElementById("retry").focus());
 };
 </script>
 </body>
@@ -199,7 +207,8 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
         builder.build_gtk(container)?
     };
 
-    spawn_preflight(proxy.clone());
+    let mut preflight_cancel = Arc::new(AtomicBool::new(false));
+    spawn_preflight(proxy.clone(), Arc::clone(&preflight_cancel));
     let mut result = None;
     let mut last_failure = String::new();
     let mut preflight_running = true;
@@ -230,6 +239,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                 }
                 preflight_running = true;
                 last_failure.clear();
+                preflight_cancel = Arc::new(AtomicBool::new(false));
                 render_stage(
                     &webview,
                     "Checking for updates…",
@@ -237,7 +247,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                     None,
                     false,
                 );
-                spawn_preflight(proxy.clone());
+                spawn_preflight(proxy.clone(), Arc::clone(&preflight_cancel));
             }
             TaoEvent::UserEvent(AppEvent::Startup(Event::Open)) => {
                 if preflight_running {
@@ -277,7 +287,8 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
                 window_id,
                 event: WindowEvent::CloseRequested,
                 ..
-            } if window_id == window.id() && !preflight_running => {
+            } if window_id == window.id() => {
+                preflight_cancel.store(true, Ordering::Release);
                 result = Some(PreflightResult {
                     exit_process: true,
                     update_state: idle_state("Update cancelled."),
@@ -296,7 +307,7 @@ pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<Pref
     }))
 }
 
-fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>) {
+fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>, cancelled: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -324,6 +335,9 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>) {
                     return;
                 }
             };
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
             let Some(release) = check.update else {
                 send(
                     &proxy,
@@ -334,6 +348,9 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>) {
                     },
                 );
                 std::thread::sleep(Duration::from_millis(250));
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
                 send(
                     &proxy,
                     Event::Continue(idle_state(&format!(
@@ -347,8 +364,14 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>) {
             let version = release.version.to_string();
             let artifact = release.artifact_name.clone();
             let progress_proxy = proxy.clone();
-            if let Err(error) =
-                trouve_update::install_release_with_progress(&release, move |progress| {
+            let progress_cancelled = Arc::clone(&cancelled);
+            let install_cancelled = Arc::clone(&cancelled);
+            if let Err(error) = trouve_update::install_release_with_progress_and_cancel(
+                &release,
+                move |progress| {
+                    if progress_cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
                     let (status, detail, percent) = install_stage(&version, &artifact, progress);
                     send(
                         &progress_proxy,
@@ -358,13 +381,21 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>) {
                             progress_percent: percent,
                         },
                     );
-                })
-                .await
+                },
+                move || install_cancelled.load(Ordering::Acquire),
+            )
+            .await
             {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
                 send(&proxy, Event::Failed(format!("{error:#}")));
                 return;
             }
 
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
             send(
                 &proxy,
                 Event::Stage {
@@ -374,6 +405,9 @@ fn spawn_preflight(proxy: tao::event_loop::EventLoopProxy<AppEvent>) {
                 },
             );
             std::thread::sleep(Duration::from_millis(250));
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
             match restart_updated_app(&release.version.to_string()) {
                 Ok(()) => send(&proxy, Event::ExitProcess),
                 Err(error) => send(
@@ -554,6 +588,20 @@ impl UpdateManager {
             Some(version.clone()),
             &format!("Version {version} is installed. Restarting…"),
             Some(100),
+        );
+        self.set_state(update.clone());
+        update
+    }
+
+    pub fn restart_failed(&self, version: &str, error: &str) -> DesktopUpdateState {
+        let update = state(
+            DesktopUpdatePhase::Error,
+            Some(version.to_string()),
+            &format!(
+                "Version {version} is installed, but trouve could not restart: {}. Keep using this window or restart manually.",
+                concise_error(error)
+            ),
+            None,
         );
         self.set_state(update.clone());
         update
@@ -749,5 +797,23 @@ mod tests {
             },
         );
         assert_eq!(progress, Some(47));
+    }
+
+    #[test]
+    fn startup_splash_announces_progress_and_focuses_recovery() {
+        assert!(SPLASH_HTML.contains("role=\"status\" aria-live=\"polite\""));
+        assert!(SPLASH_HTML.contains("aria-label=\"Update progress\""));
+        assert!(SPLASH_HTML.contains("aria-label=\"Update recovery actions\" hidden"));
+        assert!(SPLASH_HTML.contains("document.getElementById(\"retry\").focus()"));
+    }
+
+    #[test]
+    fn failed_runtime_restart_keeps_a_recoverable_update_state() {
+        let manager = UpdateManager::new(idle_state("ready"));
+        let update = manager.restart_failed("4.1.0", "spawn failed");
+        assert_eq!(update.phase, DesktopUpdatePhase::Error);
+        assert_eq!(update.available_version.as_deref(), Some("4.1.0"));
+        assert!(update.message.contains("Keep using this window"));
+        assert_eq!(manager.status(), update);
     }
 }

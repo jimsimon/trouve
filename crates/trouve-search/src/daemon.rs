@@ -57,7 +57,7 @@ pub fn run_daemon(content: &[ContentType]) -> ExitCode {
 mod unix {
     use std::fs;
     use std::io::{BufRead, BufReader, ErrorKind, Write};
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -131,6 +131,17 @@ mod unix {
         // Owner-only: the socket accepts tool calls from anyone who can
         // connect, same trust boundary as the cache files next to it.
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+
+    fn open_daemon_log(sock: &Path) -> std::io::Result<fs::File> {
+        let log_path = sock.with_extension("log");
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)?;
+        fs::set_permissions(log_path, fs::Permissions::from_mode(0o600))?;
+        Ok(log)
     }
 
     // ---------------------------------------------------------------- daemon
@@ -274,9 +285,10 @@ mod unix {
                 cmd.arg(ct.as_str());
             }
         }
+        let log = open_daemon_log(sock)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(log))
             // Don't pin whatever directory the agent launched us in.
             .current_dir("/");
         // Detach into its own session so the daemon survives the agent
@@ -485,6 +497,26 @@ mod unix {
             assert_eq!(
                 fs::metadata(dir).unwrap().permissions().mode() & 0o777,
                 0o700
+            );
+        }
+
+        #[test]
+        fn daemon_log_is_private_and_persistent() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("daemon");
+            let sock = dir.join("mcp-test.sock");
+            ensure_daemon_dir(&sock).unwrap();
+            let log_path = sock.with_extension("log");
+            let mut log = open_daemon_log(&sock).unwrap();
+            writeln!(log, "automatic update failed").unwrap();
+            assert_eq!(
+                fs::metadata(&log_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(
+                fs::read_to_string(log_path)
+                    .unwrap()
+                    .contains("automatic update failed")
             );
         }
 
