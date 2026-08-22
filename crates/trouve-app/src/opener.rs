@@ -15,6 +15,7 @@ const HANDOFF_CONFIRMATION_INTERVAL: Duration = Duration::from_secs(2);
 const LAUNCHER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LAUNCHER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LAUNCHER_REAPER_BATCH_SIZE: usize = 64;
+const LAUNCHER_REAPER_MAX_INSPECTION_ERRORS: u8 = 4;
 const DISPATCH_QUEUED: u8 = 0;
 const DISPATCH_ENTERED: u8 = 1;
 const DISPATCH_CANCELLED: u8 = 2;
@@ -321,31 +322,56 @@ fn drain_ready<T>(receiver: &Receiver<T>, limit: usize, mut accept: impl FnMut(T
 
 struct SupervisedLauncher {
     child: std::process::Child,
-    inspection_error_reported: bool,
+    inspection: LauncherInspection,
 }
 
 impl SupervisedLauncher {
     fn new(child: std::process::Child) -> Self {
         Self {
             child,
-            inspection_error_reported: false,
+            inspection: LauncherInspection::default(),
         }
+    }
+}
+
+#[derive(Default)]
+struct LauncherInspection {
+    consecutive_errors: u8,
+}
+
+impl LauncherInspection {
+    fn succeeded(&mut self) {
+        self.consecutive_errors = 0;
+    }
+
+    fn failed(&mut self, error: &std::io::Error) -> bool {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        if self.consecutive_errors == 1 {
+            tracing::warn!(%error, "could not inspect system launcher in reaper");
+        }
+        if self.consecutive_errors < LAUNCHER_REAPER_MAX_INSPECTION_ERRORS {
+            return true;
+        }
+        // A persistently uninspectable child is normally already reaped or
+        // owns an invalid platform handle. Release it after bounded retries
+        // rather than retaining it forever or blocking the shared supervisor.
+        tracing::warn!(
+            %error,
+            attempts = self.consecutive_errors,
+            "releasing uninspectable system launcher"
+        );
+        false
     }
 }
 
 fn poll_launchers(children: &mut Vec<SupervisedLauncher>) {
     children.retain_mut(|launcher| match launcher.child.try_wait() {
         Ok(Some(_)) => false,
-        Ok(None) => true,
-        Err(error) => {
-            // Keep retrying this child without blocking progress for other
-            // launchers. A later successful poll will still collect it.
-            if !launcher.inspection_error_reported {
-                tracing::warn!(%error, "could not inspect system launcher in reaper");
-                launcher.inspection_error_reported = true;
-            }
+        Ok(None) => {
+            launcher.inspection.succeeded();
             true
         }
+        Err(error) => launcher.inspection.failed(&error),
     });
 }
 
@@ -502,5 +528,19 @@ mod tests {
 
         assert_eq!(accepted.len(), LAUNCHER_REAPER_BATCH_SIZE);
         assert_eq!(receiver.try_recv(), Ok(LAUNCHER_REAPER_BATCH_SIZE));
+    }
+
+    #[test]
+    fn persistent_reaper_inspection_errors_are_released_after_bounded_retries() {
+        let error = std::io::Error::other("uninspectable child");
+        let mut inspection = LauncherInspection::default();
+
+        for _ in 1..LAUNCHER_REAPER_MAX_INSPECTION_ERRORS {
+            assert!(inspection.failed(&error));
+        }
+        assert!(!inspection.failed(&error));
+
+        inspection.succeeded();
+        assert!(inspection.failed(&error));
     }
 }
