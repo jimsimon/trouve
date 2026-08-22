@@ -77,6 +77,7 @@ mod unix {
     const DEFAULT_IDLE: Duration = Duration::from_secs(15 * 60);
     /// How long a proxy waits for a freshly spawned daemon to bind.
     const SPAWN_WAIT: Duration = Duration::from_secs(10);
+    const MAX_DAEMON_LOG_BYTES: u64 = 1024 * 1024;
 
     pub(super) fn daemon_enabled() -> bool {
         !matches!(
@@ -135,6 +136,16 @@ mod unix {
 
     fn open_daemon_log(sock: &Path) -> std::io::Result<fs::File> {
         let log_path = sock.with_extension("log");
+        if fs::metadata(&log_path).is_ok_and(|metadata| metadata.len() >= MAX_DAEMON_LOG_BYTES) {
+            let rotated = log_path.with_extension("log.1");
+            match fs::remove_file(&rotated) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            fs::rename(&log_path, &rotated)?;
+            fs::set_permissions(&rotated, fs::Permissions::from_mode(0o600))?;
+        }
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -309,27 +320,59 @@ mod unix {
         Ok(())
     }
 
-    fn connect_or_spawn(sock: &Path, content: &[ContentType]) -> Option<DaemonConn> {
+    struct ConnectResult {
+        connection: Option<DaemonConn>,
+        child_started: bool,
+    }
+
+    fn connect_or_spawn(sock: &Path, content: &[ContentType]) -> ConnectResult {
         match DaemonConn::open(sock) {
-            Ok(conn) => return Some(conn),
+            Ok(connection) => {
+                return ConnectResult {
+                    connection: Some(connection),
+                    child_started: false,
+                };
+            }
             // The socket path exceeds sockaddr_un's limit (104 bytes on
             // macOS): no daemon can ever bind it, so don't spawn one and
             // wait — serve in-process straight away.
-            Err(e) if e.kind() == ErrorKind::InvalidInput => return None,
+            Err(error) if error.kind() == ErrorKind::InvalidInput => {
+                return ConnectResult {
+                    connection: None,
+                    child_started: false,
+                };
+            }
             Err(_) => {}
         }
-        spawn_daemon(sock, content).ok()?;
+        if spawn_daemon(sock, content).is_err() {
+            return ConnectResult {
+                connection: None,
+                child_started: false,
+            };
+        }
         // Wait for a daemon to bind — ours, or a competing proxy's whose
         // daemon won the lock (just as good).
         let deadline = Instant::now() + SPAWN_WAIT;
         loop {
             std::thread::sleep(Duration::from_millis(50));
-            if let Ok(conn) = DaemonConn::open(sock) {
-                return Some(conn);
+            if let Ok(connection) = DaemonConn::open(sock) {
+                return ConnectResult {
+                    connection: Some(connection),
+                    child_started: true,
+                };
             }
             if Instant::now() >= deadline {
-                return None;
+                return ConnectResult {
+                    connection: None,
+                    child_started: true,
+                };
             }
+        }
+    }
+
+    fn schedule_local_fallback_update(child_started: bool) {
+        if !child_started {
+            crate::cli::spawn_auto_update();
         }
     }
 
@@ -376,9 +419,13 @@ mod unix {
             Daemon(DaemonConn),
             Local(IndexCache),
         }
-        let mut backend = match connect_or_spawn(&sock, content) {
+        let connection = connect_or_spawn(&sock, content);
+        let mut backend = match connection.connection {
             Some(conn) => Backend::Daemon(conn),
-            None => Backend::Local(IndexCache::new(content.to_vec())),
+            None => {
+                schedule_local_fallback_update(connection.child_started);
+                Backend::Local(IndexCache::new(content.to_vec()))
+            }
         };
 
         let stdin = std::io::stdin();
@@ -435,7 +482,11 @@ mod unix {
         match conn.roundtrip(line, expects_response) {
             Ok(response) => Ok((response, None)),
             Err(_) => {
-                let mut fresh = connect_or_spawn(sock, content).ok_or(())?;
+                let connection = connect_or_spawn(sock, content);
+                let Some(mut fresh) = connection.connection else {
+                    schedule_local_fallback_update(connection.child_started);
+                    return Err(());
+                };
                 let response = fresh.roundtrip(line, expects_response).map_err(|_| ())?;
                 Ok((response, Some(fresh)))
             }
@@ -517,6 +568,25 @@ mod unix {
                 fs::read_to_string(log_path)
                     .unwrap()
                     .contains("automatic update failed")
+            );
+        }
+        #[test]
+        fn daemon_log_rotates_at_the_size_limit() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("daemon");
+            let sock = dir.join("mcp-test.sock");
+            ensure_daemon_dir(&sock).unwrap();
+            let log_path = sock.with_extension("log");
+            fs::write(&log_path, vec![b'x'; MAX_DAEMON_LOG_BYTES as usize]).unwrap();
+
+            drop(open_daemon_log(&sock).unwrap());
+
+            let rotated = log_path.with_extension("log.1");
+            assert_eq!(fs::metadata(&log_path).unwrap().len(), 0);
+            assert_eq!(fs::metadata(&rotated).unwrap().len(), MAX_DAEMON_LOG_BYTES);
+            assert_eq!(
+                fs::metadata(rotated).unwrap().permissions().mode() & 0o777,
+                0o600
             );
         }
 

@@ -325,27 +325,38 @@ fn run_update(check_only: bool) -> ExitCode {
         }
     };
     let result = runtime.block_on(async {
-        let check = trouve_update::check(
-            trouve_update::Component::Search,
-            env!("CARGO_PKG_VERSION"),
-        )
-        .await?;
-        let Some(release) = check.update else {
-            println!("trouve-search {} is up to date.", check.current);
-            return Ok::<(), anyhow::Error>(());
-        };
         if check_only {
+            let check = trouve_update::check(
+                trouve_update::Component::Search,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .await?;
+            let Some(release) = check.update else {
+                println!("trouve-search {} is up to date.", check.current);
+                return Ok::<(), anyhow::Error>(());
+            };
             println!(
                 "trouve-search {} is available (current {}).",
                 release.version, check.current
             );
             return Ok::<(), anyhow::Error>(());
         }
-        trouve_update::install_release(&release).await?;
-        println!(
-            "Updated trouve-search from {} to {}. Restart running MCP or daemon processes to use it.",
-            check.current, release.version
-        );
+
+        match trouve_update::install_latest(
+            trouve_update::Component::Search,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await?
+        {
+            trouve_update::UpdateStatus::UpToDate { version } => {
+                println!("trouve-search {version} is up to date.");
+            }
+            trouve_update::UpdateStatus::Updated { from, to } => {
+                println!(
+                    "Updated trouve-search from {from} to {to}. Restart running MCP or daemon processes to use it."
+                );
+            }
+        }
         Ok::<(), anyhow::Error>(())
     });
     match result {

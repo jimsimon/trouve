@@ -122,6 +122,7 @@ pub struct HostCapabilities {
     pub installable: bool,
     /// The native product host can check, verify, install, and restart into
     /// repository release updates. Preview hosts and PWAs leave this false.
+    #[serde(default)]
     pub self_update: bool,
 }
 

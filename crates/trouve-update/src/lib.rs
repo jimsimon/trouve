@@ -156,6 +156,43 @@ impl InstallCancellation {
     }
 }
 
+struct UpdateLock {
+    _file: std::fs::File,
+}
+
+async fn acquire_update_lock() -> Result<UpdateLock> {
+    let executable = std::env::current_exe().context("locating executable for update lock")?;
+    tokio::task::spawn_blocking(move || acquire_update_lock_for(&executable))
+        .await
+        .context("joining update-lock task")?
+}
+
+fn acquire_update_lock_for(executable: &Path) -> Result<UpdateLock> {
+    use fs4::fs_std::FileExt as _;
+
+    let file_name = executable
+        .file_name()
+        .ok_or_else(|| anyhow!("updated executable path has no file name"))?
+        .to_string_lossy();
+    let parent = executable
+        .parent()
+        .ok_or_else(|| anyhow!("updated executable path has no parent"))?;
+    let path = parent.join(format!(".{file_name}.update.lock"));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("opening update lock {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("locking updated executable {}", executable.display()))?;
+    Ok(UpdateLock { _file: file })
+}
+
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -224,15 +261,20 @@ pub async fn check(component: Component, current_version: &str) -> Result<Update
     select_release(release, component, current, target)
 }
 
-/// Install the latest eligible release, if one exists.
+/// Install the latest eligible release, if one exists. One executable-scoped
+/// interprocess lock covers the check, download, and replacement.
 pub async fn install_latest(component: Component, current_version: &str) -> Result<UpdateStatus> {
+    if cfg!(debug_assertions) {
+        bail!("self-update is disabled for development builds");
+    }
+    let _lock = acquire_update_lock().await?;
     let check = check(component, current_version).await?;
     let Some(release) = check.update else {
         return Ok(UpdateStatus::UpToDate {
             version: check.current,
         });
     };
-    install_release(&release).await?;
+    install_release_locked(&release, |_| {}, Arc::new(InstallCancellation::default())).await?;
     Ok(UpdateStatus::Updated {
         from: check.current,
         to: release.version,
@@ -270,6 +312,15 @@ pub async fn install_release_with_progress_and_cancel(
     if cfg!(debug_assertions) {
         bail!("self-update is disabled for development builds");
     }
+    let _lock = acquire_update_lock().await?;
+    install_release_locked(release, progress, cancellation).await
+}
+
+async fn install_release_locked(
+    release: &Release,
+    progress: impl Fn(InstallProgress),
+    cancellation: Arc<InstallCancellation>,
+) -> Result<()> {
     ensure_not_cancelled(&cancellation)?;
     let client = client(env!("CARGO_PKG_VERSION"))?;
     progress(InstallProgress::FetchingChecksums);
@@ -326,9 +377,18 @@ pub async fn install_release_with_progress_and_cancel(
 
     ensure_not_cancelled(&cancellation)?;
     progress(InstallProgress::Installing);
+    let installed_executable =
+        std::env::current_exe().context("locating executable installation directory")?;
+    let installed_parent = installed_executable
+        .parent()
+        .ok_or_else(|| anyhow!("updated executable path has no parent"))?
+        .to_owned();
     tokio::task::spawn_blocking(move || {
+        sync_directory(&installed_parent)
+            .context("syncing installation directory before replacement")?;
         cancellation.commit_install()?;
-        self_replace::self_replace(&replacement).context("replacing the running executable")
+        self_replace::self_replace(&replacement).context("replacing the running executable")?;
+        sync_directory(&installed_parent).context("syncing installed executable directory")
     })
     .await
     .context("joining executable replacement task")??;
@@ -629,6 +689,30 @@ fn extract_binary_with_expanded_limit(
     }
     output.flush().context("flushing extracted update binary")?;
     make_executable(destination)?;
+    output
+        .sync_all()
+        .context("syncing extracted update binary")?;
+    drop(output);
+    if let Some(parent) = destination.parent() {
+        sync_directory(parent).context("syncing update staging directory")?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let directory = std::fs::File::open(path)
+            .with_context(|| format!("opening directory {}", path.display()))?;
+        match directory.sync_all() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("syncing directory {}", path.display()));
+            }
+        }
+    }
+    let _ = path;
     Ok(())
 }
 
@@ -876,6 +960,28 @@ mod tests {
         assert!(committed.is_committed());
         assert!(!committed.request_cancel());
         assert!(!committed.is_cancelled());
+    }
+
+    #[test]
+    fn executable_update_lock_serializes_installers() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("trouve-search");
+        std::fs::write(&executable, b"binary").unwrap();
+        let first = acquire_update_lock_for(&executable).unwrap();
+        let second_executable = executable.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let second = acquire_update_lock_for(&second_executable).unwrap();
+            acquired_tx.send(()).unwrap();
+            second
+        });
+        assert!(matches!(
+            acquired_rx.recv_timeout(Duration::from_millis(40)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(waiter.join().unwrap());
     }
 
     #[test]

@@ -381,7 +381,7 @@ export interface components {
              * @description The native product host can check, verify, install, and restart into
              *     repository release updates. Preview hosts and PWAs leave this false.
              */
-            self_update: boolean;
+            self_update?: boolean;
             sleep_inhibition: boolean;
             user_attention: boolean;
             visibility: boolean;

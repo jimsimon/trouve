@@ -770,8 +770,7 @@
           "visibility",
           "occlusion",
           "persistent_preferences",
-          "installable",
-          "self_update"
+          "installable"
         ],
         "properties": {
           "bridge_version": {

@@ -75,13 +75,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_update(check_only: bool) -> anyhow::Result<()> {
-    let check =
-        trouve_update::check(trouve_update::Component::Server, env!("CARGO_PKG_VERSION")).await?;
-    let Some(release) = check.update else {
-        println!("trouve-server {} is up to date.", check.current);
-        return Ok(());
-    };
     if check_only {
+        let check =
+            trouve_update::check(trouve_update::Component::Server, env!("CARGO_PKG_VERSION"))
+                .await?;
+        let Some(release) = check.update else {
+            println!("trouve-server {} is up to date.", check.current);
+            return Ok(());
+        };
         println!(
             "trouve-server {} is available (current {}).",
             release.version, check.current
@@ -89,10 +90,17 @@ async fn run_update(check_only: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    trouve_update::install_release(&release).await?;
-    println!(
-        "Updated trouve-server from {} to {}. Restart running server processes to use it.",
-        check.current, release.version
-    );
+    match trouve_update::install_latest(trouve_update::Component::Server, env!("CARGO_PKG_VERSION"))
+        .await?
+    {
+        trouve_update::UpdateStatus::UpToDate { version } => {
+            println!("trouve-server {version} is up to date.");
+        }
+        trouve_update::UpdateStatus::Updated { from, to } => {
+            println!(
+                "Updated trouve-server from {from} to {to}. Restart running server processes to use it."
+            );
+        }
+    }
     Ok(())
 }

@@ -148,6 +148,7 @@ const DIRECTORY_PICKER_BRIDGE_VERSION = 3;
 const NATIVE_ATTACHMENT_BRIDGE_VERSION = 4;
 const NATIVE_LIFECYCLE_BRIDGE_VERSION = 5;
 const CLOSE_ACKNOWLEDGEMENT_BRIDGE_VERSION = 13;
+const SELF_UPDATE_BRIDGE_VERSION = 14;
 const MAX_LIFECYCLE_WAIT_MS = 25_000;
 const MAX_LIFECYCLE_EVENTS = 128;
 const MAX_HOST_ID_BYTES = 256;
@@ -241,7 +242,10 @@ export const mapHostCapabilities = (
     occlusion: wire.occlusion && hasLifecycleBridge,
     persistentPreferences: wire.persistent_preferences,
     installable: wire.installable,
-    selfUpdate: wire.self_update,
+    selfUpdate:
+      (wire.self_update ?? false) &&
+      wire.bridge_version != null &&
+      wire.bridge_version >= SELF_UPDATE_BRIDGE_VERSION,
   });
 };
 

@@ -7586,6 +7586,7 @@ version = "4.0.0"
 dependencies = [
  "anyhow",
  "flate2",
+ "fs4",
  "futures",
  "hex",
  "reqwest",

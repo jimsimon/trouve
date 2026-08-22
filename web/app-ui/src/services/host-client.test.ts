@@ -19,7 +19,7 @@ import {
 import type { HostPreferences } from "./host-client.js";
 
 const validCapabilities = {
-  bridge_version: 8,
+  bridge_version: 14,
   clipboard_image: true,
   close_confirmation: true,
   directory_picker: true,
@@ -79,7 +79,7 @@ describe("HostClient", () => {
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await expect(client.bootstrap()).resolves.toMatchObject({
       kind: "desktop",
-      bridgeVersion: 8,
+      bridgeVersion: 14,
       directoryPicker: true,
       lifecycleEvents: true,
       selfUpdate: true,
@@ -87,6 +87,26 @@ describe("HostClient", () => {
     expect(client.systemFontFamilies()).toEqual(["Noto Sans", "Zed Sans"]);
     expect(client.mutationHeaders()).toEqual({
       "x-trouve-host-csrf": "a".repeat(64),
+    });
+  });
+
+  it("accepts legacy bootstrap payloads without self-update", async () => {
+    const legacyCapabilities: Record<string, unknown> = {
+      ...validCapabilities,
+      bridge_version: 13,
+    };
+    delete legacyCapabilities.self_update;
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        capabilities: legacyCapabilities,
+        csrf_token: "o".repeat(64),
+      }),
+    );
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+
+    await expect(client.bootstrap()).resolves.toMatchObject({
+      bridgeVersion: 13,
+      selfUpdate: false,
     });
   });
 

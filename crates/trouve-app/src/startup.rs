@@ -52,7 +52,7 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, #7775ff, #91a4f
 button { border: 1px solid #46506a; border-radius: 7px; padding: 8px 14px; color: #e8ecf7;
   background: #252b3a; font: inherit; cursor: pointer; }
 button.primary { border-color: #7478ff; background: #6266df; color: white; }
-.version { margin-top: 18px; color: #707a91; font-size: 11px; }
+.version { margin-top: 18px; color: #b8c1d6; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -60,8 +60,8 @@ button.primary { border-color: #7478ff; background: #6266df; color: white; }
   <div class="logo" aria-hidden="true">t</div>
   <section id="announcement" role="status" aria-live="polite" aria-atomic="true">
     <h1 id="status">Checking for updates…</h1>
-    <p id="detail">Contacting the stable release channel</p>
   </section>
+  <p id="detail">Contacting the stable release channel</p>
   <progress id="progress" max="100" aria-label="Update progress"></progress>
   <div id="actions" class="actions" role="group" aria-label="Update recovery actions" hidden>
     <button id="retry" class="primary" onclick="location.href='https://startup.trouve/retry'">Retry</button>
@@ -73,7 +73,8 @@ button.primary { border-color: #7478ff; background: #6266df; color: white; }
 window.__trouveStage = (status, detail, progress, failed) => {
   const announcement = document.getElementById("announcement");
   announcement.setAttribute("aria-live", failed ? "assertive" : "polite");
-  document.getElementById("status").textContent = status;
+  const statusNode = document.getElementById("status");
+  if (statusNode.textContent !== status) statusNode.textContent = status;
   document.getElementById("detail").textContent = detail;
   const bar = document.getElementById("progress");
   if (progress === null) bar.removeAttribute("value");
@@ -994,11 +995,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_splash_announces_progress_and_focuses_recovery() {
+    fn startup_splash_announces_coarse_progress_and_focuses_recovery() {
         assert!(SPLASH_HTML.contains("role=\"status\" aria-live=\"polite\""));
+        assert!(SPLASH_HTML.contains("</section>\n  <p id=\"detail\""));
+        assert!(SPLASH_HTML.contains("statusNode.textContent !== status"));
         assert!(SPLASH_HTML.contains("aria-label=\"Update progress\""));
         assert!(SPLASH_HTML.contains("aria-label=\"Update recovery actions\" hidden"));
         assert!(SPLASH_HTML.contains("document.getElementById(\"retry\").focus()"));
+        assert!(SPLASH_HTML.contains("color: #b8c1d6"));
     }
 
     #[test]

@@ -15,7 +15,10 @@ import {
   THEME_NAMES,
 } from "../services/theme-controller.js";
 import { APPEARANCE_FONT_SIZES } from "../services/appearance-preferences.js";
-import type { DesktopUpdateState } from "../services/host-client.js";
+import {
+  HostClientError,
+  type DesktopUpdateState,
+} from "../services/host-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./cli-settings.js";
@@ -62,6 +65,16 @@ const sectionLabel = (section: SettingsSection): string => {
   return `${section[0]?.toUpperCase()}${section.slice(1)}`;
 };
 
+const desktopUpdateIsBusy = (state: DesktopUpdateState | undefined): boolean =>
+  state !== undefined
+  && [
+    "checking",
+    "downloading",
+    "verifying",
+    "installing",
+    "restarting",
+  ].includes(state.phase);
+
 export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   static override properties = {
     section: { type: String },
@@ -81,6 +94,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #desktopUpdateActionPending = false;
   #desktopUpdateError = "";
   #desktopUpdatePollTimer: ReturnType<typeof setInterval> | undefined;
+  #desktopUpdateGeneration = 0;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -110,6 +124,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
 
   override disconnectedCallback(): void {
     globalThis.removeEventListener("focus", this.#refreshWebNotificationCapability);
+    this.#desktopUpdateGeneration += 1;
     this.#stopDesktopUpdatePolling();
     super.disconnectedCallback();
   }
@@ -136,12 +151,19 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       || action === undefined
       || this.#desktopUpdateLoading
     ) return;
+    const generation = this.#desktopUpdateGeneration;
     this.#desktopUpdateLoading = true;
     try {
-      this.#desktopUpdateState = await action();
+      const state = await action();
+      if (generation !== this.#desktopUpdateGeneration) return;
+      this.#desktopUpdateState = state;
       this.#desktopUpdateError = "";
+      if (desktopUpdateIsBusy(state)) this.#startDesktopUpdatePolling();
+      else if (!this.#desktopUpdateActionPending) this.#stopDesktopUpdatePolling();
     } catch {
-      if (!silent) this.#desktopUpdateError = "Update status could not be loaded.";
+      if (!silent && generation === this.#desktopUpdateGeneration) {
+        this.#desktopUpdateError = "Update status could not be loaded.";
+      }
     } finally {
       this.#desktopUpdateLoading = false;
       if (this.isConnected) this.requestUpdate();
@@ -155,26 +177,42 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       ? nativeHost?.installDesktopUpdate
       : nativeHost?.checkDesktopUpdate;
     if (action === undefined || this.#desktopUpdateActionPending) return;
+    this.#desktopUpdateGeneration += 1;
     this.#desktopUpdateActionPending = true;
     this.#desktopUpdateError = "";
-    if (installing) {
-      this.#desktopUpdatePollTimer = globalThis.setInterval(
-        () => void this.#loadDesktopUpdate(true),
-        500,
-      );
-    }
+    this.#startDesktopUpdatePolling();
     this.requestUpdate();
+    let keepPolling = false;
     try {
-      this.#desktopUpdateState = await action();
-    } catch {
-      this.#desktopUpdateError = installing
-        ? "The update could not be installed. You can try again without leaving the app."
-        : "The update check could not be completed.";
+      const state = await action();
+      this.#desktopUpdateGeneration += 1;
+      this.#desktopUpdateState = state;
+    } catch (error) {
+      if (error instanceof HostClientError && error.kind === "action-busy") {
+        keepPolling = true;
+      } else {
+        this.#desktopUpdateError = installing
+          ? "The update could not be installed. You can try again without leaving the app."
+          : "The update check could not be completed.";
+      }
     } finally {
       this.#desktopUpdateActionPending = false;
-      this.#stopDesktopUpdatePolling();
+      if (keepPolling || desktopUpdateIsBusy(this.#desktopUpdateState)) {
+        this.#startDesktopUpdatePolling();
+        void this.#loadDesktopUpdate(true);
+      } else {
+        this.#stopDesktopUpdatePolling();
+      }
       if (this.isConnected) this.requestUpdate();
     }
+  }
+
+  #startDesktopUpdatePolling(): void {
+    if (this.#desktopUpdatePollTimer !== undefined) return;
+    this.#desktopUpdatePollTimer = globalThis.setInterval(
+      () => void this.#loadDesktopUpdate(true),
+      500,
+    );
   }
 
   #stopDesktopUpdatePolling(): void {
