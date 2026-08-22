@@ -149,6 +149,7 @@ CREATE TABLE IF NOT EXISTS route_health (
   retry_after INTEGER,             -- UTC unix seconds; NULL = not cooling down
   last_success_at INTEGER,         -- UTC unix seconds; sticky healthy-route hint
   last_failure_at INTEGER,         -- UTC unix microseconds; orders concurrent attempts
+  last_outcome_started_at INTEGER, -- UTC unix microseconds; rejects stale outcomes
   PRIMARY KEY (provider_id, provider_model)
 );
 CREATE TABLE IF NOT EXISTS queued_prompts (
@@ -645,6 +646,7 @@ const MIGRATIONS: &[&str] = &[
        PRIMARY KEY (provider_id, provider_model)
      )",
     "ALTER TABLE route_health ADD COLUMN last_failure_at INTEGER",
+    "ALTER TABLE route_health ADD COLUMN last_outcome_started_at INTEGER",
     "ALTER TABLE thread_statuses ADD COLUMN started_at TEXT",
     "ALTER TABLE thread_statuses ADD COLUMN completed_at TEXT",
     "ALTER TABLE thread_view_items ADD COLUMN turn_start INTEGER NOT NULL DEFAULT 0",
@@ -3932,6 +3934,7 @@ pub struct RouteHealthRow {
     pub retry_after: Option<i64>,
     pub last_success_at: Option<i64>,
     pub last_failure_at: Option<i64>,
+    pub last_outcome_started_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -13487,7 +13490,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT provider_id, provider_model, consecutive_failures,
-                    retry_after, last_success_at, last_failure_at
+                    retry_after, last_success_at, last_failure_at,
+                    last_outcome_started_at
              FROM route_health",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -13500,6 +13504,7 @@ impl Store {
                 retry_after: row.get(3)?,
                 last_success_at: row.get(4)?,
                 last_failure_at: row.get(5)?,
+                last_outcome_started_at: row.get(6)?,
             })
         })?;
         let mut health = HashMap::new();
@@ -13511,27 +13516,56 @@ impl Store {
     }
 
     /// Open or extend a route's cooldown with capped exponential backoff.
-    /// Returns the row written so callers can include the retry horizon in
-    /// diagnostics without querying again.
+    /// Returns the current row so callers can include the retry horizon in
+    /// diagnostics without querying again, including when this outcome was
+    /// older than one already recorded.
     pub fn record_route_failure(
         &self,
         provider_id: &str,
         provider_model: &str,
+        attempt_started_at: i64,
         base_cooldown_secs: i64,
         max_cooldown_secs: i64,
     ) -> Result<RouteHealthRow> {
         let conn = self.conn.lock().unwrap();
         let previous = conn
             .query_row(
-                "SELECT consecutive_failures, last_success_at FROM route_health
+                "SELECT consecutive_failures, retry_after, last_success_at,
+                        last_failure_at, last_outcome_started_at
+                 FROM route_health
                  WHERE provider_id = ?1 AND provider_model = ?2",
                 params![provider_id, provider_model],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
             )
             .optional()?;
+        if previous
+            .as_ref()
+            .and_then(|(_, _, _, _, started_at)| *started_at)
+            .is_some_and(|started_at| started_at >= attempt_started_at)
+        {
+            let (failures, retry_after, last_success_at, last_failure_at, last_outcome) =
+                previous.unwrap();
+            return Ok(RouteHealthRow {
+                provider_id: provider_id.into(),
+                provider_model: provider_model.into(),
+                consecutive_failures: failures.max(0) as u32,
+                retry_after,
+                last_success_at,
+                last_failure_at,
+                last_outcome_started_at: last_outcome,
+            });
+        }
         let consecutive_failures = previous
             .as_ref()
-            .map(|(failures, _)| failures.saturating_add(1))
+            .map(|(failures, _, _, _, _)| failures.saturating_add(1))
             .unwrap_or(1)
             .max(1);
         let exponent = u32::try_from(consecutive_failures.saturating_sub(1).min(20)).unwrap_or(20);
@@ -13545,19 +13579,21 @@ impl Store {
         conn.execute(
             "INSERT INTO route_health
                  (provider_id, provider_model, consecutive_failures, retry_after,
-                  last_success_at, last_failure_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                  last_success_at, last_failure_at, last_outcome_started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(provider_id, provider_model) DO UPDATE SET
                  consecutive_failures = excluded.consecutive_failures,
                  retry_after = excluded.retry_after,
-                 last_failure_at = excluded.last_failure_at",
+                 last_failure_at = excluded.last_failure_at,
+                 last_outcome_started_at = excluded.last_outcome_started_at",
             params![
                 provider_id,
                 provider_model,
                 consecutive_failures,
                 retry_after,
-                previous.as_ref().and_then(|(_, success)| *success),
+                previous.as_ref().and_then(|(_, _, success, _, _)| *success),
                 last_failure_at,
+                attempt_started_at,
             ],
         )?;
         Ok(RouteHealthRow {
@@ -13565,8 +13601,9 @@ impl Store {
             provider_model: provider_model.into(),
             consecutive_failures: consecutive_failures as u32,
             retry_after: Some(retry_after),
-            last_success_at: previous.and_then(|(_, success)| success),
+            last_success_at: previous.and_then(|(_, _, success, _, _)| success),
             last_failure_at: Some(last_failure_at),
+            last_outcome_started_at: Some(attempt_started_at),
         })
     }
 
@@ -13581,15 +13618,16 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "INSERT INTO route_health
                  (provider_id, provider_model, consecutive_failures, retry_after,
-                  last_success_at, last_failure_at)
-             VALUES (?1, ?2, 0, NULL, ?3, NULL)
+                  last_success_at, last_failure_at, last_outcome_started_at)
+             VALUES (?1, ?2, 0, NULL, ?3, NULL, ?4)
              ON CONFLICT(provider_id, provider_model) DO UPDATE SET
                  consecutive_failures = 0,
                  retry_after = NULL,
                  last_success_at = excluded.last_success_at,
-                 last_failure_at = NULL
-             WHERE route_health.last_failure_at IS NULL
-                OR route_health.last_failure_at < ?4",
+                 last_failure_at = NULL,
+                 last_outcome_started_at = excluded.last_outcome_started_at
+             WHERE route_health.last_outcome_started_at IS NULL
+                OR route_health.last_outcome_started_at < ?4",
             params![
                 provider_id,
                 provider_model,
@@ -16833,27 +16871,28 @@ mod tests {
     fn route_health_persists_backoff_success_and_config_reset() {
         let store = Store::open_in_memory().unwrap();
         let now = chrono::Utc::now().timestamp();
+        let first_attempt = chrono::Utc::now().timestamp_micros();
         let first = store
-            .record_route_failure("provider", "model", 10, 25)
+            .record_route_failure("provider", "model", first_attempt, 10, 25)
             .unwrap();
         assert_eq!(first.consecutive_failures, 1);
         assert!(first.retry_after.unwrap() >= now + 10);
 
         let second = store
-            .record_route_failure("provider", "model", 10, 25)
+            .record_route_failure("provider", "model", first_attempt.saturating_add(1), 10, 25)
             .unwrap();
         assert_eq!(second.consecutive_failures, 2);
         assert!(second.retry_after.unwrap() >= now + 20);
 
         let third = store
-            .record_route_failure("provider", "model", 10, 25)
+            .record_route_failure("provider", "model", first_attempt.saturating_add(2), 10, 25)
             .unwrap();
         assert_eq!(third.consecutive_failures, 3);
         let third_retry_after = third.retry_after.unwrap();
         assert!(third_retry_after >= now + 25);
         assert!(third_retry_after <= chrono::Utc::now().timestamp() + 25);
 
-        let successful_attempt = third.last_failure_at.unwrap().saturating_add(1);
+        let successful_attempt = first_attempt.saturating_add(3);
         store
             .record_route_success("provider", "model", successful_attempt)
             .unwrap();
@@ -16886,17 +16925,15 @@ mod tests {
         conn.execute_batch(SCHEMA).unwrap();
         apply_migrations(&mut conn).unwrap();
 
-        let has_failure_ordering: bool = conn
+        let ordering_columns: i64 = conn
             .query_row(
-                "SELECT EXISTS (
-                   SELECT 1 FROM pragma_table_info('route_health')
-                   WHERE name = 'last_failure_at'
-                 )",
+                "SELECT COUNT(*) FROM pragma_table_info('route_health')
+                 WHERE name IN ('last_failure_at', 'last_outcome_started_at')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(has_failure_ordering);
+        assert_eq!(ordering_columns, 2);
     }
 
     #[test]
@@ -16904,7 +16941,13 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let attempt_started_at = chrono::Utc::now().timestamp_micros();
         let failure = store
-            .record_route_failure("provider", "model", 10, 25)
+            .record_route_failure(
+                "provider",
+                "model",
+                attempt_started_at.saturating_add(1),
+                10,
+                25,
+            )
             .unwrap();
 
         store
@@ -16915,15 +16958,30 @@ mod tests {
         assert_eq!(route.last_failure_at, failure.last_failure_at);
 
         store
-            .record_route_success(
-                "provider",
-                "model",
-                failure.last_failure_at.unwrap().saturating_add(1),
-            )
+            .record_route_success("provider", "model", attempt_started_at.saturating_add(2))
             .unwrap();
         let route = &store.route_health().unwrap()[&("provider".to_string(), "model".to_string())];
         assert_eq!(route.consecutive_failures, 0);
         assert_eq!(route.last_failure_at, None);
+    }
+
+    #[test]
+    fn older_route_failure_cannot_overwrite_a_newer_success() {
+        let store = Store::open_in_memory().unwrap();
+        let older_attempt = chrono::Utc::now().timestamp_micros();
+        let newer_attempt = older_attempt.saturating_add(1);
+        store
+            .record_route_success("provider", "model", newer_attempt)
+            .unwrap();
+
+        let route = store
+            .record_route_failure("provider", "model", older_attempt, 10, 25)
+            .unwrap();
+        assert_eq!(route.consecutive_failures, 0);
+        assert_eq!(route.retry_after, None);
+        assert!(route.last_success_at.is_some());
+        assert_eq!(route.last_failure_at, None);
+        assert_eq!(route.last_outcome_started_at, Some(newer_attempt));
     }
 
     #[test]

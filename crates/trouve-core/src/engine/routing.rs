@@ -351,7 +351,11 @@ impl Engine {
 
             match result {
                 RouteAttemptResult::Completed => {
-                    self.turn_scheduler.record_outcome(&route.provider_id, None);
+                    self.turn_scheduler.record_outcome(
+                        &route.provider_id,
+                        None,
+                        attempt_started_at,
+                    );
                     self.store.record_route_success(
                         &route.provider_id,
                         &route.provider_model,
@@ -397,12 +401,16 @@ impl Engine {
                         route.provider_model.clone(),
                         failure.message.clone(),
                     ));
-                    self.turn_scheduler
-                        .record_outcome(&route.provider_id, Some(&failure.message));
+                    self.turn_scheduler.record_outcome(
+                        &route.provider_id,
+                        Some(&failure.message),
+                        attempt_started_at,
+                    );
                     let (base, max) = failure.kind.cooldown();
                     let health = self.store.record_route_failure(
                         &route.provider_id,
                         &route.provider_model,
+                        attempt_started_at,
                         base,
                         max,
                     )?;

@@ -1556,6 +1556,7 @@ struct ProviderTurnCapacity {
 struct ProviderBackoff {
     until: Option<Instant>,
     delay: std::time::Duration,
+    last_outcome_started_at: Option<i64>,
 }
 
 /// Capacity shared by interactive desktop turns, spawned agents, and
@@ -1662,9 +1663,23 @@ impl TurnScheduler {
         {
             return Ok(None);
         }
-        self.acquire_permits(provider, background, cancel, started)
-            .await
-            .map(Some)
+        let capacity = self
+            .acquire_permits(provider.clone(), background, cancel, started)
+            .await?;
+        // The provider may have entered cooldown while this turn awaited its
+        // provider-specific permit. Recheck after every async admission wait
+        // and release all acquired permits before asking routing to continue.
+        if provider
+            .backoff
+            .lock()
+            .unwrap()
+            .until
+            .is_some_and(|until| until > Instant::now())
+        {
+            drop(capacity);
+            return Ok(None);
+        }
+        Ok(Some(capacity))
     }
 
     async fn acquire_permits(
@@ -1724,9 +1739,16 @@ impl TurnScheduler {
             .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
-    fn record_outcome(&self, model: &str, error: Option<&str>) {
+    fn record_outcome(&self, model: &str, error: Option<&str>, attempt_started_at: i64) {
         let provider = self.provider(model);
         let mut backoff = provider.backoff.lock().unwrap();
+        if backoff
+            .last_outcome_started_at
+            .is_some_and(|latest| latest >= attempt_started_at)
+        {
+            return;
+        }
+        backoff.last_outcome_started_at = Some(attempt_started_at);
         let throttled = error.is_some_and(|error| {
             let error = error.to_ascii_lowercase();
             [
@@ -10752,6 +10774,7 @@ impl Engine {
                 .take()
                 .expect("an active queue prompt must have a cancellation token");
             let prompt_persisted = AtomicBool::new(shell_persisted);
+            let attempt_started_at = chrono::Utc::now().timestamp_micros();
             let turn_future = async {
                 if automatic_model_name(&thread.model).is_some() {
                     self.run_routed_turn(&thread, turn, &prompt, cancel.clone(), &prompt_persisted)
@@ -10782,7 +10805,15 @@ impl Engine {
                                 thread.id
                             )
                         })?;
-                    let _ = self.store.release_queued_prompt(&prompt.id);
+                    if prompt_persisted.load(Ordering::Acquire) {
+                        // Once the user message is durable, this queue row is
+                        // the failed turn rather than a retryable dispatch.
+                        // Consuming it prevents a later dispatch from
+                        // publishing the same user message under a new turn.
+                        let _ = self.store.finish_queued_prompt(&prompt.id);
+                    } else {
+                        let _ = self.store.release_queued_prompt(&prompt.id);
+                    }
                     let _ = self.emit_queue(&thread.id);
                     self.clear_cancel(&thread.id);
                     self.release_thread(&thread.id)?;
@@ -10792,8 +10823,11 @@ impl Engine {
             let cancelled = cancel.is_cancelled();
             if !cancelled && automatic_model_name(&thread.model).is_none() {
                 let outcome_error = result.as_ref().err().map(ToString::to_string);
-                self.turn_scheduler
-                    .record_outcome(&thread.model, outcome_error.as_deref());
+                self.turn_scheduler.record_outcome(
+                    &thread.model,
+                    outcome_error.as_deref(),
+                    attempt_started_at,
+                );
             }
             // Cancellation wins a race with startup/stream errors only after
             // run_turn has returned, which is the adapter/tool acknowledgement
@@ -10855,7 +10889,14 @@ impl Engine {
                     .with_context(|| {
                         format!("persisting failure for turn {turn} of {}", thread.id)
                     })?;
-                let _ = self.store.release_queued_prompt(&prompt.id);
+                if prompt_persisted.load(Ordering::Acquire) {
+                    // The accepted prompt already owns this failed turn.
+                    // Only pre-acceptance setup failures may return a row to
+                    // the queue for a fresh dispatch attempt.
+                    let _ = self.store.finish_queued_prompt(&prompt.id);
+                } else {
+                    let _ = self.store.release_queued_prompt(&prompt.id);
+                }
                 let _ = self.emit_queue(&thread.id);
                 let resume = self.finish_interrupted_turn(&thread.id)?;
                 if !resume {
@@ -20206,7 +20247,7 @@ mod tests {
             parent_thread_id: None,
             title: None,
             mode: "code".into(),
-            model: "test/model".into(),
+            model: "auto/missing".into(),
             model_options: Default::default(),
             permission_mode: trouve_protocol::PermissionMode::Yolo,
             created_at: chrono::Utc::now(),
@@ -20248,6 +20289,36 @@ mod tests {
                 ..
             }) if content == "Visible immediately"
         ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, Event::TurnFailed { turn: 1, .. }));
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if failed && inactive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup failure should settle the accepted prompt");
+        assert!(store.queued_prompts(&thread.id).unwrap().is_empty());
+        assert_eq!(engine.dispatch_queue(&thread.id).unwrap(), None);
+        let user_messages = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| matches!(event.event, Event::UserMessage { .. }))
+            .count();
+        assert_eq!(user_messages, 1);
     }
 
     #[test]
@@ -22241,7 +22312,13 @@ default_permission_mode = "ask"
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
         store
-            .record_route_failure("provider", "shared", 10, 30)
+            .record_route_failure(
+                "provider",
+                "shared",
+                chrono::Utc::now().timestamp_micros(),
+                10,
+                30,
+            )
             .unwrap();
         let config = Config {
             providers: BTreeMap::from([("provider".into(), ProviderConfig::default())]),
@@ -22346,7 +22423,11 @@ default_permission_mode = "ask"
             providers: Mutex::new(HashMap::new()),
         };
         let cancel = tokio_util::sync::CancellationToken::new();
-        scheduler.record_outcome("busy", Some("429 rate limit"));
+        scheduler.record_outcome(
+            "busy",
+            Some("429 rate limit"),
+            chrono::Utc::now().timestamp_micros(),
+        );
 
         let capacity = tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -22357,6 +22438,64 @@ default_permission_mode = "ask"
         .unwrap();
 
         assert!(capacity.is_none());
+    }
+
+    #[tokio::test]
+    async fn routed_capacity_rechecks_backoff_after_waiting_for_a_permit() {
+        let scheduler = Arc::new(TurnScheduler {
+            all: Arc::new(tokio::sync::Semaphore::new(1)),
+            background: Arc::new(tokio::sync::Semaphore::new(1)),
+            provider_all_limit: 1,
+            provider_background_limit: 1,
+            providers: Mutex::new(HashMap::new()),
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let occupied = scheduler
+            .acquire_routed("busy/shared", false, &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let waiting_scheduler = Arc::clone(&scheduler);
+        let waiting_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_scheduler
+                .acquire_routed("busy/shared", false, &waiting_cancel)
+                .await
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        scheduler.record_outcome(
+            "busy",
+            Some("429 rate limit"),
+            chrono::Utc::now().timestamp_micros(),
+        );
+        drop(occupied);
+
+        let capacity = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(capacity.is_none());
+        assert_eq!(scheduler.all.available_permits(), 1);
+    }
+
+    #[test]
+    fn scheduler_ignores_an_older_failure_after_a_newer_success() {
+        let scheduler = TurnScheduler {
+            all: Arc::new(tokio::sync::Semaphore::new(1)),
+            background: Arc::new(tokio::sync::Semaphore::new(1)),
+            provider_all_limit: 1,
+            provider_background_limit: 1,
+            providers: Mutex::new(HashMap::new()),
+        };
+        let older_attempt = chrono::Utc::now().timestamp_micros();
+        scheduler.record_outcome("busy", None, older_attempt.saturating_add(1));
+        scheduler.record_outcome("busy", Some("429 rate limit"), older_attempt);
+
+        assert_eq!(scheduler.cooldown_remaining("busy/shared"), None);
     }
 
     #[test]
