@@ -1470,12 +1470,8 @@ impl ReviewTurnRequest {
     }
 }
 
-fn record_review_tool_call(count: &mut u64, limit: u64) -> Result<()> {
+fn record_review_tool_call(count: &mut u64) {
     *count = count.saturating_add(1);
-    if *count > limit {
-        bail!("code-review tool-call limit exceeded ({limit})");
-    }
-    Ok(())
 }
 
 struct ReviewOutputBuffer {
@@ -5865,6 +5861,14 @@ impl Engine {
         )
         .await?;
         let mut last_progress_persisted = Instant::now();
+        // Arm the hard budget before send_message can launch the disposable
+        // review turn. The guard covers every native or bridged dispatch and
+        // removes the ephemeral policy when this observer exits.
+        let _tool_budget = if tools_enabled {
+            Some(self.begin_automated_review_tool_budget(thread_id, max_tool_calls)?)
+        } else {
+            None
+        };
         let accepted = if tools_enabled {
             self.send_message(thread_id, prompt, Vec::new())?
         } else {
@@ -5996,12 +6000,7 @@ impl Engine {
                 Event::ToolRequested {
                     turn: event_turn, ..
                 } if event_turn == turn => {
-                    if let Err(error) =
-                        record_review_tool_call(&mut tool_call_count, max_tool_calls)
-                    {
-                        let _ = self.cancel_turn(thread_id);
-                        return Err(error);
-                    }
+                    record_review_tool_call(&mut tool_call_count);
                     observed_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
                     coalesce_observed_stage = true;
                 }
@@ -6017,7 +6016,12 @@ impl Engine {
                     observed_stage = output_stage;
                     coalesce_observed_stage = false;
                 }
-                Event::QuestionRequested { request_id, .. } => {
+                Event::QuestionRequested {
+                    turn: event_turn,
+                    request_id,
+                    ..
+                } if event_turn == turn => {
+                    record_review_tool_call(&mut tool_call_count);
                     // Automated review turns have no interactive user. Resolve
                     // against the owning disposable thread so the provider is
                     // unblocked without allowing a colliding request id from a
@@ -9305,46 +9309,137 @@ fn public_secret_like_token(token: &str) -> bool {
 }
 
 fn redact_public_secrets(text: &str) -> String {
-    fn push_token(output: &mut String, token: &str) {
+    #[derive(Clone, Copy)]
+    enum PendingSecret {
+        None,
+        Separator { authorization: bool },
+        Value { authorization: bool },
+    }
+
+    enum SecretLabel {
+        Bare {
+            authorization: bool,
+        },
+        Separated {
+            authorization: bool,
+            value_start: usize,
+        },
+    }
+
+    fn wrapper(character: char) -> bool {
+        !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.' | ':' | '=')
+    }
+
+    fn secret_label(token: &str) -> Option<SecretLabel> {
+        let trimmed_start = token.trim_start_matches(wrapper);
+        let leading_bytes = token.len().saturating_sub(trimmed_start.len());
+        let core = trimmed_start.trim_end_matches(wrapper);
+        let lower = core.to_ascii_lowercase();
+        for (label, authorization) in [
+            ("authorization", true),
+            ("password", false),
+            ("api_key", false),
+            ("apikey", false),
+            ("secret", false),
+            ("token", false),
+        ] {
+            if lower == label {
+                return Some(SecretLabel::Bare { authorization });
+            }
+            let Some(rest) = lower.strip_prefix(label) else {
+                continue;
+            };
+            if rest.starts_with(':') || rest.starts_with('=') {
+                return Some(SecretLabel::Separated {
+                    authorization,
+                    value_start: leading_bytes + label.len() + 1,
+                });
+            }
+        }
+        None
+    }
+
+    fn separator(token: &str) -> bool {
+        matches!(token.trim_matches(wrapper), ":" | "=")
+    }
+
+    fn authorization_scheme(token: &str) -> bool {
+        matches!(
+            token.trim_matches(wrapper).to_ascii_lowercase().as_str(),
+            "basic" | "bearer" | "token"
+        )
+    }
+
+    fn push_token(output: &mut String, token: &str, pending: &mut PendingSecret) {
         if token.is_empty() {
             return;
         }
-        let lower = token.to_ascii_lowercase();
-        let named_secret = [
-            "token=",
-            "token:",
-            "secret=",
-            "secret:",
-            "password=",
-            "password:",
-            "api_key=",
-            "api_key:",
-            "apikey=",
-            "apikey:",
-            "authorization=",
-            "authorization:",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker));
-        if named_secret || public_secret_like_token(token) {
-            output.push_str("[REDACTED]");
-        } else {
-            output.push_str(token);
+
+        if let PendingSecret::Separator { authorization } = *pending {
+            if separator(token) {
+                output.push_str(token);
+                *pending = PendingSecret::Value { authorization };
+                return;
+            }
+            *pending = PendingSecret::None;
+        }
+        if let PendingSecret::Value { authorization } = *pending {
+            if authorization && authorization_scheme(token) {
+                output.push_str(token);
+                *pending = PendingSecret::Value {
+                    authorization: false,
+                };
+            } else {
+                output.push_str("[REDACTED]");
+                *pending = PendingSecret::None;
+            }
+            return;
+        }
+
+        match secret_label(token) {
+            Some(SecretLabel::Bare { authorization }) => {
+                output.push_str(token);
+                *pending = PendingSecret::Separator { authorization };
+            }
+            Some(SecretLabel::Separated {
+                authorization,
+                value_start,
+            }) => {
+                let value = &token[value_start..];
+                let value_without_wrapper = value.trim_matches(wrapper);
+                if value_without_wrapper.is_empty() {
+                    output.push_str(token);
+                    *pending = PendingSecret::Value { authorization };
+                } else if authorization && authorization_scheme(value) {
+                    output.push_str(token);
+                    *pending = PendingSecret::Value {
+                        authorization: false,
+                    };
+                } else {
+                    let suffix = &value[value.trim_end_matches(wrapper).len()..];
+                    output.push_str(&token[..value_start]);
+                    output.push_str("[REDACTED]");
+                    output.push_str(suffix);
+                }
+            }
+            None if public_secret_like_token(token) => output.push_str("[REDACTED]"),
+            None => output.push_str(token),
         }
     }
 
     let mut output = String::with_capacity(text.len());
     let mut token = String::new();
+    let mut pending = PendingSecret::None;
     for character in text.chars() {
         if character.is_whitespace() {
-            push_token(&mut output, &token);
+            push_token(&mut output, &token, &mut pending);
             token.clear();
             output.push(character);
         } else {
             token.push(character);
         }
     }
-    push_token(&mut output, &token);
+    push_token(&mut output, &token, &mut pending);
     output
 }
 
@@ -20157,20 +20252,36 @@ mod tests {
     }
 
     #[test]
-    fn review_tool_call_limits_are_enforced_not_just_described() {
-        let mut reviewer_calls = 0;
-        for _ in 0..REVIEWER_MAX_TOOL_CALLS {
-            record_review_tool_call(&mut reviewer_calls, REVIEWER_MAX_TOOL_CALLS).unwrap();
-        }
-        assert!(record_review_tool_call(&mut reviewer_calls, REVIEWER_MAX_TOOL_CALLS).is_err());
-
-        let mut coordinator_calls = 0;
-        for _ in 0..COORDINATOR_MAX_TOOL_CALLS {
-            record_review_tool_call(&mut coordinator_calls, COORDINATOR_MAX_TOOL_CALLS).unwrap();
-        }
-        assert!(
-            record_review_tool_call(&mut coordinator_calls, COORDINATOR_MAX_TOOL_CALLS).is_err()
+    fn public_secret_redaction_follows_labels_across_whitespace() {
+        let rendered = redact_public_secrets(
+            "password: password-value\napi_key = api-value\n\
+             Authorization: Bearer bearer-value\ntoken:\nmultiline-value\n\
+             secret=inline-value\ntoken budget",
         );
+
+        assert_eq!(
+            rendered,
+            "password: [REDACTED]\napi_key = [REDACTED]\n\
+             Authorization: Bearer [REDACTED]\ntoken:\n[REDACTED]\n\
+             secret=[REDACTED]\ntoken budget"
+        );
+        for secret in [
+            "password-value",
+            "api-value",
+            "bearer-value",
+            "multiline-value",
+            "inline-value",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn review_tool_call_metrics_include_tools_and_questions() {
+        let mut calls = 0;
+        record_review_tool_call(&mut calls);
+        record_review_tool_call(&mut calls);
+        assert_eq!(calls, 2);
     }
 
     #[test]

@@ -586,6 +586,20 @@ fn backend_event_name(event: &BackendEvent) -> &'static str {
     }
 }
 
+fn enforce_automated_review_backend_boundary(
+    automated_review: bool,
+    tools_enabled: bool,
+    full_tool_bridge: bool,
+    backend_id: &str,
+) -> Result<()> {
+    if automated_review && tools_enabled && !full_tool_bridge {
+        bail!(
+            "automated code review requires backend {backend_id} to use the full ToolExecutor bridge"
+        );
+    }
+    Ok(())
+}
+
 struct BackendCollaboratorProjection {
     thread: Thread,
     mode: AgentPersona,
@@ -1873,6 +1887,65 @@ struct GlobalDefaults {
     permission_mode: trouve_protocol::PermissionMode,
 }
 
+#[derive(Clone, Copy)]
+struct AutomatedReviewToolBudget {
+    limit: u64,
+    remaining: u64,
+}
+
+#[derive(Default)]
+struct AutomatedReviewToolBudgets {
+    active: Mutex<HashMap<String, AutomatedReviewToolBudget>>,
+}
+
+impl AutomatedReviewToolBudgets {
+    fn arm(
+        self: &Arc<Self>,
+        thread_id: &str,
+        limit: u64,
+    ) -> Result<AutomatedReviewToolBudgetGuard> {
+        let mut active = self.active.lock().unwrap();
+        match active.entry(thread_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                bail!("automated-review tool budget is already active for thread {thread_id}");
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(AutomatedReviewToolBudget {
+                    limit,
+                    remaining: limit,
+                });
+            }
+        }
+        Ok(AutomatedReviewToolBudgetGuard {
+            budgets: self.clone(),
+            thread_id: thread_id.to_string(),
+        })
+    }
+
+    fn reserve(&self, thread_id: &str) -> Result<()> {
+        let mut active = self.active.lock().unwrap();
+        let Some(budget) = active.get_mut(thread_id) else {
+            return Ok(());
+        };
+        if budget.remaining == 0 {
+            bail!("code-review tool-call limit exceeded ({})", budget.limit);
+        }
+        budget.remaining -= 1;
+        Ok(())
+    }
+}
+
+pub(crate) struct AutomatedReviewToolBudgetGuard {
+    budgets: Arc<AutomatedReviewToolBudgets>,
+    thread_id: String,
+}
+
+impl Drop for AutomatedReviewToolBudgetGuard {
+    fn drop(&mut self) {
+        self.budgets.active.lock().unwrap().remove(&self.thread_id);
+    }
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -1895,6 +1968,10 @@ pub struct Engine {
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
     turn_scheduler: TurnScheduler,
+    /// Hard per-turn call caps for disposable automated-review threads.
+    /// Reservations happen inside the complete tool dispatch boundary, so a
+    /// parallel batch cannot race past its reviewer/coordinator allowance.
+    automated_review_tool_budgets: Arc<AutomatedReviewToolBudgets>,
     /// Per-session worktree access. Read-only turns share a read guard;
     /// mutating turns and checkpoint restoration take the
     /// write guard. This lets review/plan work fan out without weakening the
@@ -2328,6 +2405,7 @@ impl Engine {
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
             turn_scheduler: TurnScheduler::new(),
+            automated_review_tool_budgets: Arc::new(AutomatedReviewToolBudgets::default()),
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
@@ -9939,6 +10017,14 @@ impl Engine {
         }
     }
 
+    pub(crate) fn begin_automated_review_tool_budget(
+        &self,
+        thread_id: &str,
+        limit: u64,
+    ) -> Result<AutomatedReviewToolBudgetGuard> {
+        self.automated_review_tool_budgets.arm(thread_id, limit)
+    }
+
     /// Server-scope `session.activity` event — session lists light up (or
     /// dim) their indicator without refetching.
     fn emit_session_activity(&self, session_id: &str, active: bool) -> Result<(), EngineError> {
@@ -10123,29 +10209,28 @@ impl Engine {
                 specs = self.executor.specs(&ctx) => specs,
             }
             .into_iter()
-            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+            .filter(|spec| personas::tool_allowed(&mode, &spec.name))
             .collect()
         } else {
             Vec::new()
         };
-        if tools_enabled {
+        if tools_enabled && personas::tool_allowed(&mode, "ask_question") {
             specs.push(ask_question_spec());
+        }
+        if tools_enabled && personas::tool_allowed(&mode, "search_transcript") {
             specs.push(search_transcript_spec());
         }
         // Recursive spawn tools remain bounded by the durable tree depth and
         // also respect the mode policy, so restrictive/read-only personas that
         // do not list them cannot create child agents.
-        let spawn_allowed = |name: &str| {
-            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
-        };
         if tools_enabled && self.thread_can_spawn_subagents(&thread.id)? {
-            if spawn_allowed("spawn_thread") {
+            if personas::tool_allowed(&mode, "spawn_thread") {
                 specs.push(spawn_thread_spec());
             }
-            if spawn_allowed("spawn_session") {
+            if personas::tool_allowed(&mode, "spawn_session") {
                 specs.push(spawn_session_spec());
             }
-            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+            if personas::tool_allowed(&mode, "spawn_output") {
                 specs.push(spawn_output_spec());
             }
         }
@@ -10642,28 +10727,28 @@ impl Engine {
             .into_iter()
             .filter(|spec| {
                 (bridge_tools || matches!(spec.name.as_str(), "search" | "find_related"))
-                    && (mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&spec.name))
+                    && personas::tool_allowed(&mode, &spec.name)
             })
             .collect();
-        // Engine-served, always available (see handle_tool_call).
-        specs.push(ask_question_spec());
+        if personas::tool_allowed(&mode, "ask_question") {
+            specs.push(ask_question_spec());
+        }
         if !bridge_tools {
             return Ok(specs);
         }
-        specs.push(search_transcript_spec());
+        if personas::tool_allowed(&mode, "search_transcript") {
+            specs.push(search_transcript_spec());
+        }
         // Recursive spawn tools use the same mode and depth policy as native
         // provider turns.
-        let spawn_allowed = |name: &str| {
-            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|tool| tool == name)
-        };
         if self.thread_can_spawn_subagents(thread_id)? {
-            if spawn_allowed("spawn_thread") {
+            if personas::tool_allowed(&mode, "spawn_thread") {
                 specs.push(spawn_thread_spec());
             }
-            if spawn_allowed("spawn_session") {
+            if personas::tool_allowed(&mode, "spawn_session") {
                 specs.push(spawn_session_spec());
             }
-            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+            if personas::tool_allowed(&mode, "spawn_output") {
                 specs.push(spawn_output_spec());
             }
         }
@@ -12107,6 +12192,12 @@ impl Engine {
         let full_tool_bridge = mcp_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.bridge_tools);
+        enforce_automated_review_backend_boundary(
+            self.store.is_code_review_thread(&thread.id)?,
+            tools_enabled,
+            full_tool_bridge,
+            backend_id,
+        )?;
         if full_tool_bridge {
             if !instructions.is_empty() {
                 instructions.push_str("\n\n");
@@ -12662,6 +12753,11 @@ impl Engine {
                         }
                         continue;
                     }
+                    // Full-bridge calls reserve inside handle_tool_call and
+                    // their duplicate wrapper was suppressed above. Count
+                    // the backend's remaining sandbox-confined read tools at
+                    // their first authoritative lifecycle boundary.
+                    self.automated_review_tool_budgets.reserve(&thread.id)?;
                     if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
@@ -13084,6 +13180,10 @@ impl Engine {
                     questions,
                     responder,
                 } => {
+                    // Vendor question extensions are another engine-served
+                    // interaction path. Reserve before publishing or waiting
+                    // so they share the same hard review-turn allowance.
+                    self.automated_review_tool_budgets.reserve(&thread.id)?;
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -13689,6 +13789,10 @@ impl Engine {
         call: &trouve_providers::ToolCallRequest,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(String, Vec<trouve_providers::ToolImage>)> {
+        // The disposable review task arms this authority before dispatching
+        // its prompt. Reserve synchronously before any engine-served wait,
+        // durable tool event, approval, or ToolExecutor future can begin.
+        self.automated_review_tool_budgets.reserve(&thread.id)?;
         let scope = Scope::Thread(thread.id.clone());
         let call_id = if call.id.is_empty() {
             new_id("call")
@@ -13696,10 +13800,24 @@ impl Engine {
             call.id.clone()
         };
 
+        let engine_served = matches!(
+            call.name.as_str(),
+            "ask_question"
+                | "spawn_thread"
+                | "spawn_session"
+                | "spawn_output"
+                | "search_transcript"
+        );
+        if engine_served && !personas::tool_allowed(mode, &call.name) {
+            return Ok((
+                "Tool call denied: not permitted in this mode.".into(),
+                Vec::new(),
+            ));
+        }
+
         // ask_question is engine-served (it blocks on the QuestionHub, which
-        // tools can't reach) and never gated — asking is how the agent defers
-        // to the user, so it works even in read-only personas. No tool card is
-        // emitted: the question wizard is its representation in the UI.
+        // tools can't reach). No tool card is emitted: the question wizard is
+        // its representation in the UI.
         if call.name == "ask_question" {
             let result = match parse_question_args(&call.arguments) {
                 Ok((title, questions)) => {
@@ -17723,6 +17841,38 @@ mod tests {
                 .any(|spec| spec.name == "mcp__trusted__external")
         );
         engine.clear_cancel(&thread.id);
+    }
+
+    #[test]
+    fn automated_review_tool_budget_is_atomic_across_parallel_reservations() {
+        let budgets = Arc::new(AutomatedReviewToolBudgets::default());
+        let guard = budgets.arm("review-thread", 4).unwrap();
+        let allowed = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let budgets = budgets.clone();
+                    scope.spawn(move || budgets.reserve("review-thread").is_ok())
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|allowed| *allowed)
+                .count()
+        });
+        assert_eq!(allowed, 4);
+        assert!(budgets.reserve("review-thread").is_err());
+
+        drop(guard);
+        assert!(budgets.reserve("review-thread").is_ok());
+    }
+
+    #[test]
+    fn automated_review_vendor_tools_fail_closed_without_a_full_bridge() {
+        assert!(enforce_automated_review_backend_boundary(false, true, false, "cursor").is_ok());
+        assert!(enforce_automated_review_backend_boundary(true, false, false, "cursor").is_ok());
+        assert!(enforce_automated_review_backend_boundary(true, true, true, "codex").is_ok());
+        assert!(enforce_automated_review_backend_boundary(true, true, false, "cursor").is_err());
     }
 
     #[test]

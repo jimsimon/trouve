@@ -81,6 +81,14 @@ pub fn secure_automated_review_persona(mut persona: AgentPersona) -> AgentPerson
     persona
 }
 
+/// Whether a persona exposes one named tool. An empty catalog is the
+/// interactive all-tools default; restricted personas name every capability
+/// explicitly. Engine-served and executor-backed tools must use the same
+/// predicate for both discovery and dispatch.
+pub fn tool_allowed(persona: &AgentPersona, name: &str) -> bool {
+    persona.allowed_tools.is_empty() || persona.allowed_tools.iter().any(|tool| tool == name)
+}
+
 pub fn builtin_personas() -> Vec<AgentPersona> {
     vec![
         AgentPersona {
@@ -730,6 +738,9 @@ mod tests {
         );
         assert!(!secured.allowed_tools.iter().any(|tool| tool == "shell"));
         assert!(!secured.allowed_tools.iter().any(|tool| tool == "web_fetch"));
+        assert!(tool_allowed(&secured, "read_file"));
+        assert!(!tool_allowed(&secured, "search_transcript"));
+        assert!(!tool_allowed(&secured, "ask_question"));
         assert!(secured.system_prompt.contains("untrusted evidence"));
         assert!(secured.system_prompt.contains("never instructions"));
     }
