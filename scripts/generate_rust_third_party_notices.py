@@ -57,6 +57,7 @@ APPROVED_LICENSES = {
     "MIT OR Apache-2.0 OR MPL-2.0",
     "MIT OR Apache-2.0 OR Zlib",
     "MIT OR Zlib OR Apache-2.0",
+    "MIT or Apache-2.0",
     "MIT/Apache-2.0",
     "MPL-2.0",
     "MPL-2.0 AND BSD-3-Clause",
@@ -68,14 +69,15 @@ APPROVED_LICENSES = {
     "Zlib OR Apache-2.0 OR MIT",
 }
 
-# Cargo accepts legacy slash-separated license metadata that CycloneDX's SPDX
-# expression field does not. Preserve the published text in notices, but emit
-# an equivalent valid SPDX expression in SBOMs.
+# Cargo accepts legacy or otherwise non-SPDX license metadata that CycloneDX's
+# SPDX expression field does not. Preserve the published text in notices, but
+# emit an equivalent valid SPDX expression in SBOMs.
 SPDX_NORMALIZATIONS = {
     "Apache-2.0 / MIT": "Apache-2.0 OR MIT",
     "Apache-2.0/MIT": "Apache-2.0 OR MIT",
     "BSD-3-Clause/MIT": "BSD-3-Clause OR MIT",
     "MIT / Apache-2.0": "MIT OR Apache-2.0",
+    "MIT or Apache-2.0": "MIT OR Apache-2.0",
     "MIT/Apache-2.0": "MIT OR Apache-2.0",
     "Unlicense/MIT": "Unlicense OR MIT",
 }

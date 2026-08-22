@@ -8,16 +8,116 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 /// Bump when the chunking algorithm, tokenizer, embedding semantics, or
 /// entry layout change incompatibly. v2: padding-free (batch-independent)
 /// embeddings. v3: flat token storage in entries.
 pub const STORE_VERSION: u32 = 3;
+
+const STORE_KEY_LENGTH: usize = 16;
+const STORE_IDENTITY_FILE: &str = "identity.json";
+const STORE_IDENTITY_VERSION: u32 = 1;
+const MAX_STORE_IDENTITY_BYTES: u64 = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoreIdentityMetadata {
+    version: u32,
+    repo_identity: String,
+    /// Full BLAKE3 digest. The store directory uses only its first 16 hex
+    /// characters, so retaining the full digest lets cleanup reject a
+    /// truncated-key collision rather than deleting the wrong store.
+    digest: String,
+}
+
+fn repo_identity_digest(repo_identity: &str) -> String {
+    blake3::hash(repo_identity.as_bytes()).to_hex().to_string()
+}
+
+fn identity_metadata_path(store_root: &Path) -> PathBuf {
+    store_root.join(STORE_IDENTITY_FILE)
+}
+
+fn load_identity_metadata(store_root: &Path) -> Result<Option<StoreIdentityMetadata>> {
+    let path = identity_metadata_path(store_root);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading metadata for {path:?}")),
+    };
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "store identity metadata is not a regular file: {path:?}"
+    );
+    ensure!(
+        metadata.len() <= MAX_STORE_IDENTITY_BYTES,
+        "store identity metadata is unexpectedly large: {path:?}"
+    );
+    let bytes = fs::read(&path).with_context(|| format!("reading store identity {path:?}"))?;
+    let identity = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding store identity {path:?}"))?;
+    Ok(Some(identity))
+}
+
+fn identity_matches_store(store_root: &Path, identity: &StoreIdentityMetadata) -> bool {
+    if identity.version != STORE_IDENTITY_VERSION {
+        return false;
+    }
+    let digest = repo_identity_digest(&identity.repo_identity);
+    identity.digest == digest
+        && store_root.file_name().and_then(|name| name.to_str()) == digest.get(..STORE_KEY_LENGTH)
+}
+
+fn validate_identity_metadata(store_root: &Path, expected: &StoreIdentityMetadata) -> Result<()> {
+    let actual = load_identity_metadata(store_root)?
+        .with_context(|| format!("missing identity metadata in {store_root:?}"))?;
+    ensure!(
+        actual == *expected && identity_matches_store(store_root, &actual),
+        "store identity metadata does not match repository: {store_root:?}"
+    );
+    Ok(())
+}
+
+fn persist_identity_metadata(store_root: &Path, repo_identity: &str, digest: &str) -> Result<()> {
+    let expected = StoreIdentityMetadata {
+        version: STORE_IDENTITY_VERSION,
+        repo_identity: repo_identity.to_string(),
+        digest: digest.to_string(),
+    };
+    if load_identity_metadata(store_root)?.is_some() {
+        return validate_identity_metadata(store_root, &expected);
+    }
+
+    // A unique same-directory temporary file keeps the final rename atomic
+    // and avoids concurrent first opens sharing a predictable temp path.
+    let mut temporary = tempfile::NamedTempFile::new_in(store_root)
+        .with_context(|| format!("creating identity temp file in {store_root:?}"))?;
+    serde_json::to_writer(temporary.as_file_mut(), &expected)?;
+    temporary.as_file_mut().write_all(b"\n")?;
+    temporary.as_file_mut().sync_all()?;
+
+    let path = identity_metadata_path(store_root);
+    match temporary.persist_noclobber(&path) {
+        Ok(file) => {
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            // Another process won the first-open race. Trust it only if it
+            // wrote exactly the identity we were about to persist.
+            drop(error.file);
+            validate_identity_metadata(store_root, &expected)
+        }
+        Err(error) => {
+            Err(error.error).with_context(|| format!("persisting store identity metadata {path:?}"))
+        }
+    }
+}
 
 /// Resolve the trouve cache folder, respecting `TROUVE_CACHE_LOCATION`
 /// (highest precedence, with a deprecated `SEMBLE_CACHE_LOCATION` fallback)
@@ -120,7 +220,7 @@ impl FileEntry {
 }
 
 /// A content-addressed store rooted in the trouve cache folder, one per
-/// repository identity (git common dir, remote URL, or plain path).
+/// repository identity (git common dir or plain path).
 pub struct ChunkStore {
     root: PathBuf,
 }
@@ -128,9 +228,20 @@ pub struct ChunkStore {
 impl ChunkStore {
     /// Open (creating if needed) the store for a repository identity string.
     pub fn open(repo_identity: &str) -> Result<ChunkStore> {
-        let digest = blake3::hash(repo_identity.as_bytes()).to_hex().to_string();
-        let root = resolve_cache_folder().join("store").join(&digest[..16]);
+        Self::open_for_identity_at(&resolve_cache_folder().join("store"), repo_identity)
+    }
+
+    fn open_for_identity_at(store_root: &Path, repo_identity: &str) -> Result<ChunkStore> {
+        let digest = repo_identity_digest(repo_identity);
+        let root = store_root.join(&digest[..STORE_KEY_LENGTH]);
         fs::create_dir_all(&root).with_context(|| format!("creating store dir {root:?}"))?;
+        let metadata = fs::symlink_metadata(&root)
+            .with_context(|| format!("reading store dir metadata {root:?}"))?;
+        ensure!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "store path is not a regular directory: {root:?}"
+        );
+        persist_identity_metadata(&root, repo_identity, &digest)?;
         Ok(ChunkStore { root })
     }
 
@@ -332,9 +443,299 @@ pub fn clear_all_stores() -> Vec<PathBuf> {
     removed
 }
 
+/// Remove stores whose recorded repository identity no longer exists.
+///
+/// Cleanup is deliberately conservative: legacy stores without identity
+/// metadata, corrupt or unknown metadata, digest/name mismatches, symlinks,
+/// and identities whose existence cannot be determined are all left alone.
+pub fn clear_orphan_stores() -> Vec<PathBuf> {
+    clear_orphan_stores_at(&resolve_cache_folder().join("store"))
+}
+
+fn clear_orphan_stores_at(store_root: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let Ok(root_metadata) = fs::symlink_metadata(store_root) else {
+        return removed;
+    };
+    if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
+        return removed;
+    }
+    let Ok(entries) = fs::read_dir(store_root) else {
+        return removed;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(Some(identity)) = load_identity_metadata(&path) else {
+            continue;
+        };
+        if !identity_matches_store(&path, &identity) {
+            continue;
+        }
+        // Repository identities currently cross the store boundary as UTF-8
+        // strings. A replacement character may have come from lossy
+        // conversion of a non-UTF-8 path, which cannot be reconstructed
+        // safely for an existence check.
+        if identity.repo_identity.contains('�') {
+            continue;
+        }
+        let identity_path = Path::new(&identity.repo_identity);
+        if !identity_path.is_absolute() || !matches!(identity_path.try_exists(), Ok(false)) {
+            continue;
+        }
+
+        // Recheck the entry without following symlinks immediately before
+        // removal. remove_dir_all itself does not follow directory symlinks,
+        // but this also makes the intended boundary explicit.
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path_identity(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn concurrent_first_opens_persist_one_full_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        let repository = dir.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        let identity = std::sync::Arc::new(path_identity(&repository));
+        let store_root = std::sync::Arc::new(store_root);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let identity = std::sync::Arc::clone(&identity);
+                let store_root = std::sync::Arc::clone(&store_root);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ChunkStore::open_for_identity_at(&store_root, &identity)
+                        .unwrap()
+                        .root
+                })
+            })
+            .collect();
+        let roots: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert!(roots.windows(2).all(|pair| pair[0] == pair[1]));
+        let metadata = load_identity_metadata(&roots[0]).unwrap().unwrap();
+        let expected_digest = repo_identity_digest(&identity);
+        assert_eq!(metadata.version, STORE_IDENTITY_VERSION);
+        assert_eq!(metadata.repo_identity, *identity);
+        assert_eq!(metadata.digest, expected_digest);
+        assert!(identity_matches_store(&roots[0], &metadata));
+
+        let files: Vec<_> = fs::read_dir(&roots[0])
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, [std::ffi::OsString::from(STORE_IDENTITY_FILE)]);
+    }
+
+    #[test]
+    fn orphan_cleanup_deletes_only_a_verified_missing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        let live_repository = dir.path().join("live");
+        let deleted_repository = dir.path().join("deleted");
+        fs::create_dir(&live_repository).unwrap();
+        fs::create_dir(&deleted_repository).unwrap();
+
+        let live_store =
+            ChunkStore::open_for_identity_at(&store_root, &path_identity(&live_repository))
+                .unwrap();
+        let deleted_store =
+            ChunkStore::open_for_identity_at(&store_root, &path_identity(&deleted_repository))
+                .unwrap();
+        fs::remove_dir(&deleted_repository).unwrap();
+
+        let removed = clear_orphan_stores_at(&store_root);
+
+        assert_eq!(removed, std::slice::from_ref(&deleted_store.root));
+        assert!(live_store.root.try_exists().unwrap());
+        assert!(!deleted_store.root.try_exists().unwrap());
+    }
+
+    #[test]
+    fn orphan_cleanup_keeps_git_stores_by_the_live_common_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        let git_common_dir = dir.path().join("main").join(".git");
+        let disposable_worktree = dir.path().join("worktree");
+        fs::create_dir_all(&git_common_dir).unwrap();
+        fs::create_dir(&disposable_worktree).unwrap();
+        let store =
+            ChunkStore::open_for_identity_at(&store_root, &path_identity(&git_common_dir)).unwrap();
+
+        // Removing one checkout does not orphan the repository-wide store:
+        // git identities point at the shared common .git directory.
+        fs::remove_dir(&disposable_worktree).unwrap();
+        assert!(clear_orphan_stores_at(&store_root).is_empty());
+        assert!(store.root.try_exists().unwrap());
+    }
+
+    #[test]
+    fn orphan_cleanup_skips_legacy_corrupt_unknown_and_mismatched_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        fs::create_dir(&store_root).unwrap();
+
+        let legacy = store_root.join("aaaaaaaaaaaaaaaa");
+        fs::create_dir(&legacy).unwrap();
+
+        let corrupt = store_root.join("bbbbbbbbbbbbbbbb");
+        fs::create_dir(&corrupt).unwrap();
+        fs::write(identity_metadata_path(&corrupt), b"{not-json").unwrap();
+
+        let unknown_identity = path_identity(&dir.path().join("missing-unknown"));
+        let unknown = ChunkStore::open_for_identity_at(&store_root, &unknown_identity).unwrap();
+        let mut unknown_metadata = load_identity_metadata(&unknown.root).unwrap().unwrap();
+        unknown_metadata.version += 1;
+        fs::write(
+            identity_metadata_path(&unknown.root),
+            serde_json::to_vec(&unknown_metadata).unwrap(),
+        )
+        .unwrap();
+
+        let digest_identity = path_identity(&dir.path().join("missing-digest"));
+        let digest_store = ChunkStore::open_for_identity_at(&store_root, &digest_identity).unwrap();
+        let mut digest_metadata = load_identity_metadata(&digest_store.root).unwrap().unwrap();
+        let replacement = if digest_metadata.digest.ends_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        digest_metadata.digest.replace_range(63..64, replacement);
+        fs::write(
+            identity_metadata_path(&digest_store.root),
+            serde_json::to_vec(&digest_metadata).unwrap(),
+        )
+        .unwrap();
+
+        let prefix_identity = path_identity(&dir.path().join("missing-prefix"));
+        let prefix_digest = repo_identity_digest(&prefix_identity);
+        let wrong_name = if prefix_digest.starts_with("cccccccccccccccc") {
+            "dddddddddddddddd"
+        } else {
+            "cccccccccccccccc"
+        };
+        let prefix_mismatch = store_root.join(wrong_name);
+        fs::create_dir(&prefix_mismatch).unwrap();
+        let prefix_metadata = StoreIdentityMetadata {
+            version: STORE_IDENTITY_VERSION,
+            repo_identity: prefix_identity,
+            digest: prefix_digest,
+        };
+        fs::write(
+            identity_metadata_path(&prefix_mismatch),
+            serde_json::to_vec(&prefix_metadata).unwrap(),
+        )
+        .unwrap();
+
+        assert!(clear_orphan_stores_at(&store_root).is_empty());
+        for path in [
+            legacy,
+            corrupt,
+            unknown.root,
+            digest_store.root,
+            prefix_mismatch,
+        ] {
+            assert!(path.try_exists().unwrap(), "unexpectedly removed {path:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_skips_symlinks_and_identity_existence_errors() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        fs::create_dir(&store_root).unwrap();
+
+        // A symlinked store entry must not be followed even when the target
+        // contains otherwise valid metadata for a missing identity.
+        let external_root = dir.path().join("external");
+        let missing_store_identity = path_identity(&dir.path().join("missing-store-target"));
+        let external_store =
+            ChunkStore::open_for_identity_at(&external_root, &missing_store_identity).unwrap();
+        let store_link = store_root.join(external_store.root.file_name().unwrap());
+        symlink(&external_store.root, &store_link).unwrap();
+
+        // Nor may a regular store directory borrow identity metadata through
+        // a symlink.
+        let missing_metadata_identity = path_identity(&dir.path().join("missing-metadata-target"));
+        let metadata_source =
+            ChunkStore::open_for_identity_at(&external_root, &missing_metadata_identity).unwrap();
+        let metadata_link_store = store_root.join(metadata_source.root.file_name().unwrap());
+        fs::create_dir(&metadata_link_store).unwrap();
+        symlink(
+            identity_metadata_path(&metadata_source.root),
+            identity_metadata_path(&metadata_link_store),
+        )
+        .unwrap();
+
+        // This is absolute and has valid metadata, but statting it fails with
+        // InvalidInput. Cleanup must delete only on Ok(false), not on errors.
+        let error_identity = format!("/missing-identity-{}\0", std::process::id());
+        let error_store = ChunkStore::open_for_identity_at(&store_root, &error_identity).unwrap();
+        assert!(Path::new(&error_identity).try_exists().is_err());
+
+        // RepoIdentity currently uses a lossy UTF-8 string at the store
+        // boundary. The reconstructed string does not name this live path,
+        // so cleanup must treat its replacement character as unverifiable.
+        let non_utf8_repository = dir
+            .path()
+            .join(OsString::from_vec(b"live-non-utf8-\xff".to_vec()));
+        fs::create_dir(&non_utf8_repository).unwrap();
+        let non_utf8_identity = non_utf8_repository.to_string_lossy().into_owned();
+        assert!(non_utf8_identity.contains('�'));
+        let non_utf8_store =
+            ChunkStore::open_for_identity_at(&store_root, &non_utf8_identity).unwrap();
+
+        assert!(clear_orphan_stores_at(&store_root).is_empty());
+        assert!(
+            fs::symlink_metadata(&store_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(identity_metadata_path(&metadata_link_store))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(error_store.root.try_exists().unwrap());
+        assert!(non_utf8_store.root.try_exists().unwrap());
+    }
 
     #[test]
     fn roundtrips_entries() {
