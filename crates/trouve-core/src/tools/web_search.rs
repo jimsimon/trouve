@@ -19,6 +19,9 @@ const MAX_SEARCH_ERROR_CHARS: usize = 8 * 1024;
 const MAX_PROVIDER_ERROR_CHARS: usize = 3 * 1024;
 const MAX_QUERY_CHARS: usize = 2_000;
 const MIN_PROVIDER_INTERVAL: Duration = Duration::from_millis(250);
+const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 #[derive(Clone, Copy)]
 enum ProviderKind {
@@ -29,6 +32,11 @@ enum ProviderKind {
 enum SearchError {
     Cancelled,
     Failed(String),
+}
+
+struct McpSession {
+    id: Option<String>,
+    protocol_version: String,
 }
 
 /// Incrementally assembles complete SSE events from arbitrary byte chunks.
@@ -260,17 +268,33 @@ impl WebSearch {
         lock
     }
 
-    fn cached(&self, normalized_query: &str, max_results: usize) -> Option<CachedSearch> {
-        let mut cache = self.cache.lock().unwrap();
-        self.providers
-            .iter()
-            .find_map(|provider| cache.get(&provider.cache_key(normalized_query, max_results)))
+    fn scoped_key(scope: &str, key: &str) -> String {
+        format!("{}:{scope}{key}", scope.len())
     }
 
-    async fn wait_for_provider_slot(&self, ctx: &ToolCtx) -> Result<(), SearchError> {
+    fn cached(
+        &self,
+        scope: &str,
+        normalized_query: &str,
+        max_results: usize,
+    ) -> Option<CachedSearch> {
+        let mut cache = self.cache.lock().unwrap();
+        self.providers.iter().find_map(|provider| {
+            cache.get(&Self::scoped_key(
+                scope,
+                &provider.cache_key(normalized_query, max_results),
+            ))
+        })
+    }
+
+    async fn send_provider_request(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, SearchError> {
         let mut last_request = tokio::select! {
             biased;
-            _ = ctx.cancel.cancelled() => return Err(SearchError::Cancelled),
+            _ = cancel.cancelled() => return Err(SearchError::Cancelled),
             guard = self.provider_gate.lock() => guard,
         };
         if let Some(last_request_at) = *last_request {
@@ -280,13 +304,142 @@ impl WebSearch {
             if !wait.is_zero() {
                 tokio::select! {
                     biased;
-                    _ = ctx.cancel.cancelled() => return Err(SearchError::Cancelled),
+                    _ = cancel.cancelled() => return Err(SearchError::Cancelled),
                     _ = tokio::time::sleep(wait) => {}
                 }
             }
         }
-        *last_request = Some(Instant::now());
-        Ok(())
+        if cancel.is_cancelled() {
+            return Err(SearchError::Cancelled);
+        }
+
+        // Keep the gate through the first response headers so another task
+        // cannot reserve a later slot and dispatch ahead of this request.
+        // Once send() is polled, cancellation may race an already-started
+        // request, so that attempt must still consume its provider slot.
+        let attempted_at = Instant::now();
+        let response = tokio::select! {
+            biased;
+            response = request.send() => response
+                .map_err(|error| SearchError::Failed(format!("request failed: {error}"))),
+            _ = cancel.cancelled() => Err(SearchError::Cancelled),
+        };
+        *last_request = Some(attempted_at);
+        response
+    }
+
+    fn provider_request(
+        &self,
+        provider: &SearchProvider,
+        body: &Value,
+        session: Option<&McpSession>,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .post(&provider.endpoint)
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .json(body);
+        if let Some(session) = session {
+            request = request.header(
+                MCP_PROTOCOL_VERSION_HEADER,
+                session.protocol_version.as_str(),
+            );
+            if let Some(id) = &session.id {
+                request = request.header(MCP_SESSION_ID_HEADER, id);
+            }
+        }
+        request
+    }
+
+    async fn initialize_provider(
+        &self,
+        ctx: &ToolCtx,
+        provider: &SearchProvider,
+    ) -> Result<McpSession, SearchError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "trouve",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+        let response = self
+            .send_provider_request(&ctx.cancel, self.provider_request(provider, &body, None))
+            .await?;
+        let session_id = response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .map(|value| {
+                value.to_str().map(str::to_owned).map_err(|_| {
+                    SearchError::Failed("provider returned an invalid MCP session id".into())
+                })
+            })
+            .transpose()?;
+        let value = self.read_mcp_response(ctx, response, 0).await?;
+        let protocol_version = value
+            .pointer("/result/protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| {
+                SearchError::Failed("provider initialization omitted protocol version".into())
+            })?
+            .to_owned();
+        let session = McpSession {
+            id: session_id,
+            protocol_version,
+        };
+        let initialized = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        });
+        let response = self
+            .send_provider_request(
+                &ctx.cancel,
+                self.provider_request(provider, &initialized, Some(&session)),
+            )
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => Ok(session),
+            Ok(response) => {
+                let error = SearchError::Failed(format!(
+                    "provider rejected MCP initialization with HTTP {}",
+                    response.status()
+                ));
+                self.close_provider_session(provider, &session).await;
+                Err(error)
+            }
+            Err(error) => {
+                self.close_provider_session(provider, &session).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn close_provider_session(&self, provider: &SearchProvider, session: &McpSession) {
+        let Some(id) = &session.id else {
+            return;
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let request = self
+            .client
+            .delete(&provider.endpoint)
+            .timeout(Duration::from_secs(2))
+            .header(
+                MCP_PROTOCOL_VERSION_HEADER,
+                session.protocol_version.as_str(),
+            )
+            .header(MCP_SESSION_ID_HEADER, id);
+        let _ = self.send_provider_request(&cancel, request).await;
     }
 
     async fn call_provider(
@@ -296,7 +449,7 @@ impl WebSearch {
         query: &str,
         max_results: usize,
     ) -> Result<String, SearchError> {
-        self.wait_for_provider_slot(ctx).await?;
+        let session = self.initialize_provider(ctx, provider).await?;
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -306,15 +459,33 @@ impl WebSearch {
                 "arguments": provider.arguments(query, max_results),
             }
         });
-        let response = tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => return Err(SearchError::Cancelled),
-            response = self.client
-                .post(&provider.endpoint)
-                .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
-                .json(&body)
-                .send() => response.map_err(|error| SearchError::Failed(format!("request failed: {error}")))?,
+        let result = match self
+            .send_provider_request(
+                &ctx.cancel,
+                self.provider_request(provider, &body, Some(&session)),
+            )
+            .await
+        {
+            Ok(response) => self
+                .read_mcp_response(ctx, response, 1)
+                .await
+                .and_then(|value| {
+                    extract_mcp_value(&value).map_err(|error| {
+                        SearchError::Failed(bounded_error(&error, MAX_PROVIDER_ERROR_CHARS))
+                    })
+                }),
+            Err(error) => Err(error),
         };
+        self.close_provider_session(provider, &session).await;
+        result
+    }
+
+    async fn read_mcp_response(
+        &self,
+        ctx: &ToolCtx,
+        response: reqwest::Response,
+        expected_id: u64,
+    ) -> Result<Value, SearchError> {
         if !response.status().is_success() {
             return Err(SearchError::Failed(format!(
                 "provider returned HTTP {}",
@@ -354,12 +525,8 @@ impl WebSearch {
             }
             if let Some(decoder) = &mut sse_decoder {
                 for event in decoder.push(&chunk).map_err(SearchError::Failed)? {
-                    match extract_mcp_sse_event(&event) {
-                        Ok(Some(result)) => {
-                            return result.map_err(|error| {
-                                SearchError::Failed(bounded_error(&error, MAX_PROVIDER_ERROR_CHARS))
-                            });
-                        }
+                    match extract_mcp_sse_event(&event, expected_id) {
+                        Ok(Some(result)) => return Ok(result),
                         Ok(None) => {}
                         Err(error) => last_sse_error = Some(error),
                     }
@@ -370,12 +537,8 @@ impl WebSearch {
         }
         if let Some(mut decoder) = sse_decoder {
             for event in decoder.finish().map_err(SearchError::Failed)? {
-                match extract_mcp_sse_event(&event) {
-                    Ok(Some(result)) => {
-                        return result.map_err(|error| {
-                            SearchError::Failed(bounded_error(&error, MAX_PROVIDER_ERROR_CHARS))
-                        });
-                    }
+                match extract_mcp_sse_event(&event, expected_id) {
+                    Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(error) => last_sse_error = Some(error),
                 }
@@ -389,7 +552,7 @@ impl WebSearch {
         }
         let body = String::from_utf8(bytes)
             .map_err(|_| SearchError::Failed("provider returned non-UTF-8 content".to_string()))?;
-        extract_mcp_text(&body)
+        extract_mcp_response(&body, expected_id)
             .map_err(|error| SearchError::Failed(bounded_error(&error, MAX_PROVIDER_ERROR_CHARS)))
     }
 }
@@ -446,31 +609,44 @@ impl Tool for WebSearch {
                 "query exceeds the {MAX_QUERY_CHARS}-character limit"
             ));
         }
-        let max_results = args.get("max_results").and_then(Value::as_u64).unwrap_or(8);
+        let max_results = match args.get("max_results") {
+            None => 8,
+            Some(value) => match value.as_u64() {
+                Some(value) => value,
+                None => {
+                    return ToolResult::error("max_results must be an integer between 1 and 10");
+                }
+            },
+        };
         if !(1..=10).contains(&max_results) {
             return ToolResult::error("max_results must be between 1 and 10");
         }
         let max_results = max_results as usize;
         let normalized_query = query.to_lowercase();
+        // WebSearch is executor-global, so every cache and coalescing key must
+        // include the caller scope. Isolated tests intentionally share the
+        // empty scope; production calls always carry a stable thread id.
+        let scope = ctx.thread_id.as_str();
 
-        if let Some(cached) = self.cached(&normalized_query, max_results) {
+        if let Some(cached) = self.cached(scope, &normalized_query, max_results) {
             return ToolResult::ok(search_result(cached, true));
         }
 
         // Only one call for a normalized query reaches a provider. Followers
         // wait, then consume the newly cached result.
-        let lock_key = self
+        let provider_key = self
             .providers
             .first()
             .map(|provider| provider.cache_key(&normalized_query, max_results))
             .unwrap_or_else(|| format!("none\n{normalized_query}\n{max_results}"));
+        let lock_key = Self::scoped_key(scope, &provider_key);
         let query_lock = self.query_lock(&lock_key);
         let _query_guard = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => return ToolResult::error("search cancelled"),
             guard = query_lock.lock() => guard,
         };
-        if let Some(cached) = self.cached(&normalized_query, max_results) {
+        if let Some(cached) = self.cached(scope, &normalized_query, max_results) {
             return ToolResult::ok(search_result(cached, true));
         }
 
@@ -481,7 +657,10 @@ impl Tool for WebSearch {
                     let truncated = content.chars().count() > MAX_RETURN_CHARS;
                     let content: String = content.chars().take(MAX_RETURN_CHARS).collect();
                     self.cache.lock().unwrap().insert(
-                        provider.cache_key(&normalized_query, max_results),
+                        Self::scoped_key(
+                            scope,
+                            &provider.cache_key(&normalized_query, max_results),
+                        ),
                         provider.name,
                         content.clone(),
                         truncated,
@@ -530,9 +709,18 @@ fn search_result(cached: CachedSearch, cache_hit: bool) -> Value {
     })
 }
 
+#[cfg(test)]
 fn extract_mcp_text(body: &str) -> Result<String, String> {
+    extract_mcp_response(body, 1).and_then(|value| extract_mcp_value(&value))
+}
+
+fn extract_mcp_response(body: &str, expected_id: u64) -> Result<Value, String> {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
-        return extract_mcp_value(&value);
+        return if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            Ok(value)
+        } else {
+            Err("provider returned no MCP result".into())
+        };
     }
 
     let mut decoder = SseDecoder::default();
@@ -540,9 +728,8 @@ fn extract_mcp_text(body: &str) -> Result<String, String> {
     events.extend(decoder.finish()?);
     let mut last_error = None;
     for event in events {
-        match extract_mcp_sse_event(&event) {
-            Ok(Some(Ok(text))) => return Ok(text),
-            Ok(Some(Err(error))) => return Err(error),
+        match extract_mcp_sse_event(&event, expected_id) {
+            Ok(Some(value)) => return Ok(value),
             Ok(None) => {}
             Err(error) => last_error = Some(error),
         }
@@ -551,17 +738,17 @@ fn extract_mcp_text(body: &str) -> Result<String, String> {
 }
 
 /// Parse one SSE data payload, ignoring notifications and unrelated call ids.
-fn extract_mcp_sse_event(data: &str) -> Result<Option<Result<String, String>>, String> {
+fn extract_mcp_sse_event(data: &str, expected_id: u64) -> Result<Option<Value>, String> {
     let data = data.trim();
     if data.is_empty() || data == "[DONE]" {
         return Ok(None);
     }
     let value = serde_json::from_str::<Value>(data)
         .map_err(|error| format!("invalid SSE JSON: {error}"))?;
-    if value.get("id").and_then(Value::as_u64) != Some(1) {
+    if value.get("id").and_then(Value::as_u64) != Some(expected_id) {
         return Ok(None);
     }
-    Ok(Some(extract_mcp_value(&value)))
+    Ok(Some(value))
 }
 
 /// Bound untrusted provider text while preserving UTF-8 character boundaries.
@@ -616,11 +803,20 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug)]
+    struct CapturedRequest {
+        at: Instant,
+        method: String,
+        body: Option<Value>,
+        session_id: Option<String>,
+        protocol_version: Option<String>,
+    }
+
     async fn capturing_mock_server_with_delay(
         status: &'static str,
         body: impl Into<String>,
         response_delay: Duration,
-    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<CapturedRequest>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -631,46 +827,125 @@ mod tests {
             let requests = requests.clone();
             async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    let mut request = Vec::new();
-                    let mut buffer = [0; 4096];
-                    loop {
-                        let read = socket.read(&mut buffer).await.unwrap();
-                        if read == 0 {
-                            break;
+                    let calls = calls.clone();
+                    let requests = requests.clone();
+                    let body = body.clone();
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut buffer = [0; 4096];
+                        loop {
+                            let read = socket.read(&mut buffer).await.unwrap();
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&buffer[..read]);
+                            let Some(headers_end) = request
+                                .windows(4)
+                                .position(|window| window == b"\r\n\r\n")
+                                .map(|position| position + 4)
+                            else {
+                                continue;
+                            };
+                            let headers = String::from_utf8_lossy(&request[..headers_end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.split_once(':')
+                                        .filter(|(name, _)| {
+                                            name.eq_ignore_ascii_case("content-length")
+                                        })
+                                        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= headers_end + content_length {
+                                break;
+                            }
                         }
-                        request.extend_from_slice(&buffer[..read]);
-                        let Some(headers_end) = request
+                        let headers_end = request
                             .windows(4)
                             .position(|window| window == b"\r\n\r\n")
                             .map(|position| position + 4)
-                        else {
-                            continue;
-                        };
-                        let headers = String::from_utf8_lossy(&request[..headers_end]);
-                        let content_length = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.split_once(':')
-                                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= headers_end + content_length {
-                            let value = serde_json::from_slice(
-                                &request[headers_end..headers_end + content_length],
-                            )
                             .unwrap();
-                            requests.lock().unwrap().push(value);
-                            break;
+                        let headers = String::from_utf8_lossy(&request[..headers_end]);
+                        let method = headers
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().next())
+                            .unwrap_or_default()
+                            .to_owned();
+                        let request_body = if request.len() > headers_end {
+                            serde_json::from_slice(&request[headers_end..]).ok()
+                        } else {
+                            None
+                        };
+                        let rpc_method = request_body
+                            .as_ref()
+                            .and_then(|value: &Value| value.get("method"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let streaming = rpc_method.as_deref() == Some("tools/call")
+                            && body.trim_start().starts_with("data:");
+                        let header = |name: &str| {
+                            headers.lines().find_map(|line| {
+                                line.split_once(':')
+                                    .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+                                    .map(|(_, value)| value.trim().to_owned())
+                            })
+                        };
+                        requests.lock().unwrap().push(CapturedRequest {
+                            at: Instant::now(),
+                            method: method.clone(),
+                            body: request_body,
+                            session_id: header(MCP_SESSION_ID_HEADER),
+                            protocol_version: header(MCP_PROTOCOL_VERSION_HEADER),
+                        });
+
+                        let response = if method == "DELETE" {
+                            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_owned()
+                        } else if status != "200 OK" {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        } else if rpc_method.as_deref() == Some("initialize") {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let initialized = json!({
+                                "jsonrpc": "2.0",
+                                "id": 0,
+                                "result": {
+                                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                                    "capabilities": {"tools": {}},
+                                    "serverInfo": {"name": "mock-search", "version": "1"},
+                                },
+                            })
+                            .to_string();
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{initialized}",
+                                initialized.len()
+                            )
+                        } else if rpc_method.as_deref() == Some("notifications/initialized") {
+                            "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_owned()
+                        } else {
+                            tokio::time::sleep(response_delay).await;
+                            if streaming {
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n{body}"
+                                )
+                            } else {
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            }
+                        };
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        if streaming {
+                            let _ = socket.flush().await;
+                            tokio::time::sleep(Duration::from_secs(30)).await;
                         }
-                    }
-                    tokio::time::sleep(response_delay).await;
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
+                    });
                 }
             }
         });
@@ -712,23 +987,11 @@ mod tests {
 
     #[tokio::test]
     async fn returns_an_sse_result_without_waiting_for_eof() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            let _ = socket.read(&mut request).await;
-            let event = concat!(
-                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{",
-                "\"content\":[{\"type\":\"text\",\"text\":\"streamed\"}]}}\n\n",
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n{event}"
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        });
+        let event = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{",
+            "\"content\":[{\"type\":\"text\",\"text\":\"streamed\"}]}}\n\n",
+        );
+        let (endpoint, _) = mock_server("200 OK", event).await;
         let tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
 
         let result = tokio::time::timeout(
@@ -799,9 +1062,20 @@ mod tests {
 
         assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].body.as_ref().unwrap()["method"], "initialize");
+        assert!(requests[0].session_id.is_none());
         assert_eq!(
-            requests[0]["params"],
+            requests[1].body.as_ref().unwrap()["method"],
+            "notifications/initialized"
+        );
+        assert_eq!(requests[1].session_id.as_deref(), Some("test-session"));
+        assert_eq!(
+            requests[1].protocol_version.as_deref(),
+            Some(MCP_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            requests[2].body.as_ref().unwrap()["params"],
             json!({
                 "name": "web_search_exa",
                 "arguments": {
@@ -810,6 +1084,9 @@ mod tests {
                 },
             })
         );
+        assert_eq!(requests[2].session_id.as_deref(), Some("test-session"));
+        assert_eq!(requests[3].method, "DELETE");
+        assert_eq!(requests[3].session_id.as_deref(), Some("test-session"));
     }
 
     #[tokio::test]
@@ -827,6 +1104,69 @@ mod tests {
         assert_eq!(first.result["cache"]["hit"], false);
         assert_eq!(second.result["cache"]["hit"], true);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_and_coalescing_are_scoped_to_the_calling_thread() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"scoped result"}]}}"#;
+        let (endpoint, calls) = mock_server("200 OK", body).await;
+        let tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
+        let first_ctx = ToolCtx {
+            thread_id: "thread-a".into(),
+            ..Default::default()
+        };
+        let second_ctx = ToolCtx {
+            thread_id: "thread-b".into(),
+            ..Default::default()
+        };
+        let args = json!({"query": "same private query"});
+
+        let first = tool.run(&first_ctx, &args).await;
+        let second = tool.run(&second_ctx, &args).await;
+        let repeated = tool.run(&first_ctx, &args).await;
+
+        assert_eq!(first.result["cache"]["hit"], false);
+        assert_eq!(second.result["cache"]["hit"], false);
+        assert_eq!(repeated.result["cache"]["hit"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_orders_actual_provider_dispatches() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ordered"}]}}"#;
+        let (endpoint, _, requests) =
+            capturing_mock_server_with_delay("200 OK", body, Duration::ZERO).await;
+        let interval = Duration::from_millis(40);
+        let tool = Arc::new(WebSearch::new(
+            vec![SearchProvider::parallel(endpoint)],
+            interval,
+        ));
+        let first_ctx = ToolCtx {
+            thread_id: "thread-a".into(),
+            ..Default::default()
+        };
+        let second_ctx = ToolCtx {
+            thread_id: "thread-b".into(),
+            ..Default::default()
+        };
+        let first_args = json!({"query": "first query"});
+        let second_args = json!({"query": "second query"});
+
+        let (first, second) = tokio::join!(
+            tool.run(&first_ctx, &first_args),
+            tool.run(&second_ctx, &second_args),
+        );
+
+        assert_eq!(first.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(second.status, trouve_protocol::ToolStatus::Ok);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        assert!(
+            requests
+                .windows(2)
+                .all(|pair| { pair[1].at.duration_since(pair[0].at) >= Duration::from_millis(30) })
+        );
     }
 
     #[tokio::test]
@@ -1047,14 +1387,22 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_queries_without_network_access() {
-        let tool = WebSearch::new(Vec::new(), Duration::ZERO);
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
+        let (endpoint, calls) = mock_server("200 OK", body).await;
+        let tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
         for args in [
             json!({}),
             json!({"query": "  "}),
             json!({"query": "ok", "max_results": 11}),
+            json!({"query": "ok", "max_results": -1}),
+            json!({"query": "ok", "max_results": 1.5}),
+            json!({"query": "ok", "max_results": "8"}),
+            json!({"query": "ok", "max_results": null}),
         ] {
             let result = tool.run(&ToolCtx::default(), &args).await;
             assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
         }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
