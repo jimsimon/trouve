@@ -19,6 +19,8 @@ const MAX_SEARCH_ERROR_CHARS: usize = 8 * 1024;
 const MAX_PROVIDER_ERROR_CHARS: usize = 3 * 1024;
 const MAX_QUERY_CHARS: usize = 2_000;
 const MIN_PROVIDER_INTERVAL: Duration = Duration::from_millis(250);
+const PROVIDER_DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -37,6 +39,69 @@ enum SearchError {
 struct McpSession {
     id: Option<String>,
     protocol_version: String,
+}
+
+struct ProviderDispatcher {
+    gate: tokio::sync::Mutex<Option<Instant>>,
+    min_interval: Duration,
+    header_timeout: Duration,
+}
+
+impl ProviderDispatcher {
+    fn new(min_interval: Duration, header_timeout: Duration) -> Self {
+        Self {
+            gate: tokio::sync::Mutex::new(None),
+            min_interval,
+            header_timeout,
+        }
+    }
+
+    /// Dispatch one quota-consuming provider operation in provider-visible
+    /// order. Successful response headers are the acknowledgement boundary;
+    /// a silent endpoint is cancelled at the short header deadline.
+    async fn dispatch(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, SearchError> {
+        let mut last_request = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(SearchError::Cancelled),
+            guard = self.gate.lock() => guard,
+        };
+        if let Some(last_request_at) = *last_request {
+            let wait = self.min_interval.saturating_sub(last_request_at.elapsed());
+            if !wait.is_zero() {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(SearchError::Cancelled),
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(SearchError::Cancelled);
+        }
+
+        let attempted_at = Instant::now();
+        let response = tokio::select! {
+            biased;
+            response = tokio::time::timeout(self.header_timeout, request.send()) => {
+                match response {
+                    Ok(response) => response.map_err(|error| {
+                        SearchError::Failed(format!("request failed: {error}"))
+                    }),
+                    Err(_) => Err(SearchError::Failed(format!(
+                        "provider dispatch timed out after {:.1}s",
+                        self.header_timeout.as_secs_f64()
+                    ))),
+                }
+            },
+            _ = cancel.cancelled() => Err(SearchError::Cancelled),
+        };
+        *last_request = Some(attempted_at);
+        response
+    }
 }
 
 /// Incrementally assembles complete SSE events from arbitrary byte chunks.
@@ -221,8 +286,7 @@ pub struct WebSearch {
     providers: Vec<SearchProvider>,
     cache: Mutex<SearchCache>,
     query_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-    provider_gate: tokio::sync::Mutex<Option<Instant>>,
-    min_provider_interval: Duration,
+    dispatcher: ProviderDispatcher,
 }
 
 impl Default for WebSearch {
@@ -239,6 +303,14 @@ impl Default for WebSearch {
 
 impl WebSearch {
     fn new(providers: Vec<SearchProvider>, min_provider_interval: Duration) -> Self {
+        Self::new_with_dispatch_timeout(providers, min_provider_interval, PROVIDER_DISPATCH_TIMEOUT)
+    }
+
+    fn new_with_dispatch_timeout(
+        providers: Vec<SearchProvider>,
+        min_provider_interval: Duration,
+        dispatch_timeout: Duration,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(SEARCH_TIMEOUT)
             .user_agent(concat!("trouve-agent/", env!("CARGO_PKG_VERSION")))
@@ -252,8 +324,7 @@ impl WebSearch {
             providers,
             cache: Mutex::new(SearchCache::default()),
             query_locks: Mutex::new(HashMap::new()),
-            provider_gate: tokio::sync::Mutex::new(None),
-            min_provider_interval,
+            dispatcher: ProviderDispatcher::new(min_provider_interval, dispatch_timeout),
         }
     }
 
@@ -291,61 +362,13 @@ impl WebSearch {
         &self,
         cancel: &tokio_util::sync::CancellationToken,
         request: reqwest::RequestBuilder,
-        rate_limited: bool,
     ) -> Result<reqwest::Response, SearchError> {
-        if !rate_limited {
-            return tokio::select! {
-                biased;
-                _ = cancel.cancelled() => Err(SearchError::Cancelled),
-                response = request.send() => response
-                    .map_err(|error| SearchError::Failed(format!("request failed: {error}"))),
-            };
-        }
-
-        let mut last_request = tokio::select! {
+        tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(SearchError::Cancelled),
-            guard = self.provider_gate.lock() => guard,
-        };
-        if let Some(last_request_at) = *last_request {
-            let wait = self
-                .min_provider_interval
-                .saturating_sub(last_request_at.elapsed());
-            if !wait.is_zero() {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(SearchError::Cancelled),
-                    _ = tokio::time::sleep(wait) => {}
-                }
-            }
+            _ = cancel.cancelled() => Err(SearchError::Cancelled),
+            response = request.send() => response
+                .map_err(|error| SearchError::Failed(format!("request failed: {error}"))),
         }
-        if cancel.is_cancelled() {
-            return Err(SearchError::Cancelled);
-        }
-
-        // Poll send once while holding the gate. That begins this request in
-        // reservation order without retaining the global gate while a remote
-        // endpoint stalls before its response headers.
-        let attempted_at = Instant::now();
-        let mut send = Box::pin(request.send());
-        let first_poll = std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(std::future::Future::poll(send.as_mut(), cx))
-        })
-        .await;
-        *last_request = Some(attempted_at);
-        drop(last_request);
-
-        let response = match first_poll {
-            std::task::Poll::Ready(response) => response,
-            std::task::Poll::Pending => {
-                tokio::select! {
-                    biased;
-                    response = send => response,
-                    _ = cancel.cancelled() => return Err(SearchError::Cancelled),
-                }
-            }
-        };
-        response.map_err(|error| SearchError::Failed(format!("request failed: {error}")))
     }
 
     fn provider_request(
@@ -393,11 +416,7 @@ impl WebSearch {
             },
         });
         let response = self
-            .send_provider_request(
-                &ctx.cancel,
-                self.provider_request(provider, &body, None),
-                true,
-            )
+            .send_provider_request(&ctx.cancel, self.provider_request(provider, &body, None))
             .await?;
         let session_id = response
             .headers()
@@ -415,14 +434,14 @@ impl WebSearch {
         let value = match self.read_mcp_response(ctx, response, 0).await {
             Ok(value) => value,
             Err(error) => {
-                self.close_provider_session(provider, &session);
+                self.close_provider_session(provider, &session).await;
                 return Err(error);
             }
         };
         if value.get("error").is_some() {
             let error = extract_mcp_value(&value)
                 .expect_err("an MCP error response cannot contain a successful tool result");
-            self.close_provider_session(provider, &session);
+            self.close_provider_session(provider, &session).await;
             return Err(SearchError::Failed(bounded_error(
                 &error,
                 MAX_PROVIDER_ERROR_CHARS,
@@ -433,7 +452,7 @@ impl WebSearch {
             .and_then(Value::as_str)
             .filter(|version| !version.is_empty())
         else {
-            self.close_provider_session(provider, &session);
+            self.close_provider_session(provider, &session).await;
             return Err(SearchError::Failed(
                 "provider initialization omitted protocol version".into(),
             ));
@@ -448,7 +467,6 @@ impl WebSearch {
             .send_provider_request(
                 &ctx.cancel,
                 self.provider_request(provider, &initialized, Some(&session)),
-                false,
             )
             .await;
         match response {
@@ -458,33 +476,31 @@ impl WebSearch {
                     "provider rejected MCP initialization with HTTP {}",
                     response.status()
                 ));
-                self.close_provider_session(provider, &session);
+                self.close_provider_session(provider, &session).await;
                 Err(error)
             }
             Err(error) => {
-                self.close_provider_session(provider, &session);
+                self.close_provider_session(provider, &session).await;
                 Err(error)
             }
         }
     }
 
-    fn close_provider_session(&self, provider: &SearchProvider, session: &McpSession) {
+    async fn close_provider_session(&self, provider: &SearchProvider, session: &McpSession) {
         let Some(id) = &session.id else {
             return;
         };
-        let client = self.client.clone();
-        let endpoint = provider.endpoint.clone();
-        let protocol_version = session.protocol_version.clone();
-        let id = id.clone();
-        tokio::spawn(async move {
-            let _ = client
-                .delete(endpoint)
-                .timeout(Duration::from_secs(2))
-                .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
-                .header(MCP_SESSION_ID_HEADER, id)
-                .send()
-                .await;
-        });
+        // Await the close request so it cannot be silently aborted during
+        // executor shutdown, but keep cancellation and provider failover
+        // bounded independently from normal search I/O.
+        let _ = self
+            .client
+            .delete(&provider.endpoint)
+            .timeout(SESSION_CLEANUP_TIMEOUT)
+            .header(MCP_PROTOCOL_VERSION_HEADER, &session.protocol_version)
+            .header(MCP_SESSION_ID_HEADER, id)
+            .send()
+            .await;
     }
 
     async fn call_provider(
@@ -505,10 +521,10 @@ impl WebSearch {
             }
         });
         let result = match self
-            .send_provider_request(
+            .dispatcher
+            .dispatch(
                 &ctx.cancel,
                 self.provider_request(provider, &body, Some(&session)),
-                false,
             )
             .await
         {
@@ -522,7 +538,7 @@ impl WebSearch {
                 }),
             Err(error) => Err(error),
         };
-        self.close_provider_session(provider, &session);
+        self.close_provider_session(provider, &session).await;
         result
     }
 
@@ -1282,7 +1298,7 @@ mod tests {
         assert_eq!(first.status, trouve_protocol::ToolStatus::Ok);
         assert_eq!(second.status, trouve_protocol::ToolStatus::Ok);
         let requests = requests.lock().unwrap();
-        let initialization_times: Vec<Instant> = requests
+        let dispatch_times: Vec<Instant> = requests
             .iter()
             .filter(|request| {
                 request
@@ -1290,26 +1306,24 @@ mod tests {
                     .as_ref()
                     .and_then(|body| body.get("method"))
                     .and_then(Value::as_str)
-                    == Some("initialize")
+                    == Some("tools/call")
             })
             .map(|request| request.at)
             .collect();
-        assert_eq!(initialization_times.len(), 2);
-        assert!(
-            initialization_times[1].duration_since(initialization_times[0])
-                >= Duration::from_millis(30)
-        );
+        assert_eq!(dispatch_times.len(), 2);
+        assert!(dispatch_times[1].duration_since(dispatch_times[0]) >= Duration::from_millis(30));
     }
 
     #[tokio::test]
     async fn stalled_response_headers_do_not_block_later_dispatches() {
         let body =
             r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"late"}]}}"#;
-        let (endpoint, calls, requests) =
+        let (endpoint, _, requests) =
             capturing_mock_server_with_delay("200 OK", body, Duration::from_secs(30)).await;
-        let tool = Arc::new(WebSearch::new(
+        let tool = Arc::new(WebSearch::new_with_dispatch_timeout(
             vec![SearchProvider::parallel(endpoint)],
             Duration::from_millis(40),
+            Duration::from_millis(100),
         ));
         let first_ctx = ToolCtx {
             thread_id: "thread-a".into(),
@@ -1360,7 +1374,23 @@ mod tests {
             }
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while calls.load(Ordering::SeqCst) < 2 {
+            loop {
+                let tool_calls = requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| {
+                        request
+                            .body
+                            .as_ref()
+                            .and_then(|body| body.get("method"))
+                            .and_then(Value::as_str)
+                            == Some("tools/call")
+                    })
+                    .count();
+                if tool_calls >= 2 {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
