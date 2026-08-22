@@ -194,6 +194,23 @@ struct SessionCleanupJob {
     endpoint: String,
     session_id: String,
     protocol_version: String,
+    deadline: Instant,
+}
+
+impl SessionCleanupJob {
+    fn new(
+        endpoint: String,
+        session_id: String,
+        protocol_version: String,
+        overall_timeout: Duration,
+    ) -> Self {
+        Self {
+            endpoint,
+            session_id,
+            protocol_version,
+            deadline: Instant::now() + overall_timeout,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -220,10 +237,9 @@ async fn cleanup_provider_session(
     request: &SessionCleanupJob,
     policy: SessionCleanupPolicy,
 ) -> bool {
-    let started = Instant::now();
     let attempts = policy.max_attempts.max(1);
     for attempt in 0..attempts {
-        let remaining = policy.overall_timeout.saturating_sub(started.elapsed());
+        let remaining = request.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return false;
         }
@@ -234,7 +250,7 @@ async fn cleanup_provider_session(
             .header(MCP_SESSION_ID_HEADER, &request.session_id)
             .send()
             .await;
-        match result {
+        let retry_after = match result {
             Ok(response) if response.status().is_success() => return true,
             Ok(response)
                 if !response.status().is_server_error()
@@ -243,13 +259,14 @@ async fn cleanup_provider_session(
             {
                 return false;
             }
-            Ok(_) | Err(_) => {}
-        }
+            Ok(response) => cleanup_retry_after(response.headers()),
+            Err(_) => None,
+        };
         if attempt + 1 == attempts {
             break;
         }
-        let delay = policy.retry_delay.saturating_mul(attempt + 1);
-        if delay >= policy.overall_timeout.saturating_sub(started.elapsed()) {
+        let delay = retry_after.unwrap_or_else(|| policy.retry_delay.saturating_mul(attempt + 1));
+        if delay >= request.deadline.saturating_duration_since(Instant::now()) {
             break;
         }
         tokio::time::sleep(delay).await;
@@ -257,11 +274,26 @@ async fn cleanup_provider_session(
     false
 }
 
+fn cleanup_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delay = retry_at.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    Some(delay.to_std().unwrap_or(Duration::ZERO))
+}
+
 struct SessionCleanupWorker {
     sender: Option<tokio::sync::mpsc::Sender<SessionCleanupJob>>,
     recovery_sender: Option<tokio::sync::mpsc::UnboundedSender<PendingInitializationJob>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
+    policy: SessionCleanupPolicy,
 }
 
 impl SessionCleanupWorker {
@@ -362,11 +394,12 @@ impl SessionCleanupWorker {
                                         pending.fetch_sub(1, Ordering::Release);
                                         return;
                                     };
-                                    permit.send(SessionCleanupJob {
-                                        endpoint: job.endpoint,
+                                    permit.send(SessionCleanupJob::new(
+                                        job.endpoint,
                                         session_id,
-                                        protocol_version: job.protocol_version,
-                                    });
+                                        job.protocol_version,
+                                        policy.overall_timeout,
+                                    ));
                                 });
                             }
                         }
@@ -380,6 +413,7 @@ impl SessionCleanupWorker {
             recovery_sender: Some(recovery_sender),
             threads: vec![cleanup_thread, recovery_thread],
             pending,
+            policy,
         }
     }
 
@@ -864,11 +898,12 @@ impl WebSearch {
         };
         self.cleanup.send(
             permit,
-            SessionCleanupJob {
-                endpoint: provider.endpoint.clone(),
+            SessionCleanupJob::new(
+                provider.endpoint.clone(),
                 session_id,
-                protocol_version: session.protocol_version,
-            },
+                session.protocol_version,
+                self.cleanup.policy.overall_timeout,
+            ),
         );
     }
 
@@ -1271,6 +1306,8 @@ mod tests {
     struct MockCleanupBehavior {
         response_delay: Duration,
         delay_only_on_first_attempt: bool,
+        first_status: Option<&'static str>,
+        retry_after: Option<&'static str>,
     }
 
     async fn capturing_mock_server_with_cleanup_behavior(
@@ -1376,7 +1413,19 @@ mod tests {
                             if !cleanup.delay_only_on_first_attempt || cleanup_call == 0 {
                                 tokio::time::sleep(cleanup.response_delay).await;
                             }
-                            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_owned()
+                            if cleanup_call == 0
+                                && let Some(status) = cleanup.first_status
+                            {
+                                let retry_after = cleanup
+                                    .retry_after
+                                    .map(|value| format!("Retry-After: {value}\r\n"))
+                                    .unwrap_or_default();
+                                format!(
+                                    "HTTP/1.1 {status}\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                                )
+                            } else {
+                                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_owned()
+                            }
                         } else if status != "200 OK" {
                             calls.fetch_add(1, Ordering::SeqCst);
                             format!(
@@ -1451,6 +1500,8 @@ mod tests {
             MockCleanupBehavior {
                 response_delay: cleanup_response_delay,
                 delay_only_on_first_attempt: false,
+                first_status: None,
+                retry_after: None,
             },
             initialization_response_delay,
             stateful_initialization,
@@ -2253,6 +2304,8 @@ mod tests {
             MockCleanupBehavior {
                 response_delay: Duration::from_millis(75),
                 delay_only_on_first_attempt: true,
+                first_status: None,
+                retry_after: None,
             },
             Duration::ZERO,
             true,
@@ -2289,6 +2342,130 @@ mod tests {
         )
         .await
         .expect("cleanup must retry and complete within its overall deadline");
+    }
+
+    #[tokio::test]
+    async fn session_cleanup_honors_retry_after_within_its_deadline() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"result"}]}}"#;
+        let (endpoint, _, requests) = capturing_mock_server_with_cleanup_behavior(
+            "200 OK",
+            body,
+            Duration::ZERO,
+            MockCleanupBehavior {
+                response_delay: Duration::ZERO,
+                delay_only_on_first_attempt: false,
+                first_status: Some("429 Too Many Requests"),
+                retry_after: Some("1"),
+            },
+            Duration::ZERO,
+            true,
+            None,
+        )
+        .await;
+        let policy = SessionCleanupPolicy {
+            attempt_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_secs(2),
+            retry_delay: Duration::from_millis(10),
+            max_attempts: 3,
+        };
+        let tool = WebSearch::new_with_cleanup_policy(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::ZERO,
+            PROVIDER_HANDOFF_TIMEOUT,
+            policy,
+        );
+
+        let result = tool
+            .run(
+                &ToolCtx::default(),
+                &json!({"query": "respect provider cleanup throttling"}),
+            )
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.method == "DELETE")
+                    .count()
+                    >= 2
+                    && tool.cleanup.pending.load(Ordering::Acquire) == 0
+            }),
+        )
+        .await
+        .expect("cleanup must retry after the provider-requested delay");
+        let delete_times = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .map(|request| request.at)
+            .collect::<Vec<_>>();
+        assert_eq!(delete_times.len(), 2);
+        assert!(
+            delete_times[1].duration_since(delete_times[0]) >= Duration::from_millis(900),
+            "Retry-After must override the shorter local retry backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_session_cleanup_shares_the_enqueue_deadline() {
+        let (endpoint, _, requests) = capturing_mock_server_with_delays(
+            "200 OK",
+            "{}",
+            Duration::ZERO,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            false,
+            None,
+        )
+        .await;
+        let policy = SessionCleanupPolicy {
+            attempt_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_millis(100),
+            retry_delay: Duration::from_millis(1),
+            max_attempts: 1,
+        };
+        let worker = SessionCleanupWorker::with_policy(policy);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cleanup_count = SESSION_CLEANUP_CONCURRENCY * 2;
+        let mut permits = Vec::with_capacity(cleanup_count);
+        for _ in 0..cleanup_count {
+            match worker.reserve(&cancel).await {
+                Ok(permit) => permits.push(permit),
+                Err(_) => panic!("cleanup capacity must be reservable"),
+            }
+        }
+        for (index, permit) in permits.into_iter().enumerate() {
+            worker.send(
+                permit,
+                SessionCleanupJob::new(
+                    endpoint.clone(),
+                    format!("test-session-{index}"),
+                    MCP_PROTOCOL_VERSION.to_owned(),
+                    policy.overall_timeout,
+                ),
+            );
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| worker.pending.load(Ordering::Acquire) == 0),
+        )
+        .await
+        .expect("queued cleanup must expire within one enqueue-time budget");
+        let delete_count = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .count();
+        assert_eq!(delete_count, SESSION_CLEANUP_CONCURRENCY);
     }
 
     #[tokio::test]
