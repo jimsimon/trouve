@@ -3322,6 +3322,30 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
             ) \
           THEN 1 ELSE 0 END AS can_retry_final_editor";
 
+/// Shared ownership predicate for accepting review results and claiming their
+/// publication. Keeping both transitions on one predicate prevents stale
+/// workers from persisting after cancellation or same-generation replacement.
+const CURRENT_CODE_REVIEW_JOB_PREDICATE: &str = concat!(
+    "code_review_jobs.id = ?1 ",
+    "AND code_review_jobs.status = 'running' ",
+    "AND code_review_jobs.cancel_requested = 0 ",
+    "AND code_review_jobs.publication_claimed = 0 ",
+    "AND NOT EXISTS (",
+    "  SELECT 1 FROM code_review_jobs AS newer ",
+    "  WHERE newer.repository = code_review_jobs.repository ",
+    "    AND newer.pull_number = code_review_jobs.pull_number ",
+    "    AND newer.head_sha = code_review_jobs.head_sha ",
+    "    AND (",
+    "      newer.publication_generation > code_review_jobs.publication_generation ",
+    "      OR (",
+    "        newer.publication_generation = code_review_jobs.publication_generation ",
+    "        AND newer.rowid > code_review_jobs.rowid",
+    "      )",
+    "    ) ",
+    "    AND newer.status IN ('queued', 'running', 'succeeded')",
+    ")",
+);
+
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
     pub job_id: String,
@@ -10086,11 +10110,81 @@ impl Store {
         candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
         unadjudicated_candidates: &[trouve_protocol::CodeReviewUnadjudicatedCandidate],
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.save_code_review_result_with_adjudication_inner(
+            job_id,
+            summary,
+            prompt_for_agents,
+            candidate_issue_count,
+            findings,
+            finding_details,
+            themes,
+            candidate_rejections,
+            unadjudicated_candidates,
+            false,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("unguarded code-review result save was rejected"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_current_code_review_result_with_adjudication(
+        &self,
+        job_id: &str,
+        summary: &str,
+        prompt_for_agents: &str,
+        candidate_issue_count: u64,
+        findings: &[NewCodeReviewFinding],
+        finding_details: &[NewCodeReviewFindingDetails],
+        themes: &[NewCodeReviewTheme],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+        unadjudicated_candidates: &[trouve_protocol::CodeReviewUnadjudicatedCandidate],
+    ) -> Result<Option<Vec<trouve_protocol::CodeReviewFinding>>> {
+        self.save_code_review_result_with_adjudication_inner(
+            job_id,
+            summary,
+            prompt_for_agents,
+            candidate_issue_count,
+            findings,
+            finding_details,
+            themes,
+            candidate_rejections,
+            unadjudicated_candidates,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_code_review_result_with_adjudication_inner(
+        &self,
+        job_id: &str,
+        summary: &str,
+        prompt_for_agents: &str,
+        candidate_issue_count: u64,
+        findings: &[NewCodeReviewFinding],
+        finding_details: &[NewCodeReviewFindingDetails],
+        themes: &[NewCodeReviewTheme],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+        unadjudicated_candidates: &[trouve_protocol::CodeReviewUnadjudicatedCandidate],
+        require_current_job: bool,
+    ) -> Result<Option<Vec<trouve_protocol::CodeReviewFinding>>> {
         if !finding_details.is_empty() && finding_details.len() != findings.len() {
             anyhow::bail!("review finding details must align with findings");
         }
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        if require_current_job {
+            let current: bool = tx.query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM code_review_jobs
+                     WHERE {CURRENT_CODE_REVIEW_JOB_PREDICATE})"
+                ),
+                params![job_id],
+                |row| row.get(0),
+            )?;
+            if !current {
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
         let (repository, pull_number, head_sha): (String, i64, String) = tx.query_row(
             "SELECT repository, pull_number, head_sha FROM code_review_jobs WHERE id = ?1",
             params![job_id],
@@ -10335,7 +10429,7 @@ impl Store {
         )?;
         tx.commit()?;
         drop(conn);
-        self.code_review_findings(job_id)
+        Ok(Some(self.code_review_findings(job_id)?))
     }
 
     fn code_review_candidate_rejections(
@@ -12394,7 +12488,7 @@ impl Store {
     }
 
     pub fn claim_code_review_publication(&self, id: &str) -> Result<bool> {
-        Ok(self.conn.lock().unwrap().execute(
+        let sql = format!(
             "UPDATE code_review_jobs
              SET publication_claimed = 1, publication_dispatched = 0,
                  publication_order = CASE
@@ -12406,24 +12500,9 @@ impl Store {
                        AND existing.pull_number = code_review_jobs.pull_number
                    )
                  END
-             WHERE id = ?1 AND status = 'running'
-               AND cancel_requested = 0 AND publication_claimed = 0
-               AND NOT EXISTS (
-                 SELECT 1 FROM code_review_jobs AS newer
-                 WHERE newer.repository = code_review_jobs.repository
-                   AND newer.pull_number = code_review_jobs.pull_number
-                   AND newer.head_sha = code_review_jobs.head_sha
-                   AND (
-                     newer.publication_generation > code_review_jobs.publication_generation
-                     OR (
-                       newer.publication_generation = code_review_jobs.publication_generation
-                       AND newer.rowid > code_review_jobs.rowid
-                     )
-                   )
-                   AND newer.status IN ('queued', 'running', 'succeeded')
-               )",
-            params![id],
-        )? > 0)
+             WHERE {CURRENT_CODE_REVIEW_JOB_PREDICATE}"
+        );
+        Ok(self.conn.lock().unwrap().execute(&sql, params![id])? > 0)
     }
 
     /// Crosses the last durable boundary before the GitHub review POST. A
@@ -20991,6 +21070,76 @@ mod tests {
             .enqueue_code_review_job(&backoff_test_job_request())
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn current_result_save_rejects_cancelled_or_replaced_jobs_before_writing() {
+        let store = Store::open_in_memory().unwrap();
+        let cancelled = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            cancelled.id
+        );
+        store
+            .request_code_review_job_cancel(&cancelled.id)
+            .unwrap()
+            .unwrap();
+        let save_empty_result = |job_id: &str, summary: &str| {
+            store.save_current_code_review_result_with_adjudication(
+                job_id,
+                summary,
+                "prompt",
+                0,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+        };
+        assert!(
+            save_empty_result(&cancelled.id, "cancelled result")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .code_review_job(&cancelled.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .is_empty()
+        );
+
+        let mut older_request = backoff_test_job_request();
+        older_request.dedupe_key = "acme/widgets#42:older-result".into();
+        let older = store
+            .enqueue_code_review_job(&older_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            older.id
+        );
+        let mut replacement_request = backoff_test_job_request();
+        replacement_request.dedupe_key = "acme/widgets#42:replacement-result".into();
+        store
+            .enqueue_code_review_job(&replacement_request)
+            .unwrap()
+            .unwrap();
+        assert!(
+            save_empty_result(&older.id, "replaced result")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .code_review_job(&older.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .is_empty()
+        );
     }
 
     #[test]
