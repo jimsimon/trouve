@@ -588,6 +588,47 @@ fn opened_executable_identity(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxExecuteAccess {
+    Allowed,
+    Denied,
+    Fallback,
+}
+
+#[cfg(target_os = "linux")]
+fn classify_linux_execute_access(
+    result: libc::c_long,
+    error: Option<libc::c_int>,
+) -> LinuxExecuteAccess {
+    if result == 0 {
+        LinuxExecuteAccess::Allowed
+    } else if matches!(error, Some(libc::ENOSYS | libc::EPERM)) {
+        LinuxExecuteAccess::Fallback
+    } else {
+        LinuxExecuteAccess::Denied
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_opened_executable_access_fallback(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    // access(2) uses real credentials. It is equivalent to an effective-user
+    // check only when the process is not running setuid/setgid; otherwise a
+    // conservative replacement is safer than accepting the wrong identity.
+    if unsafe { libc::getuid() != libc::geteuid() || libc::getgid() != libc::getegid() } {
+        return false;
+    }
+    let Ok(path) = std::ffi::CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())) else {
+        return false;
+    };
+    // SAFETY: `path` is NUL-terminated and `access` only reads it. Resolving
+    // the procfs descriptor link keeps the check bound to the open file while
+    // the kernel evaluates groups, ACLs, mount flags, and privilege rules.
+    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+}
+
+#[cfg(target_os = "linux")]
 fn opened_executable_is_executable(file: &std::fs::File) -> bool {
     use std::os::fd::AsRawFd as _;
 
@@ -597,14 +638,24 @@ fn opened_executable_is_executable(file: &std::fs::File) -> bool {
     const AT_EACCESS: libc::c_int = 0x200;
     // SAFETY: `file` owns a valid descriptor and the pathname is a static,
     // NUL-terminated empty C string as required with AT_EMPTY_PATH.
-    unsafe {
+    let result = unsafe {
         libc::syscall(
             libc::SYS_faccessat2,
             file.as_raw_fd(),
             c"".as_ptr(),
             libc::X_OK,
             libc::AT_EMPTY_PATH | AT_EACCESS,
-        ) == 0
+        )
+    };
+    match classify_linux_execute_access(
+        result,
+        (result != 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten(),
+    ) {
+        LinuxExecuteAccess::Allowed => true,
+        LinuxExecuteAccess::Denied => false,
+        LinuxExecuteAccess::Fallback => linux_opened_executable_access_fallback(file),
     }
 }
 
@@ -1179,6 +1230,43 @@ mod tests {
     #[test]
     fn development_builds_disable_automatic_updates() {
         assert!(!auto_update_enabled());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_execute_access_falls_back_only_when_the_syscall_is_unavailable() {
+        assert_eq!(
+            classify_linux_execute_access(0, None),
+            LinuxExecuteAccess::Allowed
+        );
+        assert_eq!(
+            classify_linux_execute_access(-1, Some(libc::ENOSYS)),
+            LinuxExecuteAccess::Fallback
+        );
+        assert_eq!(
+            classify_linux_execute_access(-1, Some(libc::EPERM)),
+            LinuxExecuteAccess::Fallback
+        );
+        assert_eq!(
+            classify_linux_execute_access(-1, Some(libc::EACCES)),
+            LinuxExecuteAccess::Denied
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_execute_access_fallback_checks_the_open_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("trouve");
+        std::fs::write(&executable, b"executable").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = std::fs::File::open(&executable).unwrap();
+        assert!(linux_opened_executable_access_fallback(&file));
+
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o401)).unwrap();
+        assert!(!linux_opened_executable_access_fallback(&file));
     }
 
     fn asset(name: &str) -> GithubAsset {
