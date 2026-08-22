@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -26,6 +27,7 @@ const MIN_PROVIDER_INTERVAL: Duration = Duration::from_millis(250);
 const PROVIDER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_CLEANUP_CONCURRENCY: usize = 8;
+const SESSION_CLEANUP_CAPACITY: usize = 64;
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -128,7 +130,6 @@ impl ProviderDispatcher {
         let mut handoff_timeout = Box::pin(tokio::time::sleep(self.handoff_timeout));
         let early_response = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(SearchError::Cancelled),
             acknowledged = &mut acknowledged_rx => {
                 if acknowledged.is_err() {
                     return Err(SearchError::Failed(
@@ -138,6 +139,7 @@ impl ProviderDispatcher {
                 None
             },
             response = &mut send => Some(response),
+            _ = cancel.cancelled() => return Err(SearchError::Cancelled),
             _ = &mut handoff_timeout => {
                 return Err(SearchError::Failed(format!(
                     "provider dispatch timed out after {:.1}s",
@@ -168,14 +170,17 @@ struct SessionCleanupRequest {
 }
 
 struct SessionCleanupWorker {
-    sender: Option<tokio::sync::mpsc::UnboundedSender<SessionCleanupRequest>>,
+    sender: Option<tokio::sync::mpsc::Sender<SessionCleanupRequest>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    pending: Arc<AtomicUsize>,
 }
 
 impl SessionCleanupWorker {
     fn new() -> Self {
         let (sender, mut receiver) =
-            tokio::sync::mpsc::unbounded_channel::<SessionCleanupRequest>();
+            tokio::sync::mpsc::channel::<SessionCleanupRequest>(SESSION_CLEANUP_CAPACITY);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = pending.clone();
         let thread = std::thread::Builder::new()
             .name("trouve-web-search-cleanup".into())
             .stack_size(256 * 1024)
@@ -190,11 +195,15 @@ impl SessionCleanupWorker {
                         .build()
                         .expect("static web search cleanup client configuration is valid");
                     let mut cleanups = tokio::task::JoinSet::new();
-                    while let Some(request) = receiver.recv().await {
+                    loop {
                         while cleanups.len() >= SESSION_CLEANUP_CONCURRENCY {
                             let _ = cleanups.join_next().await;
                         }
+                        let Some(request) = receiver.recv().await else {
+                            break;
+                        };
                         let client = client.clone();
+                        let pending = worker_pending.clone();
                         cleanups.spawn(async move {
                             let _ = client
                                 .delete(request.endpoint)
@@ -203,6 +212,7 @@ impl SessionCleanupWorker {
                                 .header(MCP_SESSION_ID_HEADER, request.session_id)
                                 .send()
                                 .await;
+                            pending.fetch_sub(1, Ordering::Release);
                         });
                     }
                     while cleanups.join_next().await.is_some() {}
@@ -212,29 +222,42 @@ impl SessionCleanupWorker {
         Self {
             sender: Some(sender),
             thread: Some(thread),
+            pending,
         }
     }
 
-    fn schedule(&self, provider: &SearchProvider, session: &McpSession) {
+    fn schedule(&self, provider: &SearchProvider, session: &McpSession) -> bool {
         let Some(session_id) = &session.id else {
-            return;
+            return true;
         };
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(SessionCleanupRequest {
-                endpoint: provider.endpoint.clone(),
-                session_id: session_id.clone(),
-                protocol_version: session.protocol_version.clone(),
-            });
+        let Some(sender) = &self.sender else {
+            return false;
+        };
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let request = SessionCleanupRequest {
+            endpoint: provider.endpoint.clone(),
+            session_id: session_id.clone(),
+            protocol_version: session.protocol_version.clone(),
+        };
+        if sender.try_send(request).is_err() {
+            self.pending.fetch_sub(1, Ordering::Release);
+            tracing::warn!(
+                provider = provider.name,
+                "web search session cleanup queue full; session will expire remotely"
+            );
+            return false;
         }
+        true
     }
 }
 
 impl Drop for SessionCleanupWorker {
     fn drop(&mut self) {
+        // Closing the bounded queue asks the independently-owned worker thread
+        // to drain. Detaching its handle keeps tool/engine destruction
+        // nonblocking while the thread survives Tokio runtime shutdown.
         drop(self.sender.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        drop(self.thread.take());
     }
 }
 
@@ -1000,6 +1023,7 @@ mod tests {
         body: impl Into<String>,
         response_delay: Duration,
         cleanup_response_delay: Duration,
+        initialization_response_delay: Duration,
         initialization_body: Option<String>,
     ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<CapturedRequest>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1099,6 +1123,7 @@ mod tests {
                             )
                         } else if rpc_method.as_deref() == Some("initialize") {
                             calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(initialization_response_delay).await;
                             let initialized = initialization_body.unwrap_or_else(|| {
                                 json!({
                                     "jsonrpc": "2.0",
@@ -1153,6 +1178,7 @@ mod tests {
             status,
             body,
             response_delay,
+            Duration::ZERO,
             Duration::ZERO,
             initialization_body,
         )
@@ -1461,6 +1487,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handed_off_request_is_rate_accounted_when_cancelled() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
+        let (endpoint, _, requests) = capturing_mock_server_with_delays(
+            "200 OK",
+            body,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(30),
+            None,
+        )
+        .await;
+        let tool = Arc::new(WebSearch::new(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::from_millis(80),
+        ));
+        let first_ctx = ToolCtx {
+            thread_id: "thread-a".into(),
+            ..Default::default()
+        };
+        let first_cancel = first_ctx.cancel.clone();
+        let first = tokio::spawn({
+            let tool = tool.clone();
+            async move {
+                tool.run(&first_ctx, &json!({"query": "first cancelled handoff"}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first_cancel.cancel();
+        assert_eq!(
+            first.await.unwrap().status,
+            trouve_protocol::ToolStatus::Error
+        );
+
+        let second_ctx = ToolCtx {
+            thread_id: "thread-b".into(),
+            ..Default::default()
+        };
+        let second_cancel = second_ctx.cancel.clone();
+        let second = tokio::spawn({
+            let tool = tool.clone();
+            async move {
+                tool.run(&second_ctx, &json!({"query": "second after cancellation"}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let observed_spacing = {
+            let observed = requests.lock().unwrap();
+            observed[1].at.duration_since(observed[0].at)
+        };
+        assert!(observed_spacing >= Duration::from_millis(70));
+        second_cancel.cancel();
+        assert_eq!(
+            second.await.unwrap().status,
+            trouve_protocol::ToolStatus::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_handoff_timeout_releases_the_dispatch_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("https://{}/mcp", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _socket = socket;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        let tool = Arc::new(WebSearch::new_with_handoff_timeout(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::ZERO,
+            Duration::from_millis(50),
+        ));
+        let first_ctx = ToolCtx {
+            thread_id: "thread-a".into(),
+            ..Default::default()
+        };
+        let second_ctx = ToolCtx {
+            thread_id: "thread-b".into(),
+            ..Default::default()
+        };
+        let first_args = json!({"query": "first TLS stall"});
+        let second_args = json!({"query": "second TLS stall"});
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                tool.run(&first_ctx, &first_args),
+                tool.run(&second_ctx, &second_args),
+            )
+        })
+        .await
+        .expect("handoff timeouts must release the dispatcher for later requests");
+        for result in [first, second] {
+            assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+            assert!(
+                result.result["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("provider dispatch timed out")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stalled_response_headers_do_not_block_later_dispatches() {
         let body =
             r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"late"}]}}"#;
@@ -1706,6 +1852,7 @@ mod tests {
             body,
             Duration::from_secs(30),
             Duration::from_secs(30),
+            Duration::ZERO,
             None,
         )
         .await;
@@ -1757,13 +1904,64 @@ mod tests {
         .await
         .expect("the lifecycle worker must dispatch cleanup");
 
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::task::spawn_blocking(move || drop(tool)),
-        )
+        let pending = tool.cleanup.pending.clone();
+        let drop_started = Instant::now();
+        drop(tool);
+        assert!(
+            drop_started.elapsed() < Duration::from_millis(100),
+            "dropping the owner must only signal its independent cleanup drain"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pending.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("dropping the tool must drain bounded cleanup")
-        .unwrap();
+        .expect("the detached lifecycle worker must finish its bounded drain");
+    }
+
+    #[tokio::test]
+    async fn cleanup_admission_is_bounded_under_a_provider_stall() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider =
+            SearchProvider::parallel(format!("http://{}/mcp", listener.local_addr().unwrap()));
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _socket = socket;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        let worker = SessionCleanupWorker::new();
+        let pending = worker.pending.clone();
+        let session = McpSession {
+            id: Some("bounded-session".into()),
+            protocol_version: MCP_PROTOCOL_VERSION.into(),
+        };
+
+        let rejected = (0..1_000)
+            .filter(|_| !worker.schedule(&provider, &session))
+            .count();
+        assert!(
+            rejected > 0,
+            "a cancellation burst must hit bounded admission"
+        );
+        assert!(
+            pending.load(Ordering::Acquire)
+                <= SESSION_CLEANUP_CAPACITY + SESSION_CLEANUP_CONCURRENCY
+        );
+
+        let drop_started = Instant::now();
+        drop(worker);
+        assert!(drop_started.elapsed() < Duration::from_millis(100));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while pending.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded cleanup must drain after its owner closes admission");
     }
 
     #[tokio::test]
