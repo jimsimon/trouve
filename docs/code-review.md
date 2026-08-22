@@ -244,13 +244,13 @@ server and consumes no GitHub requests.
 
 ### Model-provider concurrency
 
-Review jobs may prepare up to 24 reviewer tasks concurrently, and two jobs may
+Review jobs may prepare up to 32 reviewer tasks concurrently, and two jobs may
 run at once, but the shared turn scheduler applies stricter gates before any
-model request starts. By default, at most 26 turns run globally, at most 24 of
-them may be background turns, at most 18 turns use the same provider, and at
-most 16 of those may be background turns. Consequently one provider receives
-no more than 16 concurrent review requests, background work across all
-providers is capped at 24, and two global plus two per-provider slots remain
+model request starts. By default, at most 128 turns run globally, at most 96 of
+them may be background turns, at most 64 turns use the same provider, and at
+most 48 of those may be background turns. Consequently one provider receives
+no more than 48 concurrent review requests, background work across all
+providers is capped at 96, and 32 global plus 16 per-provider slots remain
 available for interactive work.
 
 These are concurrency limits, not requests-per-minute guarantees; provider

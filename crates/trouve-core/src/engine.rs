@@ -522,13 +522,13 @@ const MAX_CONCURRENT_CHILDREN: usize = 4;
 const MAX_ACTIVE_DESCENDANTS: usize = 16;
 
 const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
-const DEFAULT_TURN_CONCURRENCY: usize = 26;
+const DEFAULT_TURN_CONCURRENCY: usize = 128;
 const BACKGROUND_TURN_CONCURRENCY_ENV: &str = "TROUVE_BACKGROUND_TURN_CONCURRENCY";
-const DEFAULT_BACKGROUND_TURN_CONCURRENCY: usize = 24;
+const DEFAULT_BACKGROUND_TURN_CONCURRENCY: usize = 96;
 const PROVIDER_TURN_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_TURN_CONCURRENCY";
-const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 18;
+const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 64;
 const PROVIDER_BACKGROUND_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY";
-const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 16;
+const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 48;
 
 fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
     let id = session_id.strip_prefix("se_").unwrap_or(session_id);
@@ -16745,6 +16745,18 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_scheduler_defaults_support_high_capacity_deployments() {
+        assert_eq!(DEFAULT_TURN_CONCURRENCY, 128);
+        assert_eq!(DEFAULT_BACKGROUND_TURN_CONCURRENCY, 96);
+        assert_eq!(DEFAULT_PROVIDER_TURN_CONCURRENCY, 64);
+        assert_eq!(DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY, 48);
+        const {
+            assert!(DEFAULT_BACKGROUND_TURN_CONCURRENCY < DEFAULT_TURN_CONCURRENCY);
+            assert!(DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY < DEFAULT_PROVIDER_TURN_CONCURRENCY);
+        }
+    }
 
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
