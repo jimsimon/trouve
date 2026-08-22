@@ -283,6 +283,47 @@ pub trait Provider: Send + Sync {
     ) -> Result<EventStream, ProviderError>;
 }
 
+/// Preserve one provider's concrete model catalog and execution behavior while
+/// withholding a provider-neutral identity. Configured loopback endpoints use
+/// this wrapper so hosted `auto/<model>` selections cannot silently route to a
+/// service on the user's machine.
+pub struct ConcreteOnlyProvider {
+    inner: std::sync::Arc<dyn Provider>,
+}
+
+impl ConcreteOnlyProvider {
+    pub fn new(inner: std::sync::Arc<dyn Provider>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ConcreteOnlyProvider {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.inner.list_models().await
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.inner.models()
+    }
+
+    async fn stream_chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.inner
+            .stream_chat(model, messages, tools, options)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

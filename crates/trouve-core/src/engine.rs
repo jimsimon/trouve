@@ -18142,29 +18142,41 @@ fn build_provider(
             "provider {id} endpoint must use http or https"
         );
     }
+    let local = base_url.as_deref().is_some_and(is_loopback_base_url);
+    let apply_routing_scope = |provider: Arc<dyn Provider>| -> Arc<dyn Provider> {
+        if local {
+            Arc::new(trouve_providers::ConcreteOnlyProvider::new(provider))
+        } else {
+            provider
+        }
+    };
 
     if pc.kind == "amazon-bedrock" {
-        return Ok(Arc::new(trouve_providers::bedrock::BedrockProvider::new(
-            id,
-            values
-                .get("AWS_REGION")
-                .cloned()
-                .or_else(|| std::env::var("AWS_REGION").ok()),
-            values
-                .get("AWS_PROFILE")
-                .cloned()
-                .or_else(|| std::env::var("AWS_PROFILE").ok()),
-            catalog.clone(),
+        return Ok(apply_routing_scope(Arc::new(
+            trouve_providers::bedrock::BedrockProvider::new(
+                id,
+                values
+                    .get("AWS_REGION")
+                    .cloned()
+                    .or_else(|| std::env::var("AWS_REGION").ok()),
+                values
+                    .get("AWS_PROFILE")
+                    .cloned()
+                    .or_else(|| std::env::var("AWS_PROFILE").ok()),
+                catalog.clone(),
+            ),
         )));
     }
     if pc.kind == "google-vertex" {
         let endpoint =
             base_url.ok_or_else(|| anyhow::anyhow!("google-vertex requires an endpoint"))?;
-        return Ok(Arc::new(trouve_providers::vertex::VertexProvider::new(
-            id,
-            endpoint,
-            values.get("GOOGLE_APPLICATION_CREDENTIALS").cloned(),
-            catalog.clone(),
+        return Ok(apply_routing_scope(Arc::new(
+            trouve_providers::vertex::VertexProvider::new(
+                id,
+                endpoint,
+                values.get("GOOGLE_APPLICATION_CREDENTIALS").cloned(),
+                catalog.clone(),
+            ),
         )));
     }
     if pc.kind == "google-vertex-anthropic" {
@@ -18173,15 +18185,14 @@ fn build_provider(
         let token = Arc::new(trouve_providers::vertex::GoogleAccessToken::new(
             values.get("GOOGLE_APPLICATION_CREDENTIALS").cloned(),
         ));
-        return Ok(Arc::new(
+        return Ok(apply_routing_scope(Arc::new(
             trouve_providers::anthropic::AnthropicProvider::new(id, Some(endpoint), token)
                 .with_catalog(catalog.clone())
                 .with_catalog_provider(id)
                 .with_vertex_bearer(),
-        ));
+        )));
     }
     // Local endpoints (e.g. Ollama) don't need a key; send an empty token.
-    let local = base_url.as_deref().is_some_and(is_loopback_base_url);
     let mut oauth_bearer = false;
     let token: Arc<dyn TokenSource> = match (api_key, &pc.oauth) {
         (Some(key), _) => Arc::new(StaticToken(key)),
@@ -18217,20 +18228,22 @@ fn build_provider(
             if let Some(catalog_provider) = known_catalog_provider {
                 provider = provider.with_catalog_provider(catalog_provider);
             }
-            Ok(Arc::new(provider))
+            Ok(apply_routing_scope(Arc::new(provider)))
         }
         "azure-openai" => {
             let endpoint =
                 base_url.ok_or_else(|| anyhow::anyhow!("azure-openai requires an endpoint"))?;
             let catalog_provider = known_catalog_provider.unwrap_or_else(|| "azure".into());
-            Ok(Arc::new(trouve_providers::azure::AzureOpenAiProvider::new(
-                id,
-                endpoint,
-                token,
-                catalog.clone(),
-                catalog_provider,
-                headers,
-                query_params,
+            Ok(apply_routing_scope(Arc::new(
+                trouve_providers::azure::AzureOpenAiProvider::new(
+                    id,
+                    endpoint,
+                    token,
+                    catalog.clone(),
+                    catalog_provider,
+                    headers,
+                    query_params,
+                ),
             )))
         }
         "anthropic" => {
@@ -18247,7 +18260,7 @@ fn build_provider(
             if oauth_bearer {
                 provider = provider.with_oauth_bearer();
             }
-            Ok(Arc::new(provider))
+            Ok(apply_routing_scope(Arc::new(provider)))
         }
         other => anyhow::bail!("unknown provider kind {other:?}"),
     }
@@ -20789,6 +20802,30 @@ mod tests {
         engine.delete_queued_prompt(&deleted_prompt.id).unwrap();
         assert!(!deleted_path.exists());
         assert!(store.attachment(&deleted.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_loopback_catalog_provider_is_concrete_only() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config {
+                providers: BTreeMap::from([(
+                    "openai".into(),
+                    ProviderConfig {
+                        base_url: Some("http://127.0.0.1:9/v1".into()),
+                        ..Default::default()
+                    },
+                )]),
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let models = engine.list_models().await;
+        assert!(models.iter().any(|model| model.id.starts_with("openai/")));
+        assert!(models.iter().all(|model| !model.id.starts_with("auto/")));
     }
 
     #[tokio::test]
