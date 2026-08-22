@@ -15,7 +15,8 @@ test("review data and CLI status do not rely on manual refresh controls", () => 
 test("persona retry labels describe the actual terminal state", () => {
   assert.ok(
     source.includes(
-      'aria-label={`Retry full review after ${group.name} ${group.status}`}',
+      '`Retry full review after ${group.name} ${group.status}`',
     ),
   );
+  assert.match(source, /group\.persona \? "Retry all" : "Retry"/u);
 });
