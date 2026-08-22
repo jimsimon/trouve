@@ -2585,7 +2585,26 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
     const target = this.#browserVideoTarget(event.detail);
     if (target === undefined) return;
-    globalThis.open(target.href, "_blank", "noopener,noreferrer");
+    // `noopener` makes successful `window.open` calls return null in some
+    // browsers, which is indistinguishable from popup blocking. Open a blank
+    // same-origin context first, sever its opener, then navigate it.
+    const opened = globalThis.open("about:blank", "_blank");
+    if (opened === null) {
+      if (target.revoke) URL.revokeObjectURL(target.href);
+      this.#shellNotice = "The browser blocked video playback. Allow pop-ups for trouve and try again.";
+      this.requestUpdate();
+      return;
+    }
+    try {
+      opened.opener = null;
+      opened.location.replace(target.href);
+    } catch {
+      opened.close();
+      if (target.revoke) URL.revokeObjectURL(target.href);
+      this.#shellNotice = "The video player could not be opened. Try again or download the attachment.";
+      this.requestUpdate();
+      return;
+    }
     if (target.revoke) {
       globalThis.setTimeout(() => URL.revokeObjectURL(target.href), 60_000);
     }

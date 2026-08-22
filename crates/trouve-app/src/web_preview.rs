@@ -81,9 +81,16 @@ struct VideoPlaybackLease {
 }
 
 #[derive(Debug)]
+struct VideoMaterializationError {
+    error: std::io::Error,
+    cleanup_path: PathBuf,
+}
+
+#[derive(Debug)]
 struct VideoPlaybackCache {
     directory: tempfile::TempDir,
     entries: Vec<VideoPlaybackCacheEntry>,
+    pending_cleanup: Vec<PathBuf>,
     next_sequence: u64,
     max_files: usize,
     max_bytes: usize,
@@ -103,6 +110,7 @@ impl VideoPlaybackCache {
         Ok(Self {
             directory: tempfile::Builder::new().prefix("trouve-video-").tempdir()?,
             entries: Vec::new(),
+            pending_cleanup: Vec::new(),
             next_sequence: 0,
             max_files,
             max_bytes,
@@ -149,15 +157,33 @@ impl VideoPlaybackCache {
     fn prepare_with_cleanup<R>(
         &mut self,
         attachment: &NativeAttachment,
-        mut remove: R,
+        remove: R,
     ) -> Result<VideoPlaybackLease, VideoAttachmentOpenError>
     where
         R: FnMut(&std::path::Path) -> bool,
+    {
+        self.prepare_with_storage(attachment, remove, materialize_temporary_video)
+    }
+
+    fn prepare_with_storage<R, M>(
+        &mut self,
+        attachment: &NativeAttachment,
+        mut remove: R,
+        mut materialize: M,
+    ) -> Result<VideoPlaybackLease, VideoAttachmentOpenError>
+    where
+        R: FnMut(&std::path::Path) -> bool,
+        M: FnMut(
+            &std::path::Path,
+            &std::path::Path,
+            &[u8],
+        ) -> Result<SystemTime, VideoMaterializationError>,
     {
         let extension = attachment.video_extension().ok_or_else(|| {
             VideoAttachmentOpenError::Failed("unsupported video attachment type".to_string())
         })?;
         let identity = video_attachment_identity(extension, attachment.bytes());
+        self.pending_cleanup.retain(|path| !remove(path));
         self.entries.retain(|entry| {
             entry.active_leases > 0 || retained_video_is_usable(entry) || !remove(&entry.path)
         });
@@ -182,6 +208,14 @@ impl VideoPlaybackCache {
             });
         }
 
+        // Do not accumulate more untracked disk usage while a prior partial
+        // materialization still cannot be removed.
+        if !self.pending_cleanup.is_empty() {
+            return Err(VideoAttachmentOpenError::Failed(
+                "temporary video cleanup is still pending".to_string(),
+            ));
+        }
+
         let retained_bytes = self
             .entries
             .iter()
@@ -204,13 +238,19 @@ impl VideoPlaybackCache {
             .directory
             .path()
             .join(format!("{sequence}.{extension}"));
-        std::fs::write(&path, attachment.bytes())
-            .map_err(|error| VideoAttachmentOpenError::Failed(error.to_string()))?;
-        let modified = match std::fs::metadata(&path).and_then(|metadata| metadata.modified()) {
+        let staging_path = self
+            .directory
+            .path()
+            .join(format!(".{sequence}.{extension}.part"));
+        let modified = match materialize(&staging_path, &path, attachment.bytes()) {
             Ok(modified) => modified,
-            Err(error) => {
-                let _ = remove_temporary_video(&path);
-                return Err(VideoAttachmentOpenError::Failed(error.to_string()));
+            Err(failure) => {
+                if !remove(&failure.cleanup_path)
+                    && !self.pending_cleanup.contains(&failure.cleanup_path)
+                {
+                    self.pending_cleanup.push(failure.cleanup_path);
+                }
+                return Err(VideoAttachmentOpenError::Failed(failure.error.to_string()));
             }
         };
         self.entries.push(VideoPlaybackCacheEntry {
@@ -265,24 +305,105 @@ impl VideoPlaybackCache {
     }
 }
 
+struct VideoPlaybackLeaseGuard {
+    cache: Arc<Mutex<VideoPlaybackCache>>,
+    lease: Option<VideoPlaybackLease>,
+}
+
+impl VideoPlaybackLeaseGuard {
+    fn new(cache: Arc<Mutex<VideoPlaybackCache>>, lease: VideoPlaybackLease) -> Self {
+        Self {
+            cache,
+            lease: Some(lease),
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.lease.as_ref().expect("unreconciled lease").path
+    }
+
+    fn complete(
+        mut self,
+        result: Result<(), VideoAttachmentOpenError>,
+    ) -> Result<(), VideoAttachmentOpenError> {
+        let cache = Arc::clone(&self.cache);
+        let mut cache = cache.lock().map_err(|_| {
+            VideoAttachmentOpenError::Failed("video playback cache is unavailable".to_string())
+        })?;
+        let lease = self.lease.take().expect("unreconciled lease");
+        cache.complete(lease, result)
+    }
+}
+
+impl Drop for VideoPlaybackLeaseGuard {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = cache.complete(
+            lease,
+            Err(VideoAttachmentOpenError::Failed(
+                "video playback request was cancelled".to_string(),
+            )),
+        );
+    }
+}
+
 async fn open_video_attachment(
     cache: Arc<Mutex<VideoPlaybackCache>>,
     attachment: NativeAttachment,
 ) -> Result<(), VideoAttachmentOpenError> {
+    open_video_attachment_with(cache, attachment, |path| async move {
+        opener::open_confirmed(path).await
+    })
+    .await
+}
+
+async fn open_video_attachment_with<F, Fut>(
+    cache: Arc<Mutex<VideoPlaybackCache>>,
+    attachment: NativeAttachment,
+    open: F,
+) -> Result<(), VideoAttachmentOpenError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
     let lease = {
         let mut cache = cache.lock().map_err(|_| {
             VideoAttachmentOpenError::Failed("video playback cache is unavailable".to_string())
         })?;
         cache.prepare(&attachment)?
     };
-
-    let result = opener::open_confirmed(&lease.path)
+    let lease = VideoPlaybackLeaseGuard::new(cache, lease);
+    let result = open(lease.path().to_owned())
         .await
         .map_err(VideoAttachmentOpenError::Failed);
-    let mut cache = cache.lock().map_err(|_| {
-        VideoAttachmentOpenError::Failed("video playback cache is unavailable".to_string())
+    lease.complete(result)
+}
+
+fn materialize_temporary_video(
+    staging_path: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<SystemTime, VideoMaterializationError> {
+    std::fs::write(staging_path, bytes).map_err(|error| VideoMaterializationError {
+        error,
+        cleanup_path: staging_path.to_owned(),
     })?;
-    cache.complete(lease, result)
+    std::fs::rename(staging_path, path).map_err(|error| VideoMaterializationError {
+        error,
+        cleanup_path: staging_path.to_owned(),
+    })?;
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| VideoMaterializationError {
+            error,
+            cleanup_path: path.to_owned(),
+        })
 }
 
 fn retained_video_is_usable(entry: &VideoPlaybackCacheEntry) -> bool {
@@ -1013,6 +1134,106 @@ mod close_confirmation_tests {
             std::fs::read_dir(cache.directory.path()).unwrap().count(),
             0
         );
+    }
+
+    #[test]
+    fn video_playback_cache_retries_partial_materialization_cleanup() {
+        for fail_after_final_name in [false, true] {
+            let mut cache =
+                VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+            let attachment = video_attachment("demo.mp4", b"video");
+            let result = cache.prepare_with_storage(
+                &attachment,
+                |_| false,
+                |staging_path, path, _| {
+                    let cleanup_path = if fail_after_final_name {
+                        std::fs::write(path, b"partial metadata result").unwrap();
+                        path
+                    } else {
+                        std::fs::write(staging_path, b"partial write").unwrap();
+                        staging_path
+                    };
+                    Err(VideoMaterializationError {
+                        error: std::io::Error::other("injected materialization failure"),
+                        cleanup_path: cleanup_path.to_owned(),
+                    })
+                },
+            );
+
+            assert_eq!(
+                result.unwrap_err(),
+                VideoAttachmentOpenError::Failed("injected materialization failure".into())
+            );
+            assert_eq!(cache.pending_cleanup.len(), 1);
+            assert_eq!(
+                std::fs::read_dir(cache.directory.path()).unwrap().count(),
+                1
+            );
+            assert_eq!(
+                cache
+                    .prepare_with_storage(
+                        &attachment,
+                        |_| false,
+                        |_, _, _| panic!("materialization must wait for cleanup"),
+                    )
+                    .unwrap_err(),
+                VideoAttachmentOpenError::Failed("temporary video cleanup is still pending".into(),)
+            );
+            assert_eq!(
+                std::fs::read_dir(cache.directory.path()).unwrap().count(),
+                1
+            );
+
+            let lease = cache.prepare(&attachment).unwrap();
+            cache.complete(lease, Ok(())).unwrap();
+            assert!(cache.pending_cleanup.is_empty());
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(
+                std::fs::read_dir(cache.directory.path()).unwrap().count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_video_playback_reconciles_its_cache_lease() {
+        let cache = Arc::new(Mutex::new(
+            VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap(),
+        ));
+        let attachment = video_attachment("cancelled.mp4", b"cancelled");
+        let (started, started_rx) = oneshot::channel();
+        let task_cache = Arc::clone(&cache);
+        let task = tokio::spawn(async move {
+            open_video_attachment_with(task_cache, attachment, move |_| async move {
+                let _ = started.send(());
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        {
+            let cache = cache.lock().unwrap();
+            assert!(cache.entries.is_empty());
+            assert_eq!(
+                std::fs::read_dir(cache.directory.path()).unwrap().count(),
+                0
+            );
+        }
+
+        open_video_attachment_with(
+            Arc::clone(&cache),
+            video_attachment("replacement.mp4", b"replacement"),
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].active_leases, 0);
+        assert!(cache.entries[0].launched);
     }
 
     #[test]

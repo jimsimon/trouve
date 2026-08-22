@@ -1816,9 +1816,21 @@ test("video attachments render thumbnails and open the browser player", async ({
       value: opened,
       configurable: true,
     });
-    globalThis.open = ((url?: string | URL) => {
-      opened.push(String(url));
-      return null;
+    Object.defineProperty(globalThis, "__trouveBlockVideoWindows", {
+      value: false,
+      writable: true,
+      configurable: true,
+    });
+    globalThis.open = (() => {
+      if ((globalThis as typeof globalThis & { __trouveBlockVideoWindows: boolean })
+        .__trouveBlockVideoWindows) return null;
+      return {
+        opener: globalThis,
+        location: {
+          replace: (url: string | URL) => opened.push(String(url)),
+        },
+        close: () => undefined,
+      } as unknown as Window;
     }) as typeof globalThis.open;
   });
   await page.goto("/");
@@ -1862,6 +1874,17 @@ test("video attachments render thumbnails and open the browser player", async ({
     () => (globalThis as typeof globalThis & { __trouveOpenedVideos: string[] })
       .__trouveOpenedVideos,
   )).toEqual(["http://127.0.0.1:4173/v1/attachments/att_video_1"]);
+
+  await page.evaluate(() => {
+    (globalThis as typeof globalThis & { __trouveBlockVideoWindows: boolean })
+      .__trouveBlockVideoWindows = true;
+  });
+  await preview.getByRole("button", {
+    name: "Open video in external player: demo.mp4",
+  }).click();
+  await expect(page.getByRole("status").filter({
+    hasText: "The browser blocked video playback. Allow pop-ups for trouve and try again.",
+  })).toBeVisible();
 });
 
 test("unsubmitted composer drafts persist per thread across navigation and reload", async ({
