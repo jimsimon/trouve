@@ -50,6 +50,8 @@ struct BuiltIndex {
 struct RepoEntry {
     last_used: Mutex<Instant>,
     built: RwLock<Option<BuiltIndex>>,
+    #[cfg(test)]
+    retained_heap_override: Mutex<Option<(usize, usize)>>,
 }
 
 /// Lock, ignoring poisoning: a panicked call must not wedge every later
@@ -139,6 +141,8 @@ impl IndexCache {
         let entry = Arc::new(RepoEntry {
             last_used: Mutex::new(Instant::now()),
             built: RwLock::new(None),
+            #[cfg(test)]
+            retained_heap_override: Mutex::new(None),
         });
         entries.insert(key.clone(), Arc::clone(&entry));
         Ok((key, entry))
@@ -237,12 +241,17 @@ impl IndexCache {
 }
 
 fn retained_heap_bytes(entries: &HashMap<String, Arc<RepoEntry>>) -> usize {
-    let mut unique = HashMap::<*const TrouveIndex, usize>::new();
+    let mut unique = HashMap::<usize, usize>::new();
     for entry in entries.values() {
         if let Some(built) = read_unpoisoned(&entry.built).as_ref() {
             unique
-                .entry(Arc::as_ptr(&built.index))
+                .entry(Arc::as_ptr(&built.index) as usize)
                 .or_insert_with(|| built.index.estimated_heap_bytes());
+        } else {
+            #[cfg(test)]
+            if let Some((identity, heap_bytes)) = *lock_unpoisoned(&entry.retained_heap_override) {
+                unique.entry(identity).or_insert(heap_bytes);
+            }
         }
     }
     unique.values().sum()
@@ -553,14 +562,15 @@ mod tests {
 
     #[test]
     fn concurrent_entries_trim_after_the_last_active_call() {
+        const RETAINED_BYTES: usize = 128;
         let cache = Arc::new(IndexCache {
             content: vec![ContentType::Code],
             entries: Mutex::new(HashMap::new()),
             shared_indexes: Mutex::new(HashMap::new()),
-            max_heap_bytes: 0,
+            max_heap_bytes: RETAINED_BYTES,
         });
         let worker_count = CACHE_MAX_SIZE + 4;
-        let barrier = Arc::new(std::sync::Barrier::new(worker_count));
+        let barrier = Arc::new(std::sync::Barrier::new(worker_count + 1));
         let workers = (0..worker_count)
             .map(|index| {
                 let cache = Arc::clone(&cache);
@@ -569,6 +579,10 @@ mod tests {
                     let (_, entry) = cache
                         .entry(&format!("/definitely-missing/concurrent-repo-{index}"))
                         .unwrap();
+                    let identity = if index < 2 { 1 } else { index };
+                    *lock_unpoisoned(&entry.retained_heap_override) =
+                        Some((identity, RETAINED_BYTES));
+                    barrier.wait();
                     barrier.wait();
                     drop(entry);
                     cache.trim();
@@ -576,11 +590,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        barrier.wait();
+        assert_eq!(
+            retained_heap_bytes(&lock_unpoisoned(&cache.entries)),
+            (worker_count - 1) * RETAINED_BYTES,
+            "shared indexes must only count once toward the heap budget"
+        );
+        barrier.wait();
+
         for worker in workers {
             worker.join().unwrap();
         }
         let entries = lock_unpoisoned(&cache.entries);
         assert!(entries.len() <= CACHE_MAX_SIZE);
+        assert!(entries.len() < worker_count);
         assert!(retained_heap_bytes(&entries) <= cache.max_heap_bytes);
     }
 

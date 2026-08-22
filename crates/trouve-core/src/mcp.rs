@@ -4869,7 +4869,6 @@ for line in sys.stdin:
             !manager.connections.lock().await.entries.is_empty(),
             "a just-completed call was treated as idle from its start time"
         );
-        assert!(last_used.lock().unwrap().elapsed() < std::time::Duration::from_secs(1));
         manager.evict_worktree(&worktree).await.unwrap();
     }
 

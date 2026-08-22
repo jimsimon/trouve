@@ -42,29 +42,90 @@ pub fn release_unused_memory() {
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
+const TRIM_RUNNING: u8 = 1;
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
+const TRIM_DIRTY: u8 = 2;
+
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
+fn drain_memory_trim_requests(state: &std::sync::atomic::AtomicU8, mut trim: impl FnMut()) {
+    use std::sync::atomic::Ordering;
+
+    loop {
+        state.fetch_and(!TRIM_DIRTY, Ordering::AcqRel);
+        trim();
+
+        loop {
+            let current = state.load(Ordering::Acquire);
+            if current & TRIM_DIRTY != 0 {
+                break;
+            }
+            if state
+                .compare_exchange(
+                    current,
+                    current & !TRIM_RUNNING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
+
 /// Schedule allocator-page release without adding its potentially expensive
 /// glibc arena scan to a foreground search request. Concurrent requests
 /// coalesce behind one process-wide trim worker.
 pub fn release_unused_memory_in_background() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicU8, Ordering};
 
-        static TRIM_RUNNING: AtomicBool = AtomicBool::new(false);
-        if TRIM_RUNNING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
+        static TRIM_STATE: AtomicU8 = AtomicU8::new(0);
+        let mut current = TRIM_STATE.fetch_or(TRIM_DIRTY, Ordering::AcqRel) | TRIM_DIRTY;
+        loop {
+            if current & TRIM_RUNNING != 0 {
+                return;
+            }
+            match TRIM_STATE.compare_exchange(
+                current,
+                current | TRIM_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
         let spawned = std::thread::Builder::new()
             .name("trouve-memory-trim".into())
-            .spawn(|| {
-                release_unused_memory();
-                TRIM_RUNNING.store(false, Ordering::Release);
-            });
+            .spawn(|| drain_memory_trim_requests(&TRIM_STATE, release_unused_memory));
         if spawned.is_err() {
-            TRIM_RUNNING.store(false, Ordering::Release);
+            drain_memory_trim_requests(&TRIM_STATE, release_unused_memory);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TRIM_DIRTY, TRIM_RUNNING, drain_memory_trim_requests};
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    #[test]
+    fn background_trim_repeats_when_requested_during_a_scan() {
+        let state = AtomicU8::new(TRIM_RUNNING | TRIM_DIRTY);
+        let mut trims = 0;
+
+        drain_memory_trim_requests(&state, || {
+            trims += 1;
+            if trims == 1 {
+                state.fetch_or(TRIM_DIRTY, Ordering::Release);
+            }
+        });
+
+        assert_eq!(trims, 2);
+        assert_eq!(state.load(Ordering::Acquire), 0);
     }
 }
