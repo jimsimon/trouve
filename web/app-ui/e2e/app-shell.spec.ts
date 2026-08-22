@@ -432,7 +432,10 @@ test("repository grouping exposes nested headings and disables ambiguous workspa
   }
 
   await expect(page.getByRole("heading", { level: 2, name: "app" })).toBeVisible();
-  await expect(page.getByRole("heading", { level: 3, name: "first" })).toBeVisible();
+  const groupedWorkspaceHeading = page.getByRole("heading", { level: 3, name: "first" });
+  await expect(groupedWorkspaceHeading).toBeVisible();
+  await expect(groupedWorkspaceHeading).toHaveCSS("margin", "0px");
+  await expect(groupedWorkspaceHeading).toHaveCSS("font-size", "13px");
   await expect(page.getByRole("heading", { level: 3, name: "clone" })).toBeVisible();
   await expect(page.locator(".workspace-grip")).toHaveCount(0);
 
