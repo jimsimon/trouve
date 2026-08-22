@@ -5473,23 +5473,23 @@ impl Engine {
             review_prompt_for_agents(&job, &parsed.summary, &parsed.findings, &parsed.themes);
         let candidate_rejections = candidate_rejections(&parsed, &candidates);
         let unadjudicated_candidates = unadjudicated_candidates(&parsed, &candidates);
-        let Some(persisted) = self
-            .store
-            .save_current_code_review_result_with_adjudication(
-                &job.id,
-                &parsed.summary,
-                &prompt_for_agents,
-                candidate_count,
-                &stored_findings,
-                &finding_details,
-                &stored_themes,
-                &candidate_rejections,
-                &unadjudicated_candidates,
-            )?
-        else {
-            bail!("stale: review was cancelled or replaced before result persistence");
-        };
         if !unadjudicated_candidates.is_empty() {
+            let Some(_) = self
+                .store
+                .save_current_code_review_result_with_adjudication(
+                    &job.id,
+                    &parsed.summary,
+                    &prompt_for_agents,
+                    candidate_count,
+                    &stored_findings,
+                    &finding_details,
+                    &stored_themes,
+                    &candidate_rejections,
+                    &unadjudicated_candidates,
+                )?
+            else {
+                bail!("stale: review was cancelled or replaced before result persistence");
+            };
             bail!(
                 "final review editor left {} candidate decision(s) unresolved after repair; retry the coordinator",
                 unadjudicated_candidates.len()
@@ -5513,6 +5513,22 @@ impl Engine {
             .context("refreshing GitHub App credentials before publication")?;
         self.revalidate_code_review_publication(&api, &job).await?;
         ensure_review_current(superseded)?;
+        let Some(persisted) = self
+            .store
+            .save_current_code_review_result_with_adjudication(
+                &job.id,
+                &parsed.summary,
+                &prompt_for_agents,
+                candidate_count,
+                &stored_findings,
+                &finding_details,
+                &stored_themes,
+                &candidate_rejections,
+                &unadjudicated_candidates,
+            )?
+        else {
+            bail!("stale: review was cancelled or replaced before result persistence");
+        };
         if !self.store.claim_code_review_publication(&job.id)? {
             bail!("stale: review was cancelled or replaced before publication");
         }
@@ -9327,6 +9343,25 @@ fn finish_lifecycle_comment(mut body: String, job_id: &str) -> String {
 
 fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
     let job = &detail.job;
+    // A cancelled or stale job never accepted its coordinator result for the
+    // live pull-request revision. Keep diagnostic status and timing visible,
+    // but never project potentially obsolete model-authored result content.
+    let expose_results = !matches!(job.status.as_str(), "cancelled" | "stale");
+    let result_summary = if expose_results {
+        detail.summary.as_str()
+    } else {
+        ""
+    };
+    let result_findings = if expose_results {
+        detail.findings.as_slice()
+    } else {
+        &[]
+    };
+    let result_unadjudicated = if expose_results {
+        detail.unadjudicated_candidates.as_slice()
+    } else {
+        &[]
+    };
     let icon = match job.status.as_str() {
         "queued" => "⏳",
         "running" => "🔎",
@@ -9393,28 +9428,27 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         }
         body.push('\n');
     }
-    let suppressed_count = detail
-        .findings
+    let suppressed_count = result_findings
         .iter()
         .filter(|finding| {
             finding.github_publication_status
                 == trouve_protocol::CodeReviewFindingPublicationStatus::SuppressedByPolicy
         })
         .count();
-    if !detail.summary.is_empty() {
+    if !result_summary.is_empty() {
         body.push_str(&bounded_utf8(
-            &detail.summary,
+            result_summary,
             LIFECYCLE_SUMMARY_MAX_BYTES,
             "\n\n_Review summary truncated._",
         ));
         body.push_str("\n\n");
     } else if job.status == "succeeded" {
-        if detail.findings.is_empty() {
+        if result_findings.is_empty() {
             body.push_str("No actionable issues found.\n\n");
         } else {
             body.push_str(&format!(
                 "Found {} actionable issue(s).\n\n",
-                detail.findings.len()
+                result_findings.len()
             ));
         }
     }
@@ -9422,16 +9456,15 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         body.push_str(&format!(
             "_{} of {} confirmed finding(s) were retained in Trouve but not posted by the publication policy._\n\n",
             suppressed_count,
-            detail.findings.len()
+            result_findings.len()
         ));
     }
-    append_unadjudicated_candidate_section(&mut body, &detail.unadjudicated_candidates);
-    let publishable_findings = detail
-        .findings
+    append_unadjudicated_candidate_section(&mut body, result_unadjudicated);
+    let publishable_findings = result_findings
         .iter()
         .filter(|finding| finding.is_publishable())
         .collect::<Vec<_>>();
-    let lifecycle_prompt = lifecycle_prompt_for_agents(job, &detail.summary, &publishable_findings);
+    let lifecycle_prompt = lifecycle_prompt_for_agents(job, result_summary, &publishable_findings);
     let (failed_findings, confirmed_findings): (Vec<_>, Vec<_>) =
         publishable_findings.into_iter().partition(|finding| {
             finding.github_publication_status
@@ -14308,6 +14341,50 @@ mod tests {
             body.contains("**Error:** model review remained invalid after one JSON repair attempt")
         );
         assert!(!body.contains("Trouve Code Review — Running"));
+    }
+
+    #[test]
+    fn stale_lifecycle_comment_never_exposes_unaccepted_review_results() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:stale-lifecycle");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .save_code_review_result(
+                &queued.id,
+                "Obsolete coordinator summary.",
+                "Apply the obsolete fix.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Obsolete finding title".into(),
+                    body: "This result belongs to an old pull-request revision.".into(),
+                    prompt_for_agents: "Apply the obsolete finding.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &queued.id,
+                "stale",
+                "",
+                "stale: pull request head changed before publication",
+            )
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        let body = render_lifecycle_comment(&detail);
+
+        assert!(body.starts_with("## ⏹️ Trouve Code Review — Stale"));
+        assert!(body.contains("**Error:** stale: pull request head changed before publication"));
+        assert!(!body.contains("Obsolete coordinator summary"));
+        assert!(!body.contains("Obsolete finding title"));
+        assert!(!body.contains("Apply the obsolete fix"));
     }
 
     #[test]

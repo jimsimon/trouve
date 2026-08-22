@@ -21143,6 +21143,35 @@ mod tests {
     }
 
     #[test]
+    fn current_result_save_accepts_the_current_running_job() {
+        let store = Store::open_in_memory().unwrap();
+        let current = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            current.id
+        );
+
+        let saved = store
+            .save_current_code_review_result_with_adjudication(
+                &current.id,
+                "Current result",
+                "Current prompt",
+                0,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        assert!(saved.is_some());
+        let record = store.code_review_job(&current.id).unwrap().unwrap();
+        assert_eq!(record.summary, "Current result");
+        assert_eq!(record.prompt_for_agents, "Current prompt");
+    }
+
+    #[test]
     fn watermark_backfill_uses_last_published_head_not_effective_base() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
