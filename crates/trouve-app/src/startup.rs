@@ -361,6 +361,18 @@ fn spawn_preflight(
     cancelled: Arc<trouve_update::InstallCancellation>,
 ) {
     std::thread::spawn(move || {
+        // Capture the installed pathname before any replacement. Resolving it
+        // after self-replace is not reliable on every supported platform.
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(error) => {
+                send(
+                    &proxy,
+                    Event::Failed(format!("locating the installed executable: {error}")),
+                );
+                return;
+            }
+        };
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -460,7 +472,7 @@ fn spawn_preflight(
             if cancelled.is_cancelled() {
                 return;
             }
-            match restart_updated_app(&release.version.to_string()) {
+            match restart_updated_app(&executable, &release.version.to_string()) {
                 Ok(()) => send(&proxy, Event::ExitProcess),
                 Err(error) => send(
                     &proxy,
@@ -503,10 +515,9 @@ fn take_restarted_version() -> Option<String> {
     version.filter(|version| version == env!("CARGO_PKG_VERSION"))
 }
 
-pub(crate) fn restart_updated_app(version: &str) -> Result<()> {
+pub(crate) fn restart_updated_app(executable: &Path, version: &str) -> Result<()> {
     let acknowledgement = UpdateReadyAcknowledgement::new();
-    let executable = std::env::current_exe().context("locating the updated executable")?;
-    let mut command = std::process::Command::new(&executable);
+    let mut command = std::process::Command::new(executable);
     command
         .args(std::env::args_os().skip(1))
         .env(UPDATE_RESTART_ENV, version)
@@ -773,6 +784,16 @@ fn spawn_supervised_relaunch(
     gate: PathBuf,
 ) {
     std::thread::spawn(move || {
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(error) => {
+                send(
+                    &proxy,
+                    Event::Failed(format!("locating the updated executable: {error}")),
+                );
+                return;
+            }
+        };
         send(
             &proxy,
             Event::Stage {
@@ -797,7 +818,7 @@ fn spawn_supervised_relaunch(
                 progress_percent: Some(99),
             },
         );
-        match restart_updated_app(&version) {
+        match restart_updated_app(&executable, &version) {
             Ok(()) => send(&proxy, Event::ExitProcess),
             Err(error) => send(
                 &proxy,
@@ -955,12 +976,14 @@ impl Drop for UpdateRelaunchGate {
 /// Start the already-updated executable in a gated mode. Process creation is
 /// confirmed while the existing UI is recoverable; the child does not initialize
 /// its host until release is called after shutdown.
-pub(crate) fn prepare_updated_app_relaunch(version: &str) -> Result<UpdateRelaunchGate> {
+pub(crate) fn prepare_updated_app_relaunch(
+    executable: &Path,
+    version: &str,
+) -> Result<UpdateRelaunchGate> {
     let gate = UpdateRelaunchGate::create()?;
     let acknowledgement = UpdateReadyAcknowledgement::new();
     let gate_path = &gate.path;
-    let executable = std::env::current_exe().context("locating the updated executable")?;
-    let mut command = std::process::Command::new(&executable);
+    let mut command = std::process::Command::new(executable);
     command
         .args(std::env::args_os().skip(1))
         .env(UPDATE_RELAUNCH_SUPERVISOR_ENV, version)

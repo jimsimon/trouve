@@ -1142,6 +1142,12 @@ export interface operations {
                 };
                 content?: never;
             };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     check_desktop_update: {

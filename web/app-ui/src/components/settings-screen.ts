@@ -82,6 +82,14 @@ const desktopUpdatePhaseAnnouncement = (
   ? (loading ? "Loading update status." : "")
   : `Update ${state.phase}.`;
 
+export const desktopUpdateCanRetryInstall = (state: DesktopUpdateState | undefined): boolean =>
+  state?.phase === "error"
+  && state.availableVersion !== undefined
+  && (
+    state.message.startsWith("Update installation failed:")
+    || state.message.includes("is installed, but trouve could not restart:")
+  );
+
 export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   static override properties = {
     section: { type: String },
@@ -102,6 +110,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #desktopUpdateError = "";
   #desktopUpdatePollTimer: ReturnType<typeof setInterval> | undefined;
   #desktopUpdateGeneration = 0;
+  #desktopUpdateInitialAttempted = false;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -126,6 +135,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   override connectedCallback(): void {
     super.connectedCallback();
     globalThis.addEventListener("focus", this.#refreshWebNotificationCapability);
+    this.#desktopUpdateInitialAttempted = false;
     queueMicrotask(() => void this.#loadDesktopUpdate(true));
   }
 
@@ -144,6 +154,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     if (
       settingsSection(this.section) === "general"
       && this.#desktopUpdateState === undefined
+      && !this.#desktopUpdateInitialAttempted
       && !this.#desktopUpdateLoading
     ) {
       void this.#loadDesktopUpdate(true);
@@ -160,6 +171,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       || this.#desktopUpdateLoading
     ) return;
     const generation = this.#desktopUpdateGeneration;
+    this.#desktopUpdateInitialAttempted = true;
     this.#desktopUpdateLoading = true;
     try {
       const state = await action();
@@ -169,7 +181,10 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       if (desktopUpdateIsBusy(state)) this.#startDesktopUpdatePolling();
       else if (!this.#desktopUpdateActionPending) this.#stopDesktopUpdatePolling();
     } catch {
-      if (!silent && generation === this.#desktopUpdateGeneration) {
+      if (
+        generation === this.#desktopUpdateGeneration
+        && (!silent || this.#desktopUpdateState === undefined)
+      ) {
         this.#desktopUpdateError = "Update status could not be loaded.";
       }
     } finally {
@@ -180,7 +195,8 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
 
   async #runDesktopUpdateAction(): Promise<void> {
     const nativeHost = this.#services.value?.nativeHost;
-    const installing = this.#desktopUpdateState?.phase === "available";
+    const installing = this.#desktopUpdateState?.phase === "available"
+      || desktopUpdateCanRetryInstall(this.#desktopUpdateState);
     const action = installing
       ? nativeHost?.installDesktopUpdate
       : nativeHost?.checkDesktopUpdate;

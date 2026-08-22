@@ -467,6 +467,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #desktopUpdateState: DesktopUpdateState | undefined;
   #desktopUpdateGeneration = 0;
   #desktopUpdateActionPending = false;
+  #desktopUpdateReadPending: Promise<DesktopUpdateState> | undefined;
   #routeRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #navigationWidth = 260;
   #inspectionWidth = 460;
@@ -823,20 +824,36 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (isThemePreference(preferences.appearance.theme)) {
       this.#theme.setPreference(preferences.appearance.theme);
     }
-    if (capabilities.selfUpdate) this.#startDesktopUpdateStatusPolling();
+    if (this.isConnected && capabilities.selfUpdate) {
+      this.#startDesktopUpdateStatusPolling();
+    }
   }
 
   async #readDesktopUpdateStatus(): Promise<DesktopUpdateState> {
-    const generation = this.#desktopUpdateGeneration;
-    const state = await this.#hostClient!.getDesktopUpdate();
-    if (
-      generation === this.#desktopUpdateGeneration
-      && !this.#desktopUpdateActionPending
-    ) {
-      this.#desktopUpdateState = state;
-      this.requestUpdate();
+    if (this.#desktopUpdateReadPending !== undefined) {
+      return this.#desktopUpdateReadPending;
     }
-    return state;
+    const host = this.#hostClient;
+    if (host === undefined) throw new Error("desktop host is unavailable");
+    const generation = this.#desktopUpdateGeneration;
+    const pending = host.getDesktopUpdate();
+    this.#desktopUpdateReadPending = pending;
+    try {
+      const state = await pending;
+      if (
+        this.isConnected
+        && generation === this.#desktopUpdateGeneration
+        && !this.#desktopUpdateActionPending
+      ) {
+        this.#desktopUpdateState = state;
+        this.requestUpdate();
+      }
+      return state;
+    } finally {
+      if (this.#desktopUpdateReadPending === pending) {
+        this.#desktopUpdateReadPending = undefined;
+      }
+    }
   }
 
   async #runDesktopUpdateAction(
@@ -863,13 +880,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   #startDesktopUpdateStatusPolling(): void {
     if (
-      this.#hostClient === undefined
+      !this.isConnected
+      || this.#hostClient === undefined
       || !readSignal(this.#capabilities.current).selfUpdate
       || this.#desktopUpdateStatusTimer !== undefined
     ) return;
     void this.#readDesktopUpdateStatus().catch(() => {});
     this.#desktopUpdateStatusTimer = globalThis.setInterval(() => {
-      if (globalThis.document?.visibilityState === "hidden") return;
+      if (!this.isConnected || globalThis.document?.visibilityState === "hidden") return;
       void this.#readDesktopUpdateStatus().catch(() => {});
     }, DESKTOP_UPDATE_STATUS_INTERVAL_MS);
   }
@@ -997,6 +1015,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #persistHostPreferences(preferences: HostPreferences, reportError = true): void {
     const host = this.#hostClient;
     if (host === undefined) return;
+    const previous = this.#hostPreferences;
     this.#hostPreferences = preferences;
     const generation = ++this.#hostPreferenceWriteGeneration;
     void host.putPreferences(preferences).then((saved) => {
@@ -1012,6 +1031,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.requestUpdate();
     }).catch(() => {
       if (generation !== this.#hostPreferenceWriteGeneration || !reportError) return;
+      if (previous !== undefined) {
+        this.#hostPreferences = previous;
+        this.#applyHostPreferences(previous);
+      }
       this.#shellNotice = "Desktop preferences could not be saved.";
       this.requestUpdate();
     });

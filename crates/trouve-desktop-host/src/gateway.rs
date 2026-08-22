@@ -771,7 +771,12 @@ async fn put_preferences(
 #[utoipa::path(
     get,
     path = "/__trouve/host/v1/update",
-    responses((status = 200, body = DesktopUpdateState), (status = 403), (status = 404))
+    responses(
+        (status = 200, body = DesktopUpdateState),
+        (status = 403),
+        (status = 404),
+        (status = 500)
+    )
 )]
 async fn get_desktop_update(
     State(state): State<GatewayState>,

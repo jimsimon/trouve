@@ -375,7 +375,14 @@ pub(crate) fn spawn_auto_update() {
     if !trouve_update::auto_update_enabled() {
         return;
     }
-    std::thread::spawn(|| {
+    let baseline = match trouve_update::InstallationBaseline::capture(env!("CARGO_PKG_VERSION")) {
+        Ok(baseline) => baseline,
+        Err(error) => {
+            eprintln!("trouve-search automatic update is unavailable: {error:#}");
+            return;
+        }
+    };
+    std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -386,10 +393,9 @@ pub(crate) fn spawn_auto_update() {
                 return;
             }
         };
-        if let Some(message) = auto_update_message(runtime.block_on(trouve_update::install_latest(
-            trouve_update::Component::Search,
-            env!("CARGO_PKG_VERSION"),
-        ))) {
+        if let Some(message) = auto_update_message(runtime.block_on(
+            trouve_update::install_latest_automatically(trouve_update::Component::Search, baseline),
+        )) {
             eprintln!("{message}");
         }
     });

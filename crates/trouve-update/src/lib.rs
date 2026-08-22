@@ -6,11 +6,12 @@
 //! directory, verified against the release's `SHA256SUMS`, and only then
 //! passed to the platform-aware executable replacement primitive.
 
+use std::future::Future;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::StreamExt as _;
@@ -27,6 +28,14 @@ const MAX_ARCHIVE_EXPANDED_BYTES: u64 = MAX_BINARY_BYTES + 64 * 1024 * 1024;
 const BINARY_COMPARE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_INSTALLED_VERSION_BYTES: u64 = 128;
 const UPDATE_STATE_DIRECTORY: &str = "updates";
+const UPDATE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const NETWORK_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const RELEASE_ASSET_RETRY_DELAY: Duration = Duration::from_secs(2);
+const RELEASE_ASSET_RETRY_ATTEMPTS: usize = 3;
+const AUTO_UPDATE_SUCCESS_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const AUTO_UPDATE_SUCCESS_JITTER: Duration = Duration::from_secs(60 * 60);
+const AUTO_UPDATE_FAILURE_BACKOFF: Duration = Duration::from_secs(15 * 60);
+const MAX_AUTO_UPDATE_SCHEDULE_BYTES: u64 = 64;
 
 /// Set this to a truthy value to disable startup/background updates. Manual
 /// update commands and the desktop's explicit update button still work.
@@ -37,7 +46,63 @@ pub const DISABLE_AUTO_UPDATE_ENV: &str = "TROUVE_DISABLE_AUTO_UPDATE";
 /// as /usr/bin and Program Files intentionally fail this probe.
 pub fn ensure_self_update_supported() -> Result<()> {
     let executable = std::env::current_exe().context("locating the installed executable")?;
-    ensure_update_directory_writable(&executable)
+    ensure_self_update_supported_for(&executable)
+}
+
+fn ensure_self_update_supported_for(executable: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let uid = unsafe { libc::getuid() };
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 || uid != euid || unsafe { libc::getgid() != libc::getegid() } {
+            bail!(
+                "self-update is disabled for elevated or credential-changing processes; use the installation's package manager"
+            );
+        }
+        let executable_metadata = std::fs::symlink_metadata(executable)
+            .with_context(|| format!("inspecting installed executable {}", executable.display()))?;
+        let parent = executable
+            .parent()
+            .ok_or_else(|| anyhow!("installed executable path has no parent"))?;
+        let parent_metadata = std::fs::symlink_metadata(parent)
+            .with_context(|| format!("inspecting installation directory {}", parent.display()))?;
+        if executable_metadata.file_type().is_symlink()
+            || !executable_metadata.is_file()
+            || executable_metadata.uid() != euid
+            || parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || parent_metadata.uid() != euid
+        {
+            bail!(
+                "installation is not owned by the current user; use the installation's package manager"
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        let executable = executable
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_lowercase();
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            let Some(root) = std::env::var_os(variable) else {
+                continue;
+            };
+            let root = PathBuf::from(root)
+                .to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase();
+            if executable == root || executable.starts_with(&format!("{root}\\")) {
+                bail!(
+                    "installation is managed under {variable}; use the installation's package manager"
+                );
+            }
+        }
+    }
+    ensure_update_directory_writable(executable)
 }
 
 fn ensure_update_directory_writable(executable: &Path) -> Result<()> {
@@ -98,6 +163,37 @@ impl Component {
             ""
         };
         format!("{}{suffix}", self.display_name())
+    }
+}
+
+/// The executable identity and compiled version observed synchronously before
+/// an automatic updater is detached from its caller. This prevents an old,
+/// long-running process from treating its compiled version as authoritative
+/// after another process or package manager replaces the on-disk executable.
+#[derive(Debug, Clone)]
+pub struct InstallationBaseline {
+    executable: PathBuf,
+    identity: String,
+    version: Version,
+}
+
+impl InstallationBaseline {
+    /// Capture a self-update-eligible installation before any asynchronous
+    /// startup work can replace it.
+    pub fn capture(current_version: &str) -> Result<Self> {
+        if cfg!(debug_assertions) {
+            bail!("self-update is disabled for development builds");
+        }
+        let executable = std::env::current_exe().context("locating the installed executable")?;
+        ensure_self_update_supported_for(&executable)?;
+        let identity = executable_identity(&executable)?;
+        let version = Version::parse(current_version)
+            .with_context(|| format!("invalid current version {current_version:?}"))?;
+        Ok(Self {
+            executable,
+            identity,
+            version,
+        })
     }
 }
 
@@ -207,8 +303,15 @@ struct UpdateLock {
 
 async fn acquire_update_lock(cancellation: Option<Arc<InstallCancellation>>) -> Result<UpdateLock> {
     let executable = std::env::current_exe().context("locating executable for update lock")?;
+    acquire_update_lock_at(executable, cancellation).await
+}
+
+async fn acquire_update_lock_at(
+    executable: PathBuf,
+    cancellation: Option<Arc<InstallCancellation>>,
+) -> Result<UpdateLock> {
     tokio::task::spawn_blocking(move || {
-        acquire_update_lock_for(&executable, cancellation.as_deref())
+        acquire_update_lock_for(&executable, cancellation.as_deref(), UPDATE_LOCK_TIMEOUT)
     })
     .await
     .context("joining update-lock task")?
@@ -217,6 +320,7 @@ async fn acquire_update_lock(cancellation: Option<Arc<InstallCancellation>>) -> 
 fn acquire_update_lock_for(
     executable: &Path,
     cancellation: Option<&InstallCancellation>,
+    timeout: Duration,
 ) -> Result<UpdateLock> {
     use fs4::fs_std::FileExt as _;
 
@@ -238,12 +342,19 @@ fn acquire_update_lock_for(
     let file = options
         .open(&path)
         .with_context(|| format!("opening update lock {}", path.display()))?;
+    let started = Instant::now();
     loop {
         if let Some(cancellation) = cancellation {
             ensure_not_cancelled(cancellation)?;
         }
         match file.try_lock_exclusive() {
             Ok(true) => break,
+            Ok(false) if started.elapsed() >= timeout => {
+                bail!(
+                    "timed out waiting for another updater to release {}",
+                    path.display()
+                );
+            }
             Ok(false) => std::thread::sleep(UPDATE_LOCK_POLL_INTERVAL),
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -312,33 +423,100 @@ pub async fn check(component: Component, current_version: &str) -> Result<Update
         .with_context(|| format!("invalid current version {current_version:?}"))?;
     let target = current_target()?;
     let client = client(current_version)?;
-    let release = client
-        .get(RELEASE_API)
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await
-        .context("checking the latest trouve release")?
-        .error_for_status()
-        .context("latest trouve release request failed")?
-        .json::<GithubRelease>()
-        .await
-        .context("decoding the latest trouve release")?;
-    select_release(release, component, current, target)
+    for attempt in 0..RELEASE_ASSET_RETRY_ATTEMPTS {
+        let release = client
+            .get(RELEASE_API)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .context("checking the latest trouve release")?
+            .error_for_status()
+            .context("latest trouve release request failed")?
+            .json::<GithubRelease>()
+            .await
+            .context("decoding the latest trouve release")?;
+        match select_release(release, component, current.clone(), target) {
+            Err(error)
+                if release_assets_are_pending(&error)
+                    && attempt + 1 < RELEASE_ASSET_RETRY_ATTEMPTS =>
+            {
+                tokio::time::sleep(RELEASE_ASSET_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("release check loop always returns on its final attempt")
 }
 
 /// Install the latest eligible release, if one exists. One executable-scoped
 /// interprocess lock covers the check, download, and replacement.
 pub async fn install_latest(component: Component, current_version: &str) -> Result<UpdateStatus> {
-    if cfg!(debug_assertions) {
-        bail!("self-update is disabled for development builds");
+    let baseline = InstallationBaseline::capture(current_version)?;
+    install_latest_from_baseline(component, baseline, false).await
+}
+
+/// Run a detached automatic update using an installation identity captured by
+/// [`InstallationBaseline::capture`]. Successful checks and failures publish
+/// an executable-scoped cooldown shared by every process.
+pub async fn install_latest_automatically(
+    component: Component,
+    baseline: InstallationBaseline,
+) -> Result<UpdateStatus> {
+    if !auto_update_enabled() {
+        bail!("automatic self-update is disabled");
     }
-    let lock = acquire_update_lock(None).await?;
-    let current = Version::parse(current_version)
-        .with_context(|| format!("invalid current version {current_version:?}"))?;
-    let observed = installed_binary_version(&lock.executable)
-        .await
-        .filter(|installed| installed > &current)
-        .unwrap_or(current);
+    install_latest_from_baseline(component, baseline, true).await
+}
+
+async fn install_latest_from_baseline(
+    component: Component,
+    baseline: InstallationBaseline,
+    automatic: bool,
+) -> Result<UpdateStatus> {
+    ensure_component_matches_executable(component, &baseline.executable)?;
+    let lock = acquire_update_lock_at(baseline.executable.clone(), None).await?;
+    let observed = observed_installation_version(&baseline).await?;
+
+    let schedule = if automatic {
+        let state_root = update_state_root()
+            .ok_or_else(|| anyhow!("no per-user data directory is available for update state"))?;
+        let now = unix_timestamp();
+        if !automatic_update_is_due(&state_root, &lock.executable, now) {
+            return Ok(UpdateStatus::UpToDate { version: observed });
+        }
+        // Publish failure backoff before touching the network. A crash or
+        // failed request therefore cannot create a process-start request loop.
+        record_automatic_update_not_before(
+            &state_root,
+            &lock.executable,
+            now.saturating_add(AUTO_UPDATE_FAILURE_BACKOFF.as_secs()),
+        )?;
+        Some((state_root, now))
+    } else {
+        None
+    };
+
+    let result = install_latest_locked(component, &observed, &lock).await;
+    if result.is_ok()
+        && let Some((state_root, checked_at)) = schedule
+    {
+        let delay = automatic_update_success_delay(&lock.executable);
+        // A successfully installed executable must not be reported as failed
+        // solely because a best-effort scheduling hint could not be extended.
+        let _ = record_automatic_update_not_before(
+            &state_root,
+            &lock.executable,
+            checked_at.saturating_add(delay.as_secs()),
+        );
+    }
+    result
+}
+
+async fn install_latest_locked(
+    component: Component,
+    observed: &Version,
+    lock: &UpdateLock,
+) -> Result<UpdateStatus> {
     let check = check(component, &observed.to_string()).await?;
     let Some(release) = check.update else {
         return Ok(UpdateStatus::UpToDate {
@@ -411,8 +589,124 @@ async fn installed_binary_version(executable: &Path) -> Option<Version> {
     .ok()?
 }
 
+async fn observed_installation_version(baseline: &InstallationBaseline) -> Result<Version> {
+    let baseline = baseline.clone();
+    tokio::task::spawn_blocking(move || {
+        let current_identity = executable_identity(&baseline.executable)?;
+        let installed = update_state_root()
+            .and_then(|root| installed_binary_version_at(&root, &baseline.executable));
+        reconcile_observed_version(&baseline, &current_identity, installed)
+    })
+    .await
+    .context("joining installed-version reconciliation task")?
+}
+
+fn reconcile_observed_version(
+    baseline: &InstallationBaseline,
+    current_identity: &str,
+    installed: Option<Version>,
+) -> Result<Version> {
+    if current_identity != baseline.identity {
+        return installed.ok_or_else(|| {
+            anyhow!(
+                "the on-disk executable changed after this process started and its version is unknown; restart before updating"
+            )
+        });
+    }
+    Ok(installed
+        .filter(|installed| installed > &baseline.version)
+        .unwrap_or_else(|| baseline.version.clone()))
+}
+
+fn ensure_component_matches_executable(component: Component, executable: &Path) -> Result<()> {
+    let target = current_target()?;
+    let expected = component.binary_name(target);
+    if executable
+        .file_name()
+        .is_none_or(|name| name != expected.as_str())
+    {
+        bail!(
+            "{} is not running from its canonical executable name {expected:?}; use the installation's package manager",
+            component.display_name()
+        );
+    }
+    Ok(())
+}
+
 fn update_state_root() -> Option<std::path::PathBuf> {
     dirs::data_local_dir().map(|directory| directory.join("trouve").join(UPDATE_STATE_DIRECTORY))
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn automatic_update_is_due(state_root: &Path, executable: &Path, now: u64) -> bool {
+    if verify_private_update_state_root(state_root).is_err() {
+        return true;
+    }
+    read_automatic_update_not_before(&automatic_update_schedule_path(state_root, executable))
+        .is_none_or(|not_before| now >= not_before)
+}
+
+fn read_automatic_update_not_before(path: &Path) -> Option<u64> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_AUTO_UPDATE_SCHEDULE_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_AUTO_UPDATE_SCHEDULE_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_AUTO_UPDATE_SCHEDULE_BYTES || text.lines().count() != 1 {
+        return None;
+    }
+    text.trim().parse().ok()
+}
+
+fn record_automatic_update_not_before(
+    state_root: &Path,
+    executable: &Path,
+    not_before: u64,
+) -> Result<()> {
+    prepare_private_update_state_root(state_root)?;
+    let path = automatic_update_schedule_path(state_root, executable);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("opening automatic-update schedule {}", path.display()))?;
+    writeln!(file, "{not_before}").context("writing automatic-update schedule")?;
+    file.sync_all()
+        .context("syncing automatic-update schedule")?;
+    sync_directory(state_root).context("syncing update-state directory")
+}
+
+fn automatic_update_success_delay(executable: &Path) -> Duration {
+    let mut digest = Sha256::new();
+    digest.update(b"trouve-auto-update-jitter-v1\0");
+    hash_executable_path(&mut digest, executable);
+    let bytes: [u8; 32] = digest.finalize().into();
+    let jitter_seed = u64::from_le_bytes(bytes[..8].try_into().expect("eight-byte slice"));
+    AUTO_UPDATE_SUCCESS_INTERVAL
+        + Duration::from_secs(jitter_seed % (AUTO_UPDATE_SUCCESS_JITTER.as_secs() + 1))
+}
+
+fn automatic_update_schedule_path(state_root: &Path, executable: &Path) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(b"trouve-auto-update-schedule-v1\0");
+    hash_executable_path(&mut digest, executable);
+    state_root.join(format!("{}.schedule", hex::encode(digest.finalize())))
 }
 
 fn installed_binary_version_at(state_root: &Path, executable: &Path) -> Option<Version> {
@@ -513,6 +807,13 @@ fn verify_private_update_state_root(state_root: &Path) -> Result<()> {
 fn update_state_path(state_root: &Path, executable: &Path, identity: &str) -> std::path::PathBuf {
     let mut digest = Sha256::new();
     digest.update(b"trouve-update-state-v1\0");
+    hash_executable_path(&mut digest, executable);
+    digest.update(b"\0");
+    digest.update(identity.as_bytes());
+    state_root.join(format!("{}.version", hex::encode(digest.finalize())))
+}
+
+fn hash_executable_path(digest: &mut Sha256, executable: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
@@ -527,9 +828,6 @@ fn update_state_path(state_root: &Path, executable: &Path, identity: &str) -> st
     }
     #[cfg(not(any(unix, windows)))]
     digest.update(executable.to_string_lossy().as_bytes());
-    digest.update(b"\0");
-    digest.update(identity.as_bytes());
-    state_root.join(format!("{}.version", hex::encode(digest.finalize())))
 }
 
 fn executable_identity(executable: &Path) -> Result<String> {
@@ -779,6 +1077,7 @@ async fn install_release_locked(
         &release.checksum_url,
         MAX_CHECKSUM_BYTES,
         "release checksums",
+        &cancellation,
     )
     .await?;
     ensure_not_cancelled(&cancellation)?;
@@ -950,6 +1249,10 @@ fn unique_asset_url(assets: &[GithubAsset], name: &str) -> Result<String> {
     Ok(first.browser_download_url.clone())
 }
 
+fn release_assets_are_pending(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with("release is not ready:")
+}
+
 fn checksum_for(contents: &str, artifact_name: &str) -> Result<String> {
     let mut found = None;
     for line in contents.lines() {
@@ -986,20 +1289,35 @@ fn client(version: &str) -> Result<reqwest::Client> {
         .context("building update HTTP client")
 }
 
+async fn cancellable_wait<F: Future>(
+    future: F,
+    cancellation: &InstallCancellation,
+) -> Result<F::Output> {
+    tokio::pin!(future);
+    loop {
+        ensure_not_cancelled(cancellation)?;
+        match tokio::time::timeout(NETWORK_CANCEL_POLL_INTERVAL, future.as_mut()).await {
+            Ok(output) => return Ok(output),
+            Err(_) => continue,
+        }
+    }
+}
+
 async fn download_text(
     client: &reqwest::Client,
     url: &str,
     limit: u64,
     label: &str,
+    cancellation: &InstallCancellation,
 ) -> Result<String> {
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .with_context(|| format!("downloading {label}"))?
-        .error_for_status()
-        .with_context(|| format!("{label} request failed"))?;
+    let response = cancellable_wait(
+        client.get(url).timeout(Duration::from_secs(30)).send(),
+        cancellation,
+    )
+    .await?
+    .with_context(|| format!("downloading {label}"))?
+    .error_for_status()
+    .with_context(|| format!("{label} request failed"))?;
     if response
         .content_length()
         .is_some_and(|length| length > limit)
@@ -1008,7 +1326,7 @@ async fn download_text(
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = cancellable_wait(stream.next(), cancellation).await? {
         let chunk = chunk.with_context(|| format!("reading {label}"))?;
         let next_len = bytes
             .len()
@@ -1031,14 +1349,14 @@ async fn download_file(
     cancellation: &InstallCancellation,
 ) -> Result<String> {
     ensure_not_cancelled(cancellation)?;
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(600))
-        .send()
-        .await
-        .context("downloading update archive")?
-        .error_for_status()
-        .context("update archive request failed")?;
+    let response = cancellable_wait(
+        client.get(url).timeout(Duration::from_secs(600)).send(),
+        cancellation,
+    )
+    .await?
+    .context("downloading update archive")?
+    .error_for_status()
+    .context("update archive request failed")?;
     let total_bytes = response.content_length();
     if total_bytes.is_some_and(|length| length > limit) {
         bail!("update archive exceeds the {limit}-byte limit");
@@ -1055,8 +1373,7 @@ async fn download_file(
         total_bytes,
     });
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        ensure_not_cancelled(cancellation)?;
+    while let Some(chunk) = cancellable_wait(stream.next(), cancellation).await? {
         let chunk = chunk.context("reading update archive")?;
         received = received
             .checked_add(chunk.len() as u64)
@@ -1634,11 +1951,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("trouve-search");
         std::fs::write(&executable, b"binary").unwrap();
-        let first = acquire_update_lock_for(&executable, None).unwrap();
+        let first = acquire_update_lock_for(&executable, None, Duration::from_secs(1)).unwrap();
         let second_executable = executable.clone();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let second = acquire_update_lock_for(&second_executable, None).unwrap();
+            let second =
+                acquire_update_lock_for(&second_executable, None, Duration::from_secs(1)).unwrap();
             acquired_tx.send(()).unwrap();
             second
         });
@@ -1656,14 +1974,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("trouve");
         std::fs::write(&executable, b"binary").unwrap();
-        let first = acquire_update_lock_for(&executable, None).unwrap();
+        let first = acquire_update_lock_for(&executable, None, Duration::from_secs(1)).unwrap();
         let cancellation = Arc::new(InstallCancellation::default());
         let waiter_cancellation = Arc::clone(&cancellation);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let result = acquire_update_lock_for(&executable, Some(&waiter_cancellation)).map(drop);
+            let result = acquire_update_lock_for(
+                &executable,
+                Some(&waiter_cancellation),
+                Duration::from_secs(1),
+            )
+            .map(drop);
             finished_tx.send(result).unwrap();
         });
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1675,6 +1998,75 @@ mod tests {
         assert_eq!(error.to_string(), "update cancelled");
         drop(first);
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn executable_update_lock_has_a_deadline_without_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("trouve");
+        std::fs::write(&executable, b"binary").unwrap();
+        let first = acquire_update_lock_for(&executable, None, Duration::from_secs(1)).unwrap();
+        let error = acquire_update_lock_for(&executable, None, Duration::from_millis(75))
+            .map(drop)
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out waiting"));
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn cancellable_network_wait_observes_cancellation_while_stalled() {
+        let cancellation = Arc::new(InstallCancellation::default());
+        let requested = Arc::clone(&cancellation);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(requested.request_cancel());
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            cancellable_wait(std::future::pending::<()>(), &cancellation),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.to_string(), "update cancelled");
+    }
+
+    #[test]
+    fn automatic_update_schedule_is_shared_by_executable_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let executable = temp.path().join("trouve-search");
+        std::fs::write(&executable, b"first identity").unwrap();
+        record_automatic_update_not_before(&state_root, &executable, 500).unwrap();
+        assert!(!automatic_update_is_due(&state_root, &executable, 499));
+        assert!(automatic_update_is_due(&state_root, &executable, 500));
+
+        std::fs::write(&executable, b"replacement identity").unwrap();
+        assert!(!automatic_update_is_due(&state_root, &executable, 499));
+    }
+
+    #[test]
+    fn changed_installation_requires_trusted_version_metadata() {
+        let baseline = InstallationBaseline {
+            executable: PathBuf::from("trouve-search"),
+            identity: "original".into(),
+            version: Version::parse("4.0.0").unwrap(),
+        };
+        let error = reconcile_observed_version(&baseline, "replacement", None).unwrap_err();
+        assert!(error.to_string().contains("restart before updating"));
+        assert_eq!(
+            reconcile_observed_version(
+                &baseline,
+                "replacement",
+                Some(Version::parse("4.2.0").unwrap()),
+            )
+            .unwrap(),
+            Version::parse("4.2.0").unwrap()
+        );
+        assert_eq!(
+            reconcile_observed_version(&baseline, "original", None).unwrap(),
+            Version::parse("4.0.0").unwrap()
+        );
     }
 
     #[test]
@@ -1692,6 +2084,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("release is not ready"));
+        assert!(release_assets_are_pending(&error));
     }
 
     #[test]

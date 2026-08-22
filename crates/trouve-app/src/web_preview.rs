@@ -307,12 +307,17 @@ pub(crate) fn run(
         })
         .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
     if product_host && !cfg!(debug_assertions) && startup.self_update_available {
+        // Preserve the installed pathname before a runtime update replaces it.
+        let update_executable = std::env::current_exe().map_err(|error| {
+            anyhow::anyhow!("locating the desktop executable before update: {error}")
+        })?;
         let updates = startup::UpdateManager::new(startup.update_state);
         updates.spawn_runtime_poll(web_preview_support::preference_path());
         let status_updates = updates.clone();
         let check_updates = updates.clone();
         let install_updates = updates.clone();
         let pending_update_relaunch_for_action = Arc::clone(&pending_update_relaunch);
+        let update_executable_for_action = update_executable.clone();
         let quit_proxy = event_loop.create_proxy();
         native_actions = native_actions.with_desktop_updater(
             move || Ok(status_updates.status()),
@@ -325,12 +330,16 @@ pub(crate) fn run(
                 let quit_proxy = quit_proxy.clone();
                 let pending_update_relaunch =
                     Arc::clone(&pending_update_relaunch_for_action);
+                let update_executable = update_executable_for_action.clone();
                 async move {
                     let mut state = updates.install_and_restart().await;
                     if state.phase == trouve_desktop_host::DesktopUpdatePhase::Restarting
                         && let Some(version) = state.available_version.clone()
                     {
-                        match startup::prepare_updated_app_relaunch(&version) {
+                        match startup::prepare_updated_app_relaunch(
+                            &update_executable,
+                            &version,
+                        ) {
                             Ok(gate) => {
                                 *pending_update_relaunch
                                     .lock()

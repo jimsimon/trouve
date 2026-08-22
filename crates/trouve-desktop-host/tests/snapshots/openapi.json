@@ -460,6 +460,9 @@
           },
           "404": {
             "description": ""
+          },
+          "500": {
+            "description": ""
           }
         }
       }

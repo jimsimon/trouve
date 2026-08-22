@@ -40,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
         return run_update(check).await;
     }
 
+    let automatic_update = (!cli.no_auto_update && trouve_update::auto_update_enabled())
+        .then(|| trouve_update::InstallationBaseline::capture(env!("CARGO_PKG_VERSION")));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -53,23 +56,28 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(%address, "a local trouve server already owns this data directory");
         return Ok(());
     };
-    if !cli.no_auto_update && trouve_update::auto_update_enabled() {
-        tokio::spawn(async {
-            match trouve_update::install_latest(
-                trouve_update::Component::Server,
-                env!("CARGO_PKG_VERSION"),
-            )
-            .await
-            {
-                Ok(trouve_update::UpdateStatus::Updated { from, to }) => {
-                    tracing::info!(
-                        "installed trouve-server {to} over {from}; restart the service to use it"
-                    );
-                }
-                Ok(trouve_update::UpdateStatus::UpToDate { .. }) => {}
-                Err(error) => tracing::warn!("automatic update failed: {error:#}"),
+    if let Some(automatic_update) = automatic_update {
+        match automatic_update {
+            Ok(baseline) => {
+                tokio::spawn(async move {
+                    match trouve_update::install_latest_automatically(
+                        trouve_update::Component::Server,
+                        baseline,
+                    )
+                    .await
+                    {
+                        Ok(trouve_update::UpdateStatus::Updated { from, to }) => {
+                            tracing::info!(
+                                "installed trouve-server {to} over {from}; restart the service to use it"
+                            );
+                        }
+                        Ok(trouve_update::UpdateStatus::UpToDate { .. }) => {}
+                        Err(error) => tracing::warn!("automatic update failed: {error:#}"),
+                    }
+                });
             }
-        });
+            Err(error) => tracing::warn!("automatic update is unavailable: {error:#}"),
+        }
     }
     server.await
 }
