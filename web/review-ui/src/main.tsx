@@ -645,12 +645,19 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+function reviewJobNeedsAttention(
+  job: Pick<ReviewJob, "status" | "open_issue_count">,
+): boolean {
+  return job.status === "succeeded" && job.open_issue_count !== 0;
+}
+
 function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   const elapsed = liveElapsed(job.running_elapsed_ms, job.status, job.started_at, now);
   const openIssueCount = job.open_issue_count;
+  const needsAttention = reviewJobNeedsAttention(job);
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
-      <StatusPill status={job.status} />
+      {needsAttention ? <span class="status failed">needs attention</span> : <StatusPill status={job.status} />}
       <span class="job-main">
         <strong>
           {job.repository} #{job.pull_number}
@@ -661,7 +668,7 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
       <span class="job-meta">
         <b>
           {openIssueCount == null
-            ? `${job.issue_count} new`
+            ? `Open status unknown · ${job.issue_count} new`
             : `${openIssueCount} open · ${job.issue_count} new`}
         </b>
         <small>{job.status === "queued" ? duration(job.pending_elapsed_ms) : duration(elapsed)}</small>
@@ -1372,9 +1379,10 @@ function JobDetailPane({
   }
   const latestReviewerTasks = new Map<string, ReviewTask>();
   detail.tasks
-    .filter((task) => task.role === "reviewer" && task.reviewer_id)
+    .filter((task) => task.role === "reviewer")
     .forEach((task) => {
-      latestReviewerTasks.set(`${task.reviewer_id}:${task.batch_index}`, task);
+      const reviewerKey = task.reviewer_id || task.reviewer_name || task.id;
+      latestReviewerTasks.set(`${reviewerKey}:${task.batch_index}`, task);
     });
   const finalEditorRetryBlocked = [...latestReviewerTasks.values()].some(
     (task) => !["succeeded", "not_applicable"].includes(task.status),
@@ -1410,8 +1418,10 @@ function JobDetailPane({
         )
       : undefined;
   const openIssueCount = job.open_issue_count;
+  const needsAttention = reviewJobNeedsAttention(job);
   const hasOpenIssues =
     job.status === "succeeded" && openIssueCount != null && openIssueCount > 0;
+  const openIssueStatusUnknown = job.status === "succeeded" && openIssueCount == null;
   const selectPreferredTask = (tasks: ReviewTask[]): void => {
     const preferred = pickPreferredTask(tasks);
     if (preferred) setSelectedTaskId(preferred.id);
@@ -1424,7 +1434,7 @@ function JobDetailPane({
       <header class="detail-header">
         <div>
           <StatusPill status={job.status} />
-          {hasOpenIssues && <span class="status failed">needs attention</span>}
+          {needsAttention && <span class="status failed">needs attention</span>}
           <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
           </h2>
@@ -1544,6 +1554,14 @@ function JobDetailPane({
           </strong>
           <p>
             This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean incremental result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
+          </p>
+        </div>
+      )}
+      {openIssueStatusUnknown && (
+        <div class="banner warning" role="alert">
+          <strong>PR-wide open issue status is unknown</strong>
+          <p>
+            This legacy review predates PR-wide finding snapshots. It cannot establish that older findings are resolved, even when this round found no new issues.
           </p>
         </div>
       )}

@@ -1864,7 +1864,9 @@ export interface components {
         /** @description Local branches of a workspace repository, for base-ref selection. */
         BranchList: {
             branches: string[];
-            /** @description The branch HEAD currently points at (default selection). */
+            /** @description The default branch advertised by the repository's origin remote. */
+            default_branch?: string | null;
+            /** @description The branch or commit HEAD currently points at. */
             head: string;
         };
         CheckRun: {
@@ -2099,7 +2101,8 @@ export interface components {
              * Format: int64
              * @description Total confirmed findings that remained open across the pull request
              *     after this review was published. Absent while publication is pending
-             *     and for legacy jobs that predate this snapshot.
+             *     and for legacy jobs that predate this snapshot. Consumers must treat
+             *     absence on a succeeded job as unknown, never as a clean review.
              */
             open_issue_count?: number | null;
             /** Format: int64 */

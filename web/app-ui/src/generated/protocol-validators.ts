@@ -1669,7 +1669,7 @@ validate101.evaluated = {"items":true,"dynamicProps":false,"dynamicItems":false}
 
 export const branchList = validate105;
 const schema43 = {"$id":"urn:trouve:protocol-validator:branchList","$ref":"urn:trouve:protocol-openapi#/components/schemas/BranchList"};
-const schema44 = {"type":"object","description":"Local branches of a workspace repository, for base-ref selection.","required":["branches","head"],"properties":{"branches":{"type":"array","items":{"type":"string"}},"head":{"type":"string","description":"The branch HEAD currently points at (default selection)."}}};
+const schema44 = {"type":"object","description":"Local branches of a workspace repository, for base-ref selection.","required":["branches","head"],"properties":{"branches":{"type":"array","items":{"type":"string"}},"default_branch":{"type":["string","null"],"description":"The default branch advertised by the repository's origin remote."},"head":{"type":"string","description":"The branch or commit HEAD currently points at."}}};
 
 function validate106(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -1719,16 +1719,30 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.head !== undefined){
+if(data.default_branch !== undefined){
+let data2 = data.default_branch;
 const _errs5 = errors;
-if(typeof data.head !== "string"){
-validate106.errors = [{instancePath:instancePath+"/head",schemaPath:"#/properties/head/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data2 !== "string") && (data2 !== null)){
+validate106.errors = [{instancePath:instancePath+"/default_branch",schemaPath:"#/properties/default_branch/type",keyword:"type",params:{type: schema44.properties.default_branch.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs5 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.head !== undefined){
+const _errs7 = errors;
+if(typeof data.head !== "string"){
+validate106.errors = [{instancePath:instancePath+"/head",schemaPath:"#/properties/head/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs7 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -1741,7 +1755,7 @@ return false;
 validate106.errors = vErrors;
 return errors === 0;
 }
-validate106.evaluated = {"props":{"branches":true,"head":true},"dynamicProps":false,"dynamicItems":false};
+validate106.evaluated = {"props":{"branches":true,"default_branch":true,"head":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate105(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -1762,7 +1776,7 @@ errors = vErrors.length;
 validate105.errors = vErrors;
 return errors === 0;
 }
-validate105.evaluated = {"props":{"branches":true,"head":true},"dynamicProps":false,"dynamicItems":false};
+validate105.evaluated = {"props":{"branches":true,"default_branch":true,"head":true},"dynamicProps":false,"dynamicItems":false};
 
 export const prInfo = validate108;
 const schema45 = {"$id":"urn:trouve:protocol-validator:prInfo","$ref":"urn:trouve:protocol-openapi#/components/schemas/PrInfo"};
@@ -10733,7 +10747,7 @@ return errors === 0;
 }
 validate285.evaluated = {"props":{"app_id":true,"bot_login":true,"check_run_webhook_configured":true,"checks_write_configured":true,"configured":true,"installation_count":true,"last_error":true,"last_poll_at":true,"rate_limit_remaining":true,"rate_limit_reset_at":true,"slug":true,"webhook_configured":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema133 = {"type":"object","description":"A durable execution of one model review against one immutable PR head.","required":["id","installation_id","repository","pull_number","pull_title","pull_url","head_sha","base_ref","head_ref","trigger","status","created_at"],"properties":{"base_ref":{"type":"string"},"cancel_requested":{"type":"boolean"},"candidate_issue_count":{"type":"integer","format":"int64","minimum":0},"check_run_id":{"type":["integer","null"],"format":"int64","minimum":0},"check_run_url":{"type":"string"},"check_sync_error":{"type":"string"},"completed_at":{"type":["string","null"],"format":"date-time"},"coordinator_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"coordinator_thinking_level":{"type":["string","null"],"description":"Thinking level snapshotted for the final coordinator/editor."},"created_at":{"type":"string","format":"date-time"},"error":{"type":"string"},"excluded_reviewer_ids":{"type":"array","items":{"type":"string"}},"fixed_issue_count":{"type":"integer","format":"int64","minimum":0},"head_ref":{"type":"string"},"head_sha":{"type":"string"},"id":{"type":"string"},"included_reviewer_ids":{"type":"array","items":{"type":"string"}},"installation_id":{"type":"integer","format":"int64","minimum":0},"issue_count":{"type":"integer","format":"int64","minimum":0},"lifecycle_comment_url":{"type":"string"},"model":{"type":["string","null"]},"open_issue_count":{"type":["integer","null"],"format":"int64","description":"Total confirmed findings that remained open across the pull request\nafter this review was published. Absent while publication is pending\nand for legacy jobs that predate this snapshot.","minimum":0},"pending_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"preparation_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"progress":{"$ref":"#/components/schemas/CodeReviewProgress"},"publication_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"pull_number":{"type":"integer","format":"int64","minimum":0},"pull_title":{"type":"string"},"pull_url":{"type":"string"},"repository":{"type":"string"},"retried_by":{"type":["string","null"]},"retry_of":{"type":["string","null"]},"review_base_sha":{"type":"string","description":"Commit used as the left side of this review's diff. For incremental\njobs this is normally the last successfully published head."},"review_url":{"type":"string"},"review_watermark_sha":{"type":"string","description":"Immutable commit from the last successfully published review. This is\nthe incremental watermark even when history rewriting makes the\neffective `review_base_sha` fall back to the pull request merge base."},"reviewer_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"reviewer_ids":{"type":"array","items":{"type":"string"},"description":"Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics. Additive/Automatic jobs\nsnapshot the candidate catalog; routing decisions record which\npersonas ran."},"router_model":{"type":["string","null"],"description":"Model snapshotted for semantic persona triage. Absent inherits\n`model`; legacy jobs may omit both and are rejected before dispatch."},"router_thinking_level":{"type":["string","null"],"description":"Thinking level snapshotted for semantic persona triage."},"routing_mode":{"$ref":"#/components/schemas/CodeReviewRoutingMode"},"running_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"scope":{"$ref":"#/components/schemas/CodeReviewJobScope"},"semantic_routing":{"type":"boolean","description":"Snapshotted Additive semantic-routing choice. Automatic jobs route\nsemantically regardless of a legacy `false` value."},"session_id":{"type":["string","null"]},"started_at":{"type":["string","null"],"format":"date-time"},"status":{"type":"string","description":"`queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`."},"thread_id":{"type":["string","null"]},"trigger":{"type":"string","description":"`automatic`, `manual`, or `retry`."}}};
+const schema133 = {"type":"object","description":"A durable execution of one model review against one immutable PR head.","required":["id","installation_id","repository","pull_number","pull_title","pull_url","head_sha","base_ref","head_ref","trigger","status","created_at"],"properties":{"base_ref":{"type":"string"},"cancel_requested":{"type":"boolean"},"candidate_issue_count":{"type":"integer","format":"int64","minimum":0},"check_run_id":{"type":["integer","null"],"format":"int64","minimum":0},"check_run_url":{"type":"string"},"check_sync_error":{"type":"string"},"completed_at":{"type":["string","null"],"format":"date-time"},"coordinator_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"coordinator_thinking_level":{"type":["string","null"],"description":"Thinking level snapshotted for the final coordinator/editor."},"created_at":{"type":"string","format":"date-time"},"error":{"type":"string"},"excluded_reviewer_ids":{"type":"array","items":{"type":"string"}},"fixed_issue_count":{"type":"integer","format":"int64","minimum":0},"head_ref":{"type":"string"},"head_sha":{"type":"string"},"id":{"type":"string"},"included_reviewer_ids":{"type":"array","items":{"type":"string"}},"installation_id":{"type":"integer","format":"int64","minimum":0},"issue_count":{"type":"integer","format":"int64","minimum":0},"lifecycle_comment_url":{"type":"string"},"model":{"type":["string","null"]},"open_issue_count":{"type":["integer","null"],"format":"int64","description":"Total confirmed findings that remained open across the pull request\nafter this review was published. Absent while publication is pending\nand for legacy jobs that predate this snapshot. Consumers must treat\nabsence on a succeeded job as unknown, never as a clean review.","minimum":0},"pending_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"preparation_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"progress":{"$ref":"#/components/schemas/CodeReviewProgress"},"publication_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"pull_number":{"type":"integer","format":"int64","minimum":0},"pull_title":{"type":"string"},"pull_url":{"type":"string"},"repository":{"type":"string"},"retried_by":{"type":["string","null"]},"retry_of":{"type":["string","null"]},"review_base_sha":{"type":"string","description":"Commit used as the left side of this review's diff. For incremental\njobs this is normally the last successfully published head."},"review_url":{"type":"string"},"review_watermark_sha":{"type":"string","description":"Immutable commit from the last successfully published review. This is\nthe incremental watermark even when history rewriting makes the\neffective `review_base_sha` fall back to the pull request merge base."},"reviewer_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"reviewer_ids":{"type":"array","items":{"type":"string"},"description":"Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics. Additive/Automatic jobs\nsnapshot the candidate catalog; routing decisions record which\npersonas ran."},"router_model":{"type":["string","null"],"description":"Model snapshotted for semantic persona triage. Absent inherits\n`model`; legacy jobs may omit both and are rejected before dispatch."},"router_thinking_level":{"type":["string","null"],"description":"Thinking level snapshotted for semantic persona triage."},"routing_mode":{"$ref":"#/components/schemas/CodeReviewRoutingMode"},"running_elapsed_ms":{"type":"integer","format":"int64","minimum":0},"scope":{"$ref":"#/components/schemas/CodeReviewJobScope"},"semantic_routing":{"type":"boolean","description":"Snapshotted Additive semantic-routing choice. Automatic jobs route\nsemantically regardless of a legacy `false` value."},"session_id":{"type":["string","null"]},"started_at":{"type":["string","null"],"format":"date-time"},"status":{"type":"string","description":"`queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`."},"thread_id":{"type":["string","null"]},"trigger":{"type":"string","description":"`automatic`, `manual`, or `retry`."}}};
 const schema134 = {"type":"object","required":["completed_reviewers","total_reviewers","percent"],"properties":{"completed_reviewers":{"type":"integer","format":"int64","minimum":0},"percent":{"type":"integer","format":"int32","description":"Integer percentage in the inclusive range 0..=100.","minimum":0},"total_reviewers":{"type":"integer","format":"int64","minimum":0}}};
 
 function validate288(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

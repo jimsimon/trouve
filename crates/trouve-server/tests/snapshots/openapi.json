@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.14"
+    "version": "7.15"
   },
   "paths": {
     "/v1/approvals": {
@@ -5260,9 +5260,16 @@
               "type": "string"
             }
           },
+          "default_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The default branch advertised by the repository's origin remote."
+          },
           "head": {
             "type": "string",
-            "description": "The branch HEAD currently points at (default selection)."
+            "description": "The branch or commit HEAD currently points at."
           }
         }
       },
@@ -5909,7 +5916,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Total confirmed findings that remained open across the pull request\nafter this review was published. Absent while publication is pending\nand for legacy jobs that predate this snapshot.",
+            "description": "Total confirmed findings that remained open across the pull request\nafter this review was published. Absent while publication is pending\nand for legacy jobs that predate this snapshot. Consumers must treat\nabsence on a succeeded job as unknown, never as a clean review.",
             "minimum": 0
           },
           "pending_elapsed_ms": {

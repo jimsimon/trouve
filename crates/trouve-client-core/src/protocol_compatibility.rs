@@ -29,7 +29,7 @@ mod tests {
     fn rejects_older_newer_other_major_and_malformed_protocols() {
         for server in [
             "4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8",
-            "7.9", "7.10", "7.11", "7.12", "7.13", "7.15", "unknown", "7.14.1",
+            "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "unknown", "7.15.1",
         ] {
             let error = ensure_compatible_protocol(server, PROTOCOL_VERSION)
                 .unwrap_err()

@@ -26,7 +26,8 @@ describe("code-review dashboard model", () => {
   it("distinguishes successful execution from unresolved PR findings", () => {
     expect(codeReviewNeedsAttention({ status: "succeeded", open_issue_count: 2 })).toBe(true);
     expect(codeReviewNeedsAttention({ status: "succeeded", open_issue_count: 0 })).toBe(false);
-    expect(codeReviewNeedsAttention({ status: "succeeded" })).toBe(false);
+    expect(codeReviewNeedsAttention({ status: "succeeded", open_issue_count: null })).toBe(true);
+    expect(codeReviewNeedsAttention({ status: "succeeded" })).toBe(true);
     expect(codeReviewNeedsAttention({ status: "running", open_issue_count: 2 })).toBe(false);
   });
 

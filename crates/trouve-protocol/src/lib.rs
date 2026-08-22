@@ -298,11 +298,13 @@ pub use requests::*;
 // retaining successful reviewer task outputs (additive).
 // 7.12: code-review jobs expose the server-authoritative final-editor retry
 // capability derived from their latest durable task attempts (additive).
-// 7.13: code-review details expose reviewer candidates left unresolved after
+// 7.13: workspace branch listings expose the origin remote's default branch
+// for session base selection (additive).
+// 7.14: code-review details expose reviewer candidates left unresolved after
 // final-editor repair so clients can represent incomplete reviews (additive).
-// 7.14: code-review jobs expose the PR-wide open-finding count captured after
+// 7.15: code-review jobs expose the PR-wide open-finding count captured after
 // publication so a clean incremental round cannot hide older findings.
-pub const PROTOCOL_VERSION: &str = "7.14";
+pub const PROTOCOL_VERSION: &str = "7.15";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

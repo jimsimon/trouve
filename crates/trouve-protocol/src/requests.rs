@@ -2327,7 +2327,8 @@ pub struct CodeReviewJob {
     pub fixed_issue_count: u64,
     /// Total confirmed findings that remained open across the pull request
     /// after this review was published. Absent while publication is pending
-    /// and for legacy jobs that predate this snapshot.
+    /// and for legacy jobs that predate this snapshot. Consumers must treat
+    /// absence on a succeeded job as unknown, never as a clean review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_issue_count: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2617,8 +2618,11 @@ pub struct CodeReviewDashboard {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchList {
     pub branches: Vec<String>,
-    /// The branch HEAD currently points at (default selection).
+    /// The branch or commit HEAD currently points at.
     pub head: String,
+    /// The default branch advertised by the repository's origin remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
 }
 
 // --- provider configuration -------------------------------------------------

@@ -10,4 +10,11 @@ test("review jobs distinguish new findings from PR-wide open findings", () => {
   assert.match(source, /open across this pull request/u);
   assert.match(source, /A clean incremental result does not resolve findings from earlier rounds/u);
   assert.match(source, /open across pull request/u);
+  assert.match(source, /Open status unknown/u);
+  assert.match(source, /legacy review predates PR-wide finding snapshots/u);
+});
+
+test("final-editor retry includes legacy reviewer tasks without reviewer ids", () => {
+  assert.match(source, /filter\(\(task\) => task\.role === "reviewer"\)/u);
+  assert.match(source, /task\.reviewer_id \|\| task\.reviewer_name \|\| task\.id/u);
 });

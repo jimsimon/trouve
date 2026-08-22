@@ -677,12 +677,14 @@ export const newThreadInheritanceForWorkspace = (
 export const resolveNewSessionBaseRef = (
   branches: readonly string[],
   preferredBaseRef = "",
-  repositoryHead = "",
+  repositoryDefaultBranch = "",
 ): string => {
   const preferred = nonEmpty(preferredBaseRef);
   if (preferred !== undefined && branches.includes(preferred)) return preferred;
-  const head = nonEmpty(repositoryHead);
-  if (head !== undefined) return branches.includes(head) ? head : "HEAD";
+  const defaultBranch = nonEmpty(repositoryDefaultBranch);
+  if (defaultBranch !== undefined) {
+    return branches.includes(defaultBranch) ? defaultBranch : "HEAD";
+  }
   if (branches.includes("main")) return "main";
   if (branches.includes("master")) return "master";
   return "HEAD";

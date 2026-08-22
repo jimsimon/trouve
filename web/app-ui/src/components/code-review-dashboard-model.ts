@@ -236,9 +236,7 @@ export const codeReviewNeedsAttention = (
   job: Pick<ReviewJobSummary, "status" | "open_issue_count">,
 ): boolean =>
   job.status === "succeeded" &&
-  job.open_issue_count !== undefined &&
-  job.open_issue_count !== null &&
-  job.open_issue_count > 0;
+  job.open_issue_count !== 0;
 
 /** Only absolute, credential-free HTTPS links may cross the native boundary. */
 export const safeCodeReviewHref = (value: string | null | undefined): string | undefined => {
