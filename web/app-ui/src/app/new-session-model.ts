@@ -470,7 +470,7 @@ export const resolveNewThreadDefaults = (
     ?? modes.find((candidate) => candidate.id === "code")
     ?? modes[0];
   const resolvedModelId = resolveNewSessionModel(overrides.modelId, mode, providers);
-  const automaticModelId = models.find((candidate) => candidate.id === "cursor/default")?.id;
+  const automaticModelId = models.find((candidate) => candidate.id.startsWith("auto/"))?.id;
   const resolvedModel = modelForSelection(models, resolvedModelId);
   const modelId = resolvedModel?.id
     ?? automaticModelId ?? models[0]?.id ?? "";

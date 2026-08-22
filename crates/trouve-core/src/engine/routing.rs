@@ -757,6 +757,25 @@ impl Engine {
             }
         };
         if cancel.is_cancelled() {
+            if !text.is_empty() {
+                self.store.append_event(
+                    scope.clone(),
+                    Event::AssistantMessage {
+                        turn,
+                        content: text.clone(),
+                    },
+                )?;
+            }
+            if !text.is_empty() || !reasoning.is_empty() {
+                self.store.append_message(
+                    &thread.id,
+                    &serde_json::to_value(Message::Assistant {
+                        content: text,
+                        tool_calls: Vec::new(),
+                        reasoning,
+                    })?,
+                )?;
+            }
             return Ok(RouteAttemptResult::Cancelled);
         }
         if let Some(error) = error {
@@ -940,6 +959,7 @@ impl Engine {
         let mut segment = String::new();
         let mut attempt_usage = Usage::default();
         let mut backend_error = None;
+        let mut approval_error = None;
         let mut backend_cancelled = false;
         let mut open_tools = HashSet::new();
         let mut side_effect_started = false;
@@ -1004,7 +1024,8 @@ impl Engine {
                             Ok(approved) => approved,
                             Err(error) => {
                                 let _ = responder.send(false);
-                                return Err(error);
+                                approval_error = Some(error);
+                                break;
                             }
                         };
                         if approved {
@@ -1026,7 +1047,8 @@ impl Engine {
                         Ok(approved) => approved,
                         Err(error) => {
                             let _ = responder.send(false);
-                            return Err(error);
+                            approval_error = Some(error);
+                            break;
                         }
                     };
                     if approved {
@@ -1535,6 +1557,8 @@ impl Engine {
             if !collaborator.terminal {
                 let reason = if cancel.is_cancelled() || backend_cancelled {
                     "turn cancelled".to_string()
+                } else if let Some(error) = approval_error.as_ref() {
+                    format!("parent approval failed: {error}")
                 } else if let Some(error) = backend_error.as_ref() {
                     format!("parent backend stream failed: {error}")
                 } else {
@@ -1552,6 +1576,10 @@ impl Engine {
         )
         .await;
         accounting.add_backend(&attempt_usage);
+
+        if let Some(error) = approval_error {
+            return Err(error);
+        }
 
         if let Some(error) = backend_error {
             if !segment.is_empty() {

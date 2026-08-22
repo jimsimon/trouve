@@ -663,7 +663,7 @@ fn automatic_model_name(selection: &str) -> Option<&str> {
 
 fn neutral_model_id(provider_model: &str) -> Option<String> {
     let id = provider_model.trim();
-    if id.is_empty() || id.contains('/') {
+    if id.is_empty() || id.split('/').any(|segment| segment.trim().is_empty()) {
         return None;
     }
     if matches!(
@@ -21761,7 +21761,7 @@ default_permission_mode = "ask"
     }
 
     #[test]
-    fn neutral_ids_merge_only_stable_unnamespaced_names() {
+    fn neutral_ids_merge_only_stable_catalog_names() {
         assert_eq!(
             neutral_model_id("gpt-5.6-sol").as_deref(),
             Some("gpt-5.6-sol")
@@ -21772,7 +21772,13 @@ default_permission_mode = "ask"
         );
         assert_eq!(neutral_model_id("default"), None);
         assert_eq!(neutral_model_id("AUTO"), None);
-        assert_eq!(neutral_model_id("openai/gpt-5.6-sol"), None);
+        assert_eq!(
+            neutral_model_id("anthropic/claude-sonnet-4.5").as_deref(),
+            Some("anthropic/claude-sonnet-4.5")
+        );
+        assert_eq!(neutral_model_id("/gpt-5.6-sol"), None);
+        assert_eq!(neutral_model_id("openai//gpt-5.6-sol"), None);
+        assert_eq!(neutral_model_id("openai/gpt-5.6-sol/"), None);
     }
 
     fn test_model_candidate(
@@ -21940,6 +21946,8 @@ default_permission_mode = "ask"
             assert!(validate_model_selection(invalid).is_err(), "{invalid}");
         }
         assert!(validate_model_selection("auto/gpt-5.6-sol").is_ok());
+        assert!(validate_model_selection("auto/anthropic/claude-sonnet-4.5").is_ok());
+        assert!(validate_model_selection("auto/anthropic//claude-sonnet-4.5").is_err());
         assert!(validate_model_selection("codex/gpt-5.6-sol").is_ok());
     }
 
@@ -22091,6 +22099,16 @@ default_permission_mode = "ask"
         assert_eq!(
             hosted.concrete_selection_id(),
             "openrouter/qwen2.5-coder:7b"
+        );
+
+        let namespaced = test_model_candidate("kilocode", "anthropic/claude-sonnet-4.5", true);
+        assert_eq!(
+            namespaced.automatic_selection_id().as_deref(),
+            Some("auto/anthropic/claude-sonnet-4.5")
+        );
+        assert_eq!(
+            namespaced.concrete_selection_id(),
+            "kilocode/anthropic/claude-sonnet-4.5"
         );
 
         let transport_owned = test_model_candidate("cursor", "default", false);

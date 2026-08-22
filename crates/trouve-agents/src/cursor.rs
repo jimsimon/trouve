@@ -320,6 +320,7 @@ impl AgentBackend for CursorBackend {
             ("anthropic", OptionsDialect::ClaudeCli),
             ("openai", OptionsDialect::CodexCli),
             ("google", OptionsDialect::Gemini),
+            ("xai", OptionsDialect::OpenAi),
         ]
         .into_iter()
         .find_map(|(provider, dialect)| {
@@ -2456,6 +2457,17 @@ mod tests {
             composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(true))
         );
+    }
+
+    #[test]
+    fn shared_model_identity_includes_catalog_backed_xai_models() {
+        let backend = CursorBackend::new("cursor", None, None);
+
+        assert_eq!(
+            backend.shared_model_identity("grok-4.5").as_deref(),
+            Some("grok-4.5")
+        );
+        assert_eq!(backend.shared_model_identity("grok-future"), None);
     }
 
     #[test]
