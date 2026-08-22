@@ -5680,6 +5680,50 @@ fn write_transaction(conn: &Connection) -> rusqlite::Result<rusqlite::Transactio
     rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
 }
 
+/// Close turns whose prompt acceptance committed before the process stopped.
+/// Their user message and shell are durable, so replay would duplicate intent.
+fn recover_accepted_prompts(conn: &Connection) -> Result<()> {
+    let accepted = {
+        let mut statement = conn.prepare(
+            "SELECT id, thread_id, accepted_turn
+             FROM queued_prompts
+             WHERE accepted_turn IS NOT NULL
+             ORDER BY thread_id, accepted_turn, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if accepted.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now();
+    let events = accepted
+        .into_iter()
+        .map(|(prompt_id, thread_id, turn)| {
+            let turn = u64::try_from(turn).context("accepted turn is negative")?;
+            let event = Event::TurnFailed {
+                turn,
+                error: "turn interrupted by server restart before completion".into(),
+            };
+            Ok(PendingEvent {
+                scope: Scope::Thread(thread_id),
+                ts: now,
+                payload: serde_json::to_string(&event)?,
+                event,
+                mutation: Some(StoreMutation::FinishQueuedPrompt { id: prompt_id }),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _ = insert_event_batch(conn, events.iter(), events.len(), std::iter::empty())?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -5692,14 +5736,9 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&mut conn)?;
-        // Accepted prompts already have their user transcript and turn shell
-        // durably committed. A crash may leave their queue tombstones behind,
-        // but redispatching them would duplicate the user turn. Only claims
-        // that never reached acceptance become visible again.
-        conn.execute(
-            "DELETE FROM queued_prompts WHERE accepted_turn IS NOT NULL",
-            [],
-        )?;
+        // Terminalize already-accepted prompts rather than replaying or
+        // silently discarding their in-flight lifecycle.
+        recover_accepted_prompts(&conn)?;
         conn.execute(
             "UPDATE queued_prompts SET claimed = 0
              WHERE claimed != 0 AND accepted_turn IS NULL",
@@ -5719,10 +5758,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&mut conn)?;
-        conn.execute(
-            "DELETE FROM queued_prompts WHERE accepted_turn IS NOT NULL",
-            [],
-        )?;
+        recover_accepted_prompts(&conn)?;
         conn.execute(
             "UPDATE queued_prompts SET claimed = 0
              WHERE claimed != 0 AND accepted_turn IS NULL",
@@ -13672,6 +13708,37 @@ impl Store {
         Ok(out)
     }
 
+    /// Replace the final accepted user row only after its attachment paths
+    /// exist. The tombstone and expected payload fence later transcript work.
+    pub fn materialize_accepted_prompt_message(
+        &self,
+        thread_id: &str,
+        prompt_id: &str,
+        turn: u64,
+        expected: &str,
+        materialized: &str,
+    ) -> Result<()> {
+        let turn = i64::try_from(turn).context("accepted turn exceeds SQLite range")?;
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE messages SET payload = ?5
+             WHERE thread_id = ?1
+               AND seq = (SELECT MAX(seq) FROM messages WHERE thread_id = ?1)
+               AND payload = ?4
+               AND EXISTS(
+                   SELECT 1 FROM queued_prompts
+                   WHERE id = ?2 AND thread_id = ?1 AND claimed = 1
+                     AND accepted_turn = ?3
+               )",
+            params![thread_id, prompt_id, turn, expected, materialized],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "accepted prompt {prompt_id} transcript changed before attachment materialization"
+        );
+        Ok(())
+    }
+
     /// Atomically replace a thread's provider transcript (context compaction).
     pub fn replace_messages(&self, thread_id: &str, payloads: &[serde_json::Value]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -13725,19 +13792,31 @@ impl Store {
         backend_session_id: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let tx = write_transaction(&conn)?;
+        tx.execute(
             "INSERT INTO backend_sessions
                  (thread_id, backend, backend_session_id, seen_messages)
-             VALUES (?1, ?2, ?3, 0)
+             VALUES (
+                 ?1, ?2, ?3,
+                 COALESCE(
+                     (SELECT seen_messages FROM backend_sessions
+                      WHERE thread_id = ?1 AND backend = ?2),
+                     (SELECT seen_messages FROM backend_sessions
+                      WHERE thread_id = ?1 AND backend = ''
+                        AND backend_session_id = ?3),
+                     0
+                 )
+             )
              ON CONFLICT(thread_id, backend)
                DO UPDATE SET backend_session_id = excluded.backend_session_id",
             params![thread_id, backend, backend_session_id],
         )?;
         // A properly keyed row supersedes any migrated legacy fallback.
-        conn.execute(
+        tx.execute(
             "DELETE FROM backend_sessions WHERE thread_id = ?1 AND backend = ''",
             params![thread_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -13753,7 +13832,8 @@ impl Store {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let seen = i64::try_from(seen).context("backend seen_messages exceeds SQLite range")?;
-        conn.execute(
+        let tx = write_transaction(&conn)?;
+        tx.execute(
             "INSERT INTO backend_sessions
                  (thread_id, backend, backend_session_id, seen_messages)
              VALUES (?1, ?2, ?3, ?4)
@@ -13764,10 +13844,11 @@ impl Store {
             params![thread_id, backend, backend_session_id, seen],
         )?;
         // A properly keyed row supersedes any migrated legacy fallback.
-        conn.execute(
+        tx.execute(
             "DELETE FROM backend_sessions WHERE thread_id = ?1 AND backend = ''",
             params![thread_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -17179,6 +17260,40 @@ mod tests {
     }
 
     #[test]
+    fn keyed_backend_session_preserves_matching_legacy_watermark() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_legacy_watermark");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO backend_sessions
+                    (thread_id, backend, backend_session_id, seen_messages)
+                 VALUES ('th_legacy_watermark', '', 'legacy-sess', 7)",
+                [],
+            )
+            .unwrap();
+
+        store
+            .set_backend_session("th_legacy_watermark", "cursor", "legacy-sess")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .backend_session("th_legacy_watermark", "cursor")
+                .unwrap(),
+            Some(("legacy-sess".into(), 7))
+        );
+        assert_eq!(
+            store
+                .backend_session("th_legacy_watermark", "claude")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn route_health_persists_backoff_success_and_config_reset() {
         let store = Store::open_in_memory().unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -17619,6 +17734,279 @@ mod tests {
         assert!(matches!(events[0].event, Event::TurnFailed { turn: 1, .. }));
     }
 
+    #[tokio::test]
+    async fn accepting_claimed_prompt_commits_marker_transcript_and_events() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_direct_accept");
+        let prompt = store
+            .enqueue_prompt("th_direct_accept", "accepted", &[])
+            .unwrap();
+        store
+            .claim_queued_prompt("th_direct_accept")
+            .unwrap()
+            .unwrap();
+        let message =
+            serde_json::to_string(&trouve_providers::Message::User(prompt.content.clone()))
+                .unwrap();
+
+        store
+            .append_events_accepting_claimed_prompt(
+                "th_direct_accept",
+                3,
+                &prompt.id,
+                message.clone(),
+                vec![Event::TurnStarted {
+                    turn: 3,
+                    mode: "code".into(),
+                    model: "provider/model".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let accepted_turn = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT accepted_turn FROM queued_prompts WHERE id = ?1",
+                params![prompt.id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap();
+        assert_eq!(accepted_turn, Some(3));
+        assert!(store.queued_prompts("th_direct_accept").unwrap().is_empty());
+        let materialized = serde_json::to_string(&trouve_providers::Message::User(
+            "accepted\n\n.trouve/attachments/at_1.txt".into(),
+        ))
+        .unwrap();
+        store
+            .materialize_accepted_prompt_message(
+                "th_direct_accept",
+                &prompt.id,
+                3,
+                &message,
+                &materialized,
+            )
+            .unwrap();
+        assert_eq!(
+            store.messages("th_direct_accept").unwrap(),
+            [serde_json::from_str::<serde_json::Value>(&materialized).unwrap()]
+        );
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread("th_direct_accept".into()), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_claimed_prompt_rolls_back_when_unclaimed_or_already_accepted() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_direct_accept_rollback");
+        let unclaimed = store
+            .enqueue_prompt("th_direct_accept_rollback", "unclaimed", &[])
+            .unwrap();
+        let event = Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "provider/model".into(),
+            thinking_level: None,
+            supports_steering: false,
+        };
+        let message =
+            serde_json::to_string(&trouve_providers::Message::User(unclaimed.content.clone()))
+                .unwrap();
+        assert!(
+            store
+                .append_events_accepting_claimed_prompt(
+                    "th_direct_accept_rollback",
+                    1,
+                    &unclaimed.id,
+                    message.clone(),
+                    vec![event.clone()],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.queued_prompts("th_direct_accept_rollback").unwrap(),
+            std::slice::from_ref(&unclaimed)
+        );
+        assert!(
+            store
+                .messages("th_direct_accept_rollback")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .events_after(&Scope::Thread("th_direct_accept_rollback".into()), 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .claim_queued_prompt("th_direct_accept_rollback")
+            .unwrap()
+            .unwrap();
+        store
+            .append_events_accepting_claimed_prompt(
+                "th_direct_accept_rollback",
+                1,
+                &unclaimed.id,
+                message.clone(),
+                vec![event.clone()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .append_events_accepting_claimed_prompt(
+                    "th_direct_accept_rollback",
+                    1,
+                    &unclaimed.id,
+                    message,
+                    vec![event],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.messages("th_direct_accept_rollback").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread("th_direct_accept_rollback".into()), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_and_finishing_claimed_prompt_commits_once() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_direct_cancel");
+        let prompt = store
+            .enqueue_prompt("th_direct_cancel", "cancelled", &[])
+            .unwrap();
+        store
+            .claim_queued_prompt("th_direct_cancel")
+            .unwrap()
+            .unwrap();
+        let message =
+            serde_json::to_string(&trouve_providers::Message::User(prompt.content.clone()))
+                .unwrap();
+
+        store
+            .append_events_accepting_and_finishing_queued_prompt(
+                "th_direct_cancel",
+                4,
+                &prompt.id,
+                message,
+                vec![Event::TurnCancelled { turn: 4 }],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.queued_prompt_thread(&prompt.id).unwrap().is_none());
+        assert_eq!(store.messages("th_direct_cancel").unwrap().len(), 1);
+        assert!(matches!(
+            store
+                .events_after(&Scope::Thread("th_direct_cancel".into()), 0)
+                .unwrap()
+                .as_slice(),
+            [EventEnvelope {
+                event: Event::TurnCancelled { turn: 4 },
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepting_and_finishing_rolls_back_for_invalid_claim_state() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_direct_cancel_rollback");
+        let prompt = store
+            .enqueue_prompt("th_direct_cancel_rollback", "cancelled", &[])
+            .unwrap();
+        let message =
+            serde_json::to_string(&trouve_providers::Message::User(prompt.content.clone()))
+                .unwrap();
+        assert!(
+            store
+                .append_events_accepting_and_finishing_queued_prompt(
+                    "th_direct_cancel_rollback",
+                    5,
+                    &prompt.id,
+                    message.clone(),
+                    vec![Event::TurnCancelled { turn: 5 }],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.queued_prompts("th_direct_cancel_rollback").unwrap(),
+            std::slice::from_ref(&prompt)
+        );
+        assert!(
+            store
+                .messages("th_direct_cancel_rollback")
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .claim_queued_prompt("th_direct_cancel_rollback")
+            .unwrap()
+            .unwrap();
+        store
+            .append_events_accepting_claimed_prompt(
+                "th_direct_cancel_rollback",
+                5,
+                &prompt.id,
+                message.clone(),
+                vec![Event::TurnStarted {
+                    turn: 5,
+                    mode: "code".into(),
+                    model: "provider/model".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .append_events_accepting_and_finishing_queued_prompt(
+                    "th_direct_cancel_rollback",
+                    5,
+                    &prompt.id,
+                    message,
+                    vec![Event::TurnCancelled { turn: 5 }],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.messages("th_direct_cancel_rollback").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread("th_direct_cancel_rollback".into()), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn terminal_event_and_prompt_release_commit_atomically() {
         let store = Store::open_in_memory().unwrap();
@@ -17858,7 +18246,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_consumes_accepted_prompt_tombstone_without_replaying_user_message() {
+    fn reopening_terminalizes_accepted_prompt_without_replaying_user_message() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("accepted-prompt-recovery.sqlite3");
         {
@@ -17913,6 +18301,14 @@ mod tests {
         );
         assert_eq!(reopened.messages("th_accept_reopen").unwrap().len(), 1);
         assert_eq!(reopened.last_turn("th_accept_reopen").unwrap(), 1);
+        let events = reopened
+            .events_after(&Scope::Thread("th_accept_reopen".into()), 0)
+            .unwrap();
+        assert!(matches!(
+            events.last().map(|event| &event.event),
+            Some(Event::TurnFailed { turn: 1, error })
+                if error == "turn interrupted by server restart before completion"
+        ));
     }
 
     #[test]

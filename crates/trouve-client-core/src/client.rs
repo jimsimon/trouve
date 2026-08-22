@@ -557,11 +557,18 @@ impl ProtocolClient {
         self.delete(&format!("/providers/{id}")).await
     }
 
-    pub async fn set_provider_order(&self, provider_ids: Vec<String>) -> Result<()> {
+    /// Replace provider routing priority using the full order observed by the
+    /// caller. The server rejects a stale snapshot instead of silently
+    /// overwriting a concurrent provider edit.
+    pub async fn set_provider_order(
+        &self,
+        provider_ids: Vec<String>,
+        expected_provider_ids: Vec<String>,
+    ) -> Result<()> {
         self.put_empty(
             "/config/provider-order",
             &SetProviderOrderRequest {
-                expected_provider_ids: None,
+                expected_provider_ids: Some(expected_provider_ids),
                 provider_ids,
             },
         )

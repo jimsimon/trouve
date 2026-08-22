@@ -204,9 +204,22 @@ impl Engine {
         {
             tracing::warn!("compaction failed for {}: {error}", thread.id);
         }
-        // The first backend attempt must see the same post-compaction
-        // transcript as native execution, excluding the current user message
-        // that is carried separately in the backend prompt.
+        // Materialization stays behind ToolExecutor and happens once before
+        // any cross-adapter handoff, so every route sees the same safe paths.
+        let materialized = self
+            .materialize_attachments_for_turn(&session, &attachments, &cancel)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.publish_materialized_attachment_paths(
+            &thread.id,
+            turn,
+            &prompt.id,
+            &prompt.content,
+            &prompt.attachments,
+        )?;
+        // The first backend attempt must see the same post-compaction,
+        // post-materialization transcript as native execution, excluding the
+        // current user message carried separately in the backend prompt.
         let mut history_before = self.store.messages(&thread.id)?;
         let current_user = history_before
             .pop()
@@ -217,13 +230,6 @@ impl Engine {
             current_user == expected_user,
             "accepted user message is not the final transcript row before backend routing"
         );
-
-        // Materialization stays behind ToolExecutor and happens once before
-        // any cross-adapter handoff, so every route sees the same safe paths.
-        let materialized = self
-            .materialize_attachments_for_turn(&session, &attachments, &cancel)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
         let (images, files): (Vec<_>, Vec<_>) = materialized
             .into_iter()
             .partition(|file| file.attachment.mime.starts_with("image/"));

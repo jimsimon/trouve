@@ -1130,12 +1130,13 @@ pub struct MaterializedAttachment {
     pub absolute_path: PathBuf,
 }
 
-/// Stable worktree-relative path reserved for an accepted attachment. This
-/// is pure metadata derivation so the engine can durably record the exact
-/// provider transcript before the executor performs the filesystem copy.
+/// Stable worktree-relative path for a successfully materialized attachment.
 pub(crate) fn materialized_attachment_relative_path(
     attachment: &trouve_protocol::Attachment,
 ) -> Result<PathBuf, String> {
+    if attachment.id.is_empty() || matches!(attachment.id.as_str(), "." | "..") {
+        return Err("attachment id cannot form an opaque materialized path".into());
+    }
     let ext = Path::new(&attachment.name)
         .extension()
         .and_then(|extension| extension.to_str())
@@ -2771,9 +2772,9 @@ impl ToolExecutor for LocalToolExecutor {
                 let bytes =
                     read_attachment_secure(&source_root, &file.source, file.attachment.size_bytes)?;
                 let relative_path = materialized_attachment_relative_path(&file.attachment)?;
-                let filename = relative_path
-                    .file_name()
-                    .expect("materialized attachment path always has a file name");
+                let filename = relative_path.file_name().ok_or_else(|| {
+                    "materialized attachment path does not have a file name".to_string()
+                })?;
                 let absolute_path = materialized_root.join(filename);
                 ensure_materialized_attachment(&materialized_root, &absolute_path, &bytes)?;
                 out.push(MaterializedAttachment {
@@ -3622,6 +3623,36 @@ impl ToolExecutor for LocalToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialized_attachment_path_rejects_empty_and_parent_components() {
+        for id in ["", ".", ".."] {
+            let attachment = trouve_protocol::Attachment {
+                id: id.into(),
+                name: "attachment".into(),
+                mime: "application/octet-stream".into(),
+                size_bytes: 0,
+            };
+            assert!(
+                materialized_attachment_relative_path(&attachment).is_err(),
+                "accepted unsafe attachment id {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_attachment_path_is_an_opaque_relative_child() {
+        let attachment = trouve_protocol::Attachment {
+            id: "at_safe-1".into(),
+            name: "Screenshot.PNG".into(),
+            mime: "image/png".into(),
+            size_bytes: 3,
+        };
+        assert_eq!(
+            materialized_attachment_relative_path(&attachment).unwrap(),
+            PathBuf::from(".trouve/attachments/at_safe-1.png")
+        );
+    }
 
     #[test]
     fn review_diff_file_preserves_two_field_construction() {

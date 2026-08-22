@@ -40,6 +40,7 @@ test("model discovery does not block unrelated repository and persona saves", ()
     configurationLoader,
     /Promise\.allSettled\(\[\s*getModels\(\)/u,
   );
+  assert.match(configurationLoader, /current\.loaded \? current : \{ \.\.\.current, error \}/u);
   assert.doesNotMatch(
     repositoryEditor,
     /disabled=\{busy \|\| !modelsLoaded \|\| reviewerPolicyInvalid/u,

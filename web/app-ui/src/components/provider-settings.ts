@@ -26,14 +26,8 @@ const PROVIDER_RETRY_MS = 5_000;
 const CUSTOM_PROVIDER = "__custom__";
 const DEFAULT_LOGIN_POLL_MS = 1_000;
 const DEFAULT_LOGIN_POLL_ATTEMPTS = 180;
-const ROUTING_UPDATED_WITHOUT_USAGE =
-  "Routing priority updated. Subscription usage is unavailable; retrying automatically.";
-
-interface ProviderLoadResult {
-  readonly providerStateLoaded: boolean;
-  readonly healthLoaded: boolean;
-}
-
+const PRESETS_ERROR = "Provider presets could not be loaded. Retrying automatically.";
+const USAGE_ERROR = "Providers loaded, but subscription usage is unavailable.";
 export const validatedHttpsUrl = (value: string): string | undefined => {
   try {
     const url = new URL(value);
@@ -63,6 +57,17 @@ export interface ProviderSubmission {
   readonly request: ProtocolUpsertProviderRequest;
 }
 
+export const normalizedProviderOrder = (
+  order: readonly string[],
+  configuredIds: readonly string[],
+): readonly string[] => {
+  const configured = new Set(configuredIds);
+  return [
+    ...order.filter((id, index) => configured.has(id) && order.indexOf(id) === index),
+    ...configuredIds.filter((id) => !order.includes(id)),
+  ];
+};
+
 export const movedProviderOrder = (
   order: readonly string[],
   configuredIds: readonly string[],
@@ -70,11 +75,7 @@ export const movedProviderOrder = (
   direction: -1 | 1,
   movableIds: readonly string[] = configuredIds,
 ): readonly string[] => {
-  const configured = new Set(configuredIds);
-  const normalized = [
-    ...order.filter((id, index) => configured.has(id) && order.indexOf(id) === index),
-    ...configuredIds.filter((id) => !order.includes(id)),
-  ];
+  const normalized = [...normalizedProviderOrder(order, configuredIds)];
   const movable = new Set(movableIds);
   const slots = normalized
     .map((id, index) => movable.has(id) ? index : -1)
@@ -437,6 +438,8 @@ export class TrouveProviderSettings extends LitElement {
   #noticeIsError = false;
   #loading = true;
   #loadGeneration = 0;
+  #knownProvidersPending: Promise<readonly ProtocolKnownProvider[]> | undefined;
+  #healthPending: Promise<readonly ProtocolSubscriptionHealth[]> | undefined;
   #login: ActiveLogin | undefined;
   #loginPoller: ProviderLoginPoller | undefined;
   #refreshTimer: ReturnType<typeof setInterval> | undefined;
@@ -470,6 +473,8 @@ export class TrouveProviderSettings extends LitElement {
     const services = this.#services.value;
     if (services !== undefined && services !== this.#loadedServices) {
       this.#loadedServices = services;
+      this.#knownProvidersPending = undefined;
+      this.#healthPending = undefined;
       void this.#load(true);
     }
   }
@@ -663,17 +668,14 @@ export class TrouveProviderSettings extends LitElement {
   #renderRoutingPriority(configured: readonly ProtocolProviderInfo[]) {
     const ids = configured.map((provider) => provider.id);
     const allIds = this.#providers?.providers.map((provider) => provider.id) ?? ids;
-    const order = movedProviderOrder(
+    const order = normalizedProviderOrder(
       this.#providers?.provider_order ?? [],
       allIds,
-      "",
-      1,
-      ids,
     ).filter((providerId) => ids.includes(providerId));
     return html`
       <section class="settings-card routing-priority" aria-labelledby="routing-priority-title">
         <h3 id="routing-priority-title">Automatic routing priority</h3>
-        <p>New automatic selections prefer the first healthy route. Threads stay on that provider until it fails or runs out of capacity.</p>
+        <p>Automatic selections prefer the first healthy route and stay there until it fails.</p>
         <div class="priority-list">
           ${order.map((providerId, index) => html`
             <div class="priority-row">
@@ -873,18 +875,45 @@ export class TrouveProviderSettings extends LitElement {
     `;
   }
 
-  async #load(forceHealth = true): Promise<ProviderLoadResult> {
+  async #load(forceHealth = true): Promise<boolean> {
     const services = this.#services.value;
-    if (services === undefined) {
-      return { providerStateLoaded: false, healthLoaded: false };
-    }
+    if (services === undefined) return false;
     this.#clearRetry();
     const generation = ++this.#loadGeneration;
     this.#loading = true;
     this.requestUpdate();
-    let healthLoaded = false;
-    void services.protocol.knownProviders().then((knownProviders) => {
-      if (generation !== this.#loadGeneration || !this.isConnected) return;
+    this.#loadKnownProviders(services);
+    this.#loadHealth(services, forceHealth);
+    const [providers] = await Promise.allSettled([services.protocol.providers()]);
+    if (generation !== this.#loadGeneration || !this.isConnected) return false;
+    this.#loading = false;
+    if (providers.status === "fulfilled") this.#providers = providers.value;
+    if (providers.status === "rejected") {
+      this.#setNotice("Provider settings could not be loaded. Retrying automatically.", true);
+      this.#scheduleRetry();
+    } else if (
+      this.#notice === "Provider settings could not be loaded. Retrying automatically."
+    ) {
+      this.#setNotice("", false);
+    }
+    this.requestUpdate();
+    // Provider state is authoritative for mutations. Optional resource loads
+    // publish independently and never keep a committed change busy.
+    const providerStateLoaded = providers.status === "fulfilled";
+    if (providerStateLoaded && this.#busy === "provider-order-sync") {
+      this.#busy = "";
+      this.#setNotice("Automatic routing priority was reloaded from the server.", false);
+      this.requestUpdate();
+    }
+    return providerStateLoaded;
+  }
+
+  #loadKnownProviders(services: AppServices): void {
+    if (this.#knownProvidersPending !== undefined) return;
+    const request = services.protocol.knownProviders();
+    this.#knownProvidersPending = request;
+    void request.then((knownProviders) => {
+      if (services !== this.#services.value || !this.isConnected) return;
       this.#knownProviders = knownProviders;
       const subscriptions = this.#knownProviders.filter(
         (provider) => category(provider) === "subscription" || provider.auth === "oauth" || provider.auth === "cli",
@@ -899,61 +928,46 @@ export class TrouveProviderSettings extends LitElement {
       if (!api.some((provider) => provider.id === this.#apiPresetId) && this.#apiPresetId !== CUSTOM_PROVIDER) {
         this.#apiPresetId = api[0]?.id ?? CUSTOM_PROVIDER;
       }
-      if (this.#notice === "Provider presets could not be loaded. Retrying automatically.") {
+      if (this.#notice === PRESETS_ERROR) {
         this.#setNotice("", false);
       }
       this.requestUpdate();
-    }).catch(() => {
-      if (generation !== this.#loadGeneration || !this.isConnected) return;
-      this.#setNotice("Provider presets could not be loaded. Retrying automatically.", true);
-      this.#scheduleRetry();
-      this.requestUpdate();
-    });
-    void services.subscriptionHealth.refresh(forceHealth ? "force" : "if-stale").then((health) => {
-      if (generation !== this.#loadGeneration || !this.isConnected) return;
-      healthLoaded = true;
-      this.#health = health;
+    }, () => {
+      if (services !== this.#services.value || !this.isConnected) return;
       if (
-        this.#notice === "Providers loaded, but subscription usage is unavailable."
-        || this.#notice === ROUTING_UPDATED_WITHOUT_USAGE
-      ) {
+        this.#notice === ""
+        || this.#notice === PRESETS_ERROR
+      ) this.#setNotice(PRESETS_ERROR, true);
+      this.#scheduleRetry();
+      this.requestUpdate();
+    }).then(() => {
+      if (this.#knownProvidersPending === request) this.#knownProvidersPending = undefined;
+    });
+  }
+
+  #loadHealth(services: AppServices, force: boolean): void {
+    if (this.#healthPending !== undefined) return;
+    const request = services.subscriptionHealth.refresh(force ? "force" : "if-stale");
+    this.#healthPending = request;
+    void request.then((health) => {
+      if (services !== this.#services.value || !this.isConnected) return;
+      this.#health = health;
+      if (this.#notice === USAGE_ERROR) {
         this.#setNotice("", false);
       }
       this.requestUpdate();
-    }).catch(() => {
-      if (generation !== this.#loadGeneration || !this.isConnected) return;
-      this.#setNotice("Providers loaded, but subscription usage is unavailable.", false);
+    }, () => {
+      if (services !== this.#services.value || !this.isConnected) return;
+      if (
+        this.#notice === ""
+        || this.#notice === USAGE_ERROR
+      ) this.#setNotice(USAGE_ERROR, false);
       this.#scheduleRetry();
       this.requestUpdate();
+    }).then(() => {
+      if (this.#healthPending !== request) return;
+      this.#healthPending = undefined;
     });
-    const [providers] = await Promise.allSettled([services.protocol.providers()]);
-    if (generation !== this.#loadGeneration || !this.isConnected) {
-      return { providerStateLoaded: false, healthLoaded: false };
-    }
-    this.#loading = false;
-    if (providers.status === "fulfilled") this.#providers = providers.value;
-    if (providers.status === "rejected") {
-      this.#setNotice("Provider settings could not be loaded. Retrying automatically.", true);
-      this.#scheduleRetry();
-    } else if (
-      this.#notice === "Provider settings could not be loaded. Retrying automatically."
-    ) {
-      this.#setNotice("", false);
-    }
-    this.requestUpdate();
-    // Provider state is authoritative for mutations. Subscription usage is an
-    // independent enhancement and must not make a committed provider change
-    // look as though it is still saving or failed.
-    const providerStateLoaded = providers.status === "fulfilled";
-    if (providerStateLoaded && this.#busy === "provider-order-sync") {
-      this.#busy = "";
-      this.#setNotice("Automatic routing priority was reloaded from the server.", false);
-      this.requestUpdate();
-    }
-    return {
-      providerStateLoaded,
-      healthLoaded,
-    };
   }
 
   #scheduleRetry(): void {
@@ -1089,22 +1103,15 @@ export class TrouveProviderSettings extends LitElement {
       this.#providers = { ...providers, provider_order: [...providerIds] };
       this.requestUpdate();
       const loaded = await this.#load(false);
-      if (loaded.providerStateLoaded) {
-        this.#setNotice(
-          loaded.healthLoaded
-            ? "Routing priority updated."
-            : ROUTING_UPDATED_WITHOUT_USAGE,
-          false,
-        );
-      }
+      if (loaded) this.#setNotice("Routing priority updated.", false);
     } catch {
       // The response may have been lost after the server committed the PUT.
       // Re-read the authoritative order while the controls remain disabled so
       // the next move is never based on an optimistic or stale snapshot.
       const loaded = await this.#load(false);
-      orderConfirmed = loaded.providerStateLoaded;
+      orderConfirmed = loaded;
       this.#setNotice(
-        loaded.providerStateLoaded
+        loaded
           ? "Routing priority could not be saved."
           : "Routing priority could not be saved or confirmed. Retrying automatically.",
         true,

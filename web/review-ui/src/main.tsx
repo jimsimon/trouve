@@ -438,7 +438,9 @@ function App() {
           })
           .catch((cause) => {
             const error = cause instanceof Error ? cause.message : String(cause);
-            setModelCatalog((current) => ({ ...current, error }));
+            setModelCatalog((current) =>
+              current.loaded ? current : { ...current, error },
+            );
           });
         staticModelLoadRef.current = staticModels;
         void staticModels.finally(() => {

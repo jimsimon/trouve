@@ -9,6 +9,7 @@ import {
   ProviderLoginPoller,
   automaticRoutingProviders,
   movedProviderOrder,
+  normalizedProviderOrder,
   providerSubmission,
   validatedHttpsUrl,
   type LoginPollScheduler,
@@ -64,6 +65,13 @@ describe("provider settings security boundaries", () => {
       .toEqual(["codex", "cursor", "openai"]);
     expect(movedProviderOrder(["codex", "openai"], ["openai", "codex"], "codex", -1))
       .toEqual(["codex", "openai"]);
+  });
+
+  it("normalizes stale, duplicate, and omitted provider ids", () => {
+    expect(normalizedProviderOrder(
+      ["codex", "stale", "codex"],
+      ["openai", "codex", "cursor"],
+    )).toEqual(["codex", "openai", "cursor"]);
   });
 
   it("moves hosted providers without changing local-provider slots", () => {

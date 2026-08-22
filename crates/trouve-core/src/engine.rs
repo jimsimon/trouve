@@ -4343,6 +4343,7 @@ impl Engine {
             .clone()
     }
 
+    #[cfg(test)]
     fn provider_generation(&self, id: &str) -> u64 {
         self.provider_generations
             .lock()
@@ -9700,6 +9701,47 @@ impl Engine {
         Ok((provider, model_name.to_string()))
     }
 
+    /// Resolve one pinned execution route while the provider-generation lock
+    /// fences registry replacement. The executor instance and generation must
+    /// come from the same snapshot: otherwise an old Arc can be attributed to
+    /// a newly configured provider generation when the registry changes
+    /// between two independent reads.
+    fn resolve_concrete_executor(
+        &self,
+        model: &str,
+    ) -> Result<(String, u64, ModelExecutor, String), EngineError> {
+        let (provider_id, model_name) = model.split_once('/').ok_or_else(|| {
+            EngineError::BadRequest(format!(
+                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
+            ))
+        })?;
+        let (providers, backends) = self.provider_registry_snapshot();
+        if let Some((id, generation, backend)) =
+            backends.into_iter().find(|(id, _, _)| id == provider_id)
+        {
+            return Ok((
+                id,
+                generation,
+                ModelExecutor::Backend(backend),
+                model_name.to_string(),
+            ));
+        }
+        if let Some((id, generation, provider)) =
+            providers.into_iter().find(|(id, _, _)| id == provider_id)
+        {
+            return Ok((
+                id,
+                generation,
+                ModelExecutor::Native(provider),
+                model_name.to_string(),
+            ));
+        }
+        Err(EngineError::BadRequest(format!(
+            "provider {provider_id} is not configured (configured: {})",
+            self.provider_ids().join(", ")
+        )))
+    }
+
     pub(crate) async fn resolve_model_info(
         &self,
         model: &str,
@@ -10546,6 +10588,32 @@ impl Engine {
             })
             .await
             .map_err(|error| EngineError::Internal(anyhow!(error)))
+    }
+
+    /// Publish attachment paths into the provider transcript only after the
+    /// executor has created those files. Before this transition the accepted
+    /// transcript contains only the user's original text, so an early setup
+    /// failure or restart never advertises a nonexistent worktree path.
+    fn publish_materialized_attachment_paths(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        prompt_id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+    ) -> Result<()> {
+        if attachments.is_empty() {
+            return Ok(());
+        }
+        let expected = serde_json::to_string(&Message::User(content.to_string()))?;
+        let materialized = serde_json::to_string(&accepted_user_message(content, attachments)?)?;
+        self.store.materialize_accepted_prompt_message(
+            thread_id,
+            prompt_id,
+            turn,
+            &expected,
+            &materialized,
+        )
     }
 
     /// Publish the thread's current queue on its event stream.
@@ -11439,17 +11507,6 @@ impl Engine {
             .turn_scheduler
             .acquire(&thread.model, background, &cancel)
             .await?;
-        let provider_id = thread
-            .model
-            .split_once('/')
-            .map_or(thread.model.as_str(), |(provider, _)| provider);
-        *concrete_attempt.provider_generation.lock().unwrap() = Some((
-            provider_id.to_string(),
-            self.provider_generation(provider_id),
-        ));
-        concrete_attempt
-            .attempt_order
-            .store(self.turn_scheduler.next_attempt_order(), Ordering::Release);
         if background
             && let Some(progress) = self
                 .store
@@ -11470,17 +11527,26 @@ impl Engine {
 
         let _turn_capacity = turn_capacity;
 
+        let (provider_id, provider_generation, executor, model_name) = self
+            .resolve_concrete_executor(&thread.model)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        *concrete_attempt.provider_generation.lock().unwrap() =
+            Some((provider_id.clone(), provider_generation));
+        concrete_attempt
+            .attempt_order
+            .store(self.turn_scheduler.next_attempt_order(), Ordering::Release);
+
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
         // stays held; mutation tools take the exclusive execution lane.
-        if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
+        if let ModelExecutor::Backend(backend) = executor {
             return self
                 .run_backend_turn(
                     &session,
                     thread,
                     turn,
                     &mode,
-                    &backend_id,
+                    &provider_id,
                     backend,
                     model_name,
                     content,
@@ -11492,9 +11558,9 @@ impl Engine {
                 .await;
         }
 
-        let (provider, model_name) = self
-            .resolve_provider(&thread.model)
-            .map_err(|e| anyhow!(e.to_string()))?;
+        let ModelExecutor::Native(provider) = executor else {
+            unreachable!("backend execution returned above")
+        };
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         let model_catalog = tokio::select! {
             biased;
@@ -11523,6 +11589,13 @@ impl Engine {
             .materialize_attachments_for_turn(&session, &attachments, &cancel)
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
+        self.publish_materialized_attachment_paths(
+            &thread.id,
+            turn,
+            &prompt.id,
+            &prompt.content,
+            &prompt.attachments,
+        )?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
             bail!("queued prompt {} vanished before turn start", prompt.id);
         }
@@ -13433,6 +13506,20 @@ impl Engine {
         // A vendor session retains the tools it was created with. Restricted
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
+        // Materialize before reading the accepted transcript. The durable row
+        // starts as the user's unannotated text and gains worktree paths only
+        // after those paths are real.
+        let materialized = self
+            .materialize_attachments_for_turn(session, &attachments, &cancel)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.publish_materialized_attachment_paths(
+            &thread.id,
+            turn,
+            queued_prompt_id,
+            &content,
+            &attachments,
+        )?;
         let mut submitted_transcript_messages = 0;
         let (resume, handoff) = if tools_enabled {
             let resume = self.store.backend_session(&thread.id, backend_id)?;
@@ -13478,10 +13565,6 @@ impl Engine {
         // Images go to the vendor protocol as native image inputs; other
         // files become path references in the prompt text (vendor agents
         // run on this filesystem and can read them with their tools).
-        let materialized = self
-            .materialize_attachments_for_turn(session, &attachments, &cancel)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
         let (images, files): (Vec<_>, Vec<_>) = materialized
             .into_iter()
             .partition(|file| file.attachment.mime.starts_with("image/"));
@@ -16421,11 +16504,8 @@ fn annotate_attachments(
 }
 
 fn accepted_prompt_message(prompt: &trouve_protocol::QueuedPrompt) -> Result<String> {
-    serde_json::to_string(&accepted_user_message(
-        &prompt.content,
-        &prompt.attachments,
-    )?)
-    .context("serializing accepted user prompt")
+    serde_json::to_string(&Message::User(prompt.content.clone()))
+        .context("serializing accepted user prompt")
 }
 
 fn accepted_user_message(
@@ -23046,6 +23126,54 @@ default_permission_mode = "ask"
 
         assert!(applied.is_none());
         assert!(store.route_health().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concrete_executor_snapshot_keeps_instance_and_generation_together() {
+        let data = tempfile::tempdir().unwrap();
+        let old_provider: Arc<dyn Provider> = Arc::new(CatalogTestProvider {
+            live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let replacement: Arc<dyn Provider> = Arc::new(CatalogTestProvider {
+            live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config::default(),
+        )
+        .with_provider("provider", old_provider.clone());
+
+        let (provider_id, stale_generation, executor, model) =
+            engine.resolve_concrete_executor("provider/model").unwrap();
+        let ModelExecutor::Native(resolved_provider) = executor else {
+            panic!("expected a native provider")
+        };
+        assert!(Arc::ptr_eq(&resolved_provider, &old_provider));
+        assert_eq!(provider_id, "provider");
+        assert_eq!(model, "model");
+
+        // Model the same fenced registry replacement performed by provider
+        // CRUD while the already-resolved old turn remains in flight.
+        {
+            let mut generations = engine.provider_generations.lock().unwrap();
+            engine
+                .providers
+                .write()
+                .unwrap()
+                .insert("provider".into(), replacement);
+            *generations.entry("provider".into()).or_default() += 1;
+        }
+
+        let attributed_to_replacement = std::sync::atomic::AtomicBool::new(false);
+        let applied = engine
+            .with_current_provider_generation("provider", stale_generation, || {
+                attributed_to_replacement.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        assert!(applied.is_none());
+        assert!(!attributed_to_replacement.load(Ordering::SeqCst));
     }
 
     #[test]
