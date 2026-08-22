@@ -20194,16 +20194,18 @@ mod tests {
         let _turn = tracker.begin_turn("thread", 8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let args = serde_json::json!({ "path": "README.md" });
-        let claim = tracker.claim_after_dispatch(
+        let mut claim = Box::pin(tracker.claim_after_dispatch(
             "thread",
             8,
             "vendor-call",
             "mcp__trouve__read_file",
             &args,
             &cancel,
+        ));
+        assert!(
+            matches!(futures::poll!(claim.as_mut()), std::task::Poll::Pending),
+            "bridge claim must reach its notification wait before cancellation"
         );
-        tokio::pin!(claim);
-        tokio::task::yield_now().await;
         cancel.cancel();
         assert!(
             tokio::time::timeout(Duration::from_millis(50), claim)
@@ -20219,16 +20221,18 @@ mod tests {
         let _turn = tracker.begin_turn("thread", 8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let args = serde_json::json!({ "path": "README.md" });
-        let claim = tracker.claim_after_dispatch(
+        let mut claim = Box::pin(tracker.claim_after_dispatch(
             "thread",
             8,
             "vendor-call",
             "mcp__trouve__read_file",
             &args,
             &cancel,
+        ));
+        assert!(
+            matches!(futures::poll!(claim.as_mut()), std::task::Poll::Pending),
+            "bridge claim must reach its notification wait before the race"
         );
-        tokio::pin!(claim);
-        tokio::task::yield_now().await;
 
         // Make both select branches ready before polling the claim again.
         tracker.register("thread", 8, "canonical-call", "read_file", &args);
