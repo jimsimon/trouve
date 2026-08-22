@@ -1468,8 +1468,8 @@ return errors === 0;
 validate85.evaluated = {"props":{"cursor":true,"summaries":true},"dynamicProps":false,"dynamicItems":false};
 
 export const workspace = validate97;
-const schema39 = {"$id":"urn:trouve:protocol-validator:workspace","$ref":"urn:trouve:protocol-openapi#/components/schemas/Workspace"};
-const schema40 = {"type":"object","required":["id","name","path"],"properties":{"id":{"$ref":"#/components/schemas/String"},"name":{"type":"string"},"path":{"type":"string"}}};
+const schema39 = {"$id":"urn:trouve:protocol-validator:workspace","$ref":"urn:trouve:protocol-openapi#/components/schemas/WorkspaceListItem"};
+const schema40 = {"type":"object","description":"Workspace presentation returned by the list and registration endpoints.\nSeparate checkouts and linked worktrees share repository_key when they\nresolve to the same configured remote or local Git common directory.","required":["id","name","path"],"properties":{"id":{"$ref":"#/components/schemas/String"},"name":{"type":"string"},"path":{"type":"string"}}};
 
 function validate98(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -1560,7 +1560,7 @@ return errors === 0;
 validate97.evaluated = {"props":{"id":true,"name":true,"path":true},"dynamicProps":false,"dynamicItems":false};
 
 export const workspaces = validate101;
-const schema41 = {"$id":"urn:trouve:protocol-validator:workspaces","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/Workspace"}};
+const schema41 = {"$id":"urn:trouve:protocol-validator:workspaces","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/WorkspaceListItem"}};
 
 function validate102(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;

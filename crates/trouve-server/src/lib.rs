@@ -50,7 +50,7 @@ use trouve_protocol::{
     ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
     UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
     UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertPersonaRequest,
-    UpsertProviderRequest, UsageSummary, Workspace,
+    UpsertProviderRequest, UsageSummary, Workspace, WorkspaceListItem,
 };
 use utoipa::OpenApi;
 
@@ -235,6 +235,7 @@ impl IntoResponse for ApiError {
         ServerInfo,
         RegisterWorkspaceRequest,
         Workspace,
+        WorkspaceListItem,
         BranchList,
         CreateSessionRequest,
         Session,
@@ -1213,18 +1214,18 @@ async fn openapi() -> Json<serde_json::Value> {
 }
 
 #[utoipa::path(post, path = "/v1/workspaces", request_body = RegisterWorkspaceRequest,
-    responses((status = 200, body = Workspace), (status = 400, body = ErrorBody)))]
+    responses((status = 200, body = WorkspaceListItem), (status = 400, body = ErrorBody)))]
 async fn register_workspace(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<RegisterWorkspaceRequest>,
-) -> Result<Json<Workspace>, ApiError> {
+) -> Result<Json<WorkspaceListItem>, ApiError> {
     Ok(Json(engine.register_workspace(&req.path, req.name)?))
 }
 
-#[utoipa::path(get, path = "/v1/workspaces", responses((status = 200, body = [Workspace])))]
+#[utoipa::path(get, path = "/v1/workspaces", responses((status = 200, body = [WorkspaceListItem])))]
 async fn list_workspaces(
     State(engine): State<Arc<Engine>>,
-) -> Result<Json<Vec<Workspace>>, ApiError> {
+) -> Result<Json<Vec<WorkspaceListItem>>, ApiError> {
     Ok(Json(engine.list_workspaces()?))
 }
 

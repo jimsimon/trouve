@@ -216,6 +216,20 @@ pub struct Workspace {
     pub path: String,
 }
 
+/// Workspace presentation returned by the list and registration endpoints.
+/// Separate checkouts and linked worktrees share repository_key when they
+/// resolve to the same configured remote or local Git common directory.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkspaceListItem {
+    pub id: WorkspaceId,
+    pub name: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_name: Option<String>,
+}
+
 // --- sessions ------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

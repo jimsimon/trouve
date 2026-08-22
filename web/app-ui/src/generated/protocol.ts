@@ -5062,6 +5062,18 @@ export interface components {
             name: string;
             path: string;
         };
+        /**
+         * @description Workspace presentation returned by the list and registration endpoints.
+         *     Separate checkouts and linked worktrees share repository_key when they
+         *     resolve to the same configured remote or local Git common directory.
+         */
+        WorkspaceListItem: {
+            id: components["schemas"]["String"];
+            name: string;
+            path: string;
+            repository_key?: string | null;
+            repository_name?: string | null;
+        };
     };
     responses: never;
     parameters: never;
@@ -8785,7 +8797,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Workspace"][];
+                    "application/json": components["schemas"]["WorkspaceListItem"][];
                 };
             };
         };
@@ -8808,7 +8820,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Workspace"];
+                    "application/json": components["schemas"]["WorkspaceListItem"];
                 };
             };
             400: {
