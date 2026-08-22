@@ -169,6 +169,7 @@ export class HostClientError extends Error {
       | "invalid-request"
       | "not-bootstrapped"
       | "capability-unavailable"
+      | "video-capacity"
       | "action-busy",
     message: string,
   ) {
@@ -631,6 +632,12 @@ export class HostClient {
       throw new HostClientError("request-failed", "desktop video playback failed");
     }
     if (!result.response.ok) {
+      if (result.response.status === 507) {
+        throw new HostClientError(
+          "video-capacity",
+          "temporary video playback capacity is full",
+        );
+      }
       throw new HostClientError("request-failed", "desktop video playback failed");
     }
   }

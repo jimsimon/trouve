@@ -64,6 +64,7 @@ import {
   chatPreferencesFromHost,
   generalPreferencesFromHost,
   HostClient,
+  HostClientError,
   notificationPreferencesFromHost,
   pullRequestGroupOrderFromHost,
   resumePreferencesFromHost,
@@ -2567,8 +2568,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       }
       void this.#pendingVideoAttachment(event.detail)
         .then((attachment) => host.openVideoAttachment(attachment))
-        .catch(() => {
-          this.#shellNotice = "The video could not be opened in the system player.";
+        .catch((error: unknown) => {
+          this.#shellNotice = error instanceof HostClientError && error.kind === "video-capacity"
+            ? "Temporary video playback capacity is full. Restart trouve to open a different video."
+            : "The video could not be opened in the system player.";
           this.requestUpdate();
         });
       return;

@@ -829,6 +829,12 @@ export interface operations {
                 };
                 content?: never;
             };
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     pick_directory: {

@@ -686,7 +686,8 @@ impl ExternalHttpsUrl {
 }
 
 type ExternalHttpsOpener = dyn Fn(&ExternalHttpsUrl) -> Result<(), String> + Send + Sync + 'static;
-type VideoAttachmentOpener = dyn Fn(NativeAttachment) -> Result<(), String> + Send + Sync + 'static;
+type VideoAttachmentOpener =
+    dyn Fn(NativeAttachment) -> Result<(), VideoAttachmentOpenError> + Send + Sync + 'static;
 type DirectoryPickerFuture =
     Pin<Box<dyn Future<Output = Result<Option<PathBuf>, String>> + Send + 'static>>;
 type DirectoryPicker = dyn Fn() -> DirectoryPickerFuture + Send + Sync + 'static;
@@ -931,6 +932,15 @@ impl NativeAttachment {
     }
 }
 
+/// Failure classes exposed by the app-owned external-video adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum VideoAttachmentOpenError {
+    #[error("temporary video playback capacity is full")]
+    Capacity,
+    #[error("{0}")]
+    Failed(String),
+}
+
 pub(crate) fn validate_native_attachment(
     attachment: &NativeAttachment,
 ) -> Result<(), HostValidationError> {
@@ -1051,7 +1061,7 @@ impl HostNativeActions {
 
     pub fn with_video_attachment_opener<F>(mut self, opener: F) -> Self
     where
-        F: Fn(NativeAttachment) -> Result<(), String> + Send + Sync + 'static,
+        F: Fn(NativeAttachment) -> Result<(), VideoAttachmentOpenError> + Send + Sync + 'static,
     {
         self.video_attachment_opener = Some(Arc::new(opener));
         self
@@ -1309,10 +1319,13 @@ impl HostNativeActions {
             .ok_or_else(|| "external URL opener is unavailable".to_string())?(url)
     }
 
-    pub(crate) fn open_video_attachment(&self, attachment: NativeAttachment) -> Result<(), String> {
-        self.video_attachment_opener
-            .as_ref()
-            .ok_or_else(|| "video attachment opener is unavailable".to_string())?(attachment)
+    pub(crate) fn open_video_attachment(
+        &self,
+        attachment: NativeAttachment,
+    ) -> Result<(), VideoAttachmentOpenError> {
+        self.video_attachment_opener.as_ref().ok_or_else(|| {
+            VideoAttachmentOpenError::Failed("video attachment opener is unavailable".to_string())
+        })?(attachment)
     }
 }
 

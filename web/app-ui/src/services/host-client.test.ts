@@ -652,6 +652,30 @@ describe("HostClient", () => {
     expect(requests).toHaveLength(2);
   });
 
+  it("surfaces video playback capacity as an actionable error kind", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      if (request.url.endsWith("/capabilities")) {
+        return Response.json({
+          capabilities: validCapabilities,
+          csrf_token: "c".repeat(64),
+        });
+      }
+      return new Response("temporary video playback capacity is full", { status: 507 });
+    });
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+    await client.bootstrap();
+
+    await expect(client.openVideoAttachment({
+      upload: {
+        name: videoAttachment.name,
+        mime: videoAttachment.mime,
+        data: videoAttachment.data,
+      },
+      size: videoAttachment.size_bytes,
+    })).rejects.toMatchObject({ kind: "video-capacity" });
+  });
+
   it("polls validated lifecycle state and applies typed native actions with CSRF", async () => {
     const requests: Request[] = [];
     let notificationId = "";

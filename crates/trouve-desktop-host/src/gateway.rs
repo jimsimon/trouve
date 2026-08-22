@@ -27,7 +27,8 @@ use crate::{
     HostCapabilities, HostKind, HostLifecycleEnvelope, HostLifecycleState, HostNativeActions,
     HostPreferences, HostValidationError, LocalFileAction, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES,
     MAX_NATIVE_ATTACHMENTS, MAX_SYSTEM_FONT_FAMILIES, NativeAttachment, NativeNotification,
-    system_font_families, valid_session_relative_path, validate_native_attachment,
+    VideoAttachmentOpenError, system_font_families, valid_session_relative_path,
+    validate_native_attachment,
 };
 
 pub const HOST_API_PREFIX: &str = "/__trouve/host/v1";
@@ -640,6 +641,7 @@ enum GatewayRejection {
     Busy,
     Missing,
     BadGateway,
+    VideoPlaybackCapacity,
     Internal,
 }
 
@@ -652,6 +654,10 @@ impl IntoResponse for GatewayRejection {
             Self::Busy => (StatusCode::CONFLICT, "native action already in progress"),
             Self::Missing => (StatusCode::NOT_FOUND, "not found"),
             Self::BadGateway => (StatusCode::BAD_GATEWAY, "protocol server unavailable"),
+            Self::VideoPlaybackCapacity => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "temporary video playback capacity is full",
+            ),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "host gateway failure"),
         };
         let mut response = (status, message).into_response();
@@ -1166,7 +1172,7 @@ async fn open_https_url(
     post,
     path = "/__trouve/host/v1/open-video-attachment",
     request_body = AttachmentPayload,
-    responses((status = 204), (status = 400), (status = 403), (status = 404), (status = 500))
+    responses((status = 204), (status = 400), (status = 403), (status = 404), (status = 500), (status = 507))
 )]
 async fn open_video_attachment(
     State(state): State<GatewayState>,
@@ -1189,7 +1195,10 @@ async fn open_video_attachment(
     state
         .native_actions
         .open_video_attachment(attachment)
-        .map_err(|_| GatewayRejection::Internal)?;
+        .map_err(|error| match error {
+            VideoAttachmentOpenError::Capacity => GatewayRejection::VideoPlaybackCapacity,
+            VideoAttachmentOpenError::Failed(_) => GatewayRejection::Internal,
+        })?;
 
     no_content()
 }
@@ -2259,6 +2268,55 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
         assert_eq!(opened.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn video_attachment_capacity_has_a_distinct_actionable_response() {
+        let app = gateway()
+            .with_native_actions(
+                HostNativeActions::default()
+                    .with_video_attachment_opener(|_| Err(VideoAttachmentOpenError::Capacity)),
+            )
+            .router();
+        let bootstrap_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        let body = serde_json::to_vec(&AttachmentPayload {
+            name: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+            size_bytes: 5,
+        })
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .header(ORIGIN, "http://127.0.0.1:43127")
+                    .header(CSRF_HEADER, bootstrap.csrf_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "temporary video playback capacity is full"
+        );
     }
 
     #[tokio::test]

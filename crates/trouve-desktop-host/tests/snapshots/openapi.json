@@ -270,6 +270,9 @@
           },
           "500": {
             "description": ""
+          },
+          "507": {
+            "description": ""
           }
         }
       }
