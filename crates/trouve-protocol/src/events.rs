@@ -15,9 +15,12 @@ where
 {
     Option::<serde_json::Number>::deserialize(deserializer)?
         .map(|number| {
-            number.as_f64().ok_or_else(|| {
-                <D::Error as serde::de::Error>::custom("number is outside the finite f64 range")
-            })
+            number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    <D::Error as serde::de::Error>::custom("number is outside the finite f64 range")
+                })
         })
         .transpose()
 }
@@ -880,6 +883,17 @@ mod tests {
             Event::TurnUsageUpdated { usage, .. }
                 if usage.cost_usd == Some(0.000_02)
         ));
+
+        assert!(
+            serde_json::from_str::<Event>(
+                r#"{
+            "type":"turn.usage_updated",
+            "turn":1,
+            "usage":{"input_tokens":0,"output_tokens":0,"cost_usd":1e400}
+        }"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

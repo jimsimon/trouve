@@ -71,6 +71,12 @@ test("model-option choices preserve selected state and scalar value types", asyn
       },
     ];
     const changes: unknown[] = [];
+    const validationMessages: string[] = [];
+    const reportValidity = HTMLInputElement.prototype.reportValidity;
+    HTMLInputElement.prototype.reportValidity = function () {
+      validationMessages.push(this.validationMessage);
+      return reportValidity.call(this);
+    };
     editor.addEventListener("trouve-model-option-changed", (event) => {
       const detail = (event as CustomEvent<{ key: string; value: unknown }>).detail;
       changes.push(detail);
@@ -84,6 +90,8 @@ test("model-option choices preserve selected state and scalar value types", asyn
       }
     });
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges = changes;
+    (window as Window & { modelOptionValidationMessages?: string[] })
+      .modelOptionValidationMessages = validationMessages;
     document.body.append(editor);
     await editor.updateComplete;
   });
@@ -103,6 +111,13 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await budget.fill("3.5");
   await budget.press("Tab");
   await expect(budget).toHaveValue("8");
+  await budget.fill("9007199254740993");
+  await budget.dispatchEvent("change");
+  await expect(budget).toHaveValue("8");
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { modelOptionValidationMessages?: string[] })
+      .modelOptionValidationMessages,
+  )).toEqual(["Enter a valid integer between 4 and 16."]);
   await tone.selectOption({ label: "Empty" });
   await instructions.fill("");
   await instructions.press("Tab");

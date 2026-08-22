@@ -118,7 +118,7 @@ const matchesScalarType = (type: AdvertisedScalarType, value: unknown): boolean 
       ? typeof value === "boolean"
       : typeof value === "number"
         && Number.isFinite(value)
-        && (type !== "integer" || Number.isInteger(value));
+        && (type !== "integer" || Number.isSafeInteger(value));
 
 const humanize = (token: string): string => {
   const words = token.replaceAll("_", " ").replaceAll("-", " ");
@@ -256,7 +256,7 @@ const validTextValue = (
 ): boolean => {
   if (type === "string") return typeof value === "string";
   if (typeof value !== "number" || !Number.isFinite(value)) return false;
-  if (type === "integer" && !Number.isInteger(value)) return false;
+  if (type === "integer" && !Number.isSafeInteger(value)) return false;
   return (minimum === undefined || value >= minimum)
     && (maximum === undefined || value <= maximum);
 };
