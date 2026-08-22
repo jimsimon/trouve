@@ -920,6 +920,13 @@ fn trouve_bridge_wrapper_call<'a>(
     Some((nested_tool, arguments))
 }
 
+/// Claude reports first-party MCP calls under their direct MCP name. Their
+/// authoritative execution enters `handle_tool_call`, so the mirrored vendor
+/// lifecycle event must not reserve a second automated-review budget slot.
+fn trouve_direct_bridge_call(tool: &str) -> bool {
+    crate::mcp::split_tool_name(tool).is_some_and(|(server, _)| server == "trouve")
+}
+
 struct BackendApprovalOutcome {
     owner_thread_id: Option<String>,
     call_id: String,
@@ -1891,6 +1898,7 @@ struct GlobalDefaults {
 struct AutomatedReviewToolBudget {
     limit: u64,
     remaining: u64,
+    dispatcher_claimed: bool,
 }
 
 #[derive(Default)]
@@ -1913,12 +1921,28 @@ impl AutomatedReviewToolBudgets {
                 entry.insert(AutomatedReviewToolBudget {
                     limit,
                     remaining: limit,
+                    dispatcher_claimed: false,
                 });
             }
         }
         Ok(AutomatedReviewToolBudgetGuard {
             budgets: self.clone(),
             thread_id: thread_id.to_string(),
+            owner: AutomatedReviewToolBudgetOwner::PreDispatch,
+        })
+    }
+
+    fn claim_dispatch(self: &Arc<Self>, thread_id: &str) -> Option<AutomatedReviewToolBudgetGuard> {
+        let mut active = self.active.lock().unwrap();
+        let budget = active.get_mut(thread_id)?;
+        if budget.dispatcher_claimed {
+            return None;
+        }
+        budget.dispatcher_claimed = true;
+        Some(AutomatedReviewToolBudgetGuard {
+            budgets: self.clone(),
+            thread_id: thread_id.to_string(),
+            owner: AutomatedReviewToolBudgetOwner::Dispatcher,
         })
     }
 
@@ -1938,11 +1962,26 @@ impl AutomatedReviewToolBudgets {
 pub(crate) struct AutomatedReviewToolBudgetGuard {
     budgets: Arc<AutomatedReviewToolBudgets>,
     thread_id: String,
+    owner: AutomatedReviewToolBudgetOwner,
+}
+
+enum AutomatedReviewToolBudgetOwner {
+    PreDispatch,
+    Dispatcher,
 }
 
 impl Drop for AutomatedReviewToolBudgetGuard {
     fn drop(&mut self) {
-        self.budgets.active.lock().unwrap().remove(&self.thread_id);
+        let mut active = self.budgets.active.lock().unwrap();
+        let remove = match self.owner {
+            AutomatedReviewToolBudgetOwner::PreDispatch => active
+                .get(&self.thread_id)
+                .is_some_and(|budget| !budget.dispatcher_claimed),
+            AutomatedReviewToolBudgetOwner::Dispatcher => true,
+        };
+        if remove {
+            active.remove(&self.thread_id);
+        }
     }
 }
 
@@ -9724,11 +9763,21 @@ impl Engine {
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: bool,
     ) {
+        let automated_review_tool_budget = self
+            .automated_review_tool_budgets
+            .claim_dispatch(&thread.id);
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
             if let Err(error) = engine
-                .drain_queue(thread, turn, prompt, cancel, prompt_persisted)
+                .drain_queue(
+                    thread,
+                    turn,
+                    prompt,
+                    cancel,
+                    prompt_persisted,
+                    automated_review_tool_budget,
+                )
                 .await
             {
                 // A terminal or activity event failed to persist. The
@@ -9749,6 +9798,7 @@ impl Engine {
         prompt: trouve_protocol::QueuedPrompt,
         first_cancel: tokio_util::sync::CancellationToken,
         first_prompt_persisted: bool,
+        mut automated_review_tool_budget: Option<AutomatedReviewToolBudgetGuard>,
     ) -> Result<()> {
         let mut thread = thread;
         let mut turn = turn;
@@ -9870,6 +9920,10 @@ impl Engine {
             } else {
                 false
             };
+            // The first dispatched turn now has a durable terminal outcome,
+            // or acknowledged cancellation cleanup. Release its disposable
+            // review policy before an unrelated queued prompt can start.
+            drop(automated_review_tool_budget.take());
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
             let (next, next_cancel) = {
@@ -12753,11 +12807,13 @@ impl Engine {
                         }
                         continue;
                     }
-                    // Full-bridge calls reserve inside handle_tool_call and
-                    // their duplicate wrapper was suppressed above. Count
-                    // the backend's remaining sandbox-confined read tools at
-                    // their first authoritative lifecycle boundary.
-                    self.automated_review_tool_budgets.reserve(&thread.id)?;
+                    // First-party MCP calls reserve inside handle_tool_call;
+                    // Claude mirrors them here under mcp__trouve__*. Count
+                    // only the backend's remaining sandbox-confined read
+                    // tools at this lifecycle boundary.
+                    if !trouve_direct_bridge_call(&tool) {
+                        self.automated_review_tool_budgets.reserve(&thread.id)?;
+                    }
                     if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
@@ -17865,6 +17921,15 @@ mod tests {
 
         drop(guard);
         assert!(budgets.reserve("review-thread").is_ok());
+
+        let pre_dispatch = budgets.arm("zero-call-review", 0).unwrap();
+        let dispatcher = budgets
+            .claim_dispatch("zero-call-review")
+            .expect("dispatcher claims the armed budget");
+        drop(pre_dispatch);
+        assert!(budgets.reserve("zero-call-review").is_err());
+        drop(dispatcher);
+        assert!(budgets.reserve("zero-call-review").is_ok());
     }
 
     #[test]
@@ -17926,6 +17991,9 @@ mod tests {
             .is_none()
         );
         assert!(trouve_bridge_wrapper_call("commandExecution", &args).is_none());
+        assert!(trouve_direct_bridge_call("mcp__trouve__read_file"));
+        assert!(!trouve_direct_bridge_call("mcp__github__get_issue"));
+        assert!(!trouve_direct_bridge_call("read_file"));
     }
 
     struct CatalogTestProvider {

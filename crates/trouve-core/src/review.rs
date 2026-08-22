@@ -5861,14 +5861,10 @@ impl Engine {
         )
         .await?;
         let mut last_progress_persisted = Instant::now();
-        // Arm the hard budget before send_message can launch the disposable
-        // review turn. The guard covers every native or bridged dispatch and
-        // removes the ephemeral policy when this observer exits.
-        let _tool_budget = if tools_enabled {
-            Some(self.begin_automated_review_tool_budget(thread_id, max_tool_calls)?)
-        } else {
-            None
-        };
+        // Arm every disposable review turn before send_message can dispatch,
+        // including zero-call JSON repair turns. The engine transfers policy
+        // ownership to the dispatcher and retains it through terminal cleanup.
+        let _tool_budget = self.begin_automated_review_tool_budget(thread_id, max_tool_calls)?;
         let accepted = if tools_enabled {
             self.send_message(thread_id, prompt, Vec::new())?
         } else {
@@ -9323,6 +9319,7 @@ fn redact_public_secrets(text: &str) -> String {
         Separated {
             authorization: bool,
             value_start: usize,
+            value_end: usize,
         },
     }
 
@@ -9332,7 +9329,6 @@ fn redact_public_secrets(text: &str) -> String {
 
     fn secret_label(token: &str) -> Option<SecretLabel> {
         let trimmed_start = token.trim_start_matches(wrapper);
-        let leading_bytes = token.len().saturating_sub(trimmed_start.len());
         let core = trimmed_start.trim_end_matches(wrapper);
         let lower = core.to_ascii_lowercase();
         for (label, authorization) in [
@@ -9346,14 +9342,57 @@ fn redact_public_secrets(text: &str) -> String {
             if lower == label {
                 return Some(SecretLabel::Bare { authorization });
             }
-            let Some(rest) = lower.strip_prefix(label) else {
-                continue;
-            };
-            if rest.starts_with(':') || rest.starts_with('=') {
-                return Some(SecretLabel::Separated {
-                    authorization,
-                    value_start: leading_bytes + label.len() + 1,
-                });
+
+            let token_lower = token.to_ascii_lowercase();
+            let mut search_start = 0;
+            while let Some(relative) = token_lower[search_start..].find(label) {
+                let label_start = search_start + relative;
+                let label_end = label_start + label.len();
+                let valid_boundary = label_start == 0
+                    || token[..label_start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|character| {
+                            !character.is_ascii_alphanumeric() && character != '_'
+                        });
+                let separator = token_lower.as_bytes().get(label_end).copied();
+                if valid_boundary && matches!(separator, Some(b':' | b'=')) {
+                    let mut value_start = label_end + 1;
+                    let quote = token[value_start..]
+                        .chars()
+                        .next()
+                        .filter(|character| matches!(character, '\'' | '"'));
+                    if let Some(quote) = quote {
+                        value_start += quote.len_utf8();
+                    }
+                    let value_end = token[value_start..]
+                        .char_indices()
+                        .find_map(|(offset, character)| {
+                            let closes_quote = quote == Some(character);
+                            let ends_fragment = quote.is_none()
+                                && matches!(
+                                    character,
+                                    '&' | '#'
+                                        | ','
+                                        | ';'
+                                        | ')'
+                                        | ']'
+                                        | '}'
+                                        | '\''
+                                        | '"'
+                                        | '<'
+                                        | '>'
+                                );
+                            (closes_quote || ends_fragment).then_some(value_start + offset)
+                        })
+                        .unwrap_or(token.len());
+                    return Some(SecretLabel::Separated {
+                        authorization,
+                        value_start,
+                        value_end,
+                    });
+                }
+                search_start = label_start + 1;
             }
         }
         None
@@ -9404,22 +9443,29 @@ fn redact_public_secrets(text: &str) -> String {
             Some(SecretLabel::Separated {
                 authorization,
                 value_start,
+                value_end,
             }) => {
-                let value = &token[value_start..];
-                let value_without_wrapper = value.trim_matches(wrapper);
-                if value_without_wrapper.is_empty() {
+                let value = &token[value_start..value_end];
+                if value.is_empty() {
                     output.push_str(token);
-                    *pending = PendingSecret::Value { authorization };
+                    *pending = if value_end == token.len() {
+                        PendingSecret::Value { authorization }
+                    } else {
+                        PendingSecret::None
+                    };
                 } else if authorization && authorization_scheme(value) {
                     output.push_str(token);
-                    *pending = PendingSecret::Value {
-                        authorization: false,
+                    *pending = if value_end == token.len() {
+                        PendingSecret::Value {
+                            authorization: false,
+                        }
+                    } else {
+                        PendingSecret::None
                     };
                 } else {
-                    let suffix = &value[value.trim_end_matches(wrapper).len()..];
                     output.push_str(&token[..value_start]);
                     output.push_str("[REDACTED]");
-                    output.push_str(suffix);
+                    output.push_str(&token[value_end..]);
                 }
             }
             None if public_secret_like_token(token) => output.push_str("[REDACTED]"),
@@ -9488,7 +9534,8 @@ fn safe_public_model_markdown(text: &str, maximum: usize, marker: &str) -> Strin
             _ => escaped.push(character),
         }
     }
-    safe_prompt_fence(&escaped).replace("](", "]\\(")
+    let safe = safe_prompt_fence(&escaped).replace("](", "]\\(");
+    bounded_utf8(&safe, maximum, marker)
 }
 
 fn safe_public_inline_code(text: &str, maximum: usize) -> String {
@@ -10986,13 +11033,9 @@ fn validation_prompt(
         .collect::<HashSet<_>>();
     let diff_context = coordinator_diff_context(files, &relevant_paths, &candidate_paths);
     let candidate_findings = serde_json::to_value(candidates)?;
-    let finding_history =
-        serde_json::from_str::<serde_json::Value>(&compact_finding_history(finding_history)?)?;
-    let previous_themes =
-        serde_json::from_str::<serde_json::Value>(&compact_theme_history(previous_themes)?)?;
-    let external_comments = serde_json::from_str::<serde_json::Value>(
-        &compact_external_review_comments(external_comments)?,
-    )?;
+    let finding_history = compact_finding_history(finding_history)?;
+    let previous_themes = compact_theme_history(previous_themes)?;
+    let external_comments = compact_external_review_comments(external_comments)?;
     let reuse_note = if reused_hunk_count == 0 {
         String::new()
     } else {
@@ -11111,7 +11154,7 @@ fn validation_prompt(
 fn bounded_json_values(
     values: impl IntoIterator<Item = serde_json::Value>,
     max: usize,
-) -> Result<String> {
+) -> Result<Vec<serde_json::Value>> {
     let mut kept = Vec::new();
     let mut used = 2_usize;
     for value in values {
@@ -11122,7 +11165,7 @@ fn bounded_json_values(
         used += encoded.len() + 1;
         kept.push(value);
     }
-    Ok(serde_json::to_string(&kept)?)
+    Ok(kept)
 }
 
 fn prioritized_finding_history(
@@ -11208,7 +11251,9 @@ fn external_review_comment_from_thread(
     })
 }
 
-fn compact_external_review_comments(comments: &[ExternalReviewComment]) -> Result<String> {
+fn compact_external_review_comments(
+    comments: &[ExternalReviewComment],
+) -> Result<Vec<serde_json::Value>> {
     let values = comments
         .iter()
         .map(serde_json::to_value)
@@ -11216,7 +11261,9 @@ fn compact_external_review_comments(comments: &[ExternalReviewComment]) -> Resul
     bounded_json_values(values, REVIEW_EXTERNAL_COMMENTS_MAX_BYTES)
 }
 
-fn compact_finding_history(findings: &[trouve_protocol::CodeReviewFinding]) -> Result<String> {
+fn compact_finding_history(
+    findings: &[trouve_protocol::CodeReviewFinding],
+) -> Result<Vec<serde_json::Value>> {
     let values = findings
         .iter()
         .rev()
@@ -11269,7 +11316,6 @@ fn compact_finding_value(
             .map(|id| serde_json::json!(bounded_json_text(id, 256, "…"))),
         REVIEW_HISTORY_FINDING_THEME_IDS_MAX_BYTES,
     )?;
-    let theme_ids = serde_json::from_str::<Vec<serde_json::Value>>(&theme_ids)?;
     let evidence = &finding.evidence;
     Ok(serde_json::json!({
         "id": bounded_json_text(&finding.id, 256, "…"),
@@ -11308,7 +11354,6 @@ fn compact_theme_value(theme: &trouve_protocol::CodeReviewTheme) -> Result<serde
             .map(|path| serde_json::json!(bounded_json_text(path, 512, "…"))),
         REVIEW_HISTORY_THEME_PATHS_MAX_BYTES,
     )?;
-    let affected_paths = serde_json::from_str::<Vec<serde_json::Value>>(&affected_paths)?;
 
     let observations = theme
         .observations
@@ -11325,7 +11370,6 @@ fn compact_theme_value(theme: &trouve_protocol::CodeReviewTheme) -> Result<serde
                     .map(|id| serde_json::json!(bounded_json_text(id, 128, "…"))),
                 REVIEW_HISTORY_THEME_FINDING_IDS_MAX_BYTES,
             )?;
-            let finding_ids = serde_json::from_str::<Vec<serde_json::Value>>(&finding_ids)?;
             Ok(serde_json::json!({
                 "job_id": bounded_json_text(&observation.job_id, 256, "…"),
                 "head_sha": bounded_json_text(&observation.head_sha, 256, "…"),
@@ -11338,7 +11382,6 @@ fn compact_theme_value(theme: &trouve_protocol::CodeReviewTheme) -> Result<serde
         .collect::<Result<Vec<_>>>()?;
     let observations =
         bounded_json_values(observations, REVIEW_HISTORY_THEME_OBSERVATIONS_MAX_BYTES)?;
-    let observations = serde_json::from_str::<Vec<serde_json::Value>>(&observations)?;
 
     Ok(serde_json::json!({
         "id": bounded_json_text(&theme.id, 256, "…"),
@@ -11356,7 +11399,9 @@ fn compact_theme_value(theme: &trouve_protocol::CodeReviewTheme) -> Result<serde
     }))
 }
 
-fn compact_theme_history(themes: &[trouve_protocol::CodeReviewTheme]) -> Result<String> {
+fn compact_theme_history(
+    themes: &[trouve_protocol::CodeReviewTheme],
+) -> Result<Vec<serde_json::Value>> {
     let values = themes
         .iter()
         .rev()
@@ -17468,16 +17513,12 @@ mod tests {
             }))
             .unwrap();
         let findings = (0..100).map(|_| finding.clone()).collect::<Vec<_>>();
-        let encoded = compact_finding_history(&findings).unwrap();
+        let compact = compact_finding_history(&findings).unwrap();
+        let encoded = serde_json::to_string(&compact).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_FINDINGS_MAX_BYTES);
         assert!(!encoded.contains("must not be copied"));
         assert!(encoded.contains("resolved_by_job_id"));
-        assert!(
-            serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
-                .unwrap()
-                .len()
-                < findings.len()
-        );
+        assert!(compact.len() < findings.len());
     }
 
     #[test]
@@ -17510,9 +17551,9 @@ mod tests {
             }))
             .unwrap();
 
-        let encoded = compact_finding_history(&[finding]).unwrap();
+        let findings = compact_finding_history(&[finding]).unwrap();
+        let encoded = serde_json::to_string(&findings).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_FINDINGS_MAX_BYTES);
-        let findings = serde_json::from_str::<Vec<serde_json::Value>>(&encoded).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["theme_count"], 100);
         assert!(findings[0]["theme_ids"].as_array().unwrap().len() <= 16);
@@ -17555,9 +17596,9 @@ mod tests {
             compact_value_len < REVIEW_HISTORY_THEMES_MAX_BYTES,
             "compacted theme still uses {compact_value_len} bytes"
         );
-        let encoded = compact_theme_history(&[theme]).unwrap();
+        let themes = compact_theme_history(&[theme]).unwrap();
+        let encoded = serde_json::to_string(&themes).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_THEMES_MAX_BYTES);
-        let themes = serde_json::from_str::<Vec<serde_json::Value>>(&encoded).unwrap();
         assert_eq!(themes.len(), 1);
         let retained = &themes[0];
         assert_eq!(retained["affected_path_count"], 500);
@@ -17688,13 +17729,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let encoded = compact_external_review_comments(&comments).unwrap();
+        let compact = compact_external_review_comments(&comments).unwrap();
+        let encoded = serde_json::to_string(&compact).unwrap();
         assert!(encoded.len() <= REVIEW_EXTERNAL_COMMENTS_MAX_BYTES);
-        assert!(
-            !serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!compact.is_empty());
     }
 
     #[test]
@@ -20274,6 +20312,36 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret));
         }
+    }
+
+    #[test]
+    fn public_secret_redaction_handles_embedded_and_url_credential_fragments() {
+        let rendered = redact_public_secrets(
+            "env:api_key=short-secret \
+             https://host.test/path?token=url-secret&mode=test \
+             password=\"quoted-secret\" notatoken=public",
+        );
+
+        assert_eq!(
+            rendered,
+            "env:api_key=[REDACTED] \
+             https://host.test/path?token=[REDACTED]&mode=test \
+             password=\"[REDACTED]\" notatoken=public"
+        );
+        for secret in ["short-secret", "url-secret", "quoted-secret"] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn public_markdown_bound_applies_after_safety_escaping() {
+        let maximum = 24;
+        let rendered = safe_public_model_markdown("<&@user](https://example.test)", maximum, "…");
+
+        assert!(rendered.len() <= maximum);
+        assert!(!rendered.contains("@user"));
+        assert!(!rendered.contains("https://"));
+        assert!(!rendered.contains('<'));
     }
 
     #[test]
