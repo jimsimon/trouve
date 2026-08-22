@@ -33,6 +33,29 @@ pub fn system_prompt(
     workspace_root: &Path,
     include_builtin_skills: bool,
 ) -> String {
+    system_prompt_with_skills(
+        mode,
+        config_dir,
+        workspace_root,
+        Some(include_builtin_skills),
+    )
+}
+
+/// Assemble instructions for a turn that has no callable skill loader.
+pub fn system_prompt_without_skills(
+    mode: &AgentPersona,
+    config_dir: Option<&Path>,
+    workspace_root: &Path,
+) -> String {
+    system_prompt_with_skills(mode, config_dir, workspace_root, None)
+}
+
+fn system_prompt_with_skills(
+    mode: &AgentPersona,
+    config_dir: Option<&Path>,
+    workspace_root: &Path,
+    include_builtin_skills: Option<bool>,
+) -> String {
     let mut sections = vec![BASE_PROMPT.to_string(), mode.system_prompt.clone()];
 
     if let Some(dir) = config_dir
@@ -54,9 +77,12 @@ pub fn system_prompt(
             ));
         }
     }
-    let skills = crate::skills::discover(config_dir, Some(workspace_root), include_builtin_skills);
-    if let Some(section) = crate::skills::prompt_section(&skills) {
-        sections.push(section);
+    if let Some(include_builtin_skills) = include_builtin_skills {
+        let skills =
+            crate::skills::discover(config_dir, Some(workspace_root), include_builtin_skills);
+        if let Some(section) = crate::skills::prompt_section(&skills) {
+            sections.push(section);
+        }
     }
     sections.join("\n\n")
 }
@@ -105,5 +131,22 @@ mod tests {
         let prompt = system_prompt(&builtin_personas()[0], None, &repo, false);
         assert!(prompt.contains("Workspace review"));
         assert!(!prompt.contains("code-review"));
+    }
+
+    #[test]
+    fn tool_free_prompt_omits_every_skill_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".agents/skills/review")).unwrap();
+        std::fs::write(
+            repo.join(".agents/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Workspace review\n---\nReview it.",
+        )
+        .unwrap();
+
+        let prompt = system_prompt_without_skills(&builtin_personas()[0], None, &repo);
+        assert!(!prompt.contains("Available skills"));
+        assert!(!prompt.contains("load_skill"));
+        assert!(!prompt.contains("Workspace review"));
     }
 }

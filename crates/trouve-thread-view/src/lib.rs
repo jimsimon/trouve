@@ -156,7 +156,6 @@ impl ThreadProjection {
                 arguments,
                 output,
             } => {
-                self.finish_thinking();
                 self.push(ThreadViewItem::Command {
                     name: name.clone(),
                     arguments: arguments.clone(),
@@ -1806,6 +1805,41 @@ mod tests {
         assert!(matches!(
             projection.snapshot.items.last(),
             Some(ThreadViewItem::Thinking { complete: true, .. })
+        ));
+    }
+
+    #[test]
+    fn deterministic_command_does_not_finish_an_active_model_thought() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantThinking {
+                turn: 4,
+                text: "Still reasoning.".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            5,
+            Event::CommandExecuted {
+                name: "status".into(),
+                arguments: String::new(),
+                output: "Ready".into(),
+            },
+        ));
+
+        assert!(projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::Thinking {
+                complete: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::Command { name, .. }) if name == "status"
         ));
     }
 

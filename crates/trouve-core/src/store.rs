@@ -15,9 +15,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
-    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, SessionAttention,
-    SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadStatus,
-    ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
+    CommandResult, Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session,
+    SessionAttention, SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread,
+    ThreadStatus, ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
 };
 use trouve_thread_view::{MaterializedThreadItem, ThreadProjection};
 
@@ -103,6 +103,14 @@ CREATE TABLE IF NOT EXISTS threads (
   todos TEXT NOT NULL DEFAULT '[]',
   last_turn INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS command_execution_requests (
+  idempotency_key TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  request_fingerprint TEXT NOT NULL,
+  result TEXT,
+  created_at TEXT NOT NULL,
+  completed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   thread_id TEXT NOT NULL REFERENCES threads(id),
@@ -4155,6 +4163,12 @@ impl ArtifactCleanupJob {
     }
 }
 
+pub(crate) struct CommandExecutionRecord {
+    pub thread_id: String,
+    pub request_fingerprint: String,
+    pub result: Option<CommandResult>,
+}
+
 /// One serialized event, in flight to the writer thread.
 struct PendingEvent {
     scope: Scope,
@@ -4192,6 +4206,12 @@ enum StoreMutation {
         thread: Box<Thread>,
         model_options: serde_json::Map<String, serde_json::Value>,
         spawn: Option<(String, String)>,
+    },
+    CompleteCommandExecution {
+        idempotency_key: String,
+        thread_id: String,
+        request_fingerprint: String,
+        result: Box<CommandResult>,
     },
     Delete {
         id: String,
@@ -4612,6 +4632,25 @@ fn update_thread_row(
     Ok(())
 }
 
+fn row_to_command_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandExecutionRecord> {
+    let result = row
+        .get::<_, Option<String>>(2)?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    Ok(CommandExecutionRecord {
+        thread_id: row.get(0)?,
+        request_fingerprint: row.get(1)?,
+        result,
+    })
+}
+
 fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM session_create_requests WHERE session_id = ?1",
@@ -4629,6 +4668,11 @@ fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
     )?;
     conn.execute(
         "DELETE FROM messages WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM command_execution_requests WHERE thread_id IN
          (SELECT id FROM threads WHERE session_id = ?1)",
         params![id],
     )?;
@@ -4795,6 +4839,31 @@ fn apply_store_mutation(
                     params![thread.id, parent, kind],
                 )?;
             }
+        }
+        StoreMutation::CompleteCommandExecution {
+            idempotency_key,
+            thread_id,
+            request_fingerprint,
+            result,
+        } => {
+            let result = serde_json::to_string(result)?;
+            let updated = conn.execute(
+                "UPDATE command_execution_requests
+                 SET result = ?4, completed_at = ?5
+                 WHERE idempotency_key = ?1 AND thread_id = ?2
+                   AND request_fingerprint = ?3 AND result IS NULL",
+                params![
+                    idempotency_key,
+                    thread_id,
+                    request_fingerprint,
+                    result,
+                    timestamp.to_rfc3339(),
+                ],
+            )?;
+            anyhow::ensure!(
+                updated == 1,
+                "command execution claim is missing, mismatched, or already complete"
+            );
         }
         StoreMutation::Delete { id, cleanup } => {
             insert_artifact_cleanup_job(conn, cleanup, timestamp)?;
@@ -6879,6 +6948,98 @@ impl Store {
         insert_thread_row(&self.conn.lock().unwrap(), t, model_options)
     }
 
+    /// Claim a client command request before any side effect. `None` means
+    /// this caller owns a new claim; `Some` is the durable prior attempt.
+    pub(crate) fn claim_command_execution(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+    ) -> Result<Option<CommandExecutionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO command_execution_requests
+               (idempotency_key, thread_id, request_fingerprint, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                idempotency_key,
+                thread_id,
+                request_fingerprint,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        let prior = if inserted == 0 {
+            tx.query_row(
+                "SELECT thread_id, request_fingerprint, result
+                 FROM command_execution_requests WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                row_to_command_execution,
+            )
+            .optional()?
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(prior)
+    }
+
+    pub(crate) fn command_execution(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<CommandExecutionRecord>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT thread_id, request_fingerprint, result
+                 FROM command_execution_requests WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                row_to_command_execution,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn release_command_execution(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM command_execution_requests
+             WHERE idempotency_key = ?1 AND thread_id = ?2
+               AND request_fingerprint = ?3 AND result IS NULL",
+            params![idempotency_key, thread_id, request_fingerprint],
+        )?;
+        Ok(())
+    }
+
+    /// Complete an owned command claim and publish its replayable output in
+    /// the same SQLite transaction. A retry can therefore return the durable
+    /// result without executing the command again.
+    pub(crate) fn complete_command_execution_with_event(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+        result: &CommandResult,
+        event: Event,
+    ) -> Result<()> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Thread(thread_id.to_string()), event)],
+            StoreMutation::CompleteCommandExecution {
+                idempotency_key: idempotency_key.to_string(),
+                thread_id: thread_id.to_string(),
+                request_fingerprint: request_fingerprint.to_string(),
+                result: Box::new(result.clone()),
+            },
+        )?;
+        self.append_pending_events(pending)?;
+        Ok(())
+    }
+
     /// Insert a thread (and optional spawn edge) together with its durable
     /// creation edge. Parent ownership is validated in the same transaction.
     pub(crate) fn insert_thread_with_event(
@@ -6887,9 +7048,12 @@ impl Store {
         model_options: &serde_json::Map<String, serde_json::Value>,
         spawn: Option<(&str, &str)>,
         event: Event,
+        additional_events: Vec<(Scope, Event)>,
     ) -> Result<EventEnvelope> {
+        let mut events = vec![(Scope::Server, event)];
+        events.extend(additional_events);
         let pending = serialize_lifecycle_events(
-            vec![(Scope::Server, event)],
+            events,
             StoreMutation::InsertThread {
                 thread: Box::new(thread.clone()),
                 model_options: model_options.clone(),
@@ -6898,8 +7062,9 @@ impl Store {
         )?;
         Ok(self
             .append_pending_events(pending)?
-            .pop()
-            .expect("one lifecycle event returns one envelope"))
+            .into_iter()
+            .next()
+            .expect("thread lifecycle returns its source envelope"))
     }
 
     /// Insert a spawned thread and its parent edge in one transaction. A
@@ -16703,6 +16868,67 @@ mod tests {
                 &serde_json::Map::new(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn command_execution_claim_and_result_are_durable_and_atomic() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_command");
+
+        assert!(
+            store
+                .claim_command_execution("command-once", "th_command", "fingerprint")
+                .unwrap()
+                .is_none()
+        );
+        let pending = store
+            .claim_command_execution("command-once", "th_command", "fingerprint")
+            .unwrap()
+            .unwrap();
+        assert!(pending.result.is_none());
+
+        let result = CommandResult {
+            name: "new".into(),
+            output: "Created thread `th_child`.".into(),
+            action: trouve_protocol::CommandAction::SwitchThread {
+                thread_id: "th_child".into(),
+            },
+        };
+        store
+            .complete_command_execution_with_event(
+                "command-once",
+                "th_command",
+                "fingerprint",
+                &result,
+                Event::CommandExecuted {
+                    name: "new".into(),
+                    arguments: String::new(),
+                    output: result.output.clone(),
+                },
+            )
+            .unwrap();
+
+        let replay = store
+            .claim_command_execution("command-once", "th_command", "fingerprint")
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(replay.name, result.name);
+        assert_eq!(replay.output, result.output);
+        assert_eq!(replay.action, result.action);
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread("th_command".into()), 0)
+                .unwrap()
+                .into_iter()
+                .filter(|event| matches!(event.event, Event::CommandExecuted { .. }))
+                .count(),
+            1
+        );
+
+        store.delete_session("se_q").unwrap();
+        assert!(store.command_execution("command-once").unwrap().is_none());
     }
 
     #[test]

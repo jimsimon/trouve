@@ -76,6 +76,7 @@ import {
   activityGroupSummary,
   buildChatLayout,
   isContextCompactionTool,
+  isStandaloneCommandUnit,
   type AgentActivityItem,
   type AgentChatItem,
   type ChatRenderUnit,
@@ -360,6 +361,13 @@ const toolCallNeedsApproval = (
 
 type ActivityGroupStatus = "awaiting-approval" | "running" | "ok" | "mixed" | "error";
 
+interface CommandRetry {
+  readonly threadId: string;
+  readonly name: string;
+  readonly arguments: string;
+  readonly idempotencyKey: string;
+}
+
 const activityGroupStatusLabel = (status: ActivityGroupStatus): string =>
   ({
     "awaiting-approval": "Approval needed",
@@ -389,6 +397,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #turnRequestGeneration = 0;
   #threadInteractionGeneration = 0;
   #requestError = "";
+  #commandRetry: CommandRetry | undefined;
   #pendingStartTurn: number | undefined;
   #cancelRequestedTurn: number | undefined;
   #messageRequest: "start" | "queue" | undefined;
@@ -2524,6 +2533,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         if (
           unit?.kind === "turn"
           && unit.turn === activeTurn
+          && !isStandaloneCommandUnit(unit)
           && (
             unit.items.some(
               (item) => item.kind === "compaction" && item.state.kind === "running",
@@ -2875,7 +2885,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     activityPresentation: AgentActivityPresentation | undefined,
     activityInput: RunningAgentActivityInput | undefined,
   ) {
-    const command = unit.items.length === 1 && unit.items[0]?.kind === "command"
+    const command = isStandaloneCommandUnit(unit)
       ? unit.items[0]
       : undefined;
     if (command !== undefined) return this.#renderCommandCard(command);
@@ -7037,6 +7047,21 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.requestUpdate();
       return;
     }
+    const commandArguments = commandMatch?.[2]?.trim() ?? "";
+    const previousCommand = this.#commandRetry;
+    const commandRetry = actionCommand === undefined
+      ? undefined
+      : previousCommand?.threadId === threadId
+          && previousCommand.name === actionCommand.name
+          && previousCommand.arguments === commandArguments
+        ? previousCommand
+        : {
+            threadId,
+            name: actionCommand.name,
+            arguments: commandArguments,
+            idempotencyKey: globalThis.crypto.randomUUID(),
+          };
+    if (commandRetry !== undefined) this.#commandRetry = commandRetry;
     const startingTurn = view?.turnRunning === true
       || this.#pendingStartTurn !== undefined
       || this.#cancelRequestedTurn !== undefined;
@@ -7088,9 +7113,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       let acceptedTurn: number | undefined;
       if (actionCommand !== undefined) {
         const result = await services.protocol.executeCommand(threadId, {
+          idempotency_key: commandRetry?.idempotencyKey ?? globalThis.crypto.randomUUID(),
           name: actionCommand.name,
-          arguments: commandMatch?.[2]?.trim() ?? "",
+          arguments: commandArguments,
         });
+        this.#commandRetry = undefined;
         if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;
         const action = result.action ?? { type: "none" as const };
         if (action.type === "switch_thread") {

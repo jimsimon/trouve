@@ -296,12 +296,14 @@ impl ProtocolClient {
     pub async fn execute_command(
         &self,
         thread_id: &str,
+        idempotency_key: &str,
         name: &str,
         arguments: &str,
     ) -> Result<CommandResult> {
         self.post_json(
             &format!("/threads/{thread_id}/commands"),
             &ExecuteCommandRequest {
+                idempotency_key: idempotency_key.into(),
                 name: name.into(),
                 arguments: arguments.into(),
             },

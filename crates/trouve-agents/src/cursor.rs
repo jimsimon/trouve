@@ -41,7 +41,7 @@
 //! when it goes stale the user runs any `cursor-agent` command, which
 //! refreshes `auth.json` through the sanctioned path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -423,11 +423,16 @@ impl AgentBackend for CursorBackend {
         // Resume the ACP session for this thread, or start a fresh one. A
         // failed load (e.g. server restarted and lost it) degrades to fresh.
         let mut fresh_session = false;
+        let desired_mcp_fingerprint = acp_mcp_fingerprint(&acp_mcp_servers(
+            &turn.mcp_servers,
+            turn.mcp_bridge.as_ref(),
+            server.mcp_http.load(Ordering::Relaxed),
+        )?)?;
         let known_session = match &turn.session {
             Some(sid) => tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-                known = server.knows_session(sid) => known,
+                known = server.session_settings_match(sid, desired_mcp_fingerprint) => known,
             },
             None => false,
         };
@@ -1491,14 +1496,24 @@ async fn write_reply(stdin: &Mutex<ChildStdin>, reply: Value) {
     let _ = stdin.flush().await;
 }
 
+fn acp_mcp_fingerprint(servers: &Value) -> Result<[u8; 32], BackendError> {
+    use sha2::{Digest as _, Sha256};
+
+    let encoded = serde_json::to_vec(servers).map_err(|error| {
+        BackendError::Protocol(format!("serializing Cursor MCP config: {error}"))
+    })?;
+    Ok(Sha256::digest(encoded).into())
+}
+
 struct AcpServer {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicI64,
     pending: Pending,
     routes: Routes,
-    /// Sessions this process has created or loaded (session/prompt on an
-    /// unknown session fails, so resumes go through session/load first).
-    sessions: Mutex<HashSet<String>>,
+    /// Effective MCP configuration for sessions this process created or
+    /// loaded. Rotating bridge tickets and edited MCP servers must trigger a
+    /// fresh session/load before the next prompt.
+    sessions: Mutex<HashMap<String, [u8; 32]>>,
     /// Serializes model/mode config + prompt start: cursor applies model
     /// selection process-wide, so concurrent turns must not interleave.
     config_lock: Mutex<()>,
@@ -1650,7 +1665,7 @@ impl AcpServer {
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             routes: Arc::new(Mutex::new(HashMap::new())),
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
             config_lock: Mutex::new(()),
             plans: Arc::new(Mutex::new(HashMap::new())),
             calls: Arc::new(Mutex::new(HashMap::new())),
@@ -1872,6 +1887,7 @@ impl AcpServer {
     ) -> Result<String, BackendError> {
         let mcp_servers =
             acp_mcp_servers(mcp_servers, bridge, self.mcp_http.load(Ordering::Relaxed))?;
+        let mcp_fingerprint = acp_mcp_fingerprint(&mcp_servers)?;
         let result = self
             .request_cancellable(
                 "session/new",
@@ -1894,7 +1910,10 @@ impl AcpServer {
                 ));
             }
         };
-        self.sessions.lock().await.insert(id.clone());
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), mcp_fingerprint);
         Ok(id)
     }
 
@@ -1908,6 +1927,7 @@ impl AcpServer {
     ) -> Result<(), BackendError> {
         let mcp_servers =
             acp_mcp_servers(mcp_servers, bridge, self.mcp_http.load(Ordering::Relaxed))?;
+        let mcp_fingerprint = acp_mcp_fingerprint(&mcp_servers)?;
         self.request_cancellable(
             "session/load",
             json!({
@@ -1919,12 +1939,19 @@ impl AcpServer {
         )
         .await
         .map_err(auth_hint)?;
-        self.sessions.lock().await.insert(session_id.to_string());
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.to_string(), mcp_fingerprint);
         Ok(())
     }
 
-    async fn knows_session(&self, session_id: &str) -> bool {
-        self.sessions.lock().await.contains(session_id)
+    async fn session_settings_match(
+        &self,
+        session_id: &str,
+        desired_mcp_fingerprint: [u8; 32],
+    ) -> bool {
+        self.sessions.lock().await.get(session_id) == Some(&desired_mcp_fingerprint)
     }
 
     async fn set_config_option(
@@ -2324,6 +2351,30 @@ mod tests {
             }])
         );
         assert!(acp_mcp_servers(&[], Some(&bridge), false).is_err());
+    }
+
+    #[test]
+    fn acp_session_fingerprint_tracks_rotating_bridge_configuration() {
+        let first = json!([{
+            "type": "http",
+            "name": "trouve",
+            "url": "http://127.0.0.1/mcp?ticket=first",
+            "headers": [],
+        }]);
+        let second = json!([{
+            "type": "http",
+            "name": "trouve",
+            "url": "http://127.0.0.1/mcp?ticket=second",
+            "headers": [],
+        }]);
+        assert_ne!(
+            acp_mcp_fingerprint(&first).unwrap(),
+            acp_mcp_fingerprint(&second).unwrap()
+        );
+        assert_eq!(
+            acp_mcp_fingerprint(&first).unwrap(),
+            acp_mcp_fingerprint(&first).unwrap()
+        );
     }
 
     #[test]

@@ -5,12 +5,33 @@ import {
   activityGroupSummary,
   buildChatLayout,
   isContextCompactionTool,
+  isStandaloneCommandUnit,
   type AgentActivityItem,
 } from "./chat-layout.js";
 
 const output = { text: "", omitted: false, bytes: 0 } as const;
 
 describe("buildChatLayout", () => {
+  it("identifies deterministic commands as standalone transcript units", () => {
+    const command: ThreadChatItem = {
+      id: "command-1",
+      kind: "command",
+      name: "status",
+      arguments: "",
+      output: "Ready",
+    };
+    const unit = buildChatLayout([command]).units[0];
+    expect(unit).toBeDefined();
+    expect(isStandaloneCommandUnit(unit!)).toBe(true);
+
+    const turnUnit = buildChatLayout([
+      { id: "u1", kind: "user", turn: 1, content: "Run", attachments: [] },
+      command,
+    ]).units[0];
+    expect(turnUnit).toBeDefined();
+    expect(isStandaloneCommandUnit(turnUnit!)).toBe(false);
+  });
+
   it("groups each prompt and assistant/work run into one turn", () => {
     const items: ThreadChatItem[] = [
       { id: "u1", kind: "user", turn: 1, content: "Do it", attachments: [] },

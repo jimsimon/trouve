@@ -687,6 +687,11 @@ pub struct TurnAccepted {
 /// catalog continue to use `SendMessageRequest` so they start a model turn.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExecuteCommandRequest {
+    /// Stable client-generated key for retrying this command without
+    /// repeating a non-idempotent side effect if the original response is
+    /// lost.
+    #[schema(min_length = 1, max_length = 128, pattern = "^[A-Za-z0-9._-]+$")]
+    pub idempotency_key: String,
     /// Catalog name without the leading slash.
     pub name: String,
     /// Everything following the command name, without leading whitespace.
@@ -1896,6 +1901,7 @@ pub struct CodeReviewProgress {
     pub completed_reviewers: u64,
     pub total_reviewers: u64,
     /// Integer percentage in the inclusive range 0..=100.
+    #[schema(maximum = 100)]
     pub percent: u8,
 }
 

@@ -2040,6 +2040,9 @@ impl Drop for ActiveTurnSteererGuard<'_> {
 pub struct BridgeTicketClaims {
     pub serve_approval: bool,
     pub correlate_codex_owner: bool,
+    /// Turn-start snapshot. A settings edit must not change the tools or
+    /// load_skill behavior of a bridge that is already in flight.
+    pub builtin_skills_enabled: bool,
 }
 
 struct ActiveBridgeTicket {
@@ -2063,6 +2066,37 @@ struct GlobalDefaults {
     model: String,
     thinking_level: Option<String>,
     permission_mode: trouve_protocol::PermissionMode,
+}
+
+struct CommandExecutionGuard {
+    store: Store,
+    idempotency_key: String,
+    thread_id: String,
+    request_fingerprint: String,
+    release_on_drop: bool,
+}
+
+impl CommandExecutionGuard {
+    fn preserve(&mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for CommandExecutionGuard {
+    fn drop(&mut self) {
+        if self.release_on_drop
+            && let Err(error) = self.store.release_command_execution(
+                &self.idempotency_key,
+                &self.thread_id,
+                &self.request_fingerprint,
+            )
+        {
+            tracing::error!(
+                thread_id = %self.thread_id,
+                "failed to release an uncommitted command claim: {error}"
+            );
+        }
+    }
 }
 
 fn fenced_block(language: &str, body: &str) -> String {
@@ -2111,6 +2145,18 @@ pub struct Engine {
     /// before turns so edited skills converge, but identical durable events
     /// are suppressed for the lifetime of this engine.
     command_catalogs: Mutex<HashMap<String, Vec<CommandInfo>>>,
+    /// Serializes catalog computation, durable publication, and cache update
+    /// per thread so an older concurrent snapshot cannot land after a newer
+    /// one. Weak entries avoid retaining deleted threads.
+    command_catalog_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// Coordinates global catalog-generation changes with thread creation and
+    /// per-thread publication. Readers publish from one stable settings
+    /// generation; a settings writer waits for them, updates the config, and
+    /// republishes every durable thread before releasing the barrier.
+    command_catalog_generation: RwLock<()>,
+    /// Orders deterministic commands per session so state-changing commands
+    /// and their presentation history cannot interleave out of order.
+    command_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Catalog prepared while constructing a vendor bridge URL. The matching
     /// tools/list request reuses it instead of repeating MCP discovery.
     bridged_tool_catalogs: Mutex<HashMap<String, BridgedToolCatalog>>,
@@ -2338,6 +2384,12 @@ fn resolved_cli_command(kind: &str, command: Option<String>, data_dir: &Path) ->
             .filter(|bin| bin.exists())
             .map(|bin| bin.to_string_lossy().into_owned())
     })
+}
+
+/// Version the vendor-session namespace with Trouve's capability contract so
+/// contexts created under an older tool surface are never resumed silently.
+fn backend_session_key(backend_id: &str) -> String {
+    format!("{backend_id}#trouve-native-v1")
 }
 
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
@@ -2579,6 +2631,9 @@ impl Engine {
             bridge_echoes: BridgeEchoTracker::default(),
             turn_scheduler: TurnScheduler::new(),
             command_catalogs: Mutex::new(HashMap::new()),
+            command_catalog_locks: Mutex::new(HashMap::new()),
+            command_catalog_generation: RwLock::new(()),
+            command_execution_locks: Mutex::new(HashMap::new()),
             bridged_tool_catalogs: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
@@ -4932,28 +4987,27 @@ impl Engine {
     /// catalogs for existing threads. Running turns keep their initial
     /// instruction snapshot.
     pub fn set_builtin_skills_enabled(self: &Arc<Self>, enabled: bool) -> Result<(), EngineError> {
+        let _catalog_generation = self.command_catalog_generation.write().unwrap();
         {
             let mut config = self.config.lock().unwrap();
             if config.builtin_skills_enabled() == enabled {
                 return Ok(());
             }
-            config.builtin_skills_enabled = Some(enabled);
-            self.persist_config(&config);
+            let mut updated = config.clone();
+            updated.builtin_skills_enabled = Some(enabled);
+            self.persist_config_checked(&updated)?;
+            *config = updated;
         }
-
-        let engine = Arc::clone(self);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let _task = runtime.spawn_blocking(move || engine.republish_command_catalogs());
-        } else if let Err(error) = std::thread::Builder::new()
-            .name("trouve-skill-catalogs".into())
-            .spawn(move || engine.republish_command_catalogs())
-        {
-            tracing::warn!("failed to start skill catalog refresh: {error}");
-        }
+        self.republish_command_catalogs_inner();
         Ok(())
     }
 
     fn republish_command_catalogs(&self) {
+        let _catalog_generation = self.command_catalog_generation.read().unwrap();
+        self.republish_command_catalogs_inner();
+    }
+
+    fn republish_command_catalogs_inner(&self) {
         let sessions = match self.store.list_sessions(None) {
             Ok(sessions) => sessions,
             Err(error) => {
@@ -4979,12 +5033,19 @@ impl Engine {
             };
             for thread in threads {
                 if let Err(error) =
-                    self.emit_command_catalog(&thread.id, Path::new(&workspace.path))
+                    self.emit_command_catalog_inner(&thread.id, Path::new(&workspace.path))
                 {
                     tracing::warn!(thread_id = %thread.id, "failed to refresh skill command catalog: {error}");
                 }
             }
         }
+    }
+
+    /// Reconcile every durable thread's provider-neutral command catalog at
+    /// startup. This makes edited user/workspace skills visible even when no
+    /// turn runs after the server restarts.
+    pub fn reconcile_command_catalogs(&self) {
+        self.republish_command_catalogs();
     }
 
     fn builtin_skills_enabled(&self) -> bool {
@@ -5019,6 +5080,13 @@ impl Engine {
         {
             tracing::warn!("failed to persist config: {e}");
         }
+    }
+
+    fn persist_config_checked(&self, config: &Config) -> Result<(), EngineError> {
+        if let Some(path) = &self.config_file {
+            config.save_to(path).map_err(EngineError::Internal)?;
+        }
+        Ok(())
     }
 
     /// Rebuild the provider registry from the current config (after provider
@@ -8505,6 +8573,8 @@ impl Engine {
             .store
             .session(&session.id)?
             .ok_or_else(|| EngineError::NotFound(format!("session {}", session.id)))?;
+        let _catalog_generation = self.command_catalog_generation.read().unwrap();
+        let commands = self.command_catalog(Path::new(&ws.path));
         self.store.insert_thread_with_event(
             &thread,
             &model_options,
@@ -8513,8 +8583,17 @@ impl Engine {
                 thread_id: thread.id.clone(),
                 session_id: live_session.id,
             },
+            vec![(
+                Scope::Thread(thread.id.clone()),
+                Event::CommandCatalogUpdated {
+                    commands: commands.clone(),
+                },
+            )],
         )?;
-        self.emit_command_catalog(&thread.id, Path::new(&ws.path))?;
+        self.command_catalogs
+            .lock()
+            .unwrap()
+            .insert(thread.id.clone(), commands);
         drop(deleting);
         Ok(thread)
     }
@@ -8528,6 +8607,13 @@ impl Engine {
     }
 
     fn emit_command_catalog(&self, thread_id: &str, workspace_root: &Path) -> Result<()> {
+        let _catalog_generation = self.command_catalog_generation.read().unwrap();
+        self.emit_command_catalog_inner(thread_id, workspace_root)
+    }
+
+    fn emit_command_catalog_inner(&self, thread_id: &str, workspace_root: &Path) -> Result<()> {
+        let publication_lock = self.command_catalog_lock(thread_id);
+        let _publication = publication_lock.lock().unwrap();
         let commands = self.command_catalog(workspace_root);
         if self.command_catalogs.lock().unwrap().get(thread_id) == Some(&commands) {
             return Ok(());
@@ -8545,6 +8631,28 @@ impl Engine {
         Ok(())
     }
 
+    fn command_catalog_lock(&self, thread_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.command_catalog_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(thread_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(thread_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn command_execution_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.command_execution_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
     /// Execute one Trouve-owned slash command. Prompt commands never enter
     /// this path; clients send those through `send_message` so skills start a
     /// normal model turn.
@@ -8553,13 +8661,33 @@ impl Engine {
         thread_id: &str,
         req: ExecuteCommandRequest,
     ) -> Result<CommandResult, EngineError> {
-        let name = req.name.trim().trim_start_matches('/');
+        let ExecuteCommandRequest {
+            idempotency_key,
+            name: requested_name,
+            arguments,
+        } = req;
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || !idempotency_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            return Err(EngineError::BadRequest(
+                "command idempotency key must be 1-128 ASCII letters, digits, '.', '_', or '-'"
+                    .into(),
+            ));
+        }
+        let name = requested_name.trim().trim_start_matches('/');
         let Some(spec) = crate::commands::action_spec(name) else {
             return Err(EngineError::BadRequest(format!(
                 "unknown action command: /{name}"
             )));
         };
-        let arguments = req.arguments.trim().to_string();
+        let arguments = arguments.trim().to_string();
+        let initial_thread = self.get_thread(thread_id)?;
+        let command_lock = self.command_execution_lock(&initial_thread.session_id);
+        let _command_execution = command_lock.lock_owned().await;
+        // A previous command may have changed this thread while we waited.
         let thread = self.get_thread(thread_id)?;
         let session = self.get_session(&thread.session_id)?;
         let workspace = self
@@ -8567,6 +8695,31 @@ impl Engine {
             .workspace(&session.workspace_id)?
             .ok_or_else(|| EngineError::NotFound(format!("workspace {}", session.workspace_id)))?;
         let workspace_root = Path::new(&workspace.path);
+
+        let request_fingerprint = serde_json::to_string(&(thread_id, name, arguments.as_str()))
+            .map_err(|error| EngineError::Internal(error.into()))?;
+        if let Some(prior) =
+            self.store
+                .claim_command_execution(&idempotency_key, thread_id, &request_fingerprint)?
+        {
+            if prior.thread_id != thread_id || prior.request_fingerprint != request_fingerprint {
+                return Err(EngineError::Conflict(
+                    "command idempotency key was already used for a different request".into(),
+                ));
+            }
+            return prior.result.ok_or_else(|| {
+                EngineError::Conflict(
+                    "command outcome is uncertain; reload the thread before retrying".into(),
+                )
+            });
+        }
+        let mut command_claim = CommandExecutionGuard {
+            store: self.store.clone(),
+            idempotency_key: idempotency_key.clone(),
+            thread_id: thread_id.to_string(),
+            request_fingerprint: request_fingerprint.clone(),
+            release_on_drop: true,
+        };
 
         let (output, action) = match name {
             "help" => {
@@ -8719,6 +8872,7 @@ impl Engine {
                     (output, CommandAction::None)
                 } else {
                     let mode = single_command_argument(spec, &arguments)?;
+                    command_claim.preserve();
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -8750,6 +8904,7 @@ impl Engine {
                     (output, CommandAction::None)
                 } else {
                     let model = single_command_argument(spec, &arguments)?;
+                    command_claim.preserve();
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -8782,6 +8937,7 @@ impl Engine {
                             return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
                         }
                     };
+                    command_claim.preserve();
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -8800,6 +8956,7 @@ impl Engine {
             }
             "undo" => {
                 require_no_command_arguments(spec, &arguments)?;
+                command_claim.preserve();
                 self.undo(&session.id).await?;
                 (
                     "Restored the previous checkpoint.".into(),
@@ -8808,11 +8965,13 @@ impl Engine {
             }
             "redo" => {
                 require_no_command_arguments(spec, &arguments)?;
+                command_claim.preserve();
                 self.redo(&session.id).await?;
                 ("Restored the next checkpoint.".into(), CommandAction::None)
             }
             "cancel" => {
                 require_no_command_arguments(spec, &arguments)?;
+                command_claim.preserve();
                 self.cancel_turn(thread_id)?;
                 (
                     "Cancellation requested for the current turn.".into(),
@@ -8821,6 +8980,7 @@ impl Engine {
             }
             "new" => {
                 require_no_command_arguments(spec, &arguments)?;
+                command_claim.preserve();
                 let created = self.create_thread(CreateThreadRequest {
                     session_id: session.id.clone(),
                     title: None,
@@ -8953,6 +9113,7 @@ impl Engine {
                 if arguments.is_empty() {
                     return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
                 }
+                command_claim.preserve();
                 let updated = self.update_session(
                     &session.id,
                     &UpdateSessionRequest {
@@ -8981,19 +9142,39 @@ impl Engine {
         };
 
         let output = truncate_command_output(output);
-        self.store.append_event(
-            Scope::Thread(thread_id.to_string()),
+        let result = CommandResult {
+            name: name.to_string(),
+            output: output.clone(),
+            action,
+        };
+        let completion = self.store.complete_command_execution_with_event(
+            &idempotency_key,
+            thread_id,
+            &request_fingerprint,
+            &result,
             Event::CommandExecuted {
                 name: name.to_string(),
                 arguments: arguments.clone(),
-                output: output.clone(),
+                output,
             },
-        )?;
-        Ok(CommandResult {
-            name: name.to_string(),
-            output,
-            action,
-        })
+        );
+        if let Err(error) = completion {
+            // The event writer may commit and then lose its reply. Re-read the
+            // durable receipt before surfacing a failure; a pending receipt is
+            // intentionally retained after any possible side effect so a
+            // retry cannot execute it twice.
+            if let Some(record) = self.store.command_execution(&idempotency_key)?
+                && record.thread_id == thread_id
+                && record.request_fingerprint == request_fingerprint
+                && let Some(durable) = record.result
+            {
+                command_claim.preserve();
+                return Ok(durable);
+            }
+            return Err(error.into());
+        }
+        command_claim.preserve();
+        Ok(result)
     }
 
     pub fn get_thread(&self, id: &str) -> Result<Thread, EngineError> {
@@ -11002,12 +11183,20 @@ impl Engine {
             }
         }
 
-        let system = context::system_prompt(
-            &mode,
-            self.config_dir.as_deref(),
-            Path::new(&ws.path),
-            self.builtin_skills_enabled(),
-        );
+        let system = if tools_enabled {
+            context::system_prompt(
+                &mode,
+                self.config_dir.as_deref(),
+                Path::new(&ws.path),
+                self.builtin_skills_enabled(),
+            )
+        } else {
+            context::system_prompt_without_skills(
+                &mode,
+                self.config_dir.as_deref(),
+                Path::new(&ws.path),
+            )
+        };
         let live_models = tokio::select! {
             biased;
             _ = cancel.cancelled() => bail!("turn cancelled"),
@@ -11429,12 +11618,16 @@ impl Engine {
         // Codex and Cursor own their approval protocols. Claude uses the
         // bridge as its headless permission-prompt target.
         let serve_approval = kind == "claude-cli";
+        let builtin_skills_enabled = self.builtin_skills_enabled();
         let claims = BridgeTicketClaims {
             serve_approval,
             correlate_codex_owner: kind == "codex-app-server",
+            builtin_skills_enabled,
         };
         let ticket = self.bridge_ticket_for(thread_id, claims);
-        let (revision, _) = self.refresh_bridged_tool_catalog(thread_id).await?;
+        let (revision, _) = self
+            .refresh_bridged_tool_catalog_with_skills(thread_id, builtin_skills_enabled)
+            .await?;
         let url = format!(
             "{}/internal/threads/{}/mcp?approval={}&ticket={}&catalog_revision={revision:016x}",
             base_url.trim_end_matches('/'),
@@ -11458,7 +11651,8 @@ impl Engine {
     /// Tool specs for a thread, as exposed to a bridged vendor agent
     /// (filtered by the thread's mode, same as native turns).
     pub async fn bridged_tool_specs(&self, thread_id: &str) -> Result<Vec<ToolSpec>, EngineError> {
-        self.build_bridged_tool_specs(thread_id).await
+        self.build_bridged_tool_specs_with_skills(thread_id, self.builtin_skills_enabled())
+            .await
     }
 
     /// Reuse the catalog prepared for the bridge URL when its revision
@@ -11468,6 +11662,20 @@ impl Engine {
         &self,
         thread_id: &str,
         revision: Option<u64>,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
+        self.bridged_tool_specs_for_revision_with_skills(
+            thread_id,
+            revision,
+            self.builtin_skills_enabled(),
+        )
+        .await
+    }
+
+    pub async fn bridged_tool_specs_for_revision_with_skills(
+        &self,
+        thread_id: &str,
+        revision: Option<u64>,
+        builtin_skills_enabled: bool,
     ) -> Result<Vec<ToolSpec>, EngineError> {
         if let Some(revision) = revision
             && let Some(catalog) = self
@@ -11480,15 +11688,20 @@ impl Engine {
         {
             return Ok(catalog.specs);
         }
-        let (_, specs) = self.refresh_bridged_tool_catalog(thread_id).await?;
+        let (_, specs) = self
+            .refresh_bridged_tool_catalog_with_skills(thread_id, builtin_skills_enabled)
+            .await?;
         Ok(specs)
     }
 
-    async fn refresh_bridged_tool_catalog(
+    async fn refresh_bridged_tool_catalog_with_skills(
         &self,
         thread_id: &str,
+        builtin_skills_enabled: bool,
     ) -> Result<(u64, Vec<ToolSpec>), EngineError> {
-        let specs = self.build_bridged_tool_specs(thread_id).await?;
+        let specs = self
+            .build_bridged_tool_specs_with_skills(thread_id, builtin_skills_enabled)
+            .await?;
         let revision = tool_catalog_revision(&specs);
         self.bridged_tool_catalogs.lock().unwrap().insert(
             thread_id.to_string(),
@@ -11500,11 +11713,14 @@ impl Engine {
         Ok((revision, specs))
     }
 
-    async fn build_bridged_tool_specs(
+    async fn build_bridged_tool_specs_with_skills(
         &self,
         thread_id: &str,
+        builtin_skills_enabled: bool,
     ) -> Result<Vec<ToolSpec>, EngineError> {
-        let (_, _, mode, ctx) = self.bridged_context(thread_id)?;
+        let cancel = self.active_bridge_cancel(thread_id)?;
+        let (_, _, mode, ctx) =
+            self.bridged_context_with_cancel_and_skills(thread_id, cancel, builtin_skills_enabled)?;
         let mut specs: Vec<ToolSpec> = self
             .executor
             .specs(&ctx)
@@ -11540,9 +11756,31 @@ impl Engine {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String, EngineError> {
+        self.bridged_tool_call_with_skills(
+            thread_id,
+            name,
+            arguments,
+            self.builtin_skills_enabled(),
+        )
+        .await
+    }
+
+    pub async fn bridged_tool_call_with_skills(
+        self: &Arc<Self>,
+        thread_id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+        builtin_skills_enabled: bool,
+    ) -> Result<String, EngineError> {
         let cancel = self.active_bridge_cancel(thread_id)?;
-        self.bridged_tool_call_for(thread_id, name, arguments, cancel)
-            .await
+        self.bridged_tool_call_for_with_skills(
+            thread_id,
+            name,
+            arguments,
+            cancel,
+            builtin_skills_enabled,
+        )
+        .await
     }
 
     /// Execute a Codex MCP call after correlating app-server's authoritative
@@ -11555,6 +11793,26 @@ impl Engine {
         vendor_call_id: Option<&str>,
         name: &str,
         arguments: &serde_json::Value,
+    ) -> Result<String, EngineError> {
+        self.bridged_codex_tool_call_with_skills(
+            root_thread_id,
+            vendor_thread_id,
+            vendor_call_id,
+            name,
+            arguments,
+            self.builtin_skills_enabled(),
+        )
+        .await
+    }
+
+    pub async fn bridged_codex_tool_call_with_skills(
+        self: &Arc<Self>,
+        root_thread_id: &str,
+        vendor_thread_id: Option<&str>,
+        vendor_call_id: Option<&str>,
+        name: &str,
+        arguments: &serde_json::Value,
+        builtin_skills_enabled: bool,
     ) -> Result<String, EngineError> {
         let vendor_thread_id = vendor_thread_id
             .filter(|thread_id| !thread_id.is_empty())
@@ -11670,19 +11928,29 @@ impl Engine {
         if root_cancel.is_cancelled() {
             return Err(EngineError::Conflict("tool call cancelled".into()));
         }
-        self.bridged_tool_call_for(&owner_thread_id, name, arguments, root_cancel)
-            .await
+        self.bridged_tool_call_for_with_skills(
+            &owner_thread_id,
+            name,
+            arguments,
+            root_cancel,
+            builtin_skills_enabled,
+        )
+        .await
     }
 
-    async fn bridged_tool_call_for(
+    async fn bridged_tool_call_for_with_skills(
         self: &Arc<Self>,
         thread_id: &str,
         name: &str,
         arguments: &serde_json::Value,
         cancel: tokio_util::sync::CancellationToken,
+        builtin_skills_enabled: bool,
     ) -> Result<String, EngineError> {
-        let (session, thread, mode, ctx) =
-            self.bridged_context_with_cancel(thread_id, cancel.clone())?;
+        let (session, thread, mode, ctx) = self.bridged_context_with_cancel_and_skills(
+            thread_id,
+            cancel.clone(),
+            builtin_skills_enabled,
+        )?;
         let turn = self.store.last_turn(thread_id)?;
         let call = trouve_providers::ToolCallRequest {
             id: new_id("call"),
@@ -12051,6 +12319,19 @@ impl Engine {
         thread_id: &str,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(Session, Thread, AgentPersona, ToolCtx), EngineError> {
+        self.bridged_context_with_cancel_and_skills(
+            thread_id,
+            cancel,
+            self.builtin_skills_enabled(),
+        )
+    }
+
+    fn bridged_context_with_cancel_and_skills(
+        &self,
+        thread_id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+        builtin_skills_enabled: bool,
+    ) -> Result<(Session, Thread, AgentPersona, ToolCtx), EngineError> {
         let thread = self.get_thread(thread_id)?;
         let session = self.get_session(&thread.session_id)?;
         let ws = self
@@ -12079,7 +12360,7 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
-            builtin_skills_enabled: self.builtin_skills_enabled(),
+            builtin_skills_enabled,
             edit_strategy: edit_strategy_for_model(&thread.model),
             background_mutation_lease: None,
         };
@@ -12330,8 +12611,11 @@ impl Engine {
                 )
             })
             .map_err(|error| anyhow!(error.to_string()))?;
-        self.store
-            .set_backend_session(&child.id, backend_id, &vendor_session_id)?;
+        self.store.set_backend_session(
+            &child.id,
+            &backend_session_key(backend_id),
+            &vendor_session_id,
+        )?;
         vendor_threads.insert(vendor_session_id.clone(), child.id.clone());
         let mut collaborator = BackendCollaboratorProjection {
             thread: child,
@@ -12503,8 +12787,11 @@ impl Engine {
                 usage.context_input_tokens = Some(context_input_tokens);
                 collaborator.usage = usage.clone();
                 let seen = self.store.messages(&collaborator.thread.id)?.len() as u64;
-                self.store
-                    .mark_backend_seen(&collaborator.thread.id, backend_id, seen)?;
+                self.store.mark_backend_seen(
+                    &collaborator.thread.id,
+                    &backend_session_key(backend_id),
+                    seen,
+                )?;
                 self.store.record_usage(
                     &session.id,
                     &collaborator.thread.id,
@@ -12865,7 +13152,7 @@ impl Engine {
         // Keep contexts from the retired full-replacement mode out of this
         // optimized-native contract. Bump the namespace whenever provider
         // surface isolation changes enough to require a fresh vendor context.
-        let backend_session_key = format!("{backend_id}#trouve-native-v1");
+        let backend_session_key = backend_session_key(backend_id);
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
@@ -12952,12 +13239,20 @@ impl Engine {
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
         // (MCP instructions alone are too weak a signal).
-        let mut instructions = context::system_prompt(
-            mode,
-            self.config_dir.as_deref(),
-            Path::new(&workspace.path),
-            self.builtin_skills_enabled(),
-        );
+        let mut instructions = if tools_enabled {
+            context::system_prompt(
+                mode,
+                self.config_dir.as_deref(),
+                Path::new(&workspace.path),
+                self.builtin_skills_enabled(),
+            )
+        } else {
+            context::system_prompt_without_skills(
+                mode,
+                self.config_dir.as_deref(),
+                Path::new(&workspace.path),
+            )
+        };
         if mcp_bridge.is_some() {
             if !instructions.is_empty() {
                 instructions.push_str("\n\n");
@@ -17935,6 +18230,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_skill_setting_persistence_keeps_runtime_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::create_dir(&config_path).unwrap();
+        let engine = Arc::new(
+            Engine::new(
+                Store::open_in_memory().unwrap(),
+                temp.path().join("data"),
+                &Config::default(),
+            )
+            .with_config_file(Some(config_path)),
+        );
+
+        assert!(engine.skills_settings().builtin_skills_enabled);
+        assert!(engine.set_builtin_skills_enabled(false).is_err());
+        assert!(engine.skills_settings().builtin_skills_enabled);
+    }
+
     struct RejectingPersonaDeletionExecutor {
         attempted: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -20410,7 +20724,7 @@ mod tests {
             "provider metadata must not widen a read-only parent"
         );
         store
-            .set_backend_session(&parent.id, "codex", "vendor-root")
+            .set_backend_session(&parent.id, &backend_session_key("codex"), "vendor-root")
             .unwrap();
 
         let mut vendor_threads = HashMap::from([("vendor-root".into(), parent.id.clone())]);
@@ -20452,7 +20766,9 @@ mod tests {
             Some(parent.id.clone())
         );
         assert_eq!(
-            store.backend_session(&child.id, "codex").unwrap(),
+            store
+                .backend_session(&child.id, &backend_session_key("codex"))
+                .unwrap(),
             Some(("vendor-child".into(), 0))
         );
         assert_eq!(
@@ -20942,7 +21258,9 @@ default_permission_mode = "ask"
             .unwrap();
         assert!(projection.terminal);
         assert_eq!(
-            store.backend_session(&child.id, "codex").unwrap(),
+            store
+                .backend_session(&child.id, &backend_session_key("codex"))
+                .unwrap(),
             Some(("vendor-child".into(), 2))
         );
 
@@ -21147,7 +21465,7 @@ default_permission_mode = "ask"
         ));
         assert_eq!(
             store
-                .backend_session(&late_prompt_child_id, "codex")
+                .backend_session(&late_prompt_child_id, &backend_session_key("codex"))
                 .unwrap(),
             Some(("vendor-late-prompt".into(), 1))
         );
@@ -21263,7 +21581,9 @@ default_permission_mode = "ask"
             2
         );
         assert_eq!(
-            store.backend_session(&child.id, "codex").unwrap(),
+            store
+                .backend_session(&child.id, &backend_session_key("codex"))
+                .unwrap(),
             Some(("vendor-child".into(), 5))
         );
 

@@ -101,6 +101,17 @@ fn permission_settings(
     }
 }
 
+fn sandbox_policy(permission: BackendPermission, sandbox_policy_type: &str) -> Value {
+    if matches!(permission, BackendPermission::ReadOnly) {
+        // A read-only native shell must not exfiltrate repository data or
+        // mutate remote services outside Trouve's approval/audit gate. The
+        // app-server MCP transport is outside this command sandbox.
+        json!({ "type": sandbox_policy_type, "networkAccess": false })
+    } else {
+        json!({ "type": sandbox_policy_type })
+    }
+}
+
 impl CodexBackend {
     pub fn new(id: impl Into<String>, command: Option<String>) -> Self {
         Self {
@@ -345,15 +356,7 @@ impl AgentBackend for CodexBackend {
             .and_then(Value::as_str)
             .or(id_effort);
         let (approval_policy, sandbox, sandbox_policy_type) = permission_settings(turn.permission);
-        let sandbox_policy = if matches!(turn.permission, BackendPermission::ReadOnly) {
-            // Sandboxed read-only turns still need outbound access for
-            // fetches, remote inspection, and Trouve's loopback MCP bridge.
-            json!({ "type": sandbox_policy_type, "networkAccess": true })
-        } else {
-            // dangerFullAccess has no networkAccess field: with no OS
-            // sandbox, network access is already unrestricted.
-            json!({ "type": sandbox_policy_type })
-        };
+        let sandbox_policy = sandbox_policy(turn.permission, sandbox_policy_type);
 
         // Per-thread config overrides: request raw reasoning from models that
         // expose it and mount trouve/user MCP servers. Both thread/start and
@@ -3608,6 +3611,7 @@ impl AuthFileLock {
         options.open(path)
     }
 
+    #[cfg(test)]
     fn acquire(source: &Path) -> std::io::Result<Self> {
         let file = Self::open(source)?;
         file.lock()?;
@@ -3631,16 +3635,58 @@ impl AuthFileLock {
 }
 
 async fn acquire_auth_lock(source: PathBuf) -> Result<AuthFileLock, BackendError> {
-    tokio::task::spawn_blocking(move || AuthFileLock::acquire(&source))
+    tokio::task::spawn_blocking(move || AuthFileLock::try_acquire_for(&source, AUTH_LOCK_WAIT))
         .await
         .map_err(|error| BackendError::Io(std::io::Error::other(error.to_string())))?
-        .map_err(BackendError::Io)
+        .map_err(BackendError::Io)?
+        .ok_or_else(|| {
+            BackendError::Protocol(
+                "Codex credentials are being updated; retry login shortly".into(),
+            )
+        })
 }
 
 fn read_auth_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn auth_publication_backup(source: &Path) -> std::io::Result<PathBuf> {
+    let mut name = source
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Codex auth path has no file name",
+            )
+        })?
+        .to_os_string();
+    name.push(".trouve.previous");
+    Ok(source.with_file_name(name))
+}
+
+/// Restore a claimed credential file without replacing a path that a direct
+/// vendor login created concurrently. A hard link is an atomic no-clobber
+/// publication on every platform we support and both names share a directory.
+fn restore_claimed_auth(source: &Path, backup: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(backup, source) {
+        Ok(()) => std::fs::remove_file(backup),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(backup)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Recover an interrupted claim before starting a new publication. The live
+/// source always wins when both names exist.
+fn recover_auth_publication(source: &Path, backup: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(backup) {
+        Ok(_) => restore_claimed_auth(source, backup),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -3697,7 +3743,15 @@ impl AuthSync {
         self.sync_with_publish_hook(|| {})
     }
 
-    fn sync_with_publish_hook(&self, before_publish: impl FnOnce()) -> std::io::Result<()> {
+    fn sync_with_publish_hook(&self, before_claim: impl FnOnce()) -> std::io::Result<()> {
+        self.sync_with_publish_hooks(before_claim, || {})
+    }
+
+    fn sync_with_publish_hooks(
+        &self,
+        before_claim: impl FnOnce(),
+        after_claim: impl FnOnce(),
+    ) -> std::io::Result<()> {
         let mut baseline = self.baseline.lock().unwrap();
         let Some(previous) = baseline.clone() else {
             return Ok(());
@@ -3712,6 +3766,8 @@ impl AuthSync {
             );
             return Ok(());
         };
+        let backup = auth_publication_backup(&self.source)?;
+        recover_auth_publication(&self.source, &backup)?;
         let source = read_auth_or_empty(&self.source)?;
         if source != previous && source != isolated {
             tracing::warn!(
@@ -3736,7 +3792,7 @@ impl AuthSync {
                 staged.as_file().sync_all()?;
             }
 
-            before_publish();
+            before_claim();
             let current = read_auth_or_empty(&self.source)?;
             if current != source {
                 if current != isolated {
@@ -3746,8 +3802,45 @@ impl AuthSync {
                     *baseline = None;
                     return Ok(());
                 }
-            } else {
-                staged.persist(&self.source).map_err(|error| error.error)?;
+                *baseline = Some(isolated);
+                return Ok(());
+            }
+
+            // Claim the exact path we inspected. A direct CLI replacement
+            // before the rename is captured and detected below; one after
+            // the rename makes persist_noclobber fail, so it also wins.
+            std::fs::rename(&self.source, &backup)?;
+            let claimed = std::fs::read(&backup)?;
+            if claimed != source {
+                restore_claimed_auth(&self.source, &backup)?;
+                if claimed != isolated {
+                    tracing::warn!(
+                        "Codex auth changed while its refresh was claimed; preserving the newer source"
+                    );
+                    *baseline = None;
+                }
+                return Ok(());
+            }
+
+            after_claim();
+            match staged.persist_noclobber(&self.source) {
+                Ok(_) => std::fs::remove_file(&backup)?,
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let winner = read_auth_or_empty(&self.source)?;
+                    restore_claimed_auth(&self.source, &backup)?;
+                    if winner != isolated {
+                        tracing::warn!(
+                            "Codex login completed during isolated credential publication; preserving it"
+                        );
+                        *baseline = None;
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    let publish_error = error.error;
+                    restore_claimed_auth(&self.source, &backup)?;
+                    return Err(publish_error);
+                }
             }
         }
         // Publication (or another writer's identical publication) succeeded.
@@ -7799,6 +7892,14 @@ cat > /dev/null
             permission_settings(crate::BackendPermission::Yolo),
             ("untrusted", "danger-full-access", "dangerFullAccess")
         );
+        assert_eq!(
+            sandbox_policy(crate::BackendPermission::ReadOnly, "readOnly"),
+            json!({ "type": "readOnly", "networkAccess": false })
+        );
+        assert_eq!(
+            sandbox_policy(crate::BackendPermission::Ask, "dangerFullAccess"),
+            json!({ "type": "dangerFullAccess" })
+        );
     }
 
     #[test]
@@ -8066,6 +8167,32 @@ for line in sys.stdin:
         })
         .unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        std::fs::write(&isolated, b"later-stale-refresh").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+    }
+
+    #[test]
+    fn auth_sync_never_clobbers_login_after_source_is_claimed() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
+
+        sync.sync_with_publish_hooks(
+            || {},
+            || {
+                // The claim temporarily removes auth.json. A direct vendor
+                // login can recreate it without participating in our lock.
+                std::fs::write(&source, b"new-login").unwrap();
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+        assert!(!auth_publication_backup(&source).unwrap().exists());
 
         std::fs::write(&isolated, b"later-stale-refresh").unwrap();
         sync.sync().unwrap();

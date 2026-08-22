@@ -694,7 +694,6 @@ impl ThreadViewModel {
                 arguments,
                 output,
             } => {
-                self.finish_thinking();
                 self.items.push(ChatItem::Command {
                     name: name.clone(),
                     arguments: arguments.clone(),
@@ -1829,6 +1828,33 @@ mod tests {
         assert!(matches!(
             vm.items.first(),
             Some(ChatItem::Command { name, output, .. }) if name == "status" && output == "Ready"
+        ));
+    }
+
+    #[test]
+    fn command_output_does_not_finish_active_model_thinking() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 4,
+            text: "Still reasoning.".into(),
+        }));
+        vm.apply(&env(Event::CommandExecuted {
+            name: "status".into(),
+            arguments: String::new(),
+            output: "Ready".into(),
+        }));
+
+        assert!(vm.thinking);
+        assert!(vm.items.iter().any(|item| matches!(
+            item,
+            ChatItem::Thinking {
+                complete: false,
+                ..
+            }
+        )));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::Command { name, .. }) if name == "status"
         ));
     }
 

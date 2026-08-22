@@ -299,7 +299,8 @@ pub use requests::*;
 // 7.12: code-review jobs expose the server-authoritative final-editor retry
 // capability derived from their latest durable task attempts (additive).
 // 7.13: provider-neutral command catalogs, deterministic command execution,
-// durable command output, and global built-in skill settings (additive).
+// durable command output, global built-in skill settings, bounded code-review
+// progress schemas, and retriable command idempotency keys (additive).
 pub const PROTOCOL_VERSION: &str = "7.13";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";

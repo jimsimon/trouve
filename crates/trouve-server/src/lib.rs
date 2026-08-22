@@ -973,6 +973,7 @@ pub async fn serve_listener(
     engine.reconcile_checkpoint_refs().await;
     engine.retry_artifact_cleanup_jobs().await;
     engine.retry_persona_deletions().await;
+    engine.reconcile_command_catalogs();
     engine.start_artifact_cleanup_worker();
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.

@@ -3101,6 +3101,12 @@ export interface components {
         ExecuteCommandRequest: {
             /** @description Everything following the command name, without leading whitespace. */
             arguments?: string;
+            /**
+             * @description Stable client-generated key for retrying this command without
+             *     repeating a non-idempotent side effect if the original response is
+             *     lost.
+             */
+            idempotency_key: string;
             /** @description Catalog name without the leading slash. */
             name: string;
         };

@@ -694,7 +694,11 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
 
     let status: serde_json::Value = client
         .post(format!("{base}/threads/{thread_id}/commands"))
-        .json(&serde_json::json!({"name": "status", "arguments": ""}))
+        .json(&serde_json::json!({
+            "idempotency_key": "command-status",
+            "name": "status",
+            "arguments": ""
+        }))
         .send()
         .await
         .unwrap()
@@ -714,7 +718,11 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
 
     let terminal: serde_json::Value = client
         .post(format!("{base}/threads/{thread_id}/commands"))
-        .json(&serde_json::json!({"name": "terminal", "arguments": ""}))
+        .json(&serde_json::json!({
+            "idempotency_key": "command-terminal",
+            "name": "terminal",
+            "arguments": ""
+        }))
         .send()
         .await
         .unwrap()
@@ -725,7 +733,11 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
 
     let new_thread: serde_json::Value = client
         .post(format!("{base}/threads/{thread_id}/commands"))
-        .json(&serde_json::json!({"name": "new", "arguments": ""}))
+        .json(&serde_json::json!({
+            "idempotency_key": "command-new",
+            "name": "new",
+            "arguments": ""
+        }))
         .send()
         .await
         .unwrap()
@@ -734,10 +746,28 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .unwrap();
     assert_eq!(new_thread["action"]["type"], "switch_thread");
     assert!(new_thread["action"]["thread_id"].is_string());
+    let repeated_new: serde_json::Value = client
+        .post(format!("{base}/threads/{thread_id}/commands"))
+        .json(&serde_json::json!({
+            "idempotency_key": "command-new",
+            "name": "new",
+            "arguments": ""
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repeated_new, new_thread);
 
     let help: serde_json::Value = client
         .post(format!("{base}/threads/{thread_id}/commands"))
-        .json(&serde_json::json!({"name": "help", "arguments": "terminal"}))
+        .json(&serde_json::json!({
+            "idempotency_key": "command-help",
+            "name": "help",
+            "arguments": "terminal"
+        }))
         .send()
         .await
         .unwrap()
@@ -750,7 +780,11 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     // endpoint and bypass the normal model-turn path.
     let response = client
         .post(format!("{base}/threads/{thread_id}/commands"))
-        .json(&serde_json::json!({"name": "skill", "arguments": "code-review"}))
+        .json(&serde_json::json!({
+            "idempotency_key": "command-invalid-prompt",
+            "name": "skill",
+            "arguments": "code-review"
+        }))
         .send()
         .await
         .unwrap();

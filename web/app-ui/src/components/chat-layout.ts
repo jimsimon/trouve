@@ -43,6 +43,20 @@ export interface ChatLayout {
   readonly unitIdForItem: ReadonlyMap<string, string>;
 }
 
+/** Deterministic commands are independent transcript entries, not activity
+ * produced by the model turn whose number happens to precede them. */
+export type StandaloneCommandUnit = ChatRenderUnit & {
+  readonly items: readonly [Extract<AgentChatItem, { readonly kind: "command" }>];
+};
+
+export const isStandaloneCommandUnit = (
+  unit: ChatRenderUnit,
+): unit is StandaloneCommandUnit =>
+  unit.prompt === undefined
+  && unit.status === undefined
+  && unit.items.length === 1
+  && unit.items[0]?.kind === "command";
+
 const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   item.kind === "assistant"
   || item.kind === "steered"

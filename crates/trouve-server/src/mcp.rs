@@ -116,7 +116,14 @@ pub(crate) async fn mcp_endpoint(
                 .catalog_revision
                 .as_deref()
                 .and_then(|value| u64::from_str_radix(value, 16).ok());
-            tools_list(&engine, &thread_id, serve_approval, revision).await
+            tools_list(
+                &engine,
+                &thread_id,
+                serve_approval,
+                revision,
+                claims.builtin_skills_enabled,
+            )
+            .await
         }
         "tools/call"
             if tool_available_for_bridge(
@@ -132,6 +139,7 @@ pub(crate) async fn mcp_endpoint(
                     &thread_id,
                     &msg["params"],
                     claims.correlate_codex_owner,
+                    claims.builtin_skills_enabled,
                 )
                 .await
             }
@@ -158,6 +166,7 @@ async fn tools_list(
     thread_id: &str,
     serve_approval: bool,
     catalog_revision: Option<u64>,
+    builtin_skills_enabled: bool,
 ) -> Result<Value, String> {
     // The approval gate is served for Claude (its permission-prompt tool is
     // invoked by name and must exist on the configured MCP server).
@@ -179,7 +188,11 @@ async fn tools_list(
         }));
     }
     let specs = engine
-        .bridged_tool_specs_for_revision(thread_id, catalog_revision)
+        .bridged_tool_specs_for_revision_with_skills(
+            thread_id,
+            catalog_revision,
+            builtin_skills_enabled,
+        )
         .await
         .map_err(|e| format!("supplemental tool catalog unavailable for {thread_id}: {e}"))?;
     tools.extend(
@@ -228,6 +241,7 @@ async fn tools_call(
     thread_id: &str,
     params: &Value,
     correlate_codex_owner: bool,
+    builtin_skills_enabled: bool,
 ) -> Result<Value, String> {
     let name = params["name"].as_str().unwrap_or_default();
     if !tool_available_for_bridge(name, false) {
@@ -237,16 +251,19 @@ async fn tools_call(
     let result = if correlate_codex_owner {
         let (vendor_thread_id, vendor_call_id) = codex_tool_call_metadata(params)?;
         engine
-            .bridged_codex_tool_call(
+            .bridged_codex_tool_call_with_skills(
                 thread_id,
                 Some(vendor_thread_id),
                 vendor_call_id,
                 name,
                 &arguments,
+                builtin_skills_enabled,
             )
             .await
     } else {
-        engine.bridged_tool_call(thread_id, name, &arguments).await
+        engine
+            .bridged_tool_call_with_skills(thread_id, name, &arguments, builtin_skills_enabled)
+            .await
     };
     match result {
         Ok(content) => Ok(json!({

@@ -60,14 +60,19 @@ fn valid_skill_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
 }
 
+fn canonical_skill_root(base: &Path, relative: &Path) -> Option<PathBuf> {
+    let base = base.canonicalize().ok()?;
+    let root = base.join(relative).canonicalize().ok()?;
+    root.starts_with(&base).then_some(root)
+}
+
 fn canonical_skill_roots(config_dir: Option<&Path>, workspace_root: Option<&Path>) -> Vec<PathBuf> {
     [
-        config_dir.map(|dir| dir.join("skills")),
-        workspace_root.map(|root| root.join(".agents").join("skills")),
+        config_dir.and_then(|dir| canonical_skill_root(dir, Path::new("skills"))),
+        workspace_root.and_then(|root| canonical_skill_root(root, Path::new(".agents/skills"))),
     ]
     .into_iter()
     .flatten()
-    .filter_map(|root| root.canonicalize().ok())
     .collect()
 }
 
@@ -191,38 +196,273 @@ fn fallback_description(text: &str) -> String {
         .to_string()
 }
 
-fn load_dir(dir: &Path, origin: &'static str, out: &mut BTreeMap<String, Skill>) {
-    let Ok(canonical_dir) = dir.canonicalize() else {
+fn skill_relative_components(path: &Path) -> Result<Vec<&std::ffi::OsStr>> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(name) => components.push(name),
+            _ => bail!(
+                "skill path contains an unsafe component: {}",
+                path.display()
+            ),
+        }
+    }
+    if components.is_empty() {
+        bail!("skill path is empty");
+    }
+    Ok(components)
+}
+
+#[cfg(unix)]
+fn read_skill_file(root: &Path, relative: &Path) -> Result<String> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let relative = skill_relative_components(relative)?;
+    if !root.is_absolute() {
+        bail!("skill root is not absolute: {}", root.display());
+    }
+    let anchor = std::ffi::CString::new("/").expect("static path has no NUL");
+    let raw = unsafe {
+        libc::open(
+            anchor.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if raw < 0 {
+        return Err(anyhow::anyhow!(
+            "opening skill root anchor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut directory = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    // Walk the canonical root by descriptor. A component swapped for a link
+    // after discovery is rejected by O_NOFOLLOW instead of being traversed.
+    for component in root.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::CurDir
+            ) {
+                continue;
+            }
+            bail!(
+                "skill root contains an unsafe component: {}",
+                root.display()
+            );
+        };
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| anyhow::anyhow!("skill root contains NUL"))?;
+        let next = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if next < 0 {
+            return Err(anyhow::anyhow!(
+                "opening skill root without following links: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        directory = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+
+    for component in &relative[..relative.len() - 1] {
+        let name = std::ffi::CString::new(component.as_bytes())
+            .map_err(|_| anyhow::anyhow!("skill path contains NUL"))?;
+        let next = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if next < 0 {
+            return Err(anyhow::anyhow!(
+                "opening skill directory without following links: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        directory = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+
+    let name = std::ffi::CString::new(relative.last().unwrap().as_bytes())
+        .map_err(|_| anyhow::anyhow!("skill path contains NUL"))?;
+    let raw = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if raw < 0 {
+        return Err(anyhow::anyhow!(
+            "opening skill without following links: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(file.as_raw_fd(), metadata.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+        bail!("skill is not a regular file");
+    }
+    if metadata.st_size < 0 || metadata.st_size as u64 > MAX_SKILL_BYTES {
+        bail!("skill exceeds the {MAX_SKILL_BYTES} byte limit");
+    }
+    let mut bytes = Vec::with_capacity(metadata.st_size as usize);
+    std::fs::File::from(file)
+        .take(MAX_SKILL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SKILL_BYTES {
+        bail!("skill exceeds the {MAX_SKILL_BYTES} byte limit");
+    }
+    String::from_utf8(bytes).map_err(|error| anyhow::anyhow!("skill is not UTF-8: {error}"))
+}
+
+#[cfg(windows)]
+fn normalize_windows_skill_path(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    let path = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    };
+    path.trim_end_matches('\\').to_lowercase()
+}
+
+#[cfg(windows)]
+fn skill_windows_final_path(file: &std::fs::File) -> Result<String> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let needed = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut buffer = vec![0_u16; needed as usize + 1];
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(normalize_windows_skill_path(&String::from_utf16_lossy(
+        &buffer[..written as usize],
+    )))
+}
+
+#[cfg(windows)]
+fn read_skill_file(root: &Path, relative: &Path) -> Result<String> {
+    use std::io::Read as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let _ = skill_relative_components(relative)?;
+    let mut root_options = std::fs::OpenOptions::new();
+    root_options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let root_file = root_options.open(root)?;
+    let root_metadata = root_file.metadata()?;
+    if root_metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0
+        || root_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        bail!("skill root is not a plain directory");
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(root.join(relative))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        bail!("skill is not a plain regular file");
+    }
+    if metadata.len() > MAX_SKILL_BYTES {
+        bail!("skill exceeds the {MAX_SKILL_BYTES} byte limit");
+    }
+    let root_final = skill_windows_final_path(&root_file)?;
+    let expected_root = normalize_windows_skill_path(&root.to_string_lossy());
+    if root_final != expected_root {
+        bail!("opened skill root changed after validation");
+    }
+    let file_final = skill_windows_final_path(&file)?;
+    let suffix = file_final
+        .strip_prefix(&root_final)
+        .filter(|suffix| suffix.starts_with(['\\', '/']))
+        .ok_or_else(|| anyhow::anyhow!("opened skill escaped its declared root"))?;
+    if suffix.len() <= 1 {
+        bail!("opened skill does not name a file below its declared root");
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SKILL_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SKILL_BYTES {
+        bail!("skill exceeds the {MAX_SKILL_BYTES} byte limit");
+    }
+    String::from_utf8(bytes).map_err(|error| anyhow::anyhow!("skill is not UTF-8: {error}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_skill_file(root: &Path, relative: &Path) -> Result<String> {
+    let _ = skill_relative_components(relative)?;
+    let path = root.join(relative).canonicalize()?;
+    if !path.starts_with(root) {
+        bail!("skill escaped its declared root");
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.len() as u64 > MAX_SKILL_BYTES {
+        bail!("skill exceeds the {MAX_SKILL_BYTES} byte limit");
+    }
+    String::from_utf8(bytes).map_err(|error| anyhow::anyhow!("skill is not UTF-8: {error}"))
+}
+
+fn load_dir(base: &Path, relative: &Path, origin: &'static str, out: &mut BTreeMap<String, Skill>) {
+    let Some(canonical_dir) = canonical_skill_root(base, relative) else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(&canonical_dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let skill_md = entry.path().join("SKILL.md");
-        // Repositories can contain symlinks. A skill is allowed to read only
-        // a SKILL.md physically contained by its declared skill root.
-        let Ok(canonical_skill) = skill_md.canonicalize() else {
+        let relative = PathBuf::from(entry.file_name()).join("SKILL.md");
+        let Ok(text) = read_skill_file(&canonical_dir, &relative) else {
             continue;
         };
-        if !canonical_skill.starts_with(&canonical_dir) {
-            continue;
-        }
-        if std::fs::metadata(&canonical_skill).is_ok_and(|m| m.len() > MAX_SKILL_BYTES) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&canonical_skill) else {
-            continue;
-        };
-        if text.len() as u64 > MAX_SKILL_BYTES {
-            continue;
-        }
         let directory = entry.file_name().to_string_lossy().to_string();
         if let Some(skill) = skill_from_text(
             &directory,
             &text,
             origin,
-            SkillSource::File(canonical_skill),
+            SkillSource::File(canonical_dir.join(relative)),
         ) {
             out.insert(skill.name.clone(), skill);
         }
@@ -251,14 +491,10 @@ pub fn discover(
         }
     }
     if let Some(dir) = config_dir {
-        load_dir(&dir.join("skills"), "user", &mut skills);
+        load_dir(dir, Path::new("skills"), "user", &mut skills);
     }
     if let Some(root) = workspace_root {
-        load_dir(
-            &root.join(".agents").join("skills"),
-            "workspace",
-            &mut skills,
-        );
+        load_dir(root, Path::new(".agents/skills"), "workspace", &mut skills);
     }
     skills.into_values().collect()
 }
@@ -281,30 +517,18 @@ pub fn load(
     match &skill.source {
         SkillSource::BuiltIn(text) => Ok((skill.clone(), (*text).to_string())),
         SkillSource::File(path) => {
-            let canonical_path = path
-                .canonicalize()
-                .map_err(|error| anyhow::anyhow!("cannot resolve skill {name}: {error}"))?;
-            if !canonical_skill_roots(config_dir, workspace_root)
+            let roots = canonical_skill_roots(config_dir, workspace_root);
+            let (root, relative) = roots
                 .iter()
-                .any(|root| canonical_path.starts_with(root))
-            {
-                bail!("skill {name} escaped its declared root");
-            }
-            if std::fs::metadata(&canonical_path).is_ok_and(|m| m.len() > MAX_SKILL_BYTES) {
-                bail!("skill {name} exceeds the {MAX_SKILL_BYTES} byte limit");
-            }
-            let text = std::fs::read_to_string(&canonical_path)
+                .find_map(|root| {
+                    path.strip_prefix(root)
+                        .ok()
+                        .map(|relative| (root, relative))
+                })
+                .ok_or_else(|| anyhow::anyhow!("skill {name} escaped its declared root"))?;
+            let text = read_skill_file(root, relative)
                 .map_err(|error| anyhow::anyhow!("cannot load skill {name}: {error}"))?;
-            if text.len() as u64 > MAX_SKILL_BYTES {
-                bail!("skill {name} exceeds the {MAX_SKILL_BYTES} byte limit");
-            }
-            Ok((
-                Skill {
-                    source: SkillSource::File(canonical_path),
-                    ..skill
-                },
-                text,
-            ))
+            Ok((skill, text))
         }
     }
 }
@@ -528,6 +752,46 @@ mod tests {
         assert!(section.contains("load_skill"));
         assert!(!section.contains("/x/SKILL.md"));
         assert!(prompt_section(&[]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_and_load_reject_symlinked_skill_files_and_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skill_dir = repo.join(".agents/skills/escape");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(
+            &outside,
+            "---\nname: escape\ndescription: escaped\n---\nsecret",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, skill_dir.join("SKILL.md")).unwrap();
+
+        assert!(
+            discover(None, Some(&repo), false)
+                .iter()
+                .all(|skill| skill.name != "escape")
+        );
+        assert!(load(None, Some(&repo), "escape", false).is_err());
+
+        let linked_repo = tmp.path().join("linked-repo");
+        std::fs::create_dir_all(linked_repo.join(".agents")).unwrap();
+        let outside_root = tmp.path().join("outside-skills");
+        std::fs::create_dir_all(outside_root.join("escape")).unwrap();
+        std::fs::write(
+            outside_root.join("escape/SKILL.md"),
+            "---\nname: escape\ndescription: escaped\n---\nsecret",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside_root, linked_repo.join(".agents/skills")).unwrap();
+        assert!(
+            discover(None, Some(&linked_repo), false)
+                .iter()
+                .all(|skill| skill.name != "escape")
+        );
+        assert!(load(None, Some(&linked_repo), "escape", false).is_err());
     }
 
     #[test]
