@@ -35,6 +35,7 @@ describe("SubscriptionHealthController", () => {
     const one = controller.refresh();
     const two = controller.refresh();
     expect(controller.loading.get()).toBe(true);
+    await Promise.resolve();
     expect(subscriptionHealth).toHaveBeenCalledTimes(1);
     first.resolve([health("codex")]);
     await expect(one).resolves.toEqual([health("codex")]);
@@ -103,5 +104,18 @@ describe("SubscriptionHealthController", () => {
     subscriptionHealth.mockResolvedValueOnce([health("recovered")]);
     await expect(controller.refresh("force")).resolves.toEqual([health("recovered")]);
     expect(subscriptionHealth).toHaveBeenCalledTimes(2);
+  });
+
+  it("settles loading after synchronous request construction fails", async () => {
+    const subscriptionHealth = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error("unsupported request option");
+      })
+      .mockResolvedValueOnce([health("recovered")]);
+    const controller = new SubscriptionHealthController({ subscriptionHealth });
+
+    await expect(controller.refresh()).rejects.toThrow("unsupported request option");
+    expect(controller.loading.get()).toBe(false);
+    await expect(controller.refresh("force")).resolves.toEqual([health("recovered")]);
   });
 });

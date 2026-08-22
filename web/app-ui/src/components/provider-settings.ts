@@ -13,6 +13,7 @@ import type {
   ProtocolSubscriptionHealth,
   ProtocolUpsertProviderRequest,
 } from "../services/protocol-client.js";
+import { requestTimeoutSignal } from "../services/subscription-health-controller.js";
 import "./cli-settings.js";
 import {
   boundedSubscriptionUsage,
@@ -28,7 +29,7 @@ const DEFAULT_LOGIN_POLL_MS = 1_000;
 const DEFAULT_LOGIN_POLL_ATTEMPTS = 180;
 const PRESETS_ERROR = "Provider presets unavailable. Retrying.";
 const USAGE_ERROR = "Subscription usage unavailable.";
-const PROVIDERS_ERROR = "Provider settings unavailable. Retrying.";
+const PROVIDERS_ERROR = "Providers unavailable. Retrying.";
 export const validatedHttpsUrl = (value: string): string | undefined => {
   try {
     const url = new URL(value);
@@ -909,7 +910,9 @@ export class TrouveProviderSettings extends LitElement {
 
   #loadKnownProviders(services: AppServices): void {
     if (this.#knownProvidersPending !== undefined) return;
-    const request = services.protocol.knownProviders(AbortSignal.timeout(PROVIDER_REFRESH_MS));
+    const request = (async () =>
+      services.protocol.knownProviders(requestTimeoutSignal(PROVIDER_REFRESH_MS))
+    )();
     this.#knownProvidersPending = request;
     void request.then((knownProviders) => {
       if (services !== this.#services.value || !this.isConnected) return;

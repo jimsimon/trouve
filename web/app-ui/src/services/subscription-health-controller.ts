@@ -9,6 +9,13 @@ export type SubscriptionHealthFreshness = "if-stale" | "force";
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
+/** Portable request deadline for WebViews that predate AbortSignal.timeout. */
+export const requestTimeoutSignal = (timeoutMs: number): AbortSignal => {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), timeoutMs);
+  return controller.signal;
+};
+
 /** One app-wide freshness and response-generation gate for provider usage.
  * Some probes launch vendor helpers, so independent component polling is both
  * expensive and vulnerable to older responses overwriting forced refreshes. */
@@ -64,9 +71,9 @@ export class SubscriptionHealthController {
     this.#lastStartedAt = now;
     const generation = ++this.#generation;
     this.#loading.set(true);
-    const promise = this.#protocol.subscriptionHealth(
-      AbortSignal.timeout(this.#requestTimeoutMs),
-    ).then(
+    const promise = (async () => this.#protocol.subscriptionHealth(
+      requestTimeoutSignal(this.#requestTimeoutMs),
+    ))().then(
       (health) => {
         if (generation === this.#generation) {
           const snapshot = Object.freeze([...health]);
