@@ -148,8 +148,8 @@ CREATE TABLE IF NOT EXISTS route_health (
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
   retry_after INTEGER,             -- UTC unix seconds; NULL = not cooling down
   last_success_at INTEGER,         -- UTC unix seconds; sticky healthy-route hint
-  last_failure_at INTEGER,         -- UTC unix microseconds; orders concurrent attempts
-  last_outcome_started_at INTEGER, -- UTC unix microseconds; rejects stale outcomes
+  last_failure_at INTEGER,         -- UTC unix microseconds; diagnostic observation time
+  last_outcome_started_at INTEGER, -- hybrid logical attempt order; rejects stale outcomes
   PRIMARY KEY (provider_id, provider_model)
 );
 CREATE TABLE IF NOT EXISTS queued_prompts (
@@ -3934,7 +3934,9 @@ pub struct RouteHealthRow {
     pub retry_after: Option<i64>,
     pub last_success_at: Option<i64>,
     pub last_failure_at: Option<i64>,
-    pub last_outcome_started_at: Option<i64>,
+    /// Hybrid logical order of the newest admitted attempt whose outcome was
+    /// recorded. The backing column keeps its original migration name.
+    pub last_outcome_order: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -4255,6 +4257,12 @@ enum StoreMutation {
         payload: String,
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    },
+    FinishQueuedPrompt {
+        id: String,
+    },
+    ReleaseQueuedPrompt {
+        id: String,
     },
 }
 
@@ -5036,6 +5044,31 @@ fn apply_store_mutation(
                 );
             }
         }
+        StoreMutation::FinishQueuedPrompt { id } => {
+            conn.execute(
+                "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 1",
+                params![id],
+            )?;
+            let remains = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM queued_prompts WHERE id = ?1)",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            anyhow::ensure!(
+                !remains,
+                "queued prompt {id} is no longer claimed and cannot be consumed"
+            );
+        }
+        StoreMutation::ReleaseQueuedPrompt { id } => {
+            let released = conn.execute(
+                "UPDATE queued_prompts SET claimed = 0 WHERE id = ?1 AND claimed = 1",
+                params![id],
+            )?;
+            anyhow::ensure!(
+                released == 1,
+                "queued prompt {id} is no longer claimed and cannot be released"
+            );
+        }
     }
     Ok(StoreMutationOutcome::AppendEvent)
 }
@@ -5521,6 +5554,19 @@ fn serialize_lifecycle_events(
     Ok(pending)
 }
 
+fn pending_events_require_isolation(events: &[PendingEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.mutation.as_ref(),
+            Some(
+                StoreMutation::CompleteSessionPrVerificationIntent { .. }
+                    | StoreMutation::FinishQueuedPrompt { .. }
+                    | StoreMutation::ReleaseQueuedPrompt { .. }
+            )
+        )
+    })
+}
+
 /// Reserve SQLite's writer slot before a write transaction reads state.
 ///
 /// The event log uses a dedicated connection. A deferred transaction could
@@ -5608,6 +5654,68 @@ impl Store {
         Ok(envelopes.pop().expect("single append returns one event"))
     }
 
+    /// Persist a terminal event and consume its claimed prompt in one event-
+    /// writer transaction. A prompt already consumed by normal provider
+    /// startup is accepted idempotently; a still-visible prompt rejects and
+    /// rolls back the event so the two durable states cannot diverge.
+    pub(crate) fn append_event_finishing_queued_prompt(
+        &self,
+        scope: Scope,
+        event: Event,
+        prompt_id: &str,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(scope, event)],
+            StoreMutation::FinishQueuedPrompt {
+                id: prompt_id.to_string(),
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one terminal event returns one envelope"))
+    }
+
+    /// Async batch form used when cancellation must synthesize the accepted
+    /// turn shell as well as its terminal event.
+    pub(crate) async fn append_events_finishing_queued_prompt(
+        &self,
+        scope: Scope,
+        events: Vec<Event>,
+        prompt_id: &str,
+    ) -> Result<Vec<EventEnvelope>> {
+        let pending = serialize_lifecycle_events(
+            events
+                .into_iter()
+                .map(|event| (scope.clone(), event))
+                .collect(),
+            StoreMutation::FinishQueuedPrompt {
+                id: prompt_id.to_string(),
+            },
+        )?;
+        self.append_pending_events_async(pending).await
+    }
+
+    /// Persist a pre-acceptance failure and make its claimed prompt visible
+    /// again in the same transaction.
+    pub(crate) fn append_event_releasing_queued_prompt(
+        &self,
+        scope: Scope,
+        event: Event,
+        prompt_id: &str,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(scope, event)],
+            StoreMutation::ReleaseQueuedPrompt {
+                id: prompt_id.to_string(),
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one terminal event returns one envelope"))
+    }
+
     /// Persist a same-scope batch synchronously. Use this for cancellation
     /// guards whose lifecycle must not be split after enqueue by dropping an
     /// async future.
@@ -5619,12 +5727,13 @@ impl Store {
     }
 
     fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
+        let isolated = pending_events_require_isolation(&events);
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
                 events,
                 code_review_outbox_ids: Vec::new(),
-                isolated: false,
+                isolated,
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -5687,12 +5796,7 @@ impl Store {
         &self,
         events: Vec<PendingEvent>,
     ) -> Result<Vec<EventEnvelope>> {
-        let isolated = events.iter().any(|event| {
-            matches!(
-                event.mutation.as_ref(),
-                Some(StoreMutation::CompleteSessionPrVerificationIntent { .. })
-            )
-        });
+        let isolated = pending_events_require_isolation(&events);
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.append_tx
             .send(AppendRequest {
@@ -13504,7 +13608,7 @@ impl Store {
                 retry_after: row.get(3)?,
                 last_success_at: row.get(4)?,
                 last_failure_at: row.get(5)?,
-                last_outcome_started_at: row.get(6)?,
+                last_outcome_order: row.get(6)?,
             })
         })?;
         let mut health = HashMap::new();
@@ -13523,7 +13627,7 @@ impl Store {
         &self,
         provider_id: &str,
         provider_model: &str,
-        attempt_started_at: i64,
+        attempt_order: i64,
         base_cooldown_secs: i64,
         max_cooldown_secs: i64,
     ) -> Result<RouteHealthRow> {
@@ -13548,8 +13652,8 @@ impl Store {
             .optional()?;
         if previous
             .as_ref()
-            .and_then(|(_, _, _, _, started_at)| *started_at)
-            .is_some_and(|started_at| started_at >= attempt_started_at)
+            .and_then(|(_, _, _, _, order)| *order)
+            .is_some_and(|order| order >= attempt_order)
         {
             let (failures, retry_after, last_success_at, last_failure_at, last_outcome) =
                 previous.unwrap();
@@ -13560,7 +13664,7 @@ impl Store {
                 retry_after,
                 last_success_at,
                 last_failure_at,
-                last_outcome_started_at: last_outcome,
+                last_outcome_order: last_outcome,
             });
         }
         let consecutive_failures = previous
@@ -13593,7 +13697,7 @@ impl Store {
                 retry_after,
                 previous.as_ref().and_then(|(_, _, success, _, _)| *success),
                 last_failure_at,
-                attempt_started_at,
+                attempt_order,
             ],
         )?;
         Ok(RouteHealthRow {
@@ -13603,7 +13707,7 @@ impl Store {
             retry_after: Some(retry_after),
             last_success_at: previous.and_then(|(_, _, success, _, _)| success),
             last_failure_at: Some(last_failure_at),
-            last_outcome_started_at: Some(attempt_started_at),
+            last_outcome_order: Some(attempt_order),
         })
     }
 
@@ -13613,7 +13717,7 @@ impl Store {
         &self,
         provider_id: &str,
         provider_model: &str,
-        attempt_started_at: i64,
+        attempt_order: i64,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO route_health
@@ -13632,7 +13736,7 @@ impl Store {
                 provider_id,
                 provider_model,
                 chrono::Utc::now().timestamp(),
-                attempt_started_at,
+                attempt_order,
             ],
         )?;
         Ok(())
@@ -16939,26 +17043,20 @@ mod tests {
     #[test]
     fn older_route_success_cannot_erase_a_newer_failure() {
         let store = Store::open_in_memory().unwrap();
-        let attempt_started_at = chrono::Utc::now().timestamp_micros();
+        let attempt_order = chrono::Utc::now().timestamp_micros();
         let failure = store
-            .record_route_failure(
-                "provider",
-                "model",
-                attempt_started_at.saturating_add(1),
-                10,
-                25,
-            )
+            .record_route_failure("provider", "model", attempt_order.saturating_add(1), 10, 25)
             .unwrap();
 
         store
-            .record_route_success("provider", "model", attempt_started_at)
+            .record_route_success("provider", "model", attempt_order)
             .unwrap();
         let route = &store.route_health().unwrap()[&("provider".to_string(), "model".to_string())];
         assert_eq!(route.consecutive_failures, 1);
         assert_eq!(route.last_failure_at, failure.last_failure_at);
 
         store
-            .record_route_success("provider", "model", attempt_started_at.saturating_add(2))
+            .record_route_success("provider", "model", attempt_order.saturating_add(2))
             .unwrap();
         let route = &store.route_health().unwrap()[&("provider".to_string(), "model".to_string())];
         assert_eq!(route.consecutive_failures, 0);
@@ -16981,7 +17079,7 @@ mod tests {
         assert_eq!(route.retry_after, None);
         assert!(route.last_success_at.is_some());
         assert_eq!(route.last_failure_at, None);
-        assert_eq!(route.last_outcome_started_at, Some(newer_attempt));
+        assert_eq!(route.last_outcome_order, Some(newer_attempt));
     }
 
     #[test]
@@ -17277,6 +17375,134 @@ mod tests {
 
         // The other thread's queue is untouched.
         assert_eq!(store.queued_prompts("th_2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn terminal_event_and_claimed_prompt_finish_commit_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_terminal_prompt");
+        let prompt = store
+            .enqueue_prompt("th_terminal_prompt", "fail once", &[])
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_queued_prompt("th_terminal_prompt")
+                .unwrap()
+                .unwrap()
+                .id,
+            prompt.id
+        );
+
+        store
+            .append_event_finishing_queued_prompt(
+                Scope::Thread("th_terminal_prompt".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "provider unavailable".into(),
+                },
+                &prompt.id,
+            )
+            .unwrap();
+
+        assert!(store.queued_prompt_thread(&prompt.id).unwrap().is_none());
+        let events = store
+            .events_after(&Scope::Thread("th_terminal_prompt".into()), 0)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].event, Event::TurnFailed { turn: 1, .. }));
+    }
+
+    #[test]
+    fn terminal_event_and_prompt_release_commit_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_terminal_release");
+        let prompt = store
+            .enqueue_prompt("th_terminal_release", "retry later", &[])
+            .unwrap();
+        store
+            .claim_queued_prompt("th_terminal_release")
+            .unwrap()
+            .unwrap();
+
+        store
+            .append_event_releasing_queued_prompt(
+                Scope::Thread("th_terminal_release".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "setup failed".into(),
+                },
+                &prompt.id,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.queued_prompts("th_terminal_release").unwrap(),
+            [prompt]
+        );
+        let events = store
+            .events_after(&Scope::Thread("th_terminal_release".into()), 0)
+            .unwrap();
+        assert!(matches!(events[0].event, Event::TurnFailed { turn: 1, .. }));
+    }
+
+    #[test]
+    fn terminal_event_can_finish_an_already_consumed_prompt() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_terminal_consumed");
+        let prompt = store
+            .enqueue_prompt("th_terminal_consumed", "already started", &[])
+            .unwrap();
+        store
+            .claim_queued_prompt("th_terminal_consumed")
+            .unwrap()
+            .unwrap();
+        assert!(store.finish_queued_prompt(&prompt.id).unwrap());
+
+        store
+            .append_event_finishing_queued_prompt(
+                Scope::Thread("th_terminal_consumed".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "provider failed".into(),
+                },
+                &prompt.id,
+            )
+            .unwrap();
+
+        let events = store
+            .events_after(&Scope::Thread("th_terminal_consumed".into()), 0)
+            .unwrap();
+        assert!(matches!(events[0].event, Event::TurnFailed { turn: 1, .. }));
+    }
+
+    #[test]
+    fn terminal_event_rolls_back_when_prompt_is_no_longer_claimed() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_terminal_rollback");
+        let prompt = store
+            .enqueue_prompt("th_terminal_rollback", "still visible", &[])
+            .unwrap();
+
+        let result = store.append_event_finishing_queued_prompt(
+            Scope::Thread("th_terminal_rollback".into()),
+            Event::TurnFailed {
+                turn: 1,
+                error: "provider unavailable".into(),
+            },
+            &prompt.id,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            store.queued_prompts("th_terminal_rollback").unwrap(),
+            [prompt]
+        );
+        assert!(
+            store
+                .events_after(&Scope::Thread("th_terminal_rollback".into()), 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

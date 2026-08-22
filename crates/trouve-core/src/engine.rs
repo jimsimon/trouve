@@ -8,7 +8,7 @@ mod routing;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -1556,7 +1556,7 @@ struct ProviderTurnCapacity {
 struct ProviderBackoff {
     until: Option<Instant>,
     delay: std::time::Duration,
-    last_outcome_started_at: Option<i64>,
+    last_outcome_order: Option<i64>,
 }
 
 /// Capacity shared by interactive desktop turns, spawned agents, and
@@ -1568,11 +1568,20 @@ struct TurnScheduler {
     provider_all_limit: usize,
     provider_background_limit: usize,
     providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
+    /// Hybrid logical clock for provider attempts. Wall time keeps values
+    /// comparable with persisted health across restarts; the atomic increment
+    /// makes every admission in this process unique even within one microsecond.
+    attempt_order: AtomicI64,
 }
 
 struct TurnCapacityGuard {
     _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
     wait_ms: u64,
+}
+
+fn positive_attempt_order(attempt_order: &AtomicI64) -> Option<i64> {
+    let attempt_order = attempt_order.load(Ordering::Acquire);
+    (attempt_order > 0).then_some(attempt_order)
 }
 
 impl TurnScheduler {
@@ -1598,7 +1607,33 @@ impl TurnScheduler {
             provider_all_limit,
             provider_background_limit,
             providers: Mutex::new(HashMap::new()),
+            attempt_order: AtomicI64::new(chrono::Utc::now().timestamp_micros()),
         }
+    }
+
+    fn next_attempt_order(&self) -> i64 {
+        let wall_order = chrono::Utc::now().timestamp_micros();
+        let mut observed = self.attempt_order.load(Ordering::Acquire);
+        loop {
+            let next = observed
+                .checked_add(1)
+                .expect("provider attempt order exhausted")
+                .max(wall_order);
+            match self.attempt_order.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn observe_attempt_order(&self, attempt_order: i64) {
+        self.attempt_order
+            .fetch_max(attempt_order, Ordering::AcqRel);
     }
 
     fn provider(&self, model: &str) -> ProviderTurnCapacity {
@@ -1739,16 +1774,16 @@ impl TurnScheduler {
             .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
-    fn record_outcome(&self, model: &str, error: Option<&str>, attempt_started_at: i64) {
+    fn record_outcome(&self, model: &str, error: Option<&str>, attempt_order: i64) {
         let provider = self.provider(model);
         let mut backoff = provider.backoff.lock().unwrap();
         if backoff
-            .last_outcome_started_at
-            .is_some_and(|latest| latest >= attempt_started_at)
+            .last_outcome_order
+            .is_some_and(|latest| latest >= attempt_order)
         {
             return;
         }
-        backoff.last_outcome_started_at = Some(attempt_started_at);
+        backoff.last_outcome_order = Some(attempt_order);
         let throttled = error.is_some_and(|error| {
             let error = error.to_ascii_lowercase();
             [
@@ -2911,6 +2946,21 @@ impl Engine {
             providers.insert("local".into(), local_provider.clone());
             injected_providers.insert("local".to_string(), local_provider.clone());
         }
+        let turn_scheduler = TurnScheduler::new();
+        match store.route_health() {
+            Ok(health) => {
+                if let Some(latest) = health
+                    .values()
+                    .filter_map(|route| route.last_outcome_order)
+                    .max()
+                {
+                    turn_scheduler.observe_attempt_order(latest);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not seed provider attempt order from route health");
+            }
+        }
         Self {
             store,
             data_dir,
@@ -2924,7 +2974,7 @@ impl Engine {
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
-            turn_scheduler: TurnScheduler::new(),
+            turn_scheduler,
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
@@ -10774,14 +10824,21 @@ impl Engine {
                 .take()
                 .expect("an active queue prompt must have a cancellation token");
             let prompt_persisted = AtomicBool::new(shell_persisted);
-            let attempt_started_at = chrono::Utc::now().timestamp_micros();
+            let concrete_attempt_order = AtomicI64::new(0);
             let turn_future = async {
                 if automatic_model_name(&thread.model).is_some() {
                     self.run_routed_turn(&thread, turn, &prompt, cancel.clone(), &prompt_persisted)
                         .await
                 } else {
-                    self.run_turn(&thread, turn, &prompt, cancel.clone(), &prompt_persisted)
-                        .await
+                    self.run_turn(
+                        &thread,
+                        turn,
+                        &prompt,
+                        cancel.clone(),
+                        &prompt_persisted,
+                        &concrete_attempt_order,
+                    )
+                    .await
                 }
             };
             let result = std::panic::AssertUnwindSafe(turn_future)
@@ -10791,28 +10848,50 @@ impl Engine {
                 Ok(result) => result,
                 Err(_) => {
                     tracing::error!("turn {turn} of {} panicked", thread.id);
-                    self.store
-                        .append_event(
-                            Scope::Thread(thread.id.clone()),
-                            Event::TurnFailed {
-                                turn,
-                                error: "internal error".into(),
-                            },
-                        )
-                        .with_context(|| {
-                            format!(
-                                "persisting failure after panic in turn {turn} of {}",
-                                thread.id
-                            )
-                        })?;
+                    let failure = Event::TurnFailed {
+                        turn,
+                        error: "internal error".into(),
+                    };
+                    if !cancel.is_cancelled()
+                        && automatic_model_name(&thread.model).is_none()
+                        && let Some(attempt_order) = positive_attempt_order(&concrete_attempt_order)
+                    {
+                        self.turn_scheduler.record_outcome(
+                            &thread.model,
+                            Some("internal error"),
+                            attempt_order,
+                        );
+                    }
                     if prompt_persisted.load(Ordering::Acquire) {
                         // Once the user message is durable, this queue row is
                         // the failed turn rather than a retryable dispatch.
-                        // Consuming it prevents a later dispatch from
-                        // publishing the same user message under a new turn.
-                        let _ = self.store.finish_queued_prompt(&prompt.id);
+                        // Consume it in the same transaction as the terminal
+                        // event so neither side can become stranded alone.
+                        self.store
+                            .append_event_finishing_queued_prompt(
+                                Scope::Thread(thread.id.clone()),
+                                failure,
+                                &prompt.id,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "persisting failure after panic in turn {turn} of {}",
+                                    thread.id
+                                )
+                            })?;
                     } else {
-                        let _ = self.store.release_queued_prompt(&prompt.id);
+                        self.store
+                            .append_event_releasing_queued_prompt(
+                                Scope::Thread(thread.id.clone()),
+                                failure,
+                                &prompt.id,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "persisting failure after panic in turn {turn} of {}",
+                                    thread.id
+                                )
+                            })?;
                     }
                     let _ = self.emit_queue(&thread.id);
                     self.clear_cancel(&thread.id);
@@ -10821,12 +10900,15 @@ impl Engine {
                 }
             };
             let cancelled = cancel.is_cancelled();
-            if !cancelled && automatic_model_name(&thread.model).is_none() {
+            if !cancelled
+                && automatic_model_name(&thread.model).is_none()
+                && let Some(attempt_order) = positive_attempt_order(&concrete_attempt_order)
+            {
                 let outcome_error = result.as_ref().err().map(ToString::to_string);
                 self.turn_scheduler.record_outcome(
                     &thread.model,
                     outcome_error.as_deref(),
-                    attempt_started_at,
+                    attempt_order,
                 );
             }
             // Cancellation wins a race with startup/stream errors only after
@@ -10840,9 +10922,6 @@ impl Engine {
                         thread.id
                     );
                 }
-                // A cancellation can arrive before run_turn consumes the
-                // claimed queue row. Remove it here as an idempotent fallback.
-                let _ = self.store.finish_queued_prompt(&prompt.id);
                 let mut terminal_events = Vec::with_capacity(3);
                 if !prompt_persisted.load(Ordering::Acquire) {
                     // Cancellation becomes available as soon as dispatch is
@@ -10866,7 +10945,11 @@ impl Engine {
                 }
                 terminal_events.push(Event::TurnCancelled { turn });
                 self.store
-                    .append_events_async(Scope::Thread(thread.id.clone()), terminal_events)
+                    .append_events_finishing_queued_prompt(
+                        Scope::Thread(thread.id.clone()),
+                        terminal_events,
+                        &prompt.id,
+                    )
                     .await
                     .with_context(|| {
                         format!("persisting cancellation for turn {turn} of {}", thread.id)
@@ -10878,24 +10961,33 @@ impl Engine {
             }
             let resume_after_failure = if !cancelled && let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
-                self.store
-                    .append_event(
-                        Scope::Thread(thread.id.clone()),
-                        Event::TurnFailed {
-                            turn,
-                            error: e.to_string(),
-                        },
-                    )
-                    .with_context(|| {
-                        format!("persisting failure for turn {turn} of {}", thread.id)
-                    })?;
+                let failure = Event::TurnFailed {
+                    turn,
+                    error: e.to_string(),
+                };
                 if prompt_persisted.load(Ordering::Acquire) {
                     // The accepted prompt already owns this failed turn.
                     // Only pre-acceptance setup failures may return a row to
                     // the queue for a fresh dispatch attempt.
-                    let _ = self.store.finish_queued_prompt(&prompt.id);
+                    self.store
+                        .append_event_finishing_queued_prompt(
+                            Scope::Thread(thread.id.clone()),
+                            failure,
+                            &prompt.id,
+                        )
+                        .with_context(|| {
+                            format!("persisting failure for turn {turn} of {}", thread.id)
+                        })?;
                 } else {
-                    let _ = self.store.release_queued_prompt(&prompt.id);
+                    self.store
+                        .append_event_releasing_queued_prompt(
+                            Scope::Thread(thread.id.clone()),
+                            failure,
+                            &prompt.id,
+                        )
+                        .with_context(|| {
+                            format!("persisting failure for turn {turn} of {}", thread.id)
+                        })?;
                 }
                 let _ = self.emit_queue(&thread.id);
                 let resume = self.finish_interrupted_turn(&thread.id)?;
@@ -11079,6 +11171,7 @@ impl Engine {
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
+        attempt_order: &AtomicI64,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -11140,6 +11233,7 @@ impl Engine {
             .turn_scheduler
             .acquire(&thread.model, background, &cancel)
             .await?;
+        attempt_order.store(self.turn_scheduler.next_attempt_order(), Ordering::Release);
         if background
             && let Some(progress) = self
                 .store
@@ -22372,6 +22466,7 @@ default_permission_mode = "ask"
             provider_all_limit: 1,
             provider_background_limit: 1,
             providers: Mutex::new(HashMap::new()),
+            attempt_order: AtomicI64::new(0),
         });
         let cancel = tokio_util::sync::CancellationToken::new();
         let first = scheduler
@@ -22421,6 +22516,7 @@ default_permission_mode = "ask"
             provider_all_limit: 1,
             provider_background_limit: 1,
             providers: Mutex::new(HashMap::new()),
+            attempt_order: AtomicI64::new(0),
         };
         let cancel = tokio_util::sync::CancellationToken::new();
         scheduler.record_outcome(
@@ -22448,6 +22544,7 @@ default_permission_mode = "ask"
             provider_all_limit: 1,
             provider_background_limit: 1,
             providers: Mutex::new(HashMap::new()),
+            attempt_order: AtomicI64::new(0),
         });
         let cancel = tokio_util::sync::CancellationToken::new();
         let occupied = scheduler
@@ -22456,26 +22553,20 @@ default_permission_mode = "ask"
             .unwrap()
             .unwrap();
 
-        let waiting_scheduler = Arc::clone(&scheduler);
-        let waiting_cancel = cancel.clone();
-        let waiter = tokio::spawn(async move {
-            waiting_scheduler
-                .acquire_routed("busy/shared", false, &waiting_cancel)
-                .await
-        });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        let mut waiter = Box::pin(scheduler.acquire_routed("busy/shared", false, &cancel));
+        assert!(matches!(
+            futures::poll!(&mut waiter),
+            std::task::Poll::Pending
+        ));
         scheduler.record_outcome(
             "busy",
             Some("429 rate limit"),
-            chrono::Utc::now().timestamp_micros(),
+            scheduler.next_attempt_order(),
         );
         drop(occupied);
 
-        let capacity = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        let capacity = tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter)
             .await
-            .unwrap()
             .unwrap()
             .unwrap();
         assert!(capacity.is_none());
@@ -22490,12 +22581,31 @@ default_permission_mode = "ask"
             provider_all_limit: 1,
             provider_background_limit: 1,
             providers: Mutex::new(HashMap::new()),
+            attempt_order: AtomicI64::new(0),
         };
         let older_attempt = chrono::Utc::now().timestamp_micros();
         scheduler.record_outcome("busy", None, older_attempt.saturating_add(1));
         scheduler.record_outcome("busy", Some("429 rate limit"), older_attempt);
 
         assert_eq!(scheduler.cooldown_remaining("busy/shared"), None);
+    }
+
+    #[test]
+    fn scheduler_assigns_unique_orders_to_concurrent_attempts() {
+        let scheduler = Arc::new(TurnScheduler::new());
+        let handles = (0..16)
+            .map(|_| {
+                let scheduler = Arc::clone(&scheduler);
+                std::thread::spawn(move || scheduler.next_attempt_order())
+            })
+            .collect::<Vec<_>>();
+        let mut orders = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        orders.sort_unstable();
+
+        assert!(orders.windows(2).all(|orders| orders[0] < orders[1]));
     }
 
     #[test]

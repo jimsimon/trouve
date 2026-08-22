@@ -304,7 +304,10 @@ impl Engine {
             }
             let retrying = route_index > 0;
             attempted_candidates += 1;
-            let attempt_started_at = chrono::Utc::now().timestamp_micros();
+            // Assign order only after this route owns provider capacity. The
+            // global hybrid clock prevents concurrent admissions from tying
+            // even when the wall clock has microsecond resolution.
+            let attempt_order = self.turn_scheduler.next_attempt_order();
             let result = match &route.executor {
                 ModelExecutor::Native(_) => {
                     self.run_native_route(
@@ -351,15 +354,12 @@ impl Engine {
 
             match result {
                 RouteAttemptResult::Completed => {
-                    self.turn_scheduler.record_outcome(
-                        &route.provider_id,
-                        None,
-                        attempt_started_at,
-                    );
+                    self.turn_scheduler
+                        .record_outcome(&route.provider_id, None, attempt_order);
                     self.store.record_route_success(
                         &route.provider_id,
                         &route.provider_model,
-                        attempt_started_at,
+                        attempt_order,
                     )?;
                     if automatic_model_name(&thread.model).is_some() {
                         self.store.set_thread_route_affinity(
@@ -404,13 +404,13 @@ impl Engine {
                     self.turn_scheduler.record_outcome(
                         &route.provider_id,
                         Some(&failure.message),
-                        attempt_started_at,
+                        attempt_order,
                     );
                     let (base, max) = failure.kind.cooldown();
                     let health = self.store.record_route_failure(
                         &route.provider_id,
                         &route.provider_model,
-                        attempt_started_at,
+                        attempt_order,
                         base,
                         max,
                     )?;
