@@ -10322,7 +10322,7 @@ impl Store {
              WHERE job.repository = ?1 AND job.pull_number = ?2
                AND job.id != ?3 AND job.status = 'succeeded'
              ORDER BY job.completed_at DESC, rejection.created_at DESC,
-                      rejection.candidate_id DESC
+                      job.id DESC, rejection.candidate_id DESC
              LIMIT ?4",
         )?;
         Ok(stmt
@@ -21985,6 +21985,49 @@ mod tests {
         assert_eq!(stats.churn.clean_pull_request_count, 1);
         assert_eq!(stats.churn.average_rounds_to_clean, 2.0);
         assert_eq!(stats.churn.max_rounds_to_clean, 2);
+
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_review_candidate_rejections
+                        (job_id, candidate_id, task_id, reviewer_id, reviewer_name,
+                         path, line, side, severity, confidence, title, body, reason, created_at)
+                 SELECT ?1, candidate_id, ?2, reviewer_id, reviewer_name,
+                        path, line, side, severity, confidence, title, body, reason, created_at
+                 FROM code_review_candidate_rejections
+                 WHERE job_id = ?3 AND candidate_id = 'weak'",
+                params![second.id, "second-task", first.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET completed_at = '2026-08-22T00:00:00Z'
+                 WHERE id IN (?1, ?2)",
+                params![first.id, second.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_candidate_rejections
+                 SET created_at = '2026-08-22T00:00:00Z'
+                 WHERE job_id IN (?1, ?2)",
+                params![first.id, second.id],
+            )
+            .unwrap();
+        }
+        let limited = store
+            .code_review_candidate_rejection_history_for_pull(
+                &first.repository,
+                first.pull_number,
+                &legacy.id,
+                1,
+            )
+            .unwrap();
+        let expected_task_id = if second.id > first.id {
+            "second-task"
+        } else {
+            "task"
+        };
+        assert_eq!(limited[0].task_id, expected_task_id);
     }
 
     #[test]
