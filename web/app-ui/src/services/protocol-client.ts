@@ -257,6 +257,14 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
 const isNonnegativeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
+const isOptionalNullableNonnegativeInteger = (value: unknown): boolean =>
+  value === undefined || value === null || isNonnegativeInteger(value);
+
+const isOptionalNullableFiniteNumber = (value: unknown): boolean =>
+  value === undefined
+  || value === null
+  || (typeof value === "number" && Number.isFinite(value));
+
 const isString = (value: unknown): value is string => typeof value === "string";
 
 const isTeamMessage = (value: unknown): value is ProtocolTeamMessage => {
@@ -294,7 +302,10 @@ const isUsage = (value: unknown): boolean => {
     && (
       usage["cached_input_tokens"] === undefined
       || isNonnegativeInteger(usage["cached_input_tokens"])
-    );
+    )
+    && isOptionalNullableNonnegativeInteger(usage["context_input_tokens"])
+    && isOptionalNullableNonnegativeInteger(usage["context_window"])
+    && isOptionalNullableFiniteNumber(usage["cost_usd"]);
 };
 
 const isTeamMember = (value: unknown): value is ProtocolTeamMember => {
@@ -318,6 +329,10 @@ const isTeam = (value: unknown): value is ProtocolTeam => {
     && team["members"].every(isTeamMember)
     && Array.isArray(team["messages"])
     && team["messages"].every(isTeamMessage)
+    && (
+      team["messages_truncated"] === undefined
+      || typeof team["messages_truncated"] === "boolean"
+    )
     && isNonnegativeInteger(team["max_turns"])
     && isNonnegativeInteger(team["turns_used"])
     && isString(team["created_at"]);
@@ -522,7 +537,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.13";
+export const SUPPORTED_PROTOCOL_VERSION = "7.15";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -773,6 +788,7 @@ export class ProtocolClient {
   async postTeamMessage(
     sessionId: string,
     content: string,
+    idempotencyKey?: string,
   ): Promise<ProtocolTeamMessage> {
     return this.#validatedMutation(
       `/v1/sessions/${encodeURIComponent(sessionId)}/team/messages`,
@@ -780,7 +796,7 @@ export class ProtocolClient {
       "POST",
       "TeamMessage",
       (loaded) => loaded.teamMessage,
-      { content },
+      { content, ...(idempotencyKey === undefined ? {} : { idempotency_key: idempotencyKey }) },
     );
   }
 

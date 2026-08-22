@@ -2297,7 +2297,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#shellNotice = "";
     this.requestUpdate();
 
-    let session: Awaited<ReturnType<ProtocolClient["createSession"]>>;
+    let session: Awaited<ReturnType<ProtocolClient["createSession"]>> | undefined;
+    let createdSessionId = "";
+    let createdWorkspaceId = submittedCreateRequest.workspaceId;
+    let createdSessionTitle = submittedCreateRequest.title;
     try {
       if (teamSession) {
         const memberDefaults = createNewSessionThreadRequestFromSnapshot({
@@ -2307,6 +2310,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         });
         const team = await this.#protocolClient.createTeam({
           workspace_id: submittedCreateRequest.workspaceId,
+          idempotency_key: createIdempotencyKey,
           title: submittedCreateRequest.title,
           ...(submittedCreateRequest.baseRef === ""
             ? {}
@@ -2324,10 +2328,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             ? {}
             : { permission_mode: memberDefaults.permission_mode }),
         });
-        const sessions = await this.#protocolClient.sessions();
-        const created = sessions.find((candidate) => candidate.id === team.session_id);
-        if (created === undefined) throw new Error("created team session is missing");
-        session = created;
+        createdSessionId = team.session_id;
+        try {
+          const sessions = await this.#protocolClient.sessions();
+          session = sessions.find((candidate) => candidate.id === team.session_id);
+          if (session === undefined) {
+            this.#shellNotice = "Team created; its session details will refresh automatically.";
+          }
+        } catch {
+          this.#shellNotice = "Team created; its session details will refresh automatically.";
+        }
       } else {
         session = await this.#protocolClient.createSession({
           workspace_id: submittedCreateRequest.workspaceId,
@@ -2338,6 +2348,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             : { base_ref: submittedCreateRequest.baseRef }),
           fetch_latest: submittedCreateRequest.fetchLatest,
         });
+        createdSessionId = session.id;
       }
     } catch {
       this.#newSessionSetup = navigateNewSessionSetup(
@@ -2359,12 +2370,21 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       return;
     }
 
-    this.#store.upsertSessionMetadata(session);
+    if (session !== undefined) {
+      this.#store.upsertSessionMetadata(session);
+      createdSessionId = session.id;
+      createdWorkspaceId = session.workspace_id;
+      createdSessionTitle = session.title;
+    }
     if (retainedCreateRequest === undefined) {
-      this.#upgradeSessionTitleInBackground(session.id, submittedCreateRequest.title, prompt);
+      this.#upgradeSessionTitleInBackground(
+        createdSessionId,
+        submittedCreateRequest.title,
+        prompt,
+      );
     }
     let threadId: string | undefined;
-    if (!teamSession) {
+    if (!teamSession && session !== undefined) {
       try {
         const thread = await this.#protocolClient.createThread(
           createNewSessionThreadRequestFromSnapshot({
@@ -2414,7 +2434,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPreferredBaseRef = "";
     form.reset();
     if (!completion.navigateToSession) {
-      const notice = `Session “${session.title}” was created in the background.`;
+      const notice = `Session “${createdSessionTitle}” was created in the background.`;
       this.#shellNotice = this.#shellNotice === ""
         ? notice
         : `${notice} ${this.#shellNotice}`;
@@ -2423,8 +2443,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
     this.#router.navigate({
       kind: "session",
-      workspaceId: session.workspace_id,
-      sessionId: session.id,
+      workspaceId: createdWorkspaceId,
+      sessionId: createdSessionId,
       ...(threadId === undefined ? {} : { threadId }),
     });
     this.#showMobilePane("thread");

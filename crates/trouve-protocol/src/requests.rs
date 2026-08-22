@@ -377,6 +377,10 @@ pub struct Team {
     pub orchestrator_member_id: String,
     pub members: Vec<TeamMember>,
     pub messages: Vec<TeamMessage>,
+    /// True when messages contains only the bounded recent timeline
+    /// projection. Event replay remains anchored by snapshot_cursor.
+    #[serde(default)]
+    pub messages_truncated: bool,
     pub max_turns: u64,
     pub turns_used: u64,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -404,6 +408,10 @@ pub struct TeamTemplate {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateTeamRequest {
     pub workspace_id: WorkspaceId,
+    /// Stable client-generated key used to replay an ambiguous create result
+    /// without creating a second session or worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -426,6 +434,7 @@ pub struct CreateTeamRequest {
     pub permission_mode: Option<PermissionMode>,
     /// Safety budget across automatically delivered team turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1, maximum = 1000)]
     pub max_turns: Option<u64>,
 }
 
@@ -433,6 +442,10 @@ pub struct CreateTeamRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PostTeamMessageRequest {
     pub content: String,
+    /// Stable client-generated key used to replay an ambiguous message result
+    /// without appending or delivering it twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Partial session update (rename / archive). Omitted fields are unchanged.

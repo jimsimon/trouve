@@ -219,6 +219,7 @@ impl ProtocolClient {
             &format!("/sessions/{session_id}/team/messages"),
             &PostTeamMessageRequest {
                 content: content.into(),
+                idempotency_key: None,
             },
         )
         .await

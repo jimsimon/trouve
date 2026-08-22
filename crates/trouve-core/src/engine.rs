@@ -20,10 +20,10 @@ use trouve_protocol::{
     AgentPersona, ApprovalDecision, BranchList, CreateSessionRequest, CreateTeamRequest,
     CreateThreadRequest, Event, ForkCheckpointResponse, PostTeamMessageRequest, ProviderInfo,
     ProvidersResponse, RestoreDirection, Scope, Session, SessionDiffFileSummary,
-    SessionDiffSummary, SessionFileDiff, Team, TeamAuthorKind, TeamMember, TeamMemberState,
-    TeamMention, TeamMessage, TeamStatus, TeamTemplate, TeamTemplateMember, Thread, ToolStatus,
-    TurnAccepted, TurnPhase, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest,
-    Usage, Workspace,
+    SessionDiffSummary, SessionFileDiff, SessionKind, Team, TeamAuthorKind, TeamMember,
+    TeamMemberState, TeamMention, TeamMessage, TeamStatus, TeamTemplate, TeamTemplateMember,
+    Thread, ToolStatus, TurnAccepted, TurnPhase, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertProviderRequest, Usage, Workspace,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -33,7 +33,7 @@ use crate::permissions::{
 };
 use crate::store::{
     ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
-    SessionPrVerificationIntent, Store,
+    SessionPrVerificationIntent, Store, TeamPromptDelivery,
 };
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
@@ -1318,15 +1318,34 @@ fn mentioned_team_members(
         .iter()
         .map(|member| (member.handle.to_ascii_lowercase(), member))
         .collect();
-    let mut fenced = false;
+    let mut fence: Option<(char, usize)> = None;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for line in content.lines() {
-        if line.trim_start().starts_with("```") {
-            fenced = !fenced;
+        let trimmed = line.trim_start();
+        let marker = trimmed
+            .chars()
+            .next()
+            .filter(|marker| matches!(marker, '`' | '~'));
+        let marker_len = marker.map_or(0, |marker| {
+            trimmed
+                .chars()
+                .take_while(|candidate| *candidate == marker)
+                .count()
+        });
+        if let Some((open_marker, open_len)) = fence {
+            if marker == Some(open_marker)
+                && marker_len >= open_len
+                && trimmed.chars().skip(marker_len).all(char::is_whitespace)
+            {
+                fence = None;
+            }
             continue;
         }
-        if fenced {
+        if let Some(marker) = marker
+            && marker_len >= 3
+        {
+            fence = Some((marker, marker_len));
             continue;
         }
         let chars: Vec<char> = line.chars().collect();
@@ -2075,6 +2094,9 @@ pub struct Engine {
     /// snapshots published on the durable thread stream. Lock ordering is
     /// activity publication -> prompt_queue_mutations -> active_threads.
     prompt_queue_mutations: Mutex<()>,
+    /// Serializes team snapshot checks with message, lifecycle, and budget
+    /// transitions. Prompt routing takes this before `prompt_queue_mutations`.
+    team_mutations: Mutex<()>,
     /// Sessions currently being deleted. Dispatch checks this while holding
     /// `active_threads`, making "no active turns" and "no new turns" one
     /// atomic state transition before destructive cleanup begins.
@@ -2483,6 +2505,7 @@ impl Engine {
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
             prompt_queue_mutations: Mutex::new(()),
+            team_mutations: Mutex::new(()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             turn_steerers: Mutex::new(HashMap::new()),
@@ -7747,6 +7770,27 @@ impl Engine {
         .map_err(|error| EngineError::Internal(error.into()))
     }
 
+    fn validated_idempotency_key(
+        key: Option<&str>,
+        subject: &str,
+    ) -> Result<Option<String>, EngineError> {
+        match key {
+            Some(key)
+                if key.is_empty()
+                    || key.len() > 128
+                    || !key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) =>
+            {
+                Err(EngineError::BadRequest(format!(
+                    "{subject} idempotency key must be 1-128 ASCII letters, digits, '.', '_', or '-'"
+                )))
+            }
+            Some(key) => Ok(Some(key.to_owned())),
+            None => Ok(None),
+        }
+    }
+
     async fn rollback_failed_session_creation(
         &self,
         worktree: &Path,
@@ -7780,24 +7824,24 @@ impl Engine {
     }
 
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
+        self.create_session_with_kind(req, SessionKind::Solo, None)
+            .await
+            .map(|(session, _created)| session)
+    }
+
+    async fn create_session_with_kind(
+        &self,
+        req: CreateSessionRequest,
+        kind: SessionKind,
+        request_fingerprint: Option<String>,
+    ) -> Result<(Session, bool), EngineError> {
         let create_started = Instant::now();
-        let idempotency_key = match req.idempotency_key.as_deref() {
-            Some(key)
-                if key.is_empty()
-                    || key.len() > 128
-                    || !key
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) =>
-            {
-                return Err(EngineError::BadRequest(
-                    "session idempotency key must be 1-128 ASCII letters, digits, '.', '_', or '-'"
-                        .into(),
-                ));
-            }
-            Some(key) => Some(key.to_owned()),
-            None => None,
+        let idempotency_key =
+            Self::validated_idempotency_key(req.idempotency_key.as_deref(), "session")?;
+        let request_fingerprint = match request_fingerprint {
+            Some(fingerprint) => fingerprint,
+            None => Self::session_create_request_fingerprint(&req)?,
         };
-        let request_fingerprint = Self::session_create_request_fingerprint(&req)?;
         let create_lock = idempotency_key
             .as_deref()
             .map(|key| self.session_create_lock(key));
@@ -7814,7 +7858,9 @@ impl Engine {
                     "session idempotency key was already used for a different request".into(),
                 ));
             }
-            return self.get_session(&existing.id);
+            return self
+                .get_session(&existing.id)
+                .map(|session| (session, false));
         }
         let ws = self
             .store
@@ -7881,7 +7927,7 @@ impl Engine {
             branch: branch.clone(),
             worktree_path: worktree_path.to_string_lossy().to_string(),
             base_ref,
-            kind: trouve_protocol::SessionKind::Solo,
+            kind,
             team_member_count: 0,
             archived: false,
             active: false,
@@ -7962,7 +8008,7 @@ impl Engine {
                                 creation,
                             )
                             .await;
-                            return Ok(existing);
+                            return Ok((existing, false));
                         }
                         Ok(Some(_)) => {
                             tracing::warn!(
@@ -8030,7 +8076,29 @@ impl Engine {
             elapsed_ms = create_started.elapsed().as_millis(),
             "session startup timing: session created"
         );
-        Ok(session)
+        Ok((session, true))
+    }
+
+    /// Remove team reservations whose roster transaction never committed.
+    /// This runs before the server accepts requests, so an interrupted create
+    /// cannot survive restart as an ordinary or malformed session.
+    pub async fn recover_incomplete_team_sessions(&self) -> Result<(), EngineError> {
+        let incomplete = self
+            .store
+            .list_sessions(None)?
+            .into_iter()
+            .filter(|session| session.kind == SessionKind::Team)
+            .filter_map(|session| match self.store.team(&session.id) {
+                Ok(None) => Some(Ok(session.id)),
+                Ok(Some(_)) => None,
+                Err(error) => Some(Err(EngineError::Internal(error))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for session_id in incomplete {
+            tracing::warn!(%session_id, "recovering interrupted team creation");
+            self.delete_session(&session_id).await?;
+        }
+        Ok(())
     }
 
     pub fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<Session>, EngineError> {
@@ -8066,6 +8134,22 @@ impl Engine {
         vec![software_delivery_team_template()]
     }
 
+    fn team_create_request_fingerprint(req: &CreateTeamRequest) -> Result<String, EngineError> {
+        serde_json::to_string(&(
+            &req.workspace_id,
+            &req.title,
+            &req.base_ref,
+            req.fetch_latest,
+            &req.goal,
+            &req.template_id,
+            &req.model,
+            &req.model_options,
+            req.permission_mode,
+            req.max_turns,
+        ))
+        .map_err(|error| EngineError::Internal(error.into()))
+    }
+
     /// Create the session and its role-backed threads, then deliver the goal
     /// to the orchestrator through the same persistent queue as every later
     /// mention. The server, not a provider backend or client, owns routing.
@@ -8085,29 +8169,71 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::BadRequest(format!("unknown team template: {template_id}"))
             })?;
-        let session = self
-            .create_session(CreateSessionRequest {
-                workspace_id: req.workspace_id,
-                idempotency_key: None,
-                title: req.title,
-                base_ref: req.base_ref,
-                checkout_ref: None,
-                fetch_latest: req.fetch_latest,
-            })
+        let max_turns = req.max_turns.unwrap_or(64);
+        if !(1..=1_000).contains(&max_turns) {
+            return Err(EngineError::BadRequest(
+                "team max_turns must be between 1 and 1000".into(),
+            ));
+        }
+        let idempotency_key =
+            Self::validated_idempotency_key(req.idempotency_key.as_deref(), "team creation")?;
+        let request_fingerprint = Self::team_create_request_fingerprint(&req)?;
+        let team_lock = idempotency_key
+            .as_deref()
+            .map(|key| self.session_create_lock(&format!("team:{key}")));
+        let _team_create_guard = match team_lock {
+            Some(lock) => Some(lock.lock_owned().await),
+            None => None,
+        };
+        let session_request = CreateSessionRequest {
+            workspace_id: req.workspace_id,
+            idempotency_key: idempotency_key.clone(),
+            title: req.title,
+            base_ref: req.base_ref,
+            checkout_ref: None,
+            fetch_latest: req.fetch_latest,
+        };
+        let (mut session, mut created) = self
+            .create_session_with_kind(
+                session_request.clone(),
+                SessionKind::Team,
+                Some(request_fingerprint.clone()),
+            )
             .await?;
+        if !created {
+            if let Some(team) = self.store.team(&session.id)? {
+                self.dispatch_active_team_queues(&team);
+                return Ok(team);
+            }
+            // A process interruption can commit the reserved Team session
+            // before its roster transaction. Remove that incomplete attempt
+            // under the same retry lane, then recreate it with the same key.
+            self.delete_session(&session.id).await?;
+            (session, created) = self
+                .create_session_with_kind(
+                    session_request,
+                    SessionKind::Team,
+                    Some(request_fingerprint),
+                )
+                .await?;
+            debug_assert!(created);
+        }
 
         let members_result: Result<Vec<TeamMember>, EngineError> = template
             .members
             .iter()
             .map(|spec| {
-                let thread = self.create_thread(CreateThreadRequest {
-                    session_id: session.id.clone(),
-                    title: Some(spec.display_name.clone()),
-                    mode: Some(spec.mode.clone()),
-                    model: req.model.clone(),
-                    model_options: req.model_options.clone(),
-                    permission_mode: req.permission_mode,
-                })?;
+                let thread = self.create_thread_for_session(
+                    session.clone(),
+                    CreateThreadRequest {
+                        session_id: session.id.clone(),
+                        title: Some(spec.display_name.clone()),
+                        mode: Some(spec.mode.clone()),
+                        model: req.model.clone(),
+                        model_options: req.model_options.clone(),
+                        permission_mode: req.permission_mode,
+                    },
+                )?;
                 Ok(TeamMember {
                     id: new_id("tm"),
                     session_id: session.id.clone(),
@@ -8142,39 +8268,105 @@ impl Engine {
             orchestrator_member_id,
             members,
             messages: Vec::new(),
-            max_turns: req.max_turns.unwrap_or(64).clamp(1, 1_000),
+            messages_truncated: false,
+            max_turns,
             turns_used: 0,
             created_at: chrono::Utc::now(),
         };
-        if let Err(error) = self.store.insert_team(&team) {
+        let orchestrator = team
+            .members
+            .iter()
+            .find(|member| member.id == team.orchestrator_member_id)
+            .cloned()
+            .ok_or_else(|| EngineError::Internal(anyhow!("template has no orchestrator")))?;
+        let initial_message = TeamMessage {
+            id: new_id("msg"),
+            session_id: session.id.clone(),
+            author_member_id: None,
+            author_handle: "you".into(),
+            author_kind: TeamAuthorKind::Human,
+            content: team.goal.clone(),
+            mentions: Vec::new(),
+            created_at: chrono::Utc::now(),
+        };
+        let initial_prompt = trouve_protocol::QueuedPrompt {
+            id: new_id("qp"),
+            thread_id: orchestrator.thread_id.clone(),
+            position: 0,
+            content: render_team_delivery(&team, &orchestrator, &initial_message),
+            attachments: Vec::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let mut queued_orchestrator = orchestrator.clone();
+        queued_orchestrator.state = TeamMemberState::Queued;
+        let initialized = self.store.create_team_with_events(
+            &team,
+            &initial_message,
+            vec![TeamPromptDelivery {
+                id: new_id("td"),
+                prompt: initial_prompt.clone(),
+                recipient_member_id: orchestrator.id.clone(),
+            }],
+            vec![
+                (
+                    Scope::Session(session.id.clone()),
+                    Event::TeamCreated { team: team.clone() },
+                ),
+                (
+                    Scope::Server,
+                    Event::SessionUpdated {
+                        session_id: session.id.clone(),
+                        workspace_id: session.workspace_id.clone(),
+                    },
+                ),
+                (
+                    Scope::Session(session.id.clone()),
+                    Event::TeamMessagePosted {
+                        message: initial_message.clone(),
+                    },
+                ),
+                (
+                    Scope::Thread(orchestrator.thread_id.clone()),
+                    Event::QueueUpdated {
+                        prompts: vec![initial_prompt],
+                    },
+                ),
+                (
+                    Scope::Session(session.id.clone()),
+                    Event::TeamMemberUpdated {
+                        member: queued_orchestrator,
+                    },
+                ),
+            ],
+        );
+        if let Err(error) = initialized {
+            // The event writer can lose its reply after committing. A roster
+            // row proves the entire initialization transaction is durable.
+            if let Some(team) = self.store.team(&session.id)? {
+                self.dispatch_active_team_queues(&team);
+                return Ok(team);
+            }
             let _ = self.delete_session(&session.id).await;
             return Err(error.into());
         }
-        let initialized = (|| -> Result<(), EngineError> {
-            self.store.append_event(
-                Scope::Session(session.id.clone()),
-                Event::TeamCreated { team: team.clone() },
-            )?;
-            self.store.append_event(
-                Scope::Server,
-                Event::SessionUpdated {
-                    session_id: session.id.clone(),
-                    workspace_id: session.workspace_id.clone(),
-                },
-            )?;
-            self.post_team_message(
-                &session.id,
-                PostTeamMessageRequest {
-                    content: team.goal.clone(),
-                },
-            )?;
-            Ok(())
-        })();
-        if let Err(error) = initialized {
-            let _ = self.delete_session(&session.id).await;
-            return Err(error);
+        let team = self.get_team(&session.id)?;
+        self.dispatch_active_team_queues(&team);
+        Ok(team)
+    }
+
+    fn dispatch_active_team_queues(self: &Arc<Self>, team: &Team) {
+        if team.status != TeamStatus::Active {
+            return;
         }
-        self.get_team(&session.id)
+        for member in &team.members {
+            if self
+                .store
+                .queued_prompts(&member.thread_id)
+                .is_ok_and(|prompts| !prompts.is_empty())
+            {
+                let _ = self.dispatch_queue(&member.thread_id);
+            }
+        }
     }
 
     pub fn get_team(&self, session_id: &str) -> Result<Team, EngineError> {
@@ -8200,7 +8392,16 @@ impl Engine {
                 "team message cannot be empty".into(),
             ));
         }
-        self.append_team_message(session_id, None, "you", TeamAuthorKind::Human, content)
+        let idempotency_key =
+            Self::validated_idempotency_key(req.idempotency_key.as_deref(), "team message")?;
+        self.append_team_message(
+            session_id,
+            None,
+            "you",
+            TeamAuthorKind::Human,
+            content,
+            idempotency_key.as_deref(),
+        )
     }
 
     fn append_team_message(
@@ -8210,8 +8411,26 @@ impl Engine {
         author_handle: &str,
         author_kind: TeamAuthorKind,
         content: String,
+        idempotency_key: Option<&str>,
     ) -> Result<TeamMessage, EngineError> {
+        let _team_mutation = self.team_mutations.lock().unwrap();
         let team = self.get_team(session_id)?;
+        let request_fingerprint =
+            serde_json::to_string(&content).map_err(|error| EngineError::Internal(error.into()))?;
+        if let Some(key) = idempotency_key
+            && let Some((existing, persisted_fingerprint)) = self
+                .store
+                .team_message_by_idempotency_key(session_id, key)?
+        {
+            if persisted_fingerprint != request_fingerprint {
+                return Err(EngineError::Conflict(
+                    "team message idempotency key was already used for different content".into(),
+                ));
+            }
+            drop(_team_mutation);
+            self.dispatch_active_team_queues(&team);
+            return Ok(existing);
+        }
         if author_kind == TeamAuthorKind::Human
             && matches!(team.status, TeamStatus::Completed | TeamStatus::Cancelled)
         {
@@ -8224,12 +8443,18 @@ impl Engine {
                 }
             )));
         }
-        let recipients = mentioned_team_members(
+        if author_kind == TeamAuthorKind::Human && team.turns_used >= team.max_turns {
+            return Err(EngineError::Conflict(format!(
+                "team turn budget exhausted ({}/{})",
+                team.turns_used, team.max_turns
+            )));
+        }
+        let mentioned = mentioned_team_members(
             &content,
             &team.members,
             author.map(|member| member.id.as_str()),
         );
-        let mentions = recipients
+        let mentions = mentioned
             .iter()
             .map(|member| TeamMention {
                 member_id: member.id.clone(),
@@ -8246,18 +8471,11 @@ impl Engine {
             mentions,
             created_at: chrono::Utc::now(),
         };
-        self.store.insert_team_message(&message)?;
-        self.store.append_event(
-            Scope::Session(session_id.to_string()),
-            Event::TeamMessagePosted {
-                message: message.clone(),
-            },
-        )?;
 
         // Untagged human messages address the orchestrator. Untagged agent
         // output is still visible in the timeline but deliberately creates
         // no hidden turn.
-        let recipients = if recipients.is_empty() && author_kind == TeamAuthorKind::Human {
+        let recipients = if mentioned.is_empty() && author_kind == TeamAuthorKind::Human {
             team.members
                 .iter()
                 .find(|member| member.id == team.orchestrator_member_id)
@@ -8265,42 +8483,91 @@ impl Engine {
                 .into_iter()
                 .collect()
         } else {
-            recipients
+            mentioned
         };
-        if !matches!(team.status, TeamStatus::Completed | TeamStatus::Cancelled) {
-            self.route_team_message(&team, &message, &recipients)?;
-        }
-        Ok(message)
-    }
-
-    fn route_team_message(
-        self: &Arc<Self>,
-        team: &Team,
-        message: &TeamMessage,
-        recipients: &[TeamMember],
-    ) -> Result<(), EngineError> {
-        for member in recipients {
-            let prompt = render_team_delivery(team, member, message);
-            let queued = self.store.enqueue_prompt(&member.thread_id, &prompt, &[])?;
-            self.store.insert_team_delivery(
-                &team.session_id,
-                &message.id,
-                &member.id,
-                &queued.id,
-            )?;
-            self.emit_queue(&member.thread_id)?;
-            self.set_team_member_state_and_emit(member, TeamMemberState::Queued)?;
-            if team.status == TeamStatus::Active
-                && let Err(error) = self.dispatch_queue(&member.thread_id)
-            {
-                tracing::warn!(
-                    "team delivery {} to @{} remains queued: {error}",
-                    message.id,
-                    member.handle
-                );
+        let route = !matches!(team.status, TeamStatus::Completed | TeamStatus::Cancelled)
+            && team.turns_used < team.max_turns;
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
+        let mut deliveries = Vec::new();
+        let mut events = vec![(
+            Scope::Session(session_id.to_string()),
+            Event::TeamMessagePosted {
+                message: message.clone(),
+            },
+        )];
+        if route {
+            for member in &recipients {
+                let prompt = trouve_protocol::QueuedPrompt {
+                    id: new_id("qp"),
+                    thread_id: member.thread_id.clone(),
+                    position: self.store.next_queued_prompt_position(&member.thread_id)?,
+                    content: render_team_delivery(&team, member, &message),
+                    attachments: Vec::new(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+                let mut visible_queue = self.store.queued_prompts(&member.thread_id)?;
+                visible_queue.push(prompt.clone());
+                visible_queue.sort_by_key(|candidate| candidate.position);
+                deliveries.push(TeamPromptDelivery {
+                    id: new_id("td"),
+                    prompt,
+                    recipient_member_id: member.id.clone(),
+                });
+                events.push((
+                    Scope::Thread(member.thread_id.clone()),
+                    Event::QueueUpdated {
+                        prompts: visible_queue,
+                    },
+                ));
+                let mut queued_member = member.clone();
+                queued_member.state = TeamMemberState::Queued;
+                events.push((
+                    Scope::Session(session_id.to_string()),
+                    Event::TeamMemberUpdated {
+                        member: queued_member,
+                    },
+                ));
             }
         }
-        Ok(())
+        if let Err(error) = self.store.append_team_message_with_events(
+            &message,
+            idempotency_key,
+            idempotency_key.map(|_| request_fingerprint.as_str()),
+            deliveries,
+            events,
+        ) {
+            if let Some(key) = idempotency_key
+                && let Some((existing, persisted_fingerprint)) = self
+                    .store
+                    .team_message_by_idempotency_key(session_id, key)?
+            {
+                if persisted_fingerprint != request_fingerprint {
+                    return Err(EngineError::Conflict(
+                        "team message idempotency key was already used for different content"
+                            .into(),
+                    ));
+                }
+                drop(_queue_mutation);
+                drop(_team_mutation);
+                self.dispatch_active_team_queues(&team);
+                return Ok(existing);
+            }
+            return Err(error.into());
+        }
+        drop(_queue_mutation);
+        drop(_team_mutation);
+        if team.status == TeamStatus::Active {
+            for member in &recipients {
+                if let Err(error) = self.dispatch_queue(&member.thread_id) {
+                    tracing::warn!(
+                        "team delivery {} to @{} remains queued: {error}",
+                        message.id,
+                        member.handle
+                    );
+                }
+            }
+        }
+        Ok(message)
     }
 
     fn set_team_member_state_and_emit(
@@ -8308,14 +8575,14 @@ impl Engine {
         member: &TeamMember,
         state: TeamMemberState,
     ) -> Result<(), EngineError> {
-        self.store.set_team_member_state(&member.id, state)?;
         let mut updated = self
             .store
             .team_member_by_thread(&member.thread_id)?
             .unwrap_or_else(|| member.clone());
         updated.state = state;
-        self.store.append_event(
-            Scope::Session(member.session_id.clone()),
+        self.store.set_team_member_state_with_event(
+            member,
+            state,
             Event::TeamMemberUpdated { member: updated },
         )?;
         Ok(())
@@ -8328,6 +8595,7 @@ impl Engine {
         session_id: &str,
         status: TeamStatus,
     ) -> Result<Team, EngineError> {
+        let team_mutation = self.team_mutations.lock().unwrap();
         let team = self.get_team(session_id)?;
         if status == TeamStatus::Active
             && team.status == TeamStatus::Paused
@@ -8351,14 +8619,21 @@ impl Engine {
                 team.status
             )));
         }
-        self.store.set_team_status(session_id, status)?;
-        self.store.append_event(
-            Scope::Session(session_id.to_string()),
+        let changed = self.store.set_team_status_with_event(
+            session_id,
+            team.status,
+            status,
             Event::TeamStatusChanged {
                 status,
                 turns_used: team.turns_used,
             },
         )?;
+        if !changed {
+            return Err(EngineError::Conflict(
+                "team status changed while applying the lifecycle action; refresh and retry".into(),
+            ));
+        }
+        drop(team_mutation);
         match status {
             TeamStatus::Active => {
                 for member in &team.members {
@@ -8560,6 +8835,11 @@ impl Engine {
 
     pub fn create_thread(&self, req: CreateThreadRequest) -> Result<Thread, EngineError> {
         let session = self.get_session(&req.session_id)?;
+        if session.kind == SessionKind::Team {
+            return Err(EngineError::Conflict(
+                "team backing threads are managed by the team session".into(),
+            ));
+        }
         self.create_thread_for_session(session, req)
     }
 
@@ -8857,7 +9137,8 @@ impl Engine {
         req: &UpdateThreadRequest,
     ) -> Result<Thread, EngineError> {
         let thread = self.get_thread(id)?;
-        if self.store.team_member_by_thread(id)?.is_some() {
+        let session = self.get_session(&thread.session_id)?;
+        if session.kind == SessionKind::Team {
             return Err(EngineError::Conflict(
                 "team member settings are managed by the team session".into(),
             ));
@@ -8867,8 +9148,6 @@ impl Engine {
                 "this subagent uses a read-only exploration, audit, or review mode".into(),
             ));
         }
-        let session = self.get_session(&thread.session_id)?;
-
         // Serialize this check with prompt dispatch so a turn cannot start on
         // this thread until its settings update has been persisted. Sibling
         // threads have independent settings and do not block one another.
@@ -9445,7 +9724,7 @@ impl Engine {
         allow_spawned: bool,
     ) -> Result<TurnAccepted, EngineError> {
         let thread = self.get_thread(thread_id)?; // 404 for unknown threads
-        if self.store.team_member_by_thread(thread_id)?.is_some() {
+        if self.get_session(&thread.session_id)?.kind == SessionKind::Team {
             return Err(EngineError::Conflict(
                 "team members are addressed through the shared team timeline".into(),
             ));
@@ -10211,7 +10490,56 @@ impl Engine {
                 }
             };
             if delivery.is_some() {
-                let budget = match self.store.consume_team_turn(&thread.session_id) {
+                let budget = match (|| -> Result<Option<(u64, TeamStatus)>> {
+                    let _team_mutation = self.team_mutations.lock().unwrap();
+                    let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
+                    let Some(team) = self.store.team(&thread.session_id)? else {
+                        return Ok(None);
+                    };
+                    if team.status != TeamStatus::Active || team.turns_used >= team.max_turns {
+                        return Ok(None);
+                    }
+                    let turns_used = team.turns_used + 1;
+                    let status = if turns_used >= team.max_turns {
+                        TeamStatus::Paused
+                    } else {
+                        TeamStatus::Active
+                    };
+                    let mut events = vec![(
+                        Scope::Session(thread.session_id.clone()),
+                        Event::TeamStatusChanged { status, turns_used },
+                    )];
+                    if status == TeamStatus::Paused {
+                        for member in &team.members {
+                            events.push((
+                                Scope::Thread(member.thread_id.clone()),
+                                Event::QueueUpdated {
+                                    prompts: Vec::new(),
+                                },
+                            ));
+                            let is_current_member = team_member
+                                .as_ref()
+                                .is_some_and(|current| current.id == member.id);
+                            if member.state == TeamMemberState::Queued && !is_current_member {
+                                let mut member = member.clone();
+                                member.state = TeamMemberState::Idle;
+                                events.push((
+                                    Scope::Session(thread.session_id.clone()),
+                                    Event::TeamMemberUpdated { member },
+                                ));
+                            }
+                        }
+                    }
+                    let consumed = self.store.consume_team_turn_with_events(
+                        &thread.session_id,
+                        team.turns_used,
+                        turns_used,
+                        status,
+                        &prompt.id,
+                        events,
+                    )?;
+                    Ok(consumed.then_some((turns_used, status)))
+                })() {
                     Ok(budget) => budget,
                     Err(error) => {
                         tracing::warn!(
@@ -10221,7 +10549,7 @@ impl Engine {
                         None
                     }
                 };
-                let Some((turns_used, status)) = budget else {
+                let Some((_turns_used, _status)) = budget else {
                     let _ = self.store.release_queued_prompt(&prompt.id);
                     let _ = self.emit_queue(&thread.id);
                     if let Some(member) = &team_member {
@@ -10239,10 +10567,6 @@ impl Engine {
                     let _ = self.release_thread(&thread.id);
                     return Ok(());
                 };
-                let _ = self.store.append_event(
-                    Scope::Session(thread.session_id.clone()),
-                    Event::TeamStatusChanged { status, turns_used },
-                );
                 let _ = self.store.set_team_delivery_status(&prompt.id, "running");
                 if let Some(member) = &team_member {
                     let _ = self.set_team_member_state_and_emit(member, TeamMemberState::Running);
@@ -10279,6 +10603,13 @@ impl Engine {
                                 thread.id
                             )
                         })?;
+                    if delivery.is_some() {
+                        let _ = self.store.set_team_delivery_status(&prompt.id, "failed");
+                    }
+                    if let Some(member) = &team_member {
+                        let _ =
+                            self.set_team_member_state_and_emit(member, TeamMemberState::Failed);
+                    }
                     let _ = self.store.release_queued_prompt(&prompt.id);
                     let _ = self.emit_queue(&thread.id);
                     self.clear_cancel(&thread.id);
@@ -10334,6 +10665,9 @@ impl Engine {
                     .with_context(|| {
                         format!("persisting cancellation for turn {turn} of {}", thread.id)
                     })?;
+                if delivery.is_some() {
+                    let _ = self.store.set_team_delivery_status(&prompt.id, "cancelled");
+                }
                 let resume = self.finish_interrupted_turn(&thread.id)?;
                 if !resume {
                     return Ok(());
@@ -10354,6 +10688,9 @@ impl Engine {
                     })?;
                 let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
+                if delivery.is_some() {
+                    let _ = self.store.set_team_delivery_status(&prompt.id, "failed");
+                }
                 let resume = self.finish_interrupted_turn(&thread.id)?;
                 if !resume {
                     return Ok(());
@@ -10362,7 +10699,7 @@ impl Engine {
             } else {
                 false
             };
-            if delivery.is_some() {
+            if delivery.is_some() && !cancelled && !resume_after_failure {
                 let _ = self.store.set_team_delivery_status(&prompt.id, "completed");
             }
             if let Some(member) = &team_member {
@@ -10374,6 +10711,7 @@ impl Engine {
                             &member.handle,
                             TeamAuthorKind::Agent,
                             content,
+                            None,
                         ) {
                             tracing::warn!(
                                 "failed to route output from team member @{}: {error}",
@@ -19148,6 +19486,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_recovery_removes_an_incomplete_team_reservation() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe);
+        let mut request = session_probe_request(&workspace);
+        request.idempotency_key = Some("interrupted-team".into());
+        let (session, created) = engine
+            .create_session_with_kind(request, SessionKind::Team, Some("team-fingerprint".into()))
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(session.kind, SessionKind::Team);
+        assert!(store.team(&session.id).unwrap().is_none());
+
+        engine.recover_incomplete_team_sessions().await.unwrap();
+
+        assert!(store.session(&session.id).unwrap().is_none());
+        assert!(
+            store
+                .session_by_create_idempotency_key("interrupted-team")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_session_creation_retries_share_one_worktree_attempt() {
         let probe = Arc::new(SessionCreationProbeExecutor::new(
             true,
@@ -21428,6 +21794,7 @@ default_permission_mode = "ask"
         let content = "@Coder take this; @planner outline it. `@reviewer inline` \
                        and ``@reviewer double-inline`` plus mail@reviewer.example\n\
                        ```text\n@reviewer fenced\n```\n\
+                       ~~~~markdown\n@reviewer tilde-fenced\n~~~ not-a-close\n~~~~\n\
                        @coder again, @reviewer now, and @coders is not exact.";
         let routed = mentioned_team_members(content, &members, Some(&planner.id));
 

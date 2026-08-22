@@ -286,6 +286,8 @@ CREATE TABLE IF NOT EXISTS team_messages (
   author_kind TEXT NOT NULL,
   content TEXT NOT NULL,
   mentions TEXT NOT NULL DEFAULT '[]',
+  idempotency_key TEXT,
+  request_fingerprint TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS team_messages_session ON team_messages (session_id, created_at, id);
@@ -649,6 +651,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'solo'",
+    "ALTER TABLE team_messages ADD COLUMN idempotency_key TEXT",
+    "ALTER TABLE team_messages ADD COLUMN request_fingerprint TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS team_messages_idempotency
+       ON team_messages (session_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
@@ -2778,6 +2784,30 @@ fn recover_process_state(conn: &Connection) -> Result<()> {
          WHERE state = 'running'",
         [],
     )?;
+    conn.execute(
+        "UPDATE team_deliveries
+         SET status = 'cancelled'
+         WHERE status = 'queued'
+           AND session_id IN (
+             SELECT session_id FROM teams WHERE status IN ('completed', 'cancelled')
+           )",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM queued_prompts
+         WHERE id IN (
+           SELECT queued_prompt_id FROM team_deliveries WHERE status = 'cancelled'
+         )",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE team_members
+         SET state = 'idle'
+         WHERE session_id IN (
+           SELECT session_id FROM teams WHERE status IN ('completed', 'cancelled')
+         )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -4223,6 +4253,13 @@ pub(crate) struct PromptAcceptance {
     pub staging_cleanup_claim: Option<ArtifactCleanupClaim>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TeamPromptDelivery {
+    pub id: String,
+    pub prompt: trouve_protocol::QueuedPrompt,
+    pub recipient_member_id: String,
+}
+
 impl ArtifactCleanupJob {
     pub(crate) fn claim(&self) -> Option<ArtifactCleanupClaim> {
         self.claim_token.as_ref().map(|token| ArtifactCleanupClaim {
@@ -4269,6 +4306,33 @@ enum StoreMutation {
         thread: Box<Thread>,
         model_options: serde_json::Map<String, serde_json::Value>,
         spawn: Option<(String, String)>,
+    },
+    CreateTeam {
+        team: Box<Team>,
+        initial_message: Box<TeamMessage>,
+        initial_deliveries: Vec<TeamPromptDelivery>,
+    },
+    AppendTeamMessage {
+        message: Box<TeamMessage>,
+        idempotency_key: Option<String>,
+        request_fingerprint: Option<String>,
+        deliveries: Vec<TeamPromptDelivery>,
+    },
+    SetTeamStatus {
+        session_id: String,
+        expected: TeamStatus,
+        status: TeamStatus,
+    },
+    ConsumeTeamTurn {
+        session_id: String,
+        expected_turns: u64,
+        turns_used: u64,
+        status: TeamStatus,
+        current_prompt_id: String,
+    },
+    SetTeamMemberState {
+        member_id: String,
+        state: TeamMemberState,
     },
     Delete {
         id: String,
@@ -4690,6 +4754,124 @@ fn update_thread_row(
     Ok(())
 }
 
+fn insert_team_rows(conn: &Connection, team: &Team) -> Result<()> {
+    let kind = conn
+        .query_row(
+            "SELECT kind FROM sessions WHERE id = ?1",
+            params![team.session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    anyhow::ensure!(
+        kind.as_deref() == Some("team"),
+        "team session {} is missing its reservation",
+        team.session_id
+    );
+    conn.execute(
+        "INSERT INTO teams (session_id, goal, status, orchestrator_member_id, max_turns, turns_used, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            team.session_id,
+            team.goal,
+            team_status_str(team.status),
+            team.orchestrator_member_id,
+            team.max_turns as i64,
+            team.turns_used as i64,
+            team.created_at.to_rfc3339(),
+        ],
+    )?;
+    for member in &team.members {
+        conn.execute(
+            "INSERT INTO team_members
+             (id, session_id, handle, display_name, role, thread_id, mode, model, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                member.id,
+                member.session_id,
+                member.handle,
+                member.display_name,
+                member.role,
+                member.thread_id,
+                member.mode,
+                member.model,
+                team_member_state_str(member.state),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_team_message_row(
+    conn: &Connection,
+    message: &TeamMessage,
+    idempotency_key: Option<&str>,
+    request_fingerprint: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO team_messages
+         (id, session_id, author_member_id, author_handle, author_kind, content, mentions,
+          idempotency_key, request_fingerprint, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            message.id,
+            message.session_id,
+            message.author_member_id,
+            message.author_handle,
+            team_author_kind_str(message.author_kind),
+            message.content,
+            serde_json::to_string(&message.mentions)?,
+            idempotency_key,
+            request_fingerprint,
+            message.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_team_prompt_deliveries(
+    conn: &Connection,
+    session_id: &str,
+    message_id: &str,
+    deliveries: &[TeamPromptDelivery],
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    for delivery in deliveries {
+        conn.execute(
+            "INSERT INTO queued_prompts
+             (id, thread_id, position, content, attachments, tools_enabled, claimed, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, 0, ?6)",
+            params![
+                delivery.prompt.id,
+                delivery.prompt.thread_id,
+                delivery.prompt.position as i64,
+                delivery.prompt.content,
+                serde_json::to_string(&delivery.prompt.attachments)?,
+                delivery.prompt.created_at,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO team_deliveries
+             (id, session_id, message_id, recipient_member_id, queued_prompt_id, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+            params![
+                delivery.id,
+                session_id,
+                message_id,
+                delivery.recipient_member_id,
+                delivery.prompt.id,
+                timestamp.to_rfc3339(),
+            ],
+        )?;
+        let updated = conn.execute(
+            "UPDATE team_members SET state = 'queued'
+             WHERE id = ?1 AND session_id = ?2",
+            params![delivery.recipient_member_id, session_id],
+        )?;
+        anyhow::ensure!(updated == 1, "team delivery recipient no longer exists");
+    }
+    Ok(())
+}
+
 fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM session_create_requests WHERE session_id = ?1",
@@ -4886,6 +5068,121 @@ fn apply_store_mutation(
                     params![thread.id, parent, kind],
                 )?;
             }
+        }
+        StoreMutation::CreateTeam {
+            team,
+            initial_message,
+            initial_deliveries,
+        } => {
+            insert_team_rows(conn, team)?;
+            insert_team_message_row(conn, initial_message, None, None)?;
+            insert_team_prompt_deliveries(
+                conn,
+                &team.session_id,
+                &initial_message.id,
+                initial_deliveries,
+                timestamp,
+            )?;
+        }
+        StoreMutation::AppendTeamMessage {
+            message,
+            idempotency_key,
+            request_fingerprint,
+            deliveries,
+        } => {
+            insert_team_message_row(
+                conn,
+                message,
+                idempotency_key.as_deref(),
+                request_fingerprint.as_deref(),
+            )?;
+            insert_team_prompt_deliveries(
+                conn,
+                &message.session_id,
+                &message.id,
+                deliveries,
+                timestamp,
+            )?;
+        }
+        StoreMutation::SetTeamStatus {
+            session_id,
+            expected,
+            status,
+        } => {
+            let updated = conn.execute(
+                "UPDATE teams SET status = ?3
+                 WHERE session_id = ?1 AND status = ?2",
+                params![
+                    session_id,
+                    team_status_str(*expected),
+                    team_status_str(*status)
+                ],
+            )?;
+            if updated == 0 {
+                return Ok(StoreMutationOutcome::SkipAndRollback);
+            }
+        }
+        StoreMutation::ConsumeTeamTurn {
+            session_id,
+            expected_turns,
+            turns_used,
+            status,
+            current_prompt_id,
+        } => {
+            anyhow::ensure!(
+                *turns_used == expected_turns.saturating_add(1),
+                "team turn counter must advance exactly once"
+            );
+            let updated = conn.execute(
+                "UPDATE teams SET turns_used = ?3, status = ?4
+                 WHERE session_id = ?1 AND status = 'active' AND turns_used = ?2
+                   AND ?3 <= max_turns",
+                params![
+                    session_id,
+                    *expected_turns as i64,
+                    *turns_used as i64,
+                    team_status_str(*status)
+                ],
+            )?;
+            if updated == 0 {
+                return Ok(StoreMutationOutcome::SkipAndRollback);
+            }
+            if *status == TeamStatus::Paused {
+                conn.execute(
+                    "UPDATE team_deliveries SET status = 'cancelled'
+                     WHERE session_id = ?1 AND status = 'queued'
+                       AND queued_prompt_id != ?2",
+                    params![session_id, current_prompt_id],
+                )?;
+                conn.execute(
+                    "DELETE FROM queued_prompts
+                     WHERE id IN (
+                       SELECT queued_prompt_id FROM team_deliveries
+                       WHERE session_id = ?1 AND status = 'cancelled'
+                     )",
+                    params![session_id],
+                )?;
+                conn.execute(
+                    "UPDATE team_members SET state = 'idle'
+                     WHERE session_id = ?1 AND state = 'queued'
+                       AND id != COALESCE((
+                         SELECT recipient_member_id FROM team_deliveries
+                         WHERE queued_prompt_id = ?2
+                       ), '')
+                       AND id IN (
+                         SELECT recipient_member_id FROM team_deliveries
+                         WHERE session_id = ?1 AND status = 'cancelled'
+                       )",
+                    params![session_id, current_prompt_id],
+                )?;
+            }
+        }
+        StoreMutation::SetTeamMemberState { member_id, state } => {
+            let updated = conn.execute(
+                "UPDATE team_members SET state = ?2 WHERE id = ?1",
+                params![member_id, team_member_state_str(*state)],
+            )?;
+            anyhow::ensure!(updated == 1, "team member {member_id} no longer exists");
         }
         StoreMutation::Delete { id, cleanup } => {
             insert_artifact_cleanup_job(conn, cleanup, timestamp)?;
@@ -5659,12 +5956,20 @@ impl Store {
     }
 
     fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events_with_isolation(events, false)
+    }
+
+    fn append_pending_events_with_isolation(
+        &self,
+        events: Vec<PendingEvent>,
+        isolated: bool,
+    ) -> Result<Vec<EventEnvelope>> {
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
                 events,
                 code_review_outbox_ids: Vec::new(),
-                isolated: false,
+                isolated,
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -6399,26 +6704,30 @@ impl Store {
             }))
     }
 
-    /// Fold the final assistant text for one completed turn. This is used by
-    /// team routing so native and bridged providers share one output path.
+    /// Fold all assistant text segments for one completed turn in cursor
+    /// order. Team routing must preserve mentions emitted before a progress,
+    /// reasoning, or tool boundary.
     pub fn assistant_message(&self, thread_id: &str, turn: u64) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events
-             WHERE scope_kind = 'thread' AND scope_id = ?1 ORDER BY cursor DESC",
+             WHERE scope_kind = 'thread' AND scope_id = ?1 ORDER BY cursor",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| r.get::<_, String>(0))?;
+        let mut content = String::new();
+        let mut found = false;
         for payload in rows {
             if let Ok(Event::AssistantMessage {
                 turn: event_turn,
-                content,
+                content: segment,
             }) = serde_json::from_str::<Event>(&payload?)
                 && event_turn == turn
             {
-                return Ok(Some(content));
+                content.push_str(&segment);
+                found = true;
             }
         }
-        Ok(None)
+        Ok(found.then_some(content))
     }
 
     /// Live subscription to all events; callers filter by scope.
@@ -7030,6 +7339,26 @@ impl Store {
         Ok(())
     }
 
+    /// Commit the complete team roster, its initial goal delivery, and every
+    /// durable event that exposes them in one writer transaction.
+    pub(crate) fn create_team_with_events(
+        &self,
+        team: &Team,
+        initial_message: &TeamMessage,
+        initial_deliveries: Vec<TeamPromptDelivery>,
+        events: Vec<(Scope, Event)>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let pending = serialize_lifecycle_events(
+            events,
+            StoreMutation::CreateTeam {
+                team: Box::new(team.clone()),
+                initial_message: Box::new(initial_message.clone()),
+                initial_deliveries,
+            },
+        )?;
+        self.append_pending_events(pending)
+    }
+
     pub fn team(&self, session_id: &str) -> Result<Option<Team>> {
         let conn = self.conn.lock().unwrap();
         let Some((goal, status, orchestrator_member_id, max_turns, turns_used, created_at)) = conn
@@ -7053,7 +7382,7 @@ impl Store {
             return Ok(None);
         };
         let members = team_members_with_conn(&conn, session_id)?;
-        let messages = team_messages_with_conn(&conn, session_id)?;
+        let (messages, messages_truncated) = team_messages_with_conn(&conn, session_id)?;
         // Read the cursor under the same connection lock as the snapshot.
         // Event appends use this lock too, so an event can never fall between
         // the folded state above and its replay boundary.
@@ -7071,6 +7400,7 @@ impl Store {
             orchestrator_member_id,
             members,
             messages,
+            messages_truncated,
             max_turns: max_turns as u64,
             turns_used: turns_used as u64,
             created_at: created_at.parse().unwrap_or_else(|_| chrono::Utc::now()),
@@ -7122,22 +7452,65 @@ impl Store {
     }
 
     pub fn insert_team_message(&self, message: &TeamMessage) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO team_messages
-             (id, session_id, author_member_id, author_handle, author_kind, content, mentions, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                message.id,
-                message.session_id,
-                message.author_member_id,
-                message.author_handle,
-                team_author_kind_str(message.author_kind),
-                message.content,
-                serde_json::to_string(&message.mentions)?,
-                message.created_at.to_rfc3339(),
-            ],
+        insert_team_message_row(&self.conn.lock().unwrap(), message, None, None)
+    }
+
+    pub fn team_message_by_idempotency_key(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<(TeamMessage, String)>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, session_id, author_member_id, author_handle, author_kind, content,
+                    mentions, created_at, request_fingerprint
+             FROM team_messages
+             WHERE session_id = ?1 AND idempotency_key = ?2",
+            params![session_id, key],
+            |row| {
+                let mentions: String = row.get(6)?;
+                Ok((
+                    TeamMessage {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        author_member_id: row.get(2)?,
+                        author_handle: row.get(3)?,
+                        author_kind: team_author_kind_from(&row.get::<_, String>(4)?),
+                        content: row.get(5)?,
+                        mentions: serde_json::from_str(&mentions).unwrap_or_default(),
+                        created_at: row
+                            .get::<_, String>(7)?
+                            .parse()
+                            .unwrap_or_else(|_| chrono::Utc::now()),
+                    },
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Commit a canonical team message, every routed queue row and delivery,
+    /// the recipient states, and their durable events together.
+    pub(crate) fn append_team_message_with_events(
+        &self,
+        message: &TeamMessage,
+        idempotency_key: Option<&str>,
+        request_fingerprint: Option<&str>,
+        deliveries: Vec<TeamPromptDelivery>,
+        events: Vec<(Scope, Event)>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let pending = serialize_lifecycle_events(
+            events,
+            StoreMutation::AppendTeamMessage {
+                message: Box::new(message.clone()),
+                idempotency_key: idempotency_key.map(str::to_owned),
+                request_fingerprint: request_fingerprint.map(str::to_owned),
+                deliveries,
+            },
         )?;
-        Ok(())
+        self.append_pending_events(pending)
     }
 
     pub fn set_team_status(&self, session_id: &str, status: TeamStatus) -> Result<bool> {
@@ -7146,6 +7519,26 @@ impl Store {
             params![session_id, team_status_str(status)],
         )?;
         Ok(n > 0)
+    }
+
+    pub(crate) fn set_team_status_with_event(
+        &self,
+        session_id: &str,
+        expected: TeamStatus,
+        status: TeamStatus,
+        event: Event,
+    ) -> Result<bool> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Session(session_id.to_string()), event)],
+            StoreMutation::SetTeamStatus {
+                session_id: session_id.to_string(),
+                expected,
+                status,
+            },
+        )?;
+        Ok(!self
+            .append_pending_events_with_isolation(pending, true)?
+            .is_empty())
     }
 
     /// Consume one automatic delivery turn. Returns the new count and status;
@@ -7178,6 +7571,49 @@ impl Store {
         };
         tx.commit()?;
         Ok(Some((turns as u64, next)))
+    }
+
+    pub(crate) fn consume_team_turn_with_events(
+        &self,
+        session_id: &str,
+        expected_turns: u64,
+        turns_used: u64,
+        status: TeamStatus,
+        current_prompt_id: &str,
+        events: Vec<(Scope, Event)>,
+    ) -> Result<bool> {
+        let pending = serialize_lifecycle_events(
+            events,
+            StoreMutation::ConsumeTeamTurn {
+                session_id: session_id.to_string(),
+                expected_turns,
+                turns_used,
+                status,
+                current_prompt_id: current_prompt_id.to_string(),
+            },
+        )?;
+        Ok(!self
+            .append_pending_events_with_isolation(pending, true)?
+            .is_empty())
+    }
+
+    pub(crate) fn set_team_member_state_with_event(
+        &self,
+        member: &TeamMember,
+        state: TeamMemberState,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Session(member.session_id.clone()), event)],
+            StoreMutation::SetTeamMemberState {
+                member_id: member.id.clone(),
+                state,
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one team member lifecycle event returns one envelope"))
     }
 
     pub fn insert_team_delivery(
@@ -14094,28 +14530,47 @@ fn team_members_with_conn(conn: &Connection, session_id: &str) -> Result<Vec<Tea
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-fn team_messages_with_conn(conn: &Connection, session_id: &str) -> Result<Vec<TeamMessage>> {
+const TEAM_SNAPSHOT_MESSAGE_LIMIT: usize = 200;
+
+fn team_messages_with_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(Vec<TeamMessage>, bool)> {
     let mut stmt = conn.prepare(
         "SELECT id, author_member_id, author_handle, author_kind, content, mentions, created_at
-         FROM team_messages WHERE session_id = ?1 ORDER BY rowid",
+         FROM (
+           SELECT rowid AS message_rowid, id, author_member_id, author_handle, author_kind,
+                  content, mentions, created_at
+           FROM team_messages WHERE session_id = ?1
+           ORDER BY rowid DESC LIMIT ?2
+         )
+         ORDER BY message_rowid",
     )?;
-    let rows = stmt.query_map(params![session_id], |r| {
-        let mentions: String = r.get(5)?;
-        Ok(TeamMessage {
-            id: r.get(0)?,
-            session_id: session_id.to_string(),
-            author_member_id: r.get(1)?,
-            author_handle: r.get(2)?,
-            author_kind: team_author_kind_from(&r.get::<_, String>(3)?),
-            content: r.get(4)?,
-            mentions: serde_json::from_str::<Vec<TeamMention>>(&mentions).unwrap_or_default(),
-            created_at: r
-                .get::<_, String>(6)?
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let rows = stmt.query_map(
+        params![session_id, (TEAM_SNAPSHOT_MESSAGE_LIMIT + 1) as i64],
+        |r| {
+            let mentions: String = r.get(5)?;
+            Ok(TeamMessage {
+                id: r.get(0)?,
+                session_id: session_id.to_string(),
+                author_member_id: r.get(1)?,
+                author_handle: r.get(2)?,
+                author_kind: team_author_kind_from(&r.get::<_, String>(3)?),
+                content: r.get(4)?,
+                mentions: serde_json::from_str::<Vec<TeamMention>>(&mentions).unwrap_or_default(),
+                created_at: r
+                    .get::<_, String>(6)?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        },
+    )?;
+    let mut messages = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let truncated = messages.len() > TEAM_SNAPSHOT_MESSAGE_LIMIT;
+    if truncated {
+        messages.remove(0);
+    }
+    Ok((messages, truncated))
 }
 
 fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -14638,6 +15093,38 @@ mod tests {
         assert!(claim_until.is_none());
         assert!(claim_token.is_none());
         assert!(next_attempt_at.is_some());
+    }
+
+    #[test]
+    fn assistant_message_concatenates_every_segment_in_cursor_order() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_segments");
+        let scope = Scope::Thread("th_segments".into());
+        for event in [
+            Event::AssistantMessage {
+                turn: 7,
+                content: "@coder inspect ".into(),
+            },
+            Event::AssistantThinking {
+                turn: 7,
+                text: "checking".into(),
+            },
+            Event::AssistantMessage {
+                turn: 6,
+                content: "ignore another turn".into(),
+            },
+            Event::AssistantMessage {
+                turn: 7,
+                content: "and report".into(),
+            },
+        ] {
+            store.append_event(scope.clone(), event).unwrap();
+        }
+
+        assert_eq!(
+            store.assistant_message("th_segments", 7).unwrap(),
+            Some("@coder inspect and report".into())
+        );
     }
 
     #[test]
@@ -17274,6 +17761,7 @@ mod tests {
                 orchestrator_member_id: orchestrator.id.clone(),
                 members: vec![orchestrator.clone(), coder.clone()],
                 messages: vec![],
+                messages_truncated: false,
                 max_turns: 2,
                 turns_used: 0,
                 created_at,
@@ -17303,6 +17791,26 @@ mod tests {
         assert_eq!(team.members.len(), 2);
         assert_eq!(team.messages.len(), 1);
         assert_eq!(team.messages[0].mentions[0].member_id, coder.id);
+
+        for index in 0..(TEAM_SNAPSHOT_MESSAGE_LIMIT * 10) {
+            store
+                .insert_team_message(&TeamMessage {
+                    id: format!("history_{index:04}"),
+                    session_id: "se_q".into(),
+                    author_member_id: None,
+                    author_handle: "you".into(),
+                    author_kind: TeamAuthorKind::Human,
+                    content: format!("history message {index}"),
+                    mentions: Vec::new(),
+                    created_at,
+                })
+                .unwrap();
+        }
+        let bounded = store.team("se_q").unwrap().unwrap();
+        assert!(bounded.messages_truncated);
+        assert_eq!(bounded.messages.len(), TEAM_SNAPSHOT_MESSAGE_LIMIT);
+        assert_eq!(bounded.messages.first().unwrap().id, "history_1800");
+        assert_eq!(bounded.messages.last().unwrap().id, "history_1999");
         assert_eq!(
             store
                 .team_member_by_handle("se_q", "CODER")
@@ -17345,10 +17853,84 @@ mod tests {
             store.consume_team_turn("se_q").unwrap(),
             Some((1, TeamStatus::Active))
         );
-        assert_eq!(
-            store.consume_team_turn("se_q").unwrap(),
-            Some((2, TeamStatus::Paused))
+        let budget_message = TeamMessage {
+            id: "msg_budget".into(),
+            session_id: "se_q".into(),
+            author_member_id: None,
+            author_handle: "you".into(),
+            author_kind: TeamAuthorKind::Human,
+            content: "Run both remaining deliveries".into(),
+            mentions: Vec::new(),
+            created_at,
+        };
+        store.insert_team_message(&budget_message).unwrap();
+        let current = store
+            .enqueue_prompt("th_orchestrator", "current delivery", &[])
+            .unwrap();
+        let stranded = store
+            .enqueue_prompt("th_coder", "would be stranded", &[])
+            .unwrap();
+        store
+            .insert_team_delivery("se_q", &budget_message.id, &orchestrator.id, &current.id)
+            .unwrap();
+        store
+            .insert_team_delivery("se_q", &budget_message.id, &coder.id, &stranded.id)
+            .unwrap();
+        store
+            .set_team_member_state(&orchestrator.id, TeamMemberState::Queued)
+            .unwrap();
+        store
+            .set_team_member_state(&coder.id, TeamMemberState::Queued)
+            .unwrap();
+        store
+            .claim_queued_prompt(&orchestrator.thread_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .consume_team_turn_with_events(
+                    "se_q",
+                    1,
+                    2,
+                    TeamStatus::Paused,
+                    &current.id,
+                    vec![(
+                        Scope::Session("se_q".into()),
+                        Event::TeamStatusChanged {
+                            status: TeamStatus::Paused,
+                            turns_used: 2,
+                        },
+                    )],
+                )
+                .unwrap()
         );
+        assert!(store.queued_prompt_thread(&current.id).unwrap().is_some());
+        assert!(store.queued_prompt_thread(&stranded.id).unwrap().is_none());
+        assert_eq!(
+            store
+                .team_member_by_thread(&coder.thread_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            TeamMemberState::Idle
+        );
+        let delivery_states = store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare(
+                "SELECT queued_prompt_id, status FROM team_deliveries
+                 WHERE queued_prompt_id IN (?1, ?2) ORDER BY queued_prompt_id",
+            )
+            .unwrap()
+            .query_map(params![current.id, stranded.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(delivery_states.contains(&(current.id.clone(), "queued".into())));
+        assert!(delivery_states.contains(&(stranded.id.clone(), "cancelled".into())));
         assert_eq!(store.consume_team_turn("se_q").unwrap(), None);
         let team = store.team("se_q").unwrap().unwrap();
         assert_eq!(team.turns_used, 2);

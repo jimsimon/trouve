@@ -986,6 +986,7 @@ pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     security: ServerSecurity,
 ) -> anyhow::Result<()> {
+    engine.recover_incomplete_team_sessions().await?;
     engine.reconcile_checkpoint_refs().await;
     engine.retry_artifact_cleanup_jobs().await;
     engine.retry_persona_deletions().await;

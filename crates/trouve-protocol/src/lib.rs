@@ -300,7 +300,11 @@ pub use requests::*;
 // capability derived from their latest durable task attempts (additive).
 // 7.13: session-scoped role-based teams, team members/messages/status,
 // scheduling budgets, team lifecycle events, and team endpoints (additive).
-pub const PROTOCOL_VERSION: &str = "7.13";
+// 7.14: team creation and message requests accept idempotency keys, and team
+// automatic-turn budgets publish their 1-1000 wire constraint (additive).
+// 7.15: team snapshots identify when their bounded recent-message projection
+// omits older timeline entries (additive).
+pub const PROTOCOL_VERSION: &str = "7.15";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

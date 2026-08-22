@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.13"
+    "version": "7.15"
   },
   "paths": {
     "/v1/approvals": {
@@ -7653,6 +7653,13 @@
           "goal": {
             "type": "string"
           },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable client-generated key used to replay an ambiguous create result\nwithout creating a second session or worktree."
+          },
           "max_turns": {
             "type": [
               "integer",
@@ -7660,7 +7667,8 @@
             ],
             "format": "int64",
             "description": "Safety budget across automatically delivered team turns.",
-            "minimum": 0
+            "maximum": 1000,
+            "minimum": 1
           },
           "model": {
             "type": [
@@ -10247,6 +10255,13 @@
         "properties": {
           "content": {
             "type": "string"
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable client-generated key used to replay an ambiguous message result\nwithout appending or delivering it twice."
           }
         }
       },
@@ -12938,6 +12953,10 @@
             "items": {
               "$ref": "#/components/schemas/TeamMessage"
             }
+          },
+          "messages_truncated": {
+            "type": "boolean",
+            "description": "True when messages contains only the bounded recent timeline\nprojection. Event replay remains anchored by snapshot_cursor."
           },
           "orchestrator_member_id": {
             "type": "string"

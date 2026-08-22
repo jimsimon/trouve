@@ -582,14 +582,28 @@ async fn team_sessions_route_mentions_and_expose_durable_lifecycle() {
         .json()
         .await
         .unwrap();
-    let created: serde_json::Value = client
+    let zero_budget = client
         .post(format!("{base}/teams"))
         .json(&serde_json::json!({
             "workspace_id": workspace["id"],
-            "title": "Team delivery",
-            "goal": "Ship the requested change",
-            "max_turns": 4
+            "goal": "Must not start",
+            "max_turns": 0
         }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(zero_budget.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let create_request = serde_json::json!({
+        "workspace_id": workspace["id"],
+        "idempotency_key": "create-team-once",
+        "title": "Team delivery",
+        "goal": "Ship the requested change",
+        "max_turns": 4
+    });
+    let created: serde_json::Value = client
+        .post(format!("{base}/teams"))
+        .json(&create_request)
         .send()
         .await
         .unwrap()
@@ -599,6 +613,32 @@ async fn team_sessions_route_mentions_and_expose_durable_lifecycle() {
     let session_id = created["session_id"].as_str().unwrap();
     assert_eq!(created["members"].as_array().unwrap().len(), 4);
     assert!(created["snapshot_cursor"].as_u64().unwrap() > 0);
+    let replayed: serde_json::Value = client
+        .post(format!("{base}/teams"))
+        .json(&create_request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed["session_id"], created["session_id"]);
+    assert_eq!(replayed["messages"][0]["id"], created["messages"][0]["id"]);
+    let mismatched_replay = client
+        .post(format!("{base}/teams"))
+        .json(&serde_json::json!({
+            "workspace_id": workspace["id"],
+            "idempotency_key": "create-team-once",
+            "title": "Team delivery",
+            "goal": "A different goal",
+            "max_turns": 4
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatched_replay.status(), reqwest::StatusCode::CONFLICT);
 
     let team = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -663,13 +703,45 @@ async fn team_sessions_route_mentions_and_expose_durable_lifecycle() {
         .await
         .unwrap();
     assert!(pause.status().is_success());
-    let queued = client
+    let queued: serde_json::Value = client
         .post(format!("{base}/sessions/{session_id}/team/messages"))
-        .json(&serde_json::json!({"content": "@reviewer inspect the result"}))
+        .json(&serde_json::json!({
+            "content": "@reviewer inspect the result @planner prepare the summary",
+            "idempotency_key": "review-once"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let queued_replay: serde_json::Value = client
+        .post(format!("{base}/sessions/{session_id}/team/messages"))
+        .json(&serde_json::json!({
+            "content": "@reviewer inspect the result @planner prepare the summary",
+            "idempotency_key": "review-once"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queued_replay["id"], queued["id"]);
+    let mismatched_message = client
+        .post(format!("{base}/sessions/{session_id}/team/messages"))
+        .json(&serde_json::json!({
+            "content": "@reviewer inspect something else",
+            "idempotency_key": "review-once"
+        }))
         .send()
         .await
         .unwrap();
-    assert!(queued.status().is_success());
+    assert_eq!(mismatched_message.status(), reqwest::StatusCode::CONFLICT);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     let paused: serde_json::Value = client
@@ -732,14 +804,13 @@ async fn team_sessions_route_mentions_and_expose_durable_lifecycle() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
 
-    client
+    let exhausted_message = client
         .post(format!("{base}/sessions/{session_id}/team/messages"))
         .json(&serde_json::json!({"content": "@planner prepare a follow-up"}))
         .send()
         .await
-        .unwrap()
-        .error_for_status()
         .unwrap();
+    assert_eq!(exhausted_message.status(), reqwest::StatusCode::CONFLICT);
     let completed: serde_json::Value = client
         .post(format!("{base}/sessions/{session_id}/team/complete"))
         .json(&serde_json::json!({}))
@@ -776,6 +847,17 @@ async fn team_sessions_route_mentions_and_expose_durable_lifecycle() {
         .await
         .unwrap();
     assert_eq!(direct.status(), reqwest::StatusCode::CONFLICT);
+    let direct_thread = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({
+            "session_id": session_id,
+            "title": "Bypass",
+            "mode": "code"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(direct_thread.status(), reqwest::StatusCode::CONFLICT);
     let response = client
         .post(format!("{base}/sessions/{session_id}/team/messages"))
         .json(&serde_json::json!({"content": "one more thing"}))

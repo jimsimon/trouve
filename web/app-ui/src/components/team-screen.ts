@@ -15,8 +15,10 @@ import type {
   ProtocolTeamStatus,
 } from "../services/protocol-client.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
+import { latestTeamSnapshot } from "./team-screen-model.js";
 
 const TEAM_EVENT_PREFIX = "team.";
+const TEAM_LOAD_RETRY_MS = 5_000;
 
 const statusLabel = (status: ProtocolTeamStatus): string =>
   status[0]?.toUpperCase() + status.slice(1);
@@ -185,6 +187,13 @@ export class TrouveTeamScreen extends LitElement {
       margin: 0 auto;
       padding: 0;
       list-style: none;
+    .timeline-note {
+      width: min(860px, 100%);
+      margin: 0 auto 12px;
+      color: var(--trouve-text-dim);
+      font-size: 10px;
+      text-align: center;
+    }
     }
     .message {
       display: grid;
@@ -294,7 +303,9 @@ export class TrouveTeamScreen extends LitElement {
   #pending = false;
   #refreshPending = false;
   #draft = "";
+  #draftIdempotencyKey = "";
   #error = "";
+  #loadRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
   get #effectiveSessionId(): string {
     return this.sessionId || this.#sessionScope.value?.sessionId || "";
@@ -304,6 +315,7 @@ export class TrouveTeamScreen extends LitElement {
     this.#generation += 1;
     this.#stream?.close();
     this.#stream = undefined;
+    this.#clearLoadRetry();
     super.disconnectedCallback();
   }
 
@@ -377,6 +389,9 @@ export class TrouveTeamScreen extends LitElement {
           </aside>
           <div class="timeline-column">
             <div class="timeline" aria-label="Shared team timeline" aria-live="polite">
+              ${team.messages_truncated === true
+                ? html`<p class="timeline-note" role="status">Showing the most recent team messages.</p>`
+                : nothing}
               ${team.messages.length === 0
                 ? html`<div class="empty">The shared timeline is waiting for its first update.</div>`
                 : html`<ol class="message-list">
@@ -407,6 +422,7 @@ export class TrouveTeamScreen extends LitElement {
               <form @submit=${this.#sendMessage}>
                 <textarea
                   name="message"
+                  aria-label="Team message"
                   rows="2"
                   maxlength="100000"
                   autocomplete="off"
@@ -415,6 +431,7 @@ export class TrouveTeamScreen extends LitElement {
                   ?disabled=${this.#pending || terminal}
                   @input=${(event: Event) => {
                     this.#draft = (event.currentTarget as HTMLTextAreaElement).value;
+                    this.#draftIdempotencyKey = "";
                     this.requestUpdate();
                   }}
                 ></textarea>
@@ -430,10 +447,12 @@ export class TrouveTeamScreen extends LitElement {
   }
 
   async #open(services: AppServices | undefined, sessionId: string): Promise<void> {
+    this.#clearLoadRetry();
     const generation = ++this.#generation;
     this.#stream?.close();
     this.#stream = undefined;
     this.#team = undefined;
+    this.#draftIdempotencyKey = "";
     this.#error = "";
     this.#loading = services !== undefined && sessionId !== "";
     this.requestUpdate();
@@ -441,7 +460,7 @@ export class TrouveTeamScreen extends LitElement {
     try {
       const team = await services.protocol.team(sessionId);
       if (!this.#isCurrent(generation, services, sessionId)) return;
-      this.#team = team;
+      this.#team = latestTeamSnapshot(this.#team, team);
       this.#loading = false;
       this.requestUpdate();
       const stream = await services.protocol.sessionEvents(sessionId, {
@@ -458,7 +477,8 @@ export class TrouveTeamScreen extends LitElement {
     } catch {
       if (!this.#isCurrent(generation, services, sessionId)) return;
       this.#loading = false;
-      this.#error = "This team could not be loaded.";
+      this.#error = "This team could not be loaded. Retrying automatically.";
+      this.#scheduleLoadRetry();
       this.requestUpdate();
     }
   }
@@ -484,7 +504,7 @@ export class TrouveTeamScreen extends LitElement {
     try {
       const team = await services.protocol.team(sessionId);
       if (!this.#isCurrent(generation, services, sessionId)) return;
-      this.#team = team;
+      this.#team = latestTeamSnapshot(this.#team, team);
       this.#error = "";
       this.requestUpdate();
     } catch {
@@ -502,16 +522,23 @@ export class TrouveTeamScreen extends LitElement {
     if (services === undefined || sessionId === "" || content === "" || this.#pending) return;
     const generation = this.#generation;
     this.#pending = true;
+    this.#draftIdempotencyKey ||= globalThis.crypto.randomUUID();
+    const idempotencyKey = this.#draftIdempotencyKey;
     this.#error = "";
     this.requestUpdate();
     try {
-      const message = await services.protocol.postTeamMessage(sessionId, content);
+      const message = await services.protocol.postTeamMessage(
+        sessionId,
+        content,
+        idempotencyKey,
+      );
       if (!this.#isCurrent(generation, services, sessionId)) return;
       const team = this.#team;
       if (team !== undefined && !team.messages.some((candidate) => candidate.id === message.id)) {
         this.#team = { ...team, messages: [...team.messages, message] };
       }
       this.#draft = "";
+      this.#draftIdempotencyKey = "";
     } catch {
       if (this.#isCurrent(generation, services, sessionId)) {
         this.#error = "The message could not be sent.";
@@ -547,6 +574,24 @@ export class TrouveTeamScreen extends LitElement {
         this.requestUpdate();
       }
     }
+  }
+
+  #scheduleLoadRetry(): void {
+    if (!this.isConnected || this.#loadRetryTimer !== undefined) return;
+    this.#loadRetryTimer = globalThis.setTimeout(() => {
+      this.#loadRetryTimer = undefined;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        this.#scheduleLoadRetry();
+        return;
+      }
+      void this.#open(this.#observedServices, this.#observedSessionId);
+    }, TEAM_LOAD_RETRY_MS);
+  }
+
+  #clearLoadRetry(): void {
+    if (this.#loadRetryTimer === undefined) return;
+    globalThis.clearTimeout(this.#loadRetryTimer);
+    this.#loadRetryTimer = undefined;
   }
 
   #isCurrent(generation: number, services: AppServices, sessionId: string): boolean {

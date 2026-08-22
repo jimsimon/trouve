@@ -2757,6 +2757,11 @@ export interface components {
             fetch_latest?: boolean;
             goal: string;
             /**
+             * @description Stable client-generated key used to replay an ambiguous create result
+             *     without creating a second session or worktree.
+             */
+            idempotency_key?: string | null;
+            /**
              * Format: int64
              * @description Safety budget across automatically delivered team turns.
              */
@@ -3606,6 +3611,11 @@ export interface components {
         /** @description Post a human-authored message to a team timeline. */
         PostTeamMessageRequest: {
             content: string;
+            /**
+             * @description Stable client-generated key used to replay an ambiguous message result
+             *     without appending or delivering it twice.
+             */
+            idempotency_key?: string | null;
         };
         /**
          * @description Typed PR-page actions. The server resolves every opaque target against the
@@ -4539,6 +4549,11 @@ export interface components {
             max_turns: number;
             members: components["schemas"]["TeamMember"][];
             messages: components["schemas"]["TeamMessage"][];
+            /**
+             * @description True when messages contains only the bounded recent timeline
+             *     projection. Event replay remains anchored by snapshot_cursor.
+             */
+            messages_truncated?: boolean;
             orchestrator_member_id: string;
             session_id: components["schemas"]["String"];
             /**

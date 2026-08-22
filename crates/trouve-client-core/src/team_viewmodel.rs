@@ -85,6 +85,7 @@ mod tests {
             orchestrator_member_id: "tm_1".into(),
             members: vec![],
             messages: vec![],
+            messages_truncated: false,
             max_turns: 8,
             turns_used: 0,
             created_at: Utc::now(),
