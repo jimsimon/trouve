@@ -495,27 +495,63 @@ pub(crate) fn wait_for_update_relaunch_gate() -> Result<()> {
 }
 
 fn wait_for_relaunch_gate(path: &Path, timeout: Duration, poll_interval: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while path
-        .try_exists()
-        .with_context(|| format!("checking update relaunch gate {}", path.display()))?
-    {
-        if Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for the previous trouve host to release update ownership"
-            );
+    wait_for_relaunch_gate_observed(path, timeout, poll_interval, || {})
+}
+
+fn wait_for_relaunch_gate_observed(
+    path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+    blocked: impl FnOnce(),
+) -> Result<()> {
+    use fs4::fs_std::FileExt as _;
+
+    let mut blocked = Some(blocked);
+
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("opening update relaunch gate {}", path.display()));
         }
-        std::thread::sleep(poll_interval);
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(true) => break,
+            Ok(false) => {
+                if let Some(blocked) = blocked.take() {
+                    blocked();
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out waiting for the previous trouve host to release update ownership"
+                    );
+                }
+                std::thread::sleep(poll_interval);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("waiting on update relaunch gate {}", path.display())
+                });
+            }
+        }
     }
+    drop(file);
+    let _ = std::fs::remove_file(path);
     Ok(())
 }
 
 pub(crate) struct UpdateRelaunchGate {
-    path: Option<PathBuf>,
+    path: PathBuf,
+    lock: Option<std::fs::File>,
 }
 
 impl UpdateRelaunchGate {
     fn create() -> Result<Self> {
+        use fs4::fs_std::FileExt as _;
+
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -525,42 +561,36 @@ impl UpdateRelaunchGate {
             std::process::id()
         ));
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        options
+        let lock = options
             .open(&path)
             .with_context(|| format!("creating update relaunch gate {}", path.display()))?;
-        Ok(Self { path: Some(path) })
+        lock.lock_exclusive()
+            .with_context(|| format!("locking update relaunch gate {}", path.display()))?;
+        Ok(Self {
+            path,
+            lock: Some(lock),
+        })
     }
 
-    pub fn release(mut self) -> Result<()> {
-        self.remove()?;
-        self.path = None;
-        Ok(())
+    pub fn release(mut self) {
+        self.release_lock();
     }
 
-    fn remove(&self) -> Result<()> {
-        let Some(path) = self.path.as_deref() else {
-            return Ok(());
-        };
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error)
-                .with_context(|| format!("releasing update relaunch gate {}", path.display())),
-        }
+    fn release_lock(&mut self) {
+        self.lock.take();
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
 impl Drop for UpdateRelaunchGate {
     fn drop(&mut self) {
-        if let Err(error) = self.remove() {
-            tracing::warn!(%error, "cleaning up update relaunch gate failed");
-        }
+        self.release_lock();
     }
 }
 
@@ -569,10 +599,7 @@ impl Drop for UpdateRelaunchGate {
 /// its host until release is called after shutdown.
 pub(crate) fn prepare_updated_app_relaunch(version: &str) -> Result<UpdateRelaunchGate> {
     let gate = UpdateRelaunchGate::create()?;
-    let gate_path = gate
-        .path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("update relaunch gate is unavailable"))?;
+    let gate_path = &gate.path;
     let executable = std::env::current_exe().context("locating the updated executable")?;
     let mut command = std::process::Command::new(&executable);
     command
@@ -933,15 +960,56 @@ mod tests {
     #[test]
     fn replacement_process_waits_for_host_ownership_handoff() {
         let gate = UpdateRelaunchGate::create().unwrap();
-        let path = gate.path.as_ref().unwrap().clone();
-        let release_path = path.clone();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            std::fs::remove_file(release_path).unwrap();
+        let path = gate.path.clone();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            finished_tx
+                .send(wait_for_relaunch_gate_observed(
+                    &path,
+                    Duration::from_secs(1),
+                    Duration::from_millis(1),
+                    move || blocked_tx.send(()).unwrap(),
+                ))
+                .unwrap();
         });
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(40)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        gate.release();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn replacement_process_recovers_an_unlocked_stale_gate() {
+        let mut gate = UpdateRelaunchGate::create().unwrap();
+        let path = gate.path.clone();
+        drop(gate.lock.take());
+        assert!(path.exists());
 
         wait_for_relaunch_gate(&path, Duration::from_secs(1), Duration::from_millis(1)).unwrap();
-        release.join().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn replacement_process_gate_wait_is_bounded() {
+        let gate = UpdateRelaunchGate::create().unwrap();
+        let error = wait_for_relaunch_gate(
+            &gate.path,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]

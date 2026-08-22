@@ -590,7 +590,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
     {
-        gate.release()?;
+        gate.release();
     }
     if exit_code != 0 {
         anyhow::bail!("desktop webview event loop exited with status {exit_code}");
