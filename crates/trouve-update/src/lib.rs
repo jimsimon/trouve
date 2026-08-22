@@ -422,9 +422,18 @@ fn installed_binary_version_at(state_root: &Path, executable: &Path) -> Option<V
 }
 
 fn record_installed_version(state_root: &Path, executable: &Path, version: &Version) -> Result<()> {
-    prepare_private_update_state_root(state_root)?;
     let identity = executable_identity(executable)?;
-    let state = update_state_path(state_root, executable, &identity);
+    record_installed_version_for_identity(state_root, executable, &identity, version)
+}
+
+fn record_installed_version_for_identity(
+    state_root: &Path,
+    executable: &Path,
+    identity: &str,
+    version: &Version,
+) -> Result<()> {
+    prepare_private_update_state_root(state_root)?;
+    let state = update_state_path(state_root, executable, identity);
     let text = format!("{version}\n");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -582,7 +591,7 @@ fn installed_matches_replacement(
     installed_executable: &Path,
     replacement: &Path,
     cancellation: &InstallCancellation,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     ensure_not_cancelled(cancellation)?;
     let mut installed = std::fs::File::open(installed_executable).with_context(|| {
         format!(
@@ -593,6 +602,13 @@ fn installed_matches_replacement(
     let installed_metadata = installed
         .metadata()
         .context("reading installed executable metadata for comparison")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if installed_metadata.permissions().mode() & 0o111 == 0 {
+            return Ok(None);
+        }
+    }
     let opened_identity = opened_executable_identity(&installed, &installed_metadata)?;
     let mut replacement =
         std::fs::File::open(replacement).context("opening verified replacement for comparison")?;
@@ -603,7 +619,7 @@ fn installed_matches_replacement(
         || installed_metadata.len() != replacement_metadata.len()
         || installed_metadata.len() > MAX_BINARY_BYTES
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut installed_chunk = [0_u8; BINARY_COMPARE_CHUNK_BYTES];
@@ -620,12 +636,15 @@ fn installed_matches_replacement(
             .read_exact(&mut replacement_chunk[..chunk])
             .context("reading verified replacement for comparison")?;
         if installed_chunk[..chunk] != replacement_chunk[..chunk] {
-            return Ok(false);
+            return Ok(None);
         }
         remaining -= chunk as u64;
     }
     ensure_not_cancelled(cancellation)?;
-    Ok(executable_identity(installed_executable).ok().as_ref() == Some(&opened_identity))
+    Ok(
+        (executable_identity(installed_executable).ok().as_ref() == Some(&opened_identity))
+            .then_some(opened_identity),
+    )
 }
 
 async fn install_release_locked(
@@ -699,18 +718,24 @@ async fn install_release_locked(
     let comparison_version = version.clone();
     let comparison_cancellation = Arc::clone(&cancellation);
     let already_installed = tokio::task::spawn_blocking(move || {
-        let matches = installed_matches_replacement(
+        let matched_identity = installed_matches_replacement(
             &comparison_executable,
             &comparison_replacement,
             &comparison_cancellation,
         )
-        .unwrap_or(false);
+        .unwrap_or(None);
         ensure_not_cancelled(&comparison_cancellation)?;
-        if matches && let Some(state_root) = comparison_state_root {
-            let _ =
-                record_installed_version(&state_root, &comparison_executable, &comparison_version);
+        if let (Some(identity), Some(state_root)) =
+            (matched_identity.as_deref(), comparison_state_root)
+        {
+            let _ = record_installed_version_for_identity(
+                &state_root,
+                &comparison_executable,
+                identity,
+                &comparison_version,
+            );
         }
-        Ok::<_, anyhow::Error>(matches)
+        Ok::<_, anyhow::Error>(matched_identity.is_some())
     })
     .await
     .context("joining installed executable comparison task")??;
@@ -1298,18 +1323,26 @@ mod tests {
         let executable = temp.path().join("trouve-search");
         std::fs::write(&executable, b"trusted installed executable").unwrap();
         let version = Version::parse("4.1.0").unwrap();
+        let compared_identity = executable_identity(&executable).unwrap();
 
         prepare_private_update_state_root(&state_root).unwrap();
         record_installed_version(&state_root, &executable, &version).unwrap();
         assert_eq!(
             installed_binary_version_at(&state_root, &executable),
-            Some(version)
+            Some(version.clone())
         );
 
         let untrusted = temp.path().join("untrusted-trouve-search");
         std::fs::write(&untrusted, b"untrusted replacement").unwrap();
         std::fs::remove_file(&executable).unwrap();
         std::fs::rename(&untrusted, &executable).unwrap();
+        record_installed_version_for_identity(
+            &state_root,
+            &executable,
+            &compared_identity,
+            &version,
+        )
+        .unwrap();
         assert_eq!(installed_binary_version_at(&state_root, &executable), None);
     }
 
@@ -1337,10 +1370,28 @@ mod tests {
         let cancellation = InstallCancellation::default();
         std::fs::write(&executable, b"verified release bytes").unwrap();
         std::fs::write(&replacement, b"verified release bytes").unwrap();
-        assert!(installed_matches_replacement(&executable, &replacement, &cancellation).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert!(
+                installed_matches_replacement(&executable, &replacement, &cancellation)
+                    .unwrap()
+                    .is_none()
+            );
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            installed_matches_replacement(&executable, &replacement, &cancellation)
+                .unwrap()
+                .is_some()
+        );
 
         std::fs::write(&replacement, b"different release data").unwrap();
-        assert!(!installed_matches_replacement(&executable, &replacement, &cancellation).unwrap());
+        assert!(
+            installed_matches_replacement(&executable, &replacement, &cancellation)
+                .unwrap()
+                .is_none()
+        );
         assert!(cancellation.request_cancel());
         assert!(
             installed_matches_replacement(&executable, &replacement, &cancellation)
