@@ -1266,29 +1266,29 @@ export class ProtocolClient {
   }
 
   async retryCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
-    return this.#validatedMutation(
-      `/v1/code-review/jobs/${encodeURIComponent(jobId)}/retry`,
-      "retry code review",
-      "POST",
-      "CodeReviewJob",
-      (loaded) => loaded.codeReviewJob,
-    );
+    return this.#mutateCodeReviewJob(jobId, "retry", "retry code review");
   }
 
   async retryCodeReviewFinalEditor(jobId: string): Promise<ProtocolCodeReviewJob> {
-    return this.#validatedMutation(
-      `/v1/code-review/jobs/${encodeURIComponent(jobId)}/final-editor/retry`,
+    return this.#mutateCodeReviewJob(
+      jobId,
+      "final-editor/retry",
       "retry final review editor",
-      "POST",
-      "CodeReviewJob",
-      (loaded) => loaded.codeReviewJob,
     );
   }
 
   async cancelCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
+    return this.#mutateCodeReviewJob(jobId, "cancel", "cancel code review");
+  }
+
+  #mutateCodeReviewJob(
+    jobId: string,
+    action: string,
+    description: string,
+  ): Promise<ProtocolCodeReviewJob> {
     return this.#validatedMutation(
-      `/v1/code-review/jobs/${encodeURIComponent(jobId)}/cancel`,
-      "cancel code review",
+      `/v1/code-review/jobs/${encodeURIComponent(jobId)}/${action}`,
+      description,
       "POST",
       "CodeReviewJob",
       (loaded) => loaded.codeReviewJob,
