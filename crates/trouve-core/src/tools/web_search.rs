@@ -52,9 +52,32 @@ type ProviderResponseFuture =
     Pin<Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Send>>;
 
 struct McpSession {
-    id: Option<String>,
+    endpoint: String,
+    id: Option<reqwest::header::HeaderValue>,
     protocol_version: String,
-    cleanup_permit: Option<tokio::sync::mpsc::OwnedPermit<SessionCleanupJob>>,
+    cleanup_permit: Option<SessionCleanupPermit>,
+}
+
+impl McpSession {
+    fn close(&mut self) {
+        let Some(permit) = self.cleanup_permit.take() else {
+            return;
+        };
+        let Some(session_id) = self.id.take() else {
+            return;
+        };
+        permit.send(
+            self.endpoint.clone(),
+            session_id,
+            self.protocol_version.clone(),
+        );
+    }
+}
+
+impl Drop for McpSession {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 struct DispatchBody {
@@ -192,7 +215,7 @@ struct PendingInitializationJob {
 
 struct SessionCleanupJob {
     endpoint: String,
-    session_id: String,
+    session_id: reqwest::header::HeaderValue,
     protocol_version: String,
     deadline: Instant,
 }
@@ -200,16 +223,65 @@ struct SessionCleanupJob {
 impl SessionCleanupJob {
     fn new(
         endpoint: String,
-        session_id: String,
+        session_id: reqwest::header::HeaderValue,
         protocol_version: String,
         overall_timeout: Duration,
+    ) -> Self {
+        Self::with_deadline(
+            endpoint,
+            session_id,
+            protocol_version,
+            Instant::now() + overall_timeout,
+        )
+    }
+
+    fn with_deadline(
+        endpoint: String,
+        session_id: reqwest::header::HeaderValue,
+        protocol_version: String,
+        deadline: Instant,
     ) -> Self {
         Self {
             endpoint,
             session_id,
             protocol_version,
-            deadline: Instant::now() + overall_timeout,
+            deadline,
         }
+    }
+}
+
+struct SessionCleanupPermit {
+    permit: Option<tokio::sync::mpsc::OwnedPermit<SessionCleanupJob>>,
+    pending: Arc<AtomicUsize>,
+    overall_timeout: Duration,
+}
+
+impl SessionCleanupPermit {
+    fn send(
+        mut self,
+        endpoint: String,
+        session_id: reqwest::header::HeaderValue,
+        protocol_version: String,
+    ) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        permit.send(SessionCleanupJob::new(
+            endpoint,
+            session_id,
+            protocol_version,
+            self.overall_timeout,
+        ));
+    }
+
+    #[cfg(test)]
+    fn send_job(mut self, job: SessionCleanupJob) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        permit.send(job);
     }
 }
 
@@ -247,7 +319,7 @@ async fn cleanup_provider_session(
             .delete(&request.endpoint)
             .timeout(policy.attempt_timeout.min(remaining))
             .header(MCP_PROTOCOL_VERSION_HEADER, &request.protocol_version)
-            .header(MCP_SESSION_ID_HEADER, &request.session_id)
+            .header(MCP_SESSION_ID_HEADER, request.session_id.clone())
             .send()
             .await;
         let retry_after = match result {
@@ -381,24 +453,28 @@ impl SessionCleanupWorker {
                                         pending.fetch_sub(1, Ordering::Release);
                                         return;
                                     };
-                                    let Some(session_id) = response
-                                        .headers()
-                                        .get(MCP_SESSION_ID_HEADER)
-                                        .and_then(|value| value.to_str().ok())
-                                        .map(str::to_owned)
+                                    let Some(session_id) =
+                                        response.headers().get(MCP_SESSION_ID_HEADER).cloned()
                                     else {
                                         pending.fetch_sub(1, Ordering::Release);
                                         return;
                                     };
-                                    let Ok(permit) = cleanup_sender.reserve_owned().await else {
+                                    let deadline = Instant::now() + policy.overall_timeout;
+                                    let remaining = deadline.saturating_duration_since(Instant::now());
+                                    let Ok(Ok(permit)) = tokio::time::timeout(
+                                        remaining,
+                                        cleanup_sender.reserve_owned(),
+                                    )
+                                    .await
+                                    else {
                                         pending.fetch_sub(1, Ordering::Release);
                                         return;
                                     };
-                                    permit.send(SessionCleanupJob::new(
+                                    permit.send(SessionCleanupJob::with_deadline(
                                         job.endpoint,
                                         session_id,
                                         job.protocol_version,
-                                        policy.overall_timeout,
+                                        deadline,
                                     ));
                                 });
                             }
@@ -417,10 +493,19 @@ impl SessionCleanupWorker {
         }
     }
 
+    #[cfg(test)]
     async fn reserve(
         &self,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<tokio::sync::mpsc::OwnedPermit<SessionCleanupJob>, SearchError> {
+    ) -> Result<SessionCleanupPermit, SearchError> {
+        self.reserve_with_timeout(cancel, SEARCH_TIMEOUT).await
+    }
+
+    async fn reserve_with_timeout(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        timeout: Duration,
+    ) -> Result<SessionCleanupPermit, SearchError> {
         let Some(sender) = &self.sender else {
             return Err(SearchError::Failed(
                 "web search session cleanup is unavailable".into(),
@@ -430,19 +515,26 @@ impl SessionCleanupWorker {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(SearchError::Cancelled),
-            permit = sender.reserve_owned() => permit.map_err(|_| {
-                SearchError::Failed("web search session cleanup is unavailable".into())
-            }),
+            permit = tokio::time::timeout(timeout, sender.reserve_owned()) => match permit {
+                Ok(Ok(permit)) => Ok(SessionCleanupPermit {
+                    permit: Some(permit),
+                    pending: self.pending.clone(),
+                    overall_timeout: self.policy.overall_timeout,
+                }),
+                Ok(Err(_)) => Err(SearchError::Failed(
+                    "web search session cleanup is unavailable".into()
+                )),
+                Err(_) => Err(SearchError::Failed(format!(
+                    "provider search timed out after {:.0}s awaiting cleanup capacity",
+                    timeout.as_secs_f64()
+                ))),
+            },
         }
     }
 
-    fn send(
-        &self,
-        permit: tokio::sync::mpsc::OwnedPermit<SessionCleanupJob>,
-        job: SessionCleanupJob,
-    ) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
-        permit.send(job);
+    #[cfg(test)]
+    fn send(&self, permit: SessionCleanupPermit, job: SessionCleanupJob) {
+        permit.send_job(job);
     }
 
     fn recover(&self, job: PendingInitializationJob) {
@@ -651,6 +743,7 @@ pub struct WebSearch {
     query_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     dispatcher: ProviderDispatcher,
     cleanup: SessionCleanupWorker,
+    provider_timeout: Duration,
 }
 
 impl Default for WebSearch {
@@ -704,6 +797,7 @@ impl WebSearch {
             query_locks: Mutex::new(HashMap::new()),
             dispatcher: ProviderDispatcher::new(min_provider_interval, handoff_timeout),
             cleanup: SessionCleanupWorker::with_policy(cleanup_policy),
+            provider_timeout: SEARCH_TIMEOUT,
         }
     }
 
@@ -765,7 +859,7 @@ impl WebSearch {
                 session.protocol_version.as_str(),
             );
             if let Some(id) = &session.id {
-                request = request.header(MCP_SESSION_ID_HEADER, id);
+                request = request.header(MCP_SESSION_ID_HEADER, id.clone());
             }
         }
         request
@@ -778,7 +872,10 @@ impl WebSearch {
     ) -> Result<McpSession, SearchError> {
         // Reserving cleanup capacity before initialization means every remote
         // session we may allocate already owns a bounded teardown path.
-        let cleanup_permit = self.cleanup.reserve(&ctx.cancel).await?;
+        let cleanup_permit = self
+            .cleanup
+            .reserve_with_timeout(&ctx.cancel, self.provider_timeout)
+            .await?;
         let body = json!({
             "jsonrpc": "2.0",
             "id": 0,
@@ -812,15 +909,7 @@ impl WebSearch {
             }
             Err(error) => return Err(error),
         };
-        let session_id = response
-            .headers()
-            .get(MCP_SESSION_ID_HEADER)
-            .map(|value| {
-                value.to_str().map(str::to_owned).map_err(|_| {
-                    SearchError::Failed("provider returned an invalid MCP session id".into())
-                })
-            })
-            .transpose()?;
+        let session_id = response.headers().get(MCP_SESSION_ID_HEADER).cloned();
         // Stateless MCP providers do not need teardown capacity after their
         // initialization headers establish that no session was allocated.
         let cleanup_permit = if session_id.is_some() {
@@ -829,21 +918,31 @@ impl WebSearch {
             None
         };
         let mut session = McpSession {
+            endpoint: provider.endpoint.clone(),
             id: session_id,
             protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
             cleanup_permit,
         };
+        if session
+            .id
+            .as_ref()
+            .is_some_and(|value| value.to_str().is_err())
+        {
+            return Err(SearchError::Failed(
+                "provider returned an invalid MCP session id".into(),
+            ));
+        }
         let value = match self.read_mcp_response(ctx, response, 0).await {
             Ok(value) => value,
             Err(error) => {
-                self.close_provider_session(provider, session);
+                session.close();
                 return Err(error);
             }
         };
         if value.get("error").is_some() {
             let error = extract_mcp_value(&value)
                 .expect_err("an MCP error response cannot contain a successful tool result");
-            self.close_provider_session(provider, session);
+            session.close();
             return Err(SearchError::Failed(bounded_error(
                 &error,
                 MAX_PROVIDER_ERROR_CHARS,
@@ -854,7 +953,7 @@ impl WebSearch {
             .and_then(Value::as_str)
             .filter(|version| !version.is_empty())
         else {
-            self.close_provider_session(provider, session);
+            session.close();
             return Err(SearchError::Failed(
                 "provider initialization omitted protocol version".into(),
             ));
@@ -879,32 +978,14 @@ impl WebSearch {
                     "provider rejected MCP initialization with HTTP {}",
                     response.status()
                 ));
-                self.close_provider_session(provider, session);
+                session.close();
                 Err(error)
             }
             Err(error) => {
-                self.close_provider_session(provider, session);
+                session.close();
                 Err(error)
             }
         }
-    }
-
-    fn close_provider_session(&self, provider: &SearchProvider, mut session: McpSession) {
-        let Some(permit) = session.cleanup_permit.take() else {
-            return;
-        };
-        let Some(session_id) = session.id else {
-            return;
-        };
-        self.cleanup.send(
-            permit,
-            SessionCleanupJob::new(
-                provider.endpoint.clone(),
-                session_id,
-                session.protocol_version,
-                self.cleanup.policy.overall_timeout,
-            ),
-        );
     }
 
     async fn call_provider(
@@ -914,7 +995,7 @@ impl WebSearch {
         query: &str,
         max_results: usize,
     ) -> Result<String, SearchError> {
-        let session = self.initialize_provider(ctx, provider).await?;
+        let mut session = self.initialize_provider(ctx, provider).await?;
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -947,7 +1028,7 @@ impl WebSearch {
             }
             Err(error) => Err(error),
         };
-        self.close_provider_session(provider, session);
+        session.close();
         result
     }
 
@@ -2015,6 +2096,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovered_session_cleanup_admission_uses_a_discovery_deadline() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
+        let (endpoint, _, requests) = capturing_mock_server_with_delays(
+            "200 OK",
+            body,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_millis(150),
+            true,
+            None,
+        )
+        .await;
+        let policy = SessionCleanupPolicy {
+            attempt_timeout: Duration::from_millis(40),
+            overall_timeout: Duration::from_millis(100),
+            retry_delay: Duration::from_millis(10),
+            max_attempts: 1,
+        };
+        let tool = Arc::new(WebSearch::new_with_cleanup_policy(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::ZERO,
+            PROVIDER_HANDOFF_TIMEOUT,
+            policy,
+        ));
+        let ctx = ToolCtx::default();
+        let cancel = ctx.cancel.clone();
+        let running = tokio::spawn({
+            let tool = tool.clone();
+            async move {
+                tool.run(&ctx, &json!({"query": "cancel before recovery admission"}))
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| !requests.lock().unwrap().is_empty()),
+        )
+        .await
+        .unwrap();
+        cancel.cancel();
+        assert_eq!(
+            running.await.unwrap().status,
+            trouve_protocol::ToolStatus::Error
+        );
+
+        let capacity_cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::new();
+        for _ in 0..SESSION_CLEANUP_CAPACITY {
+            match tool.cleanup.reserve(&capacity_cancel).await {
+                Ok(permit) => permits.push(permit),
+                Err(_) => panic!("cleanup capacity must be reservable"),
+            }
+        }
+        assert!(tool.cleanup.pending.load(Ordering::Acquire) > 0);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| tool.cleanup.pending.load(Ordering::Acquire) == 0),
+        )
+        .await
+        .expect("recovery admission must expire from session discovery");
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.method != "DELETE"),
+            "expired recovery must not start a fresh cleanup budget after admission"
+        );
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_established_search_future_schedules_cleanup() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"late"}]}}"#;
+        let (endpoint, _, requests) = capturing_mock_server_with_delays(
+            "200 OK",
+            body,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            None,
+        )
+        .await;
+        let tool = Arc::new(WebSearch::new_with_cleanup_policy(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::ZERO,
+            PROVIDER_HANDOFF_TIMEOUT,
+            fast_cleanup_policy(),
+        ));
+        let running = tokio::spawn({
+            let tool = tool.clone();
+            async move {
+                tool.run(
+                    &ToolCtx::default(),
+                    &json!({"query": "drop established search"}),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests.lock().unwrap().iter().any(|request| {
+                    request
+                        .body
+                        .as_ref()
+                        .and_then(|body| body.get("method"))
+                        .and_then(Value::as_str)
+                        == Some("tools/call")
+                })
+            }),
+        )
+        .await
+        .unwrap();
+
+        running.abort();
+        match running.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("aborted search must not complete normally"),
+        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+                    && tool.cleanup.pending.load(Ordering::Acquire) == 0
+            }),
+        )
+        .await
+        .expect("dropping an established session owner must enqueue cleanup");
+    }
+
+    #[tokio::test]
+    async fn invalid_session_header_still_uses_reserved_cleanup() {
+        let (endpoint, _, requests) = capturing_mock_server_with_delays(
+            "200 OK",
+            "{}",
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+            None,
+        )
+        .await;
+        let tool = WebSearch::new_with_cleanup_policy(
+            vec![],
+            Duration::ZERO,
+            PROVIDER_HANDOFF_TIMEOUT,
+            fast_cleanup_policy(),
+        );
+        let permit = match tool
+            .cleanup
+            .reserve(&tokio_util::sync::CancellationToken::new())
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => panic!("cleanup capacity must be reservable"),
+        };
+        let invalid_session_id = reqwest::header::HeaderValue::from_bytes(&[0x80]).unwrap();
+        assert!(invalid_session_id.to_str().is_err());
+
+        drop(McpSession {
+            endpoint,
+            id: Some(invalid_session_id),
+            protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
+            cleanup_permit: Some(permit),
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+                    && tool.cleanup.pending.load(Ordering::Acquire) == 0
+            }),
+        )
+        .await
+        .expect("invalid text metadata must not bypass raw-header teardown");
+    }
+
+    #[tokio::test]
+    async fn cleanup_admission_is_inside_the_provider_timeout() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
+        let (endpoint, calls) = mock_server("200 OK", body).await;
+        let mut tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
+        tool.provider_timeout = Duration::from_millis(50);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::new();
+        for _ in 0..SESSION_CLEANUP_CAPACITY {
+            match tool.cleanup.reserve(&cancel).await {
+                Ok(permit) => permits.push(permit),
+                Err(_) => panic!("cleanup capacity must be reservable"),
+            }
+        }
+
+        let started = Instant::now();
+        let result = tool
+            .run(
+                &ToolCtx::default(),
+                &json!({"query": "bounded cleanup admission"}),
+            )
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            result.result["error"]
+                .as_str()
+                .unwrap()
+                .contains("provider search timed out")
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(permits);
+    }
+
+    #[tokio::test]
     async fn outbound_handoff_timeout_releases_the_dispatch_gate() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("https://{}/mcp", listener.local_addr().unwrap());
@@ -2426,8 +2733,8 @@ mod tests {
         )
         .await;
         let policy = SessionCleanupPolicy {
-            attempt_timeout: Duration::from_millis(100),
-            overall_timeout: Duration::from_millis(100),
+            attempt_timeout: Duration::from_millis(250),
+            overall_timeout: Duration::from_millis(250),
             retry_delay: Duration::from_millis(1),
             max_attempts: 1,
         };
@@ -2446,7 +2753,7 @@ mod tests {
                 permit,
                 SessionCleanupJob::new(
                     endpoint.clone(),
-                    format!("test-session-{index}"),
+                    format!("test-session-{index}").parse().unwrap(),
                     MCP_PROTOCOL_VERSION.to_owned(),
                     policy.overall_timeout,
                 ),
@@ -2454,7 +2761,7 @@ mod tests {
         }
 
         tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(2),
             wait_for(|| worker.pending.load(Ordering::Acquire) == 0),
         )
         .await
