@@ -444,6 +444,7 @@ export const modelOptionTextValueIsValid = (
 ): boolean => {
   if (raw === "" || control.scalarType === "string") return true;
   const value = Number(raw);
+  // String(value) is the finite numeric token JSON.stringify sends on the wire.
   return normalizedNumberToken(raw) === normalizedNumberToken(String(value))
     && modelOptionValueIsValid(control, value);
 };
