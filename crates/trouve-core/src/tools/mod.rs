@@ -584,7 +584,45 @@ async fn run_optional_review_fetches(
     Ok(failures)
 }
 
-/// One session mutation lane that a tool may transfer to a background task.
+/// Ownership of one session's mutation lane after it has passed the
+/// cancellation-cleanup admission fence.
+///
+/// The execution guard serializes worktree mutations. The admission guard is
+/// deliberately acquired second and retained for the same lifetime: backend
+/// cleanup can queue an exclusive admission fence before cancellation, so a
+/// mutation already waiting for the execution guard cannot start while
+/// unacknowledged vendor cleanup is still live.
+pub(crate) struct SessionMutationPermit {
+    _admission: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _execution: tokio::sync::OwnedRwLockWriteGuard<()>,
+}
+
+impl SessionMutationPermit {
+    pub(crate) fn admitted(
+        execution: tokio::sync::OwnedRwLockWriteGuard<()>,
+        admission: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> Self {
+        Self {
+            _admission: Some(admission),
+            _execution: execution,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<tokio::sync::OwnedRwLockWriteGuard<()>> for SessionMutationPermit {
+    fn from(execution: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
+        // Isolated tool tests construct a lease without an Engine admission
+        // gate. Production Engine paths always use `admitted`.
+        Self {
+            _admission: None,
+            _execution: execution,
+        }
+    }
+}
+
+/// One admitted session mutation lane that a tool may transfer to a
+/// background task.
 ///
 /// The engine installs this only for a background `shell` call. The shell
 /// waiter takes ownership after the process starts and holds the write guard
@@ -592,7 +630,7 @@ async fn run_optional_review_fetches(
 /// the call before taking it, the guard is released when the call context is
 /// dropped.
 pub struct BackgroundMutationLease {
-    guard: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
+    guard: Mutex<Option<SessionMutationPermit>>,
 }
 
 impl std::fmt::Debug for BackgroundMutationLease {
@@ -605,13 +643,13 @@ impl std::fmt::Debug for BackgroundMutationLease {
 }
 
 impl BackgroundMutationLease {
-    pub(crate) fn new(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
+    pub(crate) fn new(guard: impl Into<SessionMutationPermit>) -> Self {
         Self {
-            guard: Mutex::new(Some(guard)),
+            guard: Mutex::new(Some(guard.into())),
         }
     }
 
-    pub(crate) fn take(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+    pub(crate) fn take(&self) -> Option<SessionMutationPermit> {
         self.guard.lock().unwrap().take()
     }
 }

@@ -14,16 +14,58 @@ const BACKEND_CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const BACKEND_CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// A fair writer queued on the admission gate before backend cancellation.
+///
+/// The acquisition future is intentionally retained after its first poll.
+/// Pending writers stay in Tokio's fair queue, while an immediately acquired
+/// writer guard closes the gate directly. Either form prevents a mutation
+/// already queued on the execution lane from starting during backend cleanup.
+struct BackendMutationQuarantine {
+    _pending_acquisition:
+        Option<futures::future::BoxFuture<'static, tokio::sync::OwnedRwLockWriteGuard<()>>>,
+    _guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+impl BackendMutationQuarantine {
+    async fn queue(mutation_admission: Arc<tokio::sync::RwLock<()>>) -> Self {
+        let mut acquisition = mutation_admission.write_owned().boxed();
+        let guard = futures::future::poll_fn(|context| {
+            std::task::Poll::Ready(
+                match std::future::Future::poll(acquisition.as_mut(), context) {
+                    std::task::Poll::Ready(guard) => Some(guard),
+                    std::task::Poll::Pending => None,
+                },
+            )
+        })
+        .await;
+        Self {
+            _pending_acquisition: guard.is_none().then_some(acquisition),
+            _guard: guard,
+        }
+    }
+}
+
 /// Drain a cancelled backend through its cleanup acknowledgement. A backend
 /// that misses the deadline is detached from the turn's scheduler resources,
 /// but the session mutation lane stays fenced until its stream really closes.
 async fn drain_or_quarantine_backend(
     mut stream: trouve_agents::BackendEventStream,
-    mutation_lane: Arc<tokio::sync::RwLock<()>>,
-    mutation_permits: Vec<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    attempt_cancel: tokio_util::sync::CancellationToken,
+    mutation_admission: Arc<tokio::sync::RwLock<()>>,
+    mutation_permits: Vec<SessionMutationPermit>,
     backend_id: String,
     thread_id: String,
 ) -> bool {
+    // An in-flight vendor-native mutation already owns both the execution
+    // lane and an admission reader. Otherwise queue the exclusive admission
+    // fence before cancellation; fair ordering then blocks mutations that
+    // were waiting for execution before this failure was observed.
+    let mutation_quarantine = if mutation_permits.is_empty() {
+        Some(BackendMutationQuarantine::queue(mutation_admission).await)
+    } else {
+        None
+    };
+    attempt_cancel.cancel();
     if tokio::time::timeout(BACKEND_CANCEL_CLEANUP_TIMEOUT, async {
         while stream.next().await.is_some() {}
     })
@@ -39,48 +81,16 @@ async fn drain_or_quarantine_backend(
         timeout_ms = BACKEND_CANCEL_CLEANUP_TIMEOUT.as_millis(),
         "backend cancellation cleanup timed out; quarantining the session mutation lane"
     );
-    if mutation_permits.is_empty() {
-        // Queue an exclusive waiter before the route returns. Tokio's fair
-        // RwLock then keeps every later tool access behind the quarantine even
-        // if another in-flight bridge tool owns the lane at this instant.
-        let (fenced, fenced_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            use std::future::Future as _;
-
-            let mut acquisition = Box::pin(mutation_lane.write_owned());
-            let first_poll = futures::future::poll_fn(|context| {
-                std::task::Poll::Ready(match acquisition.as_mut().poll(context) {
-                    std::task::Poll::Ready(permit) => Some(permit),
-                    std::task::Poll::Pending => None,
-                })
-            })
-            .await;
-            let _ = fenced.send(());
-            let _mutation_permit = match first_poll {
-                Some(permit) => permit,
-                None => acquisition.await,
-            };
-            while stream.next().await.is_some() {}
-            tracing::warn!(
-                backend_id,
-                thread_id,
-                "late backend cancellation cleanup completed; session lane released"
-            );
-        });
-        fenced_rx
-            .await
-            .expect("backend cleanup quarantine must fence the mutation lane before returning");
-    } else {
-        tokio::spawn(async move {
-            let _mutation_permits = mutation_permits;
-            while stream.next().await.is_some() {}
-            tracing::warn!(
-                backend_id,
-                thread_id,
-                "late backend cancellation cleanup completed; session lane released"
-            );
-        });
-    }
+    tokio::spawn(async move {
+        let _mutation_quarantine = mutation_quarantine;
+        let _mutation_permits = mutation_permits;
+        while stream.next().await.is_some() {}
+        tracing::warn!(
+            backend_id,
+            thread_id,
+            "late backend cancellation cleanup completed; session lane released"
+        );
+    });
     true
 }
 
@@ -1231,8 +1241,7 @@ impl Engine {
         let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
         let mut backend_approval_cancels =
             HashMap::<String, tokio_util::sync::CancellationToken>::new();
-        let mut backend_mutation_permits =
-            HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
+        let mut backend_mutation_permits = HashMap::<String, SessionMutationPermit>::new();
         let mut suppressed_bridge_calls = HashSet::new();
         let mut persisted = Vec::new();
         let mut persist_deadline = None;
@@ -1845,7 +1854,6 @@ impl Engine {
         )
         .await;
         if abort_backend {
-            attempt_cancel.cancel();
             let mut mutation_permits = backend_mutation_permits
                 .drain()
                 .map(|(_, permit)| permit)
@@ -1860,7 +1868,8 @@ impl Engine {
             }
             if drain_or_quarantine_backend(
                 stream,
-                self.tool_execution_lock(&session.id),
+                attempt_cancel,
+                self.tool_mutation_admission_lock(&session.id),
                 mutation_permits,
                 backend_id.clone(),
                 thread.id.clone(),

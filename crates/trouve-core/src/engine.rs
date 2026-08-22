@@ -37,9 +37,9 @@ use crate::store::{
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
     DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
-    McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
-    SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
-    materialized_attachment_relative_path,
+    McpConfigMutationOutcome, McpConfigMutationRequest, SessionMutationPermit,
+    SessionRepositoryDiff, SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult,
+    edit_strategy_for_model, materialized_attachment_relative_path,
 };
 use crate::{context, git, new_id, personas};
 
@@ -1065,7 +1065,7 @@ struct BackendCollaboratorProjection {
     suppressed_bridge_calls: HashSet<String>,
     /// Vendor-native mutations retain the session execution lane from
     /// approval until the matching completion event.
-    mutation_permits: HashMap<String, tokio::sync::OwnedRwLockWriteGuard<()>>,
+    mutation_permits: HashMap<String, SessionMutationPermit>,
     pending_approval: Option<PendingCollaboratorApproval>,
     approval_cancels: HashMap<String, tokio_util::sync::CancellationToken>,
     persisted: Vec<Event>,
@@ -1369,7 +1369,7 @@ struct BackendApprovalOutcome {
     /// Held from approval until the vendor reports tool completion. This is
     /// the fallback confinement mechanism for vendor protocols that cannot
     /// replace their mutation tools with trouve's full MCP bridge.
-    mutation_permit: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    mutation_permit: Option<SessionMutationPermit>,
 }
 
 struct PendingApprovalCleanup {
@@ -2543,6 +2543,11 @@ pub struct Engine {
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
     tool_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
+    /// Mutation admission is separate from execution serialization. A normal
+    /// mutation takes the execution lane first and then a shared admission
+    /// permit. Backend cleanup can queue an exclusive permit before
+    /// cancellation, fencing even mutations already waiting for execution.
+    tool_mutation_admission_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
     /// Serializes durable PR-intent reconciliation per session. Weak entries
     /// avoid retaining deleted sessions while still preventing duplicate
     /// GitHub reads and association events from overlapping retry triggers.
@@ -3008,6 +3013,7 @@ impl Engine {
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
+            tool_mutation_admission_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
             session_pr_verification_wake: Arc::new(tokio::sync::Notify::new()),
             session_pr_verification_worker_started: AtomicBool::new(false),
@@ -6792,10 +6798,9 @@ impl Engine {
                 let Ok(Some(session)) = self.store.session(session_id) else {
                     return;
                 };
-                let lane = self.tool_execution_lock(session_id);
                 let Ok(permit) = tokio::time::timeout(
                     SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT,
-                    lane.write_owned(),
+                    self.tool_mutation_permit(session_id),
                 )
                 .await
                 else {
@@ -8074,7 +8079,7 @@ impl Engine {
         req: &trouve_protocol::CreatePrRequest,
     ) -> Result<trouve_protocol::PrInfo, EngineError> {
         let _lifecycle = self.session_lock(session_id).read_owned().await;
-        let _execution = self.tool_execution_lock(session_id).write_owned().await;
+        let _execution = self.tool_mutation_permit(session_id).await;
         let session = self
             .store
             .session(session_id)?
@@ -8542,6 +8547,28 @@ impl Engine {
         let lock = Arc::new(tokio::sync::RwLock::new(()));
         locks.insert(session_id.to_string(), Arc::downgrade(&lock));
         lock
+    }
+
+    fn tool_mutation_admission_lock(&self, session_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut locks = self.tool_mutation_admission_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn tool_mutation_permit(&self, session_id: &str) -> SessionMutationPermit {
+        // Execution comes first so a cleanup writer queued on admission can
+        // overtake mutations that were already waiting for the worktree lane.
+        let execution = self.tool_execution_lock(session_id).write_owned().await;
+        let admission = self
+            .tool_mutation_admission_lock(session_id)
+            .read_owned()
+            .await;
+        SessionMutationPermit::admitted(execution, admission)
     }
 
     // --- workspaces ---------------------------------------------------------
@@ -10572,11 +10599,10 @@ impl Engine {
         if files.is_empty() {
             return Ok(Vec::new());
         }
-        let lane = self.tool_execution_lock(&session.id);
         let _mutation = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(EngineError::Conflict("turn cancelled".into())),
-            permit = lane.write_owned() => permit,
+            permit = self.tool_mutation_permit(&session.id) => permit,
         };
         self.executor
             .materialize_attachments(&AttachmentMaterialization {
@@ -13748,8 +13774,7 @@ impl Engine {
         let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
         let mut backend_approval_cancels =
             HashMap::<String, tokio_util::sync::CancellationToken>::new();
-        let mut backend_mutation_permits =
-            HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
+        let mut backend_mutation_permits = HashMap::<String, SessionMutationPermit>::new();
         let mut pending_steer = None;
         let mut pending_steer_lane = None;
         let mut pending_steer_permit = None;
@@ -13841,26 +13866,21 @@ impl Engine {
                     } else if let Some(permit) = pending_steer_permit.take() {
                         Some(permit)
                     } else {
-                        let lane = self.tool_execution_lock(&session.id);
-                        match lane.try_write_owned() {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
-                                // Wait for actual lane availability as another
-                                // select branch. Backend events and approval
-                                // outcomes continue to flow while this future
-                                // is pending, including the completion that
-                                // releases an in-flight vendor mutation.
-                                pending_steer = Some(command);
-                                steer_mutation_lane_state
-                                    .send_replace(SteerMutationLaneState::Waiting);
-                                let lane = self.tool_execution_lock(&session.id);
-                                pending_steer_lane = Some(
-                                    async move { lane.write_owned().await }.boxed(),
-                                );
-                                consecutive_backend_events = 0;
-                                continue;
-                            }
-                        }
+                        // Wait for actual lane and admission availability as
+                        // another select branch. Backend events and approval
+                        // outcomes continue to flow while this future is
+                        // pending, including the completion that releases an
+                        // in-flight vendor mutation.
+                        pending_steer = Some(command);
+                        steer_mutation_lane_state
+                            .send_replace(SteerMutationLaneState::Waiting);
+                        let engine = self.clone();
+                        let session_id = session.id.clone();
+                        pending_steer_lane = Some(
+                            async move { engine.tool_mutation_permit(&session_id).await }.boxed(),
+                        );
+                        consecutive_backend_events = 0;
+                        continue;
                     };
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
@@ -14806,11 +14826,10 @@ impl Engine {
                 && approved.as_ref().is_ok_and(|approved| *approved)
                 && engine.backend_tool_mutates(&tool)
             {
-                let lock = engine.tool_execution_lock(&session.id);
                 match tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
-                    permit = lock.write_owned() => Some(permit),
+                    permit = engine.tool_mutation_permit(&session.id) => Some(permit),
                 } {
                     Some(permit) => mutation_permit = Some(permit),
                     None => approved = Ok(false),
@@ -15481,7 +15500,7 @@ impl Engine {
                 _guard: tokio::sync::OwnedRwLockReadGuard<()>,
             },
             Write {
-                guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+                guard: Option<SessionMutationPermit>,
             },
             /// Background-job control must be able to poll or terminate a
             /// process while that process retains the write lane.
@@ -15497,7 +15516,7 @@ impl Engine {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => None,
-                permit = execution_lock.clone().write_owned() => Some(ExecutionPermit::Write { guard: Some(permit) }),
+                permit = self.tool_mutation_permit(&session.id) => Some(ExecutionPermit::Write { guard: Some(permit) }),
             }
         } else {
             tokio::select! {
@@ -16148,11 +16167,10 @@ impl Engine {
         turn: u64,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<String>> {
-        let execution_lock = self.tool_execution_lock(&session.id);
         let _mutation_guard = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(None),
-            guard = execution_lock.write_owned() => guard,
+            guard = self.tool_mutation_permit(&session.id) => guard,
         };
         let worktree = PathBuf::from(&session.worktree_path);
         let dirty = {
@@ -20982,6 +21000,25 @@ mod tests {
             ),
         );
 
+        // Reproduce the fair-lock ordering hazard: a competing mutation is
+        // already queued ahead of backend finalization on the execution lane.
+        let mutation_lane = engine.tool_execution_lock(&thread.session_id);
+        let holder = mutation_lane.clone().write_owned().await;
+        let mut competing_mutation = Box::pin(engine.tool_mutation_permit(&thread.session_id));
+        let first_poll = futures::future::poll_fn(|context| {
+            std::task::Poll::Ready(
+                match std::future::Future::poll(competing_mutation.as_mut(), context) {
+                    std::task::Poll::Ready(permit) => Some(permit),
+                    std::task::Poll::Pending => None,
+                },
+            )
+        })
+        .await;
+        assert!(
+            first_poll.is_none(),
+            "competing mutation must be queued behind the held execution lane"
+        );
+
         engine
             .send_message(&thread.id, "Fail after backend startup".into(), Vec::new())
             .unwrap();
@@ -21027,15 +21064,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(phases, [TurnPhase::ConnectingTools]);
 
-        let mutation_lane = engine.tool_execution_lock(&thread.session_id);
+        drop(holder);
         assert!(
-            mutation_lane.clone().try_write_owned().is_err(),
-            "timed-out backend cleanup must quarantine the mutation lane"
+            tokio::time::timeout(Duration::from_millis(50), competing_mutation.as_mut())
+                .await
+                .is_err(),
+            "a mutation queued before finalization must not pass the cleanup admission fence"
         );
         cleanup_release.add_permits(1);
-        let _released = tokio::time::timeout(Duration::from_secs(1), mutation_lane.write_owned())
+        let _released = tokio::time::timeout(Duration::from_secs(1), competing_mutation)
             .await
-            .expect("late backend cleanup should release the quarantined mutation lane");
+            .expect("late backend cleanup should release the queued mutation");
     }
 
     #[test]
