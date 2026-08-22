@@ -202,6 +202,8 @@ describe("model option controls", () => {
     const advertised = model({
       unsafe_choices: unsafeChoices,
       collapsed_choices: collapsedChoices,
+      unsafe_minimum: { type: "integer", minimum: 9_007_199_254_740_992 },
+      unsafe_maximum: { type: "integer", maximum: -9_007_199_254_740_992 },
       editable_integer: { type: "integer" },
     });
 

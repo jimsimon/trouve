@@ -320,8 +320,9 @@ export const modelOptionControls = (
     if (choices !== undefined) {
       const editableChoices = choices.filter(({ value }) =>
         (advertisedType === undefined || matchesScalarType(advertisedType, value))
-        && (typeof value !== "number" || minimum === undefined || value >= minimum)
-        && (typeof value !== "number" || maximum === undefined || value <= maximum)
+        && (typeof value !== "number"
+          || (minimum === undefined || value >= minimum)
+            && (maximum === undefined || value <= maximum))
       );
       if (editableChoices.length <= 1) continue;
       const selectedIndex = editableChoices.findIndex(({ value }) => Object.is(value, selected));
@@ -351,7 +352,12 @@ export const modelOptionControls = (
       continue;
     }
     const type = advertisedType;
-    if (type === undefined) continue;
+    if (
+      type === undefined
+      || type === "integer"
+        && ((minimum ?? 0) > Number.MAX_SAFE_INTEGER
+          || (maximum ?? 0) < Number.MIN_SAFE_INTEGER)
+    ) continue;
     const value = validTextValue(type, selected, minimum, maximum)
       ? selected
       : validTextValue(type, defaultValue, minimum, maximum)
