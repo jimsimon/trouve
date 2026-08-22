@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel,
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const QUEUE_CAPACITY: usize = 16;
@@ -16,6 +16,8 @@ const LAUNCHER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LAUNCHER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LAUNCHER_REAPER_BATCH_SIZE: usize = 64;
 const LAUNCHER_REAPER_MAX_INSPECTION_ERRORS: u8 = 4;
+const LAUNCHER_CLEANUP_WORKERS: usize = 2;
+const LAUNCHER_CLEANUP_QUEUE_CAPACITY: usize = 16;
 const DISPATCH_QUEUED: u8 = 0;
 const DISPATCH_ENTERED: u8 = 1;
 const DISPATCH_CANCELLED: u8 = 2;
@@ -281,10 +283,11 @@ fn launcher_reaper() -> Result<&'static Sender<std::process::Child>, OpenAttempt
 }
 
 fn start_launcher_reaper() -> Option<Sender<std::process::Child>> {
+    let cleanup = start_launcher_cleanup_workers()?;
     let (sender, receiver) = channel::<std::process::Child>();
     std::thread::Builder::new()
         .name("trouve-opener-reaper".into())
-        .spawn(move || supervise_launchers(receiver))
+        .spawn(move || supervise_launchers(receiver, cleanup))
         .map(|_| sender)
         .map_err(|error| {
             tracing::warn!(%error, "could not start system launcher reaper");
@@ -292,7 +295,44 @@ fn start_launcher_reaper() -> Option<Sender<std::process::Child>> {
         .ok()
 }
 
-fn supervise_launchers(receiver: Receiver<std::process::Child>) {
+fn start_launcher_cleanup_workers() -> Option<SyncSender<std::process::Child>> {
+    let (sender, receiver) = sync_channel::<std::process::Child>(LAUNCHER_CLEANUP_QUEUE_CAPACITY);
+    let receiver = Arc::new(Mutex::new(receiver));
+    let mut started = 0;
+    for index in 0..LAUNCHER_CLEANUP_WORKERS {
+        let receiver = Arc::clone(&receiver);
+        match std::thread::Builder::new()
+            .name(format!("trouve-opener-cleanup-{index}"))
+            .spawn(move || launcher_cleanup_worker(&receiver))
+        {
+            Ok(_) => started += 1,
+            Err(error) => {
+                tracing::warn!(%error, index, "could not start system launcher cleanup worker");
+            }
+        }
+    }
+    (started > 0).then_some(sender)
+}
+
+fn launcher_cleanup_worker(receiver: &Mutex<Receiver<std::process::Child>>) {
+    loop {
+        let next = match receiver.lock() {
+            Ok(receiver) => receiver.recv(),
+            Err(poisoned) => poisoned.into_inner().recv(),
+        };
+        let Ok(mut child) = next else {
+            return;
+        };
+        if let Err(error) = child.wait() {
+            tracing::warn!(%error, "could not reap isolated system launcher");
+        }
+    }
+}
+
+fn supervise_launchers(
+    receiver: Receiver<std::process::Child>,
+    cleanup: SyncSender<std::process::Child>,
+) {
     let mut children = Vec::new();
     loop {
         let mut intake_remaining = LAUNCHER_REAPER_BATCH_SIZE;
@@ -307,7 +347,7 @@ fn supervise_launchers(receiver: Receiver<std::process::Child>) {
         drain_ready(&receiver, intake_remaining, |child| {
             children.push(SupervisedLauncher::new(child))
         });
-        poll_launchers(&mut children);
+        poll_launchers(&mut children, &cleanup);
     }
 }
 
@@ -321,14 +361,14 @@ fn drain_ready<T>(receiver: &Receiver<T>, limit: usize, mut accept: impl FnMut(T
 }
 
 struct SupervisedLauncher {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     inspection: LauncherInspection,
 }
 
 impl SupervisedLauncher {
     fn new(child: std::process::Child) -> Self {
         Self {
-            child,
+            child: Some(child),
             inspection: LauncherInspection::default(),
         }
     }
@@ -344,7 +384,7 @@ impl LauncherInspection {
         self.consecutive_errors = 0;
     }
 
-    fn failed(&mut self, error: &std::io::Error) -> bool {
+    fn retry_after_failure(&mut self, error: &std::io::Error) -> bool {
         self.consecutive_errors = self.consecutive_errors.saturating_add(1);
         if self.consecutive_errors == 1 {
             tracing::warn!(%error, "could not inspect system launcher in reaper");
@@ -352,26 +392,74 @@ impl LauncherInspection {
         if self.consecutive_errors < LAUNCHER_REAPER_MAX_INSPECTION_ERRORS {
             return true;
         }
-        // A persistently uninspectable child is normally already reaped or
-        // owns an invalid platform handle. Release it after bounded retries
-        // rather than retaining it forever or blocking the shared supervisor.
+        // Transfer a persistently uninspectable child to isolated blocking
+        // cleanup rather than retaining it forever or blocking the shared
+        // supervisor.
         tracing::warn!(
             %error,
             attempts = self.consecutive_errors,
-            "releasing uninspectable system launcher"
+            "isolating uninspectable system launcher"
         );
         false
     }
 }
 
-fn poll_launchers(children: &mut Vec<SupervisedLauncher>) {
-    children.retain_mut(|launcher| match launcher.child.try_wait() {
-        Ok(Some(_)) => false,
-        Ok(None) => {
-            launcher.inspection.succeeded();
-            true
+fn poll_launchers(
+    children: &mut Vec<SupervisedLauncher>,
+    cleanup: &SyncSender<std::process::Child>,
+) {
+    poll_launchers_with(children, cleanup, std::process::Child::try_wait);
+}
+
+fn poll_launchers_with(
+    children: &mut Vec<SupervisedLauncher>,
+    cleanup: &SyncSender<std::process::Child>,
+    mut inspect: impl FnMut(
+        &mut std::process::Child,
+    ) -> std::io::Result<Option<std::process::ExitStatus>>,
+) {
+    children.retain_mut(|launcher| {
+        let result = inspect(
+            launcher
+                .child
+                .as_mut()
+                .expect("supervised launcher always owns its child"),
+        );
+        match result {
+            Ok(Some(_)) => false,
+            Ok(None) => {
+                launcher.inspection.succeeded();
+                true
+            }
+            Err(error) if launcher.inspection.retry_after_failure(&error) => true,
+            Err(_) => {
+                let child = launcher
+                    .child
+                    .take()
+                    .expect("supervised launcher always owns its child");
+                match cleanup.try_send(child) {
+                    Ok(()) => false,
+                    Err(TrySendError::Full(child)) => {
+                        // Keep ownership in the nonblocking supervisor while
+                        // the bounded cleanup lane is saturated, then retry
+                        // after a fresh inspection budget.
+                        launcher.child = Some(child);
+                        launcher.inspection.succeeded();
+                        tracing::warn!("system launcher cleanup queue is full");
+                        true
+                    }
+                    Err(TrySendError::Disconnected(child)) => {
+                        // The cleanup workers are established before any launcher
+                        // starts. If they nevertheless disconnect, retain the
+                        // handle and resume nonblocking supervision.
+                        launcher.child = Some(child);
+                        launcher.inspection.succeeded();
+                        tracing::warn!("system launcher cleanup workers disconnected");
+                        true
+                    }
+                }
+            }
         }
-        Err(error) => launcher.inspection.failed(&error),
     });
 }
 
@@ -496,22 +584,28 @@ mod tests {
             SupervisedLauncher::new(long_child),
             SupervisedLauncher::new(short_child),
         ];
+        let (cleanup, cleanup_receiver) = sync_channel(1);
         let deadline = Instant::now() + Duration::from_secs(1);
 
         while children.len() > 1 && Instant::now() < deadline {
-            poll_launchers(&mut children);
+            poll_launchers(&mut children, &cleanup);
             std::thread::sleep(LAUNCHER_POLL_INTERVAL);
         }
 
         let remaining_ids = children
             .iter()
-            .map(|launcher| launcher.child.id())
+            .map(|launcher| launcher.child.as_ref().unwrap().id())
             .collect::<Vec<_>>();
         for mut launcher in children {
-            launcher.child.kill().unwrap();
-            launcher.child.wait().unwrap();
+            let mut child = launcher.child.take().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
         }
         assert_eq!(remaining_ids, vec![long_id]);
+        assert!(matches!(
+            cleanup_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -531,16 +625,63 @@ mod tests {
     }
 
     #[test]
-    fn persistent_reaper_inspection_errors_are_released_after_bounded_retries() {
+    fn successful_reaper_inspection_resets_the_error_budget() {
         let error = std::io::Error::other("uninspectable child");
         let mut inspection = LauncherInspection::default();
 
         for _ in 1..LAUNCHER_REAPER_MAX_INSPECTION_ERRORS {
-            assert!(inspection.failed(&error));
+            assert!(inspection.retry_after_failure(&error));
         }
-        assert!(!inspection.failed(&error));
-
         inspection.succeeded();
-        assert!(inspection.failed(&error));
+        assert!(inspection.retry_after_failure(&error));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_reaper_errors_transfer_live_child_to_isolated_cleanup() {
+        let mut command = std::process::Command::new("true");
+        let child = trouve_process::spawn(&mut command).unwrap();
+        let child_id = child.id();
+        let mut children = vec![SupervisedLauncher::new(child)];
+        let (cleanup, cleanup_receiver) = sync_channel(1);
+
+        for _ in 0..LAUNCHER_REAPER_MAX_INSPECTION_ERRORS {
+            poll_launchers_with(&mut children, &cleanup, |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "simulated transient inspection failure",
+                ))
+            });
+        }
+
+        assert!(children.is_empty());
+        let mut isolated = cleanup_receiver.try_recv().unwrap();
+        assert_eq!(isolated.id(), child_id);
+        assert!(isolated.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saturated_isolated_cleanup_preserves_child_supervision() {
+        let mut command = std::process::Command::new("true");
+        let child = trouve_process::spawn(&mut command).unwrap();
+        let mut children = vec![SupervisedLauncher::new(child)];
+        let (cleanup, _cleanup_receiver) = sync_channel(0);
+
+        for _ in 0..LAUNCHER_REAPER_MAX_INSPECTION_ERRORS {
+            poll_launchers_with(&mut children, &cleanup, |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "simulated transient inspection failure",
+                ))
+            });
+        }
+
+        assert_eq!(children.len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !children.is_empty() && Instant::now() < deadline {
+            poll_launchers(&mut children, &cleanup);
+        }
+        assert!(children.is_empty());
     }
 }
