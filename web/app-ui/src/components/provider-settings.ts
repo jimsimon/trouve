@@ -13,7 +13,7 @@ import type {
   ProtocolSubscriptionHealth,
   ProtocolUpsertProviderRequest,
 } from "../services/protocol-client.js";
-import { requestTimeoutSignal } from "../services/subscription-health-controller.js";
+import { requestWithDeadline } from "../services/subscription-health-controller.js";
 import "./cli-settings.js";
 import {
   boundedSubscriptionUsage,
@@ -910,9 +910,10 @@ export class TrouveProviderSettings extends LitElement {
 
   #loadKnownProviders(services: AppServices): void {
     if (this.#knownProvidersPending !== undefined) return;
-    const request = (async () =>
-      services.protocol.knownProviders(requestTimeoutSignal(PROVIDER_REFRESH_MS))
-    )();
+    const request = requestWithDeadline(
+      PROVIDER_REFRESH_MS,
+      (signal) => services.protocol.knownProviders(signal),
+    );
     this.#knownProvidersPending = request;
     void request.then((knownProviders) => {
       if (services !== this.#services.value || !this.isConnected) return;

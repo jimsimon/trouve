@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { ProtocolSubscriptionHealth } from "./protocol-client.js";
-import { SubscriptionHealthController } from "./subscription-health-controller.js";
+import {
+  requestWithDeadline,
+  SubscriptionHealthController,
+} from "./subscription-health-controller.js";
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
@@ -23,6 +26,29 @@ const health = (providerId: string): ProtocolSubscriptionHealth => ({
 });
 
 describe("SubscriptionHealthController", () => {
+  it("clears portable deadlines after successful and failed requests settle", async () => {
+    vi.useFakeTimers();
+    try {
+      await expect(requestWithDeadline(30_000, async () => "known providers")).resolves.toBe(
+        "known providers",
+      );
+      expect(vi.getTimerCount()).toBe(0);
+
+      await expect(requestWithDeadline(
+        30_000,
+        async () => Promise.reject(new Error("health unavailable")),
+      )).rejects.toThrow("health unavailable");
+      expect(vi.getTimerCount()).toBe(0);
+
+      await expect(requestWithDeadline(30_000, () => {
+        throw new Error("request construction failed");
+      })).rejects.toThrow("request construction failed");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shares in-flight work and throttles ordinary refreshes for 30 seconds", async () => {
     let now = 1_000;
     const first = deferred<readonly ProtocolSubscriptionHealth[]>();
