@@ -3608,7 +3608,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         <footer class="status-bar ${statusActionable ? "actionable" : ""}">
           <span class="online-dot ${this.#protocolError || this.#hostError || serverOffline ? "offline" : ""}"></span><span class="status-copy">${connectionLabel}</span><span class="status-spacer"></span>
           ${this.#connectivityNotice === "" ? nothing : html`<span class="status-copy" role="status" aria-live="polite">${this.#connectivityNotice}</span>`}
-          ${this.#shellNotice === "" ? nothing : html`<span class="status-copy" role="status">${this.#shellNotice}</span>`}
+          ${this.#shellNotice === "" ? nothing : html`<span class="status-copy shell-notice" role="status">${this.#shellNotice}</span>`}
           ${this.#pwaActivate === undefined
             ? nothing
             : html`<button

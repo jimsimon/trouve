@@ -369,6 +369,25 @@ async fn open_video_attachment_with<F, Fut>(
     open: F,
 ) -> Result<(), VideoAttachmentOpenError>
 where
+    F: FnOnce(PathBuf) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    // The launcher, not the HTTP request, owns the playback lease. Dropping a
+    // disconnected request detaches this task; it does not reclaim the file
+    // while a blocking system launcher may still consume its path.
+    tokio::spawn(drive_video_attachment(cache, attachment, open))
+        .await
+        .map_err(|_| {
+            VideoAttachmentOpenError::Failed("video playback worker was interrupted".to_string())
+        })?
+}
+
+async fn drive_video_attachment<F, Fut>(
+    cache: Arc<Mutex<VideoPlaybackCache>>,
+    attachment: NativeAttachment,
+    open: F,
+) -> Result<(), VideoAttachmentOpenError>
+where
     F: FnOnce(PathBuf) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
@@ -1196,17 +1215,19 @@ mod close_confirmation_tests {
     }
 
     #[tokio::test]
-    async fn cancelled_video_playback_reconciles_its_cache_lease() {
+    async fn cancelled_video_request_leaves_lease_with_the_launcher() {
         let cache = Arc::new(Mutex::new(
             VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap(),
         ));
         let attachment = video_attachment("cancelled.mp4", b"cancelled");
         let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
         let task_cache = Arc::clone(&cache);
         let task = tokio::spawn(async move {
             open_video_attachment_with(task_cache, attachment, move |_| async move {
                 let _ = started.send(());
-                std::future::pending::<Result<(), String>>().await
+                let _ = release_rx.await;
+                Err("cancelled test launcher".to_string())
             })
             .await
         });
@@ -1216,12 +1237,28 @@ mod close_confirmation_tests {
         assert!(task.await.unwrap_err().is_cancelled());
         {
             let cache = cache.lock().unwrap();
-            assert!(cache.entries.is_empty());
-            assert_eq!(
-                std::fs::read_dir(cache.directory.path()).unwrap().count(),
-                0
-            );
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.entries[0].active_leases, 1);
+            assert!(cache.entries[0].path.exists());
         }
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cache.lock().unwrap().entries.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_dir(cache.lock().unwrap().directory.path())
+                .unwrap()
+                .count(),
+            0
+        );
 
         open_video_attachment_with(
             Arc::clone(&cache),
