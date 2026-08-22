@@ -1821,7 +1821,7 @@ export interface components {
              *     object take precedence when both select the same model capability.
              */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             };
             name: string;
             /** @description Next fire time (RFC3339), when enabled. */
@@ -2778,7 +2778,7 @@ export interface components {
             model?: string | null;
             /** @description Model-specific options validated against the model's options schema. */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             };
             permission_mode?: null | components["schemas"]["PermissionMode"];
             session_id: components["schemas"]["String"];
@@ -3567,6 +3567,15 @@ export interface components {
             output_price_per_mtok?: number | null;
             supports_tools: boolean;
         };
+        /**
+         * @description A scalar value accepted by a model's advertised options schema.
+         *
+         *     Protocol request/response structs retain `serde_json::Value` internally so
+         *     arbitrary-precision JSON number tokens survive deserialization. Their
+         *     OpenAPI fields use this type to advertise the narrower wire contract that
+         *     the engine already enforces.
+         */
+        ModelOptionValue: string | number | boolean;
         /** @description Aggregated usage for a thread or session. */
         ModelUsageSummary: {
             /** Format: int64 */
@@ -4568,7 +4577,7 @@ export interface components {
              *     clients render controls from the model's `options_schema`.
              */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             };
             parent_thread_id?: null | components["schemas"]["String"];
             permission_mode: components["schemas"]["PermissionMode"];
@@ -4957,7 +4966,7 @@ export interface components {
             model?: string | null;
             /** @description Replaces the thread's model options when present. */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             } | null;
             permission_mode?: null | components["schemas"]["PermissionMode"];
         };
@@ -4971,7 +4980,7 @@ export interface components {
             model?: string | null;
             /** @description Model-specific values selected from the model's `options_schema`. */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             };
             name: string;
             /**

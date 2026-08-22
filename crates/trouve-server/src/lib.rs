@@ -399,6 +399,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::ApprovalDecision,
         trouve_protocol::RestoreDirection,
         trouve_protocol::PermissionMode,
+        trouve_protocol::ModelOptionValue,
         trouve_protocol::AgentPersona,
         PersonaInfo,
         UpsertPersonaRequest,

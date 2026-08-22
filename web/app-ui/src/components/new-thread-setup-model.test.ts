@@ -209,6 +209,22 @@ describe("new thread setup model", () => {
     expect(effectiveNewThreadModel(plan, catalog)?.id).toBe("provider/global");
   });
 
+  it("retains valid options across reconciliation when the effective model is unchanged", () => {
+    const draft = selectNewThreadMode({
+      ...createInitialNewThreadDraft(catalog),
+      modelOptions: { reasoning_effort: "low" },
+    }, "plan", catalog);
+
+    expect(reconcileNewThreadDraft(draft, catalog, {
+      ...createNewThreadSetupEdits(),
+      mode: true,
+    })).toMatchObject({
+      modeId: "plan",
+      modelId: "provider/global",
+      modelOptions: { reasoning_effort: "low" },
+    });
+  });
+
   it("restores refreshed inheritance after an untouched catalog retry", () => {
     const staleCatalog: NewThreadSetupCatalog = {
       ...catalog,

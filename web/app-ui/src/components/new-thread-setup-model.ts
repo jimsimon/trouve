@@ -231,10 +231,12 @@ export const reconcileNewThreadDraft = (
     && (draft.permissionMode === "ask"
       || draft.permissionMode === "allow_list"
       || draft.permissionMode === "yolo");
-  const modelOptions = edits.thinking
-    ? sanitizeModelOptions(effectiveNewThreadModel(refreshed, catalog), draft.modelOptions)
+  const previousEffectiveModelId = effectiveNewThreadModel(draft, catalog)?.id;
+  const effectiveModel = effectiveNewThreadModel(refreshed, catalog);
+  const modelOptions = effectiveModel?.id === previousEffectiveModelId
+    ? sanitizeModelOptions(effectiveModel, draft.modelOptions)
     : {};
-  const thinking = thinkingOption(effectiveNewThreadModel(refreshed, catalog));
+  const thinking = thinkingOption(effectiveModel);
   const hasThinkingOverride = thinking !== undefined
     && modelOptions[thinking.key] !== undefined;
 

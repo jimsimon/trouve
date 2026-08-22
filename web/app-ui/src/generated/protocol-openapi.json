@@ -5155,7 +5155,9 @@
           "model_options": {
             "type": "object",
             "description": "Model-specific values selected from the model's `options_schema`.\n`thinking_level` remains as a compatibility shorthand; values in this\nobject take precedence when both select the same model capability.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
             "propertyNames": {
               "type": "string"
             }
@@ -7447,7 +7449,9 @@
           "model_options": {
             "type": "object",
             "description": "Model-specific options validated against the model's options schema.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
             "propertyNames": {
               "type": "string"
             }
@@ -9851,6 +9855,21 @@
             "type": "boolean"
           }
         }
+      },
+      "ModelOptionValue": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number",
+            "format": "double"
+          },
+          {
+            "type": "boolean"
+          }
+        ],
+        "description": "A scalar value accepted by a model's advertised options schema.\n\nProtocol request/response structs retain `serde_json::Value` internally so\narbitrary-precision JSON number tokens survive deserialization. Their\nOpenAPI fields use this type to advertise the narrower wire contract that\nthe engine already enforces."
       },
       "ModelUsageSummary": {
         "type": "object",
@@ -12687,7 +12706,9 @@
           "model_options": {
             "type": "object",
             "description": "Current values for the model's options (thinking level, etc.);\nclients render controls from the model's `options_schema`.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
             "propertyNames": {
               "type": "string"
             }
@@ -13844,7 +13865,9 @@
               "null"
             ],
             "description": "Replaces the thread's model options when present.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
             "propertyNames": {
               "type": "string"
             }
@@ -13890,7 +13913,9 @@
           "model_options": {
             "type": "object",
             "description": "Model-specific values selected from the model's `options_schema`.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
             "propertyNames": {
               "type": "string"
             }

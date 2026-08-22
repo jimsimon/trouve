@@ -9,6 +9,7 @@ import {
   isThinkingModelOption,
   sanitizeModelOptions,
   type ModelOptionChangeDetail,
+  type ModelOptionValue,
 } from "../components/model-option-controls.js";
 
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
@@ -762,7 +763,7 @@ export const createNewSessionThreadRequest = (
   const advertisedThinking = modelInfoMatches ? thinkingOption(input.modelInfo) : undefined;
   const thinking = nonEmpty(input.thinking);
   const inheritedThinking = nonEmpty(input.inheritedThinking);
-  const modelOptions: Record<string, unknown> = modelInfoMatches
+  const modelOptions: Record<string, ModelOptionValue> = modelInfoMatches
     ? { ...sanitizeModelOptions(input.modelInfo, input.modelOptions ?? undefined) }
     : {};
   if (
@@ -788,8 +789,8 @@ export const createNewSessionThreadRequest = (
 
 /**
  * Serialize authoritative selections plus any deliberate edits made while
- * catalog metadata was unavailable. Thinking edits also pin their model
- * because the option schema is model-specific.
+ * catalog metadata was unavailable. Model-option edits also pin their model
+ * because every option schema is model-specific.
  */
 export const createNewSessionThreadRequestFromSnapshot = (input: {
   readonly sessionId: string;
@@ -800,7 +801,8 @@ export const createNewSessionThreadRequestFromSnapshot = (input: {
   const includeMode = snapshot.optionsAuthoritative || snapshot.edits.mode;
   const includeModel = snapshot.optionsAuthoritative
     || snapshot.edits.model
-    || snapshot.edits.thinking;
+    || snapshot.edits.thinking
+    || Object.keys(snapshot.modelOptions).length > 0;
   // Permission is always serialized: in degraded mode there is no trustworthy
   // inherited value, so omitting the displayed choice could let the server use
   // a different (and potentially more permissive) default.
