@@ -54,6 +54,10 @@ export type ProtocolSetDefaultModelRequest =
 export type ProtocolSetDefaultPermissionModeRequest =
   ProtocolComponents["schemas"]["SetDefaultPermissionModeRequest"];
 export type ProtocolModelInfo = ProtocolComponents["schemas"]["ModelInfo"];
+export type ProtocolRoutedModelInfo =
+  ProtocolComponents["schemas"]["RoutedModelInfo"];
+export type ProtocolSetProviderOrderRequest =
+  ProtocolComponents["schemas"]["SetProviderOrderRequest"];
 export type ProtocolThread = ProtocolComponents["schemas"]["Thread"];
 export type ProtocolThreadStatus = ProtocolComponents["schemas"]["ThreadStatus"];
 export type ProtocolThreadViewSnapshot =
@@ -198,6 +202,7 @@ interface ProtocolValidators {
   readonly personas: ValidateFunction;
   readonly personaInfos: ValidateFunction;
   readonly models: ValidateFunction;
+  readonly modelRoutes: ValidateFunction;
   readonly thread: ValidateFunction;
   readonly threads: ValidateFunction;
   readonly threadStatuses: ValidateFunction;
@@ -327,6 +332,7 @@ const validateResponse = async <T>(
     | "AgentPersona[]"
     | "PersonaInfo[]"
     | "ModelInfo[]"
+    | "RoutedModelInfo[]"
     | "Thread"
     | "Thread[]"
     | "ThreadStatus[]"
@@ -424,7 +430,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.12";
+export const SUPPORTED_PROTOCOL_VERSION = "7.14";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -994,6 +1000,29 @@ export class ProtocolClient {
     );
   }
 
+  async modelRoutes(): Promise<readonly ProtocolRoutedModelInfo[]> {
+    let result;
+    try {
+      result = await this.#client.GET("/v1/model-routes");
+    } catch {
+      throw new ProtocolClientError(
+        "request-failed",
+        "model route request failed",
+      );
+    }
+    if (!result.response.ok || result.data === undefined) {
+      throw new ProtocolClientError(
+        "request-failed",
+        "model route request failed",
+      );
+    }
+    return validateResponse<readonly ProtocolRoutedModelInfo[]>(
+      "RoutedModelInfo[]",
+      result.data,
+      (loaded) => loaded.modelRoutes,
+    );
+  }
+
   async refreshModels(): Promise<readonly ProtocolModelInfo[]> {
     let result;
     try {
@@ -1026,21 +1055,23 @@ export class ProtocolClient {
     );
   }
 
-  knownProviders(): Promise<readonly ProtocolKnownProvider[]> {
+  knownProviders(signal?: AbortSignal): Promise<readonly ProtocolKnownProvider[]> {
     return this.#validatedJson(
       "/v1/providers/known",
       "known provider",
       "KnownProvider[]",
       (loaded) => loaded.knownProviders,
+      signal === undefined ? {} : { signal },
     );
   }
 
-  subscriptionHealth(): Promise<readonly ProtocolSubscriptionHealth[]> {
+  subscriptionHealth(signal?: AbortSignal): Promise<readonly ProtocolSubscriptionHealth[]> {
     return this.#validatedJson(
       "/v1/subscriptions",
       "subscription health",
       "SubscriptionHealth[]",
       (loaded) => loaded.subscriptions,
+      signal === undefined ? {} : { signal },
     );
   }
 
@@ -1063,6 +1094,15 @@ export class ProtocolClient {
       `/v1/providers/${encodeURIComponent(providerId)}`,
       "delete provider",
       "DELETE",
+    );
+  }
+
+  async setProviderOrder(request: ProtocolSetProviderOrderRequest): Promise<void> {
+    await this.#mutation(
+      "/v1/config/provider-order",
+      "set provider order",
+      "PUT",
+      request,
     );
   }
 

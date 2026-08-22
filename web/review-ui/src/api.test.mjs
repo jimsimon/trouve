@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { saveReviewer } from "./api.ts";
+import { getModelRoutes, getModels, saveReviewer } from "./api.ts";
 
 const persona = {
   id: "existing-reviewer",
@@ -10,6 +10,19 @@ const persona = {
   allowed_tools: ["read_file"],
   read_only: true,
 };
+
+test("model loading uses a static first-paint endpoint and a separate live route endpoint", async (context) => {
+  const requests = [];
+  context.mock.method(globalThis, "fetch", async (url) => {
+    requests.push(url);
+    return new Response("[]");
+  });
+
+  await getModels();
+  await getModelRoutes();
+
+  assert.deepEqual(requests, ["/v1/models", "/v1/model-routes"]);
+});
 
 test("new reviewers cannot overwrite an existing derived persona id", async (context) => {
   const requests = [];

@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { ProtocolModelInfo } from "./protocol-client.js";
-import { ModelCatalogController } from "./model-catalog-controller.js";
+import {
+  ModelCatalogController,
+  modelForSelection,
+  modelSelectionValue,
+} from "./model-catalog-controller.js";
 import { readSignal } from "../state/reactivity.js";
 
 const model = (id: string): ProtocolModelInfo => ({
@@ -22,6 +26,25 @@ const deferred = <T>() => {
   return { promise, resolve, reject };
 };
 
+describe("model selection compatibility", () => {
+  const models = [
+    {
+      ...model("auto/gpt-5.6-sol"),
+      routes: [{ provider_id: "codex", provider_model: "gpt-5.6-sol" }],
+    },
+  ];
+
+  it("maps legacy bare automatic ids to the namespaced catalog entry", () => {
+    expect(modelForSelection(models, "gpt-5.6-sol")?.id).toBe("auto/gpt-5.6-sol");
+    expect(modelSelectionValue(models, "gpt-5.6-sol")).toBe("auto/gpt-5.6-sol");
+  });
+
+  it("resolves concrete pins through automatic route metadata", () => {
+    expect(modelForSelection(models, "codex/gpt-5.6-sol")?.id).toBe("auto/gpt-5.6-sol");
+    expect(modelSelectionValue(models, "codex/gpt-5.6-sol")).toBe("codex/gpt-5.6-sol");
+  });
+});
+
 describe("ModelCatalogController", () => {
   it("returns the static snapshot before adopting live Cursor discovery", async () => {
     const live = deferred<readonly ProtocolModelInfo[]>();
@@ -32,7 +55,7 @@ describe("ModelCatalogController", () => {
         staticCalls += 1;
         return [model("cursor/default")];
       },
-      refreshModels: () => {
+      modelRoutes: () => {
         liveCalls += 1;
         return live.promise;
       },
@@ -72,7 +95,7 @@ describe("ModelCatalogController", () => {
         staticCalls += 1;
         return [model("cursor/static")];
       },
-      refreshModels: async () => [],
+      modelRoutes: async () => [],
     });
 
     await expect(controller.refresh()).resolves.toEqual([model("cursor/static")]);
@@ -91,7 +114,7 @@ describe("ModelCatalogController", () => {
         if (staticCalls === 1) throw new Error("static unavailable");
         return [model("cursor/static")];
       },
-      refreshModels: async () => [],
+      modelRoutes: async () => [],
     });
 
     await expect(controller.liveModels()).resolves.toEqual([]);
@@ -111,7 +134,7 @@ describe("ModelCatalogController", () => {
         staticCalls += 1;
         throw new Error("static unavailable");
       },
-      refreshModels: async () => [model(`cursor/live-${++liveCalls}`)],
+      modelRoutes: async () => [model(`cursor/live-${++liveCalls}`)],
     }, { liveTtlMs: 0 });
 
     await expect(controller.liveModels()).resolves.toEqual([model("cursor/live-1")]);
@@ -129,7 +152,7 @@ describe("ModelCatalogController", () => {
       models: async () => {
         throw staticError;
       },
-      refreshModels: async () => {
+      modelRoutes: async () => {
         if (!liveSucceeds) throw new Error("live unavailable");
         return [model("cursor/live")];
       },
@@ -147,7 +170,7 @@ describe("ModelCatalogController", () => {
     let liveCalls = 0;
     const controller = new ModelCatalogController({
       models: () => staticResult.promise,
-      refreshModels: async () => {
+      modelRoutes: async () => {
         liveCalls += 1;
         return [model("cursor/live")];
       },
@@ -163,7 +186,7 @@ describe("ModelCatalogController", () => {
     const liveError = new Error("live unavailable");
     const controller = new ModelCatalogController({
       models: () => staticResult.promise,
-      refreshModels: async () => {
+      modelRoutes: async () => {
         throw liveError;
       },
     });
@@ -188,7 +211,7 @@ describe("ModelCatalogController", () => {
           ? Promise.reject(initialStaticError)
           : staticRetry.promise;
       },
-      refreshModels: async () => {
+      modelRoutes: async () => {
         throw liveError;
       },
     });
@@ -211,7 +234,7 @@ describe("ModelCatalogController", () => {
     let controller!: ModelCatalogController;
     controller = new ModelCatalogController({
       models: async () => [model("cursor/static")],
-      refreshModels: () => {
+      modelRoutes: () => {
         liveCalls += 1;
         if (liveCalls === 1) reentrant = controller.liveModels("force");
         return liveResult.promise;
@@ -240,7 +263,7 @@ describe("ModelCatalogController", () => {
         staticCalls += 1;
         return staticResult.promise;
       },
-      refreshModels: () => {
+      modelRoutes: () => {
         liveCalls += 1;
         return liveResult.promise;
       },
@@ -258,6 +281,34 @@ describe("ModelCatalogController", () => {
     await Promise.resolve();
   });
 
+  it("does not let a late static response overwrite a live route catalog", async () => {
+    const secondStatic = deferred<readonly ProtocolModelInfo[]>();
+    const firstLive = deferred<readonly ProtocolModelInfo[]>();
+    let staticCalls = 0;
+    const controller = new ModelCatalogController({
+      models: () => {
+        staticCalls += 1;
+        return staticCalls === 1
+          ? Promise.resolve([model("provider/initial")])
+          : secondStatic.promise;
+      },
+      modelRoutes: () => firstLive.promise,
+    });
+
+    await controller.refresh();
+    const forced = controller.refresh("force");
+    firstLive.resolve([model("auto/shared"), model("provider/shared")]);
+    await firstLive.promise;
+    await Promise.resolve();
+    secondStatic.resolve([model("provider/stale")]);
+    await forced;
+
+    expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
+      "auto/shared",
+      "provider/shared",
+    ]);
+  });
+
   it("forces fresh static and live snapshots after connectivity recovers", async () => {
     const forcedStatic = deferred<readonly ProtocolModelInfo[]>();
     const forcedLive = deferred<readonly ProtocolModelInfo[]>();
@@ -270,7 +321,7 @@ describe("ModelCatalogController", () => {
           ? Promise.resolve([model("local/offline")])
           : forcedStatic.promise;
       },
-      refreshModels: () => {
+      modelRoutes: async () => {
         liveCalls += 1;
         return liveCalls === 1
           ? Promise.resolve([model("local/offline")])
@@ -324,7 +375,7 @@ describe("ModelCatalogController", () => {
     let liveCalls = 0;
     const controller = new ModelCatalogController({
       models: async () => [model(`cursor/static-${++staticCalls}`)],
-      refreshModels: async () => {
+      modelRoutes: async () => {
         liveCalls += 1;
         if (liveCalls === 2) throw new Error("live unavailable");
         return [model(`cursor/live-${liveCalls}`)];
@@ -356,7 +407,7 @@ describe("ModelCatalogController", () => {
     let liveCalls = 0;
     const controller = new ModelCatalogController({
       models: async () => [model("cursor/static")],
-      refreshModels: async () => {
+      modelRoutes: async () => {
         liveCalls += 1;
         if (liveCalls === 2) throw new Error("live unavailable");
         return [model(`cursor/live-${liveCalls}`)];
@@ -391,7 +442,7 @@ describe("ModelCatalogController", () => {
     let liveCalls = 0;
     const controller = new ModelCatalogController({
       models: async () => [model("cursor/static")],
-      refreshModels: () => {
+      modelRoutes: () => {
         liveCalls += 1;
         return liveCalls === 1
           ? Promise.resolve([model("cursor/live")])
@@ -422,7 +473,7 @@ describe("ModelCatalogController", () => {
     let liveCalls = 0;
     const controller = new ModelCatalogController({
       models: async () => [model("cursor/static")],
-      refreshModels: () => {
+      modelRoutes: () => {
         liveCalls += 1;
         if (liveCalls === 1) return Promise.resolve([model("cursor/live")]);
         return liveCalls === 2 ? background.promise : forcedFollowup.promise;
@@ -459,7 +510,7 @@ describe("ModelCatalogController", () => {
     let liveCalls = 0;
     const controller = new ModelCatalogController({
       models: async () => [model("cursor/static")],
-      refreshModels: () => {
+      modelRoutes: () => {
         liveCalls += 1;
         if (liveCalls === 1) return Promise.resolve([model("cursor/live")]);
         return liveCalls === 2 ? background.promise : forcedFollowup.promise;
@@ -498,7 +549,7 @@ describe("ModelCatalogController", () => {
           ? Promise.resolve([model("cursor/cached")])
           : forcedStatic.promise;
       },
-      refreshModels: async () => [model("cursor/live")],
+      modelRoutes: async () => [model("cursor/live")],
     });
 
     await controller.refresh();
@@ -528,7 +579,7 @@ describe("ModelCatalogController", () => {
     let liveCalls = 0;
     const controller = new ModelCatalogController({
       models: async () => [model("cursor/static")],
-      refreshModels: async () => [model(`cursor/live-${++liveCalls}`)],
+      modelRoutes: async () => [model(`cursor/live-${++liveCalls}`)],
     });
     const published: string[][] = [];
     const unsubscribe = controller.subscribeLive((models) => {

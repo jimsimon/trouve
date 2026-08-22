@@ -7,6 +7,7 @@ import type {
   LoginStarted,
   LoginStatus,
   Model,
+  RoutedModel,
   PersonaInfo,
   Provider,
   ProvidersResponse,
@@ -189,6 +190,7 @@ export const configureApp = (body: {
   api("/code-review/github-app", { method: "PUT", body: JSON.stringify(body) });
 export const getProviders = (): Promise<ProvidersResponse> => api("/providers");
 export const getModels = (): Promise<Model[]> => api("/models");
+export const getModelRoutes = (): Promise<RoutedModel[]> => api("/model-routes");
 export const getPersonaInfos = (): Promise<PersonaInfo[]> => api("/persona-infos");
 export const savePersona = (persona: PersonaInfo["persona"]): Promise<void> =>
   api(`/personas/${encodeURIComponent(persona.id)}`, {

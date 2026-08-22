@@ -9,6 +9,15 @@ use utoipa::ToSchema;
 
 use crate::{CallId, CheckpointId, SessionId, ThreadId, WorkspaceId};
 
+/// Why an automatic model selected a concrete provider route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouteReason {
+    Initial,
+    CapacityFailover,
+    RouteFailover,
+}
+
 /// Which stream an event belongs to. Cursors are monotonic per scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -239,6 +248,16 @@ pub enum Event {
     /// the existing activity row; it is not a transcript or tool-rail item.
     #[serde(rename = "turn.phase_changed")]
     TurnPhaseChanged { turn: u64, phase: TurnPhase },
+    /// The concrete provider route selected for an automatic model. Another
+    /// event for the same turn records a safe failover to a different route.
+    #[serde(rename = "model.route_selected")]
+    ModelRouteSelected {
+        turn: u64,
+        model: String,
+        provider_id: String,
+        provider_model: String,
+        reason: ModelRouteReason,
+    },
     /// Live usage from the most recently completed model request in a running
     /// turn. Thread snapshots add its billing counters to `active_usage` while
     /// replacing only the context fields. `last_usage` remains unchanged until
@@ -566,9 +585,10 @@ pub enum Event {
     },
     /// The server's internet reachability changed (it is the one talking to
     /// model vendors, so it owns this state). While offline, `/v1/models`
-    /// lists only models that can run without internet (local provider,
-    /// loopback endpoints); clients gate prompt entry on having usable
-    /// models and announce recovery. `ServerInfo.online` carries the same
+    /// lists only models that can run without internet (the managed `local`
+    /// provider and user-configured local endpoints); clients gate prompt
+    /// entry on having usable models and announce recovery.
+    /// `ServerInfo.online` carries the same
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },
@@ -644,6 +664,20 @@ mod tests {
             routing["routing_decisions"][0]["reviewer_id"],
             "concurrency"
         );
+    }
+
+    #[test]
+    fn model_route_reason_is_a_closed_snake_case_enum() {
+        let event = Event::ModelRouteSelected {
+            turn: 1,
+            model: "auto/shared".into(),
+            provider_id: "provider".into(),
+            provider_model: "shared".into(),
+            reason: ModelRouteReason::CapacityFailover,
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["reason"], "capacity_failover");
+        assert!(serde_json::from_value::<ModelRouteReason>(serde_json::json!("other")).is_err());
     }
 
     #[test]

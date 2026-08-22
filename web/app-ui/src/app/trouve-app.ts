@@ -103,7 +103,10 @@ import {
 } from "../services/protocol-client.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
-import { ModelCatalogController } from "../services/model-catalog-controller.js";
+import {
+  ModelCatalogController,
+  modelForSelection,
+} from "../services/model-catalog-controller.js";
 import {
   createBrowserThemeController,
   isThemePreference,
@@ -2729,7 +2732,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionSubscriptionHealth,
     );
     const newSessionThinkingOption = thinkingOption(
-      newSessionModels.find((model) => model.id === effectiveNewSessionModel),
+      modelForSelection(newSessionModels, effectiveNewSessionModel),
     );
     const newSessionOptionsLoading = newSessionOptionsAreLoading(
       this.#newSessionOptionsLifecycle,

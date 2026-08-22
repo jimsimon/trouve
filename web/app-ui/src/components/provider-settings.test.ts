@@ -3,9 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 import type {
   ProtocolKnownProvider,
   ProtocolLoginStatus,
+  ProtocolProviderInfo,
 } from "../services/protocol-client.js";
 import {
   ProviderLoginPoller,
+  automaticRoutingProviders,
+  movedProviderOrder,
+  normalizedProviderOrder,
   providerSubmission,
   validatedHttpsUrl,
   type LoginPollScheduler,
@@ -56,6 +60,46 @@ const preset: ProtocolKnownProvider = {
 };
 
 describe("provider settings security boundaries", () => {
+  it("moves providers within a normalized complete preference order", () => {
+    expect(movedProviderOrder(["codex", "stale"], ["openai", "codex", "cursor"], "cursor", -1))
+      .toEqual(["codex", "cursor", "openai"]);
+    expect(movedProviderOrder(["codex", "openai"], ["openai", "codex"], "codex", -1))
+      .toEqual(["codex", "openai"]);
+  });
+
+  it("normalizes stale, duplicate, and omitted provider ids", () => {
+    expect(normalizedProviderOrder(
+      ["codex", "stale", "codex"],
+      ["openai", "codex", "cursor"],
+    )).toEqual(["codex", "openai", "cursor"]);
+  });
+
+  it("moves hosted providers without changing local-provider slots", () => {
+    expect(movedProviderOrder(
+      ["local", "codex", "loopback", "cursor"],
+      ["local", "codex", "loopback", "cursor"],
+      "cursor",
+      -1,
+      ["codex", "cursor"],
+    )).toEqual(["local", "cursor", "loopback", "codex"]);
+  });
+
+  it("keeps managed local models and localhost APIs out of hosted priority", () => {
+    const provider = (id: string, category: string): ProtocolProviderInfo => ({
+      id,
+      kind: "openai-compat",
+      has_credentials: true,
+      auth: "api-key",
+      category,
+    });
+    expect(automaticRoutingProviders([
+      provider("codex", "subscription"),
+      provider("openai", "api"),
+      provider("local", "local"),
+      provider("ollama", "local"),
+    ]).map(({ id }) => id)).toEqual(["codex", "openai"]);
+  });
+
   it("accepts only HTTPS authorization URLs", () => {
     expect(validatedHttpsUrl("https://auth.example.test/device?flow=1")).toBe(
       "https://auth.example.test/device?flow=1",

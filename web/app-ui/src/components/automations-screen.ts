@@ -9,6 +9,7 @@ import type {
   ProtocolModelInfo,
   ProtocolWorkspace,
 } from "../services/protocol-client.js";
+import { modelForSelection } from "../services/model-catalog-controller.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import { modelOptionLabel } from "./model-option-controls.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
@@ -614,7 +615,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   #renderEditor() {
     const models = this.#availableModels();
     const editing = this.#editorMode === "edit";
-    const selectedModel = models.find((model) => model.id === this.#draft.model);
+    const selectedModel = modelForSelection(models, this.#draft.model);
     const thinking = thinkingOption(selectedModel);
     const nameError = this.#draftErrors.name;
     const promptError = this.#draftErrors.prompt;
@@ -736,7 +737,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   };
 
   readonly #modelPicked = (event: CustomEvent<{ readonly modelId: string }>): void => {
-    const model = this.#availableModels().find((candidate) => candidate.id === event.detail.modelId);
+    const model = modelForSelection(this.#availableModels(), event.detail.modelId);
     const thinking = thinkingOption(model);
     const thinkingLevel = thinking?.values.includes(this.#draft.thinkingLevel)
       ? this.#draft.thinkingLevel
@@ -759,7 +760,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       return;
     }
     const thinking = thinkingOption(
-      this.#availableModels().find((model) => model.id === this.#draft.model),
+      modelForSelection(this.#availableModels(), this.#draft.model),
     );
     if (
       this.#draft.thinkingLevel !== ""

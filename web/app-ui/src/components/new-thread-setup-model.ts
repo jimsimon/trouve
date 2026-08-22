@@ -20,6 +20,7 @@ import type {
   ProtocolProvidersResponse,
   ProtocolSendMessageRequest,
 } from "../services/protocol-client.js";
+import { modelForSelection } from "../services/model-catalog-controller.js";
 
 export type NewThreadPermissionSelection = "" | "ask" | "allow_list" | "yolo";
 
@@ -94,7 +95,7 @@ const knownModel = (
   models: readonly ProtocolModelInfo[],
   modelId: string | undefined,
 ): ProtocolModelInfo | undefined =>
-  modelId === undefined ? undefined : models.find((model) => model.id === modelId);
+  modelForSelection(models, modelId);
 
 export const effectiveNewThreadModel = (
   draft: Pick<NewThreadSetupDraft, "modeId" | "modelId">,

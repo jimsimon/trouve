@@ -791,7 +791,7 @@ describe("new session model", () => {
     });
   });
 
-  it("falls back to an advertised model when inherited defaults are stale", () => {
+  it("prefers an automatic advertised model when inherited defaults are stale", () => {
     const available = model({}, "provider/available");
     expect(resolveNewThreadDefaults(
       [mode("provider/stale-mode")],
@@ -806,13 +806,13 @@ describe("new session model", () => {
     expect(resolveNewThreadDefaults([], [], providers("provider/stale-global")).modelId)
       .toBe("");
 
-    const cursorDefault = model({}, "cursor/default");
-    const cursorFable = model({}, "cursor/claude-fable-5");
+    const automatic = model({}, "auto/gpt-5.6-sol");
+    const concrete = model({}, "openai/gpt-5.6-sol");
     expect(resolveNewThreadDefaults(
       [mode(null)],
-      [cursorFable, cursorDefault],
+      [concrete, automatic],
       providers("provider/stale-global"),
-    ).modelId).toBe("cursor/default");
+    ).modelId).toBe("auto/gpt-5.6-sol");
   });
 
   it("chooses an explicit base, repository branch, detached HEAD, then conventional trunks", () => {

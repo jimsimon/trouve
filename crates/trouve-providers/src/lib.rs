@@ -102,6 +102,64 @@ pub enum ProviderError {
     Auth(String),
 }
 
+impl ProviderError {
+    /// Whether the provider positively reported exhausted request capacity.
+    /// This deliberately excludes generic transport failures: retrying those
+    /// through another provider could replay a side effect whose outcome is
+    /// unknown.
+    pub fn is_capacity_exhausted(&self) -> bool {
+        match self {
+            Self::Api(message) | Self::Request(message) => is_capacity_exhaustion_message(message),
+            Self::Auth(_) => false,
+        }
+    }
+}
+
+/// Whether a provider or vendor-backend error positively reports exhausted
+/// request capacity. Kept here so native and agent adapters cannot drift on
+/// which failures are safe to route elsewhere.
+pub fn is_capacity_exhaustion_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    contains_standalone_token(&message, "429")
+        || [
+            "too many requests",
+            "rate limit",
+            "rate_limit",
+            "quota exceeded",
+            "quota_exceeded",
+            "insufficient_quota",
+            "resource_exhausted",
+            "capacity exhausted",
+            "capacity_exhausted",
+            "usage limit",
+            "usage_limit",
+        ]
+        .iter()
+        .any(|signal| message.contains(signal))
+}
+
+fn contains_standalone_token(message: &str, token: &str) -> bool {
+    message.match_indices(token).any(|(start, _)| {
+        let before = message[..start].chars().next_back();
+        let after = message[start + token.len()..].chars().next();
+        let decimal_prefix = before == Some('.')
+            && message[..start.saturating_sub(1)]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_digit());
+        let suffix = &message[start + token.len()..];
+        let decimal_suffix = after == Some('.')
+            && suffix
+                .get(1..)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|ch| ch.is_ascii_digit());
+        !decimal_prefix
+            && !decimal_suffix
+            && before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+            && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    })
+}
+
 pub type EventStream = BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 
 const PROVIDER_DELTA_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
@@ -191,6 +249,14 @@ pub trait Provider: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("openai/gpt-4.1").
     fn id(&self) -> &str;
 
+    /// Catalog-backed provider-neutral identity for a runnable model. Custom
+    /// endpoints and adapter-owned models return `None`, keeping them out of
+    /// automatic cross-provider routing even when their spelling happens to
+    /// match a hosted catalog model.
+    fn shared_model_identity(&self, _model: &str) -> Option<String> {
+        None
+    }
+
     /// Models available to the configured account or endpoint. For
     /// catalog-covered providers, live discovery contributes identifiers only
     /// and models.dev supplies canonical metadata and option schemas.
@@ -217,9 +283,71 @@ pub trait Provider: Send + Sync {
     ) -> Result<EventStream, ProviderError>;
 }
 
+/// Preserve one provider's concrete model catalog and execution behavior while
+/// withholding a provider-neutral identity. Configured loopback endpoints use
+/// this wrapper so hosted `auto/<model>` selections cannot silently route to a
+/// service on the user's machine.
+pub struct ConcreteOnlyProvider {
+    inner: std::sync::Arc<dyn Provider>,
+}
+
+impl ConcreteOnlyProvider {
+    pub fn new(inner: std::sync::Arc<dyn Provider>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ConcreteOnlyProvider {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.inner.list_models().await
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.inner.models()
+    }
+
+    async fn stream_chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.inner
+            .stream_chat(model, messages, tools, options)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_messages_require_a_standalone_http_status() {
+        for message in [
+            "HTTP 429 Too Many Requests",
+            "request failed (429)",
+            "status=429",
+            "RESOURCE_EXHAUSTED",
+        ] {
+            assert!(is_capacity_exhaustion_message(message), "{message}");
+        }
+        for message in [
+            "HTTP 14290",
+            "error E429x",
+            "request 4290 failed",
+            "version 1.429",
+            "version 429.0",
+        ] {
+            assert!(!is_capacity_exhaustion_message(message), "{message}");
+        }
+    }
 
     #[tokio::test]
     async fn native_provider_deltas_are_coalesced_without_crossing_boundaries() {
