@@ -4,7 +4,7 @@
 //! reported exclusively through the event log. Worktree mutations are
 //! serialized per session (threads share the session worktree, ADR 0003).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -516,6 +516,15 @@ const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// A vendor can publish its MCP lifecycle item immediately before the local
+/// HTTP request reaches Trouve. Keep that presentation event off the durable
+/// log while the trusted request catches up, without blocking the backend
+/// stream that carries unrelated text, steering, and collaborator events.
+#[cfg(not(test))]
+const BRIDGE_ECHO_REORDER_GRACE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const BRIDGE_ECHO_REORDER_GRACE: Duration = Duration::from_millis(100);
+
 /// Bounded recursive delegation. Depth counts spawn edges from the root
 /// conversation thread, so a value of four permits root → child → grandchild
 /// → great-grandchild → great-great-grandchild. The active-tree cap prevents
@@ -1023,6 +1032,10 @@ async fn deny_pending_backend_approvals(
 enum BackendLoopInput {
     Event(Option<Result<BackendEvent, BackendError>>),
     Approval(BackendApprovalOutcome),
+    BridgeEchoResolved {
+        vendor_call_id: String,
+        canonical_call_id: Option<String>,
+    },
 }
 
 /// Native collaborators are real, navigable threads while the vendor owns
@@ -1140,6 +1153,7 @@ struct BridgeEchoCall {
 #[derive(Default)]
 struct BridgeEchoTracker {
     calls: Mutex<HashMap<String, Vec<BridgeEchoCall>>>,
+    changed: tokio::sync::Notify,
 }
 
 struct BridgeEchoTurn<'a> {
@@ -1187,6 +1201,7 @@ impl BridgeEchoTracker {
                 args: args.clone(),
                 vendor_call_id: None,
             });
+        self.changed.notify_waiters();
     }
 
     fn clear_turn(&self, thread_id: &str, turn: u64) {
@@ -1248,6 +1263,36 @@ impl BridgeEchoTracker {
         // suppress a vendor event. An uncorrelated wrapper-shaped event is
         // processed immediately instead of blocking the backend stream.
         self.try_claim(thread_id, turn, vendor_call_id, tool, args)
+    }
+
+    async fn claim_after_dispatch(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        vendor_call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        // Reject ordinary vendor-native tools synchronously. Only a
+        // bridge-shaped lifecycle is eligible for the bounded reorder grace.
+        trouve_bridge_echo_payload(tool, args)?;
+        let deadline = Instant::now() + BRIDGE_ECHO_REORDER_GRACE;
+        loop {
+            // Arm the notification before checking state so registration
+            // cannot race between the check and the wait.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(call_id) = self.try_claim(thread_id, turn, vendor_call_id, tool, args) {
+                return Some(call_id);
+            }
+            if tokio::time::timeout_at(deadline.into(), changed.as_mut())
+                .await
+                .is_err()
+            {
+                return None;
+            }
+        }
     }
 }
 
@@ -12441,6 +12486,33 @@ impl Engine {
             })
     }
 
+    /// Publish one vendor call to the approval correlator only after its
+    /// canonical card is durable. This ordering prevents a concurrent
+    /// permission hook from matching the call while `gate_backend_approval`
+    /// still sees no card and synthesizing a duplicate with the same id.
+    fn expose_persisted_vendor_call(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> bool {
+        if !self.tool_card_exists(thread_id, turn, call_id) {
+            tracing::error!(
+                thread_id,
+                turn,
+                call_id,
+                tool,
+                "refusing to expose a vendor tool call before its canonical card is durable"
+            );
+            return false;
+        }
+        self.raw_vendor_tool_calls
+            .register(thread_id, turn, call_id, tool, args);
+        true
+    }
+
     /// Normalize a todo list from trouve's canonical shape or a supported
     /// vendor-native tool shape.
     fn parse_todo_snapshot(value: &serde_json::Value) -> Option<Vec<trouve_protocol::TodoItem>> {
@@ -13207,13 +13279,6 @@ impl Engine {
                 tool,
                 args,
             } => {
-                self.raw_vendor_tool_calls.register(
-                    &collaborator.thread.id,
-                    turn,
-                    &call_id,
-                    &tool,
-                    &args,
-                );
                 collaborator
                     .tool_started_at
                     .insert(call_id.clone(), Instant::now());
@@ -13237,7 +13302,22 @@ impl Engine {
                         requires_approval: false,
                     });
                 }
-                collaborator.persisted.push(Event::ToolStarted { call_id });
+                collaborator.persisted.push(Event::ToolStarted {
+                    call_id: call_id.clone(),
+                });
+                flush_backend_event_batch(
+                    &self.store,
+                    &Scope::Thread(collaborator.thread.id.clone()),
+                    &mut collaborator.persisted,
+                )
+                .await?;
+                self.expose_persisted_vendor_call(
+                    &collaborator.thread.id,
+                    turn,
+                    &call_id,
+                    &tool,
+                    &args,
+                );
             }
             BackendCollaboratorEvent::ToolOutput { call_id, chunk } => collaborator
                 .persisted
@@ -13664,6 +13744,14 @@ impl Engine {
         // ToolExecutor. Some harnesses echo that lifecycle with a different
         // call id; suppress only echoes correlated to trusted MCP execution.
         let mut ignored_bridge_call_ids = HashSet::new();
+        // Some CLIs announce an MCP lifecycle immediately before dispatching
+        // its loopback HTTP request. Resolve that small transport reorder in
+        // parallel with the backend stream, retaining any same-call follow-up
+        // events until the trusted request either correlates or times out.
+        let mut pending_bridge_echo_claims = futures::stream::FuturesUnordered::new();
+        let mut pending_bridge_echo_events = HashMap::<String, VecDeque<BackendEvent>>::new();
+        let mut replay_backend_events = VecDeque::<BackendEvent>::new();
+        let mut released_bridge_call_ids = HashSet::new();
         let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
         let mut backend_approval_cancels =
             HashMap::<String, tokio_util::sync::CancellationToken>::new();
@@ -13674,16 +13762,26 @@ impl Engine {
         let mut pending_steer_permit = None;
         let mut consecutive_backend_events = 0usize;
         let mut first_substantive_event = true;
+        let mut backend_stream_ended = false;
         loop {
+            if backend_stream_ended
+                && pending_bridge_echo_claims.is_empty()
+                && replay_backend_events.is_empty()
+            {
+                break;
+            }
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let steer_reserved = active_vendor_session.is_some()
+            let steer_reserved = !backend_stream_ended
+                && active_vendor_session.is_some()
                 && !cancel.is_cancelled()
                 && reserve_ready_steer_after_event_budget(
                     &mut steer_rx,
                     &mut pending_steer,
                     &mut consecutive_backend_events,
                 );
-            let input = if pending_steer_lane.is_some() {
+            let input = if let Some(event) = replay_backend_events.pop_front() {
+                BackendLoopInput::Event(Some(Ok(event)))
+            } else if pending_steer_lane.is_some() {
                 // Poll lane acquisition ahead of the backend stream so a
                 // continuously-ready stream cannot starve it. If the lane is
                 // still held, the future stays pending and ToolCompleted can
@@ -13703,6 +13801,14 @@ impl Engine {
                             approval.expect("non-empty approval queue must yield an outcome")
                         )
                     }
+                    bridge = pending_bridge_echo_claims.next(), if !pending_bridge_echo_claims.is_empty() => {
+                        let (vendor_call_id, canonical_call_id) = bridge
+                            .expect("non-empty bridge echo queue must yield an outcome");
+                        BackendLoopInput::BridgeEchoResolved {
+                            vendor_call_id,
+                            canonical_call_id,
+                        }
+                    }
                     permit = async {
                         pending_steer_lane
                             .as_mut()
@@ -13715,7 +13821,7 @@ impl Engine {
                         pending_steer_permit = Some(permit);
                         continue;
                     }
-                    event = stream.next() => BackendLoopInput::Event(event),
+                    event = stream.next(), if !backend_stream_ended => BackendLoopInput::Event(event),
                     _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
@@ -13731,10 +13837,18 @@ impl Engine {
                         drop(pending_steer_permit.take());
                         continue;
                     }
+                    bridge = pending_bridge_echo_claims.next(), if !pending_bridge_echo_claims.is_empty() => {
+                        let (vendor_call_id, canonical_call_id) = bridge
+                            .expect("non-empty bridge echo queue must yield an outcome");
+                        BackendLoopInput::BridgeEchoResolved {
+                            vendor_call_id,
+                            canonical_call_id,
+                        }
+                    }
                     // Persist vendor output that is already available before
                     // accepting simultaneously-ready steering. This preserves
                     // the causal order observed at the backend boundary.
-                    event = stream.next(), if !steer_reserved => BackendLoopInput::Event(event),
+                    event = stream.next(), if !steer_reserved && !backend_stream_ended => BackendLoopInput::Event(event),
                     _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
@@ -13750,7 +13864,7 @@ impl Engine {
                     &mut steer_rx,
                     &mut pending_steer,
                     active_vendor_session.is_some(),
-                ), if !cancel.is_cancelled() => {
+                ), if !cancel.is_cancelled() && !backend_stream_ended => {
                     let Some(command) = steer else {
                         steer_rx = None;
                         continue;
@@ -13895,7 +14009,31 @@ impl Engine {
                 }
             };
             let event = match input {
-                BackendLoopInput::Event(None) => break,
+                BackendLoopInput::BridgeEchoResolved {
+                    vendor_call_id,
+                    canonical_call_id,
+                } => {
+                    let buffered = pending_bridge_echo_events
+                        .remove(&vendor_call_id)
+                        .unwrap_or_default();
+                    if canonical_call_id.is_some() {
+                        ignored_bridge_call_ids.insert(vendor_call_id);
+                        for event in buffered {
+                            if let BackendEvent::ApprovalNeeded { responder, .. } = event {
+                                let _ = responder.send(true);
+                            }
+                        }
+                    } else {
+                        released_bridge_call_ids.insert(vendor_call_id);
+                        replay_backend_events.extend(buffered);
+                    }
+                    consecutive_backend_events = 0;
+                    continue;
+                }
+                BackendLoopInput::Event(None) => {
+                    backend_stream_ended = true;
+                    continue;
+                }
                 BackendLoopInput::Approval(outcome) => {
                     consecutive_backend_events = 0;
                     let BackendApprovalOutcome {
@@ -13995,6 +14133,20 @@ impl Engine {
                     }
                 },
             };
+            let buffered_call_id = match &event {
+                BackendEvent::ToolStarted { call_id, .. }
+                | BackendEvent::ToolOutput { call_id, .. }
+                | BackendEvent::ToolCompleted { call_id, .. }
+                | BackendEvent::ApprovalNeeded { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            };
+            if let Some(call_id) = buffered_call_id
+                && let Some(buffered) = pending_bridge_echo_events.get_mut(&call_id)
+            {
+                buffered.push_back(event);
+                consecutive_backend_events = 0;
+                continue;
+            }
             if first_substantive_event && !matches!(&event, BackendEvent::SessionStarted { .. }) {
                 first_substantive_event = false;
                 tracing::info!(
@@ -14115,20 +14267,57 @@ impl Engine {
                             content: std::mem::take(&mut segment),
                         });
                     }
-                    if self
-                        .bridge_echoes
-                        .claim(&thread.id, turn, &call_id, &tool, &args)
-                        .is_some()
+                    if !released_bridge_call_ids.contains(&call_id)
+                        && trouve_bridge_echo_payload(&tool, &args).is_some()
                     {
-                        // The MCP request itself already produced the one
-                        // canonical ToolExecutor card. Vendor lifecycle
-                        // notifications have a different call id; only an
-                        // exact trusted correlation suppresses the echo.
-                        ignored_bridge_call_ids.insert(call_id);
+                        if self
+                            .bridge_echoes
+                            .claim(&thread.id, turn, &call_id, &tool, &args)
+                            .is_some()
+                        {
+                            // The MCP request itself already produced the one
+                            // canonical ToolExecutor card. Vendor lifecycle
+                            // notifications have a different call id; only an
+                            // exact trusted correlation suppresses the echo.
+                            ignored_bridge_call_ids.insert(call_id);
+                            continue;
+                        }
+
+                        // The vendor can announce its wrapper just before the
+                        // loopback request reaches `register`. Preserve prior
+                        // transcript order now, then let a separate future
+                        // wait for that trusted correlation while this stream
+                        // continues to service unrelated events.
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        pending_bridge_echo_events.insert(
+                            call_id.clone(),
+                            VecDeque::from([BackendEvent::ToolStarted {
+                                call_id: call_id.clone(),
+                                tool: tool.clone(),
+                                args: args.clone(),
+                            }]),
+                        );
+                        let engine = Arc::clone(self);
+                        let owner_thread_id = thread.id.clone();
+                        let vendor_call_id = call_id.clone();
+                        pending_bridge_echo_claims.push(
+                            async move {
+                                let canonical_call_id = engine
+                                    .bridge_echoes
+                                    .claim_after_dispatch(
+                                        &owner_thread_id,
+                                        turn,
+                                        &vendor_call_id,
+                                        &tool,
+                                        &args,
+                                    )
+                                    .await;
+                                (vendor_call_id, canonical_call_id)
+                            }
+                            .boxed(),
+                        );
                         continue;
                     }
-                    self.raw_vendor_tool_calls
-                        .register(&thread.id, turn, &call_id, &tool, &args);
                     let (display_tool, mut display_args) = normalize_vendor_tool_call(&tool, &args);
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
@@ -14145,7 +14334,11 @@ impl Engine {
                             requires_approval: false,
                         });
                     }
-                    persisted.push(Event::ToolStarted { call_id });
+                    persisted.push(Event::ToolStarted {
+                        call_id: call_id.clone(),
+                    });
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    self.expose_persisted_vendor_call(&thread.id, turn, &call_id, &tool, &args);
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
                     if suppressed_bridge_calls.contains(&call_id)
@@ -14378,6 +14571,7 @@ impl Engine {
                         backend_mutation_permits.remove(&call_id);
                         continue;
                     }
+                    released_bridge_call_ids.remove(&call_id);
                     self.raw_vendor_tool_calls
                         .complete(&thread.id, turn, &call_id);
                     let status = if ok {
@@ -14496,10 +14690,11 @@ impl Engine {
                         bail!("backend requested approval for {tool} during a tool-free turn");
                     }
                     if ignored_bridge_call_ids.contains(&call_id)
-                        || self
-                            .bridge_echoes
-                            .claim(&thread.id, turn, &call_id, &tool, &args)
-                            .is_some()
+                        || (!released_bridge_call_ids.contains(&call_id)
+                            && self
+                                .bridge_echoes
+                                .claim(&thread.id, turn, &call_id, &tool, &args)
+                                .is_some())
                     {
                         // ToolExecutor already applied the canonical gate.
                         // Approve only the correlated transport-level echo,
@@ -19741,6 +19936,69 @@ mod tests {
                 &HashSet::from(["call-a".into()]),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn vendor_calls_are_exposed_only_after_their_card_is_durable() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let engine = Engine::new(store.clone(), data.path().to_path_buf(), &Config::default());
+        let args = serde_json::json!({ "command": "cargo test" });
+
+        assert!(!engine.expose_persisted_vendor_call("thread", 4, "call-a", "Bash", &args,));
+        assert_eq!(engine.open_vendor_call("thread", 4, "shell", &args), None);
+
+        store
+            .append_event(
+                Scope::Thread("thread".into()),
+                Event::ToolRequested {
+                    turn: 4,
+                    call_id: "call-a".into(),
+                    tool: "shell".into(),
+                    args: args.clone(),
+                    requires_approval: false,
+                },
+            )
+            .unwrap();
+        assert!(engine.expose_persisted_vendor_call("thread", 4, "call-a", "Bash", &args,));
+        assert_eq!(
+            engine.open_vendor_call("thread", 4, "shell", &args),
+            Some("call-a".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_wrapper_before_request_correlates_without_blocking_the_stream() {
+        let tracker = Arc::new(BridgeEchoTracker::default());
+        let _turn = tracker.begin_turn("thread", 8);
+        let args = serde_json::json!({ "path": "README.md" });
+        let waiting_tracker = Arc::clone(&tracker);
+        let waiting_args = args.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_tracker
+                .claim_after_dispatch(
+                    "thread",
+                    8,
+                    "vendor-call",
+                    "mcp__trouve__read_file",
+                    &waiting_args,
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "an unmatched wrapper must wait off-stream for its request"
+        );
+        tracker.register("thread", 8, "canonical-call", "read_file", &args);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), waiter)
+                .await
+                .expect("trusted request did not wake the deferred correlation")
+                .unwrap(),
+            Some("canonical-call".into())
         );
     }
 
