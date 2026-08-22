@@ -4,10 +4,23 @@ import {
   type ModelOptionChangeDetail,
   type ModelOptionControl,
   type ModelOptionValue,
+  type TextModelOptionControl,
 } from "./model-option-controls.js";
 
 export const MODEL_OPTION_CHANGED_EVENT = "trouve-model-option-changed" as const;
 export type ModelOptionChangedEvent = CustomEvent<ModelOptionChangeDetail>;
+
+const textInputValueIsValid = (
+  control: TextModelOptionControl,
+  raw: string,
+): boolean => {
+  if (raw === "" || control.scalarType === "string") return true;
+  const value = Number(raw);
+  return Number.isFinite(value)
+    && (control.scalarType !== "integer" || Number.isInteger(value))
+    && (control.minimum === undefined || value >= control.minimum)
+    && (control.maximum === undefined || value <= control.maximum);
+};
 
 export class TrouveModelOptionsEditor extends LitElement {
   static override properties = {
@@ -111,6 +124,7 @@ export class TrouveModelOptionsEditor extends LitElement {
         ? nothing
         : `model-option-description-${index}`;
       if (control.kind === "choice") {
+        const overridden = control.overridden ?? true;
         return html`
           <label title=${this.compact ? control.description : nothing}>
             <span class="option-label">${control.label}</span>
@@ -120,6 +134,10 @@ export class TrouveModelOptionsEditor extends LitElement {
               ?disabled=${this.disabled}
               @change=${(event: Event) => {
                 const select = event.currentTarget as HTMLSelectElement;
+                if (select.value === "") {
+                  this.#emit(control.key, undefined);
+                  return;
+                }
                 const choiceIndex = Number(select.selectedOptions[0]?.dataset["choiceIndex"]);
                 const choice = Number.isInteger(choiceIndex)
                   ? control.choices[choiceIndex]
@@ -127,14 +145,16 @@ export class TrouveModelOptionsEditor extends LitElement {
                 if (choice !== undefined) this.#emit(control.key, choice.value);
               }}
             >
-              ${control.selectedIndex < 0
-                ? html`<option value="" .selected=${true}>Select…</option>`
-                : nothing}
+              <option value="" .selected=${!overridden}>
+                Model default${control.selectedIndex < 0
+                  ? ""
+                  : ` · ${control.choices[control.selectedIndex]?.label ?? ""}`}
+              </option>
               ${control.choices.map((choice, index) =>
                 html`<option
                   value=${String(choice.value)}
                   data-choice-index=${String(index)}
-                  .selected=${index === control.selectedIndex}
+                  .selected=${overridden && index === control.selectedIndex}
                 >${choice.label}</option>`
               )}
             </select>
@@ -145,17 +165,25 @@ export class TrouveModelOptionsEditor extends LitElement {
         `;
       }
       if (control.kind === "boolean") {
+        const overridden = control.overridden ?? true;
         return html`
           <div class="boolean-option" title=${this.compact ? control.description : nothing}>
             <span class="option-label">${control.label}</span>
-            <button
-              type="button"
+            <select
               aria-label=${control.label}
               aria-describedby=${descriptionId}
-              aria-pressed=${control.selected ? "true" : "false"}
               ?disabled=${this.disabled}
-              @click=${() => this.#emit(control.key, !control.selected)}
-            >${control.selected ? "On" : "Off"}</button>
+              @change=${(event: Event) => {
+                const value = (event.currentTarget as HTMLSelectElement).value;
+                this.#emit(control.key, value === "" ? undefined : value === "true");
+              }}
+            >
+              <option value="" .selected=${!overridden}>
+                Model default · ${control.selected ? "On" : "Off"}
+              </option>
+              <option value="true" .selected=${overridden && control.selected}>On</option>
+              <option value="false" .selected=${overridden && !control.selected}>Off</option>
+            </select>
             ${control.description === ""
               ? nothing
               : html`<small id=${descriptionId}>${control.description}</small>`}
@@ -177,6 +205,19 @@ export class TrouveModelOptionsEditor extends LitElement {
             ?disabled=${this.disabled}
             @input=${(event: Event) =>
               (event.currentTarget as HTMLInputElement).setCustomValidity("")}
+            @keydown=${(event: KeyboardEvent) => {
+              if (event.key !== "Tab" && event.key !== "Enter") return;
+              const input = event.currentTarget as HTMLInputElement;
+              if (!textInputValueIsValid(control, input.value.trim())) {
+                input.value = control.text;
+              }
+            }}
+            @blur=${(event: FocusEvent) => {
+              const input = event.currentTarget as HTMLInputElement;
+              if (!textInputValueIsValid(control, input.value.trim())) {
+                input.value = control.text;
+              }
+            }}
             @change=${(event: Event) => {
               const input = event.currentTarget as HTMLInputElement;
               const raw = input.value.trim();
@@ -189,11 +230,7 @@ export class TrouveModelOptionsEditor extends LitElement {
                 return;
               }
               const value = Number(raw);
-              const valid =
-                Number.isFinite(value)
-                && (control.scalarType !== "integer" || Number.isInteger(value))
-                && (control.minimum === undefined || value >= control.minimum)
-                && (control.maximum === undefined || value <= control.maximum);
+              const valid = textInputValueIsValid(control, raw);
               if (valid) {
                 input.setCustomValidity("");
                 this.#emit(control.key, value);

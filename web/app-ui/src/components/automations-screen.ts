@@ -22,6 +22,7 @@ const AUTOMATION_RETRY_MS = 5_000;
 import {
   AUTOMATION_DAY_NAMES,
   automationDraftFrom,
+  automationEnabledRequest,
   automationDraftFromTemplate,
   automationRequestFromDraft,
   automationScheduleSummary,
@@ -824,7 +825,16 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   };
 
   readonly #modelPicked = (event: CustomEvent<{ readonly modelId: string }>): void => {
-    this.#updateDraft({ model: event.detail.modelId, modelOptions: {} });
+    const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
+    const previousModel = this.#effectiveAutomationModel(this.#draft, modes);
+    const nextDraft = { ...this.#draft, model: event.detail.modelId };
+    const nextModel = this.#effectiveAutomationModel(nextDraft, modes);
+    const previousModelId = previousModel?.id ?? this.#draft.model.trim();
+    const nextModelId = nextModel?.id ?? event.detail.modelId.trim();
+    this.#updateDraft({
+      model: event.detail.modelId,
+      modelOptions: nextModelId === previousModelId ? this.#draft.modelOptions : {},
+    });
   };
 
   readonly #modelOptionChanged = (event: CustomEvent<ModelOptionChangeDetail>): void => {
@@ -863,20 +873,26 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     const services = this.#services.value;
     if (services === undefined) return;
     const editing = this.#editorMode === "edit";
-    const busyId = editing ? this.#selectedId : "new";
+    const selectedId = this.#selectedId;
+    const draft: AutomationDraft = {
+      ...this.#draft,
+      modelOptions: { ...this.#draft.modelOptions },
+      days: [...this.#draft.days],
+    };
+    const busyId = editing ? selectedId : "new";
     this.#busyId = busyId;
     this.#actionError = "";
     this.#notice = "";
     this.requestUpdate();
     try {
-      const model = await this.#modelForMutation(this.#draft);
+      const model = await this.#modelForMutation(draft);
       if (model === undefined) return;
       const request = automationRequestFromDraft(
-        this.#draft,
+        draft,
         model,
       );
       const automation = editing
-        ? await services.protocol.updateAutomation(this.#selectedId, request)
+        ? await services.protocol.updateAutomation(selectedId, request)
         : await services.protocol.createAutomation(request);
       this.#replaceAutomation(automation);
       this.#selectedId = automation.id;
@@ -900,13 +916,14 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#notice = "";
     this.requestUpdate();
     try {
-      const draft = { ...automationDraftFrom(automation), enabled };
-      const model = await this.#modelForMutation(draft);
-      if (model === undefined) return;
+      const latest = await services.protocol.automations();
+      const current = latest.find((candidate) => candidate.id === automation.id);
+      if (current === undefined) throw new Error("automation is no longer available");
+      this.#automations = latest;
       this.#replaceAutomation(
         await services.protocol.updateAutomation(
           automation.id,
-          automationRequestFromDraft(draft, model),
+          automationEnabledRequest(current, enabled),
         ),
       );
       this.#notice = enabled ? "Automation enabled." : "Automation paused.";
@@ -1038,7 +1055,10 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     return models.find((model) => model.id === modelId);
   }
 
-  async #modelForMutation(draft: AutomationDraft): Promise<ProtocolModelInfo | undefined> {
+  async #modelForMutation(
+    draft: AutomationDraft,
+  ): Promise<ProtocolModelInfo | null | undefined> {
+    if (Object.keys(draft.modelOptions).length === 0) return null;
     const services = this.#services.value;
     if (services === undefined || draft.workspaceId === "") {
       this.#actionError = "Mode and model metadata are unavailable. No changes were saved.";

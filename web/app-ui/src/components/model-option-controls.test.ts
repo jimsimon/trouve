@@ -56,6 +56,7 @@ describe("model option controls", () => {
         key: "reasoning_effort",
         label: "Reasoning effort",
         description: "",
+        overridden: true,
         choices: [
           { label: "Low", value: "low" },
           { label: "High", value: "high" },
@@ -68,6 +69,7 @@ describe("model option controls", () => {
         key: "context",
         label: "Context",
         description: "",
+        overridden: true,
         choices: [
           { label: "Standard", value: "300k" },
           { label: "Extended", value: "1m" },
@@ -79,6 +81,7 @@ describe("model option controls", () => {
         key: "fast",
         label: "Fast",
         description: "",
+        overridden: true,
         selected: false,
       },
       {
@@ -86,6 +89,7 @@ describe("model option controls", () => {
         key: "temperature",
         label: "Temperature",
         description: "Sampling temperature",
+        overridden: true,
         scalarType: "number",
         text: "0.8",
         hint: "0 – 2",
@@ -97,6 +101,7 @@ describe("model option controls", () => {
         key: "seed",
         label: "Seed",
         description: "",
+        overridden: false,
         scalarType: "integer",
         text: "7",
         hint: "value",
@@ -106,6 +111,7 @@ describe("model option controls", () => {
         key: "instructions",
         label: "Instructions",
         description: "",
+        overridden: false,
         scalarType: "string",
         text: "",
         hint: "Be concise",
@@ -120,9 +126,9 @@ describe("model option controls", () => {
       fast: { type: "boolean", default: true },
     }), { thinking_level: "low" });
     expect(controls).toMatchObject([
-      { kind: "choice", selectedIndex: 0 },
-      { kind: "choice", selectedIndex: 1 },
-      { kind: "boolean", selected: true },
+      { kind: "choice", selectedIndex: 0, overridden: true },
+      { kind: "choice", selectedIndex: 1, overridden: false },
+      { kind: "boolean", selected: true, overridden: false },
     ]);
     expect(sanitizeModelOptions(model({
       effort: { enum: ["low", "high"] },
@@ -148,11 +154,16 @@ describe("model option controls", () => {
       nested: { type: "object" },
       broken: { type: "string", enum: ["valid", { nested: true }] },
       incomplete: { type: "string", oneOf: [{ const: "only" }] },
+      ambiguous: { type: ["string", "number"] },
+      patterned: { type: "string", pattern: "^[a-z]+$" },
+      stepped: { type: "number", multipleOf: 0.5 },
+      malformed_bound: { type: "number", minimum: "zero" },
     }), {})).toEqual([{
       kind: "choice",
       key: "context",
       label: "Context",
       description: "",
+      overridden: false,
       choices: [
         { label: "300K", value: "300k" },
         { label: "1", value: 1 },

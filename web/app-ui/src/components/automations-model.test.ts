@@ -4,6 +4,7 @@ import type { ProtocolModelInfo } from "../services/protocol-client.js";
 import {
   automationDraftFrom,
   automationDraftFromTemplate,
+  automationEnabledRequest,
   automationRequestFromDraft,
   automationScheduleSummary,
   emptyAutomationDraft,
@@ -128,6 +129,32 @@ describe("automation form model", () => {
       modelOptions: { removed: true, effort: "high" },
     }, undefined);
     expect(request.model_options).toEqual({});
+  });
+
+  it("preserves stored model fields for lifecycle-only enabled changes", () => {
+    const automation = {
+      id: "auto_retired",
+      name: " Retired model ",
+      prompt: " Run it ",
+      workspace_id: "ws_1",
+      mode: "code",
+      model: "provider/retired",
+      thinking_level: "high",
+      model_options: { removed_option: true },
+      permission_mode: "ask" as const,
+      schedule: { kind: "weekly", time: "09:00", days: [4, 1, 4] },
+      enabled: true,
+      created_at: "2026-08-02T12:00:00Z",
+    };
+    expect(automationEnabledRequest(automation, false)).toMatchObject({
+      name: " Retired model ",
+      prompt: " Run it ",
+      model: "provider/retired",
+      thinking_level: "high",
+      model_options: { removed_option: true },
+      schedule: { kind: "weekly", time: "09:00", days: [4, 1, 4] },
+      enabled: false,
+    });
   });
 
   it("does not hydrate legacy thinking beside an explicit token budget", () => {
