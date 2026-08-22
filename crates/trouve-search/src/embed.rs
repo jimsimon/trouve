@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use memmap2::Mmap;
@@ -37,6 +38,10 @@ use crate::utils::resolve_model_name;
 const MAX_TOKENS: usize = 512;
 /// Number of shards for the word -> token-ids cache.
 const CACHE_SHARDS: usize = 128;
+/// Maximum time a loader waits for another process's model-repair lock.
+const HUB_MODEL_LOCK_WAIT: Duration = Duration::from_secs(60);
+/// Poll interval while waiting for a model repository's repair lock.
+const HUB_MODEL_LOCK_RETRY: Duration = Duration::from_millis(50);
 
 /// A loaded embedding model plus the identifier it was loaded from.
 pub struct EmbeddingModel {
@@ -679,6 +684,14 @@ fn hub_model_lock_path(cache_root: &Path, id: &str) -> PathBuf {
 }
 
 fn lock_hub_model_at(cache_root: &Path, id: &str) -> Result<std::fs::File> {
+    lock_hub_model_at_with_timeout(cache_root, id, HUB_MODEL_LOCK_WAIT)
+}
+
+fn lock_hub_model_at_with_timeout(
+    cache_root: &Path,
+    id: &str,
+    timeout: Duration,
+) -> Result<std::fs::File> {
     use fs4::fs_std::FileExt as _;
 
     let lock_path = hub_model_lock_path(cache_root, id);
@@ -694,9 +707,27 @@ fn lock_hub_model_at(cache_root: &Path, id: &str) -> Result<std::fs::File> {
         .truncate(false)
         .open(&lock_path)
         .with_context(|| format!("opening Hub model lock {}", lock_path.display()))?;
-    lock.lock_exclusive()
-        .with_context(|| format!("locking Hub model cache for {id:?}"))?;
-    Ok(lock)
+    let started = Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(true) => return Ok(lock),
+            Ok(false) => {
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
+                    return Err(anyhow!(
+                        "timed out after {timeout:?} waiting for Hub model cache lock for \
+                         {id:?} at {}; another process may be downloading or repairing this \
+                         model; wait for it to finish or stop the stalled process, then retry",
+                        lock_path.display()
+                    ));
+                }
+                std::thread::sleep(HUB_MODEL_LOCK_RETRY.min(timeout - elapsed));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("locking Hub model cache for {id:?}"));
+            }
+        }
+    }
 }
 
 fn with_hub_model_lock<T>(id: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -719,7 +750,10 @@ fn load_model_with_cache_coordination(id: &str) -> Result<EmbeddingModel> {
 
     // The Hub cache is shared across processes. Hold one repository-level
     // filesystem lock from resolution through validation and any repair so a
-    // concurrent loader cannot observe snapshot pointers being replaced.
+    // concurrent loader cannot observe snapshot pointers being replaced. The
+    // forced download remains inside the lock because hf-hub publishes each
+    // artifact pointer separately; bounded acquisition keeps a stalled loader
+    // from making every other process wait forever.
     with_hub_model_lock(id, || {
         let files = resolve_hub_model_files(id, false)?;
         load_model_with_refresh(id, &files, || refresh_model_files(id, &files))
@@ -848,6 +882,11 @@ fn refresh_model_files(id: &str, files: &ModelFiles) -> Result<Option<ModelFiles
 mod tests {
     use super::*;
 
+    const TEST_HUB_MODEL_LOCK_CACHE_ENV: &str = "TROUVE_TEST_HUB_MODEL_LOCK_CACHE";
+    const TEST_HUB_MODEL_LOCK_ID_ENV: &str = "TROUVE_TEST_HUB_MODEL_LOCK_ID";
+    const TEST_HUB_MODEL_LOCK_MARKER_ENV: &str = "TROUVE_TEST_HUB_MODEL_LOCK_MARKER";
+    const TEST_HUB_MODEL_LOCK_RELEASE_ENV: &str = "TROUVE_TEST_HUB_MODEL_LOCK_RELEASE";
+
     #[test]
     fn model_load_locks_serialize_per_id() {
         let first = model_load_lock("test-model-load-lock");
@@ -903,6 +942,100 @@ mod tests {
         fs4::fs_std::FileExt::unlock(&first).unwrap();
         assert!(second.try_lock_exclusive().unwrap());
         second.unlock().unwrap();
+    }
+
+    #[test]
+    fn hub_model_lock_process_helper() {
+        let Some(cache_root) = std::env::var_os(TEST_HUB_MODEL_LOCK_CACHE_ENV) else {
+            return;
+        };
+        let id = std::env::var(TEST_HUB_MODEL_LOCK_ID_ENV).unwrap();
+        let marker = PathBuf::from(std::env::var_os(TEST_HUB_MODEL_LOCK_MARKER_ENV).unwrap());
+        let release = PathBuf::from(std::env::var_os(TEST_HUB_MODEL_LOCK_RELEASE_ENV).unwrap());
+        let lock =
+            lock_hub_model_at_with_timeout(Path::new(&cache_root), &id, Duration::from_secs(2))
+                .unwrap();
+        std::fs::write(&marker, b"locked").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !release.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "parent never released held Hub model lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs4::fs_std::FileExt::unlock(&lock).unwrap();
+    }
+
+    #[test]
+    fn hub_model_lock_timeout_is_bounded_across_processes() {
+        let cache = tempfile::tempdir().unwrap();
+        let marker = cache.path().join("holder.locked");
+        let release = cache.path().join("holder.release");
+        let id = "owner/test-hub-model-lock-timeout";
+        let test_binary = std::env::current_exe().unwrap();
+        let mut command = std::process::Command::new(test_binary);
+        command
+            .arg("--exact")
+            .arg("embed::tests::hub_model_lock_process_helper")
+            .arg("--nocapture")
+            .env(TEST_HUB_MODEL_LOCK_CACHE_ENV, cache.path())
+            .env(TEST_HUB_MODEL_LOCK_ID_ENV, id)
+            .env(TEST_HUB_MODEL_LOCK_MARKER_ENV, &marker)
+            .env(TEST_HUB_MODEL_LOCK_RELEASE_ENV, &release)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut holder = trouve_process::spawn(&mut command).unwrap();
+
+        let marker_deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < marker_deadline,
+                "helper process never acquired the Hub model lock"
+            );
+            assert!(
+                holder.try_wait().unwrap().is_none(),
+                "helper process exited before publishing its lock marker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let cache_root = cache.path().to_path_buf();
+        let contender_id = id.to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let result = lock_hub_model_at_with_timeout(
+                &cache_root,
+                &contender_id,
+                Duration::from_millis(75),
+            )
+            .map(|lock| fs4::fs_std::FileExt::unlock(&lock).unwrap());
+            sender.send(result).unwrap();
+        });
+        let attempt = receiver.recv_timeout(Duration::from_secs(1));
+
+        std::fs::write(&release, b"release").unwrap();
+        let holder_status = holder.wait().unwrap();
+        contender.join().unwrap();
+
+        assert!(holder_status.success());
+        let error = attempt
+            .expect("lock acquisition exceeded its bounded timeout")
+            .expect_err("contender unexpectedly acquired a held process lock");
+        let message = format!("{error:#}");
+        assert!(message.contains("75ms"), "{message}");
+        assert!(message.contains(id), "{message}");
+        assert!(
+            message.contains(&hub_model_lock_path(cache.path(), id).display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("stalled process, then retry"), "{message}");
+
+        let retry = lock_hub_model_at_with_timeout(cache.path(), id, Duration::from_secs(1))
+            .expect("lock should be available after the holder exits");
+        fs4::fs_std::FileExt::unlock(&retry).unwrap();
     }
 
     /// WordLevel tokenizer with `words` in the vocabulary (plus [UNK] at 0).
