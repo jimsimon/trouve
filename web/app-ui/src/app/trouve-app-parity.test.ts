@@ -51,7 +51,9 @@ describe("root shell parity wiring", () => {
 
   it("renders new-session agent controls while catalog refreshes", () => {
     expect(source).toContain('name="mode"');
-    expect(source).toContain('name="thinking"');
+    expect(source).toContain("<trouve-model-options-editor");
+    expect(source).toContain(".controls=${newSessionModelOptions}");
+    expect(source).toContain("applyNewSessionModelOptionChange({");
     expect(source).toContain('name="permission_mode"');
     expect(source).toContain(
       'this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current)',
@@ -61,7 +63,8 @@ describe("root shell parity wiring", () => {
   it("keeps async new-session defaults synchronized with native select options", () => {
     expect(source).toContain('import { live } from "lit/directives/live.js"');
     expect(source).toContain(".selected=${live(mode.id === this.#newSessionModeId)}");
-    expect(source).toContain(".selected=${live(value === this.#newSessionThinking)}");
+    expect(source).toContain("const newSessionModelOptions = modelOptionControls(");
+    expect(source).toContain(".controls=${newSessionModelOptions}");
     expect(source).toContain(
       '.selected=${live(this.#newSessionPermissionMode === "ask")}',
     );
@@ -112,5 +115,27 @@ describe("root shell parity wiring", () => {
     expect(source).toContain('routeKey(readSignal(this.#router.route))');
     expect(source).toContain('if (!restoringDraft) void this.#loadNewSessionBranches');
     expect(source).toContain('this.querySelector<HTMLElement>("main.app-shell")?.focus()');
+  });
+
+  it("drops workspace-specific new-session options before asynchronous reloads", () => {
+    const handler = source.slice(
+      source.indexOf("readonly #selectNewSessionWorkspace"),
+      source.indexOf("readonly #closeNewSession"),
+    );
+    expect(handler).toContain('this.#newSessionModeId = "";');
+    expect(handler).toContain('this.#newSessionModelId = "";');
+    expect(handler).toContain("this.#newSessionModelOptions = {};");
+    expect(handler.indexOf("this.#newSessionModelOptions = {};")).toBeLessThan(
+      handler.indexOf("void this.#loadNewSessionOptions(workspaceId);"),
+    );
+  });
+
+  it("preserves new-session model options when a mode keeps the effective model", () => {
+    const start = source.indexOf("#reconcileNewSessionDefaults(models:");
+    const reconcile = source.slice(start, source.indexOf("\n  /**", start));
+    expect(reconcile).toContain("const previousModelId = resolveNewSessionModel(");
+    expect(reconcile).toContain("const nextModelId = resolveNewSessionModel(");
+    expect(reconcile).toContain("previousModelId === nextModelId");
+    expect(reconcile).toContain("sanitizeModelOptions(nextModel, this.#newSessionModelOptions)");
   });
 });

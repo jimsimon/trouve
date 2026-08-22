@@ -397,6 +397,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::ApprovalDecision,
         trouve_protocol::RestoreDirection,
         trouve_protocol::PermissionMode,
+        trouve_protocol::ModelOptionValue,
         trouve_protocol::AgentPersona,
         PersonaInfo,
         UpsertPersonaRequest,
@@ -1962,7 +1963,7 @@ async fn create_automation(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<UpsertAutomationRequest>,
 ) -> Result<Json<Automation>, ApiError> {
-    Ok(Json(engine.create_automation(req)?))
+    Ok(Json(engine.create_automation(req).await?))
 }
 
 #[utoipa::path(put, path = "/v1/automations/{id}", params(("id" = String, Path,)),
@@ -1974,7 +1975,7 @@ async fn update_automation(
     Path(id): Path<String>,
     Json(req): Json<UpsertAutomationRequest>,
 ) -> Result<Json<Automation>, ApiError> {
-    Ok(Json(engine.update_automation(&id, req)?))
+    Ok(Json(engine.update_automation(&id, req).await?))
 }
 
 #[utoipa::path(delete, path = "/v1/automations/{id}", params(("id" = String, Path,)),
@@ -1983,7 +1984,7 @@ async fn delete_automation(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.delete_automation(&id)?;
+    engine.delete_automation(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

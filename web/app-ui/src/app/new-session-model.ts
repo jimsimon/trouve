@@ -4,6 +4,13 @@ import type {
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
+import {
+  changeModelOption,
+  isThinkingModelOption,
+  sanitizeModelOptions,
+  type ModelOptionChangeDetail,
+  type ModelOptionValue,
+} from "../components/model-option-controls.js";
 
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
 export const NEW_SESSION_TITLE_FALLBACK = "New session";
@@ -219,6 +226,7 @@ export interface NewSessionOptionLoadState {
 
 export interface NewSessionSubmissionSnapshotInput {
   readonly selections: NewThreadOptionSelections;
+  readonly modelOptions: Readonly<Record<string, unknown>>;
   readonly edits: NewThreadOptionEdits;
   readonly modes: readonly ProtocolAgentPersona[];
   readonly providers: ProtocolProvidersResponse | null | undefined;
@@ -230,6 +238,7 @@ export interface NewSessionSubmissionSnapshotInput {
 
 export interface NewSessionSubmissionSnapshot extends NewThreadOptionSelections {
   readonly edits: NewThreadOptionEdits;
+  readonly modelOptions: Readonly<Record<string, unknown>>;
   readonly inheritedThinking: string | undefined;
   readonly inheritedPermissionMode: string | undefined;
   readonly modelInfo: ProtocolModelInfo | undefined;
@@ -247,6 +256,8 @@ export interface NewSessionThreadRequestInput {
   /** Effective inherited values shown by the form. Matching selections stay server-inherited. */
   readonly inheritedPermissionMode?: string | null;
   readonly inheritedThinking?: string | null;
+  /** Schema-driven scalar model overrides selected by the setup form. */
+  readonly modelOptions?: Readonly<Record<string, unknown>> | null;
   /** Metadata for the effective model whose thinking option is being overridden. */
   readonly modelInfo?: ProtocolModelInfo | null;
 }
@@ -501,6 +512,39 @@ export const createNewThreadOptionEdits = (): NewThreadOptionEdits => ({
   permission: false,
 });
 
+/** Apply an editor change while keeping the displayed effective thinking
+ * value separate from whether the request contains an explicit override. */
+export const applyNewSessionModelOptionChange = (input: {
+  readonly modelOptions: Readonly<Record<string, unknown>>;
+  readonly thinking: string;
+  readonly inheritedThinking: string | undefined;
+  readonly change: ModelOptionChangeDetail;
+  readonly defaults: Pick<ResolvedNewThreadDefaults, "thinking" | "inheritedThinking">;
+}): {
+  readonly modelOptions: Readonly<Record<string, unknown>>;
+  readonly thinking: string;
+  readonly inheritedThinking: string | undefined;
+  readonly thinkingEdit: boolean;
+} => {
+  const modelOptions = changeModelOption(input.modelOptions, input.change);
+  const thinkingChange = isThinkingModelOption(input.change.key);
+  const resetThinking = thinkingChange && input.change.value === undefined;
+  return {
+    modelOptions,
+    thinking: !thinkingChange
+      ? input.thinking
+      : resetThinking
+        ? input.defaults.thinking
+        : String(input.change.value),
+    inheritedThinking: !thinkingChange
+      ? input.inheritedThinking
+      : resetThinking
+        ? input.defaults.inheritedThinking
+        : undefined,
+    thinkingEdit: Object.keys(modelOptions).some(isThinkingModelOption),
+  };
+};
+
 export const createNewSessionOptionsLifecycle = (): NewSessionOptionsLifecycle => ({
   status: "unloaded",
   workspaceId: "",
@@ -598,12 +642,16 @@ export const snapshotNewSessionSubmission = (
     selectedMode,
     input.providers,
   );
+  const modelInfo = input.selectableModels.find((model) => model.id === effectiveModel);
   return Object.freeze({
     ...input.selections,
     edits: Object.freeze({ ...input.edits }),
+    modelOptions: Object.freeze({
+      ...sanitizeModelOptions(modelInfo, input.modelOptions),
+    }),
     inheritedThinking: input.inheritedThinking,
     inheritedPermissionMode: input.inheritedPermissionMode,
-    modelInfo: input.selectableModels.find((model) => model.id === effectiveModel),
+    modelInfo,
     optionsAuthoritative: input.optionsAuthoritative,
   });
 };
@@ -711,20 +759,23 @@ export const createNewSessionThreadRequest = (
   const inheritedPermission = validPermissionMode(input.inheritedPermissionMode);
   const permissionOverride = validPermission && permissionMode !== inheritedPermission;
 
-  const advertisedThinking = model === undefined || input.modelInfo?.id === model
-    ? thinkingOption(input.modelInfo)
-    : undefined;
+  const modelInfoMatches = model === undefined || input.modelInfo?.id === model;
+  const advertisedThinking = modelInfoMatches ? thinkingOption(input.modelInfo) : undefined;
   const thinking = nonEmpty(input.thinking);
   const inheritedThinking = nonEmpty(input.inheritedThinking);
-  const modelOptions = thinking !== undefined
+  const modelOptions: Record<string, ModelOptionValue> = modelInfoMatches
+    ? { ...sanitizeModelOptions(input.modelInfo, input.modelOptions ?? undefined) }
+    : {};
+  if (
+    thinking !== undefined
     && thinking !== inheritedThinking
     && advertisedThinking !== undefined
     && thinkingSelectionIsValid(advertisedThinking, thinking)
-    ? {
-        [advertisedThinking.key]:
-          advertisedThinking.budget === undefined ? thinking : Number(thinking),
-      }
-    : undefined;
+    && modelOptions[advertisedThinking.key] === undefined
+  ) {
+    modelOptions[advertisedThinking.key] =
+      advertisedThinking.budget === undefined ? thinking : Number(thinking);
+  }
 
   return {
     session_id: sessionId,
@@ -732,14 +783,14 @@ export const createNewSessionThreadRequest = (
     ...(mode === undefined ? {} : { mode }),
     ...(model === undefined ? {} : { model }),
     ...(permissionOverride ? { permission_mode: permissionMode } : {}),
-    ...(modelOptions === undefined ? {} : { model_options: modelOptions }),
+    ...(Object.keys(modelOptions).length === 0 ? {} : { model_options: modelOptions }),
   };
 };
 
 /**
  * Serialize authoritative selections plus any deliberate edits made while
- * catalog metadata was unavailable. Thinking edits also pin their model
- * because the option schema is model-specific.
+ * catalog metadata was unavailable. Model-option edits also pin their model
+ * because every option schema is model-specific.
  */
 export const createNewSessionThreadRequestFromSnapshot = (input: {
   readonly sessionId: string;
@@ -750,7 +801,8 @@ export const createNewSessionThreadRequestFromSnapshot = (input: {
   const includeMode = snapshot.optionsAuthoritative || snapshot.edits.mode;
   const includeModel = snapshot.optionsAuthoritative
     || snapshot.edits.model
-    || snapshot.edits.thinking;
+    || snapshot.edits.thinking
+    || Object.keys(snapshot.modelOptions).length > 0;
   // Permission is always serialized: in degraded mode there is no trustworthy
   // inherited value, so omitting the displayed choice could let the server use
   // a different (and potentially more permissive) default.
@@ -763,6 +815,7 @@ export const createNewSessionThreadRequestFromSnapshot = (input: {
     ...(includeModel ? { model: snapshot.modelId } : {}),
     ...(includePermission ? { permissionMode: snapshot.permissionMode } : {}),
     ...(includeThinking ? { thinking: snapshot.thinking } : {}),
+    modelOptions: snapshot.modelOptions,
     ...(snapshot.optionsAuthoritative
         && snapshot.inheritedPermissionMode !== undefined
       ? { inheritedPermissionMode: snapshot.inheritedPermissionMode }

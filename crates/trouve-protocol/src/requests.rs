@@ -5,6 +5,20 @@ use utoipa::ToSchema;
 
 use crate::{ApprovalDecision, CallId, SessionId, ThreadId, WorkspaceId};
 
+/// A scalar value accepted by a model's advertised options schema.
+///
+/// Protocol request/response structs retain `serde_json::Value` internally so
+/// arbitrary-precision JSON number tokens survive deserialization. Their
+/// OpenAPI fields use this type to advertise the narrower wire contract that
+/// the engine already enforces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum ModelOptionValue {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+}
+
 /// How tool calls are gated in a thread. See ADR 0004.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -303,6 +317,7 @@ pub struct CreateThreadRequest {
     pub model: Option<String>,
     /// Model-specific options validated against the model's options schema.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
@@ -356,6 +371,7 @@ pub struct Thread {
     /// Current values for the model's options (thinking level, etc.);
     /// clients render controls from the model's `options_schema`.
     #[serde(default)]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub permission_mode: PermissionMode,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -598,6 +614,7 @@ pub struct UpdateThreadRequest {
     pub model: Option<String>,
     /// Replaces the thread's model options when present.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, ModelOptionValue>>)]
     pub model_options: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
@@ -2984,6 +3001,12 @@ pub struct Automation {
     /// advertised option key when the turn starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Model-specific values selected from the model's `options_schema`.
+    /// `thinking_level` remains as a compatibility shorthand; values in this
+    /// object take precedence when both select the same model capability.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     /// Permission policy applied only to sessions created by this automation.
     /// Defaults to Ask; Yolo is an explicit unattended-execution opt-in.
     #[serde(default)]
@@ -3020,6 +3043,10 @@ pub struct UpsertAutomationRequest {
     /// clients preserves normal model/mode/global inheritance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Model-specific values selected from the model's `options_schema`.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     /// Permission policy for each fresh automation session. Omitted by older
     /// clients means Ask.
     #[serde(default)]

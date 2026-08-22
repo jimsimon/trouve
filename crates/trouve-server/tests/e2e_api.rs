@@ -4747,6 +4747,33 @@ impl Provider for FailingAutomationProvider {
         "automation-failure"
     }
 
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "automation-failure/test".into(),
+            display_name: "Automation failure test".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    },
+                    "fast": {"type": "boolean"},
+                    "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                    }
+                }
+            }),
+        }]
+    }
+
     async fn stream_chat(
         &self,
         _model: &str,
@@ -4796,6 +4823,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
             "workspace_id": workspace["id"],
             "permission_mode": "yolo",
             "thinking_level": "high",
+            "model_options": {"fast": true, "temperature": 0.4},
             "schedule": {"kind": "daily", "time": "09:00"},
             "enabled": false
         }))
@@ -4807,6 +4835,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .unwrap();
     assert_eq!(automation["permission_mode"], "yolo");
     assert_eq!(automation["thinking_level"], "high");
+    assert_eq!(automation["model_options"]["fast"], true);
     let automation_id = automation["id"].as_str().unwrap();
     let resp = client
         .post(format!("{base}/automations/{automation_id}/run"))
@@ -4856,7 +4885,9 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .unwrap();
     assert_eq!(threads.len(), 1);
     assert_eq!(threads[0]["permission_mode"], "yolo");
-    assert_eq!(threads[0]["model_options"]["thinking_level"], "high");
+    assert_eq!(threads[0]["model_options"]["reasoning_effort"], "high");
+    assert_eq!(threads[0]["model_options"]["fast"], true);
+    assert_eq!(threads[0]["model_options"]["temperature"], 0.4);
 }
 
 /// Session naming settings persist through the protocol, and missing model

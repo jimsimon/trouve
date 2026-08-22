@@ -6,6 +6,7 @@ import type {
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
 import {
+  applyNewSessionModelOptionChange,
   beginNewSessionSubmission,
   beginNewSessionOptionLoad,
   canSubmitNewSession,
@@ -584,6 +585,7 @@ describe("new session model", () => {
         thinking: "low",
         permissionMode: "ask",
       },
+      modelOptions: {},
       modes: [{ ...mode(), id: "review" }],
       providers: providers("provider/default"),
       selectableModels: [selectedModel],
@@ -626,6 +628,7 @@ describe("new session model", () => {
         thinking: "high",
         permissionMode: "yolo",
       },
+      modelOptions: {},
       modes: [mode("provider/fallback")],
       providers: providers("provider/fallback"),
       selectableModels: [model({}, "provider/fallback")],
@@ -653,6 +656,7 @@ describe("new session model", () => {
         thinking: "high",
         permissionMode: "ask",
       },
+      modelOptions: {},
       edits: { ...createNewThreadOptionEdits(), permission: true },
       modes: [mode("provider/fallback")],
       providers: providers("provider/fallback"),
@@ -669,6 +673,42 @@ describe("new session model", () => {
     })).toEqual({
       session_id: "session-1",
       title: "Fallback title",
+      permission_mode: "ask",
+    });
+  });
+
+  it("pins the model when degraded metadata retains model-specific options", () => {
+    const selectedModel = model({
+      properties: {
+        temperature: { type: "number", minimum: 0, maximum: 1 },
+      },
+    }, "provider/selected");
+    const snapshot = snapshotNewSessionSubmission({
+      selections: {
+        modeId: "code",
+        modelId: selectedModel.id,
+        thinking: "",
+        permissionMode: "ask",
+      },
+      modelOptions: { temperature: 0.25 },
+      edits: createNewThreadOptionEdits(),
+      modes: [mode(selectedModel.id)],
+      providers: providers(selectedModel.id),
+      selectableModels: [selectedModel],
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+      optionsAuthoritative: false,
+    });
+
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Thread",
+      snapshot,
+    })).toEqual({
+      session_id: "session-1",
+      title: "Thread",
+      model: selectedModel.id,
+      model_options: { temperature: 0.25 },
       permission_mode: "ask",
     });
   });
@@ -725,6 +765,7 @@ describe("new session model", () => {
         thinking: "",
         permissionMode: "ask",
       },
+      modelOptions: {},
       edits: createNewThreadOptionEdits(),
       modes: [mode()],
       providers: providers("provider/model"),
@@ -865,6 +906,85 @@ describe("new session model", () => {
     })).toEqual({
       session_id: "session-1",
       mode: "code",
+    });
+  });
+
+  it("restores inherited thinking provenance when an override returns to default", () => {
+    const reset = applyNewSessionModelOptionChange({
+      modelOptions: { effort: "low" },
+      thinking: "low",
+      inheritedThinking: undefined,
+      change: { key: "effort", value: undefined },
+      defaults: { thinking: "high", inheritedThinking: "high" },
+    });
+    expect(reset).toEqual({
+      modelOptions: {},
+      thinking: "high",
+      inheritedThinking: "high",
+      thinkingEdit: false,
+    });
+
+    const modelInfo = model({
+      properties: {
+        effort: { type: "string", enum: ["low", "high"], default: "low" },
+      },
+    });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      thinking: reset.thinking,
+      ...(reset.inheritedThinking === undefined
+        ? {}
+        : { inheritedThinking: reset.inheritedThinking }),
+      modelOptions: reset.modelOptions,
+      modelInfo,
+    })).toEqual({ session_id: "session-1" });
+  });
+
+  it("keeps unrelated model options without pinning reset thinking across refreshes", () => {
+    const reset = applyNewSessionModelOptionChange({
+      modelOptions: { effort: "low", temperature: 0.7 },
+      thinking: "low",
+      inheritedThinking: undefined,
+      change: { key: "effort", value: undefined },
+      defaults: { thinking: "high", inheritedThinking: "high" },
+    });
+    expect(reset).toEqual({
+      modelOptions: { temperature: 0.7 },
+      thinking: "high",
+      inheritedThinking: "high",
+      thinkingEdit: false,
+    });
+
+    const modelInfo = model({
+      properties: {
+        effort: { type: "string", enum: ["low", "high"], default: "low" },
+        temperature: { type: "number", minimum: 0, maximum: 1 },
+      },
+    });
+    const refreshed = reconcileNewThreadDefaults(
+      {
+        modeId: "code",
+        modelId: modelInfo.id,
+        thinking: reset.thinking,
+        permissionMode: "ask",
+      },
+      [{ ...mode(modelInfo.id), default_thinking_level: "low" }],
+      [modelInfo],
+      providers(modelInfo.id),
+      { ...createNewThreadOptionEdits(), thinking: reset.thinkingEdit },
+    );
+    expect(refreshed).toMatchObject({ thinking: "low", inheritedThinking: "low" });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      thinking: refreshed.thinking,
+      ...(refreshed.inheritedThinking === undefined
+        ? {}
+        : { inheritedThinking: refreshed.inheritedThinking }),
+      modelOptions: reset.modelOptions,
+      modelInfo,
+    })).toEqual({
+      session_id: "session-1",
+      model_options: { temperature: 0.7 },
     });
   });
 

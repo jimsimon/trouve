@@ -2087,9 +2087,10 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
   await page.goto("/");
   await replayHistory(page);
 
-  await expect(page.locator('select[aria-label="Thinking level"]')).toHaveValue("max");
-  await expect(page.locator('select[aria-label="Thinking level"] option:checked')).toHaveText("Max");
-  await expect(page.locator('select[aria-label="Context size"]')).toHaveValue("1m");
+  const thinking = page.getByRole("combobox", { name: "Reasoning effort", exact: true });
+  await expect(thinking).toHaveValue("max");
+  await expect(thinking.locator("option:checked")).toHaveText("Max");
+  await expect(page.getByRole("combobox", { name: "Context", exact: true })).toHaveValue("1m");
   await expect(page.locator(".conversation-turn")).toHaveCount(1);
   const agentCard = page.locator(".conversation-turn").first();
   await expect(agentCard).toHaveAccessibleName("Turn 7");

@@ -134,6 +134,12 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
         providers: [],
       },
       "GET /v1/models": [],
+      "GET /v1/personas": [{
+        id: "code",
+        display_name: "Engineer",
+        group: "general",
+        system_prompt: "Implement the user's request by editing files.",
+      }],
       "GET /v1/persona-infos": [
         {
           origin: "builtin",
@@ -310,10 +316,11 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
 
   const screen = page.locator("#new-session-screen");
   const persona = screen.locator('select[name="mode"]');
-  const thinking = screen.locator('select[name="thinking"]');
+  const thinking = screen.getByLabel("Reasoning effort");
   const permission = screen.locator('select[name="permission_mode"]');
   await expect(persona).toHaveValue("code");
-  await expect(thinking).toHaveValue("high");
+  await expect(thinking).toHaveValue("");
+  await expect(thinking.locator("option:checked")).toHaveText("Model default · High");
   await expect(permission).toHaveValue("yolo");
   await expect(screen.getByText("Unattended execution (YOLO) is dangerous"))
     .toBeVisible();
@@ -321,10 +328,15 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   // Reproduce the browser-side drift caused when option lists are replaced
   // after Lit cached the state value. A later render must repair the DOM even
   // though the application state itself has not changed.
-  await screen.locator('select[name="mode"], select[name="thinking"], select[name="permission_mode"]')
-    .evaluateAll((selects) => {
-      for (const select of selects) (select as HTMLSelectElement).selectedIndex = 0;
-    });
+  for (const [select, selectedIndex] of [
+    [persona, 0],
+    [thinking, 1],
+    [permission, 0],
+  ] as const) {
+    await select.evaluate((element, index) => {
+      (element as HTMLSelectElement).selectedIndex = index;
+    }, selectedIndex);
+  }
   await page.locator("trouve-app").evaluate(async (app) => {
     const reactive = app as HTMLElement & {
       requestUpdate(): void;
@@ -335,7 +347,8 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   });
 
   await expect(persona).toHaveValue("code");
-  await expect(thinking).toHaveValue("high");
+  await expect(thinking).toHaveValue("");
+  await expect(thinking.locator("option:checked")).toHaveText("Model default · High");
   await expect(permission).toHaveValue("yolo");
 });
 
@@ -743,7 +756,7 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   await modelPicker
     .getByRole("option", { name: "codex/gpt-5.6-sol", exact: true })
     .click();
-  const thinking = page.getByRole("combobox", { name: "Thinking", exact: true });
+  const thinking = page.getByRole("combobox", { name: "Reasoning effort", exact: true });
   await expect(thinking).toBeEnabled();
   await thinking.selectOption("max");
   await page.getByRole("button", { name: "Create", exact: true }).click();
@@ -751,23 +764,25 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   await expect.poll(() => requests.length).toBe(1);
   expect(requests[0]).toMatchObject({
     model: "codex/gpt-5.6-sol",
-    thinking_level: "max",
+    thinking_level: null,
+    model_options: { reasoning_effort: "max" },
   });
 
   await page.reload();
   await page.getByRole("button", { name: "Edit", exact: true }).click();
   await expect(page.getByRole("combobox", { name: "Automation model" }))
     .toContainText("codex/gpt-5.6-sol");
-  await expect(page.getByRole("combobox", { name: "Thinking", exact: true }))
+  await expect(page.getByRole("combobox", { name: "Reasoning effort", exact: true }))
     .toHaveValue("max");
-  await page.getByRole("combobox", { name: "Thinking", exact: true })
+  await page.getByRole("combobox", { name: "Reasoning effort", exact: true })
     .selectOption("ultra");
   await page.getByRole("button", { name: "Save", exact: true }).click();
 
   await expect.poll(() => requests.length).toBe(2);
   expect(requests[1]).toMatchObject({
     model: "codex/gpt-5.6-sol",
-    thinking_level: "ultra",
+    thinking_level: null,
+    model_options: { reasoning_effort: "ultra" },
   });
 });
 
