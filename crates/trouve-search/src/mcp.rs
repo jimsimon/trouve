@@ -4,8 +4,7 @@
 //! JSON-RPC 2.0 on stdin/stdout: `initialize`, `tools/list`, and `tools/call`
 //! for the `search` and `find_related` tools. Because index assembly is
 //! incremental (content-addressed store), repos are cheaply re-validated on
-//! every call after a cooldown, instead of upstream's full-rebuild staleness
-//! dance.
+//! every call after a cooldown.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};

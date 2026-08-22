@@ -4,6 +4,11 @@
 measured with [hyperfine](https://github.com/sharkdp/hyperfine) (end-to-end) and
 [criterion](https://github.com/bheisler/criterion.rs) (micro-benchmarks).
 
+These are historical measurements against Semble v0.4.1, before Semble
+v0.5.2 added partial reindexing. The Python incremental timings below do not
+describe current Semble; the original model and conditions are retained so
+the recorded results remain interpretable.
+
 Test machine: AMD Ryzen 9 5950X (16C/32T), 64 GB RAM, Linux, NVMe.
 Model: `minishlab/potion-code-16M`. Every timing below is a full CLI invocation
 (`trouve-search search <query> <repo> -k 5 --max-snippet-lines 0`), including process

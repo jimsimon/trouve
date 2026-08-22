@@ -1,11 +1,11 @@
 //! The Trouve index: incremental, content-addressed, multithreaded.
 //!
-//! Replaces upstream's all-or-nothing cached index (`semble/index/index.py` +
-//! `semble/cache.py`). Assembly works from a manifest of `(path, content key)`
-//! pairs: cached files load their chunks/embeddings/tokens from the shared
-//! store, missing files are parsed/chunked/tokenized in parallel with rayon
-//! and embedded in batches, and the BM25 corpus statistics are recomputed on
-//! every assembly (cheap relative to embedding).
+//! Assembly works from a manifest of `(path, content key)` pairs: identical
+//! manifests load from mmap snapshots, compatible changes patch the previous
+//! snapshot, and remaining cached files load from a store shared across
+//! branches and worktrees. Missing files are parsed/chunked/tokenized in
+//! parallel with rayon and embedded in batches, and the BM25 corpus statistics
+//! are recomputed on every assembly (cheap relative to embedding).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -766,7 +766,9 @@ fn compute_file_entries(
                 let n = entry.chunks.len();
                 entry.embeddings = embeddings[start * dim..(start + n) * dim].to_vec();
                 entry.dim = dim as u32;
-                let _ = store.put(key, entry);
+                if let Err(error) = store.put(key, entry) {
+                    eprintln!("warning: failed to write search cache entry {key}: {error:#}");
+                }
             });
     });
 

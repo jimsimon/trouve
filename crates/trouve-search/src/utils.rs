@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::types::{Chunk, SearchResult};
 
-pub const DEFAULT_MODEL_NAME: &str = "minishlab/potion-code-16M";
+pub const DEFAULT_MODEL_NAME: &str = "minishlab/potion-code-16M-v2";
 
 /// Warn (once per `deprecated` name, on stderr) that a semble-era name is
 /// deprecated and which trouve name replaces it.
