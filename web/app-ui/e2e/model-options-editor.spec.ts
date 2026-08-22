@@ -16,6 +16,7 @@ test("model-option choices preserve selected state and scalar value types", asyn
         key: "context_window",
         label: "Context window",
         description: "Maximum input context.",
+        overridden: true,
         choices: [
           { label: "300K", value: 300_000 },
           { label: "1M", value: 1_000_000 },
@@ -27,6 +28,7 @@ test("model-option choices preserve selected state and scalar value types", asyn
         key: "fast",
         label: "Fast mode",
         description: "Prefer low latency.",
+        overridden: true,
         choices: [
           { label: "Off", value: false },
           { label: "On", value: true },
@@ -38,6 +40,7 @@ test("model-option choices preserve selected state and scalar value types", asyn
         key: "thinking_budget_tokens",
         label: "Thinking budget",
         description: "Token budget for reasoning.",
+        overridden: true,
         scalarType: "integer",
         text: "8",
         hint: "between 4 and 16",
@@ -73,5 +76,14 @@ test("model-option choices preserve selected state and scalar value types", asyn
   )).toEqual([
     { key: "context_window", value: 300_000 },
     { key: "fast", value: true },
+  ]);
+
+  await context.selectOption({ label: "Model default · 1M" });
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges,
+  )).toEqual([
+    { key: "context_window", value: 300_000 },
+    { key: "fast", value: true },
+    { key: "context_window", value: undefined },
   ]);
 });

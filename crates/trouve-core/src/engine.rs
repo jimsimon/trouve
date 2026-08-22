@@ -1425,14 +1425,67 @@ fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> 
         || options.contains_key("thinking_budget_tokens")
 }
 
-fn schema_scalar_type(property: &serde_json::Value) -> Option<&str> {
+#[derive(Clone, Copy)]
+enum AdvertisedScalarType<'a> {
+    Unspecified,
+    Supported(&'a str),
+    Unsupported,
+}
+
+fn schema_scalar_type(property: &serde_json::Value) -> AdvertisedScalarType<'_> {
+    let supported = |kind| matches!(kind, "string" | "boolean" | "number" | "integer");
     match property.get("type") {
-        Some(serde_json::Value::String(kind)) if kind != "null" => Some(kind),
-        Some(serde_json::Value::Array(kinds)) => kinds
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .find(|kind| *kind != "null"),
-        _ => None,
+        None => AdvertisedScalarType::Unspecified,
+        Some(serde_json::Value::String(kind)) if supported(kind) => {
+            AdvertisedScalarType::Supported(kind)
+        }
+        Some(serde_json::Value::Array(kinds)) => {
+            let mut scalar = None;
+            for kind in kinds {
+                let Some(kind) = kind.as_str() else {
+                    return AdvertisedScalarType::Unsupported;
+                };
+                if kind == "null" {
+                    continue;
+                }
+                if scalar.is_some() || !supported(kind) {
+                    return AdvertisedScalarType::Unsupported;
+                }
+                scalar = Some(kind);
+            }
+            scalar.map_or(
+                AdvertisedScalarType::Unsupported,
+                AdvertisedScalarType::Supported,
+            )
+        }
+        _ => AdvertisedScalarType::Unsupported,
+    }
+}
+
+const UNSUPPORTED_MODEL_OPTION_SCHEMA_KEYWORDS: [&str; 13] = [
+    "multipleOf",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "allOf",
+    "anyOf",
+    "not",
+    "if",
+    "then",
+    "else",
+];
+
+fn advertised_bound(property: &serde_json::Value, key: &str) -> Result<Option<f64>, ()> {
+    match property.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or(())
+            .map(Some),
     }
 }
 
@@ -1481,6 +1534,29 @@ fn valid_choice_values(property: &serde_json::Value) -> Option<Vec<&serde_json::
     let choices = property
         .get("oneOf")
         .and_then(serde_json::Value::as_array)?;
+    if choices.iter().any(|choice| {
+        UNSUPPORTED_MODEL_OPTION_SCHEMA_KEYWORDS
+            .iter()
+            .any(|keyword| choice.get(*keyword).is_some())
+            || choice.get("minimum").is_some()
+            || choice.get("maximum").is_some()
+            || match (schema_scalar_type(choice), choice.get("const")) {
+                (AdvertisedScalarType::Unspecified, _) => false,
+                (AdvertisedScalarType::Unsupported, _) => true,
+                (AdvertisedScalarType::Supported("string"), Some(value)) => !value.is_string(),
+                (AdvertisedScalarType::Supported("boolean"), Some(value)) => !value.is_boolean(),
+                (AdvertisedScalarType::Supported("number"), Some(value)) => {
+                    !value.as_f64().is_some_and(f64::is_finite)
+                }
+                (AdvertisedScalarType::Supported("integer"), Some(value)) => !value
+                    .as_f64()
+                    .is_some_and(|number| number.is_finite() && number.fract() == 0.0),
+                (AdvertisedScalarType::Supported(_), None) => true,
+                (AdvertisedScalarType::Supported(_), Some(_)) => true,
+            }
+    }) {
+        return None;
+    }
     let values: Vec<_> = choices
         .iter()
         .filter_map(|choice| choice.get("const"))
@@ -1527,6 +1603,24 @@ fn validate_model_options(
                 "model option {key} cannot be overridden"
             )));
         }
+        if UNSUPPORTED_MODEL_OPTION_SCHEMA_KEYWORDS
+            .iter()
+            .any(|keyword| property.get(*keyword).is_some())
+        {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} uses unsupported advertised constraints"
+            )));
+        }
+        let minimum = advertised_bound(property, "minimum").map_err(|()| {
+            EngineError::BadRequest(format!(
+                "model option {key} has a malformed advertised minimum"
+            ))
+        })?;
+        let maximum = advertised_bound(property, "maximum").map_err(|()| {
+            EngineError::BadRequest(format!(
+                "model option {key} has a malformed advertised maximum"
+            ))
+        })?;
         if !matches!(
             value,
             serde_json::Value::String(_)
@@ -1548,19 +1642,24 @@ fn validate_model_options(
         let matches_choice = choice_values
             .as_ref()
             .is_some_and(|values| values.contains(&value));
-        let typed = match schema_scalar_type(property) {
-            Some("string") => value.is_string(),
-            Some("boolean") => value.is_boolean(),
-            Some("number") => value.as_f64().is_some_and(f64::is_finite),
-            Some("integer") => value
+        let scalar_type = schema_scalar_type(property);
+        let typed = match scalar_type {
+            AdvertisedScalarType::Supported("string") => value.is_string(),
+            AdvertisedScalarType::Supported("boolean") => value.is_boolean(),
+            AdvertisedScalarType::Supported("number") => value.as_f64().is_some_and(f64::is_finite),
+            AdvertisedScalarType::Supported("integer") => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && number.fract() == 0.0),
             _ => false,
         };
-        let valid_type = if schema_scalar_type(property).is_some() {
-            typed
-        } else {
-            choice_values.is_some()
+        let valid_type = match scalar_type {
+            AdvertisedScalarType::Supported(_) => typed,
+            AdvertisedScalarType::Unspecified => choice_values.is_some(),
+            AdvertisedScalarType::Unsupported => {
+                return Err(EngineError::BadRequest(format!(
+                    "model option {key} has an unsupported advertised scalar type"
+                )));
+            }
         };
         if !valid_type {
             return Err(EngineError::BadRequest(format!(
@@ -1574,20 +1673,12 @@ fn validate_model_options(
             )));
         }
         if let Some(number) = value.as_f64() {
-            if property
-                .get("minimum")
-                .and_then(serde_json::Value::as_f64)
-                .is_some_and(|minimum| number < minimum)
-            {
+            if minimum.is_some_and(|minimum| number < minimum) {
                 return Err(EngineError::BadRequest(format!(
                     "model option {key} is below its advertised minimum"
                 )));
             }
-            if property
-                .get("maximum")
-                .and_then(serde_json::Value::as_f64)
-                .is_some_and(|maximum| number > maximum)
-            {
+            if maximum.is_some_and(|maximum| number > maximum) {
                 return Err(EngineError::BadRequest(format!(
                     "model option {key} is above its advertised maximum"
                 )));
@@ -4207,7 +4298,7 @@ impl Engine {
         &self,
         req: trouve_protocol::UpsertAutomationRequest,
     ) -> Result<trouve_protocol::Automation, EngineError> {
-        self.validate_automation(&req).await?;
+        let model_options = self.validate_automation(&req).await?;
         let next_run_at = if req.enabled {
             crate::automations::next_run(&req.schedule, chrono::Local::now())
                 .map(|t| t.to_rfc3339())
@@ -4222,7 +4313,7 @@ impl Engine {
             mode: req.mode,
             model: req.model,
             thinking_level: req.thinking_level,
-            model_options: req.model_options,
+            model_options,
             permission_mode: req.permission_mode,
             schedule: req.schedule,
             enabled: req.enabled,
@@ -4241,18 +4332,33 @@ impl Engine {
         id: &str,
         req: trouve_protocol::UpsertAutomationRequest,
     ) -> Result<trouve_protocol::Automation, EngineError> {
-        self.validate_automation(&req).await?;
         let mut automation = self
             .store
             .automation(id)?
             .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        let pausing_only = automation.enabled
+            && !req.enabled
+            && automation.name == req.name
+            && automation.prompt == req.prompt
+            && automation.workspace_id == req.workspace_id
+            && automation.mode == req.mode
+            && automation.model == req.model
+            && automation.thinking_level == req.thinking_level
+            && automation.model_options == req.model_options
+            && automation.permission_mode == req.permission_mode
+            && automation.schedule == req.schedule;
+        let model_options = if pausing_only {
+            req.model_options.clone()
+        } else {
+            self.validate_automation(&req).await?
+        };
         automation.name = req.name;
         automation.prompt = req.prompt;
         automation.workspace_id = req.workspace_id;
         automation.mode = req.mode;
         automation.model = req.model;
         automation.thinking_level = req.thinking_level;
-        automation.model_options = req.model_options;
+        automation.model_options = model_options;
         automation.permission_mode = req.permission_mode;
         automation.schedule = req.schedule;
         automation.enabled = req.enabled;
@@ -4276,7 +4382,7 @@ impl Engine {
     async fn validate_automation(
         &self,
         req: &trouve_protocol::UpsertAutomationRequest,
-    ) -> Result<(), EngineError> {
+    ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
         if req.name.trim().is_empty() {
             return Err(EngineError::BadRequest("automations need a name".into()));
         }
@@ -4299,16 +4405,17 @@ impl Engine {
         if let Some(complaint) = crate::automations::validate(&req.schedule) {
             return Err(EngineError::BadRequest(complaint));
         }
-        self.validated_automation_model_options(
-            &workspace,
-            req.mode.as_deref(),
-            req.model.as_deref(),
-            req.thinking_level.as_deref(),
-            &req.model_options,
-            false,
-        )
-        .await?;
-        Ok(())
+        let (_, options) = self
+            .validated_automation_model_options(
+                &workspace,
+                req.mode.as_deref(),
+                req.model.as_deref(),
+                req.thinking_level.as_deref(),
+                &req.model_options,
+                false,
+            )
+            .await?;
+        Ok(options)
     }
 
     async fn validated_automation_model_options(
@@ -4319,11 +4426,11 @@ impl Engine {
         legacy_thinking_level: Option<&str>,
         requested_options: &serde_json::Map<String, serde_json::Value>,
         validate_legacy_only: bool,
-    ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+    ) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>), EngineError> {
         if requested_options.is_empty()
             && (!validate_legacy_only || legacy_thinking_level.is_none())
         {
-            return Ok(serde_json::Map::new());
+            return Ok((None, serde_json::Map::new()));
         }
         let all_modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
         let mode_id = requested_mode.unwrap_or("code");
@@ -4346,7 +4453,7 @@ impl Engine {
         }
         normalize_thinking_option(&mut options, Some(&model));
         validate_model_options(&options, &model)?;
-        Ok(options)
+        Ok((Some(model.id.clone()), options))
     }
 
     /// Fire an automation immediately, in the background (creating the
@@ -4489,7 +4596,7 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::NotFound(format!("workspace {}", automation.workspace_id))
             })?;
-        let model_options = self
+        let (validated_model, model_options) = self
             .automation_model_options_for_fire(&workspace, automation)
             .await?;
         let session = self
@@ -4510,7 +4617,10 @@ impl Engine {
             session_id: session.id.clone(),
             title: Some(automation.name.clone()),
             mode: automation.mode.clone(),
-            model: automation.model.clone(),
+            // Pin the exact model whose option schema was validated. Without
+            // this explicit value, a concurrent default change could make
+            // `create_thread` resolve a different model.
+            model: validated_model.or_else(|| automation.model.clone()),
             model_options,
             // Scoped to this fresh run session; it does not change global
             // mode defaults or carry approvals into future runs.
@@ -4530,7 +4640,7 @@ impl Engine {
         &self,
         workspace: &trouve_protocol::Workspace,
         automation: &trouve_protocol::Automation,
-    ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+    ) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>), EngineError> {
         match self
             .validated_automation_model_options(
                 workspace,
@@ -4542,23 +4652,26 @@ impl Engine {
             )
             .await
         {
-            Ok(options) => Ok(options),
+            Ok(validated) => Ok(validated),
             Err(error) if automation.model_options.is_empty() => {
                 tracing::warn!(
                     automation_id = %automation.id,
                     %error,
                     "deferring legacy automation thinking validation until its turn"
                 );
-                Ok(automation
-                    .thinking_level
-                    .as_ref()
-                    .map(|level| {
-                        serde_json::Map::from_iter([(
-                            "thinking_level".into(),
-                            serde_json::Value::String(level.clone()),
-                        )])
-                    })
-                    .unwrap_or_default())
+                Ok((
+                    None,
+                    automation
+                        .thinking_level
+                        .as_ref()
+                        .map(|level| {
+                            serde_json::Map::from_iter([(
+                                "thinking_level".into(),
+                                serde_json::Value::String(level.clone()),
+                            )])
+                        })
+                        .unwrap_or_default(),
+                ))
             }
             Err(error) => Err(error),
         }
@@ -19387,7 +19500,13 @@ mod tests {
             options_schema: if id.ends_with("/static") {
                 serde_json::json!({
                     "type": "object",
-                    "properties": {"fast": {"type": "boolean"}}
+                    "properties": {
+                        "fast": {"type": "boolean"},
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": ["low", "high"]
+                        }
+                    }
                 })
             } else {
                 serde_json::json!({})
@@ -25182,7 +25301,11 @@ default_permission_mode = "ask"
                     },
                     "missing_schema": {"description": "No scalar contract"},
                     "locked": {"type": "string", "readOnly": true},
-                    "constant": {"type": "string", "const": "owned"}
+                    "constant": {"type": "string", "const": "owned"},
+                    "nullable": {"type": ["string", "null"]},
+                    "ambiguous": {"type": ["string", "number"]},
+                    "patterned": {"type": "string", "pattern": "^[a-z]+$"},
+                    "stepped": {"type": "number", "multipleOf": 0.5}
                 }
             }),
         };
@@ -25192,6 +25315,7 @@ default_permission_mode = "ask"
             ("fast".into(), serde_json::json!(true)),
             ("context".into(), serde_json::json!("long")),
             ("mixed".into(), serde_json::json!(1)),
+            ("nullable".into(), serde_json::json!("value")),
         ]);
         assert!(validate_model_options(&valid, &model).is_ok());
 
@@ -25221,6 +25345,9 @@ default_permission_mode = "ask"
             serde_json::json!({"fast": {"nested": true}}),
             serde_json::json!({"locked": "override"}),
             serde_json::json!({"constant": "override"}),
+            serde_json::json!({"ambiguous": "value"}),
+            serde_json::json!({"patterned": "UPPER"}),
+            serde_json::json!({"stepped": 0.25}),
         ] {
             let options = invalid.as_object().unwrap();
             assert!(
@@ -25257,8 +25384,135 @@ default_permission_mode = "ask"
                 )
                 .await
                 .unwrap(),
-            serde_json::Map::new()
+            (None, serde_json::Map::new())
         );
+    }
+
+    #[tokio::test]
+    async fn automation_mutations_persist_normalized_model_options() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_normalized_automation".into(),
+            name: "normalized".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let engine = Engine::new(store.clone(), data.path().to_path_buf(), &Config::default())
+            .with_config_dir(None)
+            .with_provider(
+                "catalog-test",
+                Arc::new(CatalogTestProvider {
+                    live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+            )
+            .with_default_model("catalog-test/static");
+        let mut request = trouve_protocol::UpsertAutomationRequest {
+            name: "Normalized options".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id,
+            mode: None,
+            model: None,
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([(
+                "thinking_level".into(),
+                serde_json::json!("high"),
+            )]),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+        };
+
+        let created = engine.create_automation(request.clone()).await.unwrap();
+        assert_eq!(
+            created.model_options,
+            serde_json::Map::from_iter([("reasoning_effort".into(), serde_json::json!("high"))])
+        );
+        request
+            .model_options
+            .insert("thinking_level".into(), serde_json::json!("low"));
+        let updated = engine
+            .update_automation(&created.id, request)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.model_options,
+            serde_json::Map::from_iter([("reasoning_effort".into(), serde_json::json!("low"))])
+        );
+        assert_eq!(
+            store
+                .automation(&created.id)
+                .unwrap()
+                .unwrap()
+                .model_options,
+            updated.model_options
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_only_automation_updates_do_not_require_model_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_retired_automation".into(),
+            name: "retired".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let automation = trouve_protocol::Automation {
+            id: "auto_retired_model".into(),
+            name: "Retired model".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id,
+            mode: None,
+            model: Some("retired/model".into()),
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([(
+                "removed_option".into(),
+                serde_json::json!(true),
+            )]),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.insert_automation(&automation).unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &Config::default())
+            .with_config_dir(None)
+            .with_default_model("unconfigured/model");
+        let request = trouve_protocol::UpsertAutomationRequest {
+            name: automation.name.clone(),
+            prompt: automation.prompt.clone(),
+            workspace_id: automation.workspace_id.clone(),
+            mode: automation.mode.clone(),
+            model: automation.model.clone(),
+            thinking_level: automation.thinking_level.clone(),
+            model_options: automation.model_options.clone(),
+            permission_mode: automation.permission_mode,
+            schedule: automation.schedule.clone(),
+            enabled: false,
+        };
+
+        let updated = engine
+            .update_automation(&automation.id, request)
+            .await
+            .unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.model_options, automation.model_options);
     }
 
     #[tokio::test]
@@ -25305,7 +25559,10 @@ default_permission_mode = "ask"
                 .automation_model_options_for_fire(&workspace, &automation)
                 .await
                 .unwrap(),
-            serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))])
+            (
+                None,
+                serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))])
+            )
         );
 
         automation
@@ -25338,12 +25595,12 @@ default_permission_mode = "ask"
             path: data.path().display().to_string(),
         };
         let options = serde_json::Map::from_iter([("fast".into(), serde_json::json!(true))]);
-        assert!(
-            engine
-                .validated_automation_model_options(&workspace, None, None, None, &options, true,)
-                .await
-                .is_ok()
-        );
+        let (validated_model, validated_options) = engine
+            .validated_automation_model_options(&workspace, None, None, None, &options, true)
+            .await
+            .unwrap();
+        assert_eq!(validated_model.as_deref(), Some("catalog-test/static"));
+        assert_eq!(validated_options, options);
 
         engine.set_default_model("catalog-test/live", None).unwrap();
         assert!(

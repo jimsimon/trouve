@@ -7,6 +7,7 @@ interface ModelOptionControlBase {
   readonly key: string;
   readonly label: string;
   readonly description: string;
+  readonly overridden: boolean;
 }
 
 export interface ChoiceModelOptionControl extends ModelOptionControlBase {
@@ -63,29 +64,61 @@ const scalar = (value: unknown): value is ModelOptionValue =>
   || typeof value === "number" && Number.isFinite(value)
   || typeof value === "boolean";
 
+type AdvertisedScalarType = ModelOptionScalarType | "boolean";
+
 const scalarType = (
   property: Readonly<Record<string, unknown>>,
-): ModelOptionScalarType | undefined => {
+): AdvertisedScalarType | null | undefined => {
   const advertised = property["type"];
+  if (advertised === undefined) return undefined;
   const names = typeof advertised === "string"
     ? [advertised]
     : Array.isArray(advertised)
-      ? advertised.filter((name): name is string => typeof name === "string")
-      : [];
-  const name = names.find((candidate) => candidate !== "null");
-  return name === "string" || name === "number" || name === "integer"
+      && advertised.every((name): name is string => typeof name === "string")
+      ? advertised
+      : undefined;
+  if (names === undefined) return null;
+  const nonNull = names.filter((candidate) => candidate !== "null");
+  if (nonNull.length !== 1) return null;
+  const name = nonNull[0];
+  return name === "string" || name === "number" || name === "integer" || name === "boolean"
     ? name
-    : undefined;
+    : null;
 };
 
-const hasType = (
+const UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
+  "multipleOf",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "format",
+  "allOf",
+  "anyOf",
+  "not",
+  "if",
+  "then",
+  "else",
+]);
+
+const hasUnsupportedConstraints = (
   property: Readonly<Record<string, unknown>>,
-  expected: string,
-): boolean => {
-  const advertised = property["type"];
-  return advertised === expected
-    || Array.isArray(advertised) && advertised.includes(expected);
-};
+): boolean => [...UNSUPPORTED_SCHEMA_KEYWORDS].some((key) =>
+  Object.prototype.hasOwnProperty.call(property, key)
+) || ["minimum", "maximum"].some((key) =>
+  Object.prototype.hasOwnProperty.call(property, key)
+  && (typeof property[key] !== "number" || !Number.isFinite(property[key]))
+);
+
+const matchesScalarType = (type: AdvertisedScalarType, value: unknown): boolean =>
+  type === "string"
+    ? typeof value === "string"
+    : type === "boolean"
+      ? typeof value === "boolean"
+      : typeof value === "number"
+        && Number.isFinite(value)
+        && (type !== "integer" || Number.isInteger(value));
 
 const humanize = (token: string): string => {
   const words = token.replaceAll("_", " ").replaceAll("-", " ");
@@ -156,7 +189,16 @@ const choiceValues = (
   for (const candidate of oneOf) {
     const entry = asRecord(candidate);
     const value = entry?.["const"];
-    if (entry === undefined || !scalar(value)) return undefined;
+    const entryType = entry === undefined ? null : scalarType(entry);
+    if (
+      entry === undefined
+      || !scalar(value)
+      || entryType === null
+      || entryType !== undefined && !matchesScalarType(entryType, value)
+      || hasUnsupportedConstraints(entry)
+      || Object.prototype.hasOwnProperty.call(entry, "minimum")
+      || Object.prototype.hasOwnProperty.call(entry, "maximum")
+    ) return undefined;
     choices.push({
       value,
       label: typeof entry["title"] === "string"
@@ -187,17 +229,23 @@ const optionHint = (property: Readonly<Record<string, unknown>>): string => {
 const storedOption = (
   options: Readonly<Record<string, unknown>>,
   key: string,
-): unknown => {
-  if (Object.prototype.hasOwnProperty.call(options, key)) return options[key];
+): { readonly value: unknown; readonly overridden: boolean } => {
+  if (Object.prototype.hasOwnProperty.call(options, key)) {
+    return { value: options[key], overridden: true };
+  }
   const thinkingKeys = [...THINKING_KEYS].filter((candidate) =>
     candidate !== key && (key === "thinking_level" || candidate !== "thinking_level")
   );
   if (thinkingKeys.some((candidate) => Object.prototype.hasOwnProperty.call(options, candidate))) {
-    return undefined;
+    return { value: undefined, overridden: false };
   }
-  return key !== "thinking_level" && THINKING_KEYS.has(key)
-    ? options["thinking_level"]
-    : undefined;
+  const inheritedKey = key !== "thinking_level"
+    && THINKING_KEYS.has(key)
+    && Object.prototype.hasOwnProperty.call(options, "thinking_level");
+  return {
+    value: inheritedKey ? options["thinking_level"] : undefined,
+    overridden: inheritedKey,
+  };
 };
 
 const validTextValue = (
@@ -228,11 +276,14 @@ export const modelOptionControls = (
 
   for (const [key, advertised] of Object.entries(properties)) {
     const property = asRecord(advertised);
+    const advertisedType = property === undefined ? null : scalarType(property);
     if (
       property === undefined
       || property["readOnly"] === true
       || Object.prototype.hasOwnProperty.call(property, "const")
       || (Array.isArray(property["enum"]) && property["enum"].length <= 1)
+      || advertisedType === null
+      || hasUnsupportedConstraints(property)
     ) continue;
     const label = typeof property["title"] === "string"
       ? property["title"]
@@ -242,44 +293,11 @@ export const modelOptionControls = (
       : "";
     const stored = storedOption(current, key);
     const selected = key === "thinking_budget_tokens"
-      && typeof stored === "string"
-      && stored.trim() !== ""
-      ? Number(stored)
-      : stored;
+      && typeof stored.value === "string"
+      && stored.value.trim() !== ""
+      ? Number(stored.value)
+      : stored.value;
     const defaultValue = property["default"];
-    const choices = choiceValues(property);
-    if (
-      choices === undefined
-      && (Object.prototype.hasOwnProperty.call(property, "enum")
-        || Object.prototype.hasOwnProperty.call(property, "oneOf"))
-    ) continue;
-    if (choices !== undefined) {
-      const selectedIndex = choices.findIndex(({ value }) => Object.is(value, selected));
-      const defaultIndex = choices.findIndex(({ value }) => Object.is(value, defaultValue));
-      controls.push({
-        kind: "choice",
-        key,
-        label,
-        description,
-        choices,
-        selectedIndex: selectedIndex >= 0 ? selectedIndex : defaultIndex,
-      });
-      continue;
-    }
-    if (hasType(property, "boolean")) {
-      controls.push({
-        kind: "boolean",
-        key,
-        label,
-        description,
-        selected: typeof selected === "boolean"
-          ? selected
-          : defaultValue === true,
-      });
-      continue;
-    }
-    const type = scalarType(property);
-    if (type === undefined) continue;
     const minimum = typeof property["minimum"] === "number"
       && Number.isFinite(property["minimum"])
       ? property["minimum"]
@@ -288,6 +306,47 @@ export const modelOptionControls = (
       && Number.isFinite(property["maximum"])
       ? property["maximum"]
       : undefined;
+    const choices = choiceValues(property);
+    if (
+      choices === undefined
+      && (Object.prototype.hasOwnProperty.call(property, "enum")
+        || Object.prototype.hasOwnProperty.call(property, "oneOf"))
+    ) continue;
+    if (choices !== undefined) {
+      const editableChoices = choices.filter(({ value }) =>
+        (advertisedType === undefined || matchesScalarType(advertisedType, value))
+        && (typeof value !== "number" || minimum === undefined || value >= minimum)
+        && (typeof value !== "number" || maximum === undefined || value <= maximum)
+      );
+      if (editableChoices.length <= 1) continue;
+      const selectedIndex = editableChoices.findIndex(({ value }) => Object.is(value, selected));
+      const defaultIndex = editableChoices.findIndex(({ value }) => Object.is(value, defaultValue));
+      controls.push({
+        kind: "choice",
+        key,
+        label,
+        description,
+        overridden: stored.overridden && selectedIndex >= 0,
+        choices: editableChoices,
+        selectedIndex: selectedIndex >= 0 ? selectedIndex : defaultIndex,
+      });
+      continue;
+    }
+    if (advertisedType === "boolean") {
+      controls.push({
+        kind: "boolean",
+        key,
+        label,
+        description,
+        overridden: stored.overridden && typeof selected === "boolean",
+        selected: typeof selected === "boolean"
+          ? selected
+          : defaultValue === true,
+      });
+      continue;
+    }
+    const type = advertisedType;
+    if (type === undefined) continue;
     const value = validTextValue(type, selected, minimum, maximum)
       ? selected
       : validTextValue(type, defaultValue, minimum, maximum)
@@ -298,6 +357,7 @@ export const modelOptionControls = (
       key,
       label,
       description,
+      overridden: stored.overridden && validTextValue(type, selected, minimum, maximum),
       scalarType: type,
       text: optionText(value),
       hint: optionHint(property),

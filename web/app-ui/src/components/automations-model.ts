@@ -217,6 +217,30 @@ export const automationRequestFromDraft = (
   };
 };
 
+/** Rebuild a full PUT body from the latest stored automation while changing
+ * only its lifecycle state. Persisted options stay byte-for-byte semantic
+ * equivalents even when their model is no longer present in the live catalog. */
+export const automationEnabledRequest = (
+  automation: ProtocolAutomation,
+  enabled: boolean,
+): ProtocolUpsertAutomationRequest => ({
+    name: automation.name,
+    prompt: automation.prompt,
+    workspace_id: automation.workspace_id,
+    mode: automation.mode ?? null,
+    model: automation.model ?? null,
+    thinking_level: automation.thinking_level ?? null,
+    model_options: { ...(automation.model_options ?? {}) },
+    permission_mode: permissionMode(automation.permission_mode),
+    schedule: {
+      kind: automation.schedule.kind,
+      minute: automation.schedule.minute ?? 0,
+      time: automation.schedule.time ?? "",
+      days: [...(automation.schedule.days ?? [])],
+    },
+    enabled,
+  });
+
 export const automationScheduleSummary = (
   schedule: ProtocolAutomationSchedule,
 ): string => {
