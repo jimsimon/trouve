@@ -71,8 +71,7 @@ describe("pull request dashboard model", () => {
       state: "merged",
       merged_at: "2026-07-17T11:00:00Z",
     }), "viewer", now)).toBeUndefined();
-    expect(classifyPullRequest(pr({ state: "closed" }), "viewer", now))
-      .toBe("recently-closed");
+    expect(classifyPullRequest(pr({ state: "closed" }), "viewer", now)).toBe("closed");
   });
 
   it("preserves conflict priority while keeping conflicted drafts in Drafts", () => {
@@ -125,7 +124,7 @@ describe("pull request dashboard model", () => {
       "pending-review",
       "needs-attention",
       "recently-merged",
-      "recently-closed",
+      "closed",
     ]);
     expect(movePullRequestGroup(reconciled.order, "drafts", -1).slice(0, 2))
       .toEqual(["drafts", "ready-to-merge"]);
