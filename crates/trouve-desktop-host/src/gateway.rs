@@ -832,16 +832,25 @@ async fn install_desktop_update(
     validate_mutation(&state, request.headers())?;
     require_desktop_updater(&state)?;
     require_empty_action_body(request).await?;
-    let _permit = state
+    let permit = state
         .desktop_update_permit
         .clone()
         .try_acquire_owned()
         .map_err(|_| GatewayRejection::Busy)?;
+    // Installation is a host-owned operation. Acknowledge its start promptly
+    // and let clients observe the authoritative state through the status
+    // endpoint instead of tying native replacement to an HTTP connection.
     let update = state
         .native_actions
-        .install_desktop_update()
-        .await
+        .desktop_update_status()
         .map_err(|_| GatewayRejection::Internal)?;
+    let native_actions = state.native_actions.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(error) = native_actions.install_desktop_update().await {
+            tracing::error!(%error, "desktop update operation failed");
+        }
+    });
     json_no_store(update)
 }
 
@@ -2448,7 +2457,8 @@ mod tests {
             message: "Version 4.1.0 is ready to install.".into(),
             progress_percent: None,
         };
-        let status_reader = status.clone();
+        let operation_status = Arc::new(Mutex::new(status.clone()));
+        let status_reader = Arc::clone(&operation_status);
         let checked = status.clone();
         let installed = DesktopUpdateState {
             phase: DesktopUpdatePhase::Restarting,
@@ -2456,16 +2466,30 @@ mod tests {
             progress_percent: Some(100),
             ..status.clone()
         };
+        let install_started = Arc::new(tokio::sync::Notify::new());
+        let install_release = Arc::new(tokio::sync::Notify::new());
+        let install_status = Arc::clone(&operation_status);
+        let install_started_for_action = Arc::clone(&install_started);
+        let install_release_for_action = Arc::clone(&install_release);
         let app = gateway()
             .with_native_actions(HostNativeActions::default().with_desktop_updater(
-                move || Ok(status_reader.clone()),
+                move || Ok(status_reader.lock().unwrap().clone()),
                 move || {
                     let checked = checked.clone();
                     async move { Ok(checked) }
                 },
                 move || {
                     let installed = installed.clone();
-                    async move { Ok(installed) }
+                    let install_status = Arc::clone(&install_status);
+                    let install_started = Arc::clone(&install_started_for_action);
+                    let install_release = Arc::clone(&install_release_for_action);
+                    async move {
+                        install_status.lock().unwrap().phase = DesktopUpdatePhase::Installing;
+                        install_started.notify_one();
+                        install_release.notified().await;
+                        *install_status.lock().unwrap() = installed.clone();
+                        Ok(installed)
+                    }
                 },
             ))
             .router();
@@ -2519,7 +2543,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response_json::<DesktopUpdateState>(checked).await, status);
-        let installed = app
+        let accepted = app
+            .clone()
             .oneshot(action_request(
                 DESKTOP_UPDATE_INSTALL_PATH,
                 &bootstrap.csrf_token,
@@ -2527,9 +2552,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            response_json::<DesktopUpdateState>(installed).await.phase,
-            DesktopUpdatePhase::Restarting
+            response_json::<DesktopUpdateState>(accepted).await.phase,
+            DesktopUpdatePhase::Available
         );
+        tokio::time::timeout(Duration::from_secs(1), install_started.notified())
+            .await
+            .unwrap();
+        let busy = app
+            .clone()
+            .oneshot(action_request(
+                DESKTOP_UPDATE_INSTALL_PATH,
+                &bootstrap.csrf_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+        install_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let current = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(DESKTOP_UPDATE_PATH)
+                            .header(HOST, "127.0.0.1:43127")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if response_json::<DesktopUpdateState>(current).await.phase
+                    == DesktopUpdatePhase::Restarting
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

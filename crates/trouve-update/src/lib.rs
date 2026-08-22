@@ -474,6 +474,8 @@ pub async fn check(component: Component, current_version: &str) -> Result<Update
 /// [`check`] when the caller may pass the result to an installation function.
 pub async fn check_read_only(component: Component, current_version: &str) -> Result<UpdateCheck> {
     let current = validated_current_version(current_version)?;
+    let executable = std::env::current_exe().context("locating the installed executable")?;
+    ensure_component_matches_executable(component, &executable)?;
     check_for_version(component, current).await
 }
 

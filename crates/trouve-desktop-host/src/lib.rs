@@ -1117,7 +1117,8 @@ impl HostNativeActions {
     }
 
     /// Attach the product updater. Status reads are synchronous snapshots;
-    /// checks and installs are asynchronous and serialized by the gateway.
+    /// checks are request-bound, while installs are launched as serialized
+    /// host-owned operations and observed through the status snapshot.
     pub fn with_desktop_updater<S, C, CFut, I, IFut>(
         mut self,
         status: S,

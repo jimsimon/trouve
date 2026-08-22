@@ -923,19 +923,17 @@ export class HostClient {
     );
     let result;
     try {
-      result = path === HOST_DESKTOP_UPDATE_CHECK_PATH
-        ? await withDesktopUpdateDeadline((signal) =>
-          this.#client.POST(HOST_DESKTOP_UPDATE_CHECK_PATH, {
+      result = await withDesktopUpdateDeadline((signal) =>
+        path === HOST_DESKTOP_UPDATE_CHECK_PATH
+          ? this.#client.POST(HOST_DESKTOP_UPDATE_CHECK_PATH, {
               headers: { [CSRF_HEADER]: csrfToken },
               signal,
             })
-        )
-        : await this.#client.POST(HOST_DESKTOP_UPDATE_INSTALL_PATH, {
-            // Installation may legitimately outlive the short status/check
-            // deadline. Keep this request attached until the native host
-            // reports its authoritative terminal outcome.
-            headers: { [CSRF_HEADER]: csrfToken },
-          });
+          : this.#client.POST(HOST_DESKTOP_UPDATE_INSTALL_PATH, {
+              headers: { [CSRF_HEADER]: csrfToken },
+              signal,
+            })
+      );
     } catch {
       throw new HostClientError("request-failed", failureMessage);
     }

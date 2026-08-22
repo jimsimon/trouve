@@ -29,6 +29,8 @@ const UPDATE_RELAUNCH_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_RELAUNCH_GATE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const UPDATE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const RUNTIME_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const RUNTIME_INSTALL_CANCEL_GRACE: Duration = Duration::from_secs(30);
 
 const SPLASH_HTML: &str = r#"<!doctype html>
 <html lang="en">
@@ -1117,6 +1119,33 @@ impl UpdateManager {
     }
 
     pub async fn install_and_restart(&self) -> DesktopUpdateState {
+        let cancellation = Arc::new(trouve_update::InstallCancellation::default());
+        match await_runtime_install(
+            self.install_and_restart_inner(Arc::clone(&cancellation)),
+            cancellation,
+            RUNTIME_INSTALL_TIMEOUT,
+            RUNTIME_INSTALL_CANCEL_GRACE,
+        )
+        .await
+        {
+            Some(update) => update,
+            None => {
+                let update = state(
+                    DesktopUpdatePhase::Error,
+                    self.available_version(),
+                    "Update installation stopped after exceeding its time limit. You can try again without leaving the app.",
+                    None,
+                );
+                self.set_state(update.clone());
+                update
+            }
+        }
+    }
+
+    async fn install_and_restart_inner(
+        &self,
+        cancellation: Arc<trouve_update::InstallCancellation>,
+    ) -> DesktopUpdateState {
         let _action = self.action.lock().await;
         let release = match self.release() {
             Some(release) => release,
@@ -1134,10 +1163,15 @@ impl UpdateManager {
         let version = release.version.to_string();
         let artifact = release.artifact_name.clone();
         let progress_manager = self.clone();
-        let install = trouve_update::install_release_with_progress(&release, move |progress| {
-            let (phase, message, percent) = runtime_install_stage(&version, &artifact, progress);
-            progress_manager.set_state(state(phase, Some(version.clone()), &message, percent));
-        })
+        let install = trouve_update::install_release_with_progress_and_cancel(
+            &release,
+            move |progress| {
+                let (phase, message, percent) =
+                    runtime_install_stage(&version, &artifact, progress);
+                progress_manager.set_state(state(phase, Some(version.clone()), &message, percent));
+            },
+            cancellation,
+        )
         .await;
 
         if let Err(error) = install {
@@ -1229,6 +1263,29 @@ impl UpdateManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .state = state;
+    }
+}
+
+async fn await_runtime_install<T>(
+    install: impl std::future::Future<Output = T>,
+    cancellation: Arc<trouve_update::InstallCancellation>,
+    operation_timeout: Duration,
+    cancellation_grace: Duration,
+) -> Option<T> {
+    tokio::pin!(install);
+    tokio::select! {
+        update = &mut install => Some(update),
+        () = tokio::time::sleep(operation_timeout) => {
+            if !cancellation.request_cancel() {
+                // Executable replacement has committed. Dropping the future
+                // now could strand a successful install before its bounded
+                // relaunch handoff, so let that terminal path finish.
+                return Some(install.await);
+            }
+            tokio::time::timeout(cancellation_grace, install)
+                .await
+                .ok()
+        }
     }
 }
 
@@ -1540,5 +1597,19 @@ mod tests {
         assert_eq!(update.available_version.as_deref(), Some("4.1.0"));
         assert!(update.message.contains("Keep using this window"));
         assert_eq!(manager.status(), update);
+    }
+
+    #[tokio::test]
+    async fn runtime_install_watchdog_cancels_a_stalled_precommit_operation() {
+        let cancellation = Arc::new(trouve_update::InstallCancellation::default());
+        let result = await_runtime_install(
+            std::future::pending::<()>(),
+            Arc::clone(&cancellation),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(result.is_none());
+        assert!(cancellation.is_cancelled());
     }
 }

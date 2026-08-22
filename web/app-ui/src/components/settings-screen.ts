@@ -229,6 +229,10 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       this.#desktopUpdateGeneration += 1;
       completionGeneration = this.#desktopUpdateGeneration;
       this.#desktopUpdateState = state;
+      // Install POST acknowledges a host-owned background operation. Poll the
+      // authoritative status immediately even if its first snapshot still
+      // shows the previously available release.
+      keepPolling = installing;
     } catch (error) {
       if (actionGeneration !== this.#desktopUpdateGeneration || !this.isConnected) return;
       if (error instanceof HostClientError && error.kind === "action-busy") {
