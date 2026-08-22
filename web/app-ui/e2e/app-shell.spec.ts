@@ -388,31 +388,33 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
 });
 
 test("team creation loads and submits the canonical template", async ({ page }, testInfo) => {
+  const goal = "Ship the team workflow";
+  const createdTeam = {
+    session_id: "se_team",
+    goal,
+    status: "active",
+    orchestrator_member_id: "tm_orchestrator",
+    members: softwareDeliveryTemplate.members.map((member) => ({
+      id: `tm_${member.handle}`,
+      session_id: "se_team",
+      thread_id: `th_${member.handle}`,
+      ...member,
+      model: "test/default",
+      state: member.handle === "orchestrator" ? "queued" : "idle",
+    })),
+    messages: [],
+    max_turns: 64,
+    turns_used: 0,
+    created_at: "2026-08-22T08:00:00Z",
+  };
   await page.route("**/v1/workspaces/ws_1/branches", async (route) => {
     await route.fulfill({ json: { branches: ["main"], head: "main" } });
   });
   await page.route("**/v1/teams", async (route) => {
-    const request = route.request().postDataJSON() as Record<string, unknown>;
-    await route.fulfill({
-      json: {
-        session_id: "se_team",
-        goal: request["goal"],
-        status: "active",
-        orchestrator_member_id: "tm_orchestrator",
-        members: softwareDeliveryTemplate.members.map((member) => ({
-          id: `tm_${member.handle}`,
-          session_id: "se_team",
-          thread_id: `th_${member.handle}`,
-          ...member,
-          model: "test/default",
-          state: member.handle === "orchestrator" ? "queued" : "idle",
-        })),
-        messages: [],
-        max_turns: 64,
-        turns_used: 0,
-        created_at: "2026-08-22T08:00:00Z",
-      },
-    });
+    await route.fulfill({ json: createdTeam });
+  });
+  await page.route("**/v1/sessions/se_team/team", async (route) => {
+    await route.fulfill({ json: createdTeam });
   });
 
   await page.goto("/");
@@ -429,18 +431,28 @@ test("team creation loads and submits the canonical template", async ({ page }, 
   await expect(screen.locator('select[name="team_template"]'))
     .toHaveValue(softwareDeliveryTemplate.id);
   await expect(screen.getByText(softwareDeliveryTemplate.description)).toBeVisible();
-  await screen.locator('textarea[name="prompt"]').fill("Ship the team workflow");
+  await screen.locator('textarea[name="prompt"]').fill(goal);
 
   const requestPending = page.waitForRequest((request) =>
     request.method() === "POST" && new URL(request.url()).pathname === "/v1/teams"
   );
+  const responsePending = page.waitForResponse((response) =>
+    response.request().method() === "POST"
+    && new URL(response.url()).pathname === "/v1/teams"
+  );
   await screen.getByRole("button", { name: "Start team" }).click();
-  const request = await requestPending;
+  const [request, response] = await Promise.all([requestPending, responsePending]);
+  expect(response.ok()).toBe(true);
+  expect(await response.json()).toMatchObject({ session_id: createdTeam.session_id });
   expect(request.postDataJSON()).toMatchObject({
     workspace_id: "ws_1",
-    goal: "Ship the team workflow",
+    goal,
     template_id: softwareDeliveryTemplate.id,
   });
+  await expect(page).toHaveURL(/\/workspaces\/ws_1\/sessions\/se_team$/u);
+  const teamScreen = page.locator('trouve-team-screen[session-id="se_team"]');
+  await expect(teamScreen.getByRole("heading", { name: goal })).toBeVisible();
+  await expect(page.getByText("Team could not be created.", { exact: true })).toHaveCount(0);
 });
 
 test("session navigation uses compact one-line rows without branch names", async ({ page }, testInfo) => {
