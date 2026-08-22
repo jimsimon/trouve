@@ -157,7 +157,7 @@ describe("automation form model", () => {
     });
   });
 
-  it("does not hydrate legacy thinking beside an explicit token budget", () => {
+  it("keeps legacy thinking available until a competing alias is validated", () => {
     const draft = automationDraftFrom({
       id: "auto_budget",
       name: "Budget",
@@ -170,7 +170,35 @@ describe("automation form model", () => {
       enabled: true,
       created_at: "2026-08-02T12:00:00Z",
     });
-    expect(draft.modelOptions).toEqual({ thinking_budget_tokens: 8192 });
+    expect(draft.modelOptions).toEqual({
+      thinking_budget_tokens: 8192,
+      thinking_level: "16384",
+    });
+    expect(automationRequestFromDraft(draft, {
+      ...model,
+      options_schema: {
+        type: "object",
+        properties: {
+          thinking_budget_tokens: { type: "integer", minimum: 1024 },
+        },
+      },
+    }).model_options).toEqual({ thinking_budget_tokens: 8192 });
+
+    const staleAlias = automationDraftFrom({
+      id: "auto_stale",
+      name: "Stale alias",
+      prompt: "Run it",
+      workspace_id: "ws_1",
+      thinking_level: "high",
+      model_options: { effort: "stale" },
+      permission_mode: "ask",
+      schedule: { kind: "daily", time: "09:00" },
+      enabled: true,
+      created_at: "2026-08-02T12:00:00Z",
+    });
+    expect(automationRequestFromDraft(staleAlias, model).model_options).toEqual({
+      reasoning_effort: "high",
+    });
   });
 
   it("applies templates without choosing unsafe permissions for the user", () => {

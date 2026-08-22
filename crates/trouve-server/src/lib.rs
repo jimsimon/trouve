@@ -1983,7 +1983,7 @@ async fn delete_automation(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.delete_automation(&id)?;
+    engine.delete_automation(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

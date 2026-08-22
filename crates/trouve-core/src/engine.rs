@@ -1617,6 +1617,9 @@ fn value_type_name(value: &serde_json::Value) -> &'static str {
 }
 
 fn valid_choice_values(property: &serde_json::Value) -> Option<Vec<&serde_json::Value>> {
+    if property.get("enum").is_some() && property.get("oneOf").is_some() {
+        return None;
+    }
     if let Some(values) = property.get("enum").and_then(serde_json::Value::as_array) {
         if values.len() <= 1
             || !values.iter().all(schema_scalar)
@@ -1638,6 +1641,8 @@ fn valid_choice_values(property: &serde_json::Value) -> Option<Vec<&serde_json::
         UNSUPPORTED_MODEL_OPTION_SCHEMA_KEYWORDS
             .iter()
             .any(|keyword| choice.get(*keyword).is_some())
+            || choice.get("enum").is_some()
+            || choice.get("oneOf").is_some()
             || choice.get("minimum").is_some()
             || choice.get("maximum").is_some()
             || match (schema_scalar_type(choice), choice.get("const")) {
@@ -2334,6 +2339,9 @@ pub struct Engine {
     /// Serializes retries for one client-generated session-create key before
     /// any worktree mutation or event-writer batch is started.
     session_create_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// Serializes automation mutations across asynchronous model validation
+    /// so an older request cannot resume over a newer edit or deletion.
+    automation_mutation_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Narrower execution lanes for tools operating on a session worktree.
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
@@ -2761,6 +2769,7 @@ impl Engine {
             turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
+            automation_mutation_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
             session_pr_verification_wake: Arc::new(tokio::sync::Notify::new()),
@@ -4087,6 +4096,8 @@ impl Engine {
         id: &str,
         req: trouve_protocol::UpsertAutomationRequest,
     ) -> Result<trouve_protocol::Automation, EngineError> {
+        let mutation_lock = self.automation_mutation_lock(id);
+        let _mutation_guard = mutation_lock.lock().await;
         let mut automation = self
             .store
             .automation(id)?
@@ -4127,7 +4138,20 @@ impl Engine {
         Ok(automation)
     }
 
-    pub fn delete_automation(&self, id: &str) -> Result<(), EngineError> {
+    fn automation_mutation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.automation_mutation_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    pub async fn delete_automation(&self, id: &str) -> Result<(), EngineError> {
+        let mutation_lock = self.automation_mutation_lock(id);
+        let _mutation_guard = mutation_lock.lock().await;
         if !self.store.delete_automation(id)? {
             return Err(EngineError::NotFound(format!("automation {id}")));
         }
@@ -18309,6 +18333,11 @@ mod tests {
         live_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    struct BlockingAutomationProvider {
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
     fn catalog_test_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
         trouve_protocol::ModelInfo {
             id: id.into(),
@@ -18364,6 +18393,32 @@ mod tests {
             _options: &serde_json::Map<String, serde_json::Value>,
         ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
             unreachable!("model catalog tests never start a provider turn")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BlockingAutomationProvider {
+        fn id(&self) -> &str {
+            "blocking-automation"
+        }
+
+        async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            vec![catalog_test_model(
+                "blocking-automation/static",
+                "Blocking automation model",
+            )]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            unreachable!("automation update tests never start a provider turn")
         }
     }
 
@@ -22947,6 +23002,19 @@ default_permission_mode = "ask"
                             {"title": "missing const"}
                         ]
                     },
+                    "composed_choice": {
+                        "enum": ["low", "high"],
+                        "oneOf": [
+                            {"const": "low"},
+                            {"const": "medium"}
+                        ]
+                    },
+                    "nested_choice": {
+                        "oneOf": [
+                            {"const": "low", "enum": ["low"]},
+                            {"const": "high", "enum": ["high"]}
+                        ]
+                    },
                     "missing_schema": {"description": "No scalar contract"},
                     "locked": {"type": "string", "readOnly": true},
                     "constant": {"type": "string", "const": "owned"},
@@ -23005,6 +23073,8 @@ default_permission_mode = "ask"
             serde_json::json!({"conflicting": 1}),
             serde_json::json!({"malformed_enum": "valid"}),
             serde_json::json!({"malformed_one_of": "valid"}),
+            serde_json::json!({"composed_choice": "high"}),
+            serde_json::json!({"nested_choice": "high"}),
             serde_json::json!({"missing_schema": "anything"}),
             serde_json::json!({"effort": "medium"}),
             serde_json::json!({"budget": 4.5}),
@@ -23193,6 +23263,100 @@ default_permission_mode = "ask"
             .unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.model_options, automation.model_options);
+    }
+
+    #[tokio::test]
+    async fn automation_updates_are_serialized_across_model_validation() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_serialized_automation".into(),
+            name: "serialized".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let automation = trouve_protocol::Automation {
+            id: "auto_serialized".into(),
+            name: "Original".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id,
+            mode: None,
+            model: Some("blocking-automation/static".into()),
+            thinking_level: None,
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.insert_automation(&automation).unwrap();
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().to_path_buf(), &Config::default())
+                .with_config_dir(None)
+                .with_provider(
+                    "blocking-automation",
+                    Arc::new(BlockingAutomationProvider {
+                        started: started.clone(),
+                        release: release.clone(),
+                    }),
+                ),
+        );
+        let request = trouve_protocol::UpsertAutomationRequest {
+            name: automation.name.clone(),
+            prompt: automation.prompt.clone(),
+            workspace_id: automation.workspace_id.clone(),
+            mode: automation.mode.clone(),
+            model: automation.model.clone(),
+            thinking_level: automation.thinking_level.clone(),
+            model_options: automation.model_options.clone(),
+            permission_mode: automation.permission_mode,
+            schedule: automation.schedule.clone(),
+            enabled: true,
+        };
+
+        let first_engine = engine.clone();
+        let mut first_request = request.clone();
+        first_request
+            .model_options
+            .insert("fast".into(), serde_json::json!(true));
+        let first = tokio::spawn(async move {
+            first_engine
+                .update_automation("auto_serialized", first_request)
+                .await
+        });
+        started.acquire().await.unwrap().forget();
+
+        let second_engine = engine.clone();
+        let mut second_request = request;
+        second_request.enabled = false;
+        let mut second = tokio::spawn(async move {
+            second_engine
+                .update_automation("auto_serialized", second_request)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "the newer update must wait for the in-flight full-row mutation"
+        );
+
+        release.add_permits(2);
+        first.await.unwrap().unwrap();
+        let updated = second.await.unwrap().unwrap();
+        assert!(!updated.enabled);
+        assert!(!store.automation(&automation.id).unwrap().unwrap().enabled);
     }
 
     #[tokio::test]

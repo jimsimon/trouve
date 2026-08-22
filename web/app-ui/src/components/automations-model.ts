@@ -6,7 +6,6 @@ import type {
   ProtocolUpsertAutomationRequest,
 } from "../services/protocol-client.js";
 import {
-  isThinkingModelOption,
   sanitizeModelOptions,
 } from "./model-option-controls.js";
 
@@ -113,7 +112,7 @@ export const automationDraftFrom = (
   };
   if (
     automation.thinking_level != null
-    && !Object.keys(modelOptions).some(isThinkingModelOption)
+    && !Object.hasOwn(modelOptions, "thinking_level")
   ) {
     modelOptions["thinking_level"] = automation.thinking_level;
   }
