@@ -17,6 +17,7 @@ const textInputValueIsValid = (
   if (raw === "" || control.scalarType === "string") return true;
   const value = Number(raw);
   return Number.isFinite(value)
+    && raw === String(value)
     && (control.scalarType !== "integer" || Number.isSafeInteger(value))
     && (control.minimum === undefined || value >= control.minimum)
     && (control.maximum === undefined || value <= control.maximum);
@@ -128,6 +129,7 @@ export class TrouveModelOptionsEditor extends LitElement {
   controls: readonly ModelOptionControl[] = [];
   disabled = false;
   compact = false;
+  #committedText = new WeakMap<HTMLInputElement, string>();
 
   override render() {
     return this.controls.map((control, index) => {
@@ -195,7 +197,9 @@ export class TrouveModelOptionsEditor extends LitElement {
               }}
             >
               <option value="" data-model-default="true">
-                Model default · ${control.selected ? "On" : "Off"}
+                Model default${control.selected === undefined
+                  ? ""
+                  : ` · ${control.selected ? "On" : "Off"}`}
               </option>
               <option value="true">On</option>
               <option value="false">Off</option>
@@ -220,46 +224,18 @@ export class TrouveModelOptionsEditor extends LitElement {
               placeholder=${control.hint}
               .value=${control.text}
               ?disabled=${this.disabled}
-              @input=${(event: Event) =>
-                (event.currentTarget as HTMLInputElement).setCustomValidity("")}
-              @keydown=${(event: KeyboardEvent) => {
-                if (event.key !== "Tab" && event.key !== "Enter") return;
+              @input=${(event: Event) => {
                 const input = event.currentTarget as HTMLInputElement;
-                if (!textInputValueIsValid(control, input.value.trim())) {
-                  input.value = control.text;
-                }
-              }}
-              @blur=${(event: FocusEvent) => {
-                const input = event.currentTarget as HTMLInputElement;
-                if (!textInputValueIsValid(control, input.value.trim())) {
-                  input.value = control.text;
-                }
-              }}
-              @change=${(event: Event) => {
-                const input = event.currentTarget as HTMLInputElement;
-                const raw = control.scalarType === "string"
-                  ? input.value
-                  : input.value.trim();
-                if (control.scalarType === "string") {
-                  this.#emit(control.key, raw);
-                  return;
-                }
-                if (raw === "") {
-                  this.#emit(control.key, undefined);
-                  return;
-                }
-                const value = Number(raw);
-                const valid = textInputValueIsValid(control, raw);
-                if (valid) {
-                  input.setCustomValidity("");
-                  this.#emit(control.key, value);
-                  return;
-                }
-                input.value = control.text;
-                input.setCustomValidity(`Enter a valid ${control.scalarType} ${control.hint}.`);
-                input.reportValidity();
                 input.setCustomValidity("");
+                this.#committedText.delete(input);
               }}
+              @keydown=${(event: KeyboardEvent) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                this.#commitText(control, event.currentTarget as HTMLInputElement);
+              }}
+              @change=${(event: Event) =>
+                this.#commitText(control, event.currentTarget as HTMLInputElement)}
             />
             ${control.overridden
               ? html`<button
@@ -281,6 +257,21 @@ export class TrouveModelOptionsEditor extends LitElement {
         </div>
       `;
     });
+  }
+
+  #commitText(control: TextModelOptionControl, input: HTMLInputElement): void {
+    const raw = control.scalarType === "string" ? input.value : input.value.trim();
+    if (!textInputValueIsValid(control, raw)) {
+      input.setCustomValidity(`Enter a valid ${control.scalarType} ${control.hint}.`);
+      input.reportValidity();
+      return;
+    }
+    input.setCustomValidity("");
+    if (this.#committedText.get(input) === raw) return;
+    this.#committedText.set(input, raw);
+    this.#emit(control.key, control.scalarType === "string"
+      ? raw
+      : raw === "" ? undefined : Number(raw));
   }
 
   #emit(key: string, value: ModelOptionValue | undefined): void {

@@ -21,7 +21,7 @@ export interface ChoiceModelOptionControl extends ModelOptionControlBase {
 
 export interface BooleanModelOptionControl extends ModelOptionControlBase {
   readonly kind: "boolean";
-  readonly selected: boolean;
+  readonly selected: boolean | undefined;
 }
 
 export interface TextModelOptionControl extends ModelOptionControlBase {
@@ -62,6 +62,7 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
 const scalar = (value: unknown): value is ModelOptionValue =>
   typeof value === "string"
   || typeof value === "number" && Number.isFinite(value)
+    && (!Number.isInteger(value) || Number.isSafeInteger(value))
   || typeof value === "boolean";
 
 type AdvertisedScalarType = ModelOptionScalarType | "boolean";
@@ -105,9 +106,9 @@ const UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
 const hasUnsupportedConstraints = (
   property: Readonly<Record<string, unknown>>,
 ): boolean => [...UNSUPPORTED_SCHEMA_KEYWORDS].some((key) =>
-  Object.prototype.hasOwnProperty.call(property, key)
+  Object.hasOwn(property, key)
 ) || ["minimum", "maximum"].some((key) =>
-  Object.prototype.hasOwnProperty.call(property, key)
+  Object.hasOwn(property, key)
   && (typeof property[key] !== "number" || !Number.isFinite(property[key]))
 );
 
@@ -164,6 +165,7 @@ const choiceValues = (
   property: Readonly<Record<string, unknown>>,
 ): readonly { readonly label: string; readonly value: ModelOptionValue }[] | undefined => {
   const advertised = property["enum"];
+  if (advertised !== undefined && property["oneOf"] !== undefined) return undefined;
   if (
     Array.isArray(advertised)
     && advertised.length > 1
@@ -196,8 +198,10 @@ const choiceValues = (
       || entryType === null
       || entryType !== undefined && !matchesScalarType(entryType, value)
       || hasUnsupportedConstraints(entry)
-      || Object.prototype.hasOwnProperty.call(entry, "minimum")
-      || Object.prototype.hasOwnProperty.call(entry, "maximum")
+      || Object.hasOwn(entry, "enum")
+      || Object.hasOwn(entry, "oneOf")
+      || Object.hasOwn(entry, "minimum")
+      || Object.hasOwn(entry, "maximum")
     ) return undefined;
     choices.push({
       value,
@@ -226,26 +230,31 @@ const optionHint = (property: Readonly<Record<string, unknown>>): string => {
   return "value";
 };
 
-const storedOption = (
+const storedValues = (
   options: Readonly<Record<string, unknown>>,
   key: string,
-): { readonly value: unknown; readonly overridden: boolean } => {
-  if (Object.prototype.hasOwnProperty.call(options, key)) {
-    return { value: options[key], overridden: true };
-  }
-  const thinkingKeys = [...THINKING_KEYS].filter((candidate) =>
-    candidate !== key && (key === "thinking_level" || candidate !== "thinking_level")
-  );
-  if (thinkingKeys.some((candidate) => Object.prototype.hasOwnProperty.call(options, candidate))) {
-    return { value: undefined, overridden: false };
-  }
-  const inheritedKey = key !== "thinking_level"
-    && THINKING_KEYS.has(key)
-    && Object.prototype.hasOwnProperty.call(options, "thinking_level");
-  return {
-    value: inheritedKey ? options["thinking_level"] : undefined,
-    overridden: inheritedKey,
-  };
+): readonly unknown[] => {
+  const keys = !THINKING_KEYS.has(key)
+    ? [key]
+    : key === "thinking_level"
+      ? [...THINKING_KEYS]
+      : [
+          key,
+          ...[...THINKING_KEYS].filter((candidate) =>
+            candidate !== key && candidate !== "thinking_level"
+          ),
+          "thinking_level",
+        ];
+  return keys
+    .filter((candidate) => Object.hasOwn(options, candidate))
+    .map((candidate) => {
+      const value = options[candidate];
+      return key === "thinking_budget_tokens"
+          && typeof value === "string"
+          && value.trim() !== ""
+        ? Number(value)
+        : value;
+    });
 };
 
 const validTextValue = (
@@ -256,7 +265,8 @@ const validTextValue = (
 ): boolean => {
   if (type === "string") return typeof value === "string";
   if (typeof value !== "number" || !Number.isFinite(value)) return false;
-  if (type === "integer" && !Number.isSafeInteger(value)) return false;
+  if (Number.isInteger(value) && !Number.isSafeInteger(value)) return false;
+  if (type === "integer" && !Number.isInteger(value)) return false;
   return (minimum === undefined || value >= minimum)
     && (maximum === undefined || value <= maximum);
 };
@@ -281,7 +291,7 @@ export const modelOptionControls = (
     if (
       property === undefined
       || property["readOnly"] === true
-      || Object.prototype.hasOwnProperty.call(property, "const")
+      || Object.hasOwn(property, "const")
       || (Array.isArray(property["enum"]) && property["enum"].length <= 1)
       || advertisedType === null
       || hasUnsupportedConstraints(property)
@@ -292,16 +302,8 @@ export const modelOptionControls = (
     const description = typeof property["description"] === "string"
       ? property["description"]
       : "";
-    const explicit = storedOption(current, key);
-    const inherited = storedOption(inheritedOptions, key);
-    const stored = explicit.overridden
-      ? explicit
-      : { value: inherited.value, overridden: false };
-    const selected = key === "thinking_budget_tokens"
-      && typeof stored.value === "string"
-      && stored.value.trim() !== ""
-      ? Number(stored.value)
-      : stored.value;
+    const explicit = storedValues(current, key);
+    const inherited = storedValues(inheritedOptions, key);
     const defaultValue = property["default"];
     const minimum = typeof property["minimum"] === "number"
       && Number.isFinite(property["minimum"])
@@ -311,11 +313,15 @@ export const modelOptionControls = (
       && Number.isFinite(property["maximum"])
       ? property["maximum"]
       : undefined;
+    if (
+      (minimum !== undefined || maximum !== undefined)
+        && advertisedType !== "number" && advertisedType !== "integer"
+      || minimum !== undefined && maximum !== undefined && minimum > maximum
+    ) continue;
     const choices = choiceValues(property);
     if (
       choices === undefined
-      && (Object.prototype.hasOwnProperty.call(property, "enum")
-        || Object.prototype.hasOwnProperty.call(property, "oneOf"))
+      && (Object.hasOwn(property, "enum") || Object.hasOwn(property, "oneOf"))
     ) continue;
     if (choices !== undefined) {
       const editableChoices = choices.filter(({ value }) =>
@@ -325,29 +331,42 @@ export const modelOptionControls = (
             && (maximum === undefined || value <= maximum))
       );
       if (editableChoices.length <= 1) continue;
+      const selected = explicit.find((value) =>
+        editableChoices.some((choice) => Object.is(choice.value, value))
+      );
+      const inheritedValue = inherited.find((value) =>
+        editableChoices.some((choice) => Object.is(choice.value, value))
+      );
       const selectedIndex = editableChoices.findIndex(({ value }) => Object.is(value, selected));
+      const inheritedIndex = editableChoices.findIndex(({ value }) =>
+        Object.is(value, inheritedValue)
+      );
       const defaultIndex = editableChoices.findIndex(({ value }) => Object.is(value, defaultValue));
       controls.push({
         kind: "choice",
         key,
         label,
         description,
-        overridden: stored.overridden && selectedIndex >= 0,
+        overridden: selectedIndex >= 0,
         choices: editableChoices,
-        selectedIndex: selectedIndex >= 0 ? selectedIndex : defaultIndex,
+        selectedIndex: selectedIndex >= 0
+          ? selectedIndex
+          : inheritedIndex >= 0 ? inheritedIndex : defaultIndex,
       });
       continue;
     }
     if (advertisedType === "boolean") {
+      const selected = explicit.find((value) => typeof value === "boolean")
+        ?? inherited.find((value) => typeof value === "boolean");
       controls.push({
         kind: "boolean",
         key,
         label,
         description,
-        overridden: stored.overridden && typeof selected === "boolean",
+        overridden: explicit.some((value) => typeof value === "boolean"),
         selected: typeof selected === "boolean"
           ? selected
-          : defaultValue === true,
+          : typeof defaultValue === "boolean" ? defaultValue : undefined,
       });
       continue;
     }
@@ -358,6 +377,13 @@ export const modelOptionControls = (
         && ((minimum ?? 0) > Number.MAX_SAFE_INTEGER
           || (maximum ?? 0) < Number.MIN_SAFE_INTEGER)
     ) continue;
+    const explicitValue = explicit.find((value) =>
+      validTextValue(type, value, minimum, maximum)
+    );
+    const inheritedValue = inherited.find((value) =>
+      validTextValue(type, value, minimum, maximum)
+    );
+    const selected = explicitValue ?? inheritedValue;
     const value = validTextValue(type, selected, minimum, maximum)
       ? selected
       : validTextValue(type, defaultValue, minimum, maximum)
@@ -368,7 +394,7 @@ export const modelOptionControls = (
       key,
       label,
       description,
-      overridden: stored.overridden && validTextValue(type, selected, minimum, maximum),
+      overridden: explicitValue !== undefined,
       scalarType: type,
       text: optionText(value),
       hint: optionHint(property),
@@ -376,7 +402,12 @@ export const modelOptionControls = (
       ...(maximum === undefined ? {} : { maximum }),
     });
   }
-  return controls;
+  const thinkingKey = [...THINKING_KEYS].find((key) =>
+    controls.some((control) => control.key === key)
+  );
+  return controls.filter((control) =>
+    !THINKING_KEYS.has(control.key) || control.key === thinkingKey
+  );
 };
 
 export const modelOptionValueIsValid = (
@@ -405,18 +436,9 @@ export const sanitizeModelOptions = (
   const controls = modelOptionControls(model, {});
   const sanitized: Record<string, ModelOptionValue> = {};
   for (const control of controls) {
-    const direct = options[control.key];
-    const canonical = options["thinking_level"];
-    const legacy = control.key === "thinking_budget_tokens"
-      && typeof canonical === "string"
-      && canonical.trim() !== ""
-      ? Number(canonical)
-      : canonical;
-    const value = modelOptionValueIsValid(control, direct)
-      ? direct
-      : control.key !== "thinking_level" && THINKING_KEYS.has(control.key)
-        ? legacy
-        : undefined;
+    const value = storedValues(options, control.key).find((candidate) =>
+      modelOptionValueIsValid(control, candidate)
+    );
     if (modelOptionValueIsValid(control, value)) sanitized[control.key] = value;
   }
   return sanitized;
@@ -427,14 +449,10 @@ export const changeModelOption = (
   change: ModelOptionChangeDetail,
 ): Readonly<Record<string, unknown>> => {
   const next = { ...options };
-  if (change.value === undefined) {
-    delete next[change.key];
-  } else {
-    next[change.key] = change.value;
-  }
-  if (change.key !== "thinking_level" && THINKING_KEYS.has(change.key)) {
-    delete next["thinking_level"];
-  }
+  if (THINKING_KEYS.has(change.key)) {
+    for (const key of THINKING_KEYS) delete next[key];
+  } else delete next[change.key];
+  if (change.value !== undefined) next[change.key] = change.value;
   return next;
 };
 

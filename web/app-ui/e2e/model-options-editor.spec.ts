@@ -69,6 +69,24 @@ test("model-option choices preserve selected state and scalar value types", asyn
         text: "Existing",
         hint: "Optional instructions",
       },
+      {
+        kind: "text",
+        key: "temperature",
+        label: "Temperature",
+        description: "",
+        overridden: true,
+        scalarType: "number",
+        text: "0.5",
+        hint: "value",
+      },
+      {
+        kind: "boolean",
+        key: "stream",
+        label: "Streaming",
+        description: "",
+        overridden: false,
+        selected: undefined,
+      },
     ];
     const changes: unknown[] = [];
     const validationMessages: string[] = [];
@@ -102,22 +120,36 @@ test("model-option choices preserve selected state and scalar value types", asyn
   const budget = editor.getByRole("spinbutton", { name: "Thinking budget", exact: true });
   const tone = editor.getByLabel("Tone");
   const instructions = editor.getByRole("textbox", { name: "Instructions", exact: true });
+  const temperature = editor.getByRole("spinbutton", { name: "Temperature", exact: true });
+  const streaming = editor.getByLabel("Streaming");
   await expect(context).toHaveValue("1000000");
   await expect(fast).toHaveValue("false");
   await expect(budget).toHaveAttribute("aria-describedby", /model-option-description-/);
+  await expect(streaming.locator("option").first()).toHaveText("Model default");
 
   await context.selectOption({ label: "300K" });
   await fast.selectOption({ label: "On" });
   await budget.fill("3.5");
   await budget.press("Tab");
-  await expect(budget).toHaveValue("8");
+  await expect(budget).toHaveValue("3.5");
   await budget.fill("9007199254740993");
   await budget.dispatchEvent("change");
-  await expect(budget).toHaveValue("8");
+  await expect(budget).toHaveValue("9007199254740993");
+  await budget.fill("12");
+  await budget.press("Enter");
+  await temperature.fill("0.1234567890123456789");
+  await temperature.dispatchEvent("change");
+  await expect(temperature).toHaveValue("0.1234567890123456789");
+  await temperature.fill("0.25");
+  await temperature.press("Enter");
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { modelOptionValidationMessages?: string[] })
       .modelOptionValidationMessages,
-  )).toEqual(["Enter a valid integer between 4 and 16."]);
+  )).toEqual([
+    "Enter a valid integer between 4 and 16.",
+    "Enter a valid integer between 4 and 16.",
+    "Enter a valid number value.",
+  ]);
   await tone.selectOption({ label: "Empty" });
   await instructions.fill("");
   await instructions.press("Tab");
@@ -129,6 +161,8 @@ test("model-option choices preserve selected state and scalar value types", asyn
   )).toEqual([
     { key: "context_window", value: 300_000 },
     { key: "fast", value: true },
+    { key: "thinking_budget_tokens", value: 12 },
+    { key: "temperature", value: 0.25 },
     { key: "tone", value: "" },
     { key: "instructions", value: "" },
     { key: "instructions", value: "   " },
@@ -143,6 +177,8 @@ test("model-option choices preserve selected state and scalar value types", asyn
   )).toEqual([
     { key: "context_window", value: 300_000 },
     { key: "fast", value: true },
+    { key: "thinking_budget_tokens", value: 12 },
+    { key: "temperature", value: 0.25 },
     { key: "tone", value: "" },
     { key: "instructions", value: "" },
     { key: "instructions", value: "   " },

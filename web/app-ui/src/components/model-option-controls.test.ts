@@ -136,7 +136,7 @@ describe("model option controls", () => {
     expect(modelOptionControls(model({
       reasoning_effort: { enum: ["low", "high"], default: "low" },
     }), { thinking_level: "high", reasoning_effort: "invalid" })[0]).toMatchObject({
-      selectedIndex: 0,
+      selectedIndex: 1,
     });
     expect(modelOptionControls(model({
       reasoning_effort: { enum: ["low", "high"], default: "low" },
@@ -164,6 +164,18 @@ describe("model option controls", () => {
       patterned: { type: "string", pattern: "^[a-z]+$" },
       stepped: { type: "number", multipleOf: 0.5 },
       malformed_bound: { type: "number", minimum: "zero" },
+      bounded_string: { type: "string", enum: ["low", "high"], minimum: 0 },
+      composed: {
+        enum: ["low", "high"],
+        oneOf: [{ const: "low" }, { const: "medium" }],
+      },
+      nested_choice: {
+        oneOf: [
+          { const: "low", enum: ["low"] },
+          { const: "high", enum: ["high"] },
+        ],
+      },
+      inverted: { type: "number", minimum: 2, maximum: 1 },
     }), {})).toEqual([{
       kind: "choice",
       key: "context",
@@ -249,6 +261,36 @@ describe("model option controls", () => {
       { thinking_level: "16384" },
       { key: "thinking_budget_tokens", value: 8192 },
     )).toEqual({ thinking_budget_tokens: 8192 });
+    expect(changeModelOption(
+      { thinking_level: "high", effort: "low", reasoning: "medium", fast: true },
+      { key: "reasoning_effort", value: "high" },
+    )).toEqual({ reasoning_effort: "high", fast: true });
+  });
+
+  it("exposes and serializes one canonical thinking alias", () => {
+    const aliases = model({
+      effort: { enum: ["low", "high"] },
+      reasoning_effort: { enum: ["low", "high"] },
+      reasoning: { enum: ["low", "high"] },
+    });
+    expect(modelOptionControls(aliases, {
+      effort: "stale",
+      thinking_level: "high",
+    })).toMatchObject([{ key: "reasoning_effort", selectedIndex: 1 }]);
+    expect(sanitizeModelOptions(aliases, {
+      effort: "stale",
+      thinking_level: "high",
+    })).toEqual({ reasoning_effort: "high" });
+    expect(sanitizeModelOptions(aliases, {
+      effort: "low",
+      thinking_level: "high",
+    })).toEqual({ reasoning_effort: "low" });
+  });
+
+  it("preserves an unknown boolean model default", () => {
+    expect(modelOptionControls(model({
+      fast: { type: "boolean" },
+    }), {})).toMatchObject([{ kind: "boolean", selected: undefined, overridden: false }]);
   });
 
   it("uses the same human labels as the desktop controls", () => {
