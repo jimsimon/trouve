@@ -663,14 +663,42 @@ fn opened_executable_is_executable(file: &std::fs::File) -> bool {
 fn opened_executable_is_executable(file: &std::fs::File) -> bool {
     use std::os::fd::AsRawFd as _;
 
-    // `/dev/fd` resolves the already-open vnode, avoiding a second lookup of
-    // the mutable installation pathname. AT_EACCESS delegates ownership,
-    // groups, ACLs, and privilege semantics to the kernel.
-    let Ok(path) = std::ffi::CString::new(format!("/dev/fd/{}", file.as_raw_fd())) else {
-        return false;
+    #[repr(C)]
+    struct UserAccessAttributes {
+        length: u32,
+        user_access: u32,
+    }
+
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_USERACCESS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
     };
-    // SAFETY: `path` is NUL-terminated and `faccessat` only reads it.
-    unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
+    let mut result = UserAccessAttributes {
+        length: 0,
+        user_access: 0,
+    };
+    // SAFETY: both pointers refer to initialized, correctly sized C-layout
+    // structures. fgetattrlist queries the already-open vnode, and
+    // ATTR_CMN_USERACCESS asks Darwin to evaluate the effective user's access,
+    // including groups and ACLs, without a mutable pathname lookup.
+    let succeeded = unsafe {
+        libc::fgetattrlist(
+            file.as_raw_fd(),
+            std::ptr::from_mut(&mut attributes).cast(),
+            std::ptr::from_mut(&mut result).cast(),
+            std::mem::size_of::<UserAccessAttributes>(),
+            0,
+        ) == 0
+    };
+    if !succeeded || result.length < std::mem::size_of::<UserAccessAttributes>() as u32 {
+        return false;
+    }
+    result.user_access & libc::X_OK as u32 != 0
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
