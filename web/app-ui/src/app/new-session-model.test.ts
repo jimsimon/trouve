@@ -677,6 +677,42 @@ describe("new session model", () => {
     });
   });
 
+  it("pins the model when degraded metadata retains model-specific options", () => {
+    const selectedModel = model({
+      properties: {
+        temperature: { type: "number", minimum: 0, maximum: 1 },
+      },
+    }, "provider/selected");
+    const snapshot = snapshotNewSessionSubmission({
+      selections: {
+        modeId: "code",
+        modelId: selectedModel.id,
+        thinking: "",
+        permissionMode: "ask",
+      },
+      modelOptions: { temperature: 0.25 },
+      edits: createNewThreadOptionEdits(),
+      modes: [mode(selectedModel.id)],
+      providers: providers(selectedModel.id),
+      selectableModels: [selectedModel],
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+      optionsAuthoritative: false,
+    });
+
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Thread",
+      snapshot,
+    })).toEqual({
+      session_id: "session-1",
+      title: "Thread",
+      model: selectedModel.id,
+      model_options: { temperature: 0.25 },
+      permission_mode: "ask",
+    });
+  });
+
   it("uses live availability without replacing authoritative static metadata", () => {
     const staticModel = model({}, "provider/static");
     const unavailableStatic = model({}, "provider/unavailable");

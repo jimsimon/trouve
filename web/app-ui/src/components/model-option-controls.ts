@@ -469,11 +469,11 @@ export const sanitizeModelOptions = (
   return sanitized;
 };
 
-export const changeModelOption = (
-  options: Readonly<Record<string, unknown>>,
+export const changeModelOption = <T>(
+  options: Readonly<Record<string, T>>,
   change: ModelOptionChangeDetail,
-): Readonly<Record<string, unknown>> => {
-  const next = { ...options };
+): Readonly<Record<string, T | ModelOptionValue>> => {
+  const next: Record<string, T | ModelOptionValue> = { ...options };
   if (THINKING_KEYS.has(change.key)) {
     for (const key of THINKING_KEYS) delete next[key];
   } else delete next[change.key];

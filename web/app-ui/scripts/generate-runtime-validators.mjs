@@ -75,6 +75,18 @@ const protocolSchemaId = "urn:trouve:protocol-openapi";
 const protocolDocument = readJson("src/generated/protocol-openapi.json");
 const protocolSchemas = asRecord(asRecord(protocolDocument.components)?.schemas);
 
+// The public OpenAPI uses oneOf so generated clients get a scalar union. AJV's
+// standalone oneOf bookkeeping is much larger than the equivalent JSON Schema
+// type union, so compile the runtime copy to the compact form while preserving
+// exactly the same accepted values.
+const modelOptionValue = asRecord(protocolSchemas?.ModelOptionValue);
+if (!Array.isArray(modelOptionValue?.oneOf)) {
+  throw new TypeError("protocol schema has no ModelOptionValue variants");
+}
+modelOptionValue.type = ["string", "number", "boolean"];
+delete modelOptionValue.oneOf;
+delete modelOptionValue.description;
+
 // Full PR detail adds optional check links and timestamps to the compact
 // CheckRun projection. The PR workspace validates those fields in its lazy
 // handwritten detail guard, and every URL is independently filtered before
@@ -108,6 +120,26 @@ for (const name of [
     property.propertyNames = { type: "string", pattern: "^(0|[1-9][0-9]*)$" };
   }
 }
+
+// JSON transport object keys are strings by construction. Drop utoipa's
+// unconstrained string-only propertyNames checks from the runtime copy; AJV
+// otherwise emits a redundant loop for every map in each validator graph.
+const removeRedundantPropertyNames = (value) => {
+  if (Array.isArray(value)) {
+    for (const item of value) removeRedundantPropertyNames(item);
+    return;
+  }
+  const object = asRecord(value);
+  if (object === undefined) return;
+  const propertyNames = asRecord(object.propertyNames);
+  if (
+    propertyNames?.type === "string"
+    && Object.keys(propertyNames).length === 1
+  ) delete object.propertyNames;
+  for (const child of Object.values(object)) removeRedundantPropertyNames(child);
+};
+removeRedundantPropertyNames(protocolDocument);
+
 const eventEnvelope = asRecord(protocolSchemas?.EventEnvelope);
 const eventEnvelopeAllOf = eventEnvelope?.allOf;
 const eventEnvelopeFields = Array.isArray(eventEnvelopeAllOf)

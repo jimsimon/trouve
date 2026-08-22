@@ -277,6 +277,10 @@ describe("model option controls", () => {
       { reasoning_effort: "high", fast: true },
       { key: "fast", value: undefined },
     )).toEqual({ reasoning_effort: "high" });
+    expect(changeModelOption(
+      { temperature: 1e20 },
+      { key: "fast", value: true },
+    )).toEqual({ temperature: 1e20, fast: true });
     const budgetModel = model({
       thinking_budget_tokens: {
         type: "integer",
