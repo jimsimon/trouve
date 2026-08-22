@@ -492,6 +492,22 @@ fn extract_binary(
     binary_name: &str,
     destination: &Path,
 ) -> Result<()> {
+    extract_binary_with_expanded_limit(
+        archive_path,
+        kind,
+        binary_name,
+        destination,
+        MAX_ARCHIVE_EXPANDED_BYTES,
+    )
+}
+
+fn extract_binary_with_expanded_limit(
+    archive_path: &Path,
+    kind: ArchiveKind,
+    binary_name: &str,
+    destination: &Path,
+    expanded_limit: u64,
+) -> Result<()> {
     let packaged_binary = Path::new("bin").join(binary_name);
     let mut output = std::fs::File::create(destination)
         .with_context(|| format!("creating {}", destination.display()))?;
@@ -510,6 +526,7 @@ fn extract_binary(
                         .header()
                         .size()
                         .context("reading update tar entry size")?,
+                    expanded_limit,
                 )?;
                 let path = entry.path().context("reading update tar entry path")?;
                 if path != Path::new(binary_name) && path != packaged_binary {
@@ -568,12 +585,12 @@ fn copy_limited(reader: &mut impl Read, writer: &mut impl Write) -> Result<u64> 
     Ok(written)
 }
 
-fn add_archive_entry_size(current: u64, entry_size: u64) -> Result<u64> {
+fn add_archive_entry_size(current: u64, entry_size: u64, limit: u64) -> Result<u64> {
     let expanded = current
         .checked_add(entry_size)
         .ok_or_else(|| anyhow!("update archive expanded byte count overflow"))?;
-    if expanded > MAX_ARCHIVE_EXPANDED_BYTES {
-        bail!("update archive expands beyond the {MAX_ARCHIVE_EXPANDED_BYTES}-byte limit");
+    if expanded > limit {
+        bail!("update archive expands beyond the {limit}-byte limit");
     }
     Ok(expanded)
 }
@@ -750,8 +767,42 @@ mod tests {
     #[test]
     fn expanded_archive_budget_counts_every_tar_entry() {
         let remaining = MAX_ARCHIVE_EXPANDED_BYTES - 1;
-        assert_eq!(add_archive_entry_size(0, remaining).unwrap(), remaining);
-        let error = add_archive_entry_size(remaining, 2).unwrap_err();
+        assert_eq!(
+            add_archive_entry_size(0, remaining, MAX_ARCHIVE_EXPANDED_BYTES).unwrap(),
+            remaining
+        );
+        let error = add_archive_entry_size(remaining, 2, MAX_ARCHIVE_EXPANDED_BYTES).unwrap_err();
+        assert!(error.to_string().contains("expands beyond"));
+    }
+
+    #[test]
+    fn rejects_tar_with_oversized_unrelated_expansion() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("update.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, payload) in [
+            ("trouve", b"binary".as_slice()),
+            ("unrelated-zeroes", [0_u8; 64].as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, payload).unwrap();
+        }
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let error = extract_binary_with_expanded_limit(
+            &archive_path,
+            ArchiveKind::TarGz,
+            "trouve",
+            &temp.path().join("new-trouve"),
+            32,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("expands beyond"));
     }
 
