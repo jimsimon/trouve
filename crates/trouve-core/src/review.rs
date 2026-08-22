@@ -13000,6 +13000,8 @@ mod tests {
             branch: "main".into(),
             worktree_path: worktree.to_string_lossy().into_owned(),
             base_ref: "main".into(),
+            kind: trouve_protocol::SessionKind::Solo,
+            team_member_count: 0,
             archived: false,
             active: false,
             created_at: Utc::now(),

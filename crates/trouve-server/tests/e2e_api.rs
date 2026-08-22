@@ -120,6 +120,57 @@ impl Provider for ScriptedProvider {
     }
 }
 
+/// A provider-neutral team handoff chain: orchestrator -> coder -> orchestrator.
+struct TeamScriptedProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for TeamScriptedProvider {
+    fn id(&self) -> &str {
+        "team-scripted"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let delivery = messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(content) => Some(content.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let text = if delivery.contains("Your identity: @coder") {
+            "Implementation is ready. @orchestrator please integrate."
+        } else if delivery.contains("Your identity: @reviewer") {
+            "Review complete with no further handoff."
+        } else if delivery.contains("Your identity: @orchestrator")
+            && delivery.contains("Message from @coder")
+        {
+            "The goal is complete and the implementation is integrated."
+        } else {
+            "@coder implement the requested change and report back."
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ProviderEvent::TextDelta(text.into())),
+            Ok(ProviderEvent::Completed {
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+            }),
+        ])))
+    }
+}
+
 fn init_repo(dir: &Path) {
     let run = |args: &[&str]| {
         let mut command = Command::new("git");
@@ -482,6 +533,338 @@ async fn workspace_close_hides_and_reregister_reopens() {
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["id"], workspace_id);
+}
+
+#[tokio::test]
+async fn team_sessions_route_mentions_and_expose_durable_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let provider = Arc::new(TeamScriptedProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("team-scripted", provider.clone())
+            .with_default_model("team-scripted/test-model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, trouve_server::build_router(engine))
+            .await
+            .unwrap()
+    });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let templates: Vec<serde_json::Value> = client
+        .get(format!("{base}/team-templates"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(templates[0]["id"], "software_delivery");
+    assert_eq!(templates[0]["members"].as_array().unwrap().len(), 4);
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let zero_budget = client
+        .post(format!("{base}/teams"))
+        .json(&serde_json::json!({
+            "workspace_id": workspace["id"],
+            "goal": "Must not start",
+            "max_turns": 0
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(zero_budget.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let create_request = serde_json::json!({
+        "workspace_id": workspace["id"],
+        "idempotency_key": "create-team-once",
+        "title": "Team delivery",
+        "goal": "Ship the requested change",
+        "max_turns": 4
+    });
+    let created: serde_json::Value = client
+        .post(format!("{base}/teams"))
+        .json(&create_request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = created["session_id"].as_str().unwrap();
+    assert_eq!(created["members"].as_array().unwrap().len(), 4);
+    assert!(created["snapshot_cursor"].as_u64().unwrap() > 0);
+    let replayed: serde_json::Value = client
+        .post(format!("{base}/teams"))
+        .json(&create_request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed["session_id"], created["session_id"]);
+    assert_eq!(replayed["messages"][0]["id"], created["messages"][0]["id"]);
+    let mismatched_replay = client
+        .post(format!("{base}/teams"))
+        .json(&serde_json::json!({
+            "workspace_id": workspace["id"],
+            "idempotency_key": "create-team-once",
+            "title": "Team delivery",
+            "goal": "A different goal",
+            "max_turns": 4
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatched_replay.status(), reqwest::StatusCode::CONFLICT);
+
+    let team = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let team: serde_json::Value = client
+                .get(format!("{base}/sessions/{session_id}/team"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let messages = team["messages"].as_array().unwrap();
+            let idle = team["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|member| member["state"] == "idle");
+            if messages.len() == 4 && idle {
+                break team;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("team handoff chain did not settle");
+    assert_eq!(team["turns_used"], 3);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    let messages = team["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["author_kind"], "human");
+    assert_eq!(messages[1]["author_handle"], "orchestrator");
+    assert_eq!(messages[1]["mentions"][0]["handle"], "coder");
+    assert_eq!(messages[2]["author_handle"], "coder");
+    assert_eq!(messages[2]["mentions"][0]["handle"], "orchestrator");
+    assert_eq!(messages[3]["author_handle"], "orchestrator");
+
+    let sessions: Vec<serde_json::Value> = client
+        .get(format!(
+            "{base}/sessions?workspace_id={}",
+            workspace["id"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sessions[0]["kind"], "team");
+    assert_eq!(sessions[0]["team_member_count"], 4);
+
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/sessions/{session_id}/events?after=0"),
+        |event| event["type"] == "team.message_posted",
+    )
+    .await;
+    assert!(events.iter().any(|event| event["type"] == "team.created"));
+
+    let pause = client
+        .post(format!("{base}/sessions/{session_id}/team/pause"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(pause.status().is_success());
+    let queued: serde_json::Value = client
+        .post(format!("{base}/sessions/{session_id}/team/messages"))
+        .json(&serde_json::json!({
+            "content": "@reviewer inspect the result @planner prepare the summary",
+            "idempotency_key": "review-once"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let queued_replay: serde_json::Value = client
+        .post(format!("{base}/sessions/{session_id}/team/messages"))
+        .json(&serde_json::json!({
+            "content": "@reviewer inspect the result @planner prepare the summary",
+            "idempotency_key": "review-once"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queued_replay["id"], queued["id"]);
+    let mismatched_message = client
+        .post(format!("{base}/sessions/{session_id}/team/messages"))
+        .json(&serde_json::json!({
+            "content": "@reviewer inspect something else",
+            "idempotency_key": "review-once"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatched_message.status(), reqwest::StatusCode::CONFLICT);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    let paused: serde_json::Value = client
+        .get(format!("{base}/sessions/{session_id}/team"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        paused["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["handle"] == "reviewer" && member["state"] == "queued")
+    );
+
+    let resume = client
+        .post(format!("{base}/sessions/{session_id}/team/resume"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resume.status().is_success());
+    let exhausted = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let team: serde_json::Value = client
+                .get(format!("{base}/sessions/{session_id}/team"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if team["turns_used"] == 4
+                && team["members"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|member| member["state"] == "idle")
+            {
+                break team;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumed team delivery did not settle");
+    assert_eq!(exhausted["status"], "paused");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+
+    let exhausted_resume = client
+        .post(format!("{base}/sessions/{session_id}/team/resume"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exhausted_resume.status(), reqwest::StatusCode::CONFLICT);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+
+    let exhausted_message = client
+        .post(format!("{base}/sessions/{session_id}/team/messages"))
+        .json(&serde_json::json!({"content": "@planner prepare a follow-up"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exhausted_message.status(), reqwest::StatusCode::CONFLICT);
+    let completed: serde_json::Value = client
+        .post(format!("{base}/sessions/{session_id}/team/complete"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed["status"], "completed");
+    assert!(
+        completed["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|member| member["state"] == "idle")
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+
+    let coder_thread = completed["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["handle"] == "coder")
+        .unwrap()["thread_id"]
+        .as_str()
+        .unwrap();
+    let direct = client
+        .post(format!("{base}/threads/{coder_thread}/messages"))
+        .json(&serde_json::json!({"content": "bypass the team"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(direct.status(), reqwest::StatusCode::CONFLICT);
+    let direct_thread = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({
+            "session_id": session_id,
+            "title": "Bypass",
+            "mode": "code"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(direct_thread.status(), reqwest::StatusCode::CONFLICT);
+    let response = client
+        .post(format!("{base}/sessions/{session_id}/team/messages"))
+        .json(&serde_json::json!({"content": "one more thing"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
 }
 
 #[tokio::test]

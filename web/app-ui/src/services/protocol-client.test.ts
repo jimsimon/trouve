@@ -46,6 +46,135 @@ describe("ProtocolClient", () => {
     });
   });
 
+  it("validates team snapshots and protects team mutations", async () => {
+    const requests: Request[] = [];
+    const member = {
+      id: "member_1",
+      session_id: "se/team",
+      handle: "lead",
+      display_name: "Lead",
+      role: "Coordinate delivery",
+      thread_id: "th_1",
+      mode: "code",
+      model: "openai/gpt-5.6",
+      state: "idle",
+      usage: { input_tokens: 0, output_tokens: 0 },
+    };
+    const message = {
+      id: "message_1",
+      session_id: "se/team",
+      author_handle: "human",
+      author_kind: "human",
+      content: "@lead ship it",
+      mentions: [{ member_id: member.id, handle: member.handle }],
+      created_at: "2026-08-13T12:00:00Z",
+    };
+    const team = {
+      session_id: "se/team",
+      snapshot_cursor: 7,
+      goal: "Ship the release",
+      status: "active",
+      orchestrator_member_id: member.id,
+      members: [member],
+      messages: [message],
+      messages_truncated: false,
+      max_turns: 20,
+      turns_used: 1,
+      created_at: "2026-08-13T11:59:00Z",
+    };
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      requests.push(request);
+      const path = new URL(request.url).pathname;
+      if (path === "/v1/team-templates") {
+        return Response.json([{
+          id: "delivery",
+          name: "Delivery",
+          description: "A delivery team",
+          members: [{
+            handle: "lead",
+            display_name: "Lead",
+            role: "Coordinate delivery",
+            mode: "code",
+          }],
+        }]);
+      }
+      if (path.endsWith("/messages")) return Response.json(message);
+      return Response.json(team);
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: fakeFetch,
+      mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
+    });
+
+    await expect(client.teamTemplates()).resolves.toHaveLength(1);
+    await expect(client.team("se/team")).resolves.toEqual(team);
+    await expect(
+      client.postTeamMessage("se/team", "@lead ship it", "message-once"),
+    ).resolves.toEqual(message);
+    await expect(client.setTeamStatus("se/team", "pause")).resolves.toEqual(team);
+    await expect(client.createTeam({
+      workspace_id: "ws_1",
+      goal: "Ship the release",
+      template_id: "delivery",
+    })).resolves.toEqual(team);
+
+    expect(requests.slice(2).every((request) =>
+      request.headers.get("x-trouve-host-csrf") === "ephemeral-token"
+    )).toBe(true);
+    expect(new URL(requests[1]!.url).pathname).toContain("se%2Fteam");
+    await expect(requests[2]!.clone().json()).resolves.toEqual({
+      content: "@lead ship it",
+      idempotency_key: "message-once",
+    });
+  });
+
+  it("rejects malformed team snapshots without exposing their content", async () => {
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async () =>
+        Response.json({ goal: "repository secret", members: "invalid" })
+      ),
+    });
+
+    const error = await client.team("se_1").catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect(String(error)).not.toContain("repository secret");
+  });
+
+  it.each([
+    { context_input_tokens: -1 },
+    { context_window: 1.5 },
+    { cost_usd: "free" },
+  ])("rejects malformed optional usage fields: %o", async (malformed) => {
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async () => Response.json({
+        session_id: "se/team",
+        snapshot_cursor: 7,
+        goal: "Ship the release",
+        status: "active",
+        orchestrator_member_id: "member_1",
+        members: [{
+          id: "member_1",
+          session_id: "se/team",
+          handle: "lead",
+          display_name: "Lead",
+          role: "Coordinate delivery",
+          thread_id: "th_1",
+          mode: "code",
+          model: "openai/gpt-5.6",
+          state: "idle",
+          usage: { input_tokens: 0, output_tokens: 0, ...malformed },
+        }],
+        messages: [],
+        max_turns: 20,
+        turns_used: 1,
+        created_at: "2026-08-13T11:59:00Z",
+      })),
+    });
+
+    await expect(client.team("se/team")).rejects.toBeInstanceOf(ProtocolClientError);
+  });
+
   it("loads the cursor-bearing server projection used for cold startup", async () => {
     const requests: Request[] = [];
     const projection = {
@@ -1057,11 +1186,11 @@ describe("ProtocolClient", () => {
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.12")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.15")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.11", "7.13", "7.12.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.16", "7.15.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

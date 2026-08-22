@@ -16,6 +16,27 @@ interface CallbackSurface {
 const read = (path: string): string =>
   readFileSync(new URL(path, import.meta.url), "utf8");
 
+describe("team creation lifecycle regressions", () => {
+  const source = read("./trouve-app.ts");
+
+  it("seeds team session metadata before the session listing refresh", () => {
+    const create = source.indexOf("createdSessionId = team.session_id");
+    const provisional = source.indexOf("session = {", create);
+    const upsert = source.indexOf("this.#store.upsertSessionMetadata(session)", provisional);
+    const refresh = source.indexOf("await this.#protocolClient.sessions()", provisional);
+    expect(provisional).toBeGreaterThan(-1);
+    expect(upsert).toBeGreaterThan(provisional);
+    expect(refresh).toBeGreaterThan(upsert);
+    expect(source.slice(provisional, refresh)).toContain('kind: "team"');
+  });
+
+  it("invalidates deferred attachment reads when team mode clears attachments", () => {
+    expect(source).toMatch(
+      /if \(this\.#newSessionKind === "team"\) \{\s*this\.#newSessionAttachmentGeneration \+= 1;\s*this\.#newSessionAttachments = \[\];/,
+    );
+  });
+});
+
 /**
  * Executable inventory of the established application action boundary. Some
  * legacy callbacks collapse into one browser primitive (HTML drag-and-drop,

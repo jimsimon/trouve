@@ -92,6 +92,10 @@ These are load-bearing. Do not violate them without a new ADR.
     `trouve-process`. Process-tree creation holds that shared macOS boundary
     from sentinel setup through spawn; ordinary callers release it immediately
     after creating the child and wait outside it (ADR 0038).
+11. **Team coordination is server-owned and durable.** Team roles map to
+   persistent threads; canonical messages, mentions, and deliveries use the
+   session event log and thread prompt queues. Clients and provider backends
+   never coordinate agents through side channels (ADR 0042).
 
 ## Conventions
 

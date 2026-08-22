@@ -28,6 +28,13 @@ export type ProtocolSessionSummary =
   ProtocolComponents["schemas"]["SessionSummary"];
 export type ProtocolSessionSummariesSnapshot =
   ProtocolComponents["schemas"]["SessionSummariesSnapshot"];
+export type ProtocolTeam = ProtocolComponents["schemas"]["Team"];
+export type ProtocolTeamStatus = ProtocolComponents["schemas"]["TeamStatus"];
+export type ProtocolTeamMember = ProtocolComponents["schemas"]["TeamMember"];
+export type ProtocolTeamMessage = ProtocolComponents["schemas"]["TeamMessage"];
+export type ProtocolTeamTemplate = ProtocolComponents["schemas"]["TeamTemplate"];
+export type ProtocolCreateTeamRequest =
+  ProtocolComponents["schemas"]["CreateTeamRequest"];
 export type ProtocolWorkspace = ProtocolComponents["schemas"]["Workspace"];
 export type ProtocolRegisterWorkspaceRequest =
   ProtocolComponents["schemas"]["RegisterWorkspaceRequest"];
@@ -191,6 +198,9 @@ interface ProtocolValidators {
   readonly forkCheckpointResponse: ValidateFunction;
   readonly generatedSessionTitle: ValidateFunction;
   readonly summaries: ValidateFunction;
+  readonly team: ValidateFunction;
+  readonly teamTemplates: ValidateFunction;
+  readonly teamMessage: ValidateFunction;
   readonly workspace: ValidateFunction;
   readonly workspaces: ValidateFunction;
   readonly branchList: ValidateFunction;
@@ -247,6 +257,102 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
 const isNonnegativeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
+const isOptionalNullableNonnegativeInteger = (value: unknown): boolean =>
+  value === undefined || value === null || isNonnegativeInteger(value);
+
+const isOptionalNullableFiniteNumber = (value: unknown): boolean =>
+  value === undefined
+  || value === null
+  || (typeof value === "number" && Number.isFinite(value));
+
+const isString = (value: unknown): value is string => typeof value === "string";
+
+const isTeamMessage = (value: unknown): value is ProtocolTeamMessage => {
+  const message = asRecord(value);
+  if (
+    message === undefined
+    || !isString(message["id"])
+    || !isString(message["session_id"])
+    || !isString(message["author_handle"])
+    || !["human", "agent", "system"].includes(String(message["author_kind"]))
+    || !isString(message["content"])
+    || !isString(message["created_at"])
+  ) return false;
+  const authorMemberId = message["author_member_id"];
+  if (authorMemberId !== undefined && authorMemberId !== null && !isString(authorMemberId)) {
+    return false;
+  }
+  const mentions = message["mentions"];
+  return mentions === undefined || (
+    Array.isArray(mentions)
+    && mentions.every((candidate) => {
+      const mention = asRecord(candidate);
+      return mention !== undefined
+        && isString(mention["member_id"])
+        && isString(mention["handle"]);
+    })
+  );
+};
+
+const isUsage = (value: unknown): boolean => {
+  const usage = asRecord(value);
+  return usage !== undefined
+    && isNonnegativeInteger(usage["input_tokens"])
+    && isNonnegativeInteger(usage["output_tokens"])
+    && (
+      usage["cached_input_tokens"] === undefined
+      || isNonnegativeInteger(usage["cached_input_tokens"])
+    )
+    && isOptionalNullableNonnegativeInteger(usage["context_input_tokens"])
+    && isOptionalNullableNonnegativeInteger(usage["context_window"])
+    && isOptionalNullableFiniteNumber(usage["cost_usd"]);
+};
+
+const isTeamMember = (value: unknown): value is ProtocolTeamMember => {
+  const member = asRecord(value);
+  return member !== undefined
+    && ["id", "session_id", "handle", "display_name", "role", "thread_id", "mode", "model"]
+      .every((field) => isString(member[field]))
+    && ["idle", "queued", "running", "failed"].includes(String(member["state"]))
+    && (member["usage"] === undefined || isUsage(member["usage"]));
+};
+
+const isTeam = (value: unknown): value is ProtocolTeam => {
+  const team = asRecord(value);
+  return team !== undefined
+    && isString(team["session_id"])
+    && (team["snapshot_cursor"] === undefined || isNonnegativeInteger(team["snapshot_cursor"]))
+    && isString(team["goal"])
+    && ["active", "paused", "completed", "cancelled"].includes(String(team["status"]))
+    && isString(team["orchestrator_member_id"])
+    && Array.isArray(team["members"])
+    && team["members"].every(isTeamMember)
+    && Array.isArray(team["messages"])
+    && team["messages"].every(isTeamMessage)
+    && (
+      team["messages_truncated"] === undefined
+      || typeof team["messages_truncated"] === "boolean"
+    )
+    && isNonnegativeInteger(team["max_turns"])
+    && isNonnegativeInteger(team["turns_used"])
+    && isString(team["created_at"]);
+};
+
+const isTeamTemplate = (value: unknown): value is ProtocolTeamTemplate => {
+  const template = asRecord(value);
+  return template !== undefined
+    && isString(template["id"])
+    && isString(template["name"])
+    && isString(template["description"])
+    && Array.isArray(template["members"])
+    && template["members"].every((candidate) => {
+      const member = asRecord(candidate);
+      return member !== undefined
+        && ["handle", "display_name", "role", "mode"]
+          .every((field) => isString(member[field]));
+    });
+};
+
 const isSessionDiffSummary = (
   value: unknown,
 ): value is ProtocolSessionDiffSummary => {
@@ -292,6 +398,10 @@ const validators = (): Promise<ProtocolValidators> => {
   loadedValidators ??= import("../generated/protocol-validators.js").then(
     (precompiled) => ({
       ...precompiled,
+      team: isTeam,
+      teamTemplates: (value: unknown) =>
+        Array.isArray(value) && value.every(isTeamTemplate),
+      teamMessage: isTeamMessage,
       knownEventTypes: new Set(precompiled.knownEventTypes),
     }),
   );
@@ -319,6 +429,9 @@ const validateResponse = async <T>(
     | "ForkCheckpointResponse"
     | "GeneratedSessionTitle"
     | "SessionSummariesSnapshot"
+    | "Team"
+    | "TeamTemplate[]"
+    | "TeamMessage"
     | "Workspace"
     | "Workspace[]"
     | "BranchList"
@@ -424,7 +537,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.12";
+export const SUPPORTED_PROTOCOL_VERSION = "7.15";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -640,6 +753,63 @@ export class ProtocolClient {
       "Session",
       result.data,
       (loaded) => loaded.session,
+    );
+  }
+
+  async teamTemplates(): Promise<readonly ProtocolTeamTemplate[]> {
+    return this.#validatedJson(
+      "/v1/team-templates",
+      "team template",
+      "TeamTemplate[]",
+      (loaded) => loaded.teamTemplates,
+    );
+  }
+
+  async createTeam(request: ProtocolCreateTeamRequest): Promise<ProtocolTeam> {
+    return this.#validatedMutation(
+      "/v1/teams",
+      "create team",
+      "POST",
+      "Team",
+      (loaded) => loaded.team,
+      request,
+    );
+  }
+
+  async team(sessionId: string): Promise<ProtocolTeam> {
+    return this.#validatedJson(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/team`,
+      "team",
+      "Team",
+      (loaded) => loaded.team,
+    );
+  }
+
+  async postTeamMessage(
+    sessionId: string,
+    content: string,
+    idempotencyKey?: string,
+  ): Promise<ProtocolTeamMessage> {
+    return this.#validatedMutation(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/team/messages`,
+      "post team message",
+      "POST",
+      "TeamMessage",
+      (loaded) => loaded.teamMessage,
+      { content, ...(idempotencyKey === undefined ? {} : { idempotency_key: idempotencyKey }) },
+    );
+  }
+
+  async setTeamStatus(
+    sessionId: string,
+    action: "pause" | "resume" | "complete" | "cancel",
+  ): Promise<ProtocolTeam> {
+    return this.#validatedMutation(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/team/${action}`,
+      `${action} team`,
+      "POST",
+      "Team",
+      (loaded) => loaded.team,
     );
   }
 
@@ -2256,6 +2426,35 @@ export class ProtocolClient {
     return new CursorEventStream({
       path: new URL(
         `/v1/threads/${encodeURIComponent(threadId)}/events`,
+        this.#baseUrl,
+      ).href,
+      origin: this.#baseUrl,
+      after: options.after,
+      parse,
+      onEvent: options.onEvent,
+      ...(options.onOpen === undefined ? {} : { onOpen: options.onOpen }),
+      ...(options.onDiagnostic === undefined
+        ? {}
+        : { onDiagnostic: options.onDiagnostic }),
+      ...(this.#eventSourceFactory === undefined
+        ? {}
+        : { eventSourceFactory: this.#eventSourceFactory }),
+    });
+  }
+
+  async sessionEvents(
+    sessionId: string,
+    options: {
+      readonly after: number;
+      readonly onEvent: (event: ProtocolIngressEvent) => void;
+      readonly onOpen?: () => void;
+      readonly onDiagnostic?: (diagnostic: SafeStreamDiagnostic) => void;
+    },
+  ): Promise<CursorEventStream<ProtocolIngressEvent>> {
+    const parse = await loadProtocolEventParser();
+    return new CursorEventStream({
+      path: new URL(
+        `/v1/sessions/${encodeURIComponent(sessionId)}/events`,
         this.#baseUrl,
       ).href,
       origin: this.#baseUrl,

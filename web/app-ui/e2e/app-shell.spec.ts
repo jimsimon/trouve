@@ -34,6 +34,38 @@ const githubSnapshot = {
   pull_requests: { host: "github.com", viewer: "octocat", prs: [pr] },
 };
 
+const softwareDeliveryTemplate = {
+  id: "software_delivery",
+  name: "Software delivery",
+  description: "An orchestrator coordinates planning, implementation, and review.",
+  members: [
+    {
+      handle: "orchestrator",
+      display_name: "Orchestrator",
+      role: "Own the goal, delegate scoped work, integrate results, and decide when the team is done.",
+      mode: "plan",
+    },
+    {
+      handle: "planner",
+      display_name: "Planner",
+      role: "Investigate the codebase and turn the goal into a concrete implementation plan.",
+      mode: "plan",
+    },
+    {
+      handle: "coder",
+      display_name: "Coder",
+      role: "Implement the assigned change and verify it in the shared worktree.",
+      mode: "code",
+    },
+    {
+      handle: "reviewer",
+      display_name: "Reviewer",
+      role: "Review correctness, regressions, tests, and maintainability; report actionable findings.",
+      mode: "review",
+    },
+  ],
+} as const;
+
 test("serves the routed About icon during development", async ({ request }) => {
   const response = await request.get("/icons/trouve-512.png");
   expect(response.ok()).toBe(true);
@@ -134,6 +166,22 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
         providers: [],
       },
       "GET /v1/models": [],
+      "GET /v1/personas": [
+        {
+          id: "code",
+          display_name: "Engineer",
+          group: "general",
+          system_prompt: "Implement the user's request by editing files.",
+        },
+        {
+          id: "plan",
+          display_name: "Planner",
+          group: "general",
+          system_prompt: "Explore the workspace and produce a concrete plan.",
+          read_only: true,
+        },
+      ],
+      "GET /v1/team-templates": [softwareDeliveryTemplate],
       "GET /v1/persona-infos": [
         {
           origin: "builtin",
@@ -337,6 +385,74 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   await expect(persona).toHaveValue("code");
   await expect(thinking).toHaveValue("high");
   await expect(permission).toHaveValue("yolo");
+});
+
+test("team creation loads and submits the canonical template", async ({ page }, testInfo) => {
+  const goal = "Ship the team workflow";
+  const createdTeam = {
+    session_id: "se_team",
+    goal,
+    status: "active",
+    orchestrator_member_id: "tm_orchestrator",
+    members: softwareDeliveryTemplate.members.map((member) => ({
+      id: `tm_${member.handle}`,
+      session_id: "se_team",
+      thread_id: `th_${member.handle}`,
+      ...member,
+      model: "test/default",
+      state: member.handle === "orchestrator" ? "queued" : "idle",
+    })),
+    messages: [],
+    max_turns: 64,
+    turns_used: 0,
+    created_at: "2026-08-22T08:00:00Z",
+  };
+  await page.route("**/v1/workspaces/ws_1/branches", async (route) => {
+    await route.fulfill({ json: { branches: ["main"], head: "main" } });
+  });
+  await page.route("**/v1/teams", async (route) => {
+    await route.fulfill({ json: createdTeam });
+  });
+  await page.route("**/v1/sessions/se_team/team", async (route) => {
+    await route.fulfill({ json: createdTeam });
+  });
+
+  await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+  await page.getByRole("button", { name: "New session in trouve" }).click();
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+  }
+
+  const screen = page.locator("#new-session-screen");
+  await screen.locator('select[name="session_kind"]').selectOption("team");
+  await expect(screen.locator('select[name="team_template"]'))
+    .toHaveValue(softwareDeliveryTemplate.id);
+  await expect(screen.getByText(softwareDeliveryTemplate.description)).toBeVisible();
+  await screen.locator('textarea[name="prompt"]').fill(goal);
+
+  const requestPending = page.waitForRequest((request) =>
+    request.method() === "POST" && new URL(request.url()).pathname === "/v1/teams"
+  );
+  const responsePending = page.waitForResponse((response) =>
+    response.request().method() === "POST"
+    && new URL(response.url()).pathname === "/v1/teams"
+  );
+  await screen.getByRole("button", { name: "Start team" }).click();
+  const [request, response] = await Promise.all([requestPending, responsePending]);
+  expect(response.ok()).toBe(true);
+  expect(await response.json()).toMatchObject({ session_id: createdTeam.session_id });
+  expect(request.postDataJSON()).toMatchObject({
+    workspace_id: "ws_1",
+    goal,
+    template_id: softwareDeliveryTemplate.id,
+  });
+  await expect(page).toHaveURL(/\/workspaces\/ws_1\/sessions\/se_team$/u);
+  const teamScreen = page.locator('trouve-team-screen[session-id="se_team"]');
+  await expect(teamScreen.getByRole("heading", { name: goal })).toBeVisible();
+  await expect(page.getByText("Team could not be created.", { exact: true })).toHaveCount(0);
 });
 
 test("session navigation uses compact one-line rows without branch names", async ({ page }, testInfo) => {
