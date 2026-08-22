@@ -361,12 +361,33 @@ const toolCallNeedsApproval = (
 
 type ActivityGroupStatus = "awaiting-approval" | "running" | "ok" | "mixed" | "error";
 
-interface CommandRetry {
+export interface CommandRetry {
   readonly threadId: string;
   readonly name: string;
   readonly arguments: string;
   readonly idempotencyKey: string;
 }
+
+export const commandRetryForSubmission = (
+  previous: CommandRetry | undefined,
+  threadId: string,
+  name: string | undefined,
+  argumentsText: string,
+  createKey: () => string,
+): CommandRetry | undefined => {
+  if (name === undefined) return undefined;
+  if (
+    previous?.threadId === threadId
+    && previous.name === name
+    && previous.arguments === argumentsText
+  ) return previous;
+  return {
+    threadId,
+    name,
+    arguments: argumentsText,
+    idempotencyKey: createKey(),
+  };
+};
 
 const activityGroupStatusLabel = (status: ActivityGroupStatus): string =>
   ({
@@ -7042,26 +7063,21 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           command.name === commandMatch[1]
           && command.kind === "action")
       : undefined;
+    const commandArguments = commandMatch?.[2]?.trim() ?? "";
+    const commandRetry = commandRetryForSubmission(
+      this.#commandRetry,
+      threadId,
+      actionCommand?.name,
+      commandArguments,
+      () => globalThis.crypto.randomUUID(),
+    );
+    // Any distinct submission expires an earlier retry identity.
+    this.#commandRetry = commandRetry;
     if (actionCommand !== undefined && attachments.length > 0) {
       this.#requestError = "Trouve action commands do not accept attachments.";
       this.requestUpdate();
       return;
     }
-    const commandArguments = commandMatch?.[2]?.trim() ?? "";
-    const previousCommand = this.#commandRetry;
-    const commandRetry = actionCommand === undefined
-      ? undefined
-      : previousCommand?.threadId === threadId
-          && previousCommand.name === actionCommand.name
-          && previousCommand.arguments === commandArguments
-        ? previousCommand
-        : {
-            threadId,
-            name: actionCommand.name,
-            arguments: commandArguments,
-            idempotencyKey: globalThis.crypto.randomUUID(),
-          };
-    if (commandRetry !== undefined) this.#commandRetry = commandRetry;
     const startingTurn = view?.turnRunning === true
       || this.#pendingStartTurn !== undefined
       || this.#cancelRequestedTurn !== undefined;
@@ -7117,12 +7133,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           name: actionCommand.name,
           arguments: commandArguments,
         });
-        this.#commandRetry = undefined;
-        if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;
+        if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {
+          this.#commandRetry = undefined;
+          return;
+        }
         const action = result.action ?? { type: "none" as const };
         if (action.type === "switch_thread") {
           const threads = await services.protocol.threads(sessionId);
-          if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;
+          if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {
+            this.#commandRetry = undefined;
+            return;
+          }
           for (const thread of threads) store.upsertThread(thread);
           services.setThreadTabClosed(action.thread_id, false);
           services.router.navigate({
@@ -7140,6 +7161,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             inspection: "terminal",
           });
         }
+        // Keep the identity through every action follow-up. If fetching or
+        // navigation fails, resubmission replays the durable command result
+        // and resumes post-processing without repeating its side effect.
+        this.#commandRetry = undefined;
       } else if (steering) {
         await services.protocol.steerTurn(threadId, request);
         if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;

@@ -524,6 +524,22 @@ impl ThreadViewModel {
         Some(idx)
     }
 
+    fn split_thinking(&mut self) -> Option<usize> {
+        let idx = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::Thinking {
+                    complete: false,
+                    ..
+                }
+            )
+        })?;
+        if let ChatItem::Thinking { complete, .. } = &mut self.items[idx] {
+            *complete = true;
+        }
+        Some(idx)
+    }
+
     fn finish_progress(&mut self) -> Option<usize> {
         let idx = self.items.iter().rposition(|item| {
             matches!(
@@ -694,6 +710,7 @@ impl ThreadViewModel {
                 arguments,
                 output,
             } => {
+                self.split_thinking();
                 self.items.push(ChatItem::Command {
                     name: name.clone(),
                     arguments: arguments.clone(),
@@ -1843,18 +1860,27 @@ mod tests {
             arguments: String::new(),
             output: "Ready".into(),
         }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 4,
+            text: "Continuing after the command.".into(),
+        }));
 
         assert!(vm.thinking);
-        assert!(vm.items.iter().any(|item| matches!(
-            item,
-            ChatItem::Thinking {
-                complete: false,
-                ..
-            }
-        )));
+        assert!(matches!(
+            vm.items.first(),
+            Some(ChatItem::Thinking { complete: true, .. })
+        ));
+        assert!(matches!(
+            vm.items.get(1),
+            Some(ChatItem::Command { name, .. }) if name == "status"
+        ));
         assert!(matches!(
             vm.items.last(),
-            Some(ChatItem::Command { name, .. }) if name == "status"
+            Some(ChatItem::Thinking {
+                content,
+                complete: false,
+                ..
+            }) if content == "Continuing after the command."
         ));
     }
 

@@ -212,6 +212,33 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
+  it("orders continued thinking after an independent command", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 3,
+      text: "Before the command.",
+    }));
+    vm.apply(envelope(2, {
+      type: "thread.command_executed",
+      name: "status",
+      arguments: "",
+      output: "Ready",
+    }));
+    vm.apply(envelope(3, {
+      type: "assistant.thinking",
+      turn: 3,
+      text: "After the command.",
+    }));
+
+    expect(vm.thinking).toBe(true);
+    expect(vm.items).toMatchObject([
+      { kind: "thinking", content: "Before the command.", complete: true },
+      { kind: "command", name: "status", output: "Ready" },
+      { kind: "thinking", content: "After the command.", complete: false },
+    ]);
+  });
+
   it("projects a linked subagent as a top-level parent-turn boundary", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {

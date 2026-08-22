@@ -156,6 +156,7 @@ impl ThreadProjection {
                 arguments,
                 output,
             } => {
+                self.split_thinking();
                 self.push(ThreadViewItem::Command {
                     name: name.clone(),
                     arguments: arguments.clone(),
@@ -617,6 +618,19 @@ impl ThreadProjection {
 
     fn finish_thinking(&mut self) {
         self.snapshot.thinking = false;
+        if let Some(idx) = self.indexes.latest_thinking.take()
+            && let Some(ThreadViewItem::Thinking { turn, complete, .. }) =
+                self.snapshot.items.get_mut(idx)
+        {
+            *complete = true;
+            self.indexes.open_thinking.remove(turn);
+        }
+    }
+
+    /// Preserve the active-turn thinking state while closing its current
+    /// display block at an independent command boundary. A later delta starts
+    /// a new block after the command instead of being appended before it.
+    fn split_thinking(&mut self) {
         if let Some(idx) = self.indexes.latest_thinking.take()
             && let Some(ThreadViewItem::Thinking { turn, complete, .. }) =
                 self.snapshot.items.get_mut(idx)
@@ -1828,18 +1842,31 @@ mod tests {
                 output: "Ready".into(),
             },
         ));
+        projection.apply(&envelope(
+            3,
+            10,
+            Event::AssistantThinking {
+                turn: 4,
+                text: "Continuing after the command.".into(),
+            },
+        ));
 
         assert!(projection.snapshot.thinking);
         assert!(matches!(
             projection.snapshot.items.first(),
-            Some(ThreadViewItem::Thinking {
-                complete: false,
-                ..
-            })
+            Some(ThreadViewItem::Thinking { complete: true, .. })
+        ));
+        assert!(matches!(
+            projection.snapshot.items.get(1),
+            Some(ThreadViewItem::Command { name, .. }) if name == "status"
         ));
         assert!(matches!(
             projection.snapshot.items.last(),
-            Some(ThreadViewItem::Command { name, .. }) if name == "status"
+            Some(ThreadViewItem::Thinking {
+                content,
+                complete: false,
+                ..
+            }) if content == "Continuing after the command."
         ));
     }
 

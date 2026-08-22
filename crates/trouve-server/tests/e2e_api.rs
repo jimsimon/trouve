@@ -776,6 +776,29 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .unwrap();
     assert!(help["output"].as_str().unwrap().contains("/terminal"));
 
+    // Validation failures happen before a side-effect boundary, so the same
+    // client key remains safely retryable instead of becoming "uncertain".
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{base}/threads/{thread_id}/commands"))
+            .json(&serde_json::json!({
+                "idempotency_key": "command-invalid-mode",
+                "name": "mode",
+                "arguments": "missing-mode"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown persona")
+        );
+    }
+
     // Prompt commands cannot accidentally enter the deterministic action
     // endpoint and bypass the normal model-turn path.
     let response = client

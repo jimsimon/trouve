@@ -973,7 +973,6 @@ pub async fn serve_listener(
     engine.reconcile_checkpoint_refs().await;
     engine.retry_artifact_cleanup_jobs().await;
     engine.retry_persona_deletions().await;
-    engine.reconcile_command_catalogs();
     engine.start_artifact_cleanup_worker();
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.
@@ -987,7 +986,14 @@ pub async fn serve_listener(
     engine.start_connectivity_monitor();
     engine.start_automation_scheduler();
     engine.start_code_review_service();
+    let catalog_engine = Arc::clone(&engine);
     let router = build_secured_router(engine, security);
+    // Catalogs are rebuildable from durable thread events. Reconcile edited
+    // user/workspace skills after the router is ready so a large history can
+    // never delay server availability; unchanged catalogs produce no event.
+    let _catalog_task = tokio::task::spawn_blocking(move || {
+        catalog_engine.reconcile_command_catalogs();
+    });
     tracing::info!(
         "trouve-server listening on http://{}",
         listener.local_addr()?

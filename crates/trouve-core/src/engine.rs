@@ -32,8 +32,8 @@ use crate::permissions::{
     ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
 };
 use crate::store::{
-    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
-    SessionPrVerificationIntent, Store,
+    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, CommandExecutionCompletion,
+    CommandExecutionFailure, PromptAcceptance, SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
@@ -2074,11 +2074,50 @@ struct CommandExecutionGuard {
     thread_id: String,
     request_fingerprint: String,
     release_on_drop: bool,
+    side_effect_started: bool,
 }
 
 impl CommandExecutionGuard {
+    fn begin_side_effect(&mut self) -> Result<(), EngineError> {
+        self.store.begin_command_side_effect(
+            &self.idempotency_key,
+            &self.thread_id,
+            &self.request_fingerprint,
+        )?;
+        self.side_effect_started = true;
+        Ok(())
+    }
+
     fn preserve(&mut self) {
         self.release_on_drop = false;
+    }
+}
+
+fn command_failure(error: &EngineError) -> CommandExecutionFailure {
+    let (kind, message) = match error {
+        EngineError::NotFound(message) => ("not_found", message.clone()),
+        EngineError::BadRequest(message) => ("bad_request", message.clone()),
+        EngineError::Conflict(message) => ("conflict", message.clone()),
+        EngineError::SessionDiffTooLarge(message) => ("session_diff_too_large", message.clone()),
+        EngineError::AuthenticationRequired(message) => {
+            ("authentication_required", message.clone())
+        }
+        EngineError::Internal(_) => ("internal", error.to_string()),
+    };
+    CommandExecutionFailure {
+        kind: kind.into(),
+        message,
+    }
+}
+
+fn replay_command_failure(failure: CommandExecutionFailure) -> EngineError {
+    match failure.kind.as_str() {
+        "not_found" => EngineError::NotFound(failure.message),
+        "bad_request" => EngineError::BadRequest(failure.message),
+        "conflict" => EngineError::Conflict(failure.message),
+        "session_diff_too_large" => EngineError::SessionDiffTooLarge(failure.message),
+        "authentication_required" => EngineError::AuthenticationRequired(failure.message),
+        _ => EngineError::Internal(anyhow!(failure.message)),
     }
 }
 
@@ -8493,7 +8532,8 @@ impl Engine {
         session: Session,
         req: CreateThreadRequest,
     ) -> Result<Thread, EngineError> {
-        self.create_thread_for_session_with_parent(session, req, None)
+        self.create_thread_for_session_with_parent(session, req, None, None)
+            .map(|(thread, _)| thread)
     }
 
     fn create_spawned_thread_for_session(
@@ -8503,7 +8543,34 @@ impl Engine {
         parent_thread_id: &str,
         kind: &str,
     ) -> Result<Thread, EngineError> {
-        self.create_thread_for_session_with_parent(session, req, Some((parent_thread_id, kind)))
+        self.create_thread_for_session_with_parent(
+            session,
+            req,
+            Some((parent_thread_id, kind)),
+            None,
+        )
+        .map(|(thread, _)| thread)
+    }
+
+    fn create_thread_for_command(
+        &self,
+        session: Session,
+        req: CreateThreadRequest,
+        idempotency_key: &str,
+        source_thread_id: &str,
+        request_fingerprint: &str,
+    ) -> Result<CommandResult, EngineError> {
+        let (_, result) = self.create_thread_for_session_with_parent(
+            session,
+            req,
+            None,
+            Some((idempotency_key, source_thread_id, request_fingerprint)),
+        )?;
+        result.ok_or_else(|| {
+            EngineError::Internal(anyhow!(
+                "command thread creation omitted its durable result"
+            ))
+        })
     }
 
     fn create_thread_for_session_with_parent(
@@ -8511,7 +8578,8 @@ impl Engine {
         session: Session,
         req: CreateThreadRequest,
         spawn: Option<(&str, &str)>,
-    ) -> Result<Thread, EngineError> {
+        command_request: Option<(&str, &str, &str)>,
+    ) -> Result<(Thread, Option<CommandResult>), EngineError> {
         debug_assert_eq!(session.id, req.session_id);
         let ws = self.store.workspace(&session.workspace_id)?.unwrap();
         let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
@@ -8574,28 +8642,73 @@ impl Engine {
             .session(&session.id)?
             .ok_or_else(|| EngineError::NotFound(format!("session {}", session.id)))?;
         let _catalog_generation = self.command_catalog_generation.read().unwrap();
+        let publication_lock = self.command_catalog_lock(&thread.id);
+        let _publication = publication_lock.lock().unwrap();
         let commands = self.command_catalog(Path::new(&ws.path));
-        self.store.insert_thread_with_event(
-            &thread,
-            &model_options,
-            spawn,
-            Event::ThreadCreated {
-                thread_id: thread.id.clone(),
-                session_id: live_session.id,
+        let mut additional_events = vec![(
+            Scope::Thread(thread.id.clone()),
+            Event::CommandCatalogUpdated {
+                commands: commands.clone(),
             },
-            vec![(
-                Scope::Thread(thread.id.clone()),
-                Event::CommandCatalogUpdated {
-                    commands: commands.clone(),
+        )];
+        let command_result =
+            command_request.map(|(idempotency_key, source_thread_id, request_fingerprint)| {
+                let output = format!("Created thread `{}`.", thread.id);
+                let result = CommandResult {
+                    name: "new".into(),
+                    output: output.clone(),
+                    action: CommandAction::SwitchThread {
+                        thread_id: thread.id.clone(),
+                    },
+                };
+                additional_events.push((
+                    Scope::Thread(source_thread_id.to_string()),
+                    Event::CommandExecuted {
+                        name: "new".into(),
+                        arguments: String::new(),
+                        output,
+                    },
+                ));
+                CommandExecutionCompletion {
+                    idempotency_key: idempotency_key.to_string(),
+                    thread_id: source_thread_id.to_string(),
+                    request_fingerprint: request_fingerprint.to_string(),
+                    result,
+                }
+            });
+        let created_event = Event::ThreadCreated {
+            thread_id: thread.id.clone(),
+            session_id: live_session.id,
+        };
+        if let Some(completion) = command_result.as_ref() {
+            self.store.insert_thread_with_command_completion(
+                &thread,
+                &model_options,
+                spawn,
+                created_event,
+                additional_events,
+                CommandExecutionCompletion {
+                    idempotency_key: completion.idempotency_key.clone(),
+                    thread_id: completion.thread_id.clone(),
+                    request_fingerprint: completion.request_fingerprint.clone(),
+                    result: completion.result.clone(),
                 },
-            )],
-        )?;
+            )?;
+        } else {
+            self.store.insert_thread_with_event(
+                &thread,
+                &model_options,
+                spawn,
+                created_event,
+                additional_events,
+            )?;
+        }
         self.command_catalogs
             .lock()
             .unwrap()
             .insert(thread.id.clone(), commands);
         drop(deleting);
-        Ok(thread)
+        Ok((thread, command_result.map(|completion| completion.result)))
     }
 
     fn command_catalog(&self, workspace_root: &Path) -> Vec<CommandInfo> {
@@ -8615,7 +8728,21 @@ impl Engine {
         let publication_lock = self.command_catalog_lock(thread_id);
         let _publication = publication_lock.lock().unwrap();
         let commands = self.command_catalog(workspace_root);
-        if self.command_catalogs.lock().unwrap().get(thread_id) == Some(&commands) {
+        let cached = self
+            .command_catalogs
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned();
+        let prior = match cached {
+            Some(commands) => Some(commands),
+            None => self.store.latest_command_catalog(thread_id)?,
+        };
+        if prior.as_ref() == Some(&commands) {
+            self.command_catalogs
+                .lock()
+                .unwrap()
+                .insert(thread_id.to_string(), commands);
             return Ok(());
         }
         self.store.append_event(
@@ -8707,11 +8834,15 @@ impl Engine {
                     "command idempotency key was already used for a different request".into(),
                 ));
             }
-            return prior.result.ok_or_else(|| {
-                EngineError::Conflict(
-                    "command outcome is uncertain; reload the thread before retrying".into(),
-                )
-            });
+            if let Some(result) = prior.result {
+                return Ok(result);
+            }
+            if let Some(failure) = prior.failure {
+                return Err(replay_command_failure(failure));
+            }
+            return Err(EngineError::Conflict(
+                "command outcome is uncertain; reload the thread before retrying".into(),
+            ));
         }
         let mut command_claim = CommandExecutionGuard {
             store: self.store.clone(),
@@ -8719,9 +8850,46 @@ impl Engine {
             thread_id: thread_id.to_string(),
             request_fingerprint: request_fingerprint.clone(),
             release_on_drop: true,
+            side_effect_started: false,
         };
 
-        let (output, action) = match name {
+        if name == "new" {
+            require_no_command_arguments(spec, &arguments)?;
+            let creation = self.create_thread_for_command(
+                session.clone(),
+                CreateThreadRequest {
+                    session_id: session.id.clone(),
+                    title: None,
+                    mode: Some(thread.mode.clone()),
+                    model: Some(thread.model.clone()),
+                    model_options: thread.model_options.clone(),
+                    permission_mode: Some(thread.permission_mode),
+                },
+                &idempotency_key,
+                thread_id,
+                &request_fingerprint,
+            );
+            match creation {
+                Ok(result) => {
+                    command_claim.preserve();
+                    return Ok(result);
+                }
+                Err(error) => {
+                    if let Some(record) = self.store.command_execution(&idempotency_key)?
+                        && record.thread_id == thread_id
+                        && record.request_fingerprint == request_fingerprint
+                        && let Some(result) = record.result
+                    {
+                        command_claim.preserve();
+                        return Ok(result);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let dispatch = async {
+            Ok::<_, EngineError>(match name {
             "help" => {
                 let catalog = self.command_catalog(workspace_root);
                 let target = arguments.trim_start_matches('/');
@@ -8872,7 +9040,6 @@ impl Engine {
                     (output, CommandAction::None)
                 } else {
                     let mode = single_command_argument(spec, &arguments)?;
-                    command_claim.preserve();
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -8904,7 +9071,6 @@ impl Engine {
                     (output, CommandAction::None)
                 } else {
                     let model = single_command_argument(spec, &arguments)?;
-                    command_claim.preserve();
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -8937,7 +9103,6 @@ impl Engine {
                             return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
                         }
                     };
-                    command_claim.preserve();
                     let updated = self.update_thread(
                         thread_id,
                         &UpdateThreadRequest {
@@ -8956,7 +9121,7 @@ impl Engine {
             }
             "undo" => {
                 require_no_command_arguments(spec, &arguments)?;
-                command_claim.preserve();
+                command_claim.begin_side_effect()?;
                 self.undo(&session.id).await?;
                 (
                     "Restored the previous checkpoint.".into(),
@@ -8965,35 +9130,17 @@ impl Engine {
             }
             "redo" => {
                 require_no_command_arguments(spec, &arguments)?;
-                command_claim.preserve();
+                command_claim.begin_side_effect()?;
                 self.redo(&session.id).await?;
                 ("Restored the next checkpoint.".into(), CommandAction::None)
             }
             "cancel" => {
                 require_no_command_arguments(spec, &arguments)?;
-                command_claim.preserve();
+                command_claim.begin_side_effect()?;
                 self.cancel_turn(thread_id)?;
                 (
                     "Cancellation requested for the current turn.".into(),
                     CommandAction::None,
-                )
-            }
-            "new" => {
-                require_no_command_arguments(spec, &arguments)?;
-                command_claim.preserve();
-                let created = self.create_thread(CreateThreadRequest {
-                    session_id: session.id.clone(),
-                    title: None,
-                    mode: Some(thread.mode.clone()),
-                    model: Some(thread.model.clone()),
-                    model_options: thread.model_options.clone(),
-                    permission_mode: Some(thread.permission_mode),
-                })?;
-                (
-                    format!("Created thread `{}`.", created.id),
-                    CommandAction::SwitchThread {
-                        thread_id: created.id,
-                    },
                 )
             }
             "tools" => {
@@ -9113,7 +9260,6 @@ impl Engine {
                 if arguments.is_empty() {
                     return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
                 }
-                command_claim.preserve();
                 let updated = self.update_session(
                     &session.id,
                     &UpdateSessionRequest {
@@ -9138,6 +9284,28 @@ impl Engine {
                 return Err(EngineError::Internal(anyhow!(
                     "action command registry and executor diverged: /{name}"
                 )));
+            }
+            })
+        }
+        .await;
+        let (output, action) = match dispatch {
+            Ok(result) => result,
+            Err(error) => {
+                if command_claim.side_effect_started {
+                    let failure = command_failure(&error);
+                    if let Err(persistence_error) = self.store.fail_command_execution(
+                        &idempotency_key,
+                        thread_id,
+                        &request_fingerprint,
+                        &failure.kind,
+                        &failure.message,
+                    ) {
+                        command_claim.preserve();
+                        return Err(persistence_error.into());
+                    }
+                    command_claim.preserve();
+                }
+                return Err(error);
             }
         };
 
@@ -9170,6 +9338,9 @@ impl Engine {
             {
                 command_claim.preserve();
                 return Ok(durable);
+            }
+            if command_claim.side_effect_started {
+                command_claim.preserve();
             }
             return Err(error.into());
         }
@@ -18247,6 +18418,63 @@ mod tests {
         assert!(engine.skills_settings().builtin_skills_enabled);
         assert!(engine.set_builtin_skills_enabled(false).is_err());
         assert!(engine.skills_settings().builtin_skills_enabled);
+    }
+
+    #[test]
+    fn restart_reconciliation_does_not_duplicate_an_unchanged_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_catalog_restart".into(),
+            name: "catalog restart".into(),
+            path: temp.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_catalog_restart".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Catalog restart".into(),
+            branch: "main".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let engine = Engine::new(
+            store.clone(),
+            temp.path().join("data-one"),
+            &Config::default(),
+        );
+        let thread = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id,
+                title: None,
+                mode: Some("code".into()),
+                model: Some("test/model".into()),
+                model_options: serde_json::Map::new(),
+                permission_mode: Some(PermissionMode::Ask),
+            })
+            .unwrap();
+        let catalog_event_count = || {
+            store
+                .events_after(&Scope::Thread(thread.id.clone()), 0)
+                .unwrap()
+                .into_iter()
+                .filter(|event| matches!(event.event, Event::CommandCatalogUpdated { .. }))
+                .count()
+        };
+        assert_eq!(catalog_event_count(), 1);
+
+        drop(engine);
+        let restarted = Engine::new(
+            store.clone(),
+            temp.path().join("data-two"),
+            &Config::default(),
+        );
+        restarted.reconcile_command_catalogs();
+        assert_eq!(catalog_event_count(), 1);
     }
 
     struct RejectingPersonaDeletionExecutor {

@@ -638,6 +638,7 @@ export class ThreadViewModel {
         this.commands = envelope.commands;
         return true;
       case "thread.command_executed":
+        this.splitThinking();
         this.appendItem({
           id: `command:${envelope.cursor}`,
           kind: "command",
@@ -1102,6 +1103,15 @@ export class ThreadViewModel {
       (candidate) => candidate.kind === "thinking" && !candidate.complete,
     );
     if (item?.kind !== "thinking") return wasThinking;
+    item.complete = true;
+    return true;
+  }
+
+  private splitThinking(): boolean {
+    const item = this.#findLast(
+      (candidate) => candidate.kind === "thinking" && !candidate.complete,
+    );
+    if (item?.kind !== "thinking") return false;
     item.complete = true;
     return true;
   }

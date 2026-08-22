@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
-    CommandResult, Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session,
+    CommandInfo, CommandResult, Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session,
     SessionAttention, SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread,
     ThreadStatus, ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
 };
@@ -39,8 +39,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // ends, so interrupted collaboration waits cannot replay as active forever.
 // v10 retains active-turn usage aggregates so reconnecting clients receive
 // the same monotonic token totals as live event folds. v11 separates active
-// usage from the latest measurement. v12 keeps last_usage completed-only.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 12;
+// usage from the latest measurement. v12 keeps last_usage completed-only. v13
+// splits active thinking around independent deterministic command output.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 13;
 // A snapshot folds events without holding the SQLite connection. A terminal
 // event can therefore advance the materialized cache before the snapshot
 // reacquires the connection. Rebuild from that newer cache instead of mixing
@@ -109,6 +110,9 @@ CREATE TABLE IF NOT EXISTS command_execution_requests (
   thread_id TEXT NOT NULL REFERENCES threads(id),
   request_fingerprint TEXT NOT NULL,
   result TEXT,
+  side_effect_started INTEGER NOT NULL DEFAULT 0,
+  error_kind TEXT,
+  error_message TEXT,
   created_at TEXT NOT NULL,
   completed_at TEXT
 );
@@ -609,6 +613,9 @@ CREATE TABLE IF NOT EXISTS code_review_polled_comments (
 /// additions are retried and "duplicate column" errors are ignored.
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE session_create_requests ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE command_execution_requests ADD COLUMN side_effect_started INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE command_execution_requests ADD COLUMN error_kind TEXT",
+    "ALTER TABLE command_execution_requests ADD COLUMN error_message TEXT",
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
@@ -4167,6 +4174,20 @@ pub(crate) struct CommandExecutionRecord {
     pub thread_id: String,
     pub request_fingerprint: String,
     pub result: Option<CommandResult>,
+    pub side_effect_started: bool,
+    pub failure: Option<CommandExecutionFailure>,
+}
+
+pub(crate) struct CommandExecutionFailure {
+    pub kind: String,
+    pub message: String,
+}
+
+pub(crate) struct CommandExecutionCompletion {
+    pub idempotency_key: String,
+    pub thread_id: String,
+    pub request_fingerprint: String,
+    pub result: CommandResult,
 }
 
 /// One serialized event, in flight to the writer thread.
@@ -4206,12 +4227,10 @@ enum StoreMutation {
         thread: Box<Thread>,
         model_options: serde_json::Map<String, serde_json::Value>,
         spawn: Option<(String, String)>,
+        command_completion: Option<Box<CommandExecutionCompletion>>,
     },
     CompleteCommandExecution {
-        idempotency_key: String,
-        thread_id: String,
-        request_fingerprint: String,
-        result: Box<CommandResult>,
+        completion: Box<CommandExecutionCompletion>,
     },
     Delete {
         id: String,
@@ -4648,7 +4667,41 @@ fn row_to_command_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<Command
         thread_id: row.get(0)?,
         request_fingerprint: row.get(1)?,
         result,
+        side_effect_started: row.get::<_, i64>(3)? != 0,
+        failure: match (
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ) {
+            (Some(kind), Some(message)) => Some(CommandExecutionFailure { kind, message }),
+            _ => None,
+        },
     })
+}
+
+fn complete_command_execution_row(
+    conn: &Connection,
+    completion: &CommandExecutionCompletion,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let result = serde_json::to_string(&completion.result)?;
+    let updated = conn.execute(
+        "UPDATE command_execution_requests
+         SET result = ?4, completed_at = ?5
+         WHERE idempotency_key = ?1 AND thread_id = ?2
+           AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL",
+        params![
+            completion.idempotency_key,
+            completion.thread_id,
+            completion.request_fingerprint,
+            result,
+            timestamp.to_rfc3339(),
+        ],
+    )?;
+    anyhow::ensure!(
+        updated == 1,
+        "command execution claim is missing, mismatched, or already complete"
+    );
+    Ok(())
 }
 
 fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
@@ -4790,6 +4843,7 @@ fn apply_store_mutation(
             thread,
             model_options,
             spawn,
+            command_completion,
         } => {
             // Validate the owner in this transaction so a stale engine
             // snapshot cannot surface an FK error after session deletion.
@@ -4839,31 +4893,12 @@ fn apply_store_mutation(
                     params![thread.id, parent, kind],
                 )?;
             }
+            if let Some(completion) = command_completion {
+                complete_command_execution_row(conn, completion, timestamp)?;
+            }
         }
-        StoreMutation::CompleteCommandExecution {
-            idempotency_key,
-            thread_id,
-            request_fingerprint,
-            result,
-        } => {
-            let result = serde_json::to_string(result)?;
-            let updated = conn.execute(
-                "UPDATE command_execution_requests
-                 SET result = ?4, completed_at = ?5
-                 WHERE idempotency_key = ?1 AND thread_id = ?2
-                   AND request_fingerprint = ?3 AND result IS NULL",
-                params![
-                    idempotency_key,
-                    thread_id,
-                    request_fingerprint,
-                    result,
-                    timestamp.to_rfc3339(),
-                ],
-            )?;
-            anyhow::ensure!(
-                updated == 1,
-                "command execution claim is missing, mismatched, or already complete"
-            );
+        StoreMutation::CompleteCommandExecution { completion } => {
+            complete_command_execution_row(conn, completion, timestamp)?;
         }
         StoreMutation::Delete { id, cleanup } => {
             insert_artifact_cleanup_job(conn, cleanup, timestamp)?;
@@ -5943,6 +5978,33 @@ impl Store {
         Ok(cursor.unwrap_or(0) as u64)
     }
 
+    /// Recover the newest provider-neutral command catalog from the durable
+    /// thread log. The in-memory engine cache is intentionally rebuildable;
+    /// this prevents startup reconciliation from appending a duplicate event
+    /// merely because the process restarted.
+    pub(crate) fn latest_command_catalog(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Vec<CommandInfo>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT payload FROM events
+             WHERE scope_kind = 'thread' AND scope_id = ?1
+               AND (instr(payload, '\"type\":\"thread.command_catalog_updated\"') > 0
+                 OR instr(payload, '\"type\":\"thread.commands_updated\"') > 0)
+             ORDER BY cursor DESC",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |row| row.get::<_, String>(0))?;
+        for payload in rows {
+            match serde_json::from_str::<Event>(&payload?) {
+                Ok(Event::CommandCatalogUpdated { commands })
+                | Ok(Event::CommandsUpdated { commands }) => return Ok(Some(commands)),
+                Ok(_) | Err(_) => continue,
+            }
+        }
+        Ok(None)
+    }
+
     /// Fold a thread's durable events into a cached current-state snapshot.
     ///
     /// Raw rows are captured through one cursor while holding the connection,
@@ -6971,7 +7033,8 @@ impl Store {
         )?;
         let prior = if inserted == 0 {
             tx.query_row(
-                "SELECT thread_id, request_fingerprint, result
+                "SELECT thread_id, request_fingerprint, result, side_effect_started,
+                        error_kind, error_message
                  FROM command_execution_requests WHERE idempotency_key = ?1",
                 params![idempotency_key],
                 row_to_command_execution,
@@ -6980,6 +7043,19 @@ impl Store {
         } else {
             None
         };
+        let prior = prior.and_then(|record| {
+            let same_request =
+                record.thread_id == thread_id && record.request_fingerprint == request_fingerprint;
+            if same_request
+                && record.result.is_none()
+                && record.failure.is_none()
+                && !record.side_effect_started
+            {
+                None
+            } else {
+                Some(record)
+            }
+        });
         tx.commit()?;
         Ok(prior)
     }
@@ -6992,13 +7068,62 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT thread_id, request_fingerprint, result
+                "SELECT thread_id, request_fingerprint, result, side_effect_started,
+                        error_kind, error_message
                  FROM command_execution_requests WHERE idempotency_key = ?1",
                 params![idempotency_key],
                 row_to_command_execution,
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub(crate) fn begin_command_side_effect(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+    ) -> Result<()> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE command_execution_requests SET side_effect_started = 1
+             WHERE idempotency_key = ?1 AND thread_id = ?2
+               AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL",
+            params![idempotency_key, thread_id, request_fingerprint],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "command execution claim is missing or complete"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn fail_command_execution(
+        &self,
+        idempotency_key: &str,
+        thread_id: &str,
+        request_fingerprint: &str,
+        kind: &str,
+        message: &str,
+    ) -> Result<()> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE command_execution_requests
+             SET error_kind = ?4, error_message = ?5, completed_at = ?6
+             WHERE idempotency_key = ?1 AND thread_id = ?2
+               AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL",
+            params![
+                idempotency_key,
+                thread_id,
+                request_fingerprint,
+                kind,
+                message,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "command execution claim is missing or complete"
+        );
+        Ok(())
     }
 
     pub(crate) fn release_command_execution(
@@ -7010,7 +7135,7 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "DELETE FROM command_execution_requests
              WHERE idempotency_key = ?1 AND thread_id = ?2
-               AND request_fingerprint = ?3 AND result IS NULL",
+               AND request_fingerprint = ?3 AND result IS NULL AND error_kind IS NULL",
             params![idempotency_key, thread_id, request_fingerprint],
         )?;
         Ok(())
@@ -7030,10 +7155,12 @@ impl Store {
         let pending = serialize_lifecycle_events(
             vec![(Scope::Thread(thread_id.to_string()), event)],
             StoreMutation::CompleteCommandExecution {
-                idempotency_key: idempotency_key.to_string(),
-                thread_id: thread_id.to_string(),
-                request_fingerprint: request_fingerprint.to_string(),
-                result: Box::new(result.clone()),
+                completion: Box::new(CommandExecutionCompletion {
+                    idempotency_key: idempotency_key.to_string(),
+                    thread_id: thread_id.to_string(),
+                    request_fingerprint: request_fingerprint.to_string(),
+                    result: result.clone(),
+                }),
             },
         )?;
         self.append_pending_events(pending)?;
@@ -7050,6 +7177,44 @@ impl Store {
         event: Event,
         additional_events: Vec<(Scope, Event)>,
     ) -> Result<EventEnvelope> {
+        self.insert_thread_with_event_and_completion(
+            thread,
+            model_options,
+            spawn,
+            event,
+            additional_events,
+            None,
+        )
+    }
+
+    pub(crate) fn insert_thread_with_command_completion(
+        &self,
+        thread: &Thread,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        spawn: Option<(&str, &str)>,
+        event: Event,
+        additional_events: Vec<(Scope, Event)>,
+        command_completion: CommandExecutionCompletion,
+    ) -> Result<EventEnvelope> {
+        self.insert_thread_with_event_and_completion(
+            thread,
+            model_options,
+            spawn,
+            event,
+            additional_events,
+            Some(command_completion),
+        )
+    }
+
+    fn insert_thread_with_event_and_completion(
+        &self,
+        thread: &Thread,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        spawn: Option<(&str, &str)>,
+        event: Event,
+        additional_events: Vec<(Scope, Event)>,
+        command_completion: Option<CommandExecutionCompletion>,
+    ) -> Result<EventEnvelope> {
         let mut events = vec![(Scope::Server, event)];
         events.extend(additional_events);
         let pending = serialize_lifecycle_events(
@@ -7058,6 +7223,7 @@ impl Store {
                 thread: Box::new(thread.clone()),
                 model_options: model_options.clone(),
                 spawn: spawn.map(|(parent, kind)| (parent.to_string(), kind.to_string())),
+                command_completion: command_completion.map(Box::new),
             },
         )?;
         Ok(self
@@ -16881,11 +17047,22 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // A crash before any side-effect boundary is safe to reclaim.
+        assert!(
+            store
+                .claim_command_execution("command-once", "th_command", "fingerprint")
+                .unwrap()
+                .is_none()
+        );
+        store
+            .begin_command_side_effect("command-once", "th_command", "fingerprint")
+            .unwrap();
         let pending = store
             .claim_command_execution("command-once", "th_command", "fingerprint")
             .unwrap()
             .unwrap();
         assert!(pending.result.is_none());
+        assert!(pending.side_effect_started);
 
         let result = CommandResult {
             name: "new".into(),
@@ -16917,6 +17094,33 @@ mod tests {
         assert_eq!(replay.name, result.name);
         assert_eq!(replay.output, result.output);
         assert_eq!(replay.action, result.action);
+
+        assert!(
+            store
+                .claim_command_execution("command-failure", "th_command", "failure-fingerprint")
+                .unwrap()
+                .is_none()
+        );
+        store
+            .begin_command_side_effect("command-failure", "th_command", "failure-fingerprint")
+            .unwrap();
+        store
+            .fail_command_execution(
+                "command-failure",
+                "th_command",
+                "failure-fingerprint",
+                "bad_request",
+                "nothing to undo",
+            )
+            .unwrap();
+        let failure = store
+            .claim_command_execution("command-failure", "th_command", "failure-fingerprint")
+            .unwrap()
+            .unwrap()
+            .failure
+            .unwrap();
+        assert_eq!(failure.kind, "bad_request");
+        assert_eq!(failure.message, "nothing to undo");
         assert_eq!(
             store
                 .events_after(&Scope::Thread("th_command".into()), 0)
@@ -16929,6 +17133,104 @@ mod tests {
 
         store.delete_session("se_q").unwrap();
         assert!(store.command_execution("command-once").unwrap().is_none());
+    }
+
+    #[test]
+    fn thread_creation_and_command_completion_commit_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_source");
+        assert!(
+            store
+                .claim_command_execution("new-key", "th_source", "new-fingerprint")
+                .unwrap()
+                .is_none()
+        );
+        let child = Thread {
+            id: "th_child".into(),
+            session_id: "se_q".into(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let result = CommandResult {
+            name: "new".into(),
+            output: "Created thread `th_child`.".into(),
+            action: trouve_protocol::CommandAction::SwitchThread {
+                thread_id: child.id.clone(),
+            },
+        };
+        let events = vec![
+            (
+                Scope::Thread(child.id.clone()),
+                Event::CommandCatalogUpdated { commands: vec![] },
+            ),
+            (
+                Scope::Thread("th_source".into()),
+                Event::CommandExecuted {
+                    name: "new".into(),
+                    arguments: String::new(),
+                    output: result.output.clone(),
+                },
+            ),
+        ];
+
+        let failed = store.insert_thread_with_command_completion(
+            &child,
+            &serde_json::Map::new(),
+            None,
+            Event::ThreadCreated {
+                thread_id: child.id.clone(),
+                session_id: child.session_id.clone(),
+            },
+            events.clone(),
+            CommandExecutionCompletion {
+                idempotency_key: "new-key".into(),
+                thread_id: "th_source".into(),
+                request_fingerprint: "wrong-fingerprint".into(),
+                result: result.clone(),
+            },
+        );
+        assert!(failed.is_err());
+        assert!(store.thread(&child.id).unwrap().is_none());
+
+        store
+            .insert_thread_with_command_completion(
+                &child,
+                &serde_json::Map::new(),
+                None,
+                Event::ThreadCreated {
+                    thread_id: child.id.clone(),
+                    session_id: child.session_id.clone(),
+                },
+                events,
+                CommandExecutionCompletion {
+                    idempotency_key: "new-key".into(),
+                    thread_id: "th_source".into(),
+                    request_fingerprint: "new-fingerprint".into(),
+                    result: result.clone(),
+                },
+            )
+            .unwrap();
+        assert!(store.thread(&child.id).unwrap().is_some());
+        assert_eq!(
+            store.latest_command_catalog(&child.id).unwrap(),
+            Some(vec![])
+        );
+        let replay = store
+            .command_execution("new-key")
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(replay.name, result.name);
+        assert_eq!(replay.output, result.output);
+        assert_eq!(replay.action, result.action);
     }
 
     #[test]
