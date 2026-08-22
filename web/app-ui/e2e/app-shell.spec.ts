@@ -236,7 +236,7 @@ test.beforeEach(async ({ page }) => {
   await installProtocolFixtures(page);
 });
 
-test("new-session selects stay synchronized with asynchronously loaded defaults", async ({ page }) => {
+test("new-session selects stay synchronized with asynchronously loaded defaults", async ({ page }, testInfo) => {
   await page.route("**/v1/providers", async (route) => {
     await route.fulfill({
       json: {
@@ -300,7 +300,13 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   });
 
   await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
   await page.getByRole("button", { name: "New session in trouve" }).click();
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+  }
 
   const screen = page.locator("#new-session-screen");
   const persona = screen.locator('select[name="mode"]');
