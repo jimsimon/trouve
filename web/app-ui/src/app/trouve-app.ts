@@ -2798,10 +2798,20 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const workspaceListPreferences = readSignal(this.#workspaceListPreferences.current);
     const workspaceGroups = organizeWorkspaceList(orderedWorkspaces, workspaceListPreferences.grouping);
     const displayedWorkspaces = workspaceGroups.flatMap(({ workspaces }) => workspaces);
-    const repositoryGroupHeadings = new Map<string, string>(
-      workspaceGroups.flatMap((group) =>
-        group.repository && group.workspaces.length > 1 && group.workspaces[0] !== undefined
-          ? [[group.workspaces[0].id, group.label]]
+    const workspaceReorderingEnabled = workspaceGroups.every(
+      ({ workspaces }) => workspaces.length === 1,
+    );
+    const repositoryGroupPresentations = new Map(
+      workspaceGroups.flatMap((group, groupIndex) =>
+        group.repository && group.workspaces.length > 1
+          ? group.workspaces.map((workspace, index) => [
+              workspace.id,
+              {
+                headingId: `repository-group-${groupIndex}`,
+                label: group.label,
+                first: index === 0,
+              },
+            ] as const)
           : []),
     );
     const capabilities = readSignal(this.#capabilities.current);
@@ -2999,7 +3009,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             (workspace, index) => {
               const collapsed = this.#collapsedWorkspaceIds.has(workspace.id);
               const workspaceFilters = this.#workspaceListPreferences.filtersFor(workspace.id);
-              const repositoryHeading = repositoryGroupHeadings.get(workspace.id);
+              const repositoryGroup = repositoryGroupPresentations.get(workspace.id);
               const dropTarget = this.#workspaceDropTarget === workspace.id;
               const placeholder = html`<div
                 class="workspace-drop-placeholder"
@@ -3009,13 +3019,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 @drop=${(event: DragEvent) => this.#dropWorkspace(event, workspace.id)}
               ></div>`;
               return html`
-                ${repositoryHeading === undefined
-                  ? nothing
-                  : html`<h2 class="repository-group-heading">${repositoryHeading}</h2>`}
+                ${repositoryGroup?.first
+                  ? html`<h2 id=${repositoryGroup.headingId} class="repository-group-heading">${repositoryGroup.label}</h2>`
+                  : nothing}
                 ${dropTarget && !this.#workspaceDropAfter ? placeholder : nothing}
                 <section
                   class="workspace-group"
-                  aria-labelledby=${`workspace-${index}`}
+                  aria-labelledby=${repositoryGroup === undefined
+                    ? `workspace-${index}`
+                    : `${repositoryGroup.headingId} workspace-${index}`}
                   @dragover=${(event: DragEvent) => this.#dragOverWorkspace(event, workspace.id)}
                   @drop=${(event: DragEvent) => this.#dropWorkspace(event, workspace.id)}
                 >
@@ -3034,24 +3046,28 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       @click=${() => this.#toggleWorkspace(workspace.id)}
                     >
                       ${fontAwesomeIcon(collapsed ? "caret-right" : "caret-down")}
-                      <h2 id=${`workspace-${index}`}>${workspace.name}</h2>
+                      ${repositoryGroup === undefined
+                        ? html`<h2 id=${`workspace-${index}`}>${workspace.name}</h2>`
+                        : html`<h3 id=${`workspace-${index}`}>${workspace.name}</h3>`}
                     </button>
-                    <span
-                      class="workspace-order-controls"
-                      aria-label=${`Position of ${workspace.name}, ${index + 1} of ${orderedWorkspaces.length}`}
-                    >
-                      <button
-                        class="workspace-grip"
-                        type="button"
-                        data-workspace-id=${workspace.id}
-                        .draggable=${orderedWorkspaces.length > 1}
-                        aria-label=${`Reorder ${workspace.name}. Position ${index + 1} of ${orderedWorkspaces.length}. Use Up and Down arrow keys or drag.`}
-                        title="Drag to reorder, or use arrow keys"
-                        @keydown=${(event: KeyboardEvent) => this.#workspaceOrderKeyDown(event, workspace.id)}
-                        @dragstart=${(event: DragEvent) => this.#startWorkspaceDrag(event, workspace.id)}
-                        @dragend=${this.#finishWorkspaceDrag}
-                      >${fontAwesomeIcon("grip-vertical")}</button>
-                    </span>
+                    ${workspaceReorderingEnabled
+                      ? html`<span
+                          class="workspace-order-controls"
+                          aria-label=${`Position of ${workspace.name}, ${index + 1} of ${displayedWorkspaces.length}`}
+                        >
+                          <button
+                            class="workspace-grip"
+                            type="button"
+                            data-workspace-id=${workspace.id}
+                            .draggable=${displayedWorkspaces.length > 1}
+                            aria-label=${`Reorder ${workspace.name}. Position ${index + 1} of ${displayedWorkspaces.length}. Use Up and Down arrow keys or drag.`}
+                            title="Drag to reorder, or use arrow keys"
+                            @keydown=${(event: KeyboardEvent) => this.#workspaceOrderKeyDown(event, workspace.id)}
+                            @dragstart=${(event: DragEvent) => this.#startWorkspaceDrag(event, workspace.id)}
+                            @dragend=${this.#finishWorkspaceDrag}
+                          >${fontAwesomeIcon("grip-vertical")}</button>
+                        </span>`
+                      : nothing}
                     <span class="workspace-actions-wrap">
                       <button
                         class="workspace-actions-button"

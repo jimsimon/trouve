@@ -1216,14 +1216,29 @@ async fn register_workspace(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<RegisterWorkspaceRequest>,
 ) -> Result<Json<WorkspaceListItem>, ApiError> {
-    Ok(Json(engine.register_workspace(&req.path, req.name)?))
+    let workspace =
+        tokio::task::spawn_blocking(move || engine.register_workspace(&req.path, req.name))
+            .await
+            .map_err(|error| {
+                ApiError(EngineError::Internal(anyhow::anyhow!(
+                    "workspace registration worker failed: {error}"
+                )))
+            })??;
+    Ok(Json(workspace))
 }
 
 #[utoipa::path(get, path = "/v1/workspaces", responses((status = 200, body = [WorkspaceListItem])))]
 async fn list_workspaces(
     State(engine): State<Arc<Engine>>,
 ) -> Result<Json<Vec<WorkspaceListItem>>, ApiError> {
-    Ok(Json(engine.list_workspaces()?))
+    let workspaces = tokio::task::spawn_blocking(move || engine.list_workspaces())
+        .await
+        .map_err(|error| {
+            ApiError(EngineError::Internal(anyhow::anyhow!(
+                "workspace list worker failed: {error}"
+            )))
+        })??;
+    Ok(Json(workspaces))
 }
 
 #[utoipa::path(delete, path = "/v1/workspaces/{id}", params(("id" = String, Path,)),

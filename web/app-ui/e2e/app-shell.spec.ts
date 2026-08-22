@@ -416,6 +416,34 @@ test("workspace list options dismiss with Escape and an outside pointer", async 
   await expect(options).toHaveCount(0);
 });
 
+test("repository grouping exposes nested headings and disables ambiguous workspace reordering", async ({ page }, testInfo) => {
+  await page.route("**/v1/workspaces", async (route) => {
+    await route.fulfill({
+      json: [
+        { id: "ws_1", name: "first", path: "/src/first", repository_key: "remote:github.com/acme/app", repository_name: "app" },
+        { id: "ws_2", name: "other", path: "/src/other", repository_key: "remote:github.com/acme/other", repository_name: "other" },
+        { id: "ws_3", name: "clone", path: "/src/clone", repository_key: "remote:github.com/acme/app", repository_name: "app" },
+      ],
+    });
+  });
+  await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+
+  await expect(page.getByRole("heading", { level: 2, name: "app" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "first" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "clone" })).toBeVisible();
+  await expect(page.locator(".workspace-grip")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Workspace list options" }).click();
+  await page.getByRole("combobox", { name: "Group sessions by" }).selectOption("workspace");
+  await expect(page.getByRole("heading", { level: 2, name: "first" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 2, name: "clone" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "first" })).toHaveCount(0);
+  await expect(page.locator(".workspace-grip")).toHaveCount(3);
+});
+
 test("background session updates preserve command-palette scrolling", async ({ page }, testInfo) => {
   test.skip(
     testInfo.project.name.startsWith("mobile"),
