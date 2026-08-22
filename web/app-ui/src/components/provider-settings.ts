@@ -96,7 +96,8 @@ export const movedProviderOrder = (
   return normalized;
 };
 
-/** Local and loopback adapters never participate in hosted automatic routes. */
+/** Providers categorized as local — managed models and user-configured
+ * localhost/loopback API endpoints — never join hosted automatic routes. */
 export const automaticRoutingProviders = (
   providers: readonly ProtocolProviderInfo[],
 ): readonly ProtocolProviderInfo[] =>
@@ -677,7 +678,7 @@ export class TrouveProviderSettings extends LitElement {
     return html`
       <section class="settings-card routing-priority" aria-labelledby="routing-priority-title">
         <h3 id="routing-priority-title">Automatic routing priority</h3>
-        <p>Automatic selections prefer the first healthy route and stay there until it fails.</p>
+        <p>Auto uses one healthy hosted route. Local models and localhost APIs stay pinned.</p>
         <div class="priority-list">
           ${order.map((providerId, index) => html`
             <div class="priority-row">

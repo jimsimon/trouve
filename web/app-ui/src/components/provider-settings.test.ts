@@ -84,7 +84,7 @@ describe("provider settings security boundaries", () => {
     )).toEqual(["local", "cursor", "loopback", "codex"]);
   });
 
-  it("keeps local and configured loopback providers out of hosted priority", () => {
+  it("keeps managed local models and localhost APIs out of hosted priority", () => {
     const provider = (id: string, category: string): ProtocolProviderInfo => ({
       id,
       kind: "openai-compat",
