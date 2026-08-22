@@ -52,10 +52,15 @@ import {
 } from "../services/appearance-preferences.js";
 import { queryBrowserSystemFontFamilies } from "../services/system-fonts.js";
 import {
+  AttachmentOperationCapacityError,
   AttachmentEncodingError,
+  base64DecodedByteLength,
   encodeAttachment,
+  isVideoMime,
+  MAX_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENTS,
+  PendingAttachmentOperations,
   pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
@@ -63,6 +68,7 @@ import {
   chatPreferencesFromHost,
   generalPreferencesFromHost,
   HostClient,
+  HostClientError,
   notificationPreferencesFromHost,
   pullRequestGroupOrderFromHost,
   resumePreferencesFromHost,
@@ -182,6 +188,9 @@ import "../components/thread-screen.js";
 import "../components/model-picker.js";
 
 const SESSION_TITLE_TIMEOUT_MS = 48_000;
+const VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 30_000;
+const VIDEO_ATTACHMENT_OPEN_CONCURRENCY = 1;
+const VIDEO_ATTACHMENT_OPEN_CAPACITY = 8;
 
 const deployment =
   import.meta.env.MODE === "pwa"
@@ -255,6 +264,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   );
   readonly #hostClient =
     deployment === "desktop" ? new HostClient(globalThis.location.origin) : undefined;
+  readonly #pendingVideoOpens = new PendingAttachmentOperations(
+    VIDEO_ATTACHMENT_OPEN_CONCURRENCY,
+    VIDEO_ATTACHMENT_OPEN_CAPACITY,
+  );
   readonly #desktopCoordinator = this.#hostClient === undefined
     ? undefined
     : new DesktopHostCoordinator(this.#hostClient, {
@@ -2548,6 +2561,156 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     globalThis.open(url.href, "_blank", "noopener,noreferrer");
   };
 
+  readonly #openVideo = (event: CustomEvent<{
+    readonly source: string;
+    readonly name: string;
+    readonly mime: string;
+  }>): void => {
+    event.stopPropagation();
+    if (!isVideoMime(event.detail.mime)) return;
+    if (deployment === "desktop") {
+      const host = this.#hostClient;
+      if (
+        host === undefined
+        || !readSignal(this.#capabilities.current).openVideoAttachment
+      ) {
+        this.#shellNotice = "External video playback is unavailable in this desktop preview.";
+        this.requestUpdate();
+        return;
+      }
+      const pending = this.#pendingVideoOpens.run(event.detail.source, async () => {
+        const attachment = await this.#pendingVideoAttachment(event.detail);
+        await host.openVideoAttachment(attachment);
+      });
+      if (pending === undefined) return;
+      void pending
+        .catch((error: unknown) => {
+          this.#shellNotice = error instanceof AttachmentOperationCapacityError
+            || (error instanceof HostClientError && error.kind === "video-capacity")
+            ? "Temporary video playback capacity is full. Restart trouve to open a different video."
+            : "The video could not be opened in the system player.";
+          this.requestUpdate();
+        });
+      return;
+    }
+
+    const target = this.#browserVideoTarget(event.detail);
+    if (target === undefined) return;
+    // `noopener` makes successful `window.open` calls return null in some
+    // browsers, which is indistinguishable from popup blocking. Open a blank
+    // same-origin context first, sever its opener, then navigate it.
+    const opened = globalThis.open("about:blank", "_blank");
+    if (opened === null) {
+      if (target.revoke) URL.revokeObjectURL(target.href);
+      this.#shellNotice = "The browser blocked video playback. Allow pop-ups for trouve and try again.";
+      this.requestUpdate();
+      return;
+    }
+    try {
+      opened.opener = null;
+      opened.location.replace(target.href);
+    } catch {
+      opened.close();
+      if (target.revoke) URL.revokeObjectURL(target.href);
+      this.#shellNotice = "The video player could not be opened. Try again or download the attachment.";
+      this.requestUpdate();
+      return;
+    }
+    if (target.revoke) {
+      globalThis.setTimeout(() => URL.revokeObjectURL(target.href), 60_000);
+    }
+  };
+
+  #videoDataAttachment(detail: {
+    readonly source: string;
+    readonly name: string;
+    readonly mime: string;
+  }): PendingAttachment | undefined {
+    const mime = detail.mime.toLowerCase();
+    const prefix = `data:${mime};base64,`;
+    if (!detail.source.startsWith(prefix)) return undefined;
+    const data = detail.source.slice(prefix.length);
+    const size = base64DecodedByteLength(data);
+    if (size === undefined || size > MAX_ATTACHMENT_BYTES) return undefined;
+    return {
+      upload: { name: detail.name, mime, data },
+      size,
+    };
+  }
+
+  #protocolVideoUrl(source: string): URL | undefined {
+    let url: URL;
+    try {
+      url = new URL(source, globalThis.location.origin);
+    } catch {
+      return undefined;
+    }
+    if (
+      url.origin !== globalThis.location.origin
+      || !url.pathname.startsWith("/v1/attachments/")
+      || url.search !== ""
+      || url.hash !== ""
+    ) return undefined;
+    return url;
+  }
+
+  async #pendingVideoAttachment(detail: {
+    readonly source: string;
+    readonly name: string;
+    readonly mime: string;
+  }): Promise<PendingAttachment> {
+    const encoded = this.#videoDataAttachment(detail);
+    if (encoded !== undefined) return encoded;
+    const url = this.#protocolVideoUrl(detail.source);
+    if (url === undefined) throw new Error("invalid video attachment source");
+    const abort = new AbortController();
+    const timeout = globalThis.setTimeout(
+      () => abort.abort(),
+      VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS,
+    );
+    let blob: Blob;
+    try {
+      const response = await globalThis.fetch(url, {
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: abort.signal,
+      });
+      if (!response.ok) throw new Error("video attachment download failed");
+      blob = await response.blob();
+    } finally {
+      globalThis.clearTimeout(timeout);
+    }
+    return encodeAttachment(
+      new File([blob], detail.name, { type: detail.mime }),
+      detail.name,
+    );
+  }
+
+  #browserVideoTarget(detail: {
+    readonly source: string;
+    readonly name: string;
+    readonly mime: string;
+  }): { readonly href: string; readonly revoke: boolean } | undefined {
+    const encoded = this.#videoDataAttachment(detail);
+    if (encoded === undefined) {
+      const url = this.#protocolVideoUrl(detail.source);
+      return url === undefined ? undefined : { href: url.href, revoke: false };
+    }
+    try {
+      const binary = globalThis.atob(encoded.upload.data);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return {
+        href: URL.createObjectURL(new Blob([bytes], { type: encoded.upload.mime })),
+        revoke: true,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
   readonly #openFile = (event: CustomEvent<ChatFileTarget>): void => {
     event.stopPropagation();
     const route = readSignal(this.#router.route);
@@ -2774,6 +2937,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         aria-label="trouve application"
         @trouve-open-internal=${this.#openInternal}
         @trouve-open-external=${this.#openExternal}
+        @trouve-open-video=${this.#openVideo}
         @trouve-open-file=${this.#openFile}
         @trouve-open-inspection=${this.#openInspection}
         @trouve-chat-position=${this.#chatPositionChanged}
@@ -3162,12 +3326,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   ${this.#newSessionAttachments.map(
                     (attachment, index) => {
                       const preview = pendingAttachmentPreviewUrl(attachment);
+                      const video = isVideoMime(attachment.upload.mime);
                       return html`<li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
                         ${preview === undefined
                           ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
                           : html`<trouve-image-preview
                               .source=${preview}
                               .name=${attachment.upload.name}
+                              .mime=${attachment.upload.mime}
+                              .video=${video}
                             ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
@@ -3459,7 +3626,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         <footer class="status-bar ${statusActionable ? "actionable" : ""}">
           <span class="online-dot ${this.#protocolError || this.#hostError || serverOffline ? "offline" : ""}"></span><span class="status-copy">${connectionLabel}</span><span class="status-spacer"></span>
           ${this.#connectivityNotice === "" ? nothing : html`<span class="status-copy" role="status" aria-live="polite">${this.#connectivityNotice}</span>`}
-          ${this.#shellNotice === "" ? nothing : html`<span class="status-copy" role="status">${this.#shellNotice}</span>`}
+          ${this.#shellNotice === "" ? nothing : html`<span class="status-copy shell-notice" role="status">${this.#shellNotice}</span>`}
           ${this.#pwaActivate === undefined
             ? nothing
             : html`<button

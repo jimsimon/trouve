@@ -1222,6 +1222,7 @@ trouve-command-palette { display: contents; }
   .session-actions button { min-height: 38px; }
   .status-bar { min-height: 52px; display: flex; padding: 3px max(6px, env(safe-area-inset-right)) max(3px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left)); }
   .status-copy, .status-bar > .online-dot, .status-bar > .status-spacer, .theme-picker { display: none; }
+  .status-copy.shell-notice { position: absolute; z-index: 3; inset-inline: 8px; bottom: calc(100px + env(safe-area-inset-bottom)); display: block; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 8px 10px; color: var(--trouve-text-hi); background: var(--trouve-popup-bg); box-shadow: 0 9px 25px var(--trouve-scrim); font-size: 12px; white-space: normal; }
   .update-action { position: absolute; inset-inline: 8px; bottom: calc(52px + env(safe-area-inset-bottom)); min-height: 40px; z-index: 3; }
   .mobile-nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; }
   .mobile-nav button { min-height: 44px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: transparent; font-size: 10px; }
