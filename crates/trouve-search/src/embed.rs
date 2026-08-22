@@ -285,12 +285,13 @@ impl EmbeddingModel {
             Err(_) => None,
         };
 
-        // Every token id the tokenizer can emit must resolve to a row inside
-        // the embedding table; validating here keeps the pooling hot path
-        // free of bounds checks and turns a corrupt or mismatched model file
-        // into a load error instead of a panic mid-index. Ids are validated
-        // against the highest assigned id, not the vocabulary *count*: token
-        // ids may have gaps, so the id space can be larger than the count.
+        // Every token id the tokenizer can emit must resolve to an embedding
+        // row and, when present, a weight. Validating here keeps the pooling
+        // hot path free of bounds checks and turns a corrupt or mismatched
+        // model file into a load error instead of a panic or silent fallback
+        // mid-index. Ids are validated against the highest assigned id, not
+        // the vocabulary *count*: token ids may have gaps, so the id space can
+        // be larger than the count.
         let id_space = tokenizer
             .get_vocab(true)
             .values()
@@ -298,6 +299,14 @@ impl EmbeddingModel {
             .max()
             .map(|max_id| max_id as usize + 1)
             .unwrap_or(0);
+        if let Some(w) = &weights
+            && w.len() < id_space
+        {
+            return Err(invalid_model_artifact(format!(
+                "weights tensor covers {} entries but token ids reach {id_space}",
+                w.len()
+            )));
+        }
         match &mapping {
             Some(m) if m.len() < id_space => {
                 return Err(invalid_model_artifact(format!(
@@ -1079,9 +1088,9 @@ mod tests {
         .to_string()
     }
 
-    /// A safetensors file with a `rows x 2` zero embedding table and an
-    /// optional I64 `mapping` tensor.
-    fn safetensors_bytes(rows: usize, mapping: Option<&[i64]>) -> Vec<u8> {
+    /// A safetensors file with a `rows x 2` zero embedding table and optional
+    /// I64 `mapping` and F32 `weights` tensors.
+    fn safetensors_bytes(rows: usize, mapping: Option<&[i64]>, weights: Option<&[f32]>) -> Vec<u8> {
         let embed_len = rows * 2 * 4;
         let mut header = serde_json::json!({
             "embeddings": {"dtype": "F32", "shape": [rows, 2], "data_offsets": [0, embed_len]}
@@ -1096,6 +1105,15 @@ mod tests {
                 "dtype": "I64", "shape": [m.len()], "data_offsets": [start, data.len()]
             });
         }
+        if let Some(w) = weights {
+            let start = data.len();
+            for v in w {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            header["weights"] = serde_json::json!({
+                "dtype": "F32", "shape": [w.len()], "data_offsets": [start, data.len()]
+            });
+        }
         let header = header.to_string();
         let mut out = Vec::new();
         out.extend_from_slice(&(header.len() as u64).to_le_bytes());
@@ -1108,7 +1126,7 @@ mod tests {
         std::fs::write(dir.join("tokenizer.json"), tokenizer_json(words)).unwrap();
         std::fs::write(
             dir.join("model.safetensors"),
-            safetensors_bytes(rows, mapping),
+            safetensors_bytes(rows, mapping, None),
         )
         .unwrap();
         std::fs::write(dir.join("config.json"), r#"{"normalize": true}"#).unwrap();
@@ -1268,6 +1286,18 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert!(err.to_string().contains("mapping tensor covers"), "{err}");
+    }
+
+    #[test]
+    fn rejects_weights_shorter_than_vocab() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = write_model(dir.path(), &["alpha", "beta"], 3, None);
+        std::fs::write(&files.model, safetensors_bytes(3, None, Some(&[1.0, 1.0]))).unwrap();
+        let err = EmbeddingModel::from_files(&files, "test".into())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(is_invalid_model_artifact(&err));
+        assert!(err.to_string().contains("weights tensor covers"), "{err}");
     }
 
     #[test]
