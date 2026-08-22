@@ -613,9 +613,6 @@ CREATE TABLE IF NOT EXISTS code_review_polled_comments (
 /// additions are retried and "duplicate column" errors are ignored.
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE session_create_requests ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE command_execution_requests ADD COLUMN side_effect_started INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE command_execution_requests ADD COLUMN error_kind TEXT",
-    "ALTER TABLE command_execution_requests ADD COLUMN error_message TEXT",
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
@@ -769,6 +766,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         [],
         |row| row.get::<_, bool>(0),
     )?;
+    migrate_command_execution_phases(conn)?;
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -777,7 +775,6 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
-    migrate_legacy_command_execution_claims(conn)?;
     preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
@@ -810,12 +807,12 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Command receipts created before execution phases were persisted cannot
-/// prove whether their side effect ran before a crash. Preserve incomplete
-/// legacy claims as uncertain so an upgrade can never replay their mutation.
-/// The durable marker makes the backfill atomic and repeat-safe even if a
-/// process stops immediately after the additive column migration.
-fn migrate_legacy_command_execution_claims(conn: &mut Connection) -> Result<()> {
+/// Add command execution phases and conservatively classify receipts that
+/// provably predate them. The column addition, backfill, and durable marker
+/// share one transaction, so an interruption can never leave an ambiguous
+/// zero-valued legacy receipt. If the phase column already exists, its values
+/// came from a phase-aware writer and must be preserved.
+fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
     const MIGRATION_ID: &str = "command-execution-side-effect-phase-v1";
     let applied = conn
         .query_row(
@@ -842,12 +839,56 @@ fn migrate_legacy_command_execution_claims(conn: &mut Connection) -> Result<()> 
         tx.commit()?;
         return Ok(());
     }
-    tx.execute(
-        "UPDATE command_execution_requests
-         SET side_effect_started = 1
-         WHERE result IS NULL AND error_kind IS NULL",
+    let had_phase_column = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('command_execution_requests')
+           WHERE name = 'side_effect_started'
+         )",
         [],
+        |row| row.get::<_, bool>(0),
     )?;
+    if !had_phase_column {
+        tx.execute_batch(
+            "ALTER TABLE command_execution_requests
+               ADD COLUMN side_effect_started INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let had_error_kind = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('command_execution_requests')
+           WHERE name = 'error_kind'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !had_error_kind {
+        tx.execute_batch(
+            "ALTER TABLE command_execution_requests
+               ADD COLUMN error_kind TEXT;",
+        )?;
+    }
+    let had_error_message = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('command_execution_requests')
+           WHERE name = 'error_message'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !had_error_message {
+        tx.execute_batch(
+            "ALTER TABLE command_execution_requests
+               ADD COLUMN error_message TEXT;",
+        )?;
+    }
+    if !had_phase_column {
+        tx.execute(
+            "UPDATE command_execution_requests
+             SET side_effect_started = 1
+             WHERE result IS NULL",
+            [],
+        )?;
+    }
     tx.execute(
         "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
         params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
@@ -17221,6 +17262,53 @@ mod tests {
         assert!(legacy_claim.side_effect_started);
         assert!(legacy_claim.result.is_none());
         assert!(legacy_claim.failure.is_none());
+    }
+
+    #[test]
+    fn command_execution_migration_preserves_phase_aware_unstarted_claim() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("phase-aware-command-execution.sqlite3");
+        let store = Store::open(&database).unwrap();
+        seed_thread(&store, "th_phase_aware_command");
+        assert!(
+            store
+                .claim_command_execution(
+                    "phase-aware-command",
+                    "th_phase_aware_command",
+                    "phase-aware-fingerprint",
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        let phase_aware = Connection::open(&database).unwrap();
+        phase_aware
+            .execute(
+                "DELETE FROM store_migrations
+                 WHERE id = 'command-execution-side-effect-phase-v1'",
+                [],
+            )
+            .unwrap();
+        drop(phase_aware);
+
+        let store = Store::open(&database).unwrap();
+        let pending = store
+            .command_execution("phase-aware-command")
+            .unwrap()
+            .expect("phase-aware claim remains durable");
+        assert!(!pending.side_effect_started);
+        assert!(
+            store
+                .claim_command_execution(
+                    "phase-aware-command",
+                    "th_phase_aware_command",
+                    "phase-aware-fingerprint",
+                )
+                .unwrap()
+                .is_none(),
+            "known-unstarted phase-aware claims remain safely reclaimable"
+        );
     }
 
     #[test]
