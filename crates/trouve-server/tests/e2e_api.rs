@@ -1090,15 +1090,24 @@ impl Provider for CompactingProvider {
                     },
                 }),
             ],
-            // Compaction summarization request.
-            1 => vec![
-                Ok(ProviderEvent::TextDelta(
-                    "Summary of everything so far.".into(),
-                )),
-                Ok(ProviderEvent::Completed {
-                    usage: Usage::default(),
-                }),
-            ],
+            // Compaction summarizes only earlier turns. The newly accepted
+            // turn remains a separate tail message for its real request.
+            1 => {
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::User(text) if text == "second")),
+                    "compaction must not consume the current user message"
+                );
+                vec![
+                    Ok(ProviderEvent::TextDelta(
+                        "Summary of everything so far.".into(),
+                    )),
+                    Ok(ProviderEvent::Completed {
+                        usage: Usage::default(),
+                    }),
+                ]
+            }
             // Turn 2 proper: history must be the compacted summary + the new
             // user message.
             _ => {
@@ -1108,6 +1117,20 @@ impl Provider for CompactingProvider {
                         Message::User(text) if text.contains("Summary of everything so far.")
                     )),
                     "turn 2 should run against the compacted transcript"
+                );
+                assert!(
+                    matches!(messages.last(), Some(Message::User(text)) if text == "second"),
+                    "turn 2 should retain its user message after compaction"
+                );
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(
+                            |message| matches!(message, Message::User(text) if text == "second")
+                        )
+                        .count(),
+                    1,
+                    "the accepted current message must appear exactly once"
                 );
                 vec![
                     Ok(ProviderEvent::TextDelta("Second answer.".into())),

@@ -31,7 +31,7 @@ use crate::permissions::{
     ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
 };
 use crate::store::{
-    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
+    AcceptedPrompt, ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
     SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
@@ -39,6 +39,7 @@ use crate::tools::{
     DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
     McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
     SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
+    materialized_attachment_relative_path,
 };
 use crate::{context, git, new_id, personas};
 
@@ -88,6 +89,9 @@ const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
+type ProviderRegistryEntry = (String, u64, Arc<dyn Provider>);
+type BackendRegistryEntry = (String, u64, Arc<dyn AgentBackend>);
+type ProviderRegistrySnapshot = (Vec<ProviderRegistryEntry>, Vec<BackendRegistryEntry>);
 
 fn attachment_mime_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
@@ -522,9 +526,24 @@ const SUBSCRIPTION_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 struct ModelCandidate {
     provider_id: String,
     provider_model: String,
+    provider_generation: u64,
     info: trouve_protocol::ModelInfo,
     executor: ModelExecutor,
     shared_model_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct RoutedAttemptSnapshot {
+    provider_id: String,
+    provider_model: String,
+    provider_generation: u64,
+    attempt_order: i64,
+}
+
+#[derive(Default)]
+struct ConcreteAttemptState {
+    attempt_order: AtomicI64,
+    provider_generation: Mutex<Option<(String, u64)>>,
 }
 
 #[derive(Clone)]
@@ -1809,6 +1828,13 @@ impl TurnScheduler {
             backoff.until = None;
         }
     }
+
+    fn reset_provider_outcomes(&self, provider_id: &str) {
+        let provider = self.providers.lock().unwrap().get(provider_id).cloned();
+        if let Some(provider) = provider {
+            *provider.backoff.lock().unwrap() = ProviderBackoff::default();
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2571,6 +2597,10 @@ pub struct Engine {
     /// Serializes provider upserts and deletions across config, secret-store,
     /// and registry mutations without blocking unrelated provider ids.
     provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Monotonic provider-configuration epochs. Route outcomes are committed
+    /// while holding this lock so an attempt admitted under old credentials
+    /// cannot recreate health or affinity cleared by a later update/delete.
+    provider_generations: Mutex<HashMap<String, u64>>,
     /// Serializes persona-file mutations with durable deletion replay so a
     /// recreate cannot race a pending cleanup of the same user-level file.
     pub(crate) persona_mutations: Arc<tokio::sync::Mutex<()>>,
@@ -2993,6 +3023,7 @@ impl Engine {
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
+            provider_generations: Mutex::new(HashMap::new()),
             persona_mutations: Arc::new(tokio::sync::Mutex::new(())),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
@@ -3386,6 +3417,9 @@ impl Engine {
     /// Register (or replace) a provider instance under an id. Survives
     /// config-driven registry reloads.
     pub fn with_provider(self, id: &str, provider: Arc<dyn Provider>) -> Self {
+        let mut generations = self.provider_generations.lock().unwrap();
+        let generation = generations.entry(id.to_string()).or_default();
+        *generation = generation.saturating_add(1);
         self.injected_providers
             .lock()
             .unwrap()
@@ -3394,12 +3428,16 @@ impl Engine {
             .write()
             .unwrap()
             .insert(id.to_string(), provider);
+        drop(generations);
         self
     }
 
     /// Register (or replace) an agent backend instance under an id. Survives
     /// config-driven registry reloads (tests, embedders).
     pub fn with_backend(self, id: &str, backend: Arc<dyn AgentBackend>) -> Self {
+        let mut generations = self.provider_generations.lock().unwrap();
+        let generation = generations.entry(id.to_string()).or_default();
+        *generation = generation.saturating_add(1);
         self.subscription_health_cache.lock().unwrap().remove(id);
         self.injected_backends
             .lock()
@@ -3409,6 +3447,7 @@ impl Engine {
             .write()
             .unwrap()
             .insert(id.to_string(), backend);
+        drop(generations);
         self
     }
 
@@ -3482,48 +3521,44 @@ impl Engine {
         } else {
             self.offline_capable_provider_ids()
         };
-        let providers: Vec<_> = self
-            .providers
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
-            .map(|(id, provider)| (id.clone(), provider.clone()))
+        let (providers, backends) = self.provider_registry_snapshot();
+        let providers: Vec<_> = providers
+            .into_iter()
+            .filter(|(id, _, _)| online || offline_capable.contains(id.as_str()))
             .collect();
         let mut candidates = Vec::new();
-        for (provider_id, provider) in providers {
+        for (provider_id, provider_generation, provider) in providers {
             candidates.extend(provider.models().into_iter().map(|info| {
                 let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
                 ModelCandidate {
                     shared_model_id: provider.shared_model_identity(&provider_model),
                     provider_model,
                     provider_id: provider_id.clone(),
+                    provider_generation,
                     info,
                     executor: ModelExecutor::Native(provider.clone()),
                 }
             }));
         }
         let ready: Vec<_> = if online {
-            self.backends
-                .read()
-                .unwrap()
-                .iter()
-                .filter(|(_, backend)| {
+            backends
+                .into_iter()
+                .filter(|(_, _, backend)| {
                     let status = backend.status();
                     status.installed && status.has_credentials
                 })
-                .map(|(id, backend)| (id.clone(), backend.clone()))
                 .collect()
         } else {
             Vec::new() // vendor backends all need their cloud
         };
-        for (provider_id, backend) in ready {
+        for (provider_id, provider_generation, backend) in ready {
             candidates.extend(backend.models().into_iter().map(|info| {
                 let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
                 ModelCandidate {
                     shared_model_id: backend.shared_model_identity(&provider_model),
                     provider_model,
                     provider_id: provider_id.clone(),
+                    provider_generation,
                     info,
                     executor: ModelExecutor::Backend(backend.clone()),
                 }
@@ -3568,20 +3603,17 @@ impl Engine {
         } else {
             self.offline_capable_provider_ids()
         };
-        let providers: Vec<_> = self
-            .providers
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
-            .filter(|(id, provider)| {
+        let (providers, backends) = self.provider_registry_snapshot();
+        let providers: Vec<_> = providers
+            .into_iter()
+            .filter(|(id, _, _)| online || offline_capable.contains(id.as_str()))
+            .filter(|(id, _, provider)| {
                 automatic.is_none_or(|model| provider.shared_model_identity(model).is_some())
                     && concrete_provider.is_none_or(|selected| id.as_str() == selected)
             })
-            .map(|(id, provider)| (id.clone(), provider.clone()))
             .collect();
         let provider_lists = futures::future::join_all(providers.into_iter().map(
-            |(provider_id, provider)| async move {
+            |(provider_id, provider_generation, provider)| async move {
                 let models = match tokio::time::timeout(
                     MODEL_ROUTE_DISCOVERY_TIMEOUT,
                     provider.list_models(),
@@ -3597,43 +3629,41 @@ impl Engine {
                         provider.models()
                     }
                 };
-                (provider_id, provider, models)
+                (provider_id, provider_generation, provider, models)
             },
         ))
         .await;
         let mut candidates = Vec::new();
-        for (provider_id, provider, models) in provider_lists {
+        for (provider_id, provider_generation, provider, models) in provider_lists {
             candidates.extend(models.into_iter().map(|info| {
                 let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
                 ModelCandidate {
                     shared_model_id: provider.shared_model_identity(&provider_model),
                     provider_model,
                     provider_id: provider_id.clone(),
+                    provider_generation,
                     info,
                     executor: ModelExecutor::Native(provider.clone()),
                 }
             }));
         }
         let ready: Vec<_> = if online {
-            self.backends
-                .read()
-                .unwrap()
-                .iter()
-                .filter(|(_, backend)| {
+            backends
+                .into_iter()
+                .filter(|(_, _, backend)| {
                     let status = backend.status();
                     status.installed && status.has_credentials
                 })
-                .filter(|(id, backend)| {
+                .filter(|(id, _, backend)| {
                     automatic.is_none_or(|model| backend.shared_model_identity(model).is_some())
                         && concrete_provider.is_none_or(|selected| id.as_str() == selected)
                 })
-                .map(|(id, backend)| (id.clone(), backend.clone()))
                 .collect()
         } else {
             Vec::new()
         };
-        let listings =
-            futures::future::join_all(ready.into_iter().map(|(provider_id, backend)| async move {
+        let listings = futures::future::join_all(ready.into_iter().map(
+            |(provider_id, provider_generation, backend)| async move {
                 let models = match tokio::time::timeout(
                     MODEL_ROUTE_DISCOVERY_TIMEOUT,
                     backend.list_models(),
@@ -3649,16 +3679,18 @@ impl Engine {
                         backend.models()
                     }
                 };
-                (provider_id, backend, models)
-            }))
-            .await;
-        for (provider_id, backend, models) in listings {
+                (provider_id, provider_generation, backend, models)
+            },
+        ))
+        .await;
+        for (provider_id, provider_generation, backend, models) in listings {
             candidates.extend(models.into_iter().map(|info| {
                 let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
                 ModelCandidate {
                     shared_model_id: backend.shared_model_identity(&provider_model),
                     provider_model,
                     provider_id: provider_id.clone(),
+                    provider_generation,
                     info,
                     executor: ModelExecutor::Backend(backend.clone()),
                 }
@@ -3712,21 +3744,26 @@ impl Engine {
         // injected/custom providers that can run arbitrary model names and
         // therefore publish no finite catalog.
         if let Some((provider_id, provider_model)) = model.split_once('/') {
-            let provider = self.providers.read().unwrap().get(provider_id).cloned();
-            if let Some(provider) = provider {
+            let (providers, backends) = self.provider_registry_snapshot();
+            if let Some((_, provider_generation, provider)) =
+                providers.into_iter().find(|(id, _, _)| id == provider_id)
+            {
                 return Ok(vec![ModelCandidate {
                     provider_id: provider_id.to_string(),
                     provider_model: provider_model.to_string(),
+                    provider_generation,
                     info: fallback_model_info(model, provider_model),
                     executor: ModelExecutor::Native(provider),
                     shared_model_id: None,
                 }]);
             }
-            let backend = self.backends.read().unwrap().get(provider_id).cloned();
-            if let Some(backend) = backend {
+            if let Some((_, provider_generation, backend)) =
+                backends.into_iter().find(|(id, _, _)| id == provider_id)
+            {
                 return Ok(vec![ModelCandidate {
                     provider_id: provider_id.to_string(),
                     provider_model: provider_model.to_string(),
+                    provider_generation,
                     info: fallback_model_info(model, provider_model),
                     executor: ModelExecutor::Backend(backend),
                     shared_model_id: None,
@@ -4112,6 +4149,7 @@ impl Engine {
                 return Err(EngineError::Internal(error));
             }
         }
+        let mut provider_generations = self.provider_generations.lock().unwrap();
         {
             let mut config = self.config.lock().unwrap();
             let mut next = config.clone();
@@ -4172,12 +4210,13 @@ impl Engine {
             *config = next;
             self.reload_providers_from_config(&config);
         }
-        if let Err(error) = self.store.clear_route_health(id) {
+        if let Err(error) = self.reset_provider_route_state_locked(id, &mut provider_generations) {
             tracing::warn!(
                 provider = id,
                 "failed to clear stale route health: {error:#}"
             );
         }
+        drop(provider_generations);
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
         let pc = config.providers.get(id).cloned().unwrap_or_default();
@@ -4203,6 +4242,7 @@ impl Engine {
     pub fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().unwrap();
+        let mut provider_generations = self.provider_generations.lock().unwrap();
         let secret_names = {
             let mut config = self.config.lock().unwrap();
             let mut next = config.clone();
@@ -4227,7 +4267,7 @@ impl Engine {
                 .secrets
                 .delete(&trouve_providers::secrets::provider_secret(id, &name));
         }
-        if let Err(error) = self.store.clear_route_health(id) {
+        if let Err(error) = self.reset_provider_route_state_locked(id, &mut provider_generations) {
             tracing::warn!(
                 provider = id,
                 "failed to clear stale route health: {error:#}"
@@ -4238,7 +4278,11 @@ impl Engine {
 
     /// Replace the explicit provider preference prefix. Omitted providers
     /// remain routable after the listed entries.
-    pub fn set_provider_order(&self, provider_ids: &[String]) -> Result<(), EngineError> {
+    pub fn set_provider_order(
+        &self,
+        provider_ids: &[String],
+        expected_provider_ids: Option<&[String]>,
+    ) -> Result<(), EngineError> {
         // Hold the same config boundary used by provider CRUD while deriving
         // routable identities and committing the order. Provider CRUD updates
         // registries before releasing this lock, so a concurrent delete can
@@ -4247,6 +4291,29 @@ impl Engine {
         let mut known: HashSet<String> = self.providers.read().unwrap().keys().cloned().collect();
         known.extend(self.backends.read().unwrap().keys().cloned());
         known.extend(config.providers.keys().cloned());
+        let mut current = config
+            .provider_order
+            .iter()
+            .filter(|id| known.contains(id.as_str()))
+            .fold(Vec::new(), |mut order, id| {
+                if !order.contains(id) {
+                    order.push(id.clone());
+                }
+                order
+            });
+        let mut remaining = known.iter().cloned().collect::<Vec<_>>();
+        remaining.sort();
+        for id in remaining {
+            if !current.contains(&id) {
+                current.push(id);
+            }
+        }
+        if expected_provider_ids.is_some_and(|expected| expected != current) {
+            return Err(EngineError::Conflict(
+                "provider order changed while this edit was in progress; reload and try again"
+                    .into(),
+            ));
+        }
         let mut seen = HashSet::new();
         for id in provider_ids {
             if !known.contains(id) {
@@ -4274,6 +4341,72 @@ impl Engine {
             .entry(id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    fn provider_generation(&self, id: &str) -> u64 {
+        self.provider_generations
+            .lock()
+            .unwrap()
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn provider_registry_snapshot(&self) -> ProviderRegistrySnapshot {
+        let generations = self.provider_generations.lock().unwrap();
+        let providers = self
+            .providers
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(id, provider)| {
+                (
+                    id.clone(),
+                    generations.get(id).copied().unwrap_or(0),
+                    provider.clone(),
+                )
+            })
+            .collect();
+        let backends = self
+            .backends
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(id, backend)| {
+                (
+                    id.clone(),
+                    generations.get(id).copied().unwrap_or(0),
+                    backend.clone(),
+                )
+            })
+            .collect();
+        (providers, backends)
+    }
+
+    fn with_current_provider_generation<T>(
+        &self,
+        id: &str,
+        expected: u64,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let generations = self.provider_generations.lock().unwrap();
+        if generations.get(id).copied().unwrap_or(0) != expected {
+            return Ok(None);
+        }
+        operation().map(Some)
+    }
+
+    fn reset_provider_route_state_locked(
+        &self,
+        id: &str,
+        generations: &mut HashMap<String, u64>,
+    ) -> Result<()> {
+        let generation = generations.entry(id.to_string()).or_default();
+        *generation = generation
+            .checked_add(1)
+            .context("provider generation exhausted")?;
+        self.turn_scheduler.reset_provider_outcomes(id);
+        self.store.clear_route_health(id)
     }
 
     // --- OAuth login (subscription providers) ---------------------------------
@@ -10164,6 +10297,7 @@ impl Engine {
                     attachments: attachment_rows,
                     claim_prompt_id: None,
                     expected_previous_turn: None,
+                    accepted_prompt: None,
                     staging_cleanup_claim: attachment_cleanup.claim(),
                 },
                 vec![(
@@ -10225,6 +10359,8 @@ impl Engine {
                 .into_iter()
                 .map(|event| (Scope::Thread(thread_id.to_string()), event)),
         );
+        let accepted_message =
+            accepted_prompt_message(&started_prompt).map_err(EngineError::Internal)?;
 
         active.insert(thread_id.to_string(), thread.session_id.clone());
         let cancel = self.register_cancel(thread_id);
@@ -10235,6 +10371,11 @@ impl Engine {
                 attachments: attachment_rows,
                 claim_prompt_id: Some(started_prompt.id.clone()),
                 expected_previous_turn: Some(previous_turn),
+                accepted_prompt: Some(AcceptedPrompt {
+                    id: started_prompt.id.clone(),
+                    turn,
+                    message: accepted_message,
+                }),
                 staging_cleanup_claim: attachment_cleanup.claim(),
             },
             events,
@@ -10824,11 +10965,19 @@ impl Engine {
                 .take()
                 .expect("an active queue prompt must have a cancellation token");
             let prompt_persisted = AtomicBool::new(shell_persisted);
-            let concrete_attempt_order = AtomicI64::new(0);
+            let concrete_attempt = ConcreteAttemptState::default();
+            let routed_attempt = Mutex::new(None);
             let turn_future = async {
                 if automatic_model_name(&thread.model).is_some() {
-                    self.run_routed_turn(&thread, turn, &prompt, cancel.clone(), &prompt_persisted)
-                        .await
+                    self.run_routed_turn(
+                        &thread,
+                        turn,
+                        &prompt,
+                        cancel.clone(),
+                        &prompt_persisted,
+                        &routed_attempt,
+                    )
+                    .await
                 } else {
                     self.run_turn(
                         &thread,
@@ -10836,7 +10985,7 @@ impl Engine {
                         &prompt,
                         cancel.clone(),
                         &prompt_persisted,
-                        &concrete_attempt_order,
+                        &concrete_attempt,
                     )
                     .await
                 }
@@ -10854,13 +11003,52 @@ impl Engine {
                     };
                     if !cancel.is_cancelled()
                         && automatic_model_name(&thread.model).is_none()
-                        && let Some(attempt_order) = positive_attempt_order(&concrete_attempt_order)
+                        && let Some(attempt_order) =
+                            positive_attempt_order(&concrete_attempt.attempt_order)
+                        && let Some((provider_id, provider_generation)) =
+                            concrete_attempt.provider_generation.lock().unwrap().clone()
                     {
-                        self.turn_scheduler.record_outcome(
-                            &thread.model,
-                            Some("internal error"),
-                            attempt_order,
-                        );
+                        self.with_current_provider_generation(
+                            &provider_id,
+                            provider_generation,
+                            || {
+                                self.turn_scheduler.record_outcome(
+                                    &thread.model,
+                                    Some("internal error"),
+                                    attempt_order,
+                                );
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    if !cancel.is_cancelled()
+                        && let Some(attempt) = routed_attempt.lock().unwrap().take()
+                    {
+                        let (base, max) = RouteFailureKind::Unavailable.cooldown();
+                        self.with_current_provider_generation(
+                            &attempt.provider_id,
+                            attempt.provider_generation,
+                            || {
+                                self.turn_scheduler.record_outcome(
+                                    &attempt.provider_id,
+                                    Some("internal error"),
+                                    attempt.attempt_order,
+                                );
+                                self.store.record_route_failure(
+                                    &attempt.provider_id,
+                                    &attempt.provider_model,
+                                    attempt.attempt_order,
+                                    base,
+                                    max,
+                                )?;
+                                self.store.clear_thread_route_affinity_if_matches(
+                                    &thread.id,
+                                    &attempt.provider_id,
+                                    &attempt.provider_model,
+                                )?;
+                                Ok(())
+                            },
+                        )?;
                     }
                     if prompt_persisted.load(Ordering::Acquire) {
                         // Once the user message is durable, this queue row is
@@ -10902,14 +11090,19 @@ impl Engine {
             let cancelled = cancel.is_cancelled();
             if !cancelled
                 && automatic_model_name(&thread.model).is_none()
-                && let Some(attempt_order) = positive_attempt_order(&concrete_attempt_order)
+                && let Some(attempt_order) = positive_attempt_order(&concrete_attempt.attempt_order)
+                && let Some((provider_id, provider_generation)) =
+                    concrete_attempt.provider_generation.lock().unwrap().clone()
             {
                 let outcome_error = result.as_ref().err().map(ToString::to_string);
-                self.turn_scheduler.record_outcome(
-                    &thread.model,
-                    outcome_error.as_deref(),
-                    attempt_order,
-                );
+                self.with_current_provider_generation(&provider_id, provider_generation, || {
+                    self.turn_scheduler.record_outcome(
+                        &thread.model,
+                        outcome_error.as_deref(),
+                        attempt_order,
+                    );
+                    Ok(())
+                })?;
             }
             // Cancellation wins a race with startup/stream errors only after
             // run_turn has returned, which is the adapter/tool acknowledgement
@@ -10944,16 +11137,25 @@ impl Engine {
                     ]);
                 }
                 terminal_events.push(Event::TurnCancelled { turn });
-                self.store
-                    .append_events_finishing_queued_prompt(
-                        Scope::Thread(thread.id.clone()),
-                        terminal_events,
-                        &prompt.id,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("persisting cancellation for turn {turn} of {}", thread.id)
-                    })?;
+                if prompt_persisted.load(Ordering::Acquire) {
+                    self.store
+                        .append_events_finishing_queued_prompt(
+                            Scope::Thread(thread.id.clone()),
+                            terminal_events,
+                            &prompt.id,
+                        )
+                        .await?;
+                } else {
+                    self.store
+                        .append_events_accepting_and_finishing_queued_prompt(
+                            &thread.id,
+                            turn,
+                            &prompt.id,
+                            accepted_prompt_message(&prompt)?,
+                            terminal_events,
+                        )
+                        .await?;
+                }
                 let resume = self.finish_interrupted_turn(&thread.id)?;
                 if !resume {
                     return Ok(());
@@ -11171,15 +11373,19 @@ impl Engine {
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
-        attempt_order: &AtomicI64,
+        concrete_attempt: &ConcreteAttemptState,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
         let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
         if !prompt_persisted.load(Ordering::Acquire) {
+            let message = accepted_prompt_message(prompt)?;
             self.store
-                .append_events_async(
-                    Scope::Thread(thread.id.clone()),
+                .append_events_accepting_claimed_prompt(
+                    &thread.id,
+                    turn,
+                    &prompt.id,
+                    message,
                     self.turn_shell_events(thread, turn, prompt, tools_enabled)?,
                 )
                 .await?;
@@ -11233,7 +11439,17 @@ impl Engine {
             .turn_scheduler
             .acquire(&thread.model, background, &cancel)
             .await?;
-        attempt_order.store(self.turn_scheduler.next_attempt_order(), Ordering::Release);
+        let provider_id = thread
+            .model
+            .split_once('/')
+            .map_or(thread.model.as_str(), |(provider, _)| provider);
+        *concrete_attempt.provider_generation.lock().unwrap() = Some((
+            provider_id.to_string(),
+            self.provider_generation(provider_id),
+        ));
+        concrete_attempt
+            .attempt_order
+            .store(self.turn_scheduler.next_attempt_order(), Ordering::Release);
         if background
             && let Some(progress) = self
                 .store
@@ -11288,9 +11504,9 @@ impl Engine {
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
 
-        // Compact the transcript when it nears the model's context window,
-        // before this turn's user message joins it (the stored transcript —
-        // the event above is display-only).
+        // Compact earlier transcript messages when the accepted turn nears
+        // the model's context window. `maybe_compact` preserves the current
+        // user message as the final transcript row.
         if let Err(e) = self
             .maybe_compact(thread, turn, &provider, &model_name, 0, &cancel)
             .await
@@ -11303,17 +11519,10 @@ impl Engine {
         // follow. Copy them into the worktree first: the file tools reject
         // absolute paths (the sandbox), so a data-dir path the model can't
         // open is useless — a worktree-relative copy is reachable.
-        let materialized = self
+        let _materialized = self
             .materialize_attachments_for_turn(&session, &attachments, &cancel)
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
-        let prompt_files = materialized
-            .iter()
-            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
-            .collect::<Vec<_>>();
-        let content = annotate_attachments(content, &prompt_files);
-        self.store
-            .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
             bail!("queued prompt {} vanished before turn start", prompt.id);
         }
@@ -13228,13 +13437,27 @@ impl Engine {
         let (resume, handoff) = if tools_enabled {
             let resume = self.store.backend_session(&thread.id, backend_id)?;
             let payloads = self.store.messages(&thread.id)?;
-            submitted_transcript_messages = u64::try_from(payloads.len().saturating_add(1))
-                .context("backend transcript length exceeds u64")?;
+            submitted_transcript_messages =
+                u64::try_from(payloads.len()).context("backend transcript length exceeds u64")?;
+            // Prompt acceptance already appended this turn's user message.
+            // It is sent as `BackendTurn::prompt`, not repeated in the
+            // cross-adapter history digest.
+            let (current_user, prior_payloads) = payloads
+                .split_last()
+                .context("accepted user message is missing before backend turn")?;
+            let expected_user =
+                serde_json::to_value(accepted_user_message(&content, &attachments)?)?;
+            anyhow::ensure!(
+                current_user == &expected_user,
+                "accepted user message is not the final transcript row before backend turn"
+            );
             let unseen = match &resume {
                 // A compaction can shrink the transcript below the watermark;
                 // handing off the fresh summary again covers that.
-                Some((_, seen)) => payloads.get(*seen as usize..).unwrap_or(&payloads),
-                None => &payloads[..],
+                Some((_, seen)) => prior_payloads
+                    .get(*seen as usize..)
+                    .unwrap_or(prior_payloads),
+                None => prior_payloads,
             };
             let messages: Vec<Message> = unseen
                 .iter()
@@ -13276,10 +13499,6 @@ impl Engine {
                 local_path: Some(file.absolute_path),
             })
             .collect();
-        self.store.append_message(
-            &thread.id,
-            &serde_json::to_value(Message::User(content.clone()))?,
-        )?;
         if !self.store.finish_queued_prompt(queued_prompt_id)? {
             bail!("queued prompt {queued_prompt_id} vanished before turn start");
         }
@@ -14702,7 +14921,17 @@ impl Engine {
             }
             return Ok(());
         };
-        let payloads = self.store.messages(&thread.id)?;
+        let mut payloads = self.store.messages(&thread.id)?;
+        let current_user = payloads
+            .pop()
+            .context("accepted user message is missing before compaction")?;
+        anyhow::ensure!(
+            matches!(
+                serde_json::from_value::<Message>(current_user.clone())?,
+                Message::User(_)
+            ),
+            "accepted user message is not the final transcript row before compaction"
+        );
         if payloads.len() < 2 {
             return Ok(());
         }
@@ -14711,6 +14940,7 @@ impl Engine {
         let estimated_tokens = self.store.last_input_tokens(&thread.id)?.unwrap_or(0).max(
             payloads
                 .iter()
+                .chain(std::iter::once(&current_user))
                 .map(|p| p.to_string().len() as u64)
                 .sum::<u64>()
                 / 4,
@@ -14780,7 +15010,8 @@ impl Engine {
              (error text, file paths, command output) are recoverable with the \
              search_transcript tool.]\n\n{summary}"
         )))?;
-        self.store.replace_messages(&thread.id, &[replacement])?;
+        self.store
+            .replace_messages(&thread.id, &[replacement, current_user])?;
         self.store.append_event(
             scope,
             Event::CompactionCompleted {
@@ -16187,6 +16418,32 @@ fn annotate_attachments(
         out.push_str(&format!("\n- {} ({}): {}", a.name, a.mime, path.display()));
     }
     out
+}
+
+fn accepted_prompt_message(prompt: &trouve_protocol::QueuedPrompt) -> Result<String> {
+    serde_json::to_string(&accepted_user_message(
+        &prompt.content,
+        &prompt.attachments,
+    )?)
+    .context("serializing accepted user prompt")
+}
+
+fn accepted_user_message(
+    content: &str,
+    attachments: &[trouve_protocol::Attachment],
+) -> Result<Message> {
+    let files = attachments
+        .iter()
+        .map(|attachment| {
+            materialized_attachment_relative_path(attachment)
+                .map(|path| (attachment.clone(), path))
+                .map_err(anyhow::Error::msg)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Message::User(annotate_attachments(
+        content.to_string(),
+        &files,
+    )))
 }
 
 /// Remove the `_images` vision payload from a tool result, leaving a small
@@ -19036,6 +19293,8 @@ mod tests {
 
     struct ListedTestBackend;
 
+    struct StartupTestBackend;
+
     #[async_trait::async_trait]
     impl AgentBackend for ListedTestBackend {
         fn id(&self) -> &str {
@@ -19071,6 +19330,51 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl AgentBackend for StartupTestBackend {
+        fn id(&self) -> &str {
+            "startup-backend"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "startup-backend/shared",
+                "Startup backend model",
+            )]
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        async fn startup_activity(&self, _turn: &BackendTurn) -> Option<BackendStartupActivity> {
+            Some(BackendStartupActivity::ConnectingTools)
+        }
+
+        async fn start_login(
+            &self,
+        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+            unreachable!("startup phase test never starts login")
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+            Ok(futures::stream::iter([Ok(BackendEvent::Completed {
+                usage: Usage::default(),
+            })])
+            .boxed())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl Provider for StallingCatalogProvider {
         fn id(&self) -> &str {
             "stall"
@@ -19099,6 +19403,42 @@ mod tests {
         ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
             unreachable!("model catalog tests never start a provider turn")
         }
+    }
+
+    fn routing_test_thread(store: &Store, path: &Path, suffix: &str, model: &str) -> Thread {
+        let workspace = Workspace {
+            id: format!("ws_{suffix}"),
+            name: format!("routing {suffix}"),
+            path: path.to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: format!("se_{suffix}"),
+            workspace_id: workspace.id.clone(),
+            title: format!("Routing {suffix}"),
+            branch: "main".into(),
+            worktree_path: workspace.path,
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: format!("th_{suffix}"),
+            session_id: session.id,
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: model.into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        thread
     }
 
     struct BlockingToolExecutor {
@@ -20311,6 +20651,115 @@ mod tests {
         let model = engine.resolve_model_info("auto/live").await.unwrap();
         assert_eq!(model.id, "auto/live");
         assert_eq!(stalled_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn routed_backend_publishes_its_startup_phase() {
+        let data = tempfile::tempdir().unwrap();
+        init_engine_test_repo(data.path());
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_test_thread(&store, data.path(), "startup_phase", "auto/shared");
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .with_backend("startup-backend", Arc::new(StartupTestBackend)),
+        );
+
+        engine
+            .send_message(&thread.id, "Exercise startup".into(), Vec::new())
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap();
+                let completed = events
+                    .iter()
+                    .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }));
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if completed && inactive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("routed backend turn should complete");
+
+        let phases = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                Event::TurnPhaseChanged { turn: 1, phase } => Some(phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(phases, [TurnPhase::ConnectingTools, TurnPhase::Processing]);
+    }
+
+    #[tokio::test]
+    async fn panicked_automatic_route_is_marked_unhealthy() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_test_thread(&store, data.path(), "route_panic", "auto/live");
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .with_provider(
+                "catalog-test",
+                Arc::new(CatalogTestProvider {
+                    live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+            ),
+        );
+
+        engine
+            .send_message(&thread.id, "Trigger provider panic".into(), Vec::new())
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, Event::TurnFailed { turn: 1, .. }));
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if failed && inactive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panicked route should settle as a failed turn");
+
+        let health = store.route_health().unwrap();
+        let route = &health[&("catalog-test".to_string(), "live".to_string())];
+        assert_eq!(route.consecutive_failures, 1);
+        assert!(route.retry_after.is_some());
     }
 
     #[tokio::test]
@@ -22209,6 +22658,7 @@ default_permission_mode = "ask"
         ModelCandidate {
             provider_id: provider_id.into(),
             provider_model: provider_model.into(),
+            provider_generation: 0,
             info: fallback_model_info(&qualified_id, provider_model),
             executor: ModelExecutor::Native(Arc::new(CatalogTestProvider {
                 live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -22392,13 +22842,75 @@ default_permission_mode = "ask"
 
         assert!(
             engine
-                .set_provider_order(&["second".into(), "first".into()])
+                .set_provider_order(&["second".into(), "first".into()], None)
                 .is_err()
         );
         assert_eq!(
             engine.config.lock().unwrap().provider_order,
             vec!["first", "second"]
         );
+    }
+
+    #[test]
+    fn provider_order_rejects_a_stale_snapshot() {
+        let data = tempfile::tempdir().unwrap();
+        let config = Config {
+            providers: BTreeMap::from([
+                ("first".into(), ProviderConfig::default()),
+                ("second".into(), ProviderConfig::default()),
+            ]),
+            provider_order: vec!["first".into(), "second".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &config,
+        );
+        let observed = engine.list_providers().provider_order;
+
+        engine
+            .set_provider_order(&["second".into(), "first".into()], Some(&observed))
+            .unwrap();
+        let error = engine
+            .set_provider_order(&["first".into(), "second".into()], Some(&observed))
+            .unwrap_err();
+
+        assert!(matches!(error, EngineError::Conflict(_)));
+        assert_eq!(
+            engine.config.lock().unwrap().provider_order,
+            vec!["second", "first"]
+        );
+    }
+
+    #[test]
+    fn stale_provider_outcome_cannot_restore_cleared_route_health() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let engine = Engine::new(store.clone(), data.path().into(), &Config::default());
+        let stale_generation = engine.provider_generation("provider");
+        store
+            .record_route_failure("provider", "shared", 1, 10, 30)
+            .unwrap();
+
+        {
+            let mut generations = engine.provider_generations.lock().unwrap();
+            engine
+                .reset_provider_route_state_locked("provider", &mut generations)
+                .unwrap();
+        }
+        assert!(store.route_health().unwrap().is_empty());
+
+        let applied = engine
+            .with_current_provider_generation("provider", stale_generation, || {
+                store.record_route_failure("provider", "shared", 2, 10, 30)?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(applied.is_none());
+        assert!(store.route_health().unwrap().is_empty());
     }
 
     #[test]

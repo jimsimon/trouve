@@ -66,6 +66,16 @@ describe("provider settings security boundaries", () => {
       .toEqual(["codex", "openai"]);
   });
 
+  it("moves hosted providers without changing local-provider slots", () => {
+    expect(movedProviderOrder(
+      ["local", "codex", "loopback", "cursor"],
+      ["local", "codex", "loopback", "cursor"],
+      "cursor",
+      -1,
+      ["codex", "cursor"],
+    )).toEqual(["local", "cursor", "loopback", "codex"]);
+  });
+
   it("keeps local and configured loopback providers out of hosted priority", () => {
     const provider = (id: string, category: string): ProtocolProviderInfo => ({
       id,

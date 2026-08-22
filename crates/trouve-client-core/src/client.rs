@@ -560,7 +560,10 @@ impl ProtocolClient {
     pub async fn set_provider_order(&self, provider_ids: Vec<String>) -> Result<()> {
         self.put_empty(
             "/config/provider-order",
-            &SetProviderOrderRequest { provider_ids },
+            &SetProviderOrderRequest {
+                expected_provider_ids: None,
+                provider_ids,
+            },
         )
         .await
     }

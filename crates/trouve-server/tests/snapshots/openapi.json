@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.13"
+    "version": "7.14"
   },
   "paths": {
     "/v1/approvals": {
@@ -1467,6 +1467,16 @@
             "description": ""
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -12368,6 +12378,16 @@
           "provider_ids"
         ],
         "properties": {
+          "expected_provider_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Full resolved order observed before this edit. When present, the\nserver rejects the write if another client or provider mutation has\nchanged that order in the meantime."
+          },
           "provider_ids": {
             "type": "array",
             "items": {

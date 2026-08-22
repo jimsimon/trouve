@@ -2117,12 +2117,13 @@ async fn set_code_review_settings(
 
 #[utoipa::path(put, path = "/v1/config/provider-order",
     request_body = SetProviderOrderRequest,
-    responses((status = 204), (status = 400, body = ErrorBody)))]
+    responses((status = 204), (status = 400, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
 async fn set_provider_order(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<SetProviderOrderRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.set_provider_order(&req.provider_ids)?;
+    engine.set_provider_order(&req.provider_ids, req.expected_provider_ids.as_deref())?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -400,6 +400,8 @@ describe("ProtocolClient", () => {
     const routedModel = {
       ...model,
       id: "auto/gpt-5.6",
+      input_price_per_mtok: null,
+      output_price_per_mtok: null,
       routes: [{ provider_id: "openai", provider_model: "gpt-5.6" }],
     };
     const thread = {
@@ -1067,11 +1069,11 @@ describe("ProtocolClient", () => {
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.13")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.14")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "5.4", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.14", "8.0", "7.13.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "5.4", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "8.0", "7.14.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

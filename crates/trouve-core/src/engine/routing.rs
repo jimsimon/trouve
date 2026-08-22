@@ -14,6 +14,7 @@ impl Engine {
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
+        active_attempt: &Mutex<Option<RoutedAttemptSnapshot>>,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -57,9 +58,13 @@ impl Engine {
         if !prompt_persisted.load(Ordering::Acquire) {
             let shell_options = self.store.thread_model_options(&thread.id)?;
             let thinking_level = resolved_thinking_level(&shell_options, None);
+            let message = accepted_prompt_message(prompt)?;
             self.store
-                .append_events_async(
-                    scope.clone(),
+                .append_events_accepting_claimed_prompt(
+                    &thread.id,
+                    turn,
+                    &prompt.id,
+                    message,
                     vec![
                         Event::TurnStarted {
                             turn,
@@ -161,10 +166,11 @@ impl Engine {
                 reason: trouve_protocol::ModelRouteReason::Initial,
             },
         )?;
-        // Compaction must run before this turn's user message joins the
-        // provider transcript. If a backend is selected first and later
-        // hands off to native execution, the native route uses the full
-        // persisted transcript for that exceptional continuation.
+        // Compaction summarizes only earlier transcript rows and preserves
+        // the accepted current user message as the final row. If a backend is
+        // selected first and later hands off to native execution, the native
+        // route uses the full persisted transcript for that exceptional
+        // continuation.
         if let Some(native_route) = candidates
             .iter()
             .find(|candidate| matches!(candidate.executor, ModelExecutor::Native(_)))
@@ -183,10 +189,18 @@ impl Engine {
             tracing::warn!("compaction failed for {}: {error}", thread.id);
         }
         // The first backend attempt must see the same post-compaction
-        // transcript as native execution. Capture it before adding this
-        // turn's user message, which is carried separately in the backend
-        // prompt.
-        let history_before = self.store.messages(&thread.id)?;
+        // transcript as native execution, excluding the current user message
+        // that is carried separately in the backend prompt.
+        let mut history_before = self.store.messages(&thread.id)?;
+        let current_user = history_before
+            .pop()
+            .context("accepted user message is missing before backend routing")?;
+        let expected_user =
+            serde_json::to_value(accepted_user_message(&prompt.content, &prompt.attachments)?)?;
+        anyhow::ensure!(
+            current_user == expected_user,
+            "accepted user message is not the final transcript row before backend routing"
+        );
 
         // Materialization stays behind ToolExecutor and happens once before
         // any cross-adapter handoff, so every route sees the same safe paths.
@@ -194,11 +208,6 @@ impl Engine {
             .materialize_attachments_for_turn(&session, &attachments, &cancel)
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
-        let stored_files = materialized
-            .iter()
-            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
-            .collect::<Vec<_>>();
-        let stored_content = annotate_attachments(content.clone(), &stored_files);
         let (images, files): (Vec<_>, Vec<_>) = materialized
             .into_iter()
             .partition(|file| file.attachment.mime.starts_with("image/"));
@@ -216,10 +225,6 @@ impl Engine {
                 local_path: Some(file.absolute_path),
             })
             .collect();
-        self.store.append_message(
-            &thread.id,
-            &serde_json::to_value(Message::User(stored_content))?,
-        )?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
             bail!("queued prompt {} vanished before turn start", prompt.id);
         }
@@ -308,6 +313,12 @@ impl Engine {
             // global hybrid clock prevents concurrent admissions from tying
             // even when the wall clock has microsecond resolution.
             let attempt_order = self.turn_scheduler.next_attempt_order();
+            *active_attempt.lock().unwrap() = Some(RoutedAttemptSnapshot {
+                provider_id: route.provider_id.clone(),
+                provider_model: route.provider_model.clone(),
+                provider_generation: route.provider_generation,
+                attempt_order,
+            });
             let result = match &route.executor {
                 ModelExecutor::Native(_) => {
                     self.run_native_route(
@@ -326,7 +337,7 @@ impl Engine {
                         tools_enabled,
                         &cancel,
                     )
-                    .await?
+                    .await
                 }
                 ModelExecutor::Backend(_) => {
                     self.run_backend_route(
@@ -347,27 +358,39 @@ impl Engine {
                         tools_enabled,
                         &cancel,
                     )
-                    .await?
+                    .await
                 }
             };
+            active_attempt.lock().unwrap().take();
+            let result = result?;
             drop(route_capacity.take());
 
             match result {
                 RouteAttemptResult::Completed => {
-                    self.turn_scheduler
-                        .record_outcome(&route.provider_id, None, attempt_order);
-                    self.store.record_route_success(
+                    self.with_current_provider_generation(
                         &route.provider_id,
-                        &route.provider_model,
-                        attempt_order,
+                        route.provider_generation,
+                        || {
+                            self.turn_scheduler.record_outcome(
+                                &route.provider_id,
+                                None,
+                                attempt_order,
+                            );
+                            self.store.record_route_success(
+                                &route.provider_id,
+                                &route.provider_model,
+                                attempt_order,
+                            )?;
+                            if automatic_model_name(&thread.model).is_some() {
+                                self.store.set_thread_route_affinity(
+                                    &thread.id,
+                                    &route.provider_id,
+                                    &route.provider_model,
+                                )?;
+                            }
+                            Ok(())
+                        },
                     )?;
-                    if automatic_model_name(&thread.model).is_some() {
-                        self.store.set_thread_route_affinity(
-                            &thread.id,
-                            &route.provider_id,
-                            &route.provider_model,
-                        )?;
-                    }
                     self.record_routed_usage(&session.id, &thread.id, turn, &mut accounting, true)?;
                     let checkpoint_id = if concurrent_child {
                         None
@@ -401,27 +424,44 @@ impl Engine {
                         route.provider_model.clone(),
                         failure.message.clone(),
                     ));
-                    self.turn_scheduler.record_outcome(
-                        &route.provider_id,
-                        Some(&failure.message),
-                        attempt_order,
-                    );
                     let (base, max) = failure.kind.cooldown();
-                    let health = self.store.record_route_failure(
+                    let health = self.with_current_provider_generation(
                         &route.provider_id,
-                        &route.provider_model,
-                        attempt_order,
-                        base,
-                        max,
+                        route.provider_generation,
+                        || {
+                            self.turn_scheduler.record_outcome(
+                                &route.provider_id,
+                                Some(&failure.message),
+                                attempt_order,
+                            );
+                            self.store
+                                .record_route_failure(
+                                    &route.provider_id,
+                                    &route.provider_model,
+                                    attempt_order,
+                                    base,
+                                    max,
+                                )
+                                .and_then(|health| {
+                                    self.store.clear_thread_route_affinity_if_matches(
+                                        &thread.id,
+                                        &route.provider_id,
+                                        &route.provider_model,
+                                    )?;
+                                    Ok(health)
+                                })
+                        },
                     )?;
-                    tracing::warn!(
-                        model = %thread.model,
-                        provider = %route.provider_id,
-                        failures = health.consecutive_failures,
-                        retry_after = health.retry_after,
-                        error = %failure.message,
-                        "model route opened its circuit"
-                    );
+                    if let Some(health) = health {
+                        tracing::warn!(
+                            model = %thread.model,
+                            provider = %route.provider_id,
+                            failures = health.consecutive_failures,
+                            retry_after = health.retry_after,
+                            error = %failure.message,
+                            "model route opened its circuit"
+                        );
+                    }
                     let has_next = route_index + 1 < candidates.len();
                     if !failure.safe_to_retry {
                         self.record_routed_usage(
@@ -1026,6 +1066,21 @@ impl Engine {
             mcp_bridge,
             mcp_servers,
         };
+        let startup_activity = backend.startup_activity(&backend_turn).await;
+        if matches!(
+            startup_activity,
+            Some(BackendStartupActivity::ConnectingTools)
+        ) {
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::TurnPhaseChanged {
+                        turn,
+                        phase: TurnPhase::ConnectingTools,
+                    },
+                )
+                .await?;
+        }
         let mut stream = match backend.run_turn(backend_turn).await {
             Ok(stream) => stream,
             Err(BackendError::Cancelled) if cancel.is_cancelled() => {
@@ -1037,6 +1092,17 @@ impl Engine {
                 )));
             }
         };
+        if startup_activity.is_some() {
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::TurnPhaseChanged {
+                        turn,
+                        phase: TurnPhase::Processing,
+                    },
+                )
+                .await?;
+        }
 
         let mut text = String::new();
         let mut segment = String::new();

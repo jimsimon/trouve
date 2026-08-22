@@ -302,7 +302,9 @@ pub use requests::*;
 // persist sticky thread affinity, and emit route-selection events with a
 // closed reason enum; provider-order updates require an explicit array
 // (additive because all affected routes and wire shapes are new).
-pub const PROTOCOL_VERSION: &str = "7.13";
+// 7.14: provider-order writes can carry an optimistic concurrency precondition
+// so simultaneous settings clients cannot silently overwrite one another.
+pub const PROTOCOL_VERSION: &str = "7.14";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -370,6 +370,7 @@ function App() {
     reloadRequested: boolean;
   }>({ promise: null, reloadRequested: false });
   const configurationLoadRef = useRef<Promise<void> | null>(null);
+  const staticModelLoadRef = useRef<Promise<void> | null>(null);
   const modelRouteLoadRef = useRef<Promise<void> | null>(null);
 
   const loadDashboard = useCallback((quiet = false): Promise<void> => {
@@ -425,33 +426,34 @@ function App() {
   const loadConfiguration = useCallback((): Promise<void> => {
     if (configurationLoadRef.current) return configurationLoadRef.current;
     const request = (async (): Promise<void> => {
+      // Static model discovery has its own loading/error projection. Publish
+      // it independently so a stalled model endpoint cannot hold repository,
+      // review, or persona settings behind one aggregate promise.
+      if (!staticModelLoadRef.current) {
+        const staticModels = getModels()
+          .then((models) => {
+            setModelCatalog((current) =>
+              current.loaded ? current : { models, loaded: true, error: "" },
+            );
+          })
+          .catch((cause) => {
+            const error = cause instanceof Error ? cause.message : String(cause);
+            setModelCatalog((current) => ({ ...current, error }));
+          });
+        staticModelLoadRef.current = staticModels;
+        void staticModels.finally(() => {
+          if (staticModelLoadRef.current === staticModels) staticModelLoadRef.current = null;
+        });
+      }
       const results = await Promise.allSettled([
         getProviders(),
         getReviewSettings(),
-        getModels(),
         getPersonaInfos(),
       ]);
-      const [providerResult, settingsResult, modelResult, personaResult] = results;
+      const [providerResult, settingsResult, personaResult] = results;
       if (providerResult?.status === "fulfilled") setProviders(providerResult.value);
       if (settingsResult?.status === "fulfilled") setReviewSettings(settingsResult.value);
       if (personaResult?.status === "fulfilled") setPersonaInfos(personaResult.value);
-      if (modelResult?.status === "fulfilled") {
-        // Paint the static catalog immediately. Keep a richer live route
-        // snapshot during later refreshes until its replacement arrives.
-        setModelCatalog((current) =>
-          current.loaded
-            ? current
-            : { models: modelResult.value, loaded: true, error: "" },
-        );
-      } else if (modelResult?.status === "rejected") {
-        const error = modelResult.reason instanceof Error
-          ? modelResult.reason.message
-          : String(modelResult.reason);
-        // Retain a previously loaded catalog. An empty array before the first
-        // successful request is loading/error state, not proof that every
-        // configured model disappeared.
-        setModelCatalog((current) => ({ ...current, error }));
-      }
       // Live provider/CLI discovery can be slow or unavailable. It enriches
       // the already usable static picker without holding configuration open.
       void loadModelRoutes();

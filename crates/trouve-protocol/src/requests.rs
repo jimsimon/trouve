@@ -2651,6 +2651,11 @@ pub struct ProvidersResponse {
 /// Omitted configured providers remain eligible after the listed providers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SetProviderOrderRequest {
+    /// Full resolved order observed before this edit. When present, the
+    /// server rejects the write if another client or provider mutation has
+    /// changed that order in the meantime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_provider_ids: Option<Vec<String>>,
     pub provider_ids: Vec<String>,
 }
 

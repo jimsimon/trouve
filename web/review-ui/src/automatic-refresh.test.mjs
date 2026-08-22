@@ -31,6 +31,15 @@ test("model discovery does not block unrelated repository and persona saves", ()
     source.indexOf("function StatsPage"),
   );
   assert.match(source, /void loadModelRoutes\(\);/u);
+  const configurationLoader = source.slice(
+    source.indexOf("const loadConfiguration"),
+    source.indexOf("const needsConfiguration"),
+  );
+  assert.match(configurationLoader, /const staticModels = getModels\(\)/u);
+  assert.doesNotMatch(
+    configurationLoader,
+    /Promise\.allSettled\(\[\s*getModels\(\)/u,
+  );
   assert.doesNotMatch(
     repositoryEditor,
     /disabled=\{busy \|\| !modelsLoaded \|\| reviewerPolicyInvalid/u,

@@ -27,7 +27,7 @@ const CUSTOM_PROVIDER = "__custom__";
 const DEFAULT_LOGIN_POLL_MS = 1_000;
 const DEFAULT_LOGIN_POLL_ATTEMPTS = 180;
 const ROUTING_UPDATED_WITHOUT_USAGE =
-  "Automatic routing priority was updated. Subscription usage is unavailable; retrying automatically.";
+  "Routing priority updated. Subscription usage is unavailable; retrying automatically.";
 
 interface ProviderLoadResult {
   readonly providerStateLoaded: boolean;
@@ -68,15 +68,23 @@ export const movedProviderOrder = (
   configuredIds: readonly string[],
   providerId: string,
   direction: -1 | 1,
+  movableIds: readonly string[] = configuredIds,
 ): readonly string[] => {
   const configured = new Set(configuredIds);
   const normalized = [
     ...order.filter((id, index) => configured.has(id) && order.indexOf(id) === index),
     ...configuredIds.filter((id) => !order.includes(id)),
   ];
-  const index = normalized.indexOf(providerId);
-  const target = index + direction;
-  if (index < 0 || target < 0 || target >= normalized.length) return normalized;
+  const movable = new Set(movableIds);
+  const slots = normalized
+    .map((id, index) => movable.has(id) ? index : -1)
+    .filter((index) => index >= 0);
+  const slot = slots.indexOf(normalized.indexOf(providerId));
+  const targetSlot = slot + direction;
+  if (slot < 0 || targetSlot < 0 || targetSlot >= slots.length) return normalized;
+  const index = slots[slot];
+  const target = slots[targetSlot];
+  if (index === undefined || target === undefined) return normalized;
   const current = normalized[index];
   const replacement = normalized[target];
   if (current === undefined || replacement === undefined) return normalized;
@@ -654,16 +662,18 @@ export class TrouveProviderSettings extends LitElement {
 
   #renderRoutingPriority(configured: readonly ProtocolProviderInfo[]) {
     const ids = configured.map((provider) => provider.id);
+    const allIds = this.#providers?.providers.map((provider) => provider.id) ?? ids;
     const order = movedProviderOrder(
       this.#providers?.provider_order ?? [],
-      ids,
+      allIds,
       "",
       1,
-    );
+      ids,
+    ).filter((providerId) => ids.includes(providerId));
     return html`
       <section class="settings-card routing-priority" aria-labelledby="routing-priority-title">
         <h3 id="routing-priority-title">Automatic routing priority</h3>
-        <p>The first healthy route is preferred for a new automatic model selection. Successful threads stay on their current provider until it fails or reports exhausted capacity.</p>
+        <p>New automatic selections prefer the first healthy route. Threads stay on that provider until it fails or runs out of capacity.</p>
         <div class="priority-list">
           ${order.map((providerId, index) => html`
             <div class="priority-row">
@@ -872,50 +882,69 @@ export class TrouveProviderSettings extends LitElement {
     const generation = ++this.#loadGeneration;
     this.#loading = true;
     this.requestUpdate();
-    const [providers, knownProviders, health] = await Promise.allSettled([
-      services.protocol.providers(),
-      services.protocol.knownProviders(),
-      services.subscriptionHealth.refresh(forceHealth ? "force" : "if-stale"),
-    ]);
+    let healthLoaded = false;
+    void services.protocol.knownProviders().then((knownProviders) => {
+      if (generation !== this.#loadGeneration || !this.isConnected) return;
+      this.#knownProviders = knownProviders;
+      const subscriptions = this.#knownProviders.filter(
+        (provider) => category(provider) === "subscription" || provider.auth === "oauth" || provider.auth === "cli",
+      );
+      if (!subscriptions.some((provider) => provider.id === this.#subscriptionId)) {
+        this.#subscriptionId = subscriptions[0]?.id ?? "";
+      }
+      const subscriptionIds = new Set(subscriptions.map((provider) => provider.id));
+      const api = this.#knownProviders.filter(
+        (provider) => category(provider) !== "local" && !subscriptionIds.has(provider.id),
+      );
+      if (!api.some((provider) => provider.id === this.#apiPresetId) && this.#apiPresetId !== CUSTOM_PROVIDER) {
+        this.#apiPresetId = api[0]?.id ?? CUSTOM_PROVIDER;
+      }
+      if (this.#notice === "Provider presets could not be loaded. Retrying automatically.") {
+        this.#setNotice("", false);
+      }
+      this.requestUpdate();
+    }).catch(() => {
+      if (generation !== this.#loadGeneration || !this.isConnected) return;
+      this.#setNotice("Provider presets could not be loaded. Retrying automatically.", true);
+      this.#scheduleRetry();
+      this.requestUpdate();
+    });
+    void services.subscriptionHealth.refresh(forceHealth ? "force" : "if-stale").then((health) => {
+      if (generation !== this.#loadGeneration || !this.isConnected) return;
+      healthLoaded = true;
+      this.#health = health;
+      if (
+        this.#notice === "Providers loaded, but subscription usage is unavailable."
+        || this.#notice === ROUTING_UPDATED_WITHOUT_USAGE
+      ) {
+        this.#setNotice("", false);
+      }
+      this.requestUpdate();
+    }).catch(() => {
+      if (generation !== this.#loadGeneration || !this.isConnected) return;
+      this.#setNotice("Providers loaded, but subscription usage is unavailable.", false);
+      this.#scheduleRetry();
+      this.requestUpdate();
+    });
+    const [providers] = await Promise.allSettled([services.protocol.providers()]);
     if (generation !== this.#loadGeneration || !this.isConnected) {
       return { providerStateLoaded: false, healthLoaded: false };
     }
     this.#loading = false;
     if (providers.status === "fulfilled") this.#providers = providers.value;
-    if (knownProviders.status === "fulfilled") this.#knownProviders = knownProviders.value;
-    if (health.status === "fulfilled") this.#health = health.value;
-    if (providers.status === "rejected" || knownProviders.status === "rejected") {
+    if (providers.status === "rejected") {
       this.#setNotice("Provider settings could not be loaded. Retrying automatically.", true);
-      this.#scheduleRetry();
-    } else if (health.status === "rejected") {
-      this.#setNotice("Providers loaded, but subscription usage is unavailable.", false);
       this.#scheduleRetry();
     } else if (
       this.#notice === "Provider settings could not be loaded. Retrying automatically."
-      || this.#notice === "Providers loaded, but subscription usage is unavailable."
-      || this.#notice === ROUTING_UPDATED_WITHOUT_USAGE
     ) {
       this.#setNotice("", false);
-    }
-    const subscriptions = this.#knownProviders.filter(
-      (provider) => category(provider) === "subscription" || provider.auth === "oauth" || provider.auth === "cli",
-    );
-    if (!subscriptions.some((provider) => provider.id === this.#subscriptionId)) {
-      this.#subscriptionId = subscriptions[0]?.id ?? "";
-    }
-    const subscriptionIds = new Set(subscriptions.map((provider) => provider.id));
-    const api = this.#knownProviders.filter(
-      (provider) => category(provider) !== "local" && !subscriptionIds.has(provider.id),
-    );
-    if (!api.some((provider) => provider.id === this.#apiPresetId) && this.#apiPresetId !== CUSTOM_PROVIDER) {
-      this.#apiPresetId = api[0]?.id ?? CUSTOM_PROVIDER;
     }
     this.requestUpdate();
     // Provider state is authoritative for mutations. Subscription usage is an
     // independent enhancement and must not make a committed provider change
     // look as though it is still saving or failed.
-    const providerStateLoaded = providers.status === "fulfilled"
-      && knownProviders.status === "fulfilled";
+    const providerStateLoaded = providers.status === "fulfilled";
     if (providerStateLoaded && this.#busy === "provider-order-sync") {
       this.#busy = "";
       this.#setNotice("Automatic routing priority was reloaded from the server.", false);
@@ -923,7 +952,7 @@ export class TrouveProviderSettings extends LitElement {
     }
     return {
       providerStateLoaded,
-      healthLoaded: health.status === "fulfilled",
+      healthLoaded,
     };
   }
 
@@ -1037,27 +1066,33 @@ export class TrouveProviderSettings extends LitElement {
     const services = this.#services.value;
     const providers = this.#providers;
     if (services === undefined || providers === undefined || this.#busy !== "") return;
-    const configuredIds = automaticRoutingProviders(providers.providers)
+    const automaticIds = automaticRoutingProviders(providers.providers)
       .map((provider) => provider.id);
+    const configuredIds = providers.providers.map((provider) => provider.id);
+    const expectedProviderIds = providers.provider_order ?? configuredIds;
     const providerIds = movedProviderOrder(
-      providers.provider_order ?? [],
+      expectedProviderIds,
       configuredIds,
       providerId,
       direction,
+      automaticIds,
     );
     this.#busy = "provider-order";
-    this.#setNotice("Saving automatic routing priority…", false);
+    this.#setNotice("Saving routing priority…", false);
     this.requestUpdate();
     let orderConfirmed = true;
     try {
-      await services.protocol.setProviderOrder({ provider_ids: [...providerIds] });
+      await services.protocol.setProviderOrder({
+        expected_provider_ids: [...expectedProviderIds],
+        provider_ids: [...providerIds],
+      });
       this.#providers = { ...providers, provider_order: [...providerIds] };
       this.requestUpdate();
       const loaded = await this.#load(false);
       if (loaded.providerStateLoaded) {
         this.#setNotice(
           loaded.healthLoaded
-            ? "Automatic routing priority was updated."
+            ? "Routing priority updated."
             : ROUTING_UPDATED_WITHOUT_USAGE,
           false,
         );
@@ -1070,8 +1105,8 @@ export class TrouveProviderSettings extends LitElement {
       orderConfirmed = loaded.providerStateLoaded;
       this.#setNotice(
         loaded.providerStateLoaded
-          ? "Automatic routing priority could not be saved."
-          : "Automatic routing priority could not be saved or confirmed. Retrying automatically.",
+          ? "Routing priority could not be saved."
+          : "Routing priority could not be saved or confirmed. Retrying automatically.",
         true,
       );
     } finally {

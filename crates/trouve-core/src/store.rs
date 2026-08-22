@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS queued_prompts (
   content TEXT NOT NULL,
   attachments TEXT NOT NULL DEFAULT '[]',  -- JSON [trouve_protocol::Attachment]
   claimed INTEGER NOT NULL DEFAULT 0,
+  accepted_turn INTEGER,
   tools_enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
@@ -617,6 +618,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE queued_prompts ADD COLUMN accepted_turn INTEGER",
     "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN next_attempt_at TEXT",
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_until TEXT",
@@ -4175,12 +4177,19 @@ pub(crate) struct PersonaDeletionClaim {
 
 const PERSONA_DELETION_CLAIM_MINUTES: i64 = 5;
 
+pub(crate) struct AcceptedPrompt {
+    pub id: String,
+    pub turn: u64,
+    pub message: String,
+}
+
 pub(crate) struct PromptAcceptance {
     pub prompt: trouve_protocol::QueuedPrompt,
     pub tools_enabled: bool,
     pub attachments: Vec<(trouve_protocol::Attachment, String)>,
     pub claim_prompt_id: Option<String>,
     pub expected_previous_turn: Option<u64>,
+    pub accepted_prompt: Option<AcceptedPrompt>,
     pub staging_cleanup_claim: Option<ArtifactCleanupClaim>,
 }
 
@@ -4247,7 +4256,20 @@ enum StoreMutation {
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         claim_prompt_id: Option<String>,
         expected_previous_turn: Option<u64>,
+        accepted_prompt: Option<AcceptedPrompt>,
         staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    },
+    AcceptClaimedPrompt {
+        thread_id: String,
+        prompt_id: String,
+        turn: u64,
+        message: String,
+    },
+    AcceptAndFinishQueuedPrompt {
+        thread_id: String,
+        prompt_id: String,
+        turn: u64,
+        message: String,
     },
     AppendCheckpoint {
         checkpoint: Box<CheckpointRow>,
@@ -4935,6 +4957,7 @@ fn apply_store_mutation(
             attachments,
             claim_prompt_id,
             expected_previous_turn,
+            accepted_prompt,
             staging_cleanup_claim,
         } => {
             for (attachment, path) in attachments {
@@ -4986,6 +5009,29 @@ fn apply_store_mutation(
                 )?;
                 anyhow::ensure!(updated == 1, "turn changed while accepting message");
             }
+            if let Some(accepted) = accepted_prompt {
+                let marked = conn.execute(
+                    "UPDATE queued_prompts SET accepted_turn = ?3
+                     WHERE id = ?1 AND thread_id = ?2 AND claimed = 1
+                       AND accepted_turn IS NULL",
+                    params![accepted.id, prompt.thread_id, accepted.turn as i64],
+                )?;
+                anyhow::ensure!(
+                    marked == 1,
+                    "queued prompt {} changed while accepting turn {}",
+                    accepted.id,
+                    accepted.turn
+                );
+                conn.execute(
+                    "INSERT INTO messages (thread_id, seq, payload)
+                     VALUES (
+                         ?1,
+                         (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE thread_id = ?1),
+                         ?2
+                     )",
+                    params![prompt.thread_id, accepted.message],
+                )?;
+            }
             if let Some(claim) = staging_cleanup_claim {
                 let deleted = conn.execute(
                     "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
@@ -4997,6 +5043,58 @@ fn apply_store_mutation(
                     claim.id
                 );
             }
+        }
+        StoreMutation::AcceptClaimedPrompt {
+            thread_id,
+            prompt_id,
+            turn,
+            message,
+        } => {
+            let marked = conn.execute(
+                "UPDATE queued_prompts SET accepted_turn = ?3
+                 WHERE id = ?1 AND thread_id = ?2 AND claimed = 1
+                   AND accepted_turn IS NULL",
+                params![prompt_id, thread_id, *turn as i64],
+            )?;
+            anyhow::ensure!(
+                marked == 1,
+                "queued prompt {prompt_id} changed while accepting turn {turn}"
+            );
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, payload)
+                 VALUES (
+                     ?1,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE thread_id = ?1),
+                     ?2
+                 )",
+                params![thread_id, message],
+            )?;
+        }
+        StoreMutation::AcceptAndFinishQueuedPrompt {
+            thread_id,
+            prompt_id,
+            turn,
+            message,
+        } => {
+            let deleted = conn.execute(
+                "DELETE FROM queued_prompts
+                 WHERE id = ?1 AND thread_id = ?2 AND claimed = 1
+                   AND accepted_turn IS NULL",
+                params![prompt_id, thread_id],
+            )?;
+            anyhow::ensure!(
+                deleted == 1,
+                "queued prompt {prompt_id} changed while cancelling turn {turn}"
+            );
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, payload)
+                 VALUES (
+                     ?1,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE thread_id = ?1),
+                     ?2
+                 )",
+                params![thread_id, message],
+            )?;
         }
         StoreMutation::AppendCheckpoint { checkpoint } => {
             append_checkpoint_row(conn, checkpoint, timestamp)?;
@@ -5061,7 +5159,8 @@ fn apply_store_mutation(
         }
         StoreMutation::ReleaseQueuedPrompt { id } => {
             let released = conn.execute(
-                "UPDATE queued_prompts SET claimed = 0 WHERE id = ?1 AND claimed = 1",
+                "UPDATE queued_prompts SET claimed = 0
+                 WHERE id = ?1 AND claimed = 1 AND accepted_turn IS NULL",
                 params![id],
             )?;
             anyhow::ensure!(
@@ -5560,6 +5659,8 @@ fn pending_events_require_isolation(events: &[PendingEvent]) -> bool {
             event.mutation.as_ref(),
             Some(
                 StoreMutation::CompleteSessionPrVerificationIntent { .. }
+                    | StoreMutation::AcceptClaimedPrompt { .. }
+                    | StoreMutation::AcceptAndFinishQueuedPrompt { .. }
                     | StoreMutation::FinishQueuedPrompt { .. }
                     | StoreMutation::ReleaseQueuedPrompt { .. }
             )
@@ -5591,11 +5692,17 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&mut conn)?;
-        // Claims belong to dispatcher tasks in this process. After a crash
-        // there is no worker to own them, so make the prompts visible and
-        // explicitly dispatchable again instead of losing them.
+        // Accepted prompts already have their user transcript and turn shell
+        // durably committed. A crash may leave their queue tombstones behind,
+        // but redispatching them would duplicate the user turn. Only claims
+        // that never reached acceptance become visible again.
         conn.execute(
-            "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
+            "DELETE FROM queued_prompts WHERE accepted_turn IS NOT NULL",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE queued_prompts SET claimed = 0
+             WHERE claimed != 0 AND accepted_turn IS NULL",
             [],
         )?;
         let writer_conn = Connection::open(path)
@@ -5613,7 +5720,12 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&mut conn)?;
         conn.execute(
-            "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
+            "DELETE FROM queued_prompts WHERE accepted_turn IS NOT NULL",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE queued_prompts SET claimed = 0
+             WHERE claimed != 0 AND accepted_turn IS NULL",
             [],
         )?;
         Ok(Self::from_connections(conn, None))
@@ -5691,6 +5803,61 @@ impl Store {
                 .collect(),
             StoreMutation::FinishQueuedPrompt {
                 id: prompt_id.to_string(),
+            },
+        )?;
+        self.append_pending_events_async(pending).await
+    }
+
+    /// Commit a claimed prompt's shell, provider transcript entry, and
+    /// acceptance marker together. The marker is a crash-recovery tombstone:
+    /// startup consumes it instead of making the already-accepted prompt
+    /// dispatchable again.
+    pub(crate) async fn append_events_accepting_claimed_prompt(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        prompt_id: &str,
+        message: String,
+        events: Vec<Event>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let scope = Scope::Thread(thread_id.to_string());
+        let pending = serialize_lifecycle_events(
+            events
+                .into_iter()
+                .map(|event| (scope.clone(), event))
+                .collect(),
+            StoreMutation::AcceptClaimedPrompt {
+                thread_id: thread_id.to_string(),
+                prompt_id: prompt_id.to_string(),
+                turn,
+                message,
+            },
+        )?;
+        self.append_pending_events_async(pending).await
+    }
+
+    /// Cancellation may win before ordinary acceptance. Commit the
+    /// synthesized shell and transcript while consuming the claim so the
+    /// cancelled prompt is neither lost from history nor replayed.
+    pub(crate) async fn append_events_accepting_and_finishing_queued_prompt(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        prompt_id: &str,
+        message: String,
+        events: Vec<Event>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let scope = Scope::Thread(thread_id.to_string());
+        let pending = serialize_lifecycle_events(
+            events
+                .into_iter()
+                .map(|event| (scope.clone(), event))
+                .collect(),
+            StoreMutation::AcceptAndFinishQueuedPrompt {
+                thread_id: thread_id.to_string(),
+                prompt_id: prompt_id.to_string(),
+                turn,
+                message,
             },
         )?;
         self.append_pending_events_async(pending).await
@@ -7187,6 +7354,21 @@ impl Store {
         Ok(())
     }
 
+    pub fn clear_thread_route_affinity_if_matches(
+        &self,
+        id: &str,
+        provider_id: &str,
+        provider_model: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE threads
+             SET route_provider_id = NULL, route_provider_model = NULL
+             WHERE id = ?1 AND route_provider_id = ?2 AND route_provider_model = ?3",
+            params![id, provider_id, provider_model],
+        )?;
+        Ok(updated == 1)
+    }
+
     /// Replace the current todo snapshot for exactly one thread.
     pub fn update_thread_todos(&self, id: &str, todos: &[trouve_protocol::TodoItem]) -> Result<()> {
         self.conn.lock().unwrap().execute(
@@ -7345,6 +7527,7 @@ impl Store {
             attachments,
             claim_prompt_id,
             expected_previous_turn,
+            accepted_prompt,
             staging_cleanup_claim,
         } = acceptance;
         let pending = serialize_lifecycle_events(
@@ -7355,6 +7538,7 @@ impl Store {
                 attachments,
                 claim_prompt_id,
                 expected_previous_turn,
+                accepted_prompt,
                 staging_cleanup_claim,
             },
         )?;
@@ -7758,7 +7942,8 @@ impl Store {
     pub fn release_queued_prompt(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE queued_prompts SET claimed = 0 WHERE id = ?1 AND claimed = 1",
+            "UPDATE queued_prompts SET claimed = 0
+             WHERE id = ?1 AND claimed = 1 AND accepted_turn IS NULL",
             params![id],
         )?;
         Ok(n > 0)
@@ -13539,7 +13724,21 @@ impl Store {
         backend: &str,
         backend_session_id: &str,
     ) -> Result<()> {
-        self.set_backend_session_at_watermark(thread_id, backend, backend_session_id, 0)
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO backend_sessions
+                 (thread_id, backend, backend_session_id, seen_messages)
+             VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(thread_id, backend)
+               DO UPDATE SET backend_session_id = excluded.backend_session_id",
+            params![thread_id, backend, backend_session_id],
+        )?;
+        // A properly keyed row supersedes any migrated legacy fallback.
+        conn.execute(
+            "DELETE FROM backend_sessions WHERE thread_id = ?1 AND backend = ''",
+            params![thread_id],
+        )?;
+        Ok(())
     }
 
     /// Persist a newly reported vendor session together with the transcript
@@ -16935,6 +17134,14 @@ mod tests {
             store.backend_session("th_bs", "cursor").unwrap(),
             Some(("cursor-sess".into(), 4))
         );
+        store
+            .set_backend_session("th_bs", "cursor", "cursor-sess-rotated")
+            .unwrap();
+        assert_eq!(
+            store.backend_session("th_bs", "cursor").unwrap(),
+            Some(("cursor-sess-rotated".into(), 4)),
+            "updating only the vendor session id must preserve its transcript watermark"
+        );
         assert_eq!(
             store.backend_session("th_bs", "claude").unwrap(),
             Some(("claude-sess".into(), 0))
@@ -17558,6 +17765,14 @@ mod tests {
                     attachments: vec![(attachment.clone(), "/tmp/at_accept.png".into())],
                     claim_prompt_id: Some(prompt.id.clone()),
                     expected_previous_turn: Some(0),
+                    accepted_prompt: Some(AcceptedPrompt {
+                        id: prompt.id.clone(),
+                        turn: 1,
+                        message: serde_json::to_string(&trouve_providers::Message::User(
+                            prompt.content.clone(),
+                        ))
+                        .unwrap(),
+                    }),
                     staging_cleanup_claim: None,
                 },
                 events,
@@ -17567,6 +17782,7 @@ mod tests {
         assert_eq!(store.last_turn("th_accept").unwrap(), 1);
         assert!(store.queued_prompts("th_accept").unwrap().is_empty());
         assert!(!store.queued_prompt_tools_enabled(&prompt.id).unwrap());
+        assert_eq!(store.messages("th_accept").unwrap().len(), 1);
         assert_eq!(
             store.attachment(&attachment.id).unwrap().unwrap().0,
             attachment
@@ -17613,6 +17829,7 @@ mod tests {
                 attachments: vec![(attachment.clone(), "/tmp/at_accept_rollback.txt".into())],
                 claim_prompt_id: Some("qp_accept_rollback".into()),
                 expected_previous_turn: Some(99),
+                accepted_prompt: None,
                 staging_cleanup_claim: None,
             },
             vec![(
@@ -17638,6 +17855,64 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reopening_consumes_accepted_prompt_tombstone_without_replaying_user_message() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("accepted-prompt-recovery.sqlite3");
+        {
+            let store = Store::open(&database).unwrap();
+            seed_thread(&store, "th_accept_reopen");
+            let prompt = trouve_protocol::QueuedPrompt {
+                id: "qp_accept_reopen".into(),
+                thread_id: "th_accept_reopen".into(),
+                position: 1,
+                content: "accepted exactly once".into(),
+                attachments: Vec::new(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            store
+                .accept_prompt_with_events(
+                    PromptAcceptance {
+                        prompt: prompt.clone(),
+                        tools_enabled: true,
+                        attachments: Vec::new(),
+                        claim_prompt_id: Some(prompt.id.clone()),
+                        expected_previous_turn: Some(0),
+                        accepted_prompt: Some(AcceptedPrompt {
+                            id: prompt.id,
+                            turn: 1,
+                            message: serde_json::to_string(&trouve_providers::Message::User(
+                                prompt.content,
+                            ))
+                            .unwrap(),
+                        }),
+                        staging_cleanup_claim: None,
+                    },
+                    vec![(
+                        Scope::Thread("th_accept_reopen".into()),
+                        Event::TurnStarted {
+                            turn: 1,
+                            mode: "code".into(),
+                            model: "auto/shared".into(),
+                            thinking_level: None,
+                            supports_steering: false,
+                        },
+                    )],
+                )
+                .unwrap();
+        }
+
+        let reopened = Store::open(&database).unwrap();
+        assert!(
+            reopened
+                .queued_prompts("th_accept_reopen")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reopened.messages("th_accept_reopen").unwrap().len(), 1);
+        assert_eq!(reopened.last_turn("th_accept_reopen").unwrap(), 1);
     }
 
     #[test]

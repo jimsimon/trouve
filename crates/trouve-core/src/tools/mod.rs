@@ -1130,6 +1130,33 @@ pub struct MaterializedAttachment {
     pub absolute_path: PathBuf,
 }
 
+/// Stable worktree-relative path reserved for an accepted attachment. This
+/// is pure metadata derivation so the engine can durably record the exact
+/// provider transcript before the executor performs the filesystem copy.
+pub(crate) fn materialized_attachment_relative_path(
+    attachment: &trouve_protocol::Attachment,
+) -> Result<PathBuf, String> {
+    let ext = Path::new(&attachment.name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            extension.len() <= 8
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(|extension| format!(".{}", extension.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let filename = format!("{}{}", attachment.id, ext);
+    if !filename
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err("attachment id cannot form an opaque materialized path".into());
+    }
+    Ok(Path::new(".trouve").join("attachments").join(filename))
+}
+
 pub struct SessionWorktreeCreate {
     pub repository: PathBuf,
     pub worktree: PathBuf,
@@ -2743,30 +2770,16 @@ impl ToolExecutor for LocalToolExecutor {
                 }
                 let bytes =
                     read_attachment_secure(&source_root, &file.source, file.attachment.size_bytes)?;
-                let ext = Path::new(&file.attachment.name)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .filter(|extension| {
-                        extension.len() <= 8
-                            && extension
-                                .chars()
-                                .all(|character| character.is_ascii_alphanumeric())
-                    })
-                    .map(|extension| format!(".{}", extension.to_ascii_lowercase()))
-                    .unwrap_or_default();
-                let filename = format!("{}{}", file.attachment.id, ext);
-                if !filename
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-                {
-                    return Err("attachment id cannot form an opaque materialized path".into());
-                }
-                let absolute_path = materialized_root.join(&filename);
+                let relative_path = materialized_attachment_relative_path(&file.attachment)?;
+                let filename = relative_path
+                    .file_name()
+                    .expect("materialized attachment path always has a file name");
+                let absolute_path = materialized_root.join(filename);
                 ensure_materialized_attachment(&materialized_root, &absolute_path, &bytes)?;
                 out.push(MaterializedAttachment {
                     attachment: file.attachment,
                     bytes: Arc::from(bytes),
-                    relative_path: Path::new(".trouve").join("attachments").join(filename),
+                    relative_path,
                     absolute_path,
                 });
             }

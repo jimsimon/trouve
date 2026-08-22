@@ -4401,6 +4401,12 @@ export interface components {
          *     Omitted configured providers remain eligible after the listed providers.
          */
         SetProviderOrderRequest: {
+            /**
+             * @description Full resolved order observed before this edit. When present, the
+             *     server rejects the write if another client or provider mutation has
+             *     changed that order in the meantime.
+             */
+            expected_provider_ids?: string[] | null;
             provider_ids: string[];
         };
         /**
@@ -6214,6 +6220,14 @@ export interface operations {
                 content?: never;
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
