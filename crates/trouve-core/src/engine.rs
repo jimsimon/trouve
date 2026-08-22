@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub const BACKGROUND_ATTACH_PROMPT: &str = "[background agent activity]";
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7808,6 +7808,23 @@ impl Engine {
         self.workspace_list_refresh_lock(&format!("registration:{}", canonical.to_string_lossy()))
     }
 
+    fn acquire_workspace_registration_lock<'a>(
+        registration_lock: &'a Mutex<()>,
+        on_lock_attempt: impl FnOnce(bool),
+    ) -> MutexGuard<'a, ()> {
+        match registration_lock.try_lock() {
+            Ok(guard) => {
+                on_lock_attempt(false);
+                guard
+            }
+            Err(TryLockError::WouldBlock) => {
+                on_lock_attempt(true);
+                registration_lock.lock().unwrap()
+            }
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        }
+    }
+
     fn prepare_workspace_registration(
         &self,
         canonical: &Path,
@@ -7875,18 +7892,20 @@ impl Engine {
         path: &str,
         name: Option<String>,
     ) -> Result<WorkspaceListItem, EngineError> {
-        self.register_workspace_with(path, name, || {})
+        self.register_workspace_with(path, name, |_| {}, || {})
     }
 
     fn register_workspace_with(
         &self,
         path: &str,
         name: Option<String>,
+        on_lock_attempt: impl FnOnce(bool),
         after_prepare: impl FnOnce(),
     ) -> Result<WorkspaceListItem, EngineError> {
         let canonical = Self::canonical_workspace_registration_path(path)?;
         let registration_lock = self.workspace_registration_lock(&canonical);
-        let _registration = registration_lock.lock().unwrap();
+        let _registration =
+            Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
         let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
         after_prepare();
         let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
@@ -22562,6 +22581,7 @@ default_permission_mode = "ask"
             first_engine.register_workspace_with(
                 first_path.to_str().unwrap(),
                 Some("first registration".into()),
+                |contended| assert!(!contended),
                 || {
                     first_prepared_tx.send(()).unwrap();
                     release_first_rx.recv().unwrap();
@@ -22570,22 +22590,17 @@ default_permission_mode = "ask"
         });
         first_prepared_rx.recv().unwrap();
 
-        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
-        let (second_prepared_tx, second_prepared_rx) = std::sync::mpsc::channel();
+        let (second_lock_tx, second_lock_rx) = std::sync::mpsc::channel();
         let second_engine = Arc::clone(&engine);
         let second = std::thread::spawn(move || {
-            second_started_tx.send(()).unwrap();
             second_engine.register_workspace_with(
                 repository_path.to_str().unwrap(),
                 Some("second registration".into()),
-                || second_prepared_tx.send(()).unwrap(),
+                |contended| second_lock_tx.send(contended).unwrap(),
+                || {},
             )
         });
-        second_started_rx.recv().unwrap();
-        assert_eq!(
-            second_prepared_rx.recv_timeout(Duration::from_millis(250)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        );
+        assert!(second_lock_rx.recv().unwrap());
         release_first_tx.send(()).unwrap();
 
         let registrations = [
