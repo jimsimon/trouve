@@ -165,10 +165,10 @@ trouve-session-list { display: block; }
 .session-indicator { width: 26px; height: 30px; display: grid; place-items: center; margin: 0 auto; border-radius: 5px; color: transparent; font-weight: 400; line-height: 1; }
 .session-indicator.approval, .session-indicator.question, .session-indicator.both { color: var(--trouve-warn); font-size: 16px; }
 .session-indicator.error { color: var(--trouve-err); font-size: 18px; }
-.session-indicator.unread { color: var(--trouve-accent); font-size: 11px; }
+.session-indicator.unread { color: var(--trouve-warn); font-size: 11px; }
 .session-indicator.approval:hover, .session-indicator.question:hover, .session-indicator.both:hover { color: var(--trouve-warn); background: var(--trouve-warn-bg); }
 .session-indicator.error:hover { color: var(--trouve-err); background: var(--trouve-err-bg); }
-.session-indicator.unread:hover { color: var(--trouve-accent-hover); }
+.session-indicator.unread:hover { color: var(--trouve-warn); }
 .session-indicator.busy::before { width: 10px; height: 10px; border-radius: 50%; background: var(--trouve-accent); opacity: .55; animation: trouve-session-busy-pulse 1.6s linear infinite; content: ""; }
 /* The product activity clock samples this sine wave every 100ms. */
 @keyframes trouve-session-busy-pulse {
