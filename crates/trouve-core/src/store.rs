@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS command_execution_requests (
   request_fingerprint TEXT NOT NULL,
   result TEXT,
   side_effect_started INTEGER NOT NULL DEFAULT 0,
+  writer_generation INTEGER NOT NULL DEFAULT 0,
   error_kind TEXT,
   error_message TEXT,
   created_at TEXT NOT NULL,
@@ -807,17 +808,19 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add command execution phases and conservatively classify receipts that
-/// provably predate them. The column addition, backfill, and durable marker
-/// share one transaction, so an interruption can never leave an ambiguous
-/// zero-valued legacy receipt. If the phase column already exists, its values
-/// came from a phase-aware writer and must be preserved.
+/// Add command execution phases and durable writer provenance. A zero-valued
+/// phase is reclaimable only when its receipt identifies the current
+/// phase-aware writer generation; older and interrupted writers remain
+/// conservative. Column additions, classification, and migration markers
+/// share one transaction so this migration cannot create a new ambiguous
+/// partial state.
 fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
-    const MIGRATION_ID: &str = "command-execution-side-effect-phase-v1";
+    const PHASE_MIGRATION_ID: &str = "command-execution-side-effect-phase-v1";
+    const WRITER_MIGRATION_ID: &str = "command-execution-writer-generation-v2";
     let applied = conn
         .query_row(
             "SELECT 1 FROM store_migrations WHERE id = ?1",
-            [MIGRATION_ID],
+            [WRITER_MIGRATION_ID],
             |_| Ok(()),
         )
         .optional()?
@@ -830,7 +833,7 @@ fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
     let applied = tx
         .query_row(
             "SELECT 1 FROM store_migrations WHERE id = ?1",
-            [MIGRATION_ID],
+            [WRITER_MIGRATION_ID],
             |_| Ok(()),
         )
         .optional()?
@@ -839,6 +842,14 @@ fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
         tx.commit()?;
         return Ok(());
     }
+    let phase_migration_applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [PHASE_MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
     let had_phase_column = tx.query_row(
         "SELECT EXISTS (
            SELECT 1 FROM pragma_table_info('command_execution_requests')
@@ -853,6 +864,7 @@ fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
                ADD COLUMN side_effect_started INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    let phase_values_authoritative = phase_migration_applied && had_phase_column;
     let had_error_kind = tx.query_row(
         "SELECT EXISTS (
            SELECT 1 FROM pragma_table_info('command_execution_requests')
@@ -881,7 +893,33 @@ fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
                ADD COLUMN error_message TEXT;",
         )?;
     }
-    if !had_phase_column {
+    let had_writer_generation = tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM pragma_table_info('command_execution_requests')
+           WHERE name = 'writer_generation'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !had_writer_generation {
+        tx.execute_batch(
+            "ALTER TABLE command_execution_requests
+               ADD COLUMN writer_generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        if phase_values_authoritative {
+            // A completed phase migration makes every stored phase value
+            // authoritative. This also upgrades receipts written by the
+            // phase-aware revision before per-row provenance was introduced.
+            tx.execute(
+                "UPDATE command_execution_requests SET writer_generation = 1",
+                [],
+            )?;
+        }
+    }
+    if !had_writer_generation && !phase_values_authoritative {
+        // Without either row provenance or the completed phase marker, a
+        // zero may be a legacy receipt left by an interrupted additive
+        // migration. Preserve at-most-once execution over retry liveness.
         tx.execute(
             "UPDATE command_execution_requests
              SET side_effect_started = 1
@@ -890,8 +928,12 @@ fn migrate_command_execution_phases(conn: &mut Connection) -> Result<()> {
         )?;
     }
     tx.execute(
+        "INSERT OR IGNORE INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![PHASE_MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
         "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
-        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+        params![WRITER_MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
     )?;
     tx.commit()?;
     Ok(())
@@ -4263,8 +4305,11 @@ pub(crate) struct CommandExecutionRecord {
     pub request_fingerprint: String,
     pub result: Option<CommandResult>,
     pub side_effect_started: bool,
+    pub writer_generation: i64,
     pub failure: Option<CommandExecutionFailure>,
 }
+
+const COMMAND_EXECUTION_WRITER_GENERATION: i64 = 1;
 
 pub(crate) struct CommandExecutionFailure {
     pub kind: String,
@@ -4756,9 +4801,10 @@ fn row_to_command_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<Command
         request_fingerprint: row.get(1)?,
         result,
         side_effect_started: row.get::<_, i64>(3)? != 0,
+        writer_generation: row.get(4)?,
         failure: match (
-            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ) {
             (Some(kind), Some(message)) => Some(CommandExecutionFailure { kind, message }),
             _ => None,
@@ -7110,19 +7156,21 @@ impl Store {
         let tx = write_transaction(&conn)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO command_execution_requests
-               (idempotency_key, thread_id, request_fingerprint, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+               (idempotency_key, thread_id, request_fingerprint,
+                writer_generation, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 idempotency_key,
                 thread_id,
                 request_fingerprint,
+                COMMAND_EXECUTION_WRITER_GENERATION,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
         let prior = if inserted == 0 {
             tx.query_row(
                 "SELECT thread_id, request_fingerprint, result, side_effect_started,
-                        error_kind, error_message
+                        writer_generation, error_kind, error_message
                  FROM command_execution_requests WHERE idempotency_key = ?1",
                 params![idempotency_key],
                 row_to_command_execution,
@@ -7138,6 +7186,7 @@ impl Store {
                 && record.result.is_none()
                 && record.failure.is_none()
                 && !record.side_effect_started
+                && record.writer_generation == COMMAND_EXECUTION_WRITER_GENERATION
             {
                 None
             } else {
@@ -7157,7 +7206,7 @@ impl Store {
             .unwrap()
             .query_row(
                 "SELECT thread_id, request_fingerprint, result, side_effect_started,
-                        error_kind, error_message
+                        writer_generation, error_kind, error_message
                  FROM command_execution_requests WHERE idempotency_key = ?1",
                 params![idempotency_key],
                 row_to_command_execution,
@@ -17151,6 +17200,10 @@ mod tests {
             .unwrap();
         assert!(pending.result.is_none());
         assert!(pending.side_effect_started);
+        assert_eq!(
+            pending.writer_generation,
+            COMMAND_EXECUTION_WRITER_GENERATION
+        );
 
         let result = CommandResult {
             name: "new".into(),
@@ -17224,6 +17277,35 @@ mod tests {
     }
 
     #[test]
+    fn command_execution_claim_requires_current_writer_generation() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_old_command_writer");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO command_execution_requests
+                   (idempotency_key, thread_id, request_fingerprint, created_at)
+                 VALUES ('old-writer-command', 'th_old_command_writer',
+                         'old-writer-fingerprint', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let prior = store
+            .claim_command_execution(
+                "old-writer-command",
+                "th_old_command_writer",
+                "old-writer-fingerprint",
+            )
+            .unwrap()
+            .expect("an older writer generation is not safely reclaimable");
+        assert!(!prior.side_effect_started);
+        assert_eq!(prior.writer_generation, 0);
+    }
+
+    #[test]
     fn command_execution_migration_preserves_legacy_incomplete_claim_as_uncertain() {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("legacy-command-execution.sqlite3");
@@ -17237,6 +17319,8 @@ mod tests {
                 "PRAGMA foreign_keys = OFF;
                  DELETE FROM store_migrations
                   WHERE id = 'command-execution-side-effect-phase-v1';
+                 DELETE FROM store_migrations
+                  WHERE id = 'command-execution-writer-generation-v2';
                  DROP TABLE command_execution_requests;
                  CREATE TABLE command_execution_requests (
                    idempotency_key TEXT PRIMARY KEY,
@@ -17260,6 +17344,7 @@ mod tests {
             .unwrap()
             .expect("legacy incomplete claim must remain uncertain");
         assert!(legacy_claim.side_effect_started);
+        assert_eq!(legacy_claim.writer_generation, 0);
         assert!(legacy_claim.result.is_none());
         assert!(legacy_claim.failure.is_none());
     }
@@ -17284,10 +17369,11 @@ mod tests {
 
         let phase_aware = Connection::open(&database).unwrap();
         phase_aware
-            .execute(
+            .execute_batch(
                 "DELETE FROM store_migrations
-                 WHERE id = 'command-execution-side-effect-phase-v1'",
-                [],
+                  WHERE id = 'command-execution-writer-generation-v2';
+                 ALTER TABLE command_execution_requests
+                  DROP COLUMN writer_generation;",
             )
             .unwrap();
         drop(phase_aware);
@@ -17298,6 +17384,10 @@ mod tests {
             .unwrap()
             .expect("phase-aware claim remains durable");
         assert!(!pending.side_effect_started);
+        assert_eq!(
+            pending.writer_generation,
+            COMMAND_EXECUTION_WRITER_GENERATION
+        );
         assert!(
             store
                 .claim_command_execution(
@@ -17309,6 +17399,53 @@ mod tests {
                 .is_none(),
             "known-unstarted phase-aware claims remain safely reclaimable"
         );
+    }
+
+    #[test]
+    fn command_execution_migration_conservatively_handles_unmarked_phase_column() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data
+            .path()
+            .join("partial-command-execution-migration.sqlite3");
+        let store = Store::open(&database).unwrap();
+        seed_thread(&store, "th_partial_command");
+        assert!(
+            store
+                .claim_command_execution(
+                    "partial-command",
+                    "th_partial_command",
+                    "partial-fingerprint",
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        let partial = Connection::open(&database).unwrap();
+        partial
+            .execute_batch(
+                "DELETE FROM store_migrations
+                  WHERE id IN (
+                    'command-execution-side-effect-phase-v1',
+                    'command-execution-writer-generation-v2'
+                  );
+                 ALTER TABLE command_execution_requests
+                  DROP COLUMN writer_generation;",
+            )
+            .unwrap();
+        drop(partial);
+
+        let store = Store::open(&database).unwrap();
+        let pending = store
+            .claim_command_execution(
+                "partial-command",
+                "th_partial_command",
+                "partial-fingerprint",
+            )
+            .unwrap()
+            .expect("unmarked phase receipt must remain uncertain");
+        assert!(pending.side_effect_started);
+        assert_eq!(pending.writer_generation, 0);
     }
 
     #[test]
