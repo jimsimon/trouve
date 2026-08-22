@@ -1298,17 +1298,26 @@ IFS= read -r line # first turn/start
 printf '%s\n' "$line" > "$0.turn-start-1"
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+IFS= read -r line # first thread/unsubscribe
+echo '{"jsonrpc":"2.0","id":4,"result":{}}'
 IFS= read -r line # second thread/resume after developer instructions change
 printf '%s\n' "$line" > "$0.thread-resume-2"
-echo '{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thr-1"}}}'
+echo '{"jsonrpc":"2.0","id":5,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # second turn/start
 printf '%s\n' "$line" > "$0.turn-start-2"
-echo '{"jsonrpc":"2.0","id":5,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-2"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
-IFS= read -r line # third turn/start reuses the refreshed thread
+IFS= read -r line # second thread/unsubscribe
+echo '{"jsonrpc":"2.0","id":7,"result":{}}'
+IFS= read -r line # third thread/resume after terminal release
+printf '%s\n' "$line" > "$0.thread-resume-3"
+echo '{"jsonrpc":"2.0","id":8,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # third turn/start
 printf '%s\n' "$line" > "$0.turn-start-3"
-echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-3"}}}'
+echo '{"jsonrpc":"2.0","id":9,"result":{"turn":{"id":"turn-3"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-3","status":"completed"}}}'
+IFS= read -r line # third thread/unsubscribe
+echo '{"jsonrpc":"2.0","id":10,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1420,6 +1429,8 @@ echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn-2","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"answer","delta":"Parent finished."}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":6,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1562,6 +1573,8 @@ echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"root","tu
 IFS= read -r prompt_lookup_retry
 printf '%s\n' "$prompt_lookup_retry" >> "$0.prompt-lookup"
 echo '{"jsonrpc":"2.0","id":5,"result":{"data":[{"id":"child-turn","items":[{"type":"userMessage","content":[{"type":"input_text","text":"Recovered after completion."}]}]}]}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":6,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1621,6 +1634,8 @@ echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval"
 IFS= read -r approval
 printf '%s\n' "$approval" > "$0.approval"
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":4,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1907,6 +1922,8 @@ IFS= read -r line # predecessor turn/interrupt
 printf '%s\n' "$line" > "$0.interrupt"
 echo '{"jsonrpc":"2.0","id":4,"error":{"message":"cannot interrupt predecessor"}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":5,"result":{}}'
 cat > /dev/null
 "#,
     );

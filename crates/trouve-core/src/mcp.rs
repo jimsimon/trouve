@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail};
@@ -54,6 +54,10 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// setup so a broken settings entry gets prompt feedback.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_PARALLEL_MCP_CONNECTIONS: usize = 4;
+/// Stdio MCP servers are stateful and therefore remain isolated per
+/// worktree. Reap an idle connection instead of sharing it across sessions.
+const MCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const MCP_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_MCP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MCP_LOG_LINE_BYTES: usize = 16 * 1024;
 #[cfg(test)]
@@ -1355,6 +1359,13 @@ struct CachedConnection {
     generation: u64,
     health_generation: u64,
     reusable: bool,
+    last_used: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+impl CachedConnection {
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = std::time::Instant::now();
+    }
 }
 
 /// A config read is authorized only while both invalidation generations stay
@@ -1800,6 +1811,7 @@ impl ConnectionAttemptTask {
                     generation,
                     health_generation,
                     reusable: true,
+                    last_used: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
                 };
                 let installed = {
                     let mut state = connections.lock().await;
@@ -1888,7 +1900,58 @@ impl ConnectionAttemptTask {
 pub struct McpManager {
     connections: Arc<Mutex<ConnectionState>>,
     next_connection_generation: AtomicU64,
+    reaper_started: AtomicBool,
     logs: McpLogStore,
+}
+
+async fn reap_idle_connections(
+    connections: &Arc<Mutex<ConnectionState>>,
+    logs: &McpLogStore,
+    idle_timeout: std::time::Duration,
+) {
+    let quarantined = {
+        let mut state = connections.lock().await;
+        let keys = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.reusable
+                    && Arc::strong_count(&entry.connection) == 1
+                    && entry.last_used.lock().unwrap().elapsed() >= idle_timeout
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| {
+                let entry = state.entries.get_mut(&key)?;
+                entry.reusable = false;
+                Some((key, entry.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (key, entry) in quarantined {
+        match entry.connection.terminate().await {
+            Ok(()) => {
+                let mut state = connections.lock().await;
+                if state.entries.get(&key).is_some_and(|current| {
+                    current.generation == entry.generation && !current.reusable
+                }) {
+                    state.entries.remove(&key);
+                }
+                logs.push(&key.1, "idle connection reaped");
+            }
+            Err(error) => {
+                // Keep the entry quarantined. A replacement must never overlap
+                // a process tree whose cleanup was not acknowledged.
+                tracing::warn!(
+                    server = %key.1,
+                    worktree = %key.0,
+                    "retaining idle MCP connection after cleanup failed: {error:#}"
+                );
+            }
+        }
+    }
 }
 
 impl McpManager {
@@ -1898,8 +1961,26 @@ impl McpManager {
         Self {
             connections: Arc::default(),
             next_connection_generation: AtomicU64::new(0),
+            reaper_started: AtomicBool::new(false),
             logs,
         }
+    }
+
+    fn start_reaper(&self) {
+        if self.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let connections = Arc::downgrade(&self.connections);
+        let logs = self.logs.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(MCP_REAP_INTERVAL).await;
+                let Some(connections) = connections.upgrade() else {
+                    break;
+                };
+                reap_idle_connections(&connections, &logs, MCP_IDLE_TIMEOUT).await;
+            }
+        });
     }
 
     /// The shared log store (also fed by settings health probes).
@@ -1915,6 +1996,7 @@ impl McpManager {
         server: &str,
         cancel: &CancellationToken,
     ) -> Result<CachedConnection> {
+        self.start_reaper();
         let worktree_key = worktree.to_string_lossy().to_string();
         loop {
             if cancel.is_cancelled() {
@@ -2008,6 +2090,7 @@ impl McpManager {
                     && existing.config == *config
                     && existing.reusable
                 {
+                    existing.touch();
                     ConnectionPlan::Ready(existing.clone())
                 } else if let Some(attempt) = state
                     .attempts
@@ -2407,6 +2490,7 @@ impl McpManager {
         worktree: &Path,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<ToolSpec> {
+        self.start_reaper();
         let (trusted, generations, skipped) = loop {
             if cancel.is_cancelled() {
                 return Vec::new();
@@ -4680,7 +4764,17 @@ for line in sys.stdin:
             manager.logs.health("single-flight", &config),
             Some(("error".into(), "installed connection failed".into()))
         );
-        manager.evict_worktree(tmp.path()).await.unwrap();
+        let last_used = first.last_used.clone();
+        drop(cache_hit);
+        drop(connections);
+        *last_used.lock().unwrap() = std::time::Instant::now()
+            .checked_sub(MCP_IDLE_TIMEOUT + std::time::Duration::from_secs(1))
+            .unwrap();
+        reap_idle_connections(&manager.connections, manager.logs(), MCP_IDLE_TIMEOUT).await;
+        assert!(
+            manager.connections.lock().await.entries.is_empty(),
+            "the unreferenced idle connection remained cached"
+        );
     }
 
     #[cfg(target_os = "linux")]

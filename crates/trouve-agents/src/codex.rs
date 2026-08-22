@@ -1523,6 +1523,12 @@ fn turn_stream(
             // Remove the route before yielding completion. A consumer is
             // allowed to drop immediately after receiving the terminal event.
             server.unsubscribe(&codex_thread_id, &route_tx).await;
+            if let Err(error) = server.release_thread(&codex_thread_id).await {
+                tracing::warn!(
+                    thread_id = %codex_thread_id,
+                    "codex: failed to unsubscribe completed app-server thread: {error}"
+                );
+            }
             cleanup.disarm();
             match params["turn"]["status"].as_str() {
                 Some("completed") => {
@@ -2060,6 +2066,7 @@ const UNKNOWN_BUFFER_BUDGET: usize = 64;
 const CANCELLED_START_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const INTERRUPT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const THREAD_UNSUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const TRANSPORT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -3401,6 +3408,12 @@ impl LoadedThreadCache {
             },
         );
     }
+
+    fn forget(&mut self, thread_id: &str) {
+        if self.settings.remove(thread_id).is_some() {
+            self.order.retain(|loaded| loaded != thread_id);
+        }
+    }
 }
 struct AppServer {
     stdin: SharedStdin,
@@ -3522,6 +3535,22 @@ impl AppServer {
             .lock()
             .await
             .remember(thread_id, mcp_config, developer_instructions);
+    }
+
+    /// Release app-server's subscription after a terminal turn. A later
+    /// trouve turn resumes the persisted vendor thread and subscribes again.
+    async fn release_thread(&self, thread_id: &str) -> Result<(), BackendError> {
+        let result = self
+            .request_with_cancel_timeout(
+                "thread/unsubscribe",
+                json!({ "threadId": thread_id }),
+                None,
+                true,
+                THREAD_UNSUBSCRIBE_TIMEOUT,
+            )
+            .await;
+        self.loaded_threads.lock().await.forget(thread_id);
+        result.map(|_| ())
     }
 
     fn instructions_need_prompt_fallback(&self, thread_id: &str, instructions: &str) -> bool {
@@ -7481,6 +7510,56 @@ cat > /dev/null
                 .settings
                 .contains_key(&format!("thread-{THREAD_CACHE_CAP}"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn releasing_a_thread_unsubscribes_and_forces_the_next_turn_to_resume() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-thread-unsubscribe");
+        let methods = std::path::PathBuf::from(format!("{}.methods", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, sys
+methods = sys.argv[0] + ".methods"
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialized":
+        continue
+    if method != "initialize":
+        with open(methods, "a") as output:
+            output.write(method + "\n")
+            output.flush()
+    response = {"jsonrpc": "2.0", "id": message.get("id"), "result": {}}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = AppServer::spawn(stub.to_str().unwrap()).await.unwrap();
+        let config = json!({ "mcp_servers": {} });
+        server
+            .mark_thread_loaded("thread-1", config.clone(), Some("instructions".into()))
+            .await;
+        server.release_thread("thread-1").await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(methods).unwrap(),
+            "thread/unsubscribe\n"
+        );
+        assert!(
+            !server
+                .thread_settings_match("thread-1", &config, Some("instructions"))
+                .await,
+            "released thread was still treated as loaded"
+        );
+        server.terminate_transport().await.unwrap();
     }
 
     #[test]

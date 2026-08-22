@@ -85,6 +85,16 @@ impl<T: Pod> Buf<T> {
             _marker: PhantomData,
         }
     }
+
+    /// Heap bytes owned by this buffer. Memory-mapped storage is deliberately
+    /// excluded: it is file-backed, pageable, and may be shared by several
+    /// indexes without multiplying physical memory.
+    pub(crate) fn owned_bytes(&self) -> usize {
+        match self {
+            Buf::Owned(values) => values.capacity() * std::mem::size_of::<T>(),
+            Buf::Mapped { .. } => 0,
+        }
+    }
 }
 
 impl<T: Pod> Deref for Buf<T> {
@@ -103,6 +113,19 @@ impl<T: Pod> Deref for Buf<T> {
 impl<T: Pod> From<Vec<T>> for Buf<T> {
     fn from(v: Vec<T>) -> Buf<T> {
         Buf::Owned(v)
+    }
+}
+
+#[cfg(test)]
+mod buf_tests {
+    use super::Buf;
+
+    #[test]
+    fn owned_bytes_tracks_vector_capacity() {
+        let mut values = Vec::<u32>::with_capacity(17);
+        values.push(1);
+        let buffer = Buf::Owned(values);
+        assert_eq!(buffer.owned_bytes(), 17 * std::mem::size_of::<u32>());
     }
 }
 

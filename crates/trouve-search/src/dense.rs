@@ -69,6 +69,10 @@ impl DenseIndex {
         &self.vectors
     }
 
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.vectors.owned_bytes()
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
     }

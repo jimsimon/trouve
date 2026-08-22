@@ -23,3 +23,21 @@ pub mod tokens;
 pub mod types;
 pub mod utils;
 pub mod walker;
+
+/// Ask glibc to return completely free allocator pages to the operating
+/// system after a memory-intensive index build or eviction.
+///
+/// Other allocators and platforms either release memory by their own policy
+/// or do not expose an equivalent stable API, so this is a no-op there.
+pub fn release_unused_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+
+        // SAFETY: malloc_trim is process-global and thread-safe in glibc.
+        // A zero pad requests release of every completely free page.
+        let _ = unsafe { malloc_trim(0) };
+    }
+}
