@@ -12,7 +12,8 @@ export type PullRequestGroupKey =
   | "pending-review"
   | "ready-to-merge"
   | "needs-attention"
-  | "recently-merged";
+  | "recently-merged"
+  | "recently-closed";
 
 export type PullRequestPillTone = "neutral" | "ok" | "warning" | "danger";
 
@@ -132,6 +133,14 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     tone: "tint",
     emptyText: "Nothing merged in the last 24 hours.",
   },
+  {
+    key: "recently-closed",
+    title: "Recently Closed",
+    description: "Unmerged pull requests closed in the last 24 hours.",
+    icon: "code-pull-request",
+    tone: "danger",
+    emptyText: "Nothing closed without merging in the last 24 hours.",
+  },
 ] as const satisfies readonly PullRequestGroupDefinition[]);
 
 export const PULL_REQUEST_GROUP_KEYS = Object.freeze(
@@ -240,6 +249,10 @@ export const classifyPullRequest = (
       ? "recently-merged"
       : undefined;
   }
+  // The account feed only includes closed, unmerged PRs from its 24-hour
+  // terminal-state window. Keep them visible instead of silently dropping
+  // the same summaries that drive closed session associations and badges.
+  if (pr.state === "closed") return "recently-closed";
   if (pr.state !== "open") return undefined;
   if (pr.mergeable === false && !pr.draft) return "needs-attention";
   if (viewer !== "" && requestedReviewers(pr).includes(viewer)) {
