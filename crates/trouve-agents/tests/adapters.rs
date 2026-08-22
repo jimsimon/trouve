@@ -1298,17 +1298,26 @@ IFS= read -r line # first turn/start
 printf '%s\n' "$line" > "$0.turn-start-1"
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+IFS= read -r line # first thread/unsubscribe
+echo '{"jsonrpc":"2.0","id":4,"result":{}}'
 IFS= read -r line # second thread/resume after developer instructions change
 printf '%s\n' "$line" > "$0.thread-resume-2"
-echo '{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thr-1"}}}'
+echo '{"jsonrpc":"2.0","id":5,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # second turn/start
 printf '%s\n' "$line" > "$0.turn-start-2"
-echo '{"jsonrpc":"2.0","id":5,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-2"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
-IFS= read -r line # third turn/start reuses the refreshed thread
+IFS= read -r line # second thread/unsubscribe
+echo '{"jsonrpc":"2.0","id":7,"result":{}}'
+IFS= read -r line # third thread/resume after terminal release
+printf '%s\n' "$line" > "$0.thread-resume-3"
+echo '{"jsonrpc":"2.0","id":8,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # third turn/start
 printf '%s\n' "$line" > "$0.turn-start-3"
-echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-3"}}}'
+echo '{"jsonrpc":"2.0","id":9,"result":{"turn":{"id":"turn-3"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-3","status":"completed"}}}'
+IFS= read -r line # third thread/unsubscribe
+echo '{"jsonrpc":"2.0","id":10,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1420,6 +1429,8 @@ echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn-2","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"answer","delta":"Parent finished."}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":6,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1562,6 +1573,8 @@ echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"root","tu
 IFS= read -r prompt_lookup_retry
 printf '%s\n' "$prompt_lookup_retry" >> "$0.prompt-lookup"
 echo '{"jsonrpc":"2.0","id":5,"result":{"data":[{"id":"child-turn","items":[{"type":"userMessage","content":[{"type":"input_text","text":"Recovered after completion."}]}]}]}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":6,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1621,6 +1634,8 @@ echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval"
 IFS= read -r approval
 printf '%s\n' "$approval" > "$0.approval"
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":4,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1667,6 +1682,8 @@ while IFS= read -r interrupt; do
     fi
 done
 echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":5,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1731,6 +1748,10 @@ while IFS= read -r interrupt; do
         break
     fi
 done
+IFS= read -r unsubscribe
+printf '%s\n' "$unsubscribe" > "$0.unsubscribe.tmp"
+mv "$0.unsubscribe.tmp" "$0.unsubscribe"
+echo '{"jsonrpc":"2.0","id":5,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1757,6 +1778,176 @@ cat > /dev/null
     assert_eq!(interrupt["method"], "turn/interrupt");
     assert_eq!(interrupt["params"]["threadId"], "thr-1");
     assert_eq!(interrupt["params"]["turnId"], "turn-1");
+
+    let unsubscribe_path = std::path::PathBuf::from(format!("{stub}.unsubscribe"));
+    tokio::time::timeout(deadline, async {
+        while !unsubscribe_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stream-drop cleanup must release the vendor thread");
+    let unsubscribe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(unsubscribe_path).unwrap()).unwrap();
+    assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+    assert_eq!(unsubscribe["params"]["threadId"], "thr-1");
+}
+
+#[tokio::test]
+async fn codex_adapter_releases_completed_thread_when_queued_terminal_races_stream_drop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-terminal-drop",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # turn/start
+# Queue completion before acknowledging turn/start so it is already routed
+# when the exposed stream is returned to the caller.
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+IFS= read -r cleanup
+printf '%s\n' "$cleanup" > "$0.cleanup.tmp"
+mv "$0.cleanup.tmp" "$0.cleanup"
+if [[ "$cleanup" == *'"method":"thread/unsubscribe"'* ]]; then
+    echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+elif [[ "$cleanup" == *'"method":"turn/interrupt"'* ]]; then
+    echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+fi
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    drop(stream);
+
+    let deadline = std::time::Duration::from_secs(2);
+    let cleanup_path = std::path::PathBuf::from(format!("{stub}.cleanup"));
+    tokio::time::timeout(deadline, async {
+        while !cleanup_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queued terminal cleanup must reach the app-server");
+
+    let cleanup: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cleanup_path).unwrap()).unwrap();
+    assert_eq!(cleanup["method"], "thread/unsubscribe");
+    assert_eq!(cleanup["params"]["threadId"], "thr-1");
+}
+
+#[tokio::test]
+async fn codex_adapter_delivers_completion_before_unsubscribe_is_acknowledged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-slow-unsubscribe",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # turn/start
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+IFS= read -r unsubscribe
+printf '%s\n' "$unsubscribe" > "$0.unsubscribe.tmp"
+mv "$0.unsubscribe.tmp" "$0.unsubscribe"
+# Deliberately withhold the response: terminal delivery must not wait for it,
+# but replacement setup must remain behind this cleanup boundary.
+while [[ ! -f "$0.release" ]]; do sleep 0.01; done
+echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+IFS= read -r resume
+printf '%s\n' "$resume" > "$0.follow-up.tmp"
+mv "$0.follow-up.tmp" "$0.follow-up"
+echo '{"jsonrpc":"2.0","id":5,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r turn_start
+echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
+IFS= read -r final_unsubscribe
+echo '{"jsonrpc":"2.0","id":7,"result":{}}'
+cat > /dev/null
+"#,
+    );
+    let backend = std::sync::Arc::new(CodexBackend::new("codex", Some(stub.clone())));
+    let mut stream = start_turn(backend.as_ref(), || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(BackendEvent::Completed { .. })) => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("turn failed before completion: {error}"),
+                None => panic!("stream ended before completion"),
+            }
+        }
+    })
+    .await
+    .expect("terminal delivery waited for thread/unsubscribe");
+
+    let unsubscribe_path = std::path::PathBuf::from(format!("{stub}.unsubscribe"));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !unsubscribe_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal cleanup did not send thread/unsubscribe");
+    let unsubscribe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(unsubscribe_path).unwrap()).unwrap();
+    assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+
+    let replacement = tokio::spawn({
+        let backend = std::sync::Arc::clone(&backend);
+        let worktree = tmp.path().to_path_buf();
+        async move {
+            let mut replacement = turn(worktree, Some("thr-1"), BackendPermission::Ask);
+            replacement.prompt = "follow-up".into();
+            backend.run_turn(replacement).await
+        }
+    });
+    let follow_up_path = std::path::PathBuf::from(format!("{stub}.follow-up"));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !follow_up_path.exists(),
+        "replacement setup overtook the pending thread/unsubscribe"
+    );
+
+    std::fs::write(format!("{stub}.release"), "").unwrap();
+    let mut replacement_stream =
+        tokio::time::timeout(std::time::Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement setup remained blocked after unsubscribe acknowledgement")
+            .expect("replacement task panicked")
+            .expect("replacement setup failed");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match replacement_stream.next().await {
+                Some(Ok(BackendEvent::Completed { .. })) => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("replacement turn failed: {error}"),
+                None => panic!("replacement stream ended before completion"),
+            }
+        }
+    })
+    .await
+    .expect("replacement turn did not complete");
+    let follow_up: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(follow_up_path).unwrap()).unwrap();
+    assert_eq!(follow_up["method"], "thread/resume");
 }
 
 #[tokio::test]
@@ -1782,6 +1973,8 @@ while IFS= read -r interrupt; do
         break
     fi
 done
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":5,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1838,12 +2031,19 @@ IFS= read -r line # first turn/interrupt
 printf '%s\n' "$line" > "$0.interrupt.tmp"
 mv "$0.interrupt.tmp" "$0.interrupt"
 echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+IFS= read -r line # first thread/unsubscribe
+echo '{"jsonrpc":"2.0","id":5,"result":{}}'
+IFS= read -r line # replacement thread/resume after release
+printf '%s\n' "$line" > "$0.thread-resume"
+echo '{"jsonrpc":"2.0","id":6,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # replacement turn/start
-echo '{"jsonrpc":"2.0","id":5,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","id":7,"result":{"turn":{"id":"turn-2"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","turnId":"turn-1","delta":"stale"}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","turnId":"turn-2","delta":"replacement"}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
+IFS= read -r line # replacement thread/unsubscribe
+echo '{"jsonrpc":"2.0","id":8,"result":{}}'
 cat > /dev/null
 "#,
     );
@@ -1884,8 +2084,8 @@ cat > /dev/null
     assert_eq!(text, "replacement");
     assert_eq!(completed, 1);
     assert!(
-        !std::path::Path::new(&format!("{stub}.thread-resume")).exists(),
-        "a thread already loaded with matching MCP configuration must be reused"
+        std::path::Path::new(&format!("{stub}.thread-resume")).exists(),
+        "a released cancelled thread must be resumed before reuse"
     );
 }
 
@@ -1907,6 +2107,8 @@ IFS= read -r line # predecessor turn/interrupt
 printf '%s\n' "$line" > "$0.interrupt"
 echo '{"jsonrpc":"2.0","id":4,"error":{"message":"cannot interrupt predecessor"}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+IFS= read -r unsubscribe
+echo '{"jsonrpc":"2.0","id":5,"result":{}}'
 cat > /dev/null
 "#,
     );

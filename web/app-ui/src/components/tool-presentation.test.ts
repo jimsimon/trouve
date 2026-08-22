@@ -5,7 +5,6 @@ import {
   isSpawnOutputToolCall,
   presentToolCall,
   presentToolDetail,
-  runningActivityLabel,
   toolExecutionMetadata,
   toolDetailText,
   toolDisplayName,
@@ -455,82 +454,4 @@ describe("tool presentation", () => {
     expect(toolExecutionMetadata(null)).toBe("");
   });
 
-  it("uses a transient label only when no durable activity node is active", () => {
-    expect(runningActivityLabel([], true)).toBe("Thinking…");
-    expect(runningActivityLabel([
-      { kind: "tool", tool: "WebSearch", args: {}, status: "running" },
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "tool", tool: "read_file", args: { path: "README.md" }, status: "running" },
-    ], false)).toBe("Reading README.md…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "tool", tool: "mcp__github__create_issue", args: {}, status: "running" },
-    ], false)).toBe("Processing…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      {
-        kind: "tool",
-        tool: "mcpToolCall",
-        args: { serverName: "github", toolName: "create_issue" },
-        status: "running",
-      },
-    ], false)).toBe("Processing…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "tool", tool: "read_file", args: { path: "src/old.ts" }, status: "running" },
-      { kind: "tool", tool: "edit_file", args: { path: "src/new.ts" }, status: "running" },
-    ], false)).toBe("Editing new.ts…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "tool", tool: "write_file", args: { path: "src/new.ts" }, status: "running" },
-    ], false)).toBe("Writing new.ts…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "tool", tool: "search", args: { query: "rail" }, status: "running" },
-    ], false)).toBe("Searching code…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "tool", tool: "search_transcript", args: { query: "checkpoint" }, status: "running" },
-    ], false)).toBe("Searching transcript…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      {
-        kind: "tool",
-        tool: "mcpToolCall",
-        args: {
-          tool: "mcp__trouve__read_file",
-          arguments: { path: "src/wrapped.ts" },
-        },
-        status: "running",
-      },
-    ], false)).toBe("Reading wrapped.ts…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "tool", tool: "shell", args: { command: "cargo test" }, status: "running" },
-    ], false)).toBe("Running command…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "tool", tool: "read_file", args: { path: "src/ready.ts" }, status: "running" },
-      { kind: "tool", tool: "write_file", args: { path: "src/pending.ts" }, status: "awaiting-approval" },
-    ], false)).toBeUndefined();
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "thinking", complete: false },
-    ], true)).toBeUndefined();
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "progress", content: "Checking tests", complete: false },
-    ], false)).toBeUndefined();
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-      { kind: "compaction", state: { kind: "running" } },
-    ], false)).toBeUndefined();
-    expect(runningActivityLabel([
-      { kind: "tool", tool: "Bash", args: {}, status: "running" },
-      { kind: "turn-status", state: { kind: "running" } },
-    ], false)).toBe("Processing…");
-    expect(runningActivityLabel([
-      { kind: "turn-status", state: { kind: "running" } },
-    ], false)).toBe("Processing…");
-  });
 });

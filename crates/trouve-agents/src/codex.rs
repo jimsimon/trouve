@@ -355,6 +355,23 @@ impl AgentBackend for CodexBackend {
             params
         };
 
+        // Serialize the entire persisted-thread replacement boundary. Cleanup
+        // may have published the previous terminal event while its vendor
+        // unsubscribe is still in flight; do not inspect cached load state or
+        // resume that thread until cleanup has made the outcome unambiguous.
+        let persisted_lifecycle_server = Arc::clone(&server);
+        let persisted_lifecycle = match turn.session.as_deref() {
+            Some(thread_id) => {
+                let lifecycle = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                    lifecycle = server.lock_turn_lifecycle(thread_id) => Ok(lifecycle),
+                }?;
+                Some(lifecycle)
+            }
+            None => None,
+        };
+
         // Start or resume the vendor-side thread.
         let mut start_params = with_thread_settings(json!({
             "cwd": turn.worktree,
@@ -430,22 +447,34 @@ impl AgentBackend for CodexBackend {
             "codex startup timing: thread ready"
         );
 
+        // A failed resume may replace the app-server or return a fresh vendor
+        // thread. Transfer the setup boundary to that thread without trying
+        // to reacquire the same non-reentrant lifecycle lock.
+        let lifecycle = if persisted_lifecycle.as_ref().is_some_and(|lifecycle| {
+            lifecycle.thread_id == codex_thread_id
+                && Arc::ptr_eq(&server, &persisted_lifecycle_server)
+        }) {
+            persisted_lifecycle.expect("matching persisted lifecycle is present")
+        } else {
+            let replacement_lifecycle = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                lifecycle = server.lock_turn_lifecycle(&codex_thread_id) => Ok(lifecycle),
+            };
+            let replacement_lifecycle = match replacement_lifecycle {
+                Ok(lifecycle) => lifecycle,
+                Err(error) => {
+                    return session_setup_failure(fresh_session, &codex_thread_id, error);
+                }
+            };
+            drop(persisted_lifecycle);
+            replacement_lifecycle
+        };
         // A cancelled trouve stream may still have a live vendor turn if the
         // app-server was blocked in a model or tool request when its consumer
         // disappeared. Await its interruption before starting a replacement;
         // otherwise Codex folds the new prompt into the old turn and its late
         // completion is misattributed to the replacement.
-        let lifecycle = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(BackendError::Cancelled),
-            lifecycle = server.lock_turn_lifecycle(&codex_thread_id) => Ok(lifecycle),
-        };
-        let lifecycle = match lifecycle {
-            Ok(lifecycle) => lifecycle,
-            Err(error) => {
-                return session_setup_failure(fresh_session, &codex_thread_id, error);
-            }
-        };
         if let Err(error) = server.interrupt_active_turn(&codex_thread_id).await {
             return session_setup_failure(fresh_session, &codex_thread_id, error);
         }
@@ -1045,7 +1074,16 @@ fn turn_stream(
         let mut overload_signal = rx.overload_signal();
         let mut close_signal = rx.close_signal();
         let process_route = async {
+            // Give a queued terminal event one chance to win a simultaneous
+            // consumer drop, then observe closure between every routed input.
+            // Without this checkpoint an always-ready route can monopolize
+            // the outer biased select and keep an abandoned turn alive.
+            let mut processed_route_input = false;
             loop {
+                if processed_route_input && tx.is_closed() {
+                    client_gone = true;
+                    break;
+                }
                 let input = if terminal_params.is_some() {
                     if let Some(deadline) = collaborator_lifecycle.next_start_deadline() {
                         tokio::select! {
@@ -1074,6 +1112,7 @@ fn turn_stream(
                         message = rx.recv() => CodexRouteInput::Message(message),
                     }
                 };
+                processed_route_input = true;
                 let msg = match input {
                     CodexRouteInput::Message(Some(message)) => message,
                     CodexRouteInput::Message(None) => break,
@@ -1503,13 +1542,13 @@ fn turn_stream(
             _ = cancel.cancelled() => {
                 cancelled = true;
             }
-            _ = tx.closed() => {
-                client_gone = true;
-            }
             _ = overload_signal.wait() => {
                 route_overloaded = true;
             }
             _ = process_route => {}
+            _ = tx.closed() => {
+                client_gone = true;
+            }
             _ = close_signal.wait() => {
                 route_closed = true;
             }
@@ -1530,6 +1569,9 @@ fn turn_stream(
             // allowed to drop immediately after receiving the terminal event.
             server.unsubscribe(&codex_thread_id, &route_tx).await;
             cleanup.disarm();
+            // Publish the terminal result before best-effort vendor cleanup.
+            // The lifecycle guard still prevents this thread from resuming
+            // until an older unsubscribe can no longer race the replacement.
             match params["turn"]["status"].as_str() {
                 Some("completed") => {
                     let _ = tx
@@ -1562,6 +1604,12 @@ fn turn_stream(
                         )))
                         .await;
                 }
+            }
+            if let Err(error) = server.release_thread(&codex_thread_id).await {
+                tracing::warn!(
+                    thread_id = %codex_thread_id,
+                    "codex: failed to unsubscribe completed app-server thread: {error}"
+                );
             }
             return;
         }
@@ -1600,6 +1648,12 @@ fn turn_stream(
                 .await;
         }
         server.unsubscribe(&codex_thread_id, &route_tx).await;
+        if let Err(error) = server.release_thread(&codex_thread_id).await {
+            tracing::warn!(
+                thread_id = %codex_thread_id,
+                "codex: failed to unsubscribe cleaned-up app-server thread: {error}"
+            );
+        }
         cleanup.disarm();
     })
 }
@@ -2066,6 +2120,7 @@ const UNKNOWN_BUFFER_BUDGET: usize = 64;
 const CANCELLED_START_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const INTERRUPT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const THREAD_UNSUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const TRANSPORT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -3407,6 +3462,12 @@ impl LoadedThreadCache {
             },
         );
     }
+
+    fn forget(&mut self, thread_id: &str) {
+        if self.settings.remove(thread_id).is_some() {
+            self.order.retain(|loaded| loaded != thread_id);
+        }
+    }
 }
 struct AppServer {
     stdin: SharedStdin,
@@ -3528,6 +3589,24 @@ impl AppServer {
             .lock()
             .await
             .remember(thread_id, mcp_config, developer_instructions);
+    }
+
+    /// Release app-server's subscription after a terminal turn. A later
+    /// trouve turn resumes the persisted vendor thread and subscribes again.
+    async fn release_thread(&self, thread_id: &str) -> Result<(), BackendError> {
+        // Forget before the RPC. Callers hold the per-thread lifecycle guard,
+        // so replacements cannot inspect this state until the unsubscribe has
+        // either completed or its shared transport has been retired.
+        self.loaded_threads.lock().await.forget(thread_id);
+        self.request_with_cancel_timeout(
+            "thread/unsubscribe",
+            json!({ "threadId": thread_id }),
+            None,
+            true,
+            THREAD_UNSUBSCRIBE_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
     }
 
     fn instructions_need_prompt_fallback(&self, thread_id: &str, instructions: &str) -> bool {
@@ -7487,6 +7566,56 @@ cat > /dev/null
                 .settings
                 .contains_key(&format!("thread-{THREAD_CACHE_CAP}"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn releasing_a_thread_unsubscribes_and_forces_the_next_turn_to_resume() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-thread-unsubscribe");
+        let methods = std::path::PathBuf::from(format!("{}.methods", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, sys
+methods = sys.argv[0] + ".methods"
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialized":
+        continue
+    if method != "initialize":
+        with open(methods, "a") as output:
+            output.write(method + "\n")
+            output.flush()
+    response = {"jsonrpc": "2.0", "id": message.get("id"), "result": {}}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = AppServer::spawn(stub.to_str().unwrap()).await.unwrap();
+        let config = json!({ "mcp_servers": {} });
+        server
+            .mark_thread_loaded("thread-1", config.clone(), Some("instructions".into()))
+            .await;
+        server.release_thread("thread-1").await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(methods).unwrap(),
+            "thread/unsubscribe\n"
+        );
+        assert!(
+            !server
+                .thread_settings_match("thread-1", &config, Some("instructions"))
+                .await,
+            "released thread was still treated as loaded"
+        );
+        server.terminate_transport().await.unwrap();
     }
 
     #[test]

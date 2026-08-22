@@ -10794,7 +10794,7 @@ validate284.evaluated = {"items":true,"dynamicProps":false,"dynamicItems":false}
 
 export const codeReviewDashboard = validate288;
 const schema133 = {"$id":"urn:trouve:protocol-validator:codeReviewDashboard","$ref":"urn:trouve:protocol-openapi#/components/schemas/CodeReviewDashboard"};
-const schema134 = {"type":"object","required":["app","reviewers","repositories","jobs"],"properties":{"app":{"$ref":"#/components/schemas/GithubAppStatus"},"jobs":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewJob"}},"repositories":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewRepository"}},"reviewers":{"type":"array","items":{"$ref":"#/components/schemas/ReviewerProfile"}}}};
+const schema134 = {"type":"object","required":["app","reviewers","repositories","jobs"],"properties":{"app":{"$ref":"#/components/schemas/GithubAppStatus"},"final_editor_retryable_job_ids":{"type":"array","items":{"type":"string"},"description":"Job ids for which the server will accept a scoped retry of the latest\nfailed or cancelled final-editor attempt while retaining reviewer output."},"jobs":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewJob"}},"repositories":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewRepository"}},"reviewers":{"type":"array","items":{"$ref":"#/components/schemas/ReviewerProfile"}}}};
 const schema135 = {"type":"object","description":"Public GitHub App state. Private keys and webhook secrets are never\nreturned by the protocol.","required":["configured"],"properties":{"app_id":{"type":["integer","null"],"format":"int64","minimum":0},"bot_login":{"type":"string"},"check_run_webhook_configured":{"type":"boolean","description":"Whether `check_run` delivery is selected in the GitHub App. This is\noptional unless interactive Re-run actions are desired."},"checks_write_configured":{"type":"boolean","description":"Whether the installation token reports `checks: write`. Polling-only\ndeployments still create and update Check Runs when this is true."},"configured":{"type":"boolean"},"installation_count":{"type":"integer","format":"int64","minimum":0},"last_error":{"type":"string"},"last_poll_at":{"type":["string","null"],"format":"date-time"},"rate_limit_remaining":{"type":["integer","null"],"format":"int64","minimum":0},"rate_limit_reset_at":{"type":["string","null"],"format":"date-time"},"slug":{"type":"string"},"webhook_configured":{"type":"boolean"}}};
 
 function validate290(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -12571,8 +12571,8 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.jobs !== undefined){
-let data1 = data.jobs;
+if(data.final_editor_retryable_job_ids !== undefined){
+let data1 = data.final_editor_retryable_job_ids;
 const _errs2 = errors;
 if(errors === _errs2){
 if(Array.isArray(data1)){
@@ -12580,9 +12580,9 @@ var valid1 = true;
 const len0 = data1.length;
 for(let i0=0; i0<len0; i0++){
 const _errs4 = errors;
-if(!(validate292(data1[i0], {instancePath:instancePath+"/jobs/" + i0,parentData:data1,parentDataProperty:i0,rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate292.errors : vErrors.concat(validate292.errors);
-errors = vErrors.length;
+if(typeof data1[i0] !== "string"){
+validate289.errors = [{instancePath:instancePath+"/final_editor_retryable_job_ids/" + i0,schemaPath:"#/properties/final_editor_retryable_job_ids/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
 }
 var valid1 = _errs4 === errors;
 if(!valid1){
@@ -12591,7 +12591,7 @@ break;
 }
 }
 else {
-validate289.errors = [{instancePath:instancePath+"/jobs",schemaPath:"#/properties/jobs/type",keyword:"type",params:{type: "array"},message:"must be array"}];
+validate289.errors = [{instancePath:instancePath+"/final_editor_retryable_job_ids",schemaPath:"#/properties/final_editor_retryable_job_ids/type",keyword:"type",params:{type: "array"},message:"must be array"}];
 return false;
 }
 }
@@ -12601,21 +12601,51 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.repositories !== undefined){
-let data3 = data.repositories;
-const _errs5 = errors;
-if(errors === _errs5){
+if(data.jobs !== undefined){
+let data3 = data.jobs;
+const _errs6 = errors;
+if(errors === _errs6){
 if(Array.isArray(data3)){
 var valid2 = true;
 const len1 = data3.length;
 for(let i1=0; i1<len1; i1++){
-const _errs7 = errors;
-if(!(validate300(data3[i1], {instancePath:instancePath+"/repositories/" + i1,parentData:data3,parentDataProperty:i1,rootData,dynamicAnchors}))){
+const _errs8 = errors;
+if(!(validate292(data3[i1], {instancePath:instancePath+"/jobs/" + i1,parentData:data3,parentDataProperty:i1,rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate292.errors : vErrors.concat(validate292.errors);
+errors = vErrors.length;
+}
+var valid2 = _errs8 === errors;
+if(!valid2){
+break;
+}
+}
+}
+else {
+validate289.errors = [{instancePath:instancePath+"/jobs",schemaPath:"#/properties/jobs/type",keyword:"type",params:{type: "array"},message:"must be array"}];
+return false;
+}
+}
+var valid0 = _errs6 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.repositories !== undefined){
+let data5 = data.repositories;
+const _errs9 = errors;
+if(errors === _errs9){
+if(Array.isArray(data5)){
+var valid3 = true;
+const len2 = data5.length;
+for(let i2=0; i2<len2; i2++){
+const _errs11 = errors;
+if(!(validate300(data5[i2], {instancePath:instancePath+"/repositories/" + i2,parentData:data5,parentDataProperty:i2,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate300.errors : vErrors.concat(validate300.errors);
 errors = vErrors.length;
 }
-var valid2 = _errs7 === errors;
-if(!valid2){
+var valid3 = _errs11 === errors;
+if(!valid3){
 break;
 }
 }
@@ -12625,27 +12655,27 @@ validate289.errors = [{instancePath:instancePath+"/repositories",schemaPath:"#/p
 return false;
 }
 }
-var valid0 = _errs5 === errors;
+var valid0 = _errs9 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.reviewers !== undefined){
-let data5 = data.reviewers;
-const _errs8 = errors;
-if(errors === _errs8){
-if(Array.isArray(data5)){
-var valid3 = true;
-const len2 = data5.length;
-for(let i2=0; i2<len2; i2++){
-const _errs10 = errors;
-if(!(validate309(data5[i2], {instancePath:instancePath+"/reviewers/" + i2,parentData:data5,parentDataProperty:i2,rootData,dynamicAnchors}))){
+let data7 = data.reviewers;
+const _errs12 = errors;
+if(errors === _errs12){
+if(Array.isArray(data7)){
+var valid4 = true;
+const len3 = data7.length;
+for(let i3=0; i3<len3; i3++){
+const _errs14 = errors;
+if(!(validate309(data7[i3], {instancePath:instancePath+"/reviewers/" + i3,parentData:data7,parentDataProperty:i3,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate309.errors : vErrors.concat(validate309.errors);
 errors = vErrors.length;
 }
-var valid3 = _errs10 === errors;
-if(!valid3){
+var valid4 = _errs14 === errors;
+if(!valid4){
 break;
 }
 }
@@ -12655,10 +12685,11 @@ validate289.errors = [{instancePath:instancePath+"/reviewers",schemaPath:"#/prop
 return false;
 }
 }
-var valid0 = _errs8 === errors;
+var valid0 = _errs12 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -12673,7 +12704,7 @@ return false;
 validate289.errors = vErrors;
 return errors === 0;
 }
-validate289.evaluated = {"props":{"app":true,"jobs":true,"repositories":true,"reviewers":true},"dynamicProps":false,"dynamicItems":false};
+validate289.evaluated = {"props":{"app":true,"final_editor_retryable_job_ids":true,"jobs":true,"repositories":true,"reviewers":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate288(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -12694,7 +12725,7 @@ errors = vErrors.length;
 validate288.errors = vErrors;
 return errors === 0;
 }
-validate288.evaluated = {"props":{"app":true,"jobs":true,"repositories":true,"reviewers":true},"dynamicProps":false,"dynamicItems":false};
+validate288.evaluated = {"props":{"app":true,"final_editor_retryable_job_ids":true,"jobs":true,"repositories":true,"reviewers":true},"dynamicProps":false,"dynamicItems":false};
 
 export const codeReviewJob = validate312;
 const schema145 = {"$id":"urn:trouve:protocol-validator:codeReviewJob","$ref":"urn:trouve:protocol-openapi#/components/schemas/CodeReviewJob"};

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
     Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, SessionAttention,
@@ -3118,6 +3118,7 @@ pub struct CodeReviewManualRequest {
 #[derive(Debug, Clone)]
 pub struct CodeReviewJobRecord {
     pub job: trouve_protocol::CodeReviewJob,
+    pub can_retry_final_editor: bool,
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub summary: String,
@@ -3133,7 +3134,7 @@ pub struct CodeReviewJobRecord {
 
 #[derive(Debug, Clone)]
 pub enum CodeReviewJobRetryOutcome {
-    Replacement(trouve_protocol::CodeReviewJob),
+    Replacement(CodeReviewJobRetry),
     PublicationClaimed(trouve_protocol::CodeReviewJob),
 }
 
@@ -3142,7 +3143,8 @@ impl std::ops::Deref for CodeReviewJobRetryOutcome {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Replacement(job) | Self::PublicationClaimed(job) => job,
+            Self::Replacement(retry) => &retry.replacement,
+            Self::PublicationClaimed(job) => job,
         }
     }
 }
@@ -3156,6 +3158,18 @@ pub struct CodeReviewBatchSnapshotUpdate {
 pub struct PendingCodeReviewEvent {
     pub id: i64,
     pub event: Event,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeReviewJobTransition {
+    pub job: trouve_protocol::CodeReviewJob,
+    pub updated_tasks: Vec<trouve_protocol::CodeReviewTask>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeReviewJobRetry {
+    pub replacement: trouve_protocol::CodeReviewJob,
+    pub predecessor_tasks: Vec<trouve_protocol::CodeReviewTask>,
 }
 
 fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
@@ -3250,6 +3264,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
+        can_retry_final_editor: r.get(56)?,
         prompt: r.get(12)?,
         reviewers,
         summary: r.get(36)?,
@@ -3271,7 +3286,37 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
-     review_published, blocking_review_cleanup_pending, publication_dispatched";
+     review_published, blocking_review_cleanup_pending, publication_dispatched, \
+     CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
+            AND code_review_jobs.session_id IS NULL \
+            AND EXISTS ( \
+              SELECT 1 FROM code_review_tasks AS coordinator \
+              WHERE coordinator.job_id = code_review_jobs.id \
+                AND coordinator.role = 'coordinator' \
+                AND coordinator.status IN ('failed', 'cancelled') \
+                AND NOT EXISTS ( \
+                  SELECT 1 FROM code_review_tasks AS newer_coordinator \
+                  WHERE newer_coordinator.job_id = coordinator.job_id \
+                    AND newer_coordinator.role = 'coordinator' \
+                    AND newer_coordinator.rowid > coordinator.rowid \
+                ) \
+            ) \
+            AND NOT EXISTS ( \
+              SELECT 1 FROM code_review_tasks AS reviewer \
+              WHERE reviewer.job_id = code_review_jobs.id \
+                AND reviewer.role = 'reviewer' \
+                AND reviewer.reviewer_id IS NOT NULL \
+                AND reviewer.status NOT IN ('succeeded', 'not_applicable', 'superseded') \
+                AND NOT EXISTS ( \
+                  SELECT 1 FROM code_review_tasks AS newer_reviewer \
+                  WHERE newer_reviewer.job_id = reviewer.job_id \
+                    AND newer_reviewer.role = 'reviewer' \
+                    AND newer_reviewer.reviewer_id = reviewer.reviewer_id \
+                    AND newer_reviewer.batch_index = reviewer.batch_index \
+                    AND newer_reviewer.rowid > reviewer.rowid \
+                ) \
+            ) \
+          THEN 1 ELSE 0 END AS can_retry_final_editor";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -3585,6 +3630,58 @@ fn supersede_code_review_task(
         },
     )?;
     Ok(true)
+}
+
+fn cancel_active_code_review_tasks(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    reviewer_id: Option<&str>,
+    completed_at: &str,
+    error: &str,
+) -> Result<Vec<trouve_protocol::CodeReviewTask>> {
+    let task_ids = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM code_review_tasks
+             WHERE job_id = ?1 AND status IN ('queued', 'running')
+               AND (?2 IS NULL OR reviewer_id = ?2)
+             ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![job_id, reviewer_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    tx.execute(
+        "UPDATE code_review_tasks
+         SET status = 'cancelled', completed_at = ?2, error = ?3,
+             model_elapsed_ms = CASE
+               WHEN status != 'running' OR model_started_at IS NULL THEN model_elapsed_ms
+               ELSE model_elapsed_ms + MAX(
+                 0,
+                 CAST(
+                   (julianday(?2) - MAX(
+                     julianday(model_started_at),
+                     julianday(COALESCE(last_progress_at, model_started_at))
+                   )) * 86400000 AS INTEGER
+                 )
+               )
+             END
+         WHERE job_id = ?1 AND status IN ('queued', 'running')
+           AND (?4 IS NULL OR reviewer_id = ?4)",
+        params![job_id, completed_at, error, reviewer_id],
+    )?;
+    task_ids
+        .into_iter()
+        .map(|task_id| {
+            tx.query_row(
+                &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
+                params![task_id],
+                row_to_code_review_task,
+            )
+            .map_err(Into::into)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -8574,7 +8671,7 @@ impl Store {
         pull_number: u64,
         base_ref: &str,
         head_sha: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<CodeReviewJobTransition>> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
         let ids = {
@@ -8587,11 +8684,14 @@ impl Store {
             )?;
             let rows = stmt.query_map(
                 params![repository, pull_number as i64, base_ref, head_sha],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let mut transitions = Vec::new();
         if !ids.is_empty() {
+            let error = format!("superseded by pull request revision {base_ref}..{head_sha}");
+            let now = chrono::Utc::now().to_rfc3339();
             tx.execute(
                 "UPDATE code_review_jobs
                  SET status = 'stale', review_url = '',
@@ -8604,13 +8704,27 @@ impl Store {
                     pull_number as i64,
                     base_ref,
                     head_sha,
-                    format!("superseded by pull request revision {base_ref}..{head_sha}"),
-                    chrono::Utc::now().to_rfc3339(),
+                    error,
+                    now,
                 ],
             )?;
+            for id in ids {
+                let updated_tasks = cancel_active_code_review_tasks(&tx, &id, None, &now, &error)?;
+                let record = tx.query_row(
+                    &format!(
+                        "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"
+                    ),
+                    params![id],
+                    row_to_code_review_job,
+                )?;
+                transitions.push(CodeReviewJobTransition {
+                    job: record.job,
+                    updated_tasks,
+                });
+            }
         }
         tx.commit()?;
-        Ok(ids)
+        Ok(transitions)
     }
 
     pub fn supersede_automatic_code_review_jobs_for_draft(
@@ -8685,6 +8799,33 @@ impl Store {
         status: Option<&str>,
         repository: Option<&str>,
     ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
+        Ok(self
+            .list_code_review_job_records_filtered(limit, status, repository)?
+            .into_iter()
+            .map(|record| record.job)
+            .collect())
+    }
+
+    pub fn code_review_dashboard_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<trouve_protocol::CodeReviewJob>, Vec<String>)> {
+        let records = self.list_code_review_job_records_filtered(limit, None, None)?;
+        let retryable_job_ids = records
+            .iter()
+            .filter(|record| record.can_retry_final_editor)
+            .map(|record| record.job.id.clone())
+            .collect();
+        let jobs = records.into_iter().map(|record| record.job).collect();
+        Ok((jobs, retryable_job_ids))
+    }
+
+    fn list_code_review_job_records_filtered(
+        &self,
+        limit: usize,
+        status: Option<&str>,
+        repository: Option<&str>,
+    ) -> Result<Vec<CodeReviewJobRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs
@@ -8702,8 +8843,7 @@ impl Store {
             params![status, repository, limit as i64],
             row_to_code_review_job,
         )?;
-        let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(records.into_iter().map(|record| record.job).collect())
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn code_review_jobs_with_projection_errors(
@@ -9287,15 +9427,37 @@ impl Store {
         thread_id: &str,
         model: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
+        self.start_code_review_task_inner(id, session_id, thread_id, model, None)
+    }
+
+    pub fn start_code_review_task_with_prompt(
+        &self,
+        id: &str,
+        session_id: &str,
+        thread_id: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
+        self.start_code_review_task_inner(id, session_id, thread_id, model, Some(prompt))
+    }
+
+    fn start_code_review_task_inner(
+        &self,
+        id: &str,
+        session_id: &str,
+        thread_id: &str,
+        model: &str,
+        prompt: Option<&str>,
+    ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         let updated = conn.execute(
             "UPDATE code_review_tasks
              SET status = 'running', session_id = ?2, thread_id = ?3,
-                 model = ?4, started_at = ?5, error = '',
-                 lifecycle_stage = 'waiting_for_capacity', last_progress_at = ?5
+                 model = ?4, prompt = COALESCE(?5, prompt), started_at = ?6, error = '',
+                 lifecycle_stage = 'waiting_for_capacity', last_progress_at = ?6
              WHERE id = ?1 AND status = 'queued'",
-            params![id, session_id, thread_id, model, now],
+            params![id, session_id, thread_id, model, prompt, now],
         )?;
         if updated == 0 {
             return Ok(None);
@@ -9685,7 +9847,7 @@ impl Store {
         &self,
         id: &str,
         reviewer_id: &str,
-    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+    ) -> Result<Option<CodeReviewJobTransition>> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
         let old = tx
@@ -9710,6 +9872,15 @@ impl Store {
         if old.job.session_id.is_some() {
             anyhow::bail!("review session cleanup is still pending; retry shortly");
         }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut updated_tasks = cancel_active_code_review_tasks(
+            &tx,
+            id,
+            Some(reviewer_id),
+            &now,
+            "orphaned active task under failed review job",
+        )?;
 
         let attempts = {
             let mut stmt = tx.prepare(&format!(
@@ -9736,15 +9907,15 @@ impl Store {
             );
         }
 
-        let now = chrono::Utc::now().to_rfc3339();
         for task in retryable {
+            let task_id = crate::new_id("rvt");
             tx.execute(
                 "INSERT INTO code_review_tasks
                         (id, job_id, role, reviewer_id, reviewer_name, batch_index,
                          batch_count, status, model, prompt, created_at)
                  VALUES (?1, ?2, 'reviewer', ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9)",
                 params![
-                    crate::new_id("rvt"),
+                    task_id,
                     id,
                     reviewer_id,
                     task.reviewer_name,
@@ -9755,6 +9926,11 @@ impl Store {
                     now,
                 ],
             )?;
+            updated_tasks.push(tx.query_row(
+                &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
+                params![task_id],
+                row_to_code_review_task,
+            )?);
         }
         let updated = tx.execute(
             "UPDATE code_review_jobs
@@ -9774,7 +9950,128 @@ impl Store {
             row_to_code_review_job,
         )?;
         tx.commit()?;
-        Ok(Some(retried.job))
+        Ok(Some(CodeReviewJobTransition {
+            job: retried.job,
+            updated_tasks,
+        }))
+    }
+
+    /// Resume a failed or cancelled job at its final editing phase while
+    /// retaining all successful reviewer task outputs.
+    pub fn retry_code_review_final_editor(
+        &self,
+        id: &str,
+    ) -> Result<Option<CodeReviewJobTransition>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let old = tx
+            .query_row(
+                &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+                params![id],
+                row_to_code_review_job,
+            )
+            .optional()?;
+        let Some(old) = old else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if !matches!(old.job.status.as_str(), "failed" | "cancelled") {
+            anyhow::bail!(
+                "the final review editor can only be retried after the review job fails or is cancelled"
+            );
+        }
+        if old.job.session_id.is_some() {
+            anyhow::bail!("review session cleanup is still pending; retry shortly");
+        }
+
+        let reviewer_attempts = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {CODE_REVIEW_TASK_COLUMNS},
+                        rowid AS {CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN}
+                 FROM code_review_tasks
+                 WHERE job_id = ?1 AND role = 'reviewer'
+                 ORDER BY rowid"
+            ))?;
+            let rows = stmt.query_map(params![id], row_to_code_review_task_attempt)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if let Some(blocked) = latest_code_review_task_attempts(&reviewer_attempts)
+            .into_iter()
+            .map(|attempt| &attempt.task)
+            .find(|task| !matches!(task.status.as_str(), "succeeded" | "not_applicable"))
+        {
+            let reviewer = if blocked.reviewer_name.is_empty() {
+                blocked.reviewer_id.as_deref().unwrap_or("unknown reviewer")
+            } else {
+                &blocked.reviewer_name
+            };
+            anyhow::bail!(
+                "reviewer persona {reviewer} has a {} batch; retry that persona before retrying the final review editor",
+                blocked.status
+            );
+        }
+
+        let latest = tx
+            .query_row(
+                &format!(
+                    "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks
+                     WHERE job_id = ?1 AND role = 'coordinator'
+                     ORDER BY rowid DESC LIMIT 1"
+                ),
+                params![id],
+                row_to_code_review_task,
+            )
+            .optional()?;
+        let Some(latest) = latest else {
+            anyhow::bail!("final review editor was not started for review job {id}");
+        };
+        if !matches!(latest.status.as_str(), "failed" | "cancelled") {
+            anyhow::bail!("the final review editor has no failed or cancelled attempt to retry");
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let task_id = crate::new_id("rvt");
+        tx.execute(
+            "INSERT INTO code_review_tasks
+                    (id, job_id, role, reviewer_id, reviewer_name, batch_index,
+                     batch_count, status, model, prompt, created_at)
+             VALUES (?1, ?2, 'coordinator', NULL, ?3, ?4, ?5, 'queued', ?6, ?7, ?8)",
+            params![
+                task_id,
+                id,
+                latest.reviewer_name,
+                latest.batch_index as i64,
+                latest.batch_count as i64,
+                latest.model,
+                latest.prompt,
+                now,
+            ],
+        )?;
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET status = 'queued', started_at = NULL, completed_at = NULL,
+                 error = '', cancel_requested = 0, publication_claimed = 0
+             WHERE id = ?1 AND status IN ('failed', 'cancelled')",
+            params![id],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("review job changed before the final editor retry was queued");
+        }
+        let retried = tx.query_row(
+            &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+            params![id],
+            row_to_code_review_job,
+        )?;
+        let task = tx.query_row(
+            &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
+            params![task_id],
+            row_to_code_review_task,
+        )?;
+        tx.commit()?;
+        Ok(Some(CodeReviewJobTransition {
+            job: retried.job,
+            updated_tasks: vec![task],
+        }))
     }
 
     pub fn save_code_review_result(
@@ -11737,8 +12034,11 @@ impl Store {
         status: &str,
         review_url: &str,
         error: &str,
-    ) -> Result<bool> {
-        let updated = self.conn.lock().unwrap().execute(
+    ) -> Result<Option<CodeReviewJobTransition>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let updated = tx.execute(
             "UPDATE code_review_jobs
              SET status = CASE
                      WHEN publication_accepted != 0 AND review_published != 0
@@ -11758,21 +12058,30 @@ impl Store {
                  END,
                  completed_at = ?5
              WHERE id = ?1 AND status = 'running'",
-            params![
-                id,
-                status,
-                review_url,
-                error,
-                chrono::Utc::now().to_rfc3339()
-            ],
+            params![id, status, review_url, error, now],
         )?;
-        Ok(updated > 0)
+        let transition = if updated > 0 {
+            let updated_tasks = cancel_active_code_review_tasks(&tx, id, None, &now, error)?;
+            let record = tx.query_row(
+                &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+                params![id],
+                row_to_code_review_job,
+            )?;
+            Some(CodeReviewJobTransition {
+                job: record.job,
+                updated_tasks,
+            })
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(transition)
     }
 
     pub fn request_code_review_job_cancel(
         &self,
         id: &str,
-    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+    ) -> Result<Option<CodeReviewJobTransition>> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
         let state: Option<(String, bool)> = tx
@@ -11786,15 +12095,19 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
+        let mut updated_tasks = Vec::new();
         match status.as_str() {
             "queued" => {
+                let now = chrono::Utc::now().to_rfc3339();
                 tx.execute(
                     "UPDATE code_review_jobs
                      SET status = 'cancelled', cancel_requested = 1,
                          completed_at = ?2, error = 'cancelled by user'
                      WHERE id = ?1 AND status = 'queued'",
-                    params![id, chrono::Utc::now().to_rfc3339()],
+                    params![id, now],
                 )?;
+                updated_tasks =
+                    cancel_active_code_review_tasks(&tx, id, None, &now, "cancelled by user")?;
             }
             "running" if !publication_claimed => {
                 tx.execute(
@@ -11816,7 +12129,10 @@ impl Store {
             row_to_code_review_job,
         )?;
         tx.commit()?;
-        Ok(Some(record.job))
+        Ok(Some(CodeReviewJobTransition {
+            job: record.job,
+            updated_tasks,
+        }))
     }
 
     /// Atomically cancel an active predecessor and enqueue a linked
@@ -11855,21 +12171,28 @@ impl Store {
                 })?;
             tx.commit()?;
             return Ok(Some(CodeReviewJobRetryOutcome::Replacement(
-                replacement.job,
+                CodeReviewJobRetry {
+                    replacement: replacement.job,
+                    predecessor_tasks: Vec::new(),
+                },
             )));
         }
         if old.publication_claimed {
             tx.commit()?;
             return Ok(Some(CodeReviewJobRetryOutcome::PublicationClaimed(old.job)));
         }
+        let mut predecessor_tasks = Vec::new();
         if old.job.status == "queued" {
+            let now = chrono::Utc::now().to_rfc3339();
             tx.execute(
                 "UPDATE code_review_jobs
                  SET status = 'cancelled', cancel_requested = 1,
                      completed_at = ?2, error = 'replaced by retry'
                  WHERE id = ?1 AND status = 'queued'",
-                params![id, chrono::Utc::now().to_rfc3339()],
+                params![id, now],
             )?;
+            predecessor_tasks =
+                cancel_active_code_review_tasks(&tx, id, None, &now, "replaced by retry")?;
         } else if old.job.status == "running" {
             tx.execute(
                 "UPDATE code_review_jobs
@@ -11945,7 +12268,10 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(Some(CodeReviewJobRetryOutcome::Replacement(
-            replacement.job,
+            CodeReviewJobRetry {
+                replacement: replacement.job,
+                predecessor_tasks,
+            },
         )))
     }
 
@@ -11961,29 +12287,6 @@ impl Store {
             )
             .optional()?
             .unwrap_or(false))
-    }
-
-    pub fn cancel_active_code_review_tasks(&self, job_id: &str, error: &str) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        self.conn.lock().unwrap().execute(
-            "UPDATE code_review_tasks
-             SET status = 'cancelled', completed_at = ?2, error = ?3,
-                 model_elapsed_ms = CASE
-                   WHEN model_started_at IS NULL THEN model_elapsed_ms
-                   ELSE model_elapsed_ms + MAX(
-                     0,
-                     CAST(
-                       (julianday(?2) - MAX(
-                         julianday(model_started_at),
-                         julianday(COALESCE(last_progress_at, model_started_at))
-                       )) * 86400000 AS INTEGER
-                     )
-                   )
-                 END
-             WHERE job_id = ?1 AND status IN ('queued', 'running')",
-            params![job_id, now, error],
-        )?;
-        Ok(())
     }
 
     pub fn claim_code_review_publication(&self, id: &str) -> Result<bool> {
@@ -18742,6 +19045,7 @@ mod tests {
             store
                 .finish_code_review_job(&job.id, "failed", "", "late timeout")
                 .unwrap()
+                .is_some()
         );
 
         let record = store.code_review_job(&job.id).unwrap().unwrap();
@@ -20893,6 +21197,7 @@ mod tests {
                         "stale: pull request is a draft; automatic review stopped",
                     )
                     .unwrap()
+                    .is_some()
             );
             legacy
         };
@@ -21601,7 +21906,7 @@ mod tests {
         replacement_request.included_reviewer_ids = vec!["performance".into()];
         replacement_request.excluded_reviewer_ids = vec!["accessibility".into()];
         replacement_request.config_hash = "latest-config".into();
-        let replacement = store
+        let retry = store
             .retry_code_review_job(&queued.id, &replacement_request)
             .unwrap()
             .unwrap();
@@ -21609,6 +21914,15 @@ mod tests {
             .retry_code_review_job(&queued.id, &replacement_request)
             .unwrap()
             .unwrap();
+        let replacement = match retry {
+            CodeReviewJobRetryOutcome::Replacement(retry) => {
+                assert!(retry.predecessor_tasks.is_empty());
+                retry.replacement
+            }
+            CodeReviewJobRetryOutcome::PublicationClaimed(_) => {
+                panic!("unclaimed job should create a replacement")
+            }
+        };
         assert_eq!(repeated.id, replacement.id);
         assert_eq!(replacement.retry_of.as_deref(), Some(queued.id.as_str()));
         assert_eq!(
@@ -21914,7 +22228,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_persona_retries_failed_and_cancelled_batches() {
+    fn scoped_review_retries_preserve_successful_reviewer_batches() {
         let store = Store::open_in_memory().unwrap();
         let reviewer = crate::reviewers::built_in_reviewers().remove(0);
         let queued = store
@@ -22006,13 +22320,40 @@ mod tests {
             .finish_code_review_job(&queued.id, "failed", "", "provider unavailable")
             .unwrap();
 
+        // Simulate a terminal row persisted before active-task cleanup was
+        // atomic. Persona retry must reconcile it and retain a scoped path
+        // back to a valid queued attempt.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_tasks
+                 SET status = 'running', completed_at = NULL
+                 WHERE id = ?1",
+                params![failed.id],
+            )
+            .unwrap();
         let retried = store
             .retry_code_review_persona(&queued.id, &reviewer.id)
             .unwrap()
             .unwrap();
-        assert_eq!(retried.id, queued.id);
-        assert_eq!(retried.status, "queued");
-        assert_eq!(retried.progress.completed_reviewers, 0);
+        assert!(retried.updated_tasks.iter().any(|task| {
+            task.id == failed.id
+                && task.status == "cancelled"
+                && task.error == "orphaned active task under failed review job"
+        }));
+        assert_eq!(
+            retried
+                .updated_tasks
+                .iter()
+                .filter(|task| task.status == "queued")
+                .count(),
+            2
+        );
+        assert_eq!(retried.job.id, queued.id);
+        assert_eq!(retried.job.status, "queued");
+        assert_eq!(retried.job.progress.completed_reviewers, 0);
 
         // Force identical timestamps and misleading lexical ids: the newer
         // row must still win by SQLite insertion order.
@@ -22099,9 +22440,351 @@ mod tests {
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.personas[0].completed_batches, 3);
+        assert!(
+            !store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .can_retry_final_editor
+        );
         assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
         assert!(detail.tasks.iter().any(|task| task.id == "rvt_z_old"));
         assert!(detail.tasks.iter().any(|task| task.id == cancelled.id));
+
+        store
+            .set_code_review_job_progress(&queued.id, 1, 1)
+            .unwrap();
+        let coordinator = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Coordinator,
+                reviewer_id: None,
+                reviewer_name: "Final review editor".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/default".into()),
+                prompt: "Select the final findings".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &coordinator.id,
+                "se_editor",
+                "th_editor",
+                "provider/default",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_task(&coordinator.id, "failed", "", 0, "final editor timed out")
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "failed", "", "final editor timed out")
+            .unwrap();
+        assert!(
+            store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .can_retry_final_editor
+        );
+        let (dashboard_jobs, retryable_job_ids) = store.code_review_dashboard_jobs(100).unwrap();
+        assert!(dashboard_jobs.iter().any(|job| job.id == queued.id));
+        assert!(retryable_job_ids.contains(&queued.id));
+
+        let editor_retry = store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(editor_retry.job.id, queued.id);
+        assert_eq!(editor_retry.job.status, "queued");
+        assert_eq!(editor_retry.job.progress.completed_reviewers, 1);
+        assert_eq!(editor_retry.updated_tasks.len(), 1);
+        assert_eq!(editor_retry.updated_tasks[0].status, "queued");
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        assert!(detail.tasks.iter().any(|task| task.id == coordinator.id));
+        let queued_coordinator = detail
+            .tasks
+            .iter()
+            .find(|task| {
+                task.role == trouve_protocol::CodeReviewTaskRole::Coordinator
+                    && task.status == "queued"
+            })
+            .unwrap()
+            .clone();
+        // A stale worker finishing after a scoped retry has already queued
+        // new work must lose the guarded transition without cancelling it.
+        assert!(
+            store
+                .finish_code_review_job(&queued.id, "failed", "", "stale worker cleanup")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .code_review_task(&queued.id, &queued_coordinator.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert!(!detail.tasks.iter().any(|task| task.role
+            == trouve_protocol::CodeReviewTaskRole::Reviewer
+            && task.status == "queued"));
+
+        store.claim_code_review_job().unwrap().unwrap();
+        let started = store
+            .start_code_review_task_with_prompt(
+                &queued_coordinator.id,
+                "se_editor_retry",
+                "th_editor_retry",
+                "provider/default",
+                "Recomputed final findings prompt",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.prompt, "Recomputed final findings prompt");
+        store
+            .finish_code_review_task(&started.id, "failed", "", 0, "retry failed")
+            .unwrap()
+            .unwrap();
+
+        let failed_reviewer = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some(reviewer.id.clone()),
+                reviewer_name: reviewer.name.clone(),
+                batch_index: 0,
+                batch_count: 3,
+                model: Some("provider/default".into()),
+                prompt: "Review batch 1 again".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &failed_reviewer.id,
+                "se_reviewer_again",
+                "th_reviewer_again",
+                "provider/default",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_task(&failed_reviewer.id, "failed", "", 0, "reviewer failed")
+            .unwrap()
+            .unwrap();
+        let leftover_router = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Router,
+                reviewer_id: None,
+                reviewer_name: "Persona router".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/default".into()),
+                prompt: "Route personas".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &leftover_router.id,
+                "se_router_leftover",
+                "th_router_leftover",
+                "provider/default",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_tasks
+                 SET model_started_at = '2026-01-01T00:00:00Z',
+                     last_progress_at = '2026-01-01T00:00:10Z',
+                     model_elapsed_ms = 5000
+                 WHERE id = ?1",
+                [&leftover_router.id],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "failed", "", "retry failed")
+            .unwrap();
+        assert!(
+            !store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .can_retry_final_editor
+        );
+        assert!(
+            !store
+                .code_review_dashboard_jobs(100)
+                .unwrap()
+                .1
+                .contains(&queued.id)
+        );
+        let cancelled_router = store
+            .code_review_tasks(&queued.id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == leftover_router.id)
+            .unwrap();
+        assert_eq!(cancelled_router.status, "cancelled");
+        assert!(
+            cancelled_router.model_elapsed_ms > 5_000,
+            "cancelling a running task must finalize its unpersisted model interval"
+        );
+
+        let error = store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap_err();
+        assert!(error.to_string().contains("retry that persona"));
+
+        store
+            .retry_code_review_persona(&queued.id, &reviewer.id)
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let reviewer_retry = store
+            .code_review_tasks(&queued.id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|task| {
+                task.role == trouve_protocol::CodeReviewTaskRole::Reviewer
+                    && task.status == "queued"
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &reviewer_retry.id,
+                "se_reviewer_fixed",
+                "th_reviewer_fixed",
+                "provider/default",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_task(&reviewer_retry.id, "succeeded", r#"{"findings":[]}"#, 0, "")
+            .unwrap()
+            .unwrap();
+        store
+            .set_code_review_job_progress(&queued.id, 1, 1)
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "failed", "", "editor still failed")
+            .unwrap();
+
+        store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap()
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let queued_coordinator = detail
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| {
+                task.role == trouve_protocol::CodeReviewTaskRole::Coordinator
+                    && task.status == "queued"
+            })
+            .unwrap();
+        let skipped = store
+            .skip_code_review_task(
+                &queued_coordinator.id,
+                "No candidate or open finding required final editing on retry.",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped.status, "not_applicable");
+
+        store.claim_code_review_job().unwrap().unwrap();
+        let failed_coordinator = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Coordinator,
+                reviewer_id: None,
+                reviewer_name: "Final review editor".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/default".into()),
+                prompt: "Try final editing again".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &failed_coordinator.id,
+                "se_editor_again",
+                "th_editor_again",
+                "provider/default",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_task(&failed_coordinator.id, "failed", "", 0, "editor failed")
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "failed", "", "editor failed")
+            .unwrap();
+        store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap()
+            .unwrap();
+        let queued_coordinator = store
+            .code_review_tasks(&queued.id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|task| {
+                task.role == trouve_protocol::CodeReviewTaskRole::Coordinator
+                    && task.status == "queued"
+            })
+            .unwrap();
+        let cancelled = store
+            .request_code_review_job_cancel(&queued.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.job.status, "cancelled");
+        assert!(
+            store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .can_retry_final_editor
+        );
+        assert_eq!(cancelled.updated_tasks.len(), 1);
+        assert_eq!(cancelled.updated_tasks[0].id, queued_coordinator.id);
+        assert_eq!(cancelled.updated_tasks[0].status, "cancelled");
+        assert_eq!(
+            cancelled.updated_tasks[0].model_elapsed_ms, 0,
+            "queued task cancellation must not accrue model time"
+        );
+        assert_eq!(
+            store
+                .code_review_tasks(&queued.id)
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == queued_coordinator.id)
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        let editor_retry = store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(editor_retry.job.id, queued.id);
+        assert_eq!(editor_retry.job.status, "queued");
+        assert_eq!(editor_retry.updated_tasks.len(), 1);
+        assert_eq!(
+            editor_retry.updated_tasks[0].role,
+            trouve_protocol::CodeReviewTaskRole::Coordinator
+        );
+        assert_eq!(editor_retry.updated_tasks[0].status, "queued");
     }
 
     #[tokio::test]
@@ -22418,6 +23101,7 @@ mod tests {
             store
                 .finish_code_review_job(&queued.id, "failed", "", "test complete")
                 .unwrap()
+                .is_some()
         );
         assert_eq!(
             store.code_review_jobs_with_pending_events(10).unwrap(),
@@ -22896,6 +23580,22 @@ mod tests {
                 .set_code_review_job_session(&old_head.id, "se_old", "th_old")
                 .unwrap()
         );
+        let active_task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: old_head.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Router,
+                reviewer_id: None,
+                reviewer_name: "Persona router".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: None,
+                prompt: "Route personas".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(&active_task.id, "se_router", "th_router", "provider/router")
+            .unwrap()
+            .unwrap();
         let old_base = enqueue("old-base", "base-1", "head-2", "config");
         let old_config = enqueue("old-config", "base-2", "head-2", "old-config");
         let current = enqueue("current", "base-2", "head-2", "config");
@@ -22933,9 +23633,20 @@ mod tests {
                 .unwrap()
         );
 
-        let mut superseded = store
+        let superseded = store
             .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2")
             .unwrap();
+        let old_head_transition = superseded
+            .iter()
+            .find(|transition| transition.job.id == old_head.id)
+            .unwrap();
+        assert_eq!(old_head_transition.updated_tasks.len(), 1);
+        assert_eq!(old_head_transition.updated_tasks[0].id, active_task.id);
+        assert_eq!(old_head_transition.updated_tasks[0].status, "cancelled");
+        let mut superseded = superseded
+            .into_iter()
+            .map(|transition| transition.job.id)
+            .collect::<Vec<_>>();
         let mut expected = vec![old_head.id.clone(), old_base.id.clone()];
         superseded.sort();
         expected.sort();
@@ -22983,9 +23694,10 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            !store
+            store
                 .finish_code_review_job(&old_head.id, "failed", "", "cancelled")
                 .unwrap()
+                .is_none()
         );
         assert_eq!(
             store.pending_code_review_job_cleanups().unwrap(),

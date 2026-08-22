@@ -430,7 +430,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.11";
+export const SUPPORTED_PROTOCOL_VERSION = "7.13";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -466,13 +466,7 @@ export class ProtocolClient {
     });
   }
 
-  async #validatedJson<T>(
-    path: string,
-    label: string,
-    schemaName: Parameters<typeof validateResponse<T>>[0],
-    validate: (loaded: ProtocolValidators) => ValidateFunction,
-    init: RequestInit = {},
-  ): Promise<T> {
+  async #request(path: string, label: string, init?: RequestInit): Promise<Response> {
     let response: Response;
     try {
       response = await this.#fetch(new URL(path, this.#baseUrl), init);
@@ -486,6 +480,14 @@ export class ProtocolClient {
         response.status,
       );
     }
+    return response;
+  }
+
+  async #validatedResponse<T>(
+    response: Response,
+    schemaName: Parameters<typeof validateResponse<T>>[0],
+    validate: (loaded: ProtocolValidators) => ValidateFunction,
+  ): Promise<T> {
     let value: unknown;
     try {
       value = await response.json();
@@ -495,35 +497,33 @@ export class ProtocolClient {
     return validateResponse<T>(schemaName, value, validate);
   }
 
+  async #validatedJson<T>(
+    path: string,
+    label: string,
+    schemaName: Parameters<typeof validateResponse<T>>[0],
+    validate: (loaded: ProtocolValidators) => ValidateFunction,
+    init: RequestInit = {},
+  ): Promise<T> {
+    const response = await this.#request(path, label, init);
+    return this.#validatedResponse<T>(response, schemaName, validate);
+  }
+
   async #validatedCursorJson<T>(
     path: string,
     label: string,
     schemaName: Parameters<typeof validateResponse<T>>[0],
     validate: (loaded: ProtocolValidators) => ValidateFunction,
+    signal?: AbortSignal,
   ): Promise<ProtocolCursorSnapshot<T>> {
-    let response: Response;
-    try {
-      response = await this.#fetch(new URL(path, this.#baseUrl));
-    } catch {
-      throw new ProtocolClientError("request-failed", `${label} request failed`);
-    }
-    if (!response.ok) {
-      throw new ProtocolClientError(
-        "request-failed",
-        `${label} request failed`,
-        response.status,
-      );
-    }
+    const response = await this.#request(
+      path,
+      label,
+      signal === undefined ? undefined : { signal },
+    );
     const cursor = this.#responseCursor(response, label);
-    let raw: unknown;
-    try {
-      raw = await response.json();
-    } catch {
-      throw new ProtocolClientError("invalid-response", `server returned invalid ${schemaName}`);
-    }
     return Object.freeze({
       cursor,
-      value: await validateResponse<T>(schemaName, raw, validate),
+      value: await this.#validatedResponse<T>(response, schemaName, validate),
     });
   }
 
@@ -553,37 +553,22 @@ export class ProtocolClient {
     return value as ProtocolPrFileDiff;
   }
 
-  async #mutation(
+  #mutation(
     path: string,
     label: string,
     method: "POST" | "PUT" | "DELETE",
     body?: unknown,
     signal?: AbortSignal,
   ): Promise<Response> {
-    let response: Response;
-    try {
-      response = await this.#fetch(new URL(path, this.#baseUrl), {
-        method,
-        ...(signal === undefined ? {} : { signal }),
-        headers: {
-          ...this.#mutationHeaders(),
-          ...(body === undefined
-            ? {}
-            : { "content-type": "application/json" }),
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
-    } catch {
-      throw new ProtocolClientError("request-failed", `${label} request failed`);
-    }
-    if (!response.ok) {
-      throw new ProtocolClientError(
-        "request-failed",
-        `${label} request failed`,
-        response.status,
-      );
-    }
-    return response;
+    return this.#request(path, label, {
+      method,
+      ...(signal === undefined ? {} : { signal }),
+      headers: {
+        ...this.#mutationHeaders(),
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
   }
 
   async #validatedMutation<T>(
@@ -596,13 +581,7 @@ export class ProtocolClient {
     signal?: AbortSignal,
   ): Promise<T> {
     const response = await this.#mutation(path, label, method, body, signal);
-    let value: unknown;
-    try {
-      value = await response.json();
-    } catch {
-      throw new ProtocolClientError("invalid-response", `server returned invalid ${schemaName}`);
-    }
-    return validateResponse<T>(schemaName, value, validate);
+    return this.#validatedResponse<T>(response, schemaName, validate);
   }
 
   async #validatedCursorMutation<T>(
@@ -615,15 +594,9 @@ export class ProtocolClient {
   ): Promise<ProtocolCursorSnapshot<T>> {
     const response = await this.#mutation(path, label, method, body);
     const cursor = this.#responseCursor(response, label);
-    let raw: unknown;
-    try {
-      raw = await response.json();
-    } catch {
-      throw new ProtocolClientError("invalid-response", `server returned invalid ${schemaName}`);
-    }
     return Object.freeze({
       cursor,
-      value: await validateResponse<T>(schemaName, raw, validate),
+      value: await this.#validatedResponse<T>(response, schemaName, validate),
     });
   }
 
@@ -676,7 +649,7 @@ export class ProtocolClient {
     );
   }
 
-  async generateSessionTitle(
+  generateSessionTitle(
     prompt: string,
     options: { readonly signal?: AbortSignal } = {},
   ): Promise<ProtocolGeneratedSessionTitle> {
@@ -770,7 +743,7 @@ export class ProtocolClient {
     );
   }
 
-  async serverProjectionSnapshot(): Promise<
+  serverProjectionSnapshot(): Promise<
     ProtocolCursorSnapshot<ProtocolServerProjection>
   > {
     return this.#validatedCursorJson(
@@ -798,7 +771,7 @@ export class ProtocolClient {
     );
   }
 
-  async registerWorkspace(
+  registerWorkspace(
     request: ProtocolRegisterWorkspaceRequest,
   ): Promise<ProtocolWorkspace> {
     return this.#validatedMutation(
@@ -819,7 +792,7 @@ export class ProtocolClient {
     );
   }
 
-  async workspaceBranches(workspaceId: string): Promise<ProtocolBranchList> {
+  workspaceBranches(workspaceId: string): Promise<ProtocolBranchList> {
     return this.#validatedJson(
       `/v1/workspaces/${encodeURIComponent(workspaceId)}/branches`,
       "workspace branches",
@@ -833,7 +806,7 @@ export class ProtocolClient {
     await this.#mutation(`/v1/github/prs/refresh${query}`, "refresh pull requests", "POST");
   }
 
-  async createSessionPr(
+  createSessionPr(
     sessionId: string,
     request: ProtocolCreatePrRequest,
   ): Promise<ProtocolPrInfo> {
@@ -952,7 +925,7 @@ export class ProtocolClient {
     );
   }
 
-  async personaInfos(workspaceId?: string): Promise<readonly ProtocolPersonaInfo[]> {
+  personaInfos(workspaceId?: string): Promise<readonly ProtocolPersonaInfo[]> {
     const parameters = new URLSearchParams();
     if (workspaceId !== undefined) parameters.set("workspace_id", workspaceId);
     const suffix = parameters.size === 0 ? "" : `?${parameters.toString()}`;
@@ -1073,7 +1046,7 @@ export class ProtocolClient {
     );
   }
 
-  async providers(): Promise<ProtocolProvidersResponse> {
+  providers(): Promise<ProtocolProvidersResponse> {
     return this.#validatedJson(
       "/v1/providers",
       "provider",
@@ -1082,7 +1055,7 @@ export class ProtocolClient {
     );
   }
 
-  async knownProviders(): Promise<readonly ProtocolKnownProvider[]> {
+  knownProviders(): Promise<readonly ProtocolKnownProvider[]> {
     return this.#validatedJson(
       "/v1/providers/known",
       "known provider",
@@ -1091,7 +1064,7 @@ export class ProtocolClient {
     );
   }
 
-  async subscriptionHealth(): Promise<readonly ProtocolSubscriptionHealth[]> {
+  subscriptionHealth(): Promise<readonly ProtocolSubscriptionHealth[]> {
     return this.#validatedJson(
       "/v1/subscriptions",
       "subscription health",
@@ -1100,7 +1073,7 @@ export class ProtocolClient {
     );
   }
 
-  async upsertProvider(
+  upsertProvider(
     providerId: string,
     request: ProtocolUpsertProviderRequest,
   ): Promise<ProtocolProviderInfo> {
@@ -1131,7 +1104,7 @@ export class ProtocolClient {
     );
   }
 
-  async startProviderLogin(providerId: string): Promise<ProtocolLoginStarted> {
+  startProviderLogin(providerId: string): Promise<ProtocolLoginStarted> {
     return this.#validatedMutation(
       `/v1/providers/${encodeURIComponent(providerId)}/login`,
       "start provider login",
@@ -1141,7 +1114,7 @@ export class ProtocolClient {
     );
   }
 
-  async providerLoginStatus(providerId: string): Promise<ProtocolLoginStatus> {
+  providerLoginStatus(providerId: string): Promise<ProtocolLoginStatus> {
     return this.#validatedJson(
       `/v1/providers/${encodeURIComponent(providerId)}/login`,
       "provider login status",
@@ -1150,7 +1123,7 @@ export class ProtocolClient {
     );
   }
 
-  async completeProviderLogin(
+  completeProviderLogin(
     providerId: string,
     callbackUrl: string,
   ): Promise<ProtocolLoginStatus> {
@@ -1164,7 +1137,7 @@ export class ProtocolClient {
     );
   }
 
-  async localStatus(): Promise<ProtocolLocalStatus> {
+  localStatus(): Promise<ProtocolLocalStatus> {
     return this.#validatedJson(
       "/v1/local",
       "local model status",
@@ -1173,7 +1146,7 @@ export class ProtocolClient {
     );
   }
 
-  async searchLocalModels(query: string): Promise<readonly ProtocolLocalSearchResult[]> {
+  searchLocalModels(query: string): Promise<readonly ProtocolLocalSearchResult[]> {
     const parameters = new URLSearchParams({ q: query });
     return this.#validatedJson(
       `/v1/local/search?${parameters.toString()}`,
@@ -1225,7 +1198,7 @@ export class ProtocolClient {
     await this.#mutation("/v1/local/server/stop", "stop local server", "POST");
   }
 
-  async automations(): Promise<readonly ProtocolAutomation[]> {
+  automations(): Promise<readonly ProtocolAutomation[]> {
     return this.#validatedJson(
       "/v1/automations",
       "automation",
@@ -1234,7 +1207,7 @@ export class ProtocolClient {
     );
   }
 
-  async automationTemplates(): Promise<readonly ProtocolAutomationTemplate[]> {
+  automationTemplates(): Promise<readonly ProtocolAutomationTemplate[]> {
     return this.#validatedJson(
       "/v1/automations/templates",
       "automation template",
@@ -1243,7 +1216,7 @@ export class ProtocolClient {
     );
   }
 
-  async createAutomation(
+  createAutomation(
     request: ProtocolUpsertAutomationRequest,
   ): Promise<ProtocolAutomation> {
     return this.#validatedMutation(
@@ -1256,7 +1229,7 @@ export class ProtocolClient {
     );
   }
 
-  async updateAutomation(
+  updateAutomation(
     automationId: string,
     request: ProtocolUpsertAutomationRequest,
   ): Promise<ProtocolAutomation> {
@@ -1286,7 +1259,7 @@ export class ProtocolClient {
     );
   }
 
-  async codeReviewDashboard(): Promise<ProtocolCodeReviewDashboard> {
+  codeReviewDashboard(): Promise<ProtocolCodeReviewDashboard> {
     return this.#validatedJson(
       "/v1/code-review",
       "code review dashboard",
@@ -1299,27 +1272,37 @@ export class ProtocolClient {
     await this.#mutation("/v1/code-review/refresh", "refresh code reviews", "POST");
   }
 
-  async retryCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
+  retryCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
+    return this.#mutateCodeReviewJob(jobId, "retry", "retry code review");
+  }
+
+  retryCodeReviewFinalEditor(jobId: string): Promise<ProtocolCodeReviewJob> {
+    return this.#mutateCodeReviewJob(
+      jobId,
+      "final-editor/retry",
+      "retry final review editor",
+    );
+  }
+
+  cancelCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
+    return this.#mutateCodeReviewJob(jobId, "cancel", "cancel code review");
+  }
+
+  #mutateCodeReviewJob(
+    jobId: string,
+    action: string,
+    description: string,
+  ): Promise<ProtocolCodeReviewJob> {
     return this.#validatedMutation(
-      `/v1/code-review/jobs/${encodeURIComponent(jobId)}/retry`,
-      "retry code review",
+      `/v1/code-review/jobs/${encodeURIComponent(jobId)}/${action}`,
+      description,
       "POST",
       "CodeReviewJob",
       (loaded) => loaded.codeReviewJob,
     );
   }
 
-  async cancelCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
-    return this.#validatedMutation(
-      `/v1/code-review/jobs/${encodeURIComponent(jobId)}/cancel`,
-      "cancel code review",
-      "POST",
-      "CodeReviewJob",
-      (loaded) => loaded.codeReviewJob,
-    );
-  }
-
-  async codeReviewSettings(): Promise<ProtocolCodeReviewSettings> {
+  codeReviewSettings(): Promise<ProtocolCodeReviewSettings> {
     return this.#validatedJson(
       "/v1/config/code-review",
       "code review settings",
@@ -1328,7 +1311,7 @@ export class ProtocolClient {
     );
   }
 
-  async setCodeReviewSettings(
+  setCodeReviewSettings(
     request: ProtocolSetCodeReviewSettingsRequest,
   ): Promise<ProtocolCodeReviewSettings> {
     return this.#validatedMutation(
@@ -1341,7 +1324,7 @@ export class ProtocolClient {
     );
   }
 
-  async configureCodeReviewGithubApp(
+  configureCodeReviewGithubApp(
     request: ProtocolConfigureGithubAppRequest,
   ): Promise<ProtocolGithubAppStatus> {
     return this.#validatedMutation(
@@ -1354,7 +1337,7 @@ export class ProtocolClient {
     );
   }
 
-  async updateCodeReviewRepository(
+  updateCodeReviewRepository(
     request: ProtocolUpdateCodeReviewRepositoryRequest,
   ): Promise<ProtocolCodeReviewRepository> {
     return this.#validatedMutation(
@@ -1367,7 +1350,7 @@ export class ProtocolClient {
     );
   }
 
-  async gitWorktreeSettings(): Promise<ProtocolGitWorktreeSettings> {
+  gitWorktreeSettings(): Promise<ProtocolGitWorktreeSettings> {
     return this.#validatedJson(
       "/v1/config/git-worktrees",
       "Session naming settings",
@@ -1376,7 +1359,7 @@ export class ProtocolClient {
     );
   }
 
-  async gitWorktreeSettingsSnapshot(): Promise<
+  gitWorktreeSettingsSnapshot(): Promise<
     ProtocolCursorSnapshot<ProtocolGitWorktreeSettings>
   > {
     return this.#validatedCursorJson(
@@ -1387,7 +1370,7 @@ export class ProtocolClient {
     );
   }
 
-  async setGitWorktreeSettings(
+  setGitWorktreeSettings(
     request: ProtocolSetGitWorktreeSettingsRequest,
   ): Promise<ProtocolGitWorktreeSettings> {
     return this.#validatedMutation(
@@ -1400,7 +1383,7 @@ export class ProtocolClient {
     );
   }
 
-  async setGitWorktreeSettingsSnapshot(
+  setGitWorktreeSettingsSnapshot(
     request: ProtocolSetGitWorktreeSettingsRequest,
   ): Promise<ProtocolCursorSnapshot<ProtocolGitWorktreeSettings>> {
     return this.#validatedCursorMutation(
@@ -1429,7 +1412,7 @@ export class ProtocolClient {
     );
   }
 
-  async githubIntegration(): Promise<ProtocolGithubIntegration> {
+  githubIntegration(): Promise<ProtocolGithubIntegration> {
     return this.#validatedJson(
       "/v1/integrations/github",
       "GitHub integration",
@@ -1438,7 +1421,7 @@ export class ProtocolClient {
     );
   }
 
-  async addGithubHost(
+  addGithubHost(
     request: ProtocolAddGithubHostRequest,
   ): Promise<ProtocolGithubIntegration> {
     return this.#validatedMutation(
@@ -1451,7 +1434,7 @@ export class ProtocolClient {
     );
   }
 
-  async removeGithubHost(host: string): Promise<ProtocolGithubIntegration> {
+  removeGithubHost(host: string): Promise<ProtocolGithubIntegration> {
     return this.#validatedMutation(
       `/v1/integrations/github/hosts/${encodeURIComponent(host)}`,
       "remove GitHub host",
@@ -1461,7 +1444,7 @@ export class ProtocolClient {
     );
   }
 
-  async mcpServers(
+  mcpServers(
     workspaceId?: string,
     probe = true,
   ): Promise<readonly ProtocolMcpServerInfo[]> {
@@ -1476,7 +1459,7 @@ export class ProtocolClient {
   }
 
   /** Effective app/workspace/branch MCP configuration seen by this session. */
-  async sessionMcpServers(
+  sessionMcpServers(
     sessionId: string,
   ): Promise<readonly ProtocolMcpServerInfo[]> {
     return this.#validatedJson(
@@ -1525,7 +1508,7 @@ export class ProtocolClient {
     );
   }
 
-  async mcpServerLogs(name: string): Promise<ProtocolMcpLogs> {
+  mcpServerLogs(name: string): Promise<ProtocolMcpLogs> {
     return this.#validatedJson(
       `/v1/mcp-servers/${encodeURIComponent(name)}/logs`,
       "MCP server logs",
@@ -1534,7 +1517,7 @@ export class ProtocolClient {
     );
   }
 
-  async clis(): Promise<ProtocolCliList> {
+  clis(): Promise<ProtocolCliList> {
     return this.#validatedJson(
       "/v1/clis",
       "CLI list",
@@ -1543,7 +1526,7 @@ export class ProtocolClient {
     );
   }
 
-  async cliInstallStatus(cliId: string): Promise<ProtocolCliInstallStatus> {
+  cliInstallStatus(cliId: string): Promise<ProtocolCliInstallStatus> {
     return this.#validatedJson(
       `/v1/clis/${encodeURIComponent(cliId)}/install`,
       "CLI install status",
@@ -1595,7 +1578,7 @@ export class ProtocolClient {
     );
   }
 
-  async threadSubagents(
+  threadSubagents(
     threadId: string,
     recursive = false,
   ): Promise<readonly ProtocolThread[]> {
@@ -1632,6 +1615,7 @@ export class ProtocolClient {
   async threadView(
     threadId: string,
     before?: number,
+    options: { readonly signal?: AbortSignal } = {},
   ): Promise<ProtocolCursorSnapshot<ProtocolThreadViewSnapshot>> {
     const { threadView } = await import("../generated/thread-view-validator.js");
     const query = new URLSearchParams({
@@ -1644,6 +1628,7 @@ export class ProtocolClient {
       "thread view",
       "ThreadViewSnapshot",
       () => threadView,
+      options.signal,
     );
   }
 
@@ -2166,7 +2151,7 @@ export class ProtocolClient {
     );
   }
 
-  async openTerminal(
+  openTerminal(
     sessionId: string,
     cols: number,
     rows: number,
@@ -2174,7 +2159,7 @@ export class ProtocolClient {
     return this.#startTerminal("/v1/sessions/{id}/terminal", sessionId, cols, rows);
   }
 
-  async createTerminal(
+  createTerminal(
     sessionId: string,
     cols: number,
     rows: number,

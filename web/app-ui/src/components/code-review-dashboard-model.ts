@@ -14,7 +14,7 @@ export const CODE_REVIEW_STATUS_FILTERS = [
 ] as const;
 
 export type CodeReviewStatusFilter = (typeof CODE_REVIEW_STATUS_FILTERS)[number];
-export type CodeReviewJobAction = "cancel" | "retry";
+export type CodeReviewJobAction = "cancel" | "retry" | "final-editor";
 
 export interface ReviewJobSummary {
   readonly id: string;

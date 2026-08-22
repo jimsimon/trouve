@@ -505,6 +505,9 @@ the breaking removal of remote git URL indexing.
   and unifies data from GitHub.com and configured Enterprise instances. The
   review service deliberately uses separate GitHub App installation tokens,
   so its repository access and rate limits remain isolated from desktop OAuth.
+- **Search model parity with Semble v0.5**: the default embedding model is now
+  `minishlab/potion-code-16M-v2`. Model-keyed stores and snapshots keep
+  existing v1 cache data isolated.
 
 ### Fixed
 
@@ -524,6 +527,13 @@ the breaking removal of remote git URL indexing.
 - **Wayland image paste**: clipboard images copied by Spectacle and similar
   tools are accepted when they are exposed through Wayland's data-control
   protocol.
+- **Corrupt search caches**: malformed per-file entries and structurally
+  inconsistent mmap snapshots are rejected instead of reaching query/patch
+  code. Incomplete Hugging Face model caches are invalidated and downloaded
+  once more, while local model directories remain untouched.
+- **Hybrid search edge cases**: zero-weight candidates are removed at
+  `alpha = 0` or `alpha = 1`, matching current Semble, and an empty filter
+  selector now returns no dense results instead of panicking.
 - **Screen artifacts in the desktop app**: the app now prefers Slint's Skia
   renderer over the default FemtoVG renderer, whose glyph atlas corrupts on
   some Linux drivers — flashing garbage across the window while typing or

@@ -294,11 +294,15 @@ pub use requests::*;
 // safely retry when a committed response is lost.
 // 7.10: code-review findings identify verified RIGHT-side anchors outside the
 // pull-request diff so clients can distinguish review-level comments.
-// 7.11: provider-neutral `auto/<model>` selections expose their concrete routes,
+// 7.11: a failed or cancelled final review editor can be retried independently,
+// retaining successful reviewer task outputs (additive).
+// 7.12: code-review jobs expose the server-authoritative final-editor retry
+// capability derived from their latest durable task attempts (additive).
+// 7.13: provider-neutral `auto/<model>` selections expose their concrete routes,
 // persist sticky thread affinity, and emit route-selection events with a
 // closed reason enum; provider-order updates require an explicit array
 // (additive because all affected routes and wire shapes are new).
-pub const PROTOCOL_VERSION: &str = "7.11";
+pub const PROTOCOL_VERSION: &str = "7.13";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";
