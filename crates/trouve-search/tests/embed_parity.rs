@@ -183,7 +183,7 @@ fn matches_model2vec_on_wordlevel_test_model() {
 
 #[test]
 fn matches_model2vec_on_real_model_if_present() {
-    // Bit-exact parity against the real potion-code-16M when available
+    // Bit-exact parity against a real Model2Vec model when available
     // locally (kept out of CI: the model is ~60 MB).
     let Ok(dir) = std::env::var("TROUVE_MODEL_NAME") else {
         eprintln!("skipping: TROUVE_MODEL_NAME not set");

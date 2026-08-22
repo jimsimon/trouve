@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 const source = readFileSync(new URL("./thread-screen.ts", import.meta.url), "utf8");
+const agentActivitySource = readFileSync(
+  new URL("./agent-activity.ts", import.meta.url),
+  "utf8",
+);
 
 const section = (start: string, end: string): string => {
   const startAt = source.indexOf(start);
@@ -34,7 +38,7 @@ describe("thread screen asynchronous lifecycle guards", () => {
 
   it("invalidates history before a late page can recreate a deleted view", () => {
     const history = section(
-      "async #loadOlderHistory(loadAll: boolean)",
+      "async #loadOlderHistory(loadAll: boolean, signal?: AbortSignal)",
       "\n  readonly #toggleAccessibleHistory",
     );
     expect(disconnected).toContain("this.#historyGeneration += 1;");
@@ -45,6 +49,25 @@ describe("thread screen asynchronous lifecycle guards", () => {
       "if (!this.#isCurrentHistoryRequest",
       "store.prependThreadViewSnapshot",
     );
+  });
+
+  it("cancels find-owned history requests across query and view lifecycles", () => {
+    const find = section(
+      "#cancelChatFindHistoryLoading(): void {",
+      "\n  #selectThreadWithKeyboard(",
+    );
+    const history = section(
+      "async #loadOlderHistory(loadAll: boolean, signal?: AbortSignal)",
+      "\n  readonly #toggleAccessibleHistory",
+    );
+    expect(find).toContain("this.#chatFindHistoryAbort?.abort();");
+    expect(find).toContain('this.#chatFindQuery.trim() === ""');
+    expect(find).toContain("new AbortController()");
+    expect(find).toContain("this.#loadOlderHistory(false, abort.signal)");
+    expect(history).toContain("!signal?.aborted");
+    expect(find).toContain("const restorationPending = restoredActiveUnitId !== undefined");
+    expect(find).toContain("&& view.hasOlder");
+    expect(disconnected).toContain("this.#cancelChatFindHistoryLoading();");
   });
 
   it("guards an accepted message before reconciling optimistic store state", () => {
@@ -158,5 +181,28 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(currentScope).toContain("isSessionTombstoned(sessionId) !== true");
     expect(currentScope).toContain('route?.kind === "session"');
     expect(currentScope).toContain('(route.threadId ?? "") === threadId');
+  });
+
+  it("delegates elapsed activity updates to an isolated component", () => {
+    expect(source).toContain('import "./agent-activity.js";');
+    expect(source).not.toContain("#activityRefreshTimer");
+    expect(source).toContain("nowMs: Date.now()");
+    expect(source).toContain("this.#renderActivityRow(item.presentation, liveActivityInput)");
+    expect(agentActivitySource).toContain("globalThis.setInterval");
+    expect(agentActivitySource).toContain("() => this.requestUpdate()");
+    expect(agentActivitySource).toContain("override disconnectedCallback(): void");
+    expect(agentActivitySource).toContain("this.#stopClock();");
+  });
+
+  it("keeps timer-only activity text outside polite announcements", () => {
+    expect(source.match(/<trouve-agent-activity/gu)).toHaveLength(2);
+    expect(source.match(/\.presentation=\$\{activity\}/gu)).toHaveLength(2);
+    expect(source.match(/\.input=\$\{activityInput\}/gu)).toHaveLength(2);
+    expect(agentActivitySource).toContain("activity.announcementLabel");
+    expect(agentActivitySource).toContain('class="visually-hidden"');
+    expect(agentActivitySource).toContain('role="status"');
+    expect(agentActivitySource).toContain('aria-live="polite"');
+    expect(agentActivitySource).toContain('aria-atomic="true"');
+    expect(agentActivitySource).toContain('aria-hidden="true"');
   });
 });

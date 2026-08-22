@@ -7,7 +7,7 @@
 //! index cache across all threads and sessions.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 use trouve_search::mcp::{IndexCache, call_tool};
@@ -15,33 +15,79 @@ use trouve_search::types::ContentType;
 
 use super::{Tool, ToolCtx, ToolResult};
 
-/// Build the search index for a session worktree on a detached background
-/// thread — the in-process equivalent of the agent plugins' SessionStart
+const INDEX_WARM_QUEUE_CAPACITY: usize = 8;
+
+struct IndexWarmQueue {
+    sender: std::sync::mpsc::SyncSender<PathBuf>,
+    pending: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+}
+
+fn index_warm_queue() -> &'static IndexWarmQueue {
+    static QUEUE: OnceLock<IndexWarmQueue> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<PathBuf>(INDEX_WARM_QUEUE_CAPACITY);
+        let pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let worker_pending = Arc::clone(&pending);
+        std::thread::Builder::new()
+            .name("trouve-index-warm".into())
+            .spawn(move || {
+                while let Ok(worktree) = receiver.recv() {
+                    let started = std::time::Instant::now();
+                    match trouve_search::index::TrouveIndex::from_path(
+                        &worktree,
+                        &[ContentType::Code],
+                        None,
+                    ) {
+                        Ok(index) => {
+                            let stats = index.stats();
+                            tracing::info!(
+                                "warmed search index for {} ({} files, {} chunks) in {:.1?}",
+                                worktree.display(),
+                                stats.indexed_files,
+                                stats.total_chunks,
+                                started.elapsed(),
+                            );
+                            drop(index);
+                        }
+                        // Non-fatal by design: no embedding model yet, not a
+                        // real repo, etc. The first search call surfaces any
+                        // persistent problem.
+                        Err(error) => tracing::debug!(
+                            "search index warm skipped for {}: {error:#}",
+                            worktree.display()
+                        ),
+                    }
+                    worker_pending.lock().unwrap().remove(&worktree);
+                    trouve_search::release_unused_memory();
+                }
+            })
+            .expect("spawning the search index warm worker");
+        IndexWarmQueue { sender, pending }
+    })
+}
+
+/// Build the search index for a session worktree on one bounded background
+/// worker — the in-process equivalent of the agent plugins' SessionStart
 /// hook (which runs `trouve-search stats` in the background). The build
 /// populates the on-disk chunk store and snapshot shared across worktrees,
 /// so the session's first `search` call assembles from cache instantly.
+/// Duplicate requests for one worktree are coalesced and bursts are bounded,
+/// preventing concurrent session creation from multiplying index-build peaks.
 pub fn warm_index_in_background(worktree: PathBuf) {
-    std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        match trouve_search::index::TrouveIndex::from_path(&worktree, &[ContentType::Code], None) {
-            Ok(index) => {
-                let stats = index.stats();
-                tracing::info!(
-                    "warmed search index for {} ({} files, {} chunks) in {:.1?}",
-                    worktree.display(),
-                    stats.indexed_files,
-                    stats.total_chunks,
-                    started.elapsed(),
-                );
-            }
-            // Non-fatal by design: no embedding model yet, not a real repo,
-            // etc. The first search call surfaces any persistent problem.
-            Err(e) => tracing::debug!(
-                "search index warm skipped for {}: {e:#}",
-                worktree.display()
-            ),
-        }
-    });
+    let worktree = worktree.canonicalize().unwrap_or(worktree);
+    let queue = index_warm_queue();
+    if !queue.pending.lock().unwrap().insert(worktree.clone()) {
+        tracing::debug!("coalescing search index warm for {}", worktree.display());
+        return;
+    }
+    if let Err(error) = queue.sender.try_send(worktree.clone()) {
+        queue.pending.lock().unwrap().remove(&worktree);
+        tracing::debug!(
+            "search index warm queue is full; deferring {} until first search: {error}",
+            worktree.display()
+        );
+    }
 }
 
 /// Opportunistic index-store GC after a session is archived or deleted.
