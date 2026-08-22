@@ -19295,6 +19295,8 @@ mod tests {
 
     struct StartupTestBackend;
 
+    struct EventFailureUsageBackend;
+
     #[async_trait::async_trait]
     impl AgentBackend for ListedTestBackend {
         fn id(&self) -> &str {
@@ -19370,6 +19372,64 @@ mod tests {
             Ok(futures::stream::iter([Ok(BackendEvent::Completed {
                 usage: Usage::default(),
             })])
+            .boxed())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for EventFailureUsageBackend {
+        fn id(&self) -> &str {
+            "event-failure-backend"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "event-failure-backend/shared",
+                "Event failure backend model",
+            )]
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        async fn start_login(
+            &self,
+        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+            unreachable!("event failure test never starts login")
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+            Ok(futures::stream::iter(vec![
+                Ok(BackendEvent::Completed {
+                    usage: Usage {
+                        input_tokens: 23,
+                        cached_input_tokens: 4,
+                        output_tokens: 7,
+                        cost_usd: Some(0.5),
+                        ..Usage::default()
+                    },
+                }),
+                Ok(BackendEvent::CollaboratorStarted {
+                    session_id: "invalid-child".into(),
+                    parent_session_id: "root".into(),
+                    name: Some("Invalid child".into()),
+                    prompt: Some("Trigger event projection failure".into()),
+                    model: Some("auto/".into()),
+                    thinking_level: None,
+                    access: BackendCollaboratorAccess::Inherit,
+                }),
+            ])
             .boxed())
         }
     }
@@ -20707,6 +20767,81 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(phases, [TurnPhase::ConnectingTools, TurnPhase::Processing]);
+    }
+
+    #[test]
+    fn routed_event_processing_errors_use_a_neutral_collaborator_reason() {
+        let error = anyhow!("projection unavailable");
+        assert_eq!(
+            super::routing::unfinished_collaborator_reason(false, Some(&error), None),
+            "parent turn event processing failed: projection unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_event_processing_failure_records_accrued_usage() {
+        let data = tempfile::tempdir().unwrap();
+        init_engine_test_repo(data.path());
+        let store = Store::open_in_memory().unwrap();
+        let thread =
+            routing_test_thread(&store, data.path(), "event_processing_usage", "auto/shared");
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .with_backend("event-failure-backend", Arc::new(EventFailureUsageBackend)),
+        );
+
+        engine
+            .send_message(&thread.id, "Trigger event failure".into(), Vec::new())
+            .unwrap();
+
+        let failure = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failure = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|event| match event.event {
+                        Event::TurnFailed { turn: 1, error } => Some(error),
+                        _ => None,
+                    });
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if let (Some(failure), true) = (failure, inactive) {
+                    break failure;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let events = store
+                .events_after(&Scope::Thread(thread.id.clone()), 0)
+                .unwrap();
+            panic!(
+                "routed backend turn should fail after event processing fails; events: {events:?}"
+            )
+        });
+        assert!(failure.contains("automatic model"), "{failure}");
+
+        let summary = store
+            .usage_summary(crate::store::UsageScope::Thread(&thread.id))
+            .unwrap();
+        assert_eq!(summary.turns, 1);
+        assert_eq!(summary.input_tokens, 23);
+        assert_eq!(summary.cached_input_tokens, 4);
+        assert_eq!(summary.output_tokens, 7);
+        assert_eq!(summary.cost_usd, 0.5);
+        assert!(store.route_health().unwrap().is_empty());
     }
 
     #[tokio::test]

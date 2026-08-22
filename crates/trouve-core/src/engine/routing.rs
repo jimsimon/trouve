@@ -6,6 +6,22 @@
 
 use super::*;
 
+pub(super) fn unfinished_collaborator_reason(
+    cancelled: bool,
+    attempt_error: Option<&anyhow::Error>,
+    backend_error: Option<&BackendError>,
+) -> String {
+    if cancelled {
+        "turn cancelled".to_string()
+    } else if let Some(error) = attempt_error {
+        format!("parent turn event processing failed: {error}")
+    } else if let Some(error) = backend_error {
+        format!("parent backend stream failed: {error}")
+    } else {
+        "parent turn ended before collaborator completion".to_string()
+    }
+}
+
 impl Engine {
     pub(super) async fn run_routed_turn(
         self: &Arc<Self>,
@@ -1108,7 +1124,7 @@ impl Engine {
         let mut segment = String::new();
         let mut attempt_usage = Usage::default();
         let mut backend_error = None;
-        let mut approval_error = None;
+        let mut attempt_error = None;
         let mut backend_cancelled = false;
         let mut backend_completed = false;
         let mut open_tools = HashSet::new();
@@ -1182,7 +1198,7 @@ impl Engine {
                             Ok(approved) => approved,
                             Err(error) => {
                                 let _ = responder.send(false);
-                                approval_error = Some(error);
+                                attempt_error = Some(error);
                                 break;
                             }
                         };
@@ -1205,7 +1221,7 @@ impl Engine {
                         Ok(approved) => approved,
                         Err(error) => {
                             let _ = responder.send(false);
-                            approval_error = Some(error);
+                            attempt_error = Some(error);
                             break;
                         }
                     };
@@ -1719,22 +1735,18 @@ impl Engine {
         }
         .await;
         if let Err(error) = event_loop_result {
-            approval_error = Some(error);
+            attempt_error = Some(error);
         }
         drop(stream);
         backend_mutation_permits.clear();
         flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
         for collaborator in collaborators.values_mut() {
             if !collaborator.terminal {
-                let reason = if cancel.is_cancelled() || backend_cancelled {
-                    "turn cancelled".to_string()
-                } else if let Some(error) = approval_error.as_ref() {
-                    format!("parent approval failed: {error}")
-                } else if let Some(error) = backend_error.as_ref() {
-                    format!("parent backend stream failed: {error}")
-                } else {
-                    "parent turn ended before collaborator completion".to_string()
-                };
+                let reason = unfinished_collaborator_reason(
+                    cancel.is_cancelled() || backend_cancelled,
+                    attempt_error.as_ref(),
+                    backend_error.as_ref(),
+                );
                 self.finish_backend_collaborator(session, backend_id, collaborator, Err(reason))
                     .await?;
             }
@@ -1748,7 +1760,7 @@ impl Engine {
         .await;
         accounting.add_backend(&attempt_usage);
 
-        if approval_error.is_some() || backend_error.is_some() {
+        if attempt_error.is_some() || backend_error.is_some() {
             if !segment.is_empty() {
                 persisted.push(Event::AssistantMessage {
                     turn,
@@ -1782,7 +1794,8 @@ impl Engine {
             }
         }
 
-        if let Some(error) = approval_error {
+        if let Some(error) = attempt_error {
+            self.record_routed_usage(&session.id, &thread.id, turn, accounting, false)?;
             return Err(error);
         }
 
