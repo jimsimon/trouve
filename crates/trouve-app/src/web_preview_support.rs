@@ -29,18 +29,50 @@ fn background_nice_value(current: i32) -> i32 {
     current.saturating_add(BACKGROUND_NICE_INCREMENT).min(19)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn priority_result(value: i32, errno: i32) -> std::io::Result<i32> {
+    if value == -1 && errno != 0 {
+        Err(std::io::Error::from_raw_os_error(errno))
+    } else {
+        Ok(value)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_nice_value() -> std::io::Result<i32> {
+    // Linux exposes errno through thread-local storage. Clear it immediately
+    // before getpriority because -1 is both a valid niceness and its error
+    // sentinel, then snapshot it before another call can overwrite it.
+    // SAFETY: __errno_location returns the calling thread's errno slot.
+    let errno = unsafe { libc::__errno_location() };
+    unsafe {
+        *errno = 0;
+    }
+    // SAFETY: getpriority reads scheduler state for the calling Linux thread.
+    let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    // SAFETY: `errno` still points to this thread's valid errno slot.
+    let error_code = unsafe { *errno };
+    priority_result(current, error_code)
+}
+
 /// Lower only the runtime thread that invokes this hook. Linux inherits a
 /// thread's niceness when it spawns child processes, so agent subprocesses
 /// yield to the unchanged Tao/Wry event-loop thread under CPU contention.
 #[cfg(target_os = "linux")]
 fn deprioritize_background_thread() {
-    // SAFETY: these calls operate on the current Linux thread when `who` is
-    // zero and retain no Rust pointers.
-    let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let current = match current_nice_value() {
+        Ok(current) => current,
+        Err(error) => {
+            tracing::warn!(%error, "could not read desktop runtime CPU priority");
+            return;
+        }
+    };
     let target = background_nice_value(current);
     if target == current {
         return;
     }
+    // SAFETY: setpriority updates the calling Linux thread when `who` is
+    // zero and retains no Rust pointers.
     if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, target) } != 0 {
         tracing::warn!(
             error = %std::io::Error::last_os_error(),
@@ -314,6 +346,14 @@ mod tests {
         assert_eq!(background_nice_value(10), 15);
         assert_eq!(background_nice_value(18), 19);
         assert_eq!(background_nice_value(19), 19);
+    }
+
+    #[test]
+    fn failed_priority_reads_are_not_treated_as_valid_negative_niceness() {
+        const TEST_ERRNO: i32 = 5;
+        assert_eq!(priority_result(-1, 0).unwrap(), -1);
+        let error = priority_result(-1, TEST_ERRNO).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(TEST_ERRNO));
     }
 
     #[test]
