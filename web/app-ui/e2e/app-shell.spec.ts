@@ -339,7 +339,13 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   await expect(permission).toHaveValue("yolo");
 });
 
-test("session navigation uses compact one-line rows without branch names", async ({ page }, testInfo) => {
+test("session navigation shows configured branch names", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "trouve.workspace-list-preferences.v1",
+      JSON.stringify({ showStatus: false }),
+    );
+  });
   await page.goto("/");
   if (testInfo.project.name.startsWith("mobile")) {
     await page.getByRole("button", { name: "Sessions", exact: true }).click();
@@ -347,14 +353,17 @@ test("session navigation uses compact one-line rows without branch names", async
 
   const row = page.locator(".session-row").filter({ hasText: "Protocol ingress" });
   await expect(row).toBeVisible();
-  await expect(row).not.toContainText("feature");
-  await expect(row.locator(".session-copy small")).toHaveCount(0);
-  await expect(row).toHaveCSS("height", "34px");
+  await expect(row.locator(".session-branch")).toHaveText("feature");
+  await expect(row).toHaveCSS("height", "46px");
   await expect(row.locator(".session-copy strong")).toHaveCSS("white-space", "nowrap");
   const wrapper = row.locator("..");
   const age = row.locator(".session-age");
   const actions = wrapper.getByRole("button", { name: "Actions for Protocol ingress" });
   await expect(age).toHaveText(/^(?:now|\d+[mhdy])$/u);
+  await expect(row).toHaveClass(/without-status/u);
+  await expect(age).toHaveCSS("grid-column-start", "3");
+  expect(await row.evaluate((element) =>
+    getComputedStyle(element).gridTemplateColumns.split(" ").length)).toBe(3);
   if (testInfo.project.name.startsWith("mobile")) {
     await expect(age).toHaveCSS("opacity", "0");
     await expect(actions).toHaveCSS("opacity", "1");
@@ -383,6 +392,69 @@ test("session navigation uses compact one-line rows without branch names", async
     await expect(workspaceOrder).toHaveCSS("opacity", "1");
     await expect(workspaceActions).toHaveCSS("opacity", "1");
   }
+});
+
+test("workspace list options dismiss with Escape and an outside pointer", async ({ page }, testInfo) => {
+  await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+
+  const heading = page.locator(".workspace-list-heading");
+  const openWorkspace = heading.getByRole("button", { name: "Open workspace" });
+  await expect(openWorkspace.locator('[data-font-awesome-icon="plus"]')).toBeVisible();
+  await expect(openWorkspace).toHaveText("+");
+  const optionsBounds = await heading
+    .getByRole("button", { name: "Workspace list options" })
+    .boundingBox();
+  const openBounds = await openWorkspace.boundingBox();
+  expect(optionsBounds).not.toBeNull();
+  expect(openBounds).not.toBeNull();
+  expect(optionsBounds!.x).toBeLessThan(openBounds!.x);
+
+  const toggle = page.getByRole("button", { name: "Workspace list options" });
+  const options = page.getByRole("group", { name: "Workspace list options" });
+  await toggle.click();
+  await expect(options).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(options).toHaveCount(0);
+  await expect(toggle).toBeFocused();
+
+  await toggle.click();
+  await expect(options).toBeVisible();
+  await page.locator(".primary-links").click({ position: { x: 2, y: 2 } });
+  await expect(options).toHaveCount(0);
+});
+
+test("repository grouping exposes nested headings and disables ambiguous workspace reordering", async ({ page }, testInfo) => {
+  await page.route("**/v1/workspaces", async (route) => {
+    await route.fulfill({
+      json: [
+        { id: "ws_1", name: "first", path: "/src/first", repository_key: "remote:github.com/acme/app", repository_name: "app" },
+        { id: "ws_2", name: "other", path: "/src/other", repository_key: "remote:github.com/acme/other", repository_name: "other" },
+        { id: "ws_3", name: "clone", path: "/src/clone", repository_key: "remote:github.com/acme/app", repository_name: "app" },
+      ],
+    });
+  });
+  await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+
+  await expect(page.getByRole("heading", { level: 2, name: "app" })).toBeVisible();
+  const groupedWorkspaceHeading = page.getByRole("heading", { level: 3, name: "first" });
+  await expect(groupedWorkspaceHeading).toBeVisible();
+  await expect(groupedWorkspaceHeading).toHaveCSS("margin", "0px");
+  await expect(groupedWorkspaceHeading).toHaveCSS("font-size", "13px");
+  await expect(page.getByRole("heading", { level: 3, name: "clone" })).toBeVisible();
+  await expect(page.locator(".workspace-grip")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Workspace list options" }).click();
+  await page.getByRole("combobox", { name: "Group sessions by" }).selectOption("workspace");
+  await expect(page.getByRole("heading", { level: 2, name: "first" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 2, name: "clone" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "first" })).toHaveCount(0);
+  await expect(page.locator(".workspace-grip")).toHaveCount(3);
 });
 
 test("background session updates preserve command-palette scrolling", async ({ page }, testInfo) => {

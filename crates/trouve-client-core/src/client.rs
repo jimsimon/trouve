@@ -138,7 +138,7 @@ impl ProtocolClient {
         self.get_json("/info").await
     }
 
-    pub async fn register_workspace(&self, path: &str) -> Result<Workspace> {
+    pub async fn register_workspace(&self, path: &str) -> Result<WorkspaceListItem> {
         self.post_json(
             "/workspaces",
             &RegisterWorkspaceRequest {
@@ -149,7 +149,7 @@ impl ProtocolClient {
         .await
     }
 
-    pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+    pub async fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>> {
         self.get_json("/workspaces").await
     }
 

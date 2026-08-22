@@ -88,6 +88,17 @@ if (checkRunProperties !== undefined) {
   delete checkRunProperties.completed_at;
 }
 
+// Repository identity is optional presentation metadata. The workspace-list
+// model rejects malformed leaves before using them as grouping keys. Omitting
+// those two leaves here avoids adding duplicate optional-property branches to
+// both the single-workspace and workspace-array validators.
+const workspaceListItem = asRecord(protocolSchemas?.WorkspaceListItem);
+const workspaceListItemProperties = asRecord(workspaceListItem?.properties);
+if (workspaceListItemProperties !== undefined) {
+  delete workspaceListItemProperties.repository_key;
+  delete workspaceListItemProperties.repository_name;
+}
+
 // JSON object keys are always strings. utoipa currently describes the keys of
 // Rust maps keyed by u64 as integer-valued `propertyNames`, which rejects the
 // wire representation (for example `{ "7": "openai/gpt-5.6" }`). Normalize
@@ -151,8 +162,8 @@ const protocolValidators = {
   forkCheckpointResponse: componentRef(protocolSchemaId, "ForkCheckpointResponse"),
   generatedSessionTitle: componentRef(protocolSchemaId, "GeneratedSessionTitle"),
   summaries: componentRef(protocolSchemaId, "SessionSummariesSnapshot"),
-  workspace: componentRef(protocolSchemaId, "Workspace"),
-  workspaces: componentArray(protocolSchemaId, "Workspace"),
+  workspace: componentRef(protocolSchemaId, "WorkspaceListItem"),
+  workspaces: componentArray(protocolSchemaId, "WorkspaceListItem"),
   branchList: componentRef(protocolSchemaId, "BranchList"),
   prInfo: componentRef(protocolSchemaId, "PrInfo"),
   personas: componentArray(protocolSchemaId, "AgentPersona"),

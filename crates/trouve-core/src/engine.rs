@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +21,7 @@ use trouve_protocol::{
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
     TurnPhase, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
+    WorkspaceListItem,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -65,6 +66,13 @@ const MAX_SESSION_PR_HEAD_MOVED_ATTEMPTS: u32 = 12;
 const MAX_SESSION_PR_REQUEST_ATTEMPTS: u32 = 48;
 const SESSION_PR_AUTH_RETRY_SECONDS: i64 = 30;
 const SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+/// Repository identity changes rarely, but Git remotes remain mutable outside
+/// trouve. Revalidate periodically without spawning Git on every list poll.
+const WORKSPACE_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Repository identity is presentation metadata. Fall back to workspace
+/// identity instead of allowing a hostile or unhealthy Git probe to stall a
+/// workspace-list request indefinitely.
+const WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
 const PR_VERIFICATION_FAILURE_AUTH: &str = "authentication";
 const PR_VERIFICATION_FAILURE_CONTENTION: &str = "contention";
 const PR_VERIFICATION_FAILURE_EVIDENCE: &str = "evidence";
@@ -1872,11 +1880,21 @@ struct GlobalDefaults {
     thinking_level: Option<String>,
     permission_mode: trouve_protocol::PermissionMode,
 }
+struct WorkspaceListCacheEntry {
+    item: WorkspaceListItem,
+    refreshed_at: Instant,
+}
 
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     pub(crate) config_dir: Option<PathBuf>,
+    /// Cache repository identity so frequent workspace-list polls normally
+    /// avoid Git while still observing external remote changes within a bound.
+    workspace_list_cache: Mutex<HashMap<String, WorkspaceListCacheEntry>>,
+    /// Deduplicate expired repository-identity probes per workspace. Entries
+    /// are weak so closed or inactive workspaces do not grow this registry.
+    workspace_list_refresh_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute newly released or account-specific live models.
@@ -2319,6 +2337,8 @@ impl Engine {
             store,
             data_dir,
             config_dir,
+            workspace_list_cache: Mutex::new(HashMap::new()),
+            workspace_list_refresh_locks: Mutex::new(HashMap::new()),
             model_catalog,
             providers: RwLock::new(providers),
             injected_providers: Mutex::new(injected_providers),
@@ -7310,14 +7330,158 @@ impl Engine {
 
     // --- workspaces ---------------------------------------------------------
 
-    pub fn register_workspace(
+    fn resolve_workspace_list_item(workspace: Workspace, timeout: Duration) -> WorkspaceListItem {
+        let repository = Path::new(&workspace.path);
+        let (remote_url, common_directory) =
+            git::workspace_repository_sources(repository, "origin", timeout);
+        let remote_identity = remote_url.and_then(|remote| crate::github::parse_remote(&remote));
+        let (repository_key, repository_name) = if let Some((host, owner, name)) = remote_identity {
+            (
+                format!(
+                    "remote:{host}/{owner}/{name}",
+                    host = host.to_ascii_lowercase(),
+                    owner = owner.to_ascii_lowercase(),
+                    name = name.to_ascii_lowercase(),
+                ),
+                name,
+            )
+        } else {
+            (
+                common_directory
+                    .map(|directory| format!("local:{}", directory.to_string_lossy()))
+                    .unwrap_or_else(|| format!("workspace:{}", workspace.id)),
+                workspace.name.clone(),
+            )
+        };
+        WorkspaceListItem {
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+            repository_key: Some(repository_key),
+            repository_name: Some(repository_name),
+        }
+    }
+
+    fn fallback_workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
+        WorkspaceListItem {
+            repository_key: Some(format!("workspace:{}", workspace.id)),
+            repository_name: Some(workspace.name.clone()),
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+        }
+    }
+
+    fn workspace_list_refresh_lock(&self, workspace_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.workspace_list_refresh_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(workspace_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(workspace_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn cache_workspace_list_item(&self, item: WorkspaceListItem) -> WorkspaceListItem {
+        self.workspace_list_cache.lock().unwrap().insert(
+            item.id.clone(),
+            WorkspaceListCacheEntry {
+                item: item.clone(),
+                refreshed_at: Instant::now(),
+            },
+        );
+        item
+    }
+
+    fn cached_workspace_list_item(
         &self,
-        path: &str,
-        name: Option<String>,
-    ) -> Result<Workspace, EngineError> {
+        workspace: Workspace,
+        request_deadline: Instant,
+    ) -> WorkspaceListItem {
+        self.cached_workspace_list_item_with(
+            workspace,
+            request_deadline,
+            Self::resolve_workspace_list_item,
+        )
+    }
+
+    fn cached_workspace_list_item_with(
+        &self,
+        workspace: Workspace,
+        request_deadline: Instant,
+        resolve: impl FnOnce(Workspace, Duration) -> WorkspaceListItem,
+    ) -> WorkspaceListItem {
+        let cached = self
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get(&workspace.id)
+            .map(|entry| (entry.item.clone(), entry.refreshed_at));
+        if let Some((cached, refreshed_at)) = &cached
+            && refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL
+        {
+            return cached.clone();
+        }
+
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let Ok(_refresh) = refresh_lock.try_lock() else {
+            return cached
+                .map(|(item, _)| item)
+                .unwrap_or_else(|| Self::fallback_workspace_list_item(workspace));
+        };
+        let cached = self
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get(&workspace.id)
+            .map(|entry| (entry.item.clone(), entry.refreshed_at));
+        if let Some((cached, refreshed_at)) = &cached
+            && refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL
+        {
+            return cached.clone();
+        }
+        let Some(remaining) = request_deadline.checked_duration_since(Instant::now()) else {
+            return cached
+                .map(|(item, _)| item)
+                .unwrap_or_else(|| Self::fallback_workspace_list_item(workspace));
+        };
+        self.cache_workspace_list_item(resolve(workspace, remaining))
+    }
+
+    fn canonical_workspace_registration_path(path: &str) -> Result<PathBuf, EngineError> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| EngineError::BadRequest(format!("invalid path {path}: {e}")))?;
-        if !git::is_git_repo(&canonical) {
+        Ok(canonical)
+    }
+
+    fn workspace_registration_lock(&self, canonical: &Path) -> Arc<Mutex<()>> {
+        self.workspace_list_refresh_lock(&format!("registration:{}", canonical.to_string_lossy()))
+    }
+
+    fn acquire_workspace_registration_lock<'a>(
+        registration_lock: &'a Mutex<()>,
+        on_lock_attempt: impl FnOnce(bool),
+    ) -> MutexGuard<'a, ()> {
+        match registration_lock.try_lock() {
+            Ok(guard) => {
+                on_lock_attempt(false);
+                guard
+            }
+            Err(TryLockError::WouldBlock) => {
+                on_lock_attempt(true);
+                registration_lock.lock().unwrap()
+            }
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        }
+    }
+
+    fn prepare_workspace_registration(
+        &self,
+        canonical: &Path,
+        name: Option<String>,
+    ) -> Result<(Workspace, bool), EngineError> {
+        if !git::is_git_repo(canonical) {
             return Err(EngineError::BadRequest(format!(
                 "{} is not a git repository",
                 canonical.display()
@@ -7325,8 +7489,30 @@ impl Engine {
         }
         let path_str = canonical.to_string_lossy().to_string();
         if let Some(existing) = self.store.workspace_by_path(&path_str)? {
-            if self.store.set_workspace_closed(&existing.id, false)? {
-                for session in self.store.list_sessions(Some(&existing.id))? {
+            return Ok((existing, true));
+        }
+        let workspace = Workspace {
+            id: new_id("ws"),
+            name: name.unwrap_or_else(|| {
+                canonical
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "workspace".into())
+            }),
+            path: path_str.clone(),
+        };
+        Ok((workspace, false))
+    }
+
+    fn commit_workspace_registration(
+        &self,
+        workspace: Workspace,
+        item: WorkspaceListItem,
+        existing: bool,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        if existing {
+            if self.store.set_workspace_closed(&workspace.id, false)? {
+                for session in self.store.list_sessions(Some(&workspace.id))? {
                     if !session.archived {
                         self.terminals.reopen_session(&session.id);
                     }
@@ -7334,36 +7520,110 @@ impl Engine {
                 self.store.append_event(
                     Scope::Server,
                     Event::WorkspaceRegistered {
-                        workspace_id: existing.id.clone(),
-                        path: path_str,
+                        workspace_id: workspace.id.clone(),
+                        path: workspace.path,
                     },
                 )?;
             }
-            return Ok(existing);
+        } else {
+            self.store.insert_workspace(&workspace)?;
+            self.store.append_event(
+                Scope::Server,
+                Event::WorkspaceRegistered {
+                    workspace_id: workspace.id.clone(),
+                    path: workspace.path,
+                },
+            )?;
         }
-        let ws = Workspace {
-            id: new_id("ws"),
-            name: name.unwrap_or_else(|| {
-                canonical
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "workspace".into())
-            }),
-            path: path_str.clone(),
-        };
-        self.store.insert_workspace(&ws)?;
-        self.store.append_event(
-            Scope::Server,
-            Event::WorkspaceRegistered {
-                workspace_id: ws.id.clone(),
-                path: path_str,
-            },
-        )?;
-        Ok(ws)
+        Ok(self.cache_workspace_list_item(item))
     }
 
-    pub fn list_workspaces(&self) -> Result<Vec<Workspace>, EngineError> {
-        Ok(self.store.list_workspaces()?)
+    pub fn register_workspace(
+        &self,
+        path: &str,
+        name: Option<String>,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        self.register_workspace_with(path, name, |_| {}, || {})
+    }
+
+    fn register_workspace_with(
+        &self,
+        path: &str,
+        name: Option<String>,
+        on_lock_attempt: impl FnOnce(bool),
+        after_prepare: impl FnOnce(),
+    ) -> Result<WorkspaceListItem, EngineError> {
+        let canonical = Self::canonical_workspace_registration_path(path)?;
+        let registration_lock = self.workspace_registration_lock(&canonical);
+        let _registration =
+            Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
+        let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
+        after_prepare();
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        let item = Self::resolve_workspace_list_item(
+            workspace.clone(),
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
+        self.commit_workspace_registration(workspace, item, existing)
+    }
+
+    pub(crate) fn register_review_workspace(
+        &self,
+        path: &str,
+        name: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &Mutex<()>,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        self.register_review_workspace_with(path, name, cancel, commit_fence, || {})
+    }
+
+    fn register_review_workspace_with(
+        &self,
+        path: &str,
+        name: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &Mutex<()>,
+        before_commit: impl FnOnce(),
+    ) -> Result<WorkspaceListItem, EngineError> {
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let canonical = Self::canonical_workspace_registration_path(path)?;
+        let registration_lock = self.workspace_registration_lock(&canonical);
+        let _registration = registration_lock.lock().unwrap();
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        let item = Self::resolve_workspace_list_item(
+            workspace.clone(),
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
+        before_commit();
+        let _commit = commit_fence.lock().unwrap();
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        self.commit_workspace_registration(workspace, item, existing)
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>, EngineError> {
+        let request_deadline = Instant::now() + WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT;
+        Ok(self
+            .store
+            .list_workspaces()?
+            .into_iter()
+            .map(|workspace| self.cached_workspace_list_item(workspace, request_deadline))
+            .collect())
     }
 
     /// Capture authenticated hosts and register their cache handles as one
@@ -7556,6 +7816,7 @@ impl Engine {
                 },
             )?;
         }
+        self.workspace_list_cache.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -21634,6 +21895,294 @@ default_permission_mode = "ask"
         let evidence = pr_evidence_from_events(events, "github.com", "jimsimon", "trouve");
         assert_eq!(evidence.numbers, HashSet::from([267, 268, 271]));
         assert_eq!(evidence.successful_tool_args.len(), 3);
+    }
+
+    #[test]
+    fn workspace_list_items_cache_normalized_remote_identity() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        for repository in [first_directory.path(), second_directory.path()] {
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository);
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+            let mut remote = std::process::Command::new("git");
+            remote.arg("-C").arg(repository).args([
+                "remote",
+                "add",
+                "origin",
+                "git@GitHub.com:Acme/Widgets.git",
+            ]);
+            assert!(
+                trouve_process::output(&mut remote)
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first = engine
+            .register_workspace(
+                first_directory.path().to_str().unwrap(),
+                Some("first clone".into()),
+            )
+            .unwrap();
+        let second = engine
+            .register_workspace(
+                second_directory.path().to_str().unwrap(),
+                Some("second clone".into()),
+            )
+            .unwrap();
+
+        assert_eq!(first.repository_key, second.repository_key);
+        assert_eq!(first.repository_name.as_deref(), Some("Widgets"));
+        assert_eq!(second.repository_name.as_deref(), Some("Widgets"));
+
+        let mut remote = std::process::Command::new("git");
+        remote.arg("-C").arg(second_directory.path()).args([
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:Acme/Other.git",
+        ]);
+        assert!(
+            trouve_process::output(&mut remote)
+                .unwrap()
+                .status
+                .success()
+        );
+        engine
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get_mut(&second.id)
+            .unwrap()
+            .refreshed_at = Instant::now() - WORKSPACE_LIST_CACHE_TTL;
+
+        let listed = engine.list_workspaces().unwrap();
+        let refreshed = listed
+            .iter()
+            .find(|workspace| workspace.id == second.id)
+            .unwrap();
+        assert_ne!(refreshed.repository_key, first.repository_key);
+        assert_eq!(refreshed.repository_name.as_deref(), Some("Other"));
+
+        drop(first_directory);
+        drop(second_directory);
+        let cached = engine.list_workspaces().unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(
+            cached
+                .iter()
+                .find(|workspace| workspace.id == second.id)
+                .and_then(|workspace| workspace.repository_name.as_deref()),
+            Some("Other")
+        );
+    }
+
+    #[test]
+    fn concurrent_first_workspace_registrations_share_one_workspace() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let repository_path = repository.path().to_path_buf();
+        let (first_prepared_tx, first_prepared_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_engine = Arc::clone(&engine);
+        let first_path = repository_path.clone();
+        let first = std::thread::spawn(move || {
+            first_engine.register_workspace_with(
+                first_path.to_str().unwrap(),
+                Some("first registration".into()),
+                |contended| assert!(!contended),
+                || {
+                    first_prepared_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            )
+        });
+        first_prepared_rx.recv().unwrap();
+
+        let (second_lock_tx, second_lock_rx) = std::sync::mpsc::channel();
+        let second_engine = Arc::clone(&engine);
+        let second = std::thread::spawn(move || {
+            second_engine.register_workspace_with(
+                repository_path.to_str().unwrap(),
+                Some("second registration".into()),
+                |contended| second_lock_tx.send(contended).unwrap(),
+                || {},
+            )
+        });
+        assert!(second_lock_rx.recv().unwrap());
+        release_first_tx.send(()).unwrap();
+
+        let registrations = [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
+
+        assert_eq!(registrations[0].id, registrations[1].id);
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        assert_eq!(
+            engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|envelope| matches!(envelope.event, Event::WorkspaceRegistered { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_list_identity_refresh_is_single_flight_per_workspace() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = Workspace {
+            id: "ws_single_flight".into(),
+            name: "single flight".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        engine.workspace_list_cache.lock().unwrap().insert(
+            workspace.id.clone(),
+            WorkspaceListCacheEntry {
+                item: WorkspaceListItem {
+                    id: workspace.id.clone(),
+                    name: workspace.name.clone(),
+                    path: workspace.path.clone(),
+                    repository_key: Some("remote:github.com/acme/widgets".into()),
+                    repository_name: Some("widgets".into()),
+                },
+                refreshed_at: Instant::now() - WORKSPACE_LIST_CACHE_TTL,
+            },
+        );
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles = (0..2)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let workspace = workspace.clone();
+                let start = Arc::clone(&start);
+                let resolutions = Arc::clone(&resolutions);
+                std::thread::spawn(move || {
+                    start.wait();
+                    engine.cached_workspace_list_item_with(
+                        workspace,
+                        Instant::now() + Duration::from_secs(1),
+                        move |workspace, _timeout| {
+                            resolutions.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(50));
+                            WorkspaceListItem {
+                                id: workspace.id,
+                                name: workspace.name,
+                                path: workspace.path,
+                                repository_key: Some("remote:github.com/acme/widgets".into()),
+                                repository_name: Some("widgets".into()),
+                            }
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let items = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert!(items.iter().all(|item| {
+            item.repository_key.as_deref() == Some("remote:github.com/acme/widgets")
+        }));
+    }
+
+    #[test]
+    fn workspace_list_identity_refreshes_share_one_request_deadline() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first = Workspace {
+            id: "ws_budget_first".into(),
+            name: "first".into(),
+            path: data.path().join("first").to_string_lossy().into_owned(),
+        };
+        let second = Workspace {
+            id: "ws_budget_second".into(),
+            name: "second".into(),
+            path: data.path().join("second").to_string_lossy().into_owned(),
+        };
+        let resolutions = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let first_item =
+            engine.cached_workspace_list_item_with(first, deadline, |workspace, remaining| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(remaining + Duration::from_millis(10));
+                Engine::fallback_workspace_list_item(workspace)
+            });
+        let second_item =
+            engine.cached_workspace_list_item_with(second, deadline, |workspace, _remaining| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Engine::fallback_workspace_list_item(workspace)
+            });
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first_item.repository_key.as_deref(),
+            Some("workspace:ws_budget_first")
+        );
+        assert_eq!(
+            second_item.repository_key.as_deref(),
+            Some("workspace:ws_budget_second")
+        );
+    }
+
+    #[test]
+    fn cancelled_review_workspace_registration_does_not_commit() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let error = engine
+            .register_review_workspace_with(
+                repository.path().to_str().unwrap(),
+                Some("cancelled review".into()),
+                &cancel,
+                &Mutex::new(()),
+                || cancel.cancel(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().starts_with("stale:"));
+        assert!(engine.list_workspaces().unwrap().is_empty());
     }
 
     #[test]
