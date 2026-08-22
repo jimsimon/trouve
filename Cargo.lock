@@ -7303,6 +7303,7 @@ dependencies = [
  "arboard",
  "dirs",
  "keepawake",
+ "libc",
  "mime_guess",
  "notify-rust",
  "open",
