@@ -958,15 +958,15 @@ struct DashboardSearchQueries {
     closed: String,
 }
 
-fn dashboard_search_queries(viewer: &str, terminal_since: DateTime<Utc>) -> DashboardSearchQueries {
-    let cutoff = terminal_since.to_rfc3339();
+fn dashboard_search_queries(viewer: &str, merged_since: DateTime<Utc>) -> DashboardSearchQueries {
+    let cutoff = merged_since.to_rfc3339();
     DashboardSearchQueries {
         open: format!("is:pr is:open involves:{viewer}"),
         review: format!("is:pr is:open review-requested:{viewer}"),
         merged: format!("is:pr is:merged merged:>={cutoff} involves:{viewer}"),
-        // Closed, unmerged PRs are not actionable dashboard rows, but keeping
-        // their terminal summaries lets associated sessions render red badges.
-        closed: format!("is:pr is:closed is:unmerged closed:>={cutoff} involves:{viewer}"),
+        // Keep closed, unmerged summaries in the durable account snapshot so
+        // their sessions retain red badges and the dashboard can list them.
+        closed: format!("is:pr is:closed is:unmerged involves:{viewer}"),
     }
 }
 
@@ -3994,7 +3994,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_queries_include_recent_closed_unmerged_pull_requests() {
+    fn dashboard_queries_include_closed_unmerged_pull_requests_without_an_age_cutoff() {
         let queries = dashboard_search_queries("alice", "2026-07-20T12:34:56Z".parse().unwrap());
 
         assert_eq!(queries.open, "is:pr is:open involves:alice");
@@ -4003,10 +4003,7 @@ mod tests {
             queries.merged,
             "is:pr is:merged merged:>=2026-07-20T12:34:56+00:00 involves:alice"
         );
-        assert_eq!(
-            queries.closed,
-            "is:pr is:closed is:unmerged closed:>=2026-07-20T12:34:56+00:00 involves:alice"
-        );
+        assert_eq!(queries.closed, "is:pr is:closed is:unmerged involves:alice");
         assert!(DASHBOARD_SEARCH_QUERY.contains("closed: search"));
         assert!(DASHBOARD_SEARCH_QUERY.contains("@include(if: $includeClosed)"));
     }

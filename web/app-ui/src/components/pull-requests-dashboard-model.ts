@@ -90,39 +90,39 @@ const pullRequestGroup = <Key extends PullRequestGroupKey>(
 export const PULL_REQUEST_GROUPS = Object.freeze([
   pullRequestGroup(
     "review-requested", "Review Requested",
-    "Your requested reviews.",
-    "circle-dot", "accent", "No reviews waiting.",
+    "Requested reviews.",
+    "circle-dot", "accent", "No reviews.",
   ),
   pullRequestGroup(
     "drafts", "Drafts", "Open drafts.",
-    "pen", "muted", "No open drafts.",
+    "pen", "muted", "No drafts.",
   ),
   pullRequestGroup(
     "needs-reviewers", "Needs Reviewers",
-    "Open pull requests without reviewers.",
+    "Without reviewers.",
     "user-plus", "warning", "All have reviewers.",
   ),
   pullRequestGroup(
     "pending-review", "Pending Review",
-    "Waiting for review or approval.",
-    "circle-half-stroke", "warning", "No pending reviews.",
+    "Awaiting review.",
+    "circle-half-stroke", "warning", "None pending.",
   ),
   pullRequestGroup(
     "ready-to-merge", "Ready to Merge",
-    "Approved pull requests with passing checks.",
+    "Approved and green.",
     "check", "ok", "Nothing ready.",
   ),
   pullRequestGroup(
     "needs-attention", "Needs Attention",
-    "Merge conflicts, failing checks, or requested changes.",
+    "Conflicts, failures, or changes.",
     "triangle-exclamation", "danger", "All clear.",
   ),
   pullRequestGroup(
-    "recently-merged", "Recently Merged", "Merged in 24 hours.",
-    "code-merge", "tint", "No recent merges.",
+    "recently-merged", "Recently Merged", "Merged in 24h.",
+    "code-merge", "tint", "No merges.",
   ),
   pullRequestGroup(
-    "closed", "Closed", "Closed without merging.",
+    "closed", "Closed", "Unmerged PRs.",
     "code-pull-request", "danger", "No closed PRs.",
   ),
 ]);
@@ -273,8 +273,8 @@ export const reconcilePullRequestGroupOrder = (
   const seen = new Set<PullRequestGroupKey>();
   const order: PullRequestGroupKey[] = [];
   for (const key of saved) {
-    if (!definitionByKey.has(key as PullRequestGroupKey)) continue;
-    const known = key as PullRequestGroupKey;
+    const known = (key === "recently-closed" ? "closed" : key) as PullRequestGroupKey;
+    if (!definitionByKey.has(known)) continue;
     if (seen.has(known)) continue;
     seen.add(known);
     order.push(known);

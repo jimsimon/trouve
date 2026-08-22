@@ -134,6 +134,19 @@ describe("pull request dashboard model", () => {
       "drafts",
       false,
     ).slice(0, 3)).toEqual(["ready-to-merge", "recently-merged", "drafts"]);
+
+    const migrated = reconcilePullRequestGroupOrder([
+      "drafts",
+      "recently-closed",
+      "ready-to-merge",
+      "closed",
+    ]);
+    expect(migrated.changed).toBe(true);
+    expect(migrated.order.slice(0, 3)).toEqual([
+      "drafts",
+      "closed",
+      "ready-to-merge",
+    ]);
   });
 
   it("builds filtered, newest-first rows with chat and first-party review data", () => {
