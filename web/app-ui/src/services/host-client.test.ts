@@ -207,6 +207,44 @@ describe("HostClient", () => {
     }
   });
 
+  it("keeps a long-running desktop install attached to its native outcome", async () => {
+    vi.useFakeTimers();
+    try {
+      let installRequest: Request | undefined;
+      let finishInstall: ((response: Response) => void) | undefined;
+      const pendingInstall = new Promise<Response>((resolve) => {
+        finishInstall = resolve;
+      });
+      const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        if (request.url.endsWith("/capabilities")) {
+          return Response.json({
+            capabilities: validCapabilities,
+            csrf_token: "i".repeat(64),
+          });
+        }
+        installRequest = request;
+        return await pendingInstall;
+      });
+      const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+      await client.bootstrap();
+
+      const installation = client.installDesktopUpdate();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(installRequest?.signal.aborted).toBe(false);
+      finishInstall?.(Response.json({
+        available_version: "4.1.0",
+        current_version: "4.0.0",
+        message: "Restarting Trouve...",
+        phase: "restarting",
+        progress_percent: 100,
+      }));
+      await expect(installation).resolves.toMatchObject({ phase: "restarting" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("gates close acknowledgement on the independently versioned bridge", async () => {
     const legacyRequests: Request[] = [];
     const legacyFetch = vi.fn<typeof fetch>(async (input) => {

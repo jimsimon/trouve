@@ -204,25 +204,30 @@ impl InstallationBaseline {
     /// Capture a self-update-eligible installation before any asynchronous
     /// startup work can replace it.
     pub fn capture(current_version: &str) -> Result<Self> {
-        ensure_self_update_build()?;
+        let version = validated_current_version(current_version)?;
         let executable = std::env::current_exe().context("locating the installed executable")?;
         ensure_self_update_supported_for(&executable)?;
         let identity = executable_identity(&executable)?;
-        let version = Version::parse(current_version)
-            .with_context(|| format!("invalid current version {current_version:?}"))?;
-        let compiled = Version::parse(env!("CARGO_PKG_VERSION"))
-            .context("the updater crate has an invalid compiled version")?;
-        if version != compiled {
-            bail!(
-                "the supplied current version {version} does not match this binary's compiled version {compiled}"
-            );
-        }
         Ok(Self {
             executable,
             identity,
             version,
         })
     }
+}
+
+fn validated_current_version(current_version: &str) -> Result<Version> {
+    ensure_self_update_build()?;
+    let version = Version::parse(current_version)
+        .with_context(|| format!("invalid current version {current_version:?}"))?;
+    let compiled = Version::parse(env!("CARGO_PKG_VERSION"))
+        .context("the updater crate has an invalid compiled version")?;
+    if version != compiled {
+        bail!(
+            "the supplied current version {version} does not match this binary's compiled version {compiled}"
+        );
+    }
+    Ok(version)
 }
 
 /// A newer release with every asset required to update one component.
@@ -451,8 +456,8 @@ fn ensure_component_target_supported(component: Component, target: &str) -> Resu
     Ok(())
 }
 
-/// Query the latest stable release and resolve the exact artifact for this
-/// component and compile target.
+/// Query the latest stable release and bind any available update to this
+/// executable so the returned release can be installed safely.
 pub async fn check(component: Component, current_version: &str) -> Result<UpdateCheck> {
     let baseline = InstallationBaseline::capture(current_version)?;
     ensure_component_matches_executable(component, &baseline.executable)?;
@@ -462,6 +467,14 @@ pub async fn check(component: Component, current_version: &str) -> Result<Update
         release.checked_identity = Some(baseline.identity);
     }
     Ok(check)
+}
+
+/// Query the latest stable release without requiring this installation to be
+/// writable. Releases returned here are intentionally not installable; use
+/// [`check`] when the caller may pass the result to an installation function.
+pub async fn check_read_only(component: Component, current_version: &str) -> Result<UpdateCheck> {
+    let current = validated_current_version(current_version)?;
+    check_for_version(component, current).await
 }
 
 async fn check_for_version(component: Component, current: Version) -> Result<UpdateCheck> {

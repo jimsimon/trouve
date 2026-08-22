@@ -84,9 +84,11 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_update(check_only: bool) -> anyhow::Result<()> {
     if check_only {
-        let check =
-            trouve_update::check(trouve_update::Component::Server, env!("CARGO_PKG_VERSION"))
-                .await?;
+        let check = trouve_update::check_read_only(
+            trouve_update::Component::Server,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await?;
         let Some(release) = check.update else {
             println!("trouve-server {} is up to date.", check.current);
             return Ok(());

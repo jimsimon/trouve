@@ -326,7 +326,7 @@ fn run_update(check_only: bool) -> ExitCode {
     };
     let result = runtime.block_on(async {
         if check_only {
-            let check = trouve_update::check(
+            let check = trouve_update::check_read_only(
                 trouve_update::Component::Search,
                 env!("CARGO_PKG_VERSION"),
             )
