@@ -2235,14 +2235,16 @@ pub fn workspace_repository_sources(
     )
     .ok()
     .filter(|output| !output.truncated)
-    .and_then(|output| {
+    .map(|output| {
         let common = PathBuf::from(String::from_utf8_lossy(&output.bytes).trim().to_string());
-        let common = if common.is_absolute() {
+        // Keep all filesystem traversal inside the bounded Git child. The
+        // workspace root is canonical at registration, so joining Git's
+        // relative result is stable without an unbounded canonicalize call.
+        if common.is_absolute() {
             common
         } else {
             repo.join(common)
-        };
-        common.canonicalize().ok()
+        }
     });
     (remote_url, common_directory)
 }

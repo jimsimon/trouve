@@ -4225,15 +4225,27 @@ impl Engine {
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
         self.sync_code_review_projection(&record.job).await;
         let active_threads = Arc::new(Mutex::new(HashSet::new()));
+        let workspace_registration_fence = Arc::new(Mutex::new(()));
         let review_settings = self.effective_code_review_settings();
         let review_timeout = Duration::from_secs(review_settings.total_timeout_seconds);
         let result = tokio::time::timeout(
             review_timeout,
-            self.execute_code_review(&record, &cancel, &active_threads, &review_settings),
+            self.execute_code_review(
+                &record,
+                &cancel,
+                &active_threads,
+                &workspace_registration_fence,
+                &review_settings,
+            ),
         )
         .await;
         if result.is_err() {
             cancel.cancel();
+            // A blocking registration may outlive its dropped join future.
+            // Wait for an in-progress commit, or establish cancellation before
+            // a still-probing worker is allowed to mutate durable state.
+            let registration_commit = workspace_registration_fence.lock().unwrap();
+            drop(registration_commit);
             let active_threads = match active_threads.lock() {
                 Ok(active_threads) => active_threads.iter().cloned().collect::<Vec<_>>(),
                 Err(error) => {
@@ -4378,6 +4390,7 @@ impl Engine {
         record: &CodeReviewJobRecord,
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
+        workspace_registration_fence: &Arc<Mutex<()>>,
         review_settings: &CodeReviewSettings,
     ) -> Result<String> {
         let preparation_started = Instant::now();
@@ -4498,8 +4511,15 @@ impl Engine {
         let registration_engine = Arc::clone(self);
         let registration_path = repository_path.to_string_lossy().into_owned();
         let registration_name = job.repository.clone();
+        let registration_cancel = superseded.clone();
+        let registration_fence = Arc::clone(workspace_registration_fence);
         let workspace = tokio::task::spawn_blocking(move || {
-            registration_engine.register_workspace(&registration_path, Some(registration_name))
+            registration_engine.register_review_workspace(
+                &registration_path,
+                Some(registration_name),
+                &registration_cancel,
+                &registration_fence,
+            )
         })
         .await
         .context("joining review workspace registration worker")??;
