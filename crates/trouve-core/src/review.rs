@@ -95,7 +95,7 @@ const REVIEW_COLLAPSE_BATCH_LIMIT: u64 = 16;
 const REVIEW_COLLAPSE_GROUP_CONCURRENCY: usize = 4;
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
-const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 32;
+const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 24;
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
 // Bump when batch identity or composition changes so interrupted jobs never
@@ -19863,7 +19863,7 @@ mod tests {
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("about one minute"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("no more than 4 tool calls"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("checked-in code"));
-        assert_eq!(DEFAULT_REVIEW_TASK_CONCURRENCY, 32);
+        assert_eq!(DEFAULT_REVIEW_TASK_CONCURRENCY, 24);
     }
 
     #[test]
