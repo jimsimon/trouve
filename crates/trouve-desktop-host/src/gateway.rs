@@ -242,12 +242,18 @@ pub fn host_openapi_json() -> serde_json::Value {
         "description": "Added in bridge v14. Older desktop hosts omit it and must continue to\nbootstrap with external video playback disabled."
     });
     let mut ordered = serde_json::Map::new();
+    let mut inserted_video_schema = false;
     for (name, schema) in std::mem::take(properties) {
         if name == "persistent_preferences" {
             ordered.insert("open_video_attachment".into(), video_schema.clone());
+            inserted_video_schema = true;
         }
         ordered.insert(name, schema);
     }
+    assert!(
+        inserted_video_schema,
+        "HostCapabilities schema is missing the video capability anchor"
+    );
     *properties = ordered;
     value
 }
@@ -709,8 +715,8 @@ async fn get_capabilities(
     headers: HeaderMap,
 ) -> Result<Response, GatewayRejection> {
     validate_read(&state, &headers)?;
-    let open_video_attachment = state.capabilities.kind != HostKind::Desktop
-        || state.native_actions.can_open_video_attachment();
+    let open_video_attachment = state.capabilities.kind == HostKind::Desktop
+        && state.native_actions.can_open_video_attachment();
     let mut response = Json(HostBootstrapWire {
         capabilities: HostCapabilitiesWire {
             base: state.capabilities,
@@ -3181,7 +3187,8 @@ mod tests {
                 .with_external_https_opener(move |_| {
                     *opened_for_action.lock().unwrap() = true;
                     Ok(())
-                }),
+                })
+                .with_video_attachment_opener(|_| async { Ok(()) }),
         )
         .router();
         let bootstrap_response = app
@@ -3195,7 +3202,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        let bootstrap_value: serde_json::Value = response_json(bootstrap_response).await;
+        let bootstrap: HostBootstrap = serde_json::from_value(bootstrap_value.clone()).unwrap();
         // PWA/browser opening is a browser feature, not permission to call a
         // desktop native action.
         assert!(bootstrap.capabilities.open_https_url);
@@ -3207,6 +3215,10 @@ mod tests {
         assert!(!bootstrap.capabilities.reveal_local_file);
         assert!(!bootstrap.capabilities.native_notifications);
         assert!(!bootstrap.capabilities.sleep_inhibition);
+        assert_eq!(
+            bootstrap_value["capabilities"]["open_video_attachment"],
+            serde_json::Value::Bool(false),
+        );
 
         let response = app
             .clone()

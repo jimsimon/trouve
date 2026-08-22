@@ -20,6 +20,8 @@ describe("pending attachment previews", () => {
     expect(base64DecodedByteLength("YQ==")).toBe(1);
     expect(base64DecodedByteLength("")).toBeUndefined();
     expect(base64DecodedByteLength("YQ=")).toBeUndefined();
+    expect(base64DecodedByteLength("A===")).toBeUndefined();
+    expect(base64DecodedByteLength("====")).toBeUndefined();
   });
 
   it("coalesces duplicate attachment operations until the first settles", async () => {

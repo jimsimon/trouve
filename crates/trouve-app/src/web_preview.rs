@@ -92,6 +92,31 @@ struct VideoMaterializationError {
 }
 
 #[derive(Debug)]
+struct VideoPlaybackOpenError {
+    message: String,
+    retain_path: bool,
+}
+
+impl From<String> for VideoPlaybackOpenError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retain_path: false,
+        }
+    }
+}
+
+impl From<opener::OpenAttemptError> for VideoPlaybackOpenError {
+    fn from(error: opener::OpenAttemptError) -> Self {
+        let retain_path = error.retain_path();
+        Self {
+            message: error.to_string(),
+            retain_path,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct VideoPlaybackCache {
     _owner_lock: File,
     directory: tempfile::TempDir,
@@ -121,7 +146,9 @@ impl VideoPlaybackCache {
         max_files: usize,
         max_bytes: usize,
     ) -> std::io::Result<Self> {
-        cleanup_stale_video_directories(parent)?;
+        if let Err(error) = cleanup_stale_video_directories(parent) {
+            tracing::warn!(%error, parent = %parent.display(), "could not sweep stale video directories");
+        }
 
         let directory = tempfile::Builder::new()
             .prefix(VIDEO_PLAYBACK_DIRECTORY_PREFIX)
@@ -296,13 +323,38 @@ impl VideoPlaybackCache {
         lease: VideoPlaybackLease,
         result: Result<(), VideoAttachmentOpenError>,
     ) -> Result<(), VideoAttachmentOpenError> {
-        self.complete_with_cleanup(lease, result, remove_temporary_video)
+        let retain_path = result.is_ok();
+        self.complete_with_retention(lease, result, retain_path)
     }
 
+    fn complete_with_retention(
+        &mut self,
+        lease: VideoPlaybackLease,
+        result: Result<(), VideoAttachmentOpenError>,
+        retain_path: bool,
+    ) -> Result<(), VideoAttachmentOpenError> {
+        self.complete_with_cleanup_and_retention(lease, result, retain_path, remove_temporary_video)
+    }
+
+    #[cfg(test)]
     fn complete_with_cleanup<R>(
         &mut self,
         lease: VideoPlaybackLease,
         result: Result<(), VideoAttachmentOpenError>,
+        remove: R,
+    ) -> Result<(), VideoAttachmentOpenError>
+    where
+        R: FnMut(&std::path::Path) -> bool,
+    {
+        let retain_path = result.is_ok();
+        self.complete_with_cleanup_and_retention(lease, result, retain_path, remove)
+    }
+
+    fn complete_with_cleanup_and_retention<R>(
+        &mut self,
+        lease: VideoPlaybackLease,
+        result: Result<(), VideoAttachmentOpenError>,
+        retain_path: bool,
         mut remove: R,
     ) -> Result<(), VideoAttachmentOpenError>
     where
@@ -319,7 +371,7 @@ impl VideoPlaybackCache {
                     "video playback lease was already reconciled".to_string(),
                 )
             })?;
-            if result.is_ok() {
+            if retain_path {
                 entry.launched = true;
             } else {
                 remove_failed_entry = entry.active_leases == 0 && !entry.launched;
@@ -403,13 +455,14 @@ impl VideoPlaybackLeaseGuard {
     fn complete(
         mut self,
         result: Result<(), VideoAttachmentOpenError>,
+        retain_path: bool,
     ) -> Result<(), VideoAttachmentOpenError> {
         let cache = Arc::clone(&self.cache);
         let mut cache = cache.lock().map_err(|_| {
             VideoAttachmentOpenError::Failed("video playback cache is unavailable".to_string())
         })?;
         let lease = self.lease.take().expect("unreconciled lease");
-        cache.complete(lease, result)
+        cache.complete_with_retention(lease, result, retain_path)
     }
 }
 
@@ -436,7 +489,7 @@ async fn open_video_attachment(
     attachment: NativeAttachment,
 ) -> Result<(), VideoAttachmentOpenError> {
     open_video_attachment_with(cache, attachment, |path| async move {
-        opener::open_confirmed(path).await
+        opener::open_confirmed(path).await.map_err(Into::into)
     })
     .await
 }
@@ -448,7 +501,7 @@ async fn open_video_attachment_with<F, Fut>(
 ) -> Result<(), VideoAttachmentOpenError>
 where
     F: FnOnce(PathBuf) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(), String>> + Send + 'static,
+    Fut: Future<Output = Result<(), VideoPlaybackOpenError>> + Send + 'static,
 {
     // The launcher, not the HTTP request, owns the playback lease. Dropping a
     // disconnected request detaches this task; it does not reclaim the file
@@ -467,7 +520,7 @@ async fn drive_video_attachment<F, Fut>(
 ) -> Result<(), VideoAttachmentOpenError>
 where
     F: FnOnce(PathBuf) -> Fut,
-    Fut: Future<Output = Result<(), String>>,
+    Fut: Future<Output = Result<(), VideoPlaybackOpenError>>,
 {
     let lease = {
         let mut cache = cache.lock().map_err(|_| {
@@ -476,10 +529,10 @@ where
         cache.prepare(&attachment)?
     };
     let lease = VideoPlaybackLeaseGuard::new(cache, lease);
-    let result = open(lease.path().to_owned())
-        .await
-        .map_err(VideoAttachmentOpenError::Failed);
-    lease.complete(result)
+    let opened = open(lease.path().to_owned()).await;
+    let retain_path = opened.is_ok() || opened.as_ref().is_err_and(|error| error.retain_path);
+    let result = opened.map_err(|error| VideoAttachmentOpenError::Failed(error.message));
+    lease.complete(result, retain_path)
 }
 
 fn materialize_temporary_video(
@@ -1327,7 +1380,9 @@ mod close_confirmation_tests {
             open_video_attachment_with(task_cache, attachment, move |_| async move {
                 let _ = started.send(());
                 let _ = release_rx.await;
-                Err("cancelled test launcher".to_string())
+                Err(VideoPlaybackOpenError::from(
+                    "cancelled test launcher".to_string(),
+                ))
             })
             .await
         });
@@ -1358,7 +1413,7 @@ mod close_confirmation_tests {
         open_video_attachment_with(
             Arc::clone(&cache),
             video_attachment("replacement.mp4", b"replacement"),
-            |_| async { Ok(()) },
+            |_| async { Ok::<(), VideoPlaybackOpenError>(()) },
         )
         .await
         .unwrap();
@@ -1366,6 +1421,36 @@ mod close_confirmation_tests {
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(cache.entries[0].active_leases, 0);
         assert!(cache.entries[0].launched);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_launcher_failure_retains_the_cache_path() {
+        let cache = Arc::new(Mutex::new(
+            VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap(),
+        ));
+        let result = open_video_attachment_with(
+            Arc::clone(&cache),
+            video_attachment("ambiguous.mp4", b"ambiguous"),
+            |_| async {
+                Err(VideoPlaybackOpenError {
+                    message: "launcher state is ambiguous".into(),
+                    retain_path: true,
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(VideoAttachmentOpenError::Failed(
+                "launcher state is ambiguous".into(),
+            ))
+        );
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].active_leases, 0);
+        assert!(cache.entries[0].launched);
+        assert!(cache.entries[0].path.exists());
     }
 
     #[test]

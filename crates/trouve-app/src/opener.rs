@@ -1,16 +1,90 @@
 //! Non-blocking system opener that still reaps its launcher process.
 
 use std::ffi::{OsStr, OsString};
-use std::sync::OnceLock;
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const QUEUE_CAPACITY: usize = 16;
 const LAUNCHER_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKER_TIMEOUT: Duration = Duration::from_secs(12);
-const HANDOFF_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(250);
+const HANDOFF_CONFIRMATION_INTERVAL: Duration = Duration::from_secs(2);
 const LAUNCHER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const LAUNCHER_REAPER_WORKERS: usize = 8;
+const DISPATCH_QUEUED: u8 = 0;
+const DISPATCH_ENTERED: u8 = 1;
+const DISPATCH_CANCELLED: u8 = 2;
 static WORKER: OnceLock<Option<SyncSender<OsString>>> = OnceLock::new();
+static LAUNCHER_REAPER: OnceLock<Option<Sender<std::process::Child>>> = OnceLock::new();
+
+#[derive(Debug)]
+pub(super) struct OpenAttemptError {
+    error: std::io::Error,
+    retain_path: bool,
+}
+
+impl OpenAttemptError {
+    fn discard(error: std::io::Error) -> Self {
+        Self {
+            error,
+            retain_path: false,
+        }
+    }
+
+    fn retain(error: std::io::Error) -> Self {
+        Self {
+            error,
+            retain_path: true,
+        }
+    }
+
+    pub(super) fn retain_path(&self) -> bool {
+        self.retain_path
+    }
+
+    fn kind(&self) -> std::io::ErrorKind {
+        self.error.kind()
+    }
+}
+
+impl std::fmt::Display for OpenAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for OpenAttemptError {}
+
+#[derive(Debug, Default)]
+struct LaunchDispatch {
+    state: AtomicU8,
+}
+
+impl LaunchDispatch {
+    fn enter_launch(&self) -> Result<(), OpenAttemptError> {
+        match self.state.compare_exchange(
+            DISPATCH_QUEUED,
+            DISPATCH_ENTERED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(DISPATCH_ENTERED) => Ok(()),
+            Err(_) => Err(launcher_timeout_error()),
+        }
+    }
+
+    fn cancel_if_queued(&self) -> bool {
+        self.state
+            .compare_exchange(
+                DISPATCH_QUEUED,
+                DISPATCH_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
 
 /// Open a URL or path with the system handler without blocking the caller.
 ///
@@ -29,20 +103,36 @@ pub fn open(path: impl AsRef<OsStr>) -> Result<(), String> {
 /// launcher runs outside the gateway workers. A launcher that remains alive
 /// beyond a short confirmation interval is treated as having accepted the
 /// handoff and is reaped asynchronously without terminating it.
-pub async fn open_confirmed(path: impl AsRef<OsStr>) -> Result<(), String> {
+pub async fn open_confirmed(path: impl AsRef<OsStr>) -> Result<(), OpenAttemptError> {
     let path = path.as_ref().to_owned();
     let deadline = Instant::now() + WORKER_TIMEOUT;
-    let mut worker = tokio::task::spawn_blocking(move || open_and_reap_until(&path, deadline));
+    let dispatch = Arc::new(LaunchDispatch::default());
+    let worker_dispatch = Arc::clone(&dispatch);
+    let mut worker = tokio::task::spawn_blocking(move || {
+        open_and_reap_until_with_dispatch(&path, deadline, &worker_dispatch)
+    });
     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut worker).await {
-        Ok(Ok(result)) => result.map_err(|error| error.to_string()),
-        Ok(Err(error)) => Err(format!("system opener worker was interrupted: {error}")),
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(OpenAttemptError::discard(std::io::Error::other(format!(
+            "system opener worker was interrupted: {error}"
+        )))),
         Err(_) => {
-            // A synchronous launch boundary cannot be cancelled safely: it
-            // may still start a player that needs the retained cache path.
-            // Detach the worker and accept the queued handoff so cache
-            // reconciliation cannot remove the file underneath that player.
-            drop(worker);
-            Ok(())
+            if dispatch.cancel_if_queued() {
+                worker.abort();
+                Err(OpenAttemptError::discard(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "system opener worker timed out before launching",
+                )))
+            } else {
+                // A synchronous process-launch boundary cannot be cancelled.
+                // Report the timeout, but retain the bounded cache path while
+                // the detached worker may still hand it to a player.
+                drop(worker);
+                Err(OpenAttemptError::retain(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "system opener worker timed out during launch",
+                )))
+            }
         }
     }
 }
@@ -81,18 +171,32 @@ fn start_worker() -> Option<SyncSender<OsString>> {
     }
 }
 
-fn open_and_reap(path: &OsStr) -> std::io::Result<()> {
+fn open_and_reap(path: &OsStr) -> Result<(), OpenAttemptError> {
     open_and_reap_until(path, Instant::now() + LAUNCHER_TIMEOUT)
 }
 
-fn open_and_reap_until(path: &OsStr, deadline: Instant) -> std::io::Result<()> {
-    try_opener_candidates(open::commands(path), deadline, wait_for_launcher)
+fn open_and_reap_until(path: &OsStr, deadline: Instant) -> Result<(), OpenAttemptError> {
+    open_and_reap_until_with_dispatch(path, deadline, &LaunchDispatch::default())
 }
 
-fn try_opener_candidates<I, F>(commands: I, deadline: Instant, mut wait: F) -> std::io::Result<()>
+fn open_and_reap_until_with_dispatch(
+    path: &OsStr,
+    deadline: Instant,
+    dispatch: &LaunchDispatch,
+) -> Result<(), OpenAttemptError> {
+    try_opener_candidates(open::commands(path), deadline, |command, deadline| {
+        wait_for_launcher(command, deadline, dispatch)
+    })
+}
+
+fn try_opener_candidates<I, F>(
+    commands: I,
+    deadline: Instant,
+    mut wait: F,
+) -> Result<(), OpenAttemptError>
 where
     I: IntoIterator<Item = std::process::Command>,
-    F: FnMut(&mut std::process::Command, Instant) -> std::io::Result<LauncherOutcome>,
+    F: FnMut(&mut std::process::Command, Instant) -> Result<LauncherOutcome, OpenAttemptError>,
 {
     let mut last_error = None;
     for mut command in commands {
@@ -107,19 +211,20 @@ where
             Ok(LauncherOutcome::HandedOff) => return Ok(()),
             Ok(LauncherOutcome::Exited(status)) if status.success() => return Ok(()),
             Ok(LauncherOutcome::Exited(status)) => {
-                last_error = Some(std::io::Error::other(format!(
+                last_error = Some(OpenAttemptError::discard(std::io::Error::other(format!(
                     "launcher {command:?} failed with {status:?}"
-                )));
+                ))));
             }
+            Err(error) if error.retain_path() => return Err(error),
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
+        OpenAttemptError::discard(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no system launcher is available",
-        )
+        ))
     }))
 }
 
@@ -132,8 +237,11 @@ enum LauncherOutcome {
 fn wait_for_launcher(
     command: &mut std::process::Command,
     deadline: Instant,
-) -> std::io::Result<LauncherOutcome> {
-    let mut child = trouve_process::spawn(command)?;
+    dispatch: &LaunchDispatch,
+) -> Result<LauncherOutcome, OpenAttemptError> {
+    let reaper = launcher_reaper()?;
+    dispatch.enter_launch()?;
+    let mut child = trouve_process::spawn(command).map_err(OpenAttemptError::discard)?;
     let handoff_deadline = (Instant::now() + HANDOFF_CONFIRMATION_INTERVAL).min(deadline);
     loop {
         match child.try_wait() {
@@ -145,38 +253,76 @@ fn wait_for_launcher(
                 // player. Preserve the handoff and let the reaper make the
                 // best effort to collect it later.
                 tracing::warn!(%error, "could not inspect system launcher");
-                reap_launcher_in_background(child);
-                return Ok(LauncherOutcome::HandedOff);
+                reap_launcher_in_background(child, reaper);
+                return Err(OpenAttemptError::retain(error));
             }
         }
         if Instant::now() >= handoff_deadline {
-            reap_launcher_in_background(child);
+            reap_launcher_in_background(child, reaper);
             return Ok(LauncherOutcome::HandedOff);
         }
         std::thread::sleep(LAUNCHER_POLL_INTERVAL);
     }
 }
 
-fn reap_launcher_in_background(mut child: std::process::Child) {
-    if std::thread::Builder::new()
-        .name("trouve-opener-reaper".into())
-        .spawn(move || {
-            if let Err(error) = child.wait() {
-                tracing::warn!(%error, "could not reap system launcher");
-            }
+fn launcher_reaper() -> Result<&'static Sender<std::process::Child>, OpenAttemptError> {
+    LAUNCHER_REAPER
+        .get_or_init(start_launcher_reaper)
+        .as_ref()
+        .ok_or_else(|| {
+            OpenAttemptError::discard(std::io::Error::other(
+                "system launcher reaper is unavailable",
+            ))
         })
-        .is_err()
-    {
-        // Thread creation failure is exceptional. The child must not be
-        // killed because it may be the active player; dropping the handle is
-        // safer than interrupting playback, and the OS will reclaim it when
-        // the host exits.
-        tracing::warn!("could not start system launcher reaper");
+}
+
+fn start_launcher_reaper() -> Option<Sender<std::process::Child>> {
+    let (sender, receiver) = channel::<std::process::Child>();
+    let receiver = Arc::new(std::sync::Mutex::new(receiver));
+    let mut workers = 0usize;
+    for index in 0..LAUNCHER_REAPER_WORKERS {
+        let receiver = Arc::clone(&receiver);
+        if std::thread::Builder::new()
+            .name(format!("trouve-opener-reaper-{index}"))
+            .spawn(move || {
+                loop {
+                    let received = {
+                        let Ok(receiver) = receiver.lock() else {
+                            tracing::warn!("system launcher reaper lock was poisoned");
+                            return;
+                        };
+                        receiver.recv()
+                    };
+                    let Ok(mut child) = received else { return };
+                    if let Err(error) = child.wait() {
+                        tracing::warn!(%error, "could not reap system launcher");
+                    }
+                }
+            })
+            .is_ok()
+        {
+            workers += 1;
+        }
+    }
+    (workers > 0).then_some(sender)
+}
+
+fn reap_launcher_in_background(child: std::process::Child, reaper: &Sender<std::process::Child>) {
+    if let Err(error) = reaper.send(child) {
+        // The shared sender remains live for the process lifetime, so this is
+        // only a defensive fallback. Wait without killing a possible player.
+        let mut child = error.0;
+        if let Err(error) = child.wait() {
+            tracing::warn!(%error, "could not synchronously reap system launcher");
+        }
     }
 }
 
-fn launcher_timeout_error() -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::TimedOut, "system launcher timed out")
+fn launcher_timeout_error() -> OpenAttemptError {
+    OpenAttemptError::discard(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "system launcher timed out",
+    ))
 }
 
 #[cfg(test)]
@@ -248,5 +394,24 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn queued_dispatch_can_be_cancelled_before_a_late_launch() {
+        let dispatch = LaunchDispatch::default();
+
+        assert!(dispatch.cancel_if_queued());
+        assert_eq!(
+            dispatch.enter_launch().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn entered_launch_is_retained_when_the_caller_times_out() {
+        let dispatch = LaunchDispatch::default();
+
+        dispatch.enter_launch().unwrap();
+        assert!(!dispatch.cancel_if_queued());
     }
 }

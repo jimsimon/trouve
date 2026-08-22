@@ -92,6 +92,8 @@ export const isVideoMime = (mime: string): boolean =>
 export const base64DecodedByteLength = (data: string): number | undefined => {
   if (data.length === 0 || data.length % 4 !== 0) return undefined;
   const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  const payloadLength = data.length - padding;
+  if (payloadLength === 0 || data.slice(0, payloadLength).includes("=")) return undefined;
   const size = (data.length / 4) * 3 - padding;
   return size > 0 ? size : undefined;
 };
