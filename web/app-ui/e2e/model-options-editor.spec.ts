@@ -127,6 +127,19 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await expect(budget).toHaveAttribute("aria-describedby", /model-option-description-/);
   await expect(streaming.locator("option").first()).toHaveText("Model default");
 
+  for (const value of ["1.0", "1e3", "-0"]) {
+    await temperature.fill(value);
+    await temperature.press("Enter");
+  }
+  await expect.poll(() => page.evaluate(() => {
+    const changes = (window as Window & { modelOptionChanges?: unknown[] })
+      .modelOptionChanges as { value: unknown }[];
+    return changes.map(({ value }) => Object.is(value, -0) ? "-0" : value);
+  })).toEqual([1, 1_000, "-0"]);
+  await page.evaluate(() => {
+    (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges?.splice(0);
+  });
+
   await context.selectOption({ label: "300K" });
   await fast.selectOption({ label: "On" });
   await budget.fill("3.5");
