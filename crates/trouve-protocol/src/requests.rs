@@ -2574,6 +2574,10 @@ pub struct CodeReviewDashboard {
     pub reviewers: Vec<ReviewerProfile>,
     pub repositories: Vec<CodeReviewRepository>,
     pub jobs: Vec<CodeReviewJob>,
+    /// Job ids for which the server will accept a scoped retry of the latest
+    /// failed or cancelled final-editor attempt while retaining reviewer output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_editor_retryable_job_ids: Vec<String>,
 }
 
 // --- branches --------------------------------------------------------------

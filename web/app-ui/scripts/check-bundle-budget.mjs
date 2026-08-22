@@ -28,14 +28,14 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // The locked Vite/Rolldown graph includes the evidence-backed review-history,
 // churn-metrics, durable turn-phase, conditional-title, route-scoped
 // new-session lifecycle, outside-diff review, version-check, per-thread
-// transcript-search, schema-constrained model options, and automation
-// lifecycle hardening. The combined graphs emit 3,206,006 B for desktop and
-// 3,192,143 B for PWA; keep less than 2 kB of headroom for each. Entry, worker,
-// and largest-chunk budgets below continue to prevent one bundle from hiding
-// in this aggregate allowance.
-const totalJavaScriptLimit = mode === "desktop" ? 3_207_000 : 3_193_000;
-// Version-check and transcript-search styling bring the clean base artifact to
-// 182,349 B. Preserve less than 2 kB of headroom for the combined graph.
+// transcript-search, detailed agent activity, schema-constrained model
+// options, and automation lifecycle hardening. The combined graphs emit
+// 3,210,497 B for desktop and 3,196,615 B for PWA; keep less than 2 kB of
+// headroom for each. Entry, worker, and largest-chunk budgets below continue
+// to prevent one bundle from hiding in this aggregate allowance.
+const totalJavaScriptLimit = mode === "desktop" ? 3_212_000 : 3_198_000;
+// The combined styling graph emits 182,830 B. Preserve less than 2 kB of
+// headroom.
 const totalStyleLimit = 184_000;
 const limits = {
   entry: entryLimit,

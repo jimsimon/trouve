@@ -287,6 +287,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/code-review/jobs/{id}/final-editor/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["retry_code_review_final_editor"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/code-review/jobs/{id}/retry": {
         parameters: {
             query?: never;
@@ -1962,6 +1978,11 @@ export interface components {
         };
         CodeReviewDashboard: {
             app: components["schemas"]["GithubAppStatus"];
+            /**
+             * @description Job ids for which the server will accept a scoped retry of the latest
+             *     failed or cancelled final-editor attempt while retaining reviewer output.
+             */
+            final_editor_retryable_job_ids?: string[];
             jobs: components["schemas"]["CodeReviewJob"][];
             repositories: components["schemas"]["CodeReviewRepository"][];
             reviewers: components["schemas"]["ReviewerProfile"][];
@@ -5550,6 +5571,44 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    retry_code_review_final_editor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Review job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodeReviewJob"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
         };
     };
