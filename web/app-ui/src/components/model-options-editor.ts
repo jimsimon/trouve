@@ -272,11 +272,13 @@ export class TrouveModelOptionsEditor extends LitElement {
       return;
     }
     input.setCustomValidity("");
-    if (this.#committedText.get(input) === raw) return;
-    this.#committedText.set(input, raw);
-    this.#emit(control.key, control.scalarType === "string"
+    const value = control.scalarType === "string"
       ? raw
-      : raw === "" ? undefined : Number(raw));
+      : raw === "" ? undefined : Number(raw);
+    const committed = String(value ?? "");
+    if (this.#committedText.get(input) === committed) return;
+    this.#committedText.set(input, committed);
+    this.#emit(control.key, value);
   }
 
   #emit(key: string, value: ModelOptionValue | undefined): void {
