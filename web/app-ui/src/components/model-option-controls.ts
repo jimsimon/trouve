@@ -426,6 +426,28 @@ export const modelOptionValueIsValid = (
   );
 };
 
+const normalizedNumberToken = (raw: string): string => {
+  const sign = raw.startsWith("-") ? "-" : "";
+  const [coefficient, exponent = "0"] = raw.split(/[eE]/u);
+  const [integer, fraction = ""] = coefficient!.split(".");
+  const digits = `${integer}${fraction}`.replace(/^[+-]?0*/u, "");
+  if (digits === "") return "0";
+  const trimmed = digits.replace(/0+$/u, "");
+  return `${sign}${trimmed}e${
+    Number(exponent) - fraction.length + digits.length - trimmed.length
+  }`;
+};
+
+export const modelOptionTextValueIsValid = (
+  control: TextModelOptionControl,
+  raw: string,
+): boolean => {
+  if (raw === "" || control.scalarType === "string") return true;
+  const value = Number(raw);
+  return normalizedNumberToken(raw) === normalizedNumberToken(String(value))
+    && modelOptionValueIsValid(control, value);
+};
+
 /** Keep only values represented by the selected model's supported scalar
  * controls. Defaults remain implicit instead of being copied into requests. */
 export const sanitizeModelOptions = (

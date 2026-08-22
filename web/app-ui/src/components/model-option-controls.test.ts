@@ -6,6 +6,7 @@ import {
   modelOptionControls,
   modelOptionLabel,
   modelSelectorLabel,
+  modelOptionTextValueIsValid,
   sanitizeModelOptions,
 } from "./model-option-controls.js";
 
@@ -242,6 +243,28 @@ describe("model option controls", () => {
       { key: "explicit_number", overridden: true, text: "100000000000000000000" },
       { key: "default_number", overridden: false, text: "100000000000000000000" },
     ]);
+  });
+
+  it("accepts equivalent number spellings without silently rounding them", () => {
+    const [control] = modelOptionControls(model({
+      temperature: { type: "number" },
+    }), {});
+    expect(control?.kind).toBe("text");
+    if (control?.kind !== "text") throw new Error("expected a text control");
+
+    for (const raw of [
+      "1.0",
+      "1e3",
+      "-0",
+      "1e20",
+      "0.10000000000000000",
+      "5e-324",
+    ]) expect(modelOptionTextValueIsValid(control, raw)).toBe(true);
+    for (const raw of [
+      "0.1234567890123456789",
+      "1e-324",
+      "3e-324",
+    ]) expect(modelOptionTextValueIsValid(control, raw)).toBe(false);
   });
 
   it("applies and removes overrides without retaining a duplicate legacy key", () => {

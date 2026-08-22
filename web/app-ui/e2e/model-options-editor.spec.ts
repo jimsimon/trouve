@@ -165,6 +165,9 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await temperature.fill("1e-324");
   await temperature.press("Enter");
   await expect(temperature).toHaveValue("1e-324");
+  await temperature.fill("3e-324");
+  await temperature.press("Enter");
+  await expect(temperature).toHaveValue("3e-324");
   await temperature.fill("0.25");
   await temperature.press("Enter");
   await expect.poll(() => page.evaluate(() =>
@@ -173,6 +176,7 @@ test("model-option choices preserve selected state and scalar value types", asyn
   )).toEqual([
     "Enter a valid integer between 4 and 16.",
     "Enter a valid integer between 4 and 16.",
+    "Enter a valid number value.",
     "Enter a valid number value.",
     "Enter a valid number value.",
   ]);
