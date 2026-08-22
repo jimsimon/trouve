@@ -1722,6 +1722,20 @@ pub fn head_ref(repo: &Path) -> Result<String> {
     }
 }
 
+/// The default branch advertised by the repository's conventional `origin`
+/// remote. This reads the local remote-HEAD symbolic ref and never contacts
+/// the remote.
+pub fn default_branch(repo: &Path) -> Option<String> {
+    git(
+        repo,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .ok()?
+    .strip_prefix("refs/remotes/origin/")
+    .map(str::to_owned)
+    .filter(|branch| !branch.is_empty())
+}
+
 /// The checked-out branch and exact commit in one session worktree. Detached
 /// HEAD is intentionally rejected: PR ownership evidence must name the branch
 /// GitHub reports, not merely an object shared by every worktree.
@@ -3423,6 +3437,38 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         run(dir, &["add", "-A"]);
         run(dir, &["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn default_branch_uses_origin_head_instead_of_checked_out_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        run(
+            repo,
+            &["remote", "add", "origin", "https://example.test/repo.git"],
+        );
+        run(repo, &["update-ref", "refs/remotes/origin/main", "main"]);
+        run(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run(repo, &["switch", "-c", "feature"]);
+
+        assert_eq!(head_ref(repo).unwrap(), "feature");
+        assert_eq!(default_branch(repo).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn default_branch_is_absent_without_origin_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+
+        assert_eq!(default_branch(tmp.path()), None);
     }
 
     #[test]
