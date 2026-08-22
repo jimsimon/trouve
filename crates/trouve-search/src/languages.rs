@@ -423,6 +423,7 @@ static CONFIG_LANGUAGES: &[&str] = &[
     "ron",
     "smithy",
     "ssh_config",
+    "starlark",
     "textproto",
     "thrift",
     "todotxt",
@@ -553,6 +554,8 @@ mod tests {
         assert!(!code.contains(&".md".to_string()));
         assert!(!code.contains(&".toml".to_string()));
         assert!(!code.contains(&".json".to_string())); // data language
+        assert!(!code.contains(&".bzl".to_string()));
+        assert!(!code.contains(&".star".to_string()));
 
         let docs = get_extensions(&[ContentType::Docs]);
         assert!(docs.contains(&".md".to_string()));
@@ -562,6 +565,8 @@ mod tests {
         let config = get_extensions(&[ContentType::Config]);
         assert!(config.contains(&".toml".to_string()));
         assert!(config.contains(&".yaml".to_string()));
+        assert!(config.contains(&".bzl".to_string()));
+        assert!(config.contains(&".star".to_string()));
         assert!(!config.contains(&".py".to_string()));
     }
 

@@ -139,6 +139,7 @@ The Lit frontend's npm inventory is generated separately in
 | core-graphics | 0.25.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | core-graphics-types | 0.2.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | core_maths | 0.1.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| cortexkit-tree-sitter-scss | 1.0.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | cpufeatures | 0.3.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -676,7 +677,6 @@ The Lit frontend's npm inventory is generated separately in
 | tree-sitter-ruby | 0.23.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tree-sitter-rust | 0.24.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tree-sitter-scala | 0.26.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
-| tree-sitter-scss | 1.0.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tree-sitter-sequel | 0.3.11 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tree-sitter-solidity | 1.2.13 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tree-sitter-starlark | 1.3.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |

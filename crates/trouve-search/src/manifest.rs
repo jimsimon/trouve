@@ -361,6 +361,26 @@ mod tests {
     }
 
     #[test]
+    fn config_manifest_includes_starlark_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("rules.bzl"), "def configure():\n    pass\n").unwrap();
+        fs::write(root.join("workspace.star"), "setting = True\n").unwrap();
+        fs::write(root.join("excluded.py"), "setting = True\n").unwrap();
+
+        let store = ChunkStore::open_at(root.join(".teststore")).unwrap();
+        let identity = RepoIdentity::Path(root.to_string_lossy().into_owned());
+        let extensions = crate::languages::get_extensions(&[crate::types::ContentType::Config]);
+        let manifest = build_manifest(root, &identity, &extensions, &store).unwrap();
+        let paths: Vec<&str> = manifest
+            .iter()
+            .map(|record| record.rel_path.as_str())
+            .collect();
+
+        assert_eq!(paths, vec!["rules.bzl", "workspace.star"]);
+    }
+
+    #[test]
     fn git_manifest_uses_blob_oids() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

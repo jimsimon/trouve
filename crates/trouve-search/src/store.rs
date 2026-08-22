@@ -7,7 +7,7 @@
 //! has never been embedded before.
 
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,6 +24,7 @@ pub const STORE_VERSION: u32 = 4;
 const STORE_KEY_LENGTH: usize = 16;
 const STORE_IDENTITY_FILE: &str = "identity.json";
 const STORE_IDENTITY_VERSION: u32 = 1;
+const STORE_LEASES_DIRECTORY: &str = ".leases";
 const MAX_STORE_IDENTITY_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +43,37 @@ fn repo_identity_digest(repo_identity: &str) -> String {
 
 fn identity_metadata_path(store_root: &Path) -> PathBuf {
     store_root.join(STORE_IDENTITY_FILE)
+}
+
+fn open_store_lease_file(store_root: &Path, digest: &str) -> Result<File> {
+    let prefix = digest
+        .get(..STORE_KEY_LENGTH)
+        .context("store identity digest is too short")?;
+    let lease_root = store_root.join(STORE_LEASES_DIRECTORY);
+    fs::create_dir_all(&lease_root)
+        .with_context(|| format!("creating store lease directory {lease_root:?}"))?;
+    let metadata = fs::symlink_metadata(&lease_root)
+        .with_context(|| format!("reading store lease directory {lease_root:?}"))?;
+    ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "store lease path is not a regular directory: {lease_root:?}"
+    );
+
+    let lease_path = lease_root.join(format!("{prefix}.lock"));
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lease_path)
+        .with_context(|| format!("opening store lease {lease_path:?}"))
+}
+
+fn acquire_shared_store_lease(store_root: &Path, digest: &str) -> Result<File> {
+    let lease = open_store_lease_file(store_root, digest)?;
+    fs4::fs_std::FileExt::lock_shared(&lease)
+        .with_context(|| format!("locking shared store lease for {digest}"))?;
+    Ok(lease)
 }
 
 fn load_identity_metadata(store_root: &Path) -> Result<Option<StoreIdentityMetadata>> {
@@ -224,6 +256,13 @@ impl FileEntry {
 /// repository identity (git common dir or plain path).
 pub struct ChunkStore {
     root: PathBuf,
+    _lease: File,
+}
+
+impl Drop for ChunkStore {
+    fn drop(&mut self) {
+        let _ = fs4::fs_std::FileExt::unlock(&self._lease);
+    }
 }
 
 impl ChunkStore {
@@ -234,6 +273,10 @@ impl ChunkStore {
 
     fn open_for_identity_at(store_root: &Path, repo_identity: &str) -> Result<ChunkStore> {
         let digest = repo_identity_digest(repo_identity);
+        // Acquire the lifetime lease before touching the deletable store
+        // directory. Orphan cleanup takes the corresponding exclusive lease,
+        // so it must either finish first or observe this store as active.
+        let lease = acquire_shared_store_lease(store_root, &digest)?;
         let root = store_root.join(&digest[..STORE_KEY_LENGTH]);
         fs::create_dir_all(&root).with_context(|| format!("creating store dir {root:?}"))?;
         let metadata = fs::symlink_metadata(&root)
@@ -243,13 +286,24 @@ impl ChunkStore {
             "store path is not a regular directory: {root:?}"
         );
         persist_identity_metadata(&root, repo_identity, &digest)?;
-        Ok(ChunkStore { root })
+        Ok(ChunkStore {
+            root,
+            _lease: lease,
+        })
     }
 
     /// Open a store at an explicit directory (used by tests).
     pub fn open_at(root: PathBuf) -> Result<ChunkStore> {
+        let store_root = root
+            .parent()
+            .context("explicit store path has no parent directory")?;
+        let digest = repo_identity_digest(root.to_string_lossy().as_ref());
+        let lease = acquire_shared_store_lease(store_root, &digest)?;
         fs::create_dir_all(&root)?;
-        Ok(ChunkStore { root })
+        Ok(ChunkStore {
+            root,
+            _lease: lease,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -436,6 +490,9 @@ pub fn clear_all_stores() -> Vec<PathBuf> {
         && let Ok(entries) = fs::read_dir(&store_root)
     {
         for entry in entries.flatten() {
+            if entry.file_name() == STORE_LEASES_DIRECTORY {
+                continue;
+            }
             if fs::remove_dir_all(entry.path()).is_ok() {
                 removed.push(entry.path());
             }
@@ -454,6 +511,13 @@ pub fn clear_orphan_stores() -> Vec<PathBuf> {
 }
 
 fn clear_orphan_stores_at(store_root: &Path) -> Vec<PathBuf> {
+    clear_orphan_stores_at_with(store_root, |_| {})
+}
+
+fn clear_orphan_stores_at_with(
+    store_root: &Path,
+    mut before_exclusive_lease: impl FnMut(&Path),
+) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     let Ok(root_metadata) = fs::symlink_metadata(store_root) else {
         return removed;
@@ -488,6 +552,42 @@ fn clear_orphan_stores_at(store_root: &Path) -> Vec<PathBuf> {
         }
         let identity_path = Path::new(&identity.repo_identity);
         if !identity_path.is_absolute() || !matches!(identity_path.try_exists(), Ok(false)) {
+            continue;
+        }
+        before_exclusive_lease(&path);
+
+        // Lifetime leases live outside the directory being deleted. An open
+        // ChunkStore holds a shared lease; cleanup never waits for it or
+        // disrupts active indexing, and stale lease files are intentionally
+        // retained so future openers always coordinate on the same inode.
+        let Ok(lease) = open_store_lease_file(store_root, &identity.digest) else {
+            continue;
+        };
+        if !matches!(fs4::fs_std::FileExt::try_lock_exclusive(&lease), Ok(true)) {
+            continue;
+        }
+
+        // Every deletion condition is reloaded while the exclusive lease is
+        // held. Checks made before the lease are only a cheap candidate filter.
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(Some(current_identity)) = load_identity_metadata(&path) else {
+            continue;
+        };
+        if current_identity != identity || !identity_matches_store(&path, &current_identity) {
+            continue;
+        }
+        if current_identity.repo_identity.contains('�') {
+            continue;
+        }
+        let current_identity_path = Path::new(&current_identity.repo_identity);
+        if !current_identity_path.is_absolute()
+            || !matches!(current_identity_path.try_exists(), Ok(false))
+        {
             continue;
         }
 
@@ -532,9 +632,8 @@ mod tests {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    ChunkStore::open_for_identity_at(&store_root, &identity)
-                        .unwrap()
-                        .root
+                    let store = ChunkStore::open_for_identity_at(&store_root, &identity).unwrap();
+                    store.root.clone()
                 })
             })
             .collect();
@@ -573,13 +672,67 @@ mod tests {
         let deleted_store =
             ChunkStore::open_for_identity_at(&store_root, &path_identity(&deleted_repository))
                 .unwrap();
+        let live_store_root = live_store.root.clone();
+        let deleted_store_root = deleted_store.root.clone();
+        drop(live_store);
+        drop(deleted_store);
         fs::remove_dir(&deleted_repository).unwrap();
 
         let removed = clear_orphan_stores_at(&store_root);
 
-        assert_eq!(removed, std::slice::from_ref(&deleted_store.root));
-        assert!(live_store.root.try_exists().unwrap());
-        assert!(!deleted_store.root.try_exists().unwrap());
+        assert_eq!(removed, std::slice::from_ref(&deleted_store_root));
+        assert!(live_store_root.try_exists().unwrap());
+        assert!(!deleted_store_root.try_exists().unwrap());
+    }
+
+    #[test]
+    fn orphan_cleanup_defers_active_store_until_lease_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        let repository = dir.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+
+        let first_store =
+            ChunkStore::open_for_identity_at(&store_root, &path_identity(&repository)).unwrap();
+        let second_store =
+            ChunkStore::open_for_identity_at(&store_root, &path_identity(&repository)).unwrap();
+        let active_store_root = first_store.root.clone();
+        fs::remove_dir(&repository).unwrap();
+
+        assert!(clear_orphan_stores_at(&store_root).is_empty());
+        assert!(active_store_root.try_exists().unwrap());
+
+        drop(first_store);
+        assert!(clear_orphan_stores_at(&store_root).is_empty());
+        assert!(active_store_root.try_exists().unwrap());
+
+        drop(second_store);
+        assert_eq!(
+            clear_orphan_stores_at(&store_root),
+            std::slice::from_ref(&active_store_root)
+        );
+        assert!(!active_store_root.try_exists().unwrap());
+    }
+
+    #[test]
+    fn orphan_cleanup_revalidates_identity_after_candidate_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        let repository = dir.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+
+        let store =
+            ChunkStore::open_for_identity_at(&store_root, &path_identity(&repository)).unwrap();
+        let store_path = store.root.clone();
+        drop(store);
+        fs::remove_dir(&repository).unwrap();
+
+        let removed = clear_orphan_stores_at_with(&store_root, |_| {
+            fs::create_dir(&repository).unwrap();
+        });
+
+        assert!(removed.is_empty());
+        assert!(store_path.try_exists().unwrap());
     }
 
     #[test]
@@ -592,12 +745,14 @@ mod tests {
         fs::create_dir(&disposable_worktree).unwrap();
         let store =
             ChunkStore::open_for_identity_at(&store_root, &path_identity(&git_common_dir)).unwrap();
+        let store_path = store.root.clone();
+        drop(store);
 
         // Removing one checkout does not orphan the repository-wide store:
         // git identities point at the shared common .git directory.
         fs::remove_dir(&disposable_worktree).unwrap();
         assert!(clear_orphan_stores_at(&store_root).is_empty());
-        assert!(store.root.try_exists().unwrap());
+        assert!(store_path.try_exists().unwrap());
     }
 
     #[test]
@@ -637,6 +792,10 @@ mod tests {
             serde_json::to_vec(&digest_metadata).unwrap(),
         )
         .unwrap();
+        let unknown_root = unknown.root.clone();
+        let digest_root = digest_store.root.clone();
+        drop(unknown);
+        drop(digest_store);
 
         let prefix_identity = path_identity(&dir.path().join("missing-prefix"));
         let prefix_digest = repo_identity_digest(&prefix_identity);
@@ -659,13 +818,7 @@ mod tests {
         .unwrap();
 
         assert!(clear_orphan_stores_at(&store_root).is_empty());
-        for path in [
-            legacy,
-            corrupt,
-            unknown.root,
-            digest_store.root,
-            prefix_mismatch,
-        ] {
+        for path in [legacy, corrupt, unknown_root, digest_root, prefix_mismatch] {
             assert!(path.try_exists().unwrap(), "unexpectedly removed {path:?}");
         }
     }
@@ -673,8 +826,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn orphan_cleanup_skips_symlinks_and_identity_existence_errors() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -707,19 +858,9 @@ mod tests {
         // InvalidInput. Cleanup must delete only on Ok(false), not on errors.
         let error_identity = format!("/missing-identity-{}\0", std::process::id());
         let error_store = ChunkStore::open_for_identity_at(&store_root, &error_identity).unwrap();
+        let error_store_root = error_store.root.clone();
+        drop(error_store);
         assert!(Path::new(&error_identity).try_exists().is_err());
-
-        // RepoIdentity currently uses a lossy UTF-8 string at the store
-        // boundary. The reconstructed string does not name this live path,
-        // so cleanup must treat its replacement character as unverifiable.
-        let non_utf8_repository = dir
-            .path()
-            .join(OsString::from_vec(b"live-non-utf8-\xff".to_vec()));
-        fs::create_dir(&non_utf8_repository).unwrap();
-        let non_utf8_identity = non_utf8_repository.to_string_lossy().into_owned();
-        assert!(non_utf8_identity.contains('�'));
-        let non_utf8_store =
-            ChunkStore::open_for_identity_at(&store_root, &non_utf8_identity).unwrap();
 
         assert!(clear_orphan_stores_at(&store_root).is_empty());
         assert!(
@@ -734,8 +875,35 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert!(error_store.root.try_exists().unwrap());
-        assert!(non_utf8_store.root.try_exists().unwrap());
+        assert!(error_store_root.try_exists().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphan_cleanup_preserves_lossy_non_utf8_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        fs::create_dir(&store_root).unwrap();
+
+        // RepoIdentity currently uses a lossy UTF-8 string at the store
+        // boundary. The reconstructed string does not name this live path,
+        // so cleanup must treat its replacement character as unverifiable.
+        let non_utf8_repository = dir
+            .path()
+            .join(OsString::from_vec(b"live-non-utf8-\xff".to_vec()));
+        fs::create_dir(&non_utf8_repository).unwrap();
+        let non_utf8_identity = non_utf8_repository.to_string_lossy().into_owned();
+        assert!(non_utf8_identity.contains('�'));
+        let non_utf8_store =
+            ChunkStore::open_for_identity_at(&store_root, &non_utf8_identity).unwrap();
+        let non_utf8_store_root = non_utf8_store.root.clone();
+        drop(non_utf8_store);
+
+        assert!(clear_orphan_stores_at(&store_root).is_empty());
+        assert!(non_utf8_store_root.try_exists().unwrap());
     }
 
     #[test]
