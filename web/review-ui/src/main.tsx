@@ -647,6 +647,7 @@ function EmptyState({ title, body }: { title: string; body: string }) {
 
 function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   const elapsed = liveElapsed(job.running_elapsed_ms, job.status, job.started_at, now);
+  const openIssueCount = job.open_issue_count;
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
       <StatusPill status={job.status} />
@@ -658,7 +659,11 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
         {(job.status === "running" || job.status === "queued") && <ProgressBar job={job} />}
       </span>
       <span class="job-meta">
-        <b>{job.issue_count} issues</b>
+        <b>
+          {openIssueCount == null
+            ? `${job.issue_count} new`
+            : `${openIssueCount} open · ${job.issue_count} new`}
+        </b>
         <small>{job.status === "queued" ? duration(job.pending_elapsed_ms) : duration(elapsed)}</small>
       </span>
     </button>
@@ -1404,6 +1409,9 @@ function JobDetailPane({
             decision.batch_index === selectedTask.batch_index,
         )
       : undefined;
+  const openIssueCount = job.open_issue_count;
+  const hasOpenIssues =
+    job.status === "succeeded" && openIssueCount != null && openIssueCount > 0;
   const selectPreferredTask = (tasks: ReviewTask[]): void => {
     const preferred = pickPreferredTask(tasks);
     if (preferred) setSelectedTaskId(preferred.id);
@@ -1416,6 +1424,7 @@ function JobDetailPane({
       <header class="detail-header">
         <div>
           <StatusPill status={job.status} />
+          {hasOpenIssues && <span class="status failed">needs attention</span>}
           <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
           </h2>
@@ -1528,6 +1537,16 @@ function JobDetailPane({
         <ExternalLink href={job.check_run_url}>Open Check Run ↗</ExternalLink>
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
+      {hasOpenIssues && (
+        <div class="banner warning" role="alert">
+          <strong>
+            {openIssueCount} confirmed issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
+          </strong>
+          <p>
+            This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean incremental result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
+          </p>
+        </div>
+      )}
       {routingDecisions.length > 0 && (
         <details
           class="routing-decisions"
@@ -1585,7 +1604,9 @@ function JobDetailPane({
           <div>
             <h2>{job.status === "running" || job.status === "queued" ? "Review overview" : "Completed overview"}</h2>
             <p>
-              {job.issue_count} confirmed findings · {acceptedCandidateIds.size} selected candidates
+              {job.issue_count} new confirmed findings
+              {openIssueCount != null && ` · ${openIssueCount} open across pull request`}
+              {` · ${acceptedCandidateIds.size} selected candidates`}
               {" · "}
               {candidateRejections.length} rejected · {unadjudicatedCandidates.length} unresolved · {job.fixed_issue_count} fixed
             </p>

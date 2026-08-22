@@ -2325,6 +2325,11 @@ pub struct CodeReviewJob {
     pub issue_count: u64,
     #[serde(default)]
     pub fixed_issue_count: u64,
+    /// Total confirmed findings that remained open across the pull request
+    /// after this review was published. Absent while publication is pending
+    /// and for legacy jobs that predate this snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_issue_count: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     pub created_at: chrono::DateTime<chrono::Utc>,

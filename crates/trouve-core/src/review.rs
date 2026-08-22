@@ -7467,19 +7467,15 @@ impl Engine {
         let job = &detail.job;
         let needs_adjudication =
             job.status == "failed" && !detail.unadjudicated_candidates.is_empty();
+        let open_issue_count = review_open_issue_count(job);
+        let needs_attention =
+            needs_adjudication || (job.status == "succeeded" && open_issue_count > 0);
         let status = match job.status.as_str() {
             "queued" => "queued",
             "running" => "in_progress",
             _ => "completed",
         };
-        let conclusion = match job.status.as_str() {
-            "succeeded" if job.issue_count == 0 => Some("success"),
-            "succeeded" => Some("neutral"),
-            "failed" if needs_adjudication => Some("action_required"),
-            "failed" => Some("failure"),
-            "cancelled" | "stale" => Some("cancelled"),
-            _ => None,
-        };
+        let conclusion = review_check_conclusion(&job.status, open_issue_count, needs_adjudication);
         let check_summary = match job.status.as_str() {
             "queued" => "Waiting for a review worker.".to_string(),
             "running" => format!(
@@ -7489,8 +7485,8 @@ impl Engine {
                 job.progress.percent
             ),
             "succeeded" => format!(
-                "Review finished with {} confirmed issue(s); {} previously reported issue(s) were fixed.",
-                job.issue_count, job.fixed_issue_count
+                "Review finished with {} new confirmed issue(s); {} previously reported issue(s) were fixed; {} confirmed issue(s) remain open across the pull request.",
+                job.issue_count, job.fixed_issue_count, open_issue_count
             ),
             "failed" if needs_adjudication => format!(
                 "Review requires another final-editor pass: {} candidate decision(s) remain unresolved.",
@@ -7516,7 +7512,7 @@ impl Engine {
             "output": {
                 "title": format!(
                     "Trouve Code Review: {}",
-                    if needs_adjudication {
+                    if needs_attention {
                         "Needs Attention".to_owned()
                     } else {
                         display_review_status(&job.status)
@@ -8967,6 +8963,25 @@ fn github_review_event(has_findings: bool) -> &'static str {
     }
 }
 
+fn review_open_issue_count(job: &trouve_protocol::CodeReviewJob) -> u64 {
+    job.open_issue_count.unwrap_or(job.issue_count)
+}
+
+fn review_check_conclusion(
+    status: &str,
+    open_issue_count: u64,
+    needs_adjudication: bool,
+) -> Option<&'static str> {
+    match status {
+        "succeeded" if open_issue_count == 0 => Some("success"),
+        "succeeded" => Some("neutral"),
+        "failed" if needs_adjudication => Some("action_required"),
+        "failed" => Some("failure"),
+        "cancelled" | "stale" => Some("cancelled"),
+        _ => None,
+    }
+}
+
 fn review_has_unresolved_findings(
     current_finding_count: usize,
     previous_finding_ids: &[&str],
@@ -9376,6 +9391,8 @@ fn finish_lifecycle_comment(mut body: String, job_id: &str) -> String {
 
 fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
     let job = &detail.job;
+    let open_issue_count = review_open_issue_count(job);
+    let succeeded_with_open_issues = job.status == "succeeded" && open_issue_count > 0;
     // Only terminal review outcomes expose coordinator-authored results. A
     // queued or running job may hold a staged result while its live revision
     // is revalidated; cancelled and stale jobs never accepted that result.
@@ -9399,7 +9416,7 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
     let icon = match job.status.as_str() {
         "queued" => "⏳",
         "running" => "🔎",
-        "succeeded" if job.issue_count == 0 => "✅",
+        "succeeded" if open_issue_count == 0 => "✅",
         "succeeded" => "🟡",
         "failed" if !detail.unadjudicated_candidates.is_empty() => "⚠️",
         "cancelled" | "stale" => "⏹️",
@@ -9409,7 +9426,9 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         "## {icon} Trouve Code Review — {status}\n\n\
          **Progress:** {complete}/{total} reviewer personas ({percent}%)  \n\
          **Scope:** {scope} `{base}`…`{head}`  \n",
-        status = if job.status == "failed" && !detail.unadjudicated_candidates.is_empty() {
+        status = if (job.status == "failed" && !detail.unadjudicated_candidates.is_empty())
+            || succeeded_with_open_issues
+        {
             "Needs Attention".to_owned()
         } else {
             display_review_status(&job.status)
@@ -9426,8 +9445,8 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
     );
     if job.status == "succeeded" {
         body.push_str(&format!(
-            "**Result:** {} confirmed issue(s)  \n",
-            detail.findings.len()
+            "**Result:** {} new confirmed issue(s); {} issue(s) remain open across the pull request  \n",
+            detail.findings.len(), open_issue_count
         ));
     } else if job.status == "failed" && !detail.unadjudicated_candidates.is_empty() {
         body.push_str(&format!(
@@ -9478,7 +9497,7 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         body.push_str("\n\n");
     } else if job.status == "succeeded" {
         if result_findings.is_empty() {
-            body.push_str("No actionable issues found.\n\n");
+            body.push_str("No new actionable issues found.\n\n");
         } else {
             body.push_str(&format!(
                 "Found {} actionable issue(s).\n\n",
@@ -14639,10 +14658,12 @@ mod tests {
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
 
         let body = render_lifecycle_comment(&detail);
-        assert!(body.starts_with("## 🟡 Trouve Code Review — Succeeded"));
+        assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
         assert!(body.contains("### Reviewer coverage"));
         assert!(body.contains("| Application Reliability Engineer | Not Applicable |"));
-        assert!(body.contains("**Result:** 1 confirmed issue(s)"));
+        assert!(body.contains(
+            "**Result:** 1 new confirmed issue(s); 1 issue(s) remain open across the pull request"
+        ));
         assert!(body.contains("### Confirmed issues"));
         assert!(body.contains(
             "- **Severity: HIGH · Confidence: HIGH** — `src/lib.rs` line 42: **Error bypasses handling** — Return a typed error"
@@ -14665,6 +14686,41 @@ mod tests {
         assert!(!body.contains("### Inline comments that failed to post"));
         assert!(body.contains("<summary>Prompt for agents</summary>"));
         assert!(body.contains("_Reviewed by Trouve._"));
+    }
+
+    #[test]
+    fn clean_incremental_review_keeps_prior_open_findings_visible() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:prior-open-lifecycle");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .save_code_review_result(&queued.id, "No new issues.", "", 0, &[], &[])
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "succeeded", "https://example.test/review", "")
+            .unwrap();
+        let mut detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        detail.job.open_issue_count = Some(2);
+
+        assert_eq!(review_open_issue_count(&detail.job), 2);
+        assert_eq!(
+            review_check_conclusion(&detail.job.status, 2, false),
+            Some("neutral")
+        );
+        let body = render_lifecycle_comment(&detail);
+        assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
+        assert!(body.contains(
+            "**Result:** 0 new confirmed issue(s); 2 issue(s) remain open across the pull request"
+        ));
+
+        detail.job.open_issue_count = Some(0);
+        assert_eq!(
+            review_check_conclusion(&detail.job.status, 0, false),
+            Some("success")
+        );
+        assert!(
+            render_lifecycle_comment(&detail).starts_with("## ✅ Trouve Code Review — Succeeded")
+        );
     }
 
     #[test]

@@ -111,6 +111,7 @@ export interface ReviewJob {
   candidate_issue_count: number;
   issue_count: number;
   fixed_issue_count: number;
+  open_issue_count?: number | null;
   error: string;
   created_at: string;
   started_at?: string;

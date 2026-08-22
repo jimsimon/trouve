@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.13"
+    "version": "7.14"
   },
   "paths": {
     "/v1/approvals": {
@@ -5902,6 +5902,15 @@
               "string",
               "null"
             ]
+          },
+          "open_issue_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Total confirmed findings that remained open across the pull request\nafter this review was published. Absent while publication is pending\nand for legacy jobs that predate this snapshot.",
+            "minimum": 0
           },
           "pending_elapsed_ms": {
             "type": "integer",

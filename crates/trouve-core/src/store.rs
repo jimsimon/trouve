@@ -3300,6 +3300,9 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             candidate_issue_count: r.get::<_, i64>(33)? as u64,
             issue_count: r.get::<_, i64>(34)? as u64,
             fixed_issue_count: r.get::<_, i64>(35)? as u64,
+            open_issue_count: r
+                .get::<_, Option<i64>>(56)?
+                .map(|value| value.max(0) as u64),
             error: r.get(18)?,
             created_at,
             started_at,
@@ -3311,7 +3314,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
-        can_retry_final_editor: r.get(56)?,
+        can_retry_final_editor: r.get(57)?,
         prompt: r.get(12)?,
         reviewers,
         summary: r.get(36)?,
@@ -3334,6 +3337,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
      review_published, blocking_review_cleanup_pending, publication_dispatched, \
+     publication_open_issue_count, \
      CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
             AND code_review_jobs.session_id IS NULL \
             AND EXISTS ( \
@@ -22591,6 +22595,24 @@ mod tests {
         };
         assert_eq!(publication_open_issue_count(&first.id), Some(3));
         assert_eq!(publication_open_issue_count(&second.id), Some(0));
+        assert_eq!(
+            store
+                .code_review_job(&first.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .open_issue_count,
+            Some(3)
+        );
+        assert_eq!(
+            store
+                .code_review_job(&second.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .open_issue_count,
+            Some(0)
+        );
 
         let stats = store
             .code_review_stats(

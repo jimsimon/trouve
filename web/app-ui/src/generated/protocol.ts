@@ -2095,6 +2095,13 @@ export interface components {
             issue_count?: number;
             lifecycle_comment_url?: string;
             model?: string | null;
+            /**
+             * Format: int64
+             * @description Total confirmed findings that remained open across the pull request
+             *     after this review was published. Absent while publication is pending
+             *     and for legacy jobs that predate this snapshot.
+             */
+            open_issue_count?: number | null;
             /** Format: int64 */
             pending_elapsed_ms?: number;
             /** Format: int64 */
