@@ -9329,6 +9329,13 @@ fn redact_public_secrets(text: &str) -> String {
         value_end: usize,
     }
 
+    #[derive(Clone, Copy)]
+    enum UrlParameterContext {
+        None,
+        Query,
+        Fragment,
+    }
+
     fn wrapper(character: char) -> bool {
         !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.' | ':' | '=')
     }
@@ -9342,6 +9349,21 @@ fn redact_public_secrets(text: &str) -> String {
             .find_map(|(label, authorization)| (lower == *label).then_some(*authorization))
     }
 
+    fn fragment_field_follows(text: &str) -> bool {
+        let mut saw_key_character = false;
+        for character in text.chars() {
+            if character == '=' {
+                return saw_key_character;
+            }
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                saw_key_character = true;
+                continue;
+            }
+            return false;
+        }
+        false
+    }
+
     fn secret_fragments(token: &str) -> Vec<SecretFragment> {
         let lower = token.to_ascii_lowercase();
         let mut fragments = Vec::new();
@@ -9350,23 +9372,30 @@ fn redact_public_secrets(text: &str) -> String {
         let structured_url = url_core.starts_with("http://")
             || url_core.starts_with("https://")
             || url_core.starts_with("www.");
-        let mut url_parameters = token.starts_with('&');
+        let mut url_parameter_context = if token.starts_with('&') {
+            UrlParameterContext::Query
+        } else {
+            UrlParameterContext::None
+        };
         while index < token.len() {
             let character = token[index..]
                 .chars()
                 .next()
                 .expect("token index remains in bounds");
             if character == '?' {
-                url_parameters = true;
+                url_parameter_context = UrlParameterContext::Query;
                 index += character.len_utf8();
                 continue;
             }
             if character == '#' {
-                // URI fragments can carry `&`-separated fields too. Keep
-                // parsing their delimiters for a known URL while retaining
-                // conservative whole-tail redaction for arbitrary text such
-                // as `password=secret#suffix`.
-                url_parameters |= structured_url;
+                // A known URL fragment can carry structured fields, but `&`
+                // is also valid opaque fragment content. Only a following
+                // `key=` proves that an ampersand ends the current field.
+                url_parameter_context = if structured_url {
+                    UrlParameterContext::Fragment
+                } else {
+                    UrlParameterContext::None
+                };
                 index += character.len_utf8();
                 continue;
             }
@@ -9410,9 +9439,18 @@ fn redact_public_secrets(text: &str) -> String {
                 .char_indices()
                 .find_map(|(offset, candidate)| {
                     let closes_quote = quote == Some(candidate);
-                    let ends_query_value =
-                        quote.is_none() && url_parameters && matches!(candidate, '&' | '#');
-                    (closes_quote || ends_query_value).then_some(value_start + offset)
+                    let ends_parameter_value = quote.is_none()
+                        && match url_parameter_context {
+                            UrlParameterContext::None => false,
+                            UrlParameterContext::Query => matches!(candidate, '&' | '#'),
+                            UrlParameterContext::Fragment => {
+                                candidate == '&'
+                                    && fragment_field_follows(
+                                        &token[value_start + offset + candidate.len_utf8()..],
+                                    )
+                            }
+                        };
+                    (closes_quote || ends_parameter_value).then_some(value_start + offset)
                 })
                 .unwrap_or(token.len());
             fragments.push(SecretFragment {
@@ -20416,6 +20454,19 @@ mod tests {
             rendered,
             "https://host.test/path?mode=ok#section&api_key=[REDACTED]&note=keep"
         );
+    }
+
+    #[test]
+    fn public_secret_redaction_consumes_ambiguous_url_fragment_suffixes() {
+        let rendered =
+            redact_public_secrets("https://host.test/path#api_key=secret&suffix&note=keep");
+
+        assert_eq!(
+            rendered,
+            "https://host.test/path#api_key=[REDACTED]&note=keep"
+        );
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("suffix"));
     }
 
     #[test]
