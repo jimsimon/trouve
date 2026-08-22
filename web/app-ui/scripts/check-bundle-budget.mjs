@@ -33,11 +33,9 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // agent-activity, attachment-gallery, external-video, and PR-wide
 // review-state and workspace-organization additions, including lazy previews,
 // mobile playback notices, and the route-scoped subscription/API/local usage
-// panel, including its
-// generated per-model usage schema and scope breakdowns. Preserve less than
-// 2 kB of headroom; entry, worker, and
-// largest-chunk budgets below still prevent one bundle from hiding in the
-// aggregate.
+// panel, including its generated per-model usage schema and scope breakdowns.
+// Preserve less than 2 kB of headroom; entry, worker, and largest-chunk budgets
+// below still prevent one bundle from hiding in the aggregate.
 const totalJavaScriptLimit = 3_233_000;
 // Version-check, transcript-search, compact navigation, and the sticky
 // multi-mode usage panel with thread/session model rows plus workspace
