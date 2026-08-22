@@ -1863,12 +1863,24 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 IFS= read -r unsubscribe
 printf '%s\n' "$unsubscribe" > "$0.unsubscribe.tmp"
 mv "$0.unsubscribe.tmp" "$0.unsubscribe"
-# Deliberately withhold the response: terminal delivery must not wait for it.
+# Deliberately withhold the response: terminal delivery must not wait for it,
+# but replacement setup must remain behind this cleanup boundary.
+while [[ ! -f "$0.release" ]]; do sleep 0.01; done
+echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+IFS= read -r resume
+printf '%s\n' "$resume" > "$0.follow-up.tmp"
+mv "$0.follow-up.tmp" "$0.follow-up"
+echo '{"jsonrpc":"2.0","id":5,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r turn_start
+echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
+IFS= read -r final_unsubscribe
+echo '{"jsonrpc":"2.0","id":7,"result":{}}'
 cat > /dev/null
 "#,
     );
-    let backend = CodexBackend::new("codex", Some(stub.clone()));
-    let mut stream = start_turn(&backend, || {
+    let backend = std::sync::Arc::new(CodexBackend::new("codex", Some(stub.clone())));
+    let mut stream = start_turn(backend.as_ref(), || {
         turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
     })
     .await;
@@ -1897,6 +1909,45 @@ cat > /dev/null
     let unsubscribe: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(unsubscribe_path).unwrap()).unwrap();
     assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+
+    let replacement = tokio::spawn({
+        let backend = std::sync::Arc::clone(&backend);
+        let worktree = tmp.path().to_path_buf();
+        async move {
+            let mut replacement = turn(worktree, Some("thr-1"), BackendPermission::Ask);
+            replacement.prompt = "follow-up".into();
+            backend.run_turn(replacement).await
+        }
+    });
+    let follow_up_path = std::path::PathBuf::from(format!("{stub}.follow-up"));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !follow_up_path.exists(),
+        "replacement setup overtook the pending thread/unsubscribe"
+    );
+
+    std::fs::write(format!("{stub}.release"), "").unwrap();
+    let mut replacement_stream =
+        tokio::time::timeout(std::time::Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement setup remained blocked after unsubscribe acknowledgement")
+            .expect("replacement task panicked")
+            .expect("replacement setup failed");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match replacement_stream.next().await {
+                Some(Ok(BackendEvent::Completed { .. })) => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("replacement turn failed: {error}"),
+                None => panic!("replacement stream ended before completion"),
+            }
+        }
+    })
+    .await
+    .expect("replacement turn did not complete");
+    let follow_up: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(follow_up_path).unwrap()).unwrap();
+    assert_eq!(follow_up["method"], "thread/resume");
 }
 
 #[tokio::test]

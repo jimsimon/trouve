@@ -349,6 +349,23 @@ impl AgentBackend for CodexBackend {
             params
         };
 
+        // Serialize the entire persisted-thread replacement boundary. Cleanup
+        // may have published the previous terminal event while its vendor
+        // unsubscribe is still in flight; do not inspect cached load state or
+        // resume that thread until cleanup has made the outcome unambiguous.
+        let persisted_lifecycle_server = Arc::clone(&server);
+        let persisted_lifecycle = match turn.session.as_deref() {
+            Some(thread_id) => {
+                let lifecycle = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                    lifecycle = server.lock_turn_lifecycle(thread_id) => Ok(lifecycle),
+                }?;
+                Some(lifecycle)
+            }
+            None => None,
+        };
+
         // Start or resume the vendor-side thread.
         let mut start_params = with_thread_settings(json!({
             "cwd": turn.worktree,
@@ -424,22 +441,34 @@ impl AgentBackend for CodexBackend {
             "codex startup timing: thread ready"
         );
 
+        // A failed resume may replace the app-server or return a fresh vendor
+        // thread. Transfer the setup boundary to that thread without trying
+        // to reacquire the same non-reentrant lifecycle lock.
+        let lifecycle = if persisted_lifecycle.as_ref().is_some_and(|lifecycle| {
+            lifecycle.thread_id == codex_thread_id
+                && Arc::ptr_eq(&server, &persisted_lifecycle_server)
+        }) {
+            persisted_lifecycle.expect("matching persisted lifecycle is present")
+        } else {
+            let replacement_lifecycle = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                lifecycle = server.lock_turn_lifecycle(&codex_thread_id) => Ok(lifecycle),
+            };
+            let replacement_lifecycle = match replacement_lifecycle {
+                Ok(lifecycle) => lifecycle,
+                Err(error) => {
+                    return session_setup_failure(fresh_session, &codex_thread_id, error);
+                }
+            };
+            drop(persisted_lifecycle);
+            replacement_lifecycle
+        };
         // A cancelled trouve stream may still have a live vendor turn if the
         // app-server was blocked in a model or tool request when its consumer
         // disappeared. Await its interruption before starting a replacement;
         // otherwise Codex folds the new prompt into the old turn and its late
         // completion is misattributed to the replacement.
-        let lifecycle = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(BackendError::Cancelled),
-            lifecycle = server.lock_turn_lifecycle(&codex_thread_id) => Ok(lifecycle),
-        };
-        let lifecycle = match lifecycle {
-            Ok(lifecycle) => lifecycle,
-            Err(error) => {
-                return session_setup_failure(fresh_session, &codex_thread_id, error);
-            }
-        };
         if let Err(error) = server.interrupt_active_turn(&codex_thread_id).await {
             return session_setup_failure(fresh_session, &codex_thread_id, error);
         }
@@ -3549,14 +3578,15 @@ impl AppServer {
     /// Release app-server's subscription after a terminal turn. A later
     /// trouve turn resumes the persisted vendor thread and subscribes again.
     async fn release_thread(&self, thread_id: &str) -> Result<(), BackendError> {
-        // Forget before the RPC so a replacement that starts while cleanup
-        // is in flight cannot decide to reuse the stale subscription.
+        // Forget before the RPC. Callers hold the per-thread lifecycle guard,
+        // so replacements cannot inspect this state until the unsubscribe has
+        // either completed or its shared transport has been retired.
         self.loaded_threads.lock().await.forget(thread_id);
         self.request_with_cancel_timeout(
             "thread/unsubscribe",
             json!({ "threadId": thread_id }),
             None,
-            false,
+            true,
             THREAD_UNSUBSCRIBE_TIMEOUT,
         )
         .await
