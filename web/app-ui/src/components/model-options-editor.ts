@@ -4,7 +4,7 @@ import {
   type ModelOptionChangeDetail,
   type ModelOptionControl,
   type ModelOptionValue,
-  modelOptionTextValueIsValid,
+  modelOptionTextValue,
   type TextModelOptionControl,
 } from "./model-option-controls.js";
 
@@ -249,15 +249,13 @@ export class TrouveModelOptionsEditor extends LitElement {
 
   #commitText(control: TextModelOptionControl, input: HTMLInputElement): void {
     const raw = control.scalarType === "string" ? input.value : input.value.trim();
-    if (!modelOptionTextValueIsValid(control, raw)) {
+    const value = modelOptionTextValue(control, raw);
+    if (value === null) {
       input.setCustomValidity(`Enter a valid ${control.scalarType} ${control.hint}.`);
       input.reportValidity();
       return;
     }
     input.setCustomValidity("");
-    const value = control.scalarType === "string"
-      ? raw
-      : raw === "" ? undefined : Number(raw);
     const committed = String(value ?? "");
     if (this.#committedText.get(input) === committed) return;
     this.#committedText.set(input, committed);
