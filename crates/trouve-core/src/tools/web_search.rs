@@ -211,6 +211,7 @@ struct PendingInitializationJob {
     endpoint: String,
     protocol_version: String,
     response: ProviderResponseFuture,
+    cleanup_permit: SessionCleanupPermit,
 }
 
 struct SessionCleanupJob {
@@ -273,6 +274,15 @@ impl SessionCleanupPermit {
             protocol_version,
             self.overall_timeout,
         ));
+    }
+
+    fn send_recovered_job(mut self, job: SessionCleanupJob) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        // Recovery itself is already represented in pending; transferring
+        // that obligation to the cleanup worker must not count it twice.
+        permit.send(job);
     }
 
     #[cfg(test)]
@@ -422,7 +432,6 @@ impl SessionCleanupWorker {
                 });
             })
             .expect("web search cleanup worker must start");
-        let recovery_cleanup_sender = sender.clone();
         let recovery_pending = pending.clone();
         let recovery_thread = std::thread::Builder::new()
             .name("trouve-web-search-session-recovery".into())
@@ -444,11 +453,16 @@ impl SessionCleanupWorker {
                                 let Some(job) = job else {
                                     break;
                                 };
-                                let cleanup_sender = recovery_cleanup_sender.clone();
                                 let pending = recovery_pending.clone();
                                 recoveries.spawn(async move {
+                                    let PendingInitializationJob {
+                                        endpoint,
+                                        protocol_version,
+                                        response,
+                                        cleanup_permit,
+                                    } = job;
                                     let Ok(Ok(response)) =
-                                        tokio::time::timeout(SEARCH_TIMEOUT, job.response).await
+                                        tokio::time::timeout(SEARCH_TIMEOUT, response).await
                                     else {
                                         pending.fetch_sub(1, Ordering::Release);
                                         return;
@@ -460,20 +474,11 @@ impl SessionCleanupWorker {
                                         return;
                                     };
                                     let deadline = Instant::now() + policy.overall_timeout;
-                                    let remaining = deadline.saturating_duration_since(Instant::now());
-                                    let Ok(Ok(permit)) = tokio::time::timeout(
-                                        remaining,
-                                        cleanup_sender.reserve_owned(),
-                                    )
-                                    .await
-                                    else {
-                                        pending.fetch_sub(1, Ordering::Release);
-                                        return;
-                                    };
-                                    permit.send(SessionCleanupJob::with_deadline(
-                                        job.endpoint,
+                                    cleanup_permit.send_recovered_job(
+                                        SessionCleanupJob::with_deadline(
+                                        endpoint,
                                         session_id,
-                                        job.protocol_version,
+                                        protocol_version,
                                         deadline,
                                     ));
                                 });
@@ -898,12 +903,14 @@ impl WebSearch {
             Err(SearchError::CancelledAfterHandoff(response)) => {
                 // The caller remains promptly cancellable while independently
                 // bounded lifecycle work captures and closes any session that
-                // the handed-off initialization created.
-                drop(cleanup_permit);
+                // the handed-off initialization created. Transfer the already
+                // reserved DELETE capacity so recovery cannot lose teardown
+                // while the cleanup queue is saturated.
                 self.cleanup.recover(PendingInitializationJob {
                     endpoint: provider.endpoint.clone(),
                     protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
                     response,
+                    cleanup_permit,
                 });
                 return Err(SearchError::Cancelled);
             }
@@ -2063,7 +2070,7 @@ mod tests {
         assert_eq!(result.result["error"], "search cancelled");
         let capacity_cancel = tokio_util::sync::CancellationToken::new();
         let mut permits = Vec::new();
-        for _ in 0..SESSION_CLEANUP_CAPACITY {
+        for _ in 0..SESSION_CLEANUP_CAPACITY - 1 {
             match tokio::time::timeout(
                 Duration::from_millis(100),
                 tool.cleanup.reserve(&capacity_cancel),
@@ -2071,10 +2078,9 @@ mod tests {
             .await
             {
                 Ok(Ok(permit)) => permits.push(permit),
-                _ => panic!("pending header recovery must not consume teardown admission"),
+                _ => panic!("all cleanup capacity except recovery's permit must remain available"),
             }
         }
-        drop(permits);
         tokio::time::timeout(
             Duration::from_secs(1),
             wait_for(|| {
@@ -2087,6 +2093,7 @@ mod tests {
         )
         .await
         .expect("delayed initialization must retain its session cleanup path");
+        drop(permits);
         tokio::time::timeout(
             Duration::from_secs(1),
             wait_for(|| tool.cleanup.pending.load(Ordering::Acquire) == 0),
@@ -2096,7 +2103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovered_session_cleanup_admission_uses_a_discovery_deadline() {
+    async fn cancelled_initialization_transfers_reserved_cleanup_capacity() {
         let body =
             r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
         let (endpoint, _, requests) = capturing_mock_server_with_delays(
@@ -2104,7 +2111,7 @@ mod tests {
             body,
             Duration::ZERO,
             Duration::ZERO,
-            Duration::from_millis(150),
+            Duration::from_millis(250),
             true,
             None,
         )
@@ -2126,7 +2133,7 @@ mod tests {
         let running = tokio::spawn({
             let tool = tool.clone();
             async move {
-                tool.run(&ctx, &json!({"query": "cancel before recovery admission"}))
+                tool.run(&ctx, &json!({"query": "retain recovery cleanup admission"}))
                     .await
             }
         });
@@ -2136,35 +2143,36 @@ mod tests {
         )
         .await
         .unwrap();
-        cancel.cancel();
-        assert_eq!(
-            running.await.unwrap().status,
-            trouve_protocol::ToolStatus::Error
-        );
-
         let capacity_cancel = tokio_util::sync::CancellationToken::new();
         let mut permits = Vec::new();
-        for _ in 0..SESSION_CLEANUP_CAPACITY {
+        // Initialization already owns one permit. Retain every other permit
+        // beyond the cleanup budget to prove recovery transfers its own
+        // capacity instead of trying (and eventually failing) to reacquire.
+        for _ in 0..SESSION_CLEANUP_CAPACITY - 1 {
             match tool.cleanup.reserve(&capacity_cancel).await {
                 Ok(permit) => permits.push(permit),
                 Err(_) => panic!("cleanup capacity must be reservable"),
             }
         }
+        cancel.cancel();
+        assert_eq!(
+            running.await.unwrap().status,
+            trouve_protocol::ToolStatus::Error
+        );
         assert!(tool.cleanup.pending.load(Ordering::Acquire) > 0);
         tokio::time::timeout(
             Duration::from_secs(1),
-            wait_for(|| tool.cleanup.pending.load(Ordering::Acquire) == 0),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+                    && tool.cleanup.pending.load(Ordering::Acquire) == 0
+            }),
         )
         .await
-        .expect("recovery admission must expire from session discovery");
-        assert!(
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|request| request.method != "DELETE"),
-            "expired recovery must not start a fresh cleanup budget after admission"
-        );
+        .expect("recovery must use its reserved cleanup capacity");
         drop(permits);
     }
 
