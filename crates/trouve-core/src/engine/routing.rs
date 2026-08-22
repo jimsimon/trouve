@@ -2009,3 +2009,47 @@ impl Engine {
         Ok(RouteAttemptResult::Completed)
     }
 }
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::BackendMutationQuarantine;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn retained_pending_writer_keeps_new_readers_behind_the_fence() {
+        let admission = Arc::new(tokio::sync::RwLock::new(()));
+        let initial_reader = admission.clone().read_owned().await;
+        let quarantine = BackendMutationQuarantine::queue(admission.clone()).await;
+        assert!(quarantine._pending_acquisition.is_some());
+
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let mut competing_reader = tokio::spawn(async move {
+            let mut acquisition = Box::pin(admission.read_owned());
+            let mut queued_tx = Some(queued_tx);
+            futures::future::poll_fn(|context| {
+                let result = std::future::Future::poll(acquisition.as_mut(), context);
+                if let Some(queued_tx) = queued_tx.take() {
+                    let _ = queued_tx.send(matches!(&result, std::task::Poll::Pending));
+                }
+                result
+            })
+            .await
+        });
+        assert!(queued_rx.await.unwrap(), "competing reader was not queued");
+
+        drop(initial_reader);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut competing_reader)
+                .await
+                .is_err(),
+            "competing reader skipped the retained pending writer"
+        );
+
+        drop(quarantine);
+        tokio::time::timeout(Duration::from_millis(250), competing_reader)
+            .await
+            .expect("reader remained blocked after the quarantine was dropped")
+            .unwrap();
+    }
+}
