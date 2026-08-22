@@ -119,12 +119,12 @@ impl ProviderDispatcher {
     /// order. The request-body handoff is the acknowledgement boundary: it
     /// occurs only after the HTTP transport is ready to consume outbound
     /// bytes, but does not couple later admission to response-header latency.
-    async fn dispatch(
+    async fn begin_dispatch(
         &self,
         cancel: &tokio_util::sync::CancellationToken,
         request: reqwest::RequestBuilder,
         body: &Value,
-    ) -> Result<reqwest::Response, SearchError> {
+    ) -> Result<ProviderResponseFuture, SearchError> {
         let mut last_request = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(SearchError::Cancelled),
@@ -195,9 +195,20 @@ impl ProviderDispatcher {
         drop(last_request);
 
         if let Some(response) = early_response {
-            return response
-                .map_err(|error| SearchError::Failed(format!("request failed: {error}")));
+            let response = response
+                .map_err(|error| SearchError::Failed(format!("request failed: {error}")))?;
+            return Ok(Box::pin(async move { Ok(response) }));
         }
+        Ok(send)
+    }
+
+    async fn dispatch(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        request: reqwest::RequestBuilder,
+        body: &Value,
+    ) -> Result<reqwest::Response, SearchError> {
+        let mut send = self.begin_dispatch(cancel, request, body).await?;
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(SearchError::CancelledAfterHandoff(send)),
@@ -212,6 +223,45 @@ struct PendingInitializationJob {
     protocol_version: String,
     response: ProviderResponseFuture,
     cleanup_permit: SessionCleanupPermit,
+}
+
+struct PendingInitializationOwner<'a> {
+    cleanup: &'a SessionCleanupWorker,
+    job: Option<PendingInitializationJob>,
+}
+
+impl PendingInitializationOwner<'_> {
+    async fn response(
+        &mut self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<reqwest::Response, SearchError> {
+        let response = &mut self
+            .job
+            .as_mut()
+            .expect("pending initialization owner must stay armed while awaiting")
+            .response;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(SearchError::Cancelled),
+            response = response => response
+                .map_err(|error| SearchError::Failed(format!("request failed: {error}"))),
+        }
+    }
+
+    fn disarm(mut self) -> SessionCleanupPermit {
+        self.job
+            .take()
+            .expect("pending initialization owner must disarm exactly once")
+            .cleanup_permit
+    }
+}
+
+impl Drop for PendingInitializationOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            self.cleanup.recover(job);
+        }
+    }
 }
 
 struct SessionCleanupJob {
@@ -896,10 +946,34 @@ impl WebSearch {
         });
         let response = match self
             .dispatcher
-            .dispatch(&ctx.cancel, self.provider_request(provider, None), &body)
+            .begin_dispatch(&ctx.cancel, self.provider_request(provider, None), &body)
             .await
         {
-            Ok(response) => response,
+            Ok(response) => {
+                // Once the request body is handed off, this owner transfers
+                // the response future and reserved teardown capacity to the
+                // recovery worker if this enclosing future is cancelled,
+                // aborted, or otherwise dropped before response headers.
+                let mut pending = PendingInitializationOwner {
+                    cleanup: &self.cleanup,
+                    job: Some(PendingInitializationJob {
+                        endpoint: provider.endpoint.clone(),
+                        protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
+                        response,
+                        cleanup_permit,
+                    }),
+                };
+                let response = match pending.response(&ctx.cancel).await {
+                    Ok(response) => response,
+                    Err(SearchError::Cancelled) => return Err(SearchError::Cancelled),
+                    Err(error) => {
+                        drop(pending.disarm());
+                        return Err(error);
+                    }
+                };
+                let cleanup_permit = pending.disarm();
+                (response, cleanup_permit)
+            }
             Err(SearchError::CancelledAfterHandoff(response)) => {
                 // The caller remains promptly cancellable while independently
                 // bounded lifecycle work captures and closes any session that
@@ -916,6 +990,7 @@ impl WebSearch {
             }
             Err(error) => return Err(error),
         };
+        let (response, cleanup_permit) = response;
         let session_id = response.headers().get(MCP_SESSION_ID_HEADER).cloned();
         // Stateless MCP providers do not need teardown capacity after their
         // initialization headers establish that no session was allocated.
@@ -965,6 +1040,12 @@ impl WebSearch {
                 "provider initialization omitted protocol version".into(),
             ));
         };
+        if reqwest::header::HeaderValue::from_str(protocol_version).is_err() {
+            session.close();
+            return Err(SearchError::Failed(
+                "provider returned an invalid MCP protocol version".into(),
+            ));
+        }
         session.protocol_version = protocol_version.to_owned();
         let initialized = json!({
             "jsonrpc": "2.0",
@@ -1823,6 +1904,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_negotiated_protocol_uses_safe_cleanup_fallback() {
+        let invalid_initialization = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "protocolVersion": "invalid\nversion",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "mock-search", "version": "1"},
+            },
+        })
+        .to_string();
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
+        let (endpoint, _, requests) = capturing_mock_server_with_initialization(
+            "200 OK",
+            body,
+            Duration::ZERO,
+            Some(invalid_initialization),
+        )
+        .await;
+        let tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
+
+        let result = tool
+            .run(
+                &ToolCtx::default(),
+                &json!({"query": "invalid negotiated metadata"}),
+            )
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            result.result["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid MCP protocol version")
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+            }),
+        )
+        .await
+        .expect("invalid negotiation must still close the allocated session");
+        let requests = requests.lock().unwrap();
+        let cleanup = requests
+            .iter()
+            .find(|request| request.method == "DELETE")
+            .unwrap();
+        assert_eq!(cleanup.session_id.as_deref(), Some("test-session"));
+        assert_eq!(
+            cleanup.protocol_version.as_deref(),
+            Some(MCP_PROTOCOL_VERSION)
+        );
+    }
+
+    #[tokio::test]
     async fn caches_normalized_queries() {
         let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"result with https://example.com"}]}}"#;
         let (endpoint, calls) = mock_server("200 OK", body).await;
@@ -2100,6 +2242,61 @@ mod tests {
         )
         .await
         .expect("delayed initialization cleanup must remain bounded");
+    }
+
+    #[tokio::test]
+    async fn aborting_initialization_after_handoff_recovers_session() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unused"}]}}"#;
+        let (endpoint, _, requests) = capturing_mock_server_with_delays(
+            "200 OK",
+            body,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_millis(250),
+            true,
+            None,
+        )
+        .await;
+        let tool = Arc::new(WebSearch::new(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::ZERO,
+        ));
+        let running = tokio::spawn({
+            let tool = tool.clone();
+            async move {
+                tool.run(
+                    &ToolCtx::default(),
+                    &json!({"query": "abort handed-off initialization"}),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| !requests.lock().unwrap().is_empty()),
+        )
+        .await
+        .expect("provider must observe the handed-off initialization");
+
+        running.abort();
+        match running.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("aborted search must not complete normally"),
+        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(|| {
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "DELETE")
+                    && tool.cleanup.pending.load(Ordering::Acquire) == 0
+            }),
+        )
+        .await
+        .expect("dropping post-handoff initialization must transfer recovery ownership");
     }
 
     #[tokio::test]

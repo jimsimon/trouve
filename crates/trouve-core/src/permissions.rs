@@ -73,6 +73,21 @@ pub fn gate(
     allow_list: &HashSet<String>,
     key: &str,
 ) -> Gate {
+    gate_tool(mode, mode_read_only, tool_mutates, allow_list, key, key)
+}
+
+/// Apply permission policy using both the reported tool identity and its
+/// allow-list scope. Bridged trouve tools retain an MCP server key for
+/// session-scoped approval, but outbound web tools must still be classified
+/// by the underlying operation before generic read-only handling.
+pub fn gate_tool(
+    mode: PermissionMode,
+    mode_read_only: bool,
+    tool_mutates: bool,
+    allow_list: &HashSet<String>,
+    tool: &str,
+    key: &str,
+) -> Gate {
     // Yolo is opt-in full trust: no approval prompts. Read-only agent personas
     // still deny mutating tools.
     if mode == PermissionMode::Yolo {
@@ -88,7 +103,11 @@ pub fn gate(
     // non-yolo mode — including read-only modes, where research is
     // legitimate but silent exfiltration is not. "Always approve" unlocks
     // the session via the allow-list.
-    if matches!(key, "web_fetch" | "web_search") {
+    let outbound_web_tool = matches!(tool, "web_fetch" | "web_search")
+        || crate::mcp::split_tool_name(tool).is_some_and(|(server, tool)| {
+            server == "trouve" && matches!(tool, "web_fetch" | "web_search")
+        });
+    if outbound_web_tool {
         return if allow_list.contains(key) {
             Gate::Allow
         } else {
@@ -516,6 +535,25 @@ mod tests {
         assert_ne!(
             allow_key("mcpToolCall", &serde_json::json!({"serverName": "github"})),
             allow_key("mcpToolCall", &serde_json::json!({"serverName": "jira"}))
+        );
+    }
+
+    #[test]
+    fn bridged_web_tools_keep_mcp_scope_but_require_outbound_approval() {
+        let empty = HashSet::new();
+        let args = serde_json::json!({"query": "sensitive query"});
+        let tool = "mcp__trouve__web_search";
+        let key = allow_key(tool, &args);
+        assert_eq!(key, "mcp:trouve");
+        assert_eq!(
+            gate_tool(PermissionMode::Ask, true, false, &empty, tool, &key),
+            Gate::NeedsApproval
+        );
+
+        let listed = HashSet::from([key.clone()]);
+        assert_eq!(
+            gate_tool(PermissionMode::Ask, true, false, &listed, tool, &key),
+            Gate::Allow
         );
     }
 
