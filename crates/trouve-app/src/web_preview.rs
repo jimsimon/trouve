@@ -108,29 +108,37 @@ impl VideoPlaybackCache {
     fn open_with<F>(
         &mut self,
         attachment: &NativeAttachment,
-        mut open: F,
+        open: F,
     ) -> Result<(), VideoAttachmentOpenError>
     where
         F: FnMut(&std::path::Path) -> Result<(), String>,
+    {
+        self.open_with_cleanup(attachment, open, remove_temporary_video)
+    }
+
+    fn open_with_cleanup<F, R>(
+        &mut self,
+        attachment: &NativeAttachment,
+        mut open: F,
+        mut remove: R,
+    ) -> Result<(), VideoAttachmentOpenError>
+    where
+        F: FnMut(&std::path::Path) -> Result<(), String>,
+        R: FnMut(&std::path::Path) -> bool,
     {
         let extension = attachment.video_extension().ok_or_else(|| {
             VideoAttachmentOpenError::Failed("unsupported video attachment type".to_string())
         })?;
         let identity = video_attachment_identity(extension, attachment.bytes());
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.identity == identity)
-        {
-            if retained_video_is_usable(&self.entries[index]) {
-                return open(&self.entries[index].path).map_err(VideoAttachmentOpenError::Failed);
-            }
-            if !remove_temporary_video(&self.entries[index].path) {
+        self.entries
+            .retain(|entry| retained_video_is_usable(entry) || !remove(&entry.path));
+        if let Some(entry) = self.entries.iter().find(|entry| entry.identity == identity) {
+            if !retained_video_is_usable(entry) {
                 return Err(VideoAttachmentOpenError::Failed(
                     "stale temporary video could not be replaced".to_string(),
                 ));
             }
-            self.entries.swap_remove(index);
+            return open(&entry.path).map_err(VideoAttachmentOpenError::Failed);
         }
 
         let retained_bytes = self
@@ -171,7 +179,7 @@ impl VideoPlaybackCache {
             modified,
         });
         let result = open(&path).map_err(VideoAttachmentOpenError::Failed);
-        if result.is_err() && remove_temporary_video(&path) {
+        if result.is_err() && remove(&path) {
             self.entries.retain(|entry| entry.path != path);
         }
         result
@@ -971,6 +979,27 @@ mod close_confirmation_tests {
         assert_ne!(reopened_path, stale_path);
         assert_eq!(std::fs::read(reopened_path).unwrap(), b"video");
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn video_playback_cache_retries_stale_cleanup_before_capacity_checks() {
+        let mut cache = VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        cache
+            .open_with(&video_attachment("first.mp4", b"first"), |_| Ok(()))
+            .unwrap();
+        let stale_path = cache.entries[0].path.clone();
+        std::fs::write(&stale_path, b"changed length").unwrap();
+        let second = video_attachment("second.mp4", b"second");
+
+        assert_eq!(
+            cache.open_with_cleanup(&second, |_| Ok(()), |_| false),
+            Err(VideoAttachmentOpenError::Capacity)
+        );
+        cache.open_with(&second, |_| Ok(())).unwrap();
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(std::fs::read(&cache.entries[0].path).unwrap(), b"second");
+        assert_ne!(cache.entries[0].path, stale_path);
     }
 
     #[test]
