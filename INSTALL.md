@@ -58,12 +58,14 @@ Unlike the OpenCode plugin it runs one CLI process per call (no in-session
 index cache and no session-start warming), but it also needs no npm
 package.
 
-Copy [`src/agents/opencode-tool.ts`](src/agents/opencode-tool.ts) to
+Copy
+[`crates/trouve-search/src/agents/opencode-tool.ts`](crates/trouve-search/src/agents/opencode-tool.ts)
+to
 `~/.config/opencode/tools/trouve.ts`:
 
 ```bash
 mkdir -p ~/.config/opencode/tools
-curl -fsSL https://raw.githubusercontent.com/jimsimon/trouve/main/src/agents/opencode-tool.ts \
+curl -fsSL https://raw.githubusercontent.com/jimsimon/trouve/main/crates/trouve-search/src/agents/opencode-tool.ts \
   -o ~/.config/opencode/tools/trouve.ts
 ```
 
@@ -189,8 +191,8 @@ To uninstall, remove the `trouve-search` entry from the same file.
 
 Ready-made `trouve-search` sub-agent files (search specialists that use the
 trouve-search CLI via the agent's shell tool) live in
-[`src/agents/`](src/agents/). Copy the one matching your agent to where it
-loads sub-agents from:
+[`crates/trouve-search/src/agents/`](crates/trouve-search/src/agents/). Copy
+the one matching your agent to where it loads sub-agents from:
 
 | Agent | Source file | Destination |
 | --- | --- | --- |

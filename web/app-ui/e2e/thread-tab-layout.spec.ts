@@ -54,7 +54,12 @@ test("thread working set stays on one row with persistent actions", async ({ pag
     total.textContent = "7";
     toggle.append(toggleLabel, total);
     switcher.append(toggle);
-    fixture.append(tabs, add, switcher);
+    const find = document.createElement("button");
+    find.className = "chat-find-toggle";
+    find.type = "button";
+    find.setAttribute("aria-label", "Find in chat");
+    find.textContent = "⌕";
+    fixture.append(tabs, add, switcher, find);
     document.body.append(fixture);
   });
 
@@ -66,7 +71,10 @@ test("thread working set stays on one row with persistent actions", async ({ pag
     const items = [...element.querySelectorAll<HTMLElement>(".thread-tab-item")];
     const add = element.querySelector<HTMLElement>(".new-thread-tab");
     const switcher = element.querySelector<HTMLElement>(".thread-switcher-toggle");
-    if (tabs === null || add === null || switcher === null) throw new Error("fixture incomplete");
+    const find = element.querySelector<HTMLElement>(".chat-find-toggle");
+    if (tabs === null || add === null || switcher === null || find === null) {
+      throw new Error("fixture incomplete");
+    }
     const top = Math.round(items[0]?.getBoundingClientRect().top ?? -1);
     return {
       tabHeight: tabs.clientHeight,
@@ -74,7 +82,10 @@ test("thread working set stays on one row with persistent actions", async ({ pag
       allOneRow: items.every((item) => Math.round(item.getBoundingClientRect().top) === top),
       addVisible: add.getBoundingClientRect().right <= bounds.right,
       switcherVisible: switcher.getBoundingClientRect().right <= bounds.right,
-      actionsAligned: Math.abs(add.getBoundingClientRect().top - switcher.getBoundingClientRect().top) <= 1,
+      findVisible: find.getBoundingClientRect().right <= bounds.right,
+      findRightmost: find.getBoundingClientRect().left >= switcher.getBoundingClientRect().right,
+      actionsAligned: [switcher, find].every((action) =>
+        Math.abs(add.getBoundingClientRect().top - action.getBoundingClientRect().top) <= 1),
       overflow: getComputedStyle(tabs).overflow,
     };
   });
@@ -86,8 +97,11 @@ test("thread working set stays on one row with persistent actions", async ({ pag
   expect(geometry.allOneRow).toBe(true);
   expect(geometry.addVisible).toBe(true);
   expect(geometry.switcherVisible).toBe(true);
+  expect(geometry.findVisible).toBe(true);
+  expect(geometry.findRightmost).toBe(true);
   expect(geometry.actionsAligned).toBe(true);
   expect(geometry.overflow).toBe("hidden");
   await expect(tabs).toBeVisible();
   await expect(page.getByRole("button", { name: "Threads (7)" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Find in chat" })).toBeVisible();
 });

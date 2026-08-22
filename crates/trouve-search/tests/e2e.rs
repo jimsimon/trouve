@@ -1,6 +1,6 @@
 //! Model-backed end-to-end tests.
 //!
-//! These download the real default embedding model (potion-code-16M) from
+//! These download the real default embedding model (potion-code-16M-v2) from
 //! the Hugging Face Hub, so they are `#[ignore]`d by default and run with:
 //!
 //! ```bash
@@ -92,7 +92,7 @@ fn e2e_index_search_and_find_related() {
     let root = dir.path();
     sample_project(root);
 
-    // `None` resolves TROUVE_MODEL_NAME or the default potion-code-16M,
+    // `None` resolves TROUVE_MODEL_NAME or the default potion-code-16M-v2,
     // exercising the real download / load / tokenize / embed pipeline.
     let index = TrouveIndex::from_path(root, CODE, None).unwrap();
     assert_eq!(index.build_stats.files_total, 3);
