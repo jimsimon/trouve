@@ -350,7 +350,8 @@ fn run_git_bounded_with_status(
     operation: &GitOperation<'_>,
 ) -> Result<BoundedGitCommandOutput> {
     operation.check()?;
-    let execution_deadline = operation.deadline - PROCESS_TREE_CLEANUP_RESERVE;
+    let cleanup_reserve = PROCESS_TREE_CLEANUP_RESERVE.min(operation.timeout / 3);
+    let execution_deadline = operation.deadline - cleanup_reserve;
     if Instant::now() >= execution_deadline {
         bail!(
             "{} timed out after {}s",
@@ -2217,6 +2218,49 @@ pub fn common_directory(repo: &Path) -> Result<PathBuf> {
         .with_context(|| format!("canonicalizing git common directory {}", common.display()))
 }
 
+/// Resolve the local inputs used to identify a workspace repository under one
+/// shared deadline. Workspace listing is latency-sensitive and must not wait
+/// indefinitely on Git configuration or filesystem probes.
+pub fn workspace_repository_sources(
+    repo: &Path,
+    remote: &str,
+    timeout: Duration,
+) -> (Option<String>, Option<PathBuf>) {
+    let operation = GitOperation::with_timeout(None, timeout, "workspace repository identity");
+    let remote_url = run_git_bounded(
+        repo,
+        None,
+        &["remote", "get-url", remote],
+        None,
+        64 * 1024,
+        &operation,
+    )
+    .ok()
+    .filter(|output| !output.truncated)
+    .map(|output| String::from_utf8_lossy(&output.bytes).trim().to_string())
+    .filter(|url| !url.is_empty());
+    let common_directory = run_git_bounded(
+        repo,
+        None,
+        &["rev-parse", "--git-common-dir"],
+        None,
+        64 * 1024,
+        &operation,
+    )
+    .ok()
+    .filter(|output| !output.truncated)
+    .and_then(|output| {
+        let common = PathBuf::from(String::from_utf8_lossy(&output.bytes).trim().to_string());
+        let common = if common.is_absolute() {
+            common
+        } else {
+            repo.join(common)
+        };
+        common.canonicalize().ok()
+    });
+    (remote_url, common_directory)
+}
+
 /// Remove an unpersisted immutable checkpoint anchor only while it still names
 /// the commit produced by that attempt. The old-OID argument is the ownership
 /// proof: a concurrent replacement makes this fail closed.
@@ -3464,6 +3508,30 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         run(dir, &["add", "-A"]);
         run(dir, &["commit", "-m", "init"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_repository_sources_bound_stalled_git_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let stalled_include = tmp.path().join("stalled-config");
+        let mut mkfifo = Command::new("mkfifo");
+        mkfifo.arg(&stalled_include);
+        assert!(trouve_process::status(&mut mkfifo).unwrap().success());
+        let mut config = OpenOptions::new()
+            .append(true)
+            .open(tmp.path().join(".git/config"))
+            .unwrap();
+        writeln!(config, "[include]\n\tpath = {}", stalled_include.display()).unwrap();
+        drop(config);
+
+        let started = Instant::now();
+        let sources =
+            workspace_repository_sources(tmp.path(), "origin", Duration::from_millis(300));
+
+        assert_eq!(sources, (None, None));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

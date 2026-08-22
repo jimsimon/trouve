@@ -4,7 +4,7 @@ import { repeat } from "lit/directives/repeat.js";
 
 import { appServicesContext, appStoreContext } from "../contexts/app-contexts.js";
 import { preferredSessionThreadId } from "../services/resume-preferences.js";
-import type { SessionListItem } from "../state/app-store.js";
+import type { AppStore, SessionListItem } from "../state/app-store.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
   sessionAgePresentation,
@@ -13,6 +13,7 @@ import {
 import { sessionIndicatorPresentation } from "../state/session-indicator-model.js";
 import {
   visibleSessionPullRequestBadge,
+  type SessionPullRequestBadge,
 } from "./session-pull-request-badge.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
@@ -26,6 +27,26 @@ import {
 } from "./workspace-session-list-model.js";
 
 let nextArchivedListId = 0;
+
+type OrganizedSessionListItem = SessionListItem & WorkspaceSessionListFields & {
+  readonly pullRequestBadge: SessionPullRequestBadge | undefined;
+};
+
+export const enrichWorkspaceSessions = (
+  store: Pick<AppStore, "sessionMetadata" | "sessionPullRequests">,
+  sessions: readonly SessionListItem[],
+  workspaceId: string,
+): readonly OrganizedSessionListItem[] => sessions
+  .filter((session) => workspaceId === "" || session.workspaceId === workspaceId)
+  .map((session) => {
+    const pullRequests = store.sessionPullRequests(session.id);
+    return {
+      ...session,
+      createdAt: store.sessionMetadata(session.id)?.created_at ?? session.updatedAt,
+      pullRequestKind: pullRequestKind(pullRequests),
+      pullRequestBadge: visibleSessionPullRequestBadge(pullRequests),
+    };
+  });
 
 /** A first real context consumer: gallery tests can provide an isolated store,
  * while application screens share the stable provider at the shell boundary. */
@@ -115,12 +136,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const selectedSessionId =
       currentRoute?.kind === "session" ? currentRoute.sessionId : undefined;
     const now = Date.now();
-    const organizedSessions: readonly (SessionListItem & WorkspaceSessionListFields)[] =
-      sessions.map((session) => ({
-        ...session,
-        createdAt: store.sessionMetadata(session.id)?.created_at ?? session.updatedAt,
-        pullRequestKind: pullRequestKind(store.sessionPullRequests(session.id)),
-      }));
+    const organizedSessions = enrichWorkspaceSessions(store, sessions, this.workspaceId);
     const groups = organizeWorkspaceSessions(organizedSessions, {
       workspaceId: this.workspaceId,
       grouping: this.grouping,
@@ -210,7 +226,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   }
 
   #renderSection(
-    section: WorkspaceSessionSection<SessionListItem & WorkspaceSessionListFields>,
+    section: WorkspaceSessionSection<OrganizedSessionListItem>,
     selectedSessionId: string | undefined,
     now: number,
   ) {
@@ -250,15 +266,12 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   }
 
   #renderSession(
-    session: SessionListItem,
+    session: OrganizedSessionListItem,
     selectedSessionId: string | undefined,
     now: number,
   ) {
     const selected = session.id === selectedSessionId;
-    const store = this.#store.value;
-    const pullRequestBadge = visibleSessionPullRequestBadge(
-      store?.sessionPullRequests(session.id) ?? [],
-    );
+    const pullRequestBadge = session.pullRequestBadge;
     const indicator = sessionIndicatorPresentation(session);
     const age = sessionAgePresentation(session.updatedAt, now);
     return html`

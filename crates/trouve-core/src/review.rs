@@ -5131,10 +5131,14 @@ impl Engine {
         )? {
             bail!("stale: review was superseded while selecting its diff base");
         }
-        let workspace = self.register_workspace(
-            &repository_path.to_string_lossy(),
-            Some(job.repository.clone()),
-        )?;
+        let registration_engine = Arc::clone(self);
+        let registration_path = repository_path.to_string_lossy().into_owned();
+        let registration_name = job.repository.clone();
+        let workspace = tokio::task::spawn_blocking(move || {
+            registration_engine.register_workspace(&registration_path, Some(registration_name))
+        })
+        .await
+        .context("joining review workspace registration worker")??;
         let session = self
             .create_session(CreateSessionRequest {
                 workspace_id: workspace.id,
