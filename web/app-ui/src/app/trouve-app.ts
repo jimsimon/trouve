@@ -103,6 +103,7 @@ import {
   type ProtocolSubscriptionHealth,
 } from "../services/protocol-client.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
+import { ConfirmedWriteTracker } from "../services/confirmed-write-tracker.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
 import { ModelCatalogController } from "../services/model-catalog-controller.js";
 import {
@@ -384,7 +385,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   );
   readonly #threadIngress = createBrowserThreadIngress(this.#protocolClient, this.#store);
   #hostPreferences: HostPreferences | undefined;
-  #hostPreferenceWriteGeneration = 0;
+  readonly #hostPreferenceWrites = new ConfirmedWriteTracker<HostPreferences>();
   #browserFontFamilies: Promise<readonly string[]> | undefined;
   #hostLoadStarted = false;
   #hostError = false;
@@ -820,6 +821,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#systemFontFamilies.set(host.systemFontFamilies());
     const preferences = await host.getPreferences();
     this.#hostPreferences = preferences;
+    this.#hostPreferenceWrites.load(preferences);
     this.#applyHostPreferences(preferences);
     if (isThemePreference(preferences.appearance.theme)) {
       this.#theme.setPreference(preferences.appearance.theme);
@@ -1015,14 +1017,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #persistHostPreferences(preferences: HostPreferences, reportError = true): void {
     const host = this.#hostClient;
     if (host === undefined) return;
-    const previous = this.#hostPreferences;
     this.#hostPreferences = preferences;
-    const generation = ++this.#hostPreferenceWriteGeneration;
+    const generation = this.#hostPreferenceWrites.begin();
     void host.putPreferences(preferences).then((saved) => {
+      // Every successful host response advances the authoritative rollback
+      // point, even when a newer optimistic edit is already queued.
+      const current = this.#hostPreferenceWrites.succeed(generation, saved);
       // HostClient coalesces queued writes, so only the newest caller may
       // adopt its response. An older request can finish after a newer local
       // edit was submitted; applying that response would erase the edit.
-      if (generation !== this.#hostPreferenceWriteGeneration) return;
+      if (!current) return;
       this.#hostPreferences = saved;
       this.#applyHostPreferences(saved);
       if (isThemePreference(saved.appearance.theme)) {
@@ -1030,12 +1034,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       }
       this.requestUpdate();
     }).catch(() => {
-      if (generation !== this.#hostPreferenceWriteGeneration || !reportError) return;
-      if (previous !== undefined) {
-        this.#hostPreferences = previous;
-        this.#applyHostPreferences(previous);
+      const failed = this.#hostPreferenceWrites.fail(generation);
+      if (!failed.current) return;
+      const confirmed = failed.confirmed;
+      if (confirmed !== undefined) {
+        this.#hostPreferences = confirmed;
+        this.#applyHostPreferences(confirmed);
       }
-      this.#shellNotice = "Desktop preferences could not be saved.";
+      if (reportError) {
+        this.#shellNotice = "Desktop preferences could not be saved.";
+      }
       this.requestUpdate();
     });
   }

@@ -37,9 +37,9 @@ pub fn serve_default(content: &[ContentType]) -> ExitCode {
 
 /// Run the shared daemon in the foreground (the `daemon` subcommand).
 pub fn run_daemon(content: &[ContentType]) -> ExitCode {
-    crate::cli::spawn_auto_update();
     #[cfg(unix)]
     {
+        crate::cli::spawn_auto_update();
         unix::run_daemon(content)
     }
     #[cfg(not(unix))]
@@ -56,7 +56,8 @@ pub fn run_daemon(content: &[ContentType]) -> ExitCode {
 #[cfg(unix)]
 mod unix {
     use std::fs;
-    use std::io::{BufRead, BufReader, ErrorKind, Write};
+    use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -78,7 +79,7 @@ mod unix {
     /// How long a proxy waits for a freshly spawned daemon to bind.
     const SPAWN_WAIT: Duration = Duration::from_secs(10);
     const MAX_DAEMON_LOG_BYTES: u64 = 1024 * 1024;
-    const DAEMON_LOG_RETENTION_INTERVAL: Duration = Duration::from_secs(1);
+    const MANAGED_DAEMON_LOG_ENV: &str = "TROUVE_MANAGED_DAEMON_LOG";
 
     pub(super) fn daemon_enabled() -> bool {
         !matches!(
@@ -146,13 +147,53 @@ mod unix {
         Ok(log)
     }
 
-    fn truncate_daemon_log_if_needed(sock: &Path) -> std::io::Result<()> {
-        let log = open_daemon_log(sock)?;
-        // Only the daemon lock owner may truncate. Keeping the inode means
-        // the inherited stderr descriptor remains attached to the bounded
-        // current log.
-        if log.metadata()?.len() >= MAX_DAEMON_LOG_BYTES {
+    fn write_bounded_daemon_log(
+        mut source: impl Read,
+        mut log: fs::File,
+        limit: u64,
+    ) -> std::io::Result<()> {
+        let mut length = log.metadata()?.len();
+        if length > limit {
             log.set_len(0)?;
+            length = 0;
+        }
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let bytes = if read as u64 >= limit {
+                log.set_len(0)?;
+                length = 0;
+                &buffer[read - limit as usize..read]
+            } else {
+                if length.saturating_add(read as u64) > limit {
+                    log.set_len(0)?;
+                    length = 0;
+                }
+                &buffer[..read]
+            };
+            log.write_all(bytes)?;
+            log.flush()?;
+            length += bytes.len() as u64;
+        }
+        Ok(())
+    }
+
+    fn install_bounded_daemon_log(sock: &Path) -> std::io::Result<()> {
+        let log = open_daemon_log(sock)?;
+        let (reader, writer) = UnixStream::pair()?;
+        std::thread::Builder::new()
+            .name("trouve-daemon-log".into())
+            .spawn(move || {
+                let _ = write_bounded_daemon_log(reader, log, MAX_DAEMON_LOG_BYTES);
+            })?;
+        // SAFETY: both descriptors are valid. dup2 atomically replaces only
+        // this process's stderr; the dedicated reader thread was started
+        // first, so no diagnostic bytes can be stranded without a consumer.
+        if unsafe { libc::dup2(writer.as_raw_fd(), libc::STDERR_FILENO) } == -1 {
+            return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -178,8 +219,11 @@ mod unix {
             // Another daemon already owns this socket; nothing to do.
             return ExitCode::SUCCESS;
         }
-        if let Err(e) = truncate_daemon_log_if_needed(&sock) {
-            eprintln!("cannot retain daemon log: {e}");
+        if std::env::var_os(MANAGED_DAEMON_LOG_ENV).is_some()
+            && let Err(e) = install_bounded_daemon_log(&sock)
+        {
+            eprintln!("cannot install bounded daemon log: {e}");
+            return ExitCode::FAILURE;
         }
         // Holding the lock proves any existing socket file is a leftover
         // from a crashed daemon, so removing it is safe.
@@ -202,16 +246,7 @@ mod unix {
         let active = Arc::new(AtomicUsize::new(0));
         let idle = idle_timeout();
         let mut last_activity = Instant::now();
-        let mut last_log_retention = Instant::now();
-        let mut retain_log = true;
         loop {
-            if retain_log && last_log_retention.elapsed() >= DAEMON_LOG_RETENTION_INTERVAL {
-                last_log_retention = Instant::now();
-                if let Err(e) = truncate_daemon_log_if_needed(&sock) {
-                    eprintln!("cannot retain daemon log: {e}");
-                    retain_log = false;
-                }
-            }
             match listener.accept() {
                 Ok((stream, _)) => {
                     last_activity = Instant::now();
@@ -314,6 +349,7 @@ mod unix {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(log))
+            .env(MANAGED_DAEMON_LOG_ENV, "1")
             // Don't pin whatever directory the agent launched us in.
             .current_dir("/");
         // Detach into its own session so the daemon survives the agent
@@ -571,29 +607,19 @@ mod unix {
             );
         }
         #[test]
-        fn only_the_daemon_owner_truncates_the_active_inode_at_the_size_limit() {
+        fn managed_daemon_writer_keeps_the_active_log_within_the_size_limit() {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("daemon");
             let sock = dir.join("mcp-test.sock");
             ensure_daemon_dir(&sock).unwrap();
             let log_path = sock.with_extension("log");
-            let mut active = open_daemon_log(&sock).unwrap();
-            active
-                .write_all(&vec![b'x'; MAX_DAEMON_LOG_BYTES as usize])
-                .unwrap();
-            active.flush().unwrap();
+            let mut input = vec![b'x'; 48];
+            input.extend_from_slice(b"latest diagnostics");
+            write_bounded_daemon_log(&input[..], open_daemon_log(&sock).unwrap(), 32).unwrap();
 
-            // A competing proxy only opens the shared log and preserves the
-            // current owner's diagnostics.
-            drop(open_daemon_log(&sock).unwrap());
-            assert_eq!(fs::metadata(&log_path).unwrap().len(), MAX_DAEMON_LOG_BYTES);
-
-            truncate_daemon_log_if_needed(&sock).unwrap();
-            assert_eq!(fs::metadata(&log_path).unwrap().len(), 0);
-
-            writeln!(active, "still active").unwrap();
-            active.flush().unwrap();
-            assert_eq!(fs::read_to_string(&log_path).unwrap(), "still active\n");
+            let retained = fs::read(&log_path).unwrap();
+            assert!(retained.len() <= 32);
+            assert!(retained.ends_with(b"latest diagnostics"));
             assert!(!log_path.with_extension("log.1").exists());
         }
 

@@ -233,7 +233,7 @@ pub(crate) fn run(
     let lifecycle = HostLifecycleHandle::default();
     let notification_lifecycle = lifecycle.clone();
     let sleep_inhibitor = Arc::new(Mutex::new(sleep::SleepInhibitor::default()));
-    let pending_update_relaunch = Arc::new(Mutex::new(None));
+    let pending_update_relaunch = Arc::new(startup::UpdateRelaunchHandoff::default());
     let sleep_for_action = sleep_inhibitor.clone();
     let mut native_actions = HostNativeActions::default()
         .with_window_geometry()
@@ -306,7 +306,7 @@ pub(crate) fn run(
                 .map_err(|_| "desktop clipboard worker was interrupted".to_string())?
         })
         .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
-    if product_host && !cfg!(debug_assertions) && startup.self_update_available {
+    if product_host && trouve_update::self_update_enabled() && startup.self_update_available {
         // Preserve the installed pathname before a runtime update replaces it.
         let update_executable = std::env::current_exe().map_err(|error| {
             anyhow::anyhow!("locating the desktop executable before update: {error}")
@@ -336,14 +336,8 @@ pub(crate) fn run(
                     if state.phase == trouve_desktop_host::DesktopUpdatePhase::Restarting
                         && let Some(version) = state.available_version.clone()
                     {
-                        match startup::prepare_updated_app_relaunch(
-                            &update_executable,
-                            &version,
-                        ) {
-                            Ok(gate) => {
-                                *pending_update_relaunch
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+                        match pending_update_relaunch.prepare(&update_executable, &version) {
+                            Ok(()) => {
                                 let _ = quit_proxy.send_event(AppEvent::QuitNow);
                             }
                             Err(error) => {
@@ -610,13 +604,7 @@ pub(crate) fn run(
     drop(webview);
     drop(window);
     host.shutdown();
-    if let Some(gate) = pending_update_relaunch
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-    {
-        gate.release();
-    }
+    pending_update_relaunch.release();
     if exit_code != 0 {
         anyhow::bail!("desktop webview event loop exited with status {exit_code}");
     }

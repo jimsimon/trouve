@@ -75,6 +75,15 @@ const desktopUpdateIsBusy = (state: DesktopUpdateState | undefined): boolean =>
     "restarting",
   ].includes(state.phase);
 
+const DESKTOP_UPDATE_BUSY_POLL_MS = 500;
+const DESKTOP_UPDATE_IDLE_POLL_MS = 30_000;
+
+export const desktopUpdatePollIntervalMs = (
+  state: DesktopUpdateState | undefined,
+): number => desktopUpdateIsBusy(state)
+  ? DESKTOP_UPDATE_BUSY_POLL_MS
+  : DESKTOP_UPDATE_IDLE_POLL_MS;
+
 const desktopUpdatePhaseAnnouncement = (
   state: DesktopUpdateState | undefined,
   loading: boolean,
@@ -109,6 +118,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #desktopUpdateActionPending = false;
   #desktopUpdateError = "";
   #desktopUpdatePollTimer: ReturnType<typeof setInterval> | undefined;
+  #desktopUpdatePollIntervalMs: number | undefined;
   #desktopUpdateGeneration = 0;
   #desktopUpdateInitialAttempted = false;
 
@@ -178,14 +188,16 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       if (generation !== this.#desktopUpdateGeneration) return;
       this.#desktopUpdateState = state;
       this.#desktopUpdateError = "";
-      if (desktopUpdateIsBusy(state)) this.#startDesktopUpdatePolling();
-      else if (!this.#desktopUpdateActionPending) this.#stopDesktopUpdatePolling();
+      this.#startDesktopUpdatePolling(desktopUpdatePollIntervalMs(state));
     } catch {
       if (
         generation === this.#desktopUpdateGeneration
         && (!silent || this.#desktopUpdateState === undefined)
       ) {
         this.#desktopUpdateError = "Update status could not be loaded.";
+      }
+      if (generation === this.#desktopUpdateGeneration) {
+        this.#startDesktopUpdatePolling(DESKTOP_UPDATE_IDLE_POLL_MS);
       }
     } finally {
       this.#desktopUpdateLoading = false;
@@ -205,7 +217,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     const actionGeneration = this.#desktopUpdateGeneration;
     this.#desktopUpdateActionPending = true;
     this.#desktopUpdateError = "";
-    this.#startDesktopUpdatePolling();
+    this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
     this.requestUpdate();
     let keepPolling = false;
     let completionGeneration = actionGeneration;
@@ -228,20 +240,22 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       if (!this.isConnected || completionGeneration !== this.#desktopUpdateGeneration) return;
       this.#desktopUpdateActionPending = false;
       if (keepPolling || desktopUpdateIsBusy(this.#desktopUpdateState)) {
-        this.#startDesktopUpdatePolling();
+        this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
         void this.#loadDesktopUpdate(true);
       } else {
-        this.#stopDesktopUpdatePolling();
+        this.#startDesktopUpdatePolling(DESKTOP_UPDATE_IDLE_POLL_MS);
       }
       this.requestUpdate();
     }
   }
 
-  #startDesktopUpdatePolling(): void {
-    if (!this.isConnected || this.#desktopUpdatePollTimer !== undefined) return;
+  #startDesktopUpdatePolling(intervalMs: number): void {
+    if (!this.isConnected || this.#desktopUpdatePollIntervalMs === intervalMs) return;
+    this.#stopDesktopUpdatePolling();
+    this.#desktopUpdatePollIntervalMs = intervalMs;
     this.#desktopUpdatePollTimer = globalThis.setInterval(
       () => void this.#loadDesktopUpdate(true),
-      500,
+      intervalMs,
     );
   }
 
@@ -249,6 +263,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     if (this.#desktopUpdatePollTimer === undefined) return;
     globalThis.clearInterval(this.#desktopUpdatePollTimer);
     this.#desktopUpdatePollTimer = undefined;
+    this.#desktopUpdatePollIntervalMs = undefined;
   }
 
   async #loadFontFamilies(): Promise<void> {

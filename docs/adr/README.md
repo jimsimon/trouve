@@ -55,3 +55,4 @@ sequentially.
 | [0043](0043-automatic-desktop-updates-at-startup.md) | Automatic desktop updates at startup | Accepted |
 | [0044](0044-pre-main-window-update-preflight.md) | Pre-main-window update preflight | Accepted |
 | [0045](0045-startup-only-automatic-desktop-installation.md) | Startup-only automatic desktop installation | Accepted |
+| [0046](0046-release-provenance-for-self-update.md) | Release provenance for self-update | Accepted |

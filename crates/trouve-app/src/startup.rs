@@ -126,13 +126,13 @@ impl PreflightResult {
 }
 
 pub(crate) fn run_preflight(event_loop: &mut EventLoop<AppEvent>) -> Result<PreflightResult> {
-    if cfg!(debug_assertions) {
+    if !trouve_update::self_update_enabled() {
         return Ok(PreflightResult {
             exit_process: false,
             update_state: state(
                 DesktopUpdatePhase::Disabled,
                 None,
-                "Self-update is disabled in development builds.",
+                "Self-update is disabled in development and locally built binaries.",
                 None,
             ),
             self_update_available: false,
@@ -921,7 +921,7 @@ fn remove_relaunch_gate(path: &Path) {
     }
 }
 
-pub(crate) struct UpdateRelaunchGate {
+struct UpdateRelaunchGate {
     path: PathBuf,
     lock: Option<std::fs::File>,
 }
@@ -956,10 +956,6 @@ impl UpdateRelaunchGate {
         })
     }
 
-    pub fn release(mut self) {
-        self.release_lock();
-    }
-
     fn release_lock(&mut self) {
         if self.lock.take().is_some() {
             remove_relaunch_gate(&self.path);
@@ -973,36 +969,68 @@ impl Drop for UpdateRelaunchGate {
     }
 }
 
-/// Start the already-updated executable in a gated mode. Process creation is
-/// confirmed while the existing UI is recoverable; the child does not initialize
-/// its host until release is called after shutdown.
-pub(crate) fn prepare_updated_app_relaunch(
-    executable: &Path,
-    version: &str,
-) -> Result<UpdateRelaunchGate> {
-    let gate = UpdateRelaunchGate::create()?;
-    let acknowledgement = UpdateReadyAcknowledgement::new();
-    let gate_path = &gate.path;
-    let mut command = std::process::Command::new(executable);
-    command
-        .args(std::env::args_os().skip(1))
-        .env(UPDATE_RELAUNCH_SUPERVISOR_ENV, version)
-        .env(UPDATE_RELAUNCH_GATE_ENV, gate_path)
-        .env(UPDATE_READY_ACK_ENV, &acknowledgement.path);
-    let mut child = trouve_process::spawn(&mut command)
-        .with_context(|| format!("starting gated {}", executable.display()))?;
-    let ready = wait_for_update_ready(
-        &acknowledgement.path,
-        UPDATE_READY_TIMEOUT,
-        UPDATE_RELAUNCH_GATE_POLL_INTERVAL,
-        || Ok(child.try_wait()?.is_none()),
-    );
-    if ready.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
+/// Host-lifetime owner for the gated transition from an installed runtime
+/// update to process shutdown. The gateway request never owns the gate, so
+/// request cancellation cannot let the replacement initialize early.
+#[derive(Default)]
+pub(crate) struct UpdateRelaunchHandoff {
+    gate: Mutex<Option<UpdateRelaunchGate>>,
+}
+
+impl UpdateRelaunchHandoff {
+    /// Start the already-updated executable in gated supervisor mode. Gate
+    /// ownership moves into this host-lifetime object before process creation
+    /// or readiness waits begin.
+    pub fn prepare(&self, executable: &Path, version: &str) -> Result<()> {
+        let gate = UpdateRelaunchGate::create()?;
+        let gate_path = gate.path.clone();
+        {
+            let mut owned = self
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if owned.is_some() {
+                anyhow::bail!("an updated trouve relaunch is already pending");
+            }
+            *owned = Some(gate);
+        }
+
+        let result = (|| -> Result<()> {
+            let acknowledgement = UpdateReadyAcknowledgement::new();
+            let mut command = std::process::Command::new(executable);
+            command
+                .args(std::env::args_os().skip(1))
+                .env(UPDATE_RELAUNCH_SUPERVISOR_ENV, version)
+                .env(UPDATE_RELAUNCH_GATE_ENV, &gate_path)
+                .env(UPDATE_READY_ACK_ENV, &acknowledgement.path);
+            let mut child = trouve_process::spawn(&mut command)
+                .with_context(|| format!("starting gated {}", executable.display()))?;
+            let ready = wait_for_update_ready(
+                &acknowledgement.path,
+                UPDATE_READY_TIMEOUT,
+                UPDATE_RELAUNCH_GATE_POLL_INTERVAL,
+                || Ok(child.try_wait()?.is_none()),
+            );
+            if ready.is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            ready.context("waiting for the update recovery window")
+        })();
+        if result.is_err() {
+            self.release();
+        }
+        result
     }
-    ready.context("waiting for the update recovery window")?;
-    Ok(gate)
+
+    /// Release replacement initialization only after the retiring host has
+    /// shut down its embedded server, gateway, webview, and window.
+    pub fn release(&self) {
+        self.gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
 }
 
 #[derive(Clone)]
@@ -1362,8 +1390,14 @@ mod tests {
 
     #[test]
     fn replacement_process_waits_for_host_ownership_handoff() {
+        let handoff = Arc::new(UpdateRelaunchHandoff::default());
         let gate = UpdateRelaunchGate::create().unwrap();
         let path = gate.path.clone();
+        *handoff
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+        let request_owner = Arc::clone(&handoff);
         let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
@@ -1382,7 +1416,14 @@ mod tests {
             finished_rx.recv_timeout(Duration::from_millis(40)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
-        gate.release();
+        // Dropping a cancellable request's Arc cannot release the gate; the
+        // host-lifetime owner releases it only after shutdown.
+        drop(request_owner);
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(40)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        handoff.release();
         assert!(
             finished_rx
                 .recv_timeout(Duration::from_secs(1))

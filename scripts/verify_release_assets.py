@@ -47,6 +47,8 @@ def expected_assets(
     expected.update(
         artifact_name("trouve", tag, target)
         for target in targets
+        # The Wry desktop is built only for the glibc Linux targets; the
+        # updater rejects Desktop + musl before querying the release channel.
         if "-musl" not in target
     )
     if not allow_missing_search:

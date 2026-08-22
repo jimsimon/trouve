@@ -14,11 +14,14 @@ cargo install trouve-search
 # or download a release binary from GitHub Releases
 ```
 
-The native binary checks stable GitHub Releases in the background while its
-MCP daemon is running. Use `trouve-search update --check` to inspect the
-channel, `trouve-search update` to install immediately, or set
-`TROUVE_DISABLE_AUTO_UPDATE=1` to leave background checks to npm, Cargo, or
-another package manager. The explicit `update` commands remain available.
+The official native binary bundled by npm or downloaded from GitHub Releases
+checks the stable channel in the background while its MCP daemon is running.
+Use `trouve-search update --check` to inspect the channel,
+`trouve-search update` to install immediately, or set
+`TROUVE_DISABLE_AUTO_UPDATE=1` to leave background checks to npm or another
+package manager. Source and Cargo builds are intentionally unmarked development
+artifacts: their update checks stay disabled and `cargo install` remains their
+update path.
 
 There are three ways to wire trouve-search into an agent. Pick **one per
 agent** — they expose the same tools, so combining them shows the model

@@ -721,8 +721,10 @@ describe("Trouve visual contract", () => {
       settings.lastIndexOf("this.#desktopUpdateActionPending = false;"),
     );
     expect(settings).toContain(
-      "if (!this.isConnected || this.#desktopUpdatePollTimer !== undefined) return;",
+      "if (!this.isConnected || this.#desktopUpdatePollIntervalMs === intervalMs) return;",
     );
+    expect(settings).toContain("this.#startDesktopUpdatePolling(DESKTOP_UPDATE_IDLE_POLL_MS);");
+    expect(settings).toContain("this.#stopDesktopUpdatePolling();");
   });
 
   it("orders app-level desktop update publications and announces coarse settings phases", () => {

@@ -41,6 +41,24 @@ const MAX_AUTO_UPDATE_SCHEDULE_BYTES: u64 = 64;
 /// update commands and the desktop's explicit update button still work.
 pub const DISABLE_AUTO_UPDATE_ENV: &str = "TROUVE_DISABLE_AUTO_UPDATE";
 
+/// Compile-time marker set only while building official release artifacts.
+/// Cargo profiles alone are not distribution provenance: an unmarked local
+/// `cargo build --release` must remain unable to replace itself.
+pub const RELEASE_BUILD_ENV: &str = "TROUVE_RELEASE_BUILD";
+
+/// Whether this binary was built by the official release workflow with
+/// self-update support enabled.
+pub const fn self_update_enabled() -> bool {
+    !cfg!(debug_assertions) && option_env!("TROUVE_RELEASE_BUILD").is_some()
+}
+
+fn ensure_self_update_build() -> Result<()> {
+    if !self_update_enabled() {
+        bail!("self-update is disabled for development and locally built binaries");
+    }
+    Ok(())
+}
+
 /// Verify that the running executable lives in an installation directory the
 /// current user can update without elevation. Package-managed locations such
 /// as /usr/bin and Program Files intentionally fail this probe.
@@ -181,14 +199,19 @@ impl InstallationBaseline {
     /// Capture a self-update-eligible installation before any asynchronous
     /// startup work can replace it.
     pub fn capture(current_version: &str) -> Result<Self> {
-        if cfg!(debug_assertions) {
-            bail!("self-update is disabled for development builds");
-        }
+        ensure_self_update_build()?;
         let executable = std::env::current_exe().context("locating the installed executable")?;
         ensure_self_update_supported_for(&executable)?;
         let identity = executable_identity(&executable)?;
         let version = Version::parse(current_version)
             .with_context(|| format!("invalid current version {current_version:?}"))?;
+        let compiled = Version::parse(env!("CARGO_PKG_VERSION"))
+            .context("the updater crate has an invalid compiled version")?;
+        if version != compiled {
+            bail!(
+                "the supplied current version {version} does not match this binary's compiled version {compiled}"
+            );
+        }
         Ok(Self {
             executable,
             identity,
@@ -203,6 +226,8 @@ pub struct Release {
     pub version: Version,
     pub tag: String,
     pub artifact_name: String,
+    component: Component,
+    checked_from: Version,
     artifact_url: String,
     checksum_url: String,
     binary_name: String,
@@ -301,11 +326,6 @@ struct UpdateLock {
     executable: std::path::PathBuf,
 }
 
-async fn acquire_update_lock(cancellation: Option<Arc<InstallCancellation>>) -> Result<UpdateLock> {
-    let executable = std::env::current_exe().context("locating executable for update lock")?;
-    acquire_update_lock_at(executable, cancellation).await
-}
-
 async fn acquire_update_lock_at(
     executable: PathBuf,
     cancellation: Option<Arc<InstallCancellation>>,
@@ -388,7 +408,7 @@ struct GithubAsset {
 /// Whether automatic update behavior is enabled for this process. Development
 /// builds are always disabled, even when no environment override is present.
 pub fn auto_update_enabled() -> bool {
-    !cfg!(debug_assertions)
+    self_update_enabled()
         && std::env::var_os(DISABLE_AUTO_UPDATE_ENV)
             .and_then(|value| value.into_string().ok())
             .is_none_or(|value| !is_truthy(&value))
@@ -416,13 +436,33 @@ pub fn current_target() -> Result<&'static str> {
     }
 }
 
+fn ensure_component_target_supported(component: Component, target: &str) -> Result<()> {
+    if component == Component::Desktop && target.contains("-linux-musl") {
+        bail!("desktop self-update is not supported for Linux musl builds");
+    }
+    Ok(())
+}
+
 /// Query the latest stable release and resolve the exact artifact for this
 /// component and compile target.
 pub async fn check(component: Component, current_version: &str) -> Result<UpdateCheck> {
+    ensure_self_update_build()?;
     let current = Version::parse(current_version)
         .with_context(|| format!("invalid current version {current_version:?}"))?;
+    let compiled = Version::parse(env!("CARGO_PKG_VERSION"))
+        .context("the updater crate has an invalid compiled version")?;
+    if current != compiled {
+        bail!(
+            "the supplied current version {current} does not match this binary's compiled version {compiled}"
+        );
+    }
+    check_for_version(component, current).await
+}
+
+async fn check_for_version(component: Component, current: Version) -> Result<UpdateCheck> {
     let target = current_target()?;
-    let client = client(current_version)?;
+    ensure_component_target_supported(component, target)?;
+    let client = client(&current.to_string())?;
     for attempt in 0..RELEASE_ASSET_RETRY_ATTEMPTS {
         let release = client
             .get(RELEASE_API)
@@ -475,14 +515,16 @@ async fn install_latest_from_baseline(
 ) -> Result<UpdateStatus> {
     ensure_component_matches_executable(component, &baseline.executable)?;
     let lock = acquire_update_lock_at(baseline.executable.clone(), None).await?;
-    let observed = observed_installation_version(&baseline).await?;
+    let observed = observed_installation(&baseline).await?;
 
     let schedule = if automatic {
         let state_root = update_state_root()
             .ok_or_else(|| anyhow!("no per-user data directory is available for update state"))?;
         let now = unix_timestamp();
         if !automatic_update_is_due(&state_root, &lock.executable, now) {
-            return Ok(UpdateStatus::UpToDate { version: observed });
+            return Ok(UpdateStatus::UpToDate {
+                version: observed.version,
+            });
         }
         // Publish failure backoff before touching the network. A crash or
         // failed request therefore cannot create a process-start request loop.
@@ -514,10 +556,10 @@ async fn install_latest_from_baseline(
 
 async fn install_latest_locked(
     component: Component,
-    observed: &Version,
+    observed: &ObservedInstallation,
     lock: &UpdateLock,
 ) -> Result<UpdateStatus> {
-    let check = check(component, &observed.to_string()).await?;
+    let check = check_for_version(component, observed.version.clone()).await?;
     let Some(release) = check.update else {
         return Ok(UpdateStatus::UpToDate {
             version: check.current,
@@ -526,6 +568,7 @@ async fn install_latest_locked(
     install_release_locked(
         &release,
         &lock.executable,
+        &observed.identity,
         |_| {},
         Arc::new(InstallCancellation::default()),
     )
@@ -564,38 +607,62 @@ pub async fn install_release_with_progress_and_cancel(
     progress: impl Fn(InstallProgress),
     cancellation: Arc<InstallCancellation>,
 ) -> Result<()> {
-    if cfg!(debug_assertions) {
-        bail!("self-update is disabled for development builds");
-    }
+    ensure_self_update_build()?;
+    validate_release_binding(release)?;
     ensure_not_cancelled(&cancellation)?;
-    let lock = acquire_update_lock(Some(Arc::clone(&cancellation))).await?;
-    if installed_binary_version(&lock.executable)
-        .await
-        .is_some_and(|installed| installed >= release.version)
-    {
+    let baseline = InstallationBaseline::capture(&release.checked_from.to_string())?;
+    ensure_component_matches_executable(release.component, &baseline.executable)?;
+    let lock = acquire_update_lock_at(baseline.executable.clone(), Some(Arc::clone(&cancellation)))
+        .await?;
+    let observed = observed_installation(&baseline).await?;
+    if observed.version >= release.version {
         return Ok(());
     }
+    if observed.version != release.checked_from {
+        bail!(
+            "the installed version changed from {} to {} after this release was checked; check again before updating",
+            release.checked_from,
+            observed.version
+        );
+    }
     ensure_not_cancelled(&cancellation)?;
-    install_release_locked(release, &lock.executable, progress, cancellation).await
-}
-
-async fn installed_binary_version(executable: &Path) -> Option<Version> {
-    let executable = executable.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let state_root = update_state_root()?;
-        installed_binary_version_at(&state_root, &executable)
-    })
+    install_release_locked(
+        release,
+        &lock.executable,
+        &observed.identity,
+        progress,
+        cancellation,
+    )
     .await
-    .ok()?
 }
 
-async fn observed_installation_version(baseline: &InstallationBaseline) -> Result<Version> {
+fn validate_release_binding(release: &Release) -> Result<()> {
+    if release.version <= release.checked_from {
+        bail!(
+            "release {} is not newer than the checked version {}",
+            release.version,
+            release.checked_from
+        );
+    }
+    Ok(())
+}
+
+struct ObservedInstallation {
+    identity: String,
+    version: Version,
+}
+
+async fn observed_installation(baseline: &InstallationBaseline) -> Result<ObservedInstallation> {
     let baseline = baseline.clone();
     tokio::task::spawn_blocking(move || {
         let current_identity = executable_identity(&baseline.executable)?;
         let installed = update_state_root()
             .and_then(|root| installed_binary_version_at(&root, &baseline.executable));
-        reconcile_observed_version(&baseline, &current_identity, installed)
+        let version = reconcile_observed_version(&baseline, &current_identity, installed)?;
+        Ok(ObservedInstallation {
+            identity: current_identity,
+            version,
+        })
     })
     .await
     .context("joining installed-version reconciliation task")?
@@ -620,6 +687,7 @@ fn reconcile_observed_version(
 
 fn ensure_component_matches_executable(component: Component, executable: &Path) -> Result<()> {
     let target = current_target()?;
+    ensure_component_target_supported(component, target)?;
     let expected = component.binary_name(target);
     if executable
         .file_name()
@@ -676,20 +744,56 @@ fn record_automatic_update_not_before(
 ) -> Result<()> {
     prepare_private_update_state_root(state_root)?;
     let path = automatic_update_schedule_path(state_root, executable);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("opening automatic-update schedule {}", path.display()))?;
-    writeln!(file, "{not_before}").context("writing automatic-update schedule")?;
-    file.sync_all()
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".automatic-update-schedule-")
+        .tempfile_in(state_root)
+        .context("creating temporary automatic-update schedule")?;
+    writeln!(temporary, "{not_before}").context("writing automatic-update schedule")?;
+    temporary
+        .as_file_mut()
+        .sync_all()
         .context("syncing automatic-update schedule")?;
+    let temporary = temporary.into_temp_path();
+    replace_update_state_file(&temporary, &path)
+        .with_context(|| format!("publishing automatic-update schedule {}", path.display()))?;
+    let _ = temporary.keep();
     sync_directory(state_root).context("syncing update-state directory")
+}
+
+#[cfg(not(windows))]
+fn replace_update_state_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, path)
+}
+
+#[cfg(windows)]
+fn replace_update_state_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temporary = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn automatic_update_success_delay(executable: &Path) -> Duration {
@@ -1063,9 +1167,20 @@ fn installed_matches_replacement(
     )
 }
 
+fn ensure_executable_identity(executable: &Path, expected_identity: &str) -> Result<()> {
+    let current_identity = executable_identity(executable)?;
+    if current_identity != expected_identity {
+        bail!(
+            "the installed executable changed while the update was downloading; check again before updating"
+        );
+    }
+    Ok(())
+}
+
 async fn install_release_locked(
     release: &Release,
     installed_executable: &Path,
+    expected_identity: &str,
     progress: impl Fn(InstallProgress),
     cancellation: Arc<InstallCancellation>,
 ) -> Result<()> {
@@ -1127,6 +1242,7 @@ async fn install_release_locked(
     ensure_not_cancelled(&cancellation)?;
     progress(InstallProgress::Installing);
     let installed_executable = installed_executable.to_owned();
+    let expected_identity = expected_identity.to_owned();
     let state_root = update_state_root();
     let version = release.version.clone();
     let comparison_executable = installed_executable.clone();
@@ -1167,6 +1283,7 @@ async fn install_release_locked(
     tokio::task::spawn_blocking(move || {
         sync_directory(&installed_parent)
             .context("syncing installation directory before replacement")?;
+        ensure_executable_identity(&installed_executable, &expected_identity)?;
         cancellation.commit_install()?;
         self_replace::self_replace(&replacement).context("replacing the running executable")?;
         // This is deduplication metadata, not part of the replacement commit.
@@ -1175,7 +1292,13 @@ async fn install_release_locked(
         if let Some(state_root) = state_root {
             let _ = record_installed_version(&state_root, &installed_executable, &version);
         }
-        sync_directory(&installed_parent).context("syncing installed executable directory")
+        if let Err(error) = sync_directory(&installed_parent) {
+            eprintln!(
+                "trouve update installed successfully, but syncing {} failed: {error}",
+                installed_parent.display()
+            );
+        }
+        Ok::<(), anyhow::Error>(())
     })
     .await
     .context("joining executable replacement task")??;
@@ -1224,12 +1347,14 @@ fn select_release(
     let artifact_url = unique_asset_url(&release.assets, &artifact_name)?;
     let checksum_url = unique_asset_url(&release.assets, CHECKSUM_ASSET)?;
     Ok(UpdateCheck {
-        current,
+        current: current.clone(),
         latest: latest.clone(),
         update: Some(Release {
             version: latest,
             tag: release.tag_name,
             artifact_name,
+            component,
+            checked_from: current,
             artifact_url,
             checksum_url,
             binary_name: component.binary_name(target),
@@ -1574,6 +1699,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn development_builds_disable_automatic_updates() {
+        assert!(!self_update_enabled());
         assert!(!auto_update_enabled());
     }
 
@@ -1641,6 +1767,8 @@ mod tests {
         .unwrap();
         let update = check.update.unwrap();
         assert_eq!(update.version, Version::parse("3.7.0").unwrap());
+        assert_eq!(update.component, Component::Server);
+        assert_eq!(update.checked_from, Version::parse("3.6.0").unwrap());
         assert_eq!(
             update.artifact_name,
             "trouve-server-v3.7.0-x86_64-unknown-linux-gnu.tar.gz"
@@ -2043,6 +2171,42 @@ mod tests {
 
         std::fs::write(&executable, b"replacement identity").unwrap();
         assert!(!automatic_update_is_due(&state_root, &executable, 499));
+
+        record_automatic_update_not_before(&state_root, &executable, 700).unwrap();
+        let schedule = automatic_update_schedule_path(&state_root, &executable);
+        assert_eq!(read_automatic_update_not_before(&schedule), Some(700));
+        assert_eq!(std::fs::read_dir(&state_root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn desktop_musl_target_is_rejected_before_release_selection() {
+        for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
+            let error = ensure_component_target_supported(Component::Desktop, target).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("desktop self-update is not supported")
+            );
+            ensure_component_target_supported(Component::Server, target).unwrap();
+            ensure_component_target_supported(Component::Search, target).unwrap();
+        }
+    }
+
+    #[test]
+    fn executable_identity_must_still_match_at_replacement_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("trouve");
+        std::fs::write(&executable, b"original").unwrap();
+        let identity = executable_identity(&executable).unwrap();
+        ensure_executable_identity(&executable, &identity).unwrap();
+
+        std::fs::write(&executable, b"externally replaced").unwrap();
+        let error = ensure_executable_identity(&executable, &identity).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed while the update was downloading")
+        );
     }
 
     #[test]

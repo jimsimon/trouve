@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { DesktopUpdateState } from "../services/host-client.js";
-import { desktopUpdateCanRetryInstall } from "./settings-screen.js";
+import {
+  desktopUpdateCanRetryInstall,
+  desktopUpdatePollIntervalMs,
+} from "./settings-screen.js";
 
 const updateState = (
   message: string,
@@ -35,5 +38,18 @@ describe("desktop update retry action", () => {
       "Update installation failed: no release",
       undefined,
     ))).toBe(false);
+  });
+});
+
+describe("desktop update status polling", () => {
+  it("polls active work quickly and settled states at a continuing low frequency", () => {
+    expect(desktopUpdatePollIntervalMs({
+      ...updateState("Downloading", "4.1.0"),
+      phase: "downloading",
+    })).toBe(500);
+    expect(desktopUpdatePollIntervalMs({
+      ...updateState("Up to date", undefined),
+      phase: "idle",
+    })).toBe(30_000);
   });
 });

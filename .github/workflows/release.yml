@@ -187,6 +187,7 @@ jobs:
           --target ${{ matrix.target }}
         env:
           TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
+          TROUVE_RELEASE_BUILD: "1"
       # Manual runs backfill only application and server binaries. Existing
       # search assets stay byte-for-byte unchanged.
       - name: Build backfill artifacts
@@ -198,6 +199,7 @@ jobs:
           --target ${{ matrix.target }}
         env:
           TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
+          TROUVE_RELEASE_BUILD: "1"
       - name: Package trouve-server (unix)
         if: runner.os != 'Windows'
         run: |
@@ -236,10 +238,14 @@ jobs:
           Debian/Ubuntu users should install the accompanying .deb package, which
           declares these dependencies. For the tar archive, install:
             libwebkit2gtk-4.1-0 libgtk-3-0 libdbus-1-3 libfontconfig1
-          The archive's share/ directory contains the desktop entry and icon for
-          installation below /usr/local or another XDG data prefix. Extract the
-          archive into that prefix so bin/trouve is available on PATH:
-            sudo tar -C /usr/local -xzf trouve-vX.Y.Z-<target>.tar.gz
+          The archive's share/ directory contains the desktop entry and icon.
+          Extract into your user-owned ~/.local prefix so bin/trouve is on PATH
+          and verified self-updates can replace it without elevated privileges:
+            mkdir -p "$HOME/.local"
+            tar -C "$HOME/.local" -xzf trouve-vX.Y.Z-<target>.tar.gz
+          If ~/.local/bin is not already on PATH, add it in your shell profile.
+          System-owned installations such as /usr/local must be updated by their
+          package manager and intentionally disable in-app self-update.
           EOF
             tar -C "$package_root" -czf \
               "$GITHUB_WORKSPACE/$release_dir/trouve-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
@@ -330,6 +336,15 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
+      - name: Check out current release verification tooling
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # `github.sha` is the immutable revision whose workflow definition
+          # is executing; release sources remain checked out at RELEASE_TAG.
+          ref: ${{ github.sha }}
+          path: .release-tools
       - name: Download compliance artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -376,10 +391,12 @@ jobs:
         shell: bash
         run: |
           args=()
+          verifier=scripts/verify_release_assets.py
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
             args+=(--allow-missing-search)
+            verifier=.release-tools/scripts/verify_release_assets.py
           fi
-          python3 scripts/verify_release_assets.py \
+          python3 "$verifier" \
             artifacts/SHA256SUMS "$RELEASE_TAG" "${args[@]}"
       # Attaches to the existing release when one was published from the UI;
       # creates the release when the run came from a pushed tag.
