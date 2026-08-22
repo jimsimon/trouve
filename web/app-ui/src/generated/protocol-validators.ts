@@ -1669,7 +1669,7 @@ validate101.evaluated = {"items":true,"dynamicProps":false,"dynamicItems":false}
 
 export const branchList = validate105;
 const schema43 = {"$id":"urn:trouve:protocol-validator:branchList","$ref":"urn:trouve:protocol-openapi#/components/schemas/BranchList"};
-const schema44 = {"type":"object","description":"Local branches of a workspace repository, for base-ref selection.","required":["branches","head"],"properties":{"branches":{"type":"array","items":{"type":"string"}},"head":{"type":"string","description":"The branch HEAD currently points at (default selection)."}}};
+const schema44 = {"type":"object","description":"Local branches of a workspace repository, for base-ref selection.","required":["branches","head"],"properties":{"branches":{"type":"array","items":{"type":"string"}},"default_branch":{"type":["string","null"],"description":"The default branch advertised by the repository's origin remote."},"head":{"type":"string","description":"The branch or commit HEAD currently points at."}}};
 
 function validate106(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -1719,16 +1719,30 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.head !== undefined){
+if(data.default_branch !== undefined){
+let data2 = data.default_branch;
 const _errs5 = errors;
-if(typeof data.head !== "string"){
-validate106.errors = [{instancePath:instancePath+"/head",schemaPath:"#/properties/head/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if((typeof data2 !== "string") && (data2 !== null)){
+validate106.errors = [{instancePath:instancePath+"/default_branch",schemaPath:"#/properties/default_branch/type",keyword:"type",params:{type: schema44.properties.default_branch.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs5 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.head !== undefined){
+const _errs7 = errors;
+if(typeof data.head !== "string"){
+validate106.errors = [{instancePath:instancePath+"/head",schemaPath:"#/properties/head/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs7 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -1741,7 +1755,7 @@ return false;
 validate106.errors = vErrors;
 return errors === 0;
 }
-validate106.evaluated = {"props":{"branches":true,"head":true},"dynamicProps":false,"dynamicItems":false};
+validate106.evaluated = {"props":{"branches":true,"default_branch":true,"head":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate105(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -1762,7 +1776,7 @@ errors = vErrors.length;
 validate105.errors = vErrors;
 return errors === 0;
 }
-validate105.evaluated = {"props":{"branches":true,"head":true},"dynamicProps":false,"dynamicItems":false};
+validate105.evaluated = {"props":{"branches":true,"default_branch":true,"head":true},"dynamicProps":false,"dynamicItems":false};
 
 export const prInfo = validate108;
 const schema45 = {"$id":"urn:trouve:protocol-validator:prInfo","$ref":"urn:trouve:protocol-openapi#/components/schemas/PrInfo"};

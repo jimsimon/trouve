@@ -1708,11 +1708,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     try {
       const result = await this.#protocolClient.workspaceBranches(workspaceId);
       if (generation !== this.#newSessionBranchGeneration) return;
+      // `default_branch` is selection metadata, not a synthetic option.
       this.#newSessionBranches = [...new Set([...result.branches, "HEAD"])];
       this.#newSessionBaseRef = resolveNewSessionBaseRef(
         result.branches,
         this.#newSessionPreferredBaseRef,
-        result.head,
+        result.default_branch ?? "",
       );
     } catch {
       if (generation !== this.#newSessionBranchGeneration) return;

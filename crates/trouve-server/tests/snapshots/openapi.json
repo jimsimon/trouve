@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.12"
+    "version": "7.13"
   },
   "paths": {
     "/v1/approvals": {
@@ -5260,9 +5260,16 @@
               "type": "string"
             }
           },
+          "default_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The default branch advertised by the repository's origin remote."
+          },
           "head": {
             "type": "string",
-            "description": "The branch HEAD currently points at (default selection)."
+            "description": "The branch or commit HEAD currently points at."
           }
         }
       },
