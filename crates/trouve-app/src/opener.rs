@@ -1,7 +1,7 @@
 //! Non-blocking system opener that still reaps its launcher process.
 
 use std::ffi::{OsStr, OsString};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel,
 };
@@ -18,11 +18,12 @@ const LAUNCHER_REAPER_BATCH_SIZE: usize = 64;
 const LAUNCHER_REAPER_MAX_INSPECTION_ERRORS: u8 = 4;
 const LAUNCHER_CLEANUP_WORKERS: usize = 2;
 const LAUNCHER_CLEANUP_QUEUE_CAPACITY: usize = 16;
+const MAX_OWNED_LAUNCHERS: usize = 64;
 const DISPATCH_QUEUED: u8 = 0;
 const DISPATCH_ENTERED: u8 = 1;
 const DISPATCH_CANCELLED: u8 = 2;
 static WORKER: OnceLock<Option<SyncSender<OsString>>> = OnceLock::new();
-static LAUNCHER_REAPER: OnceLock<Option<Sender<std::process::Child>>> = OnceLock::new();
+static LAUNCHER_REAPER: OnceLock<Option<LauncherReaper>> = OnceLock::new();
 
 #[derive(Debug)]
 pub(super) struct OpenAttemptError {
@@ -246,11 +247,16 @@ fn wait_for_launcher(
     dispatch: &LaunchDispatch,
 ) -> Result<LauncherOutcome, OpenAttemptError> {
     let reaper = launcher_reaper()?;
+    let admission = reaper.acquire()?;
     dispatch.enter_launch()?;
-    let mut child = trouve_process::spawn(command).map_err(OpenAttemptError::discard)?;
+    let child = trouve_process::spawn(command).map_err(OpenAttemptError::discard)?;
+    let mut launcher = OwnedLauncher {
+        child,
+        _admission: admission,
+    };
     let handoff_deadline = (Instant::now() + HANDOFF_CONFIRMATION_INTERVAL).min(deadline);
     loop {
-        match child.try_wait() {
+        match launcher.child.try_wait() {
             Ok(Some(status)) => return Ok(LauncherOutcome::Exited(status)),
             Ok(None) => {}
             Err(error) => {
@@ -259,19 +265,19 @@ fn wait_for_launcher(
                 // player. Preserve the handoff and let the reaper make the
                 // best effort to collect it later.
                 tracing::warn!(%error, "could not inspect system launcher");
-                reap_launcher_in_background(child, reaper);
+                reap_launcher_in_background(launcher, &reaper.sender);
                 return Err(OpenAttemptError::retain(error));
             }
         }
         if Instant::now() >= handoff_deadline {
-            reap_launcher_in_background(child, reaper);
+            reap_launcher_in_background(launcher, &reaper.sender);
             return Ok(LauncherOutcome::HandedOff);
         }
         std::thread::sleep(LAUNCHER_POLL_INTERVAL);
     }
 }
 
-fn launcher_reaper() -> Result<&'static Sender<std::process::Child>, OpenAttemptError> {
+fn launcher_reaper() -> Result<&'static LauncherReaper, OpenAttemptError> {
     LAUNCHER_REAPER
         .get_or_init(start_launcher_reaper)
         .as_ref()
@@ -282,21 +288,73 @@ fn launcher_reaper() -> Result<&'static Sender<std::process::Child>, OpenAttempt
         })
 }
 
-fn start_launcher_reaper() -> Option<Sender<std::process::Child>> {
+struct LauncherReaper {
+    sender: Sender<OwnedLauncher>,
+    active: Arc<AtomicUsize>,
+}
+
+impl LauncherReaper {
+    fn acquire(&self) -> Result<LauncherAdmission, OpenAttemptError> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_OWNED_LAUNCHERS).then_some(active + 1)
+            })
+            .map(|_| LauncherAdmission {
+                active: Arc::clone(&self.active),
+            })
+            .map_err(|_| {
+                OpenAttemptError::discard(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "system launcher capacity is exhausted",
+                ))
+            })
+    }
+}
+
+struct LauncherAdmission {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for LauncherAdmission {
+    fn drop(&mut self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "launcher admission count underflowed");
+    }
+}
+
+struct OwnedLauncher {
+    child: std::process::Child,
+    _admission: LauncherAdmission,
+}
+
+impl OwnedLauncher {
+    #[cfg(test)]
+    fn untracked(child: std::process::Child) -> Self {
+        Self {
+            child,
+            _admission: LauncherAdmission {
+                active: Arc::new(AtomicUsize::new(1)),
+            },
+        }
+    }
+}
+
+fn start_launcher_reaper() -> Option<LauncherReaper> {
     let cleanup = start_launcher_cleanup_workers()?;
-    let (sender, receiver) = channel::<std::process::Child>();
+    let active = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = channel::<OwnedLauncher>();
     std::thread::Builder::new()
         .name("trouve-opener-reaper".into())
         .spawn(move || supervise_launchers(receiver, cleanup))
-        .map(|_| sender)
+        .map(|_| LauncherReaper { sender, active })
         .map_err(|error| {
             tracing::warn!(%error, "could not start system launcher reaper");
         })
         .ok()
 }
 
-fn start_launcher_cleanup_workers() -> Option<SyncSender<std::process::Child>> {
-    let (sender, receiver) = sync_channel::<std::process::Child>(LAUNCHER_CLEANUP_QUEUE_CAPACITY);
+fn start_launcher_cleanup_workers() -> Option<SyncSender<OwnedLauncher>> {
+    let (sender, receiver) = sync_channel::<OwnedLauncher>(LAUNCHER_CLEANUP_QUEUE_CAPACITY);
     let receiver = Arc::new(Mutex::new(receiver));
     let mut started = 0;
     for index in 0..LAUNCHER_CLEANUP_WORKERS {
@@ -314,38 +372,35 @@ fn start_launcher_cleanup_workers() -> Option<SyncSender<std::process::Child>> {
     (started > 0).then_some(sender)
 }
 
-fn launcher_cleanup_worker(receiver: &Mutex<Receiver<std::process::Child>>) {
+fn launcher_cleanup_worker(receiver: &Mutex<Receiver<OwnedLauncher>>) {
     loop {
         let next = match receiver.lock() {
             Ok(receiver) => receiver.recv(),
             Err(poisoned) => poisoned.into_inner().recv(),
         };
-        let Ok(mut child) = next else {
+        let Ok(mut launcher) = next else {
             return;
         };
-        if let Err(error) = child.wait() {
+        if let Err(error) = launcher.child.wait() {
             tracing::warn!(%error, "could not reap isolated system launcher");
         }
     }
 }
 
-fn supervise_launchers(
-    receiver: Receiver<std::process::Child>,
-    cleanup: SyncSender<std::process::Child>,
-) {
+fn supervise_launchers(receiver: Receiver<OwnedLauncher>, cleanup: SyncSender<OwnedLauncher>) {
     let mut children = Vec::new();
     loop {
         let mut intake_remaining = LAUNCHER_REAPER_BATCH_SIZE;
         match receiver.recv_timeout(LAUNCHER_REAPER_POLL_INTERVAL) {
-            Ok(child) => {
-                children.push(SupervisedLauncher::new(child));
+            Ok(launcher) => {
+                children.push(SupervisedLauncher::new(launcher));
                 intake_remaining -= 1;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        drain_ready(&receiver, intake_remaining, |child| {
-            children.push(SupervisedLauncher::new(child))
+        drain_ready(&receiver, intake_remaining, |launcher| {
+            children.push(SupervisedLauncher::new(launcher))
         });
         poll_launchers(&mut children, &cleanup);
     }
@@ -361,16 +416,21 @@ fn drain_ready<T>(receiver: &Receiver<T>, limit: usize, mut accept: impl FnMut(T
 }
 
 struct SupervisedLauncher {
-    child: Option<std::process::Child>,
+    launcher: Option<OwnedLauncher>,
     inspection: LauncherInspection,
 }
 
 impl SupervisedLauncher {
-    fn new(child: std::process::Child) -> Self {
+    fn new(launcher: OwnedLauncher) -> Self {
         Self {
-            child: Some(child),
+            launcher: Some(launcher),
             inspection: LauncherInspection::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn untracked(child: std::process::Child) -> Self {
+        Self::new(OwnedLauncher::untracked(child))
     }
 }
 
@@ -404,26 +464,24 @@ impl LauncherInspection {
     }
 }
 
-fn poll_launchers(
-    children: &mut Vec<SupervisedLauncher>,
-    cleanup: &SyncSender<std::process::Child>,
-) {
+fn poll_launchers(children: &mut Vec<SupervisedLauncher>, cleanup: &SyncSender<OwnedLauncher>) {
     poll_launchers_with(children, cleanup, std::process::Child::try_wait);
 }
 
 fn poll_launchers_with(
     children: &mut Vec<SupervisedLauncher>,
-    cleanup: &SyncSender<std::process::Child>,
+    cleanup: &SyncSender<OwnedLauncher>,
     mut inspect: impl FnMut(
         &mut std::process::Child,
     ) -> std::io::Result<Option<std::process::ExitStatus>>,
 ) {
     children.retain_mut(|launcher| {
         let result = inspect(
-            launcher
-                .child
+            &mut launcher
+                .launcher
                 .as_mut()
-                .expect("supervised launcher always owns its child"),
+                .expect("supervised launcher always owns its child")
+                .child,
         );
         match result {
             Ok(Some(_)) => false,
@@ -433,26 +491,26 @@ fn poll_launchers_with(
             }
             Err(error) if launcher.inspection.retry_after_failure(&error) => true,
             Err(_) => {
-                let child = launcher
-                    .child
+                let owned = launcher
+                    .launcher
                     .take()
                     .expect("supervised launcher always owns its child");
-                match cleanup.try_send(child) {
+                match cleanup.try_send(owned) {
                     Ok(()) => false,
-                    Err(TrySendError::Full(child)) => {
+                    Err(TrySendError::Full(owned)) => {
                         // Keep ownership in the nonblocking supervisor while
                         // the bounded cleanup lane is saturated, then retry
                         // after a fresh inspection budget.
-                        launcher.child = Some(child);
+                        launcher.launcher = Some(owned);
                         launcher.inspection.succeeded();
                         tracing::warn!("system launcher cleanup queue is full");
                         true
                     }
-                    Err(TrySendError::Disconnected(child)) => {
+                    Err(TrySendError::Disconnected(owned)) => {
                         // The cleanup workers are established before any launcher
                         // starts. If they nevertheless disconnect, retain the
                         // handle and resume nonblocking supervision.
-                        launcher.child = Some(child);
+                        launcher.launcher = Some(owned);
                         launcher.inspection.succeeded();
                         tracing::warn!("system launcher cleanup workers disconnected");
                         true
@@ -463,12 +521,12 @@ fn poll_launchers_with(
     });
 }
 
-fn reap_launcher_in_background(child: std::process::Child, reaper: &Sender<std::process::Child>) {
-    if let Err(error) = reaper.send(child) {
+fn reap_launcher_in_background(launcher: OwnedLauncher, reaper: &Sender<OwnedLauncher>) {
+    if let Err(error) = reaper.send(launcher) {
         // The shared sender remains live for the process lifetime, so this is
         // only a defensive fallback. Wait without killing a possible player.
-        let mut child = error.0;
-        if let Err(error) = child.wait() {
+        let mut launcher = error.0;
+        if let Err(error) = launcher.child.wait() {
             tracing::warn!(%error, "could not synchronously reap system launcher");
         }
     }
@@ -581,8 +639,8 @@ mod tests {
         let mut short_command = std::process::Command::new("true");
         let short_child = trouve_process::spawn(&mut short_command).unwrap();
         let mut children = vec![
-            SupervisedLauncher::new(long_child),
-            SupervisedLauncher::new(short_child),
+            SupervisedLauncher::untracked(long_child),
+            SupervisedLauncher::untracked(short_child),
         ];
         let (cleanup, cleanup_receiver) = sync_channel(1);
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -594,12 +652,12 @@ mod tests {
 
         let remaining_ids = children
             .iter()
-            .map(|launcher| launcher.child.as_ref().unwrap().id())
+            .map(|launcher| launcher.launcher.as_ref().unwrap().child.id())
             .collect::<Vec<_>>();
         for mut launcher in children {
-            let mut child = launcher.child.take().unwrap();
-            child.kill().unwrap();
-            child.wait().unwrap();
+            let mut owned = launcher.launcher.take().unwrap();
+            owned.child.kill().unwrap();
+            owned.child.wait().unwrap();
         }
         assert_eq!(remaining_ids, vec![long_id]);
         assert!(matches!(
@@ -636,13 +694,37 @@ mod tests {
         assert!(inspection.retry_after_failure(&error));
     }
 
+    #[test]
+    fn launcher_admission_bounds_every_owned_child_lifecycle() {
+        let (sender, _receiver) = channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        let reaper = LauncherReaper {
+            sender,
+            active: Arc::clone(&active),
+        };
+        let mut admissions = Vec::new();
+
+        for _ in 0..MAX_OWNED_LAUNCHERS {
+            admissions.push(reaper.acquire().unwrap());
+        }
+        assert_eq!(active.load(Ordering::Acquire), MAX_OWNED_LAUNCHERS);
+        assert_eq!(
+            reaper.acquire().err().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        drop(admissions.pop());
+        admissions.push(reaper.acquire().unwrap());
+        assert_eq!(active.load(Ordering::Acquire), MAX_OWNED_LAUNCHERS);
+    }
+
     #[cfg(unix)]
     #[test]
     fn persistent_reaper_errors_transfer_live_child_to_isolated_cleanup() {
         let mut command = std::process::Command::new("true");
         let child = trouve_process::spawn(&mut command).unwrap();
         let child_id = child.id();
-        let mut children = vec![SupervisedLauncher::new(child)];
+        let mut children = vec![SupervisedLauncher::untracked(child)];
         let (cleanup, cleanup_receiver) = sync_channel(1);
 
         for _ in 0..LAUNCHER_REAPER_MAX_INSPECTION_ERRORS {
@@ -656,8 +738,8 @@ mod tests {
 
         assert!(children.is_empty());
         let mut isolated = cleanup_receiver.try_recv().unwrap();
-        assert_eq!(isolated.id(), child_id);
-        assert!(isolated.wait().unwrap().success());
+        assert_eq!(isolated.child.id(), child_id);
+        assert!(isolated.child.wait().unwrap().success());
     }
 
     #[cfg(unix)]
@@ -665,7 +747,7 @@ mod tests {
     fn saturated_isolated_cleanup_preserves_child_supervision() {
         let mut command = std::process::Command::new("true");
         let child = trouve_process::spawn(&mut command).unwrap();
-        let mut children = vec![SupervisedLauncher::new(child)];
+        let mut children = vec![SupervisedLauncher::untracked(child)];
         let (cleanup, _cleanup_receiver) = sync_channel(0);
 
         for _ in 0..LAUNCHER_REAPER_MAX_INSPECTION_ERRORS {
