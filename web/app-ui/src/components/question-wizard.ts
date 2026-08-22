@@ -5,6 +5,8 @@ type QuestionAnswer = ProtocolComponents["schemas"]["QuestionAnswer"];
 
 /** Synthetic choice used by both frontends for the trailing free-form answer. */
 export const OTHER_OPTION_ID = "__other__";
+export const QUESTION_SKIPPED_STATUS = "Skipped";
+export const QUESTION_SKIPPED_MESSAGE = "The questions were skipped.";
 
 export interface QuestionWizardState {
   /** `questions.length` is the review page. */

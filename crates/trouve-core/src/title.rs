@@ -9,8 +9,8 @@
 const MAX_WORDS: usize = 16;
 const MAX_CHARS: usize = 96;
 const MAX_SCANNED_WORDS: usize = MAX_WORDS + 16;
-/// Conservative one-character-per-token budget for the 1,024-token title
-/// sidecar, leaving room for its system prompt, chat template, and response.
+/// Shared character cap for heuristic scanning and model input. The model
+/// unconditionally applies a stricter byte cap before generation.
 pub(crate) const MAX_PROMPT_CHARS: usize = 768;
 const REQUEST_MARKERS: &[&str] = &[
     "is there a way ",

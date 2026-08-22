@@ -69,6 +69,10 @@ impl DenseIndex {
         &self.vectors
     }
 
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.vectors.owned_bytes()
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
     }
@@ -124,6 +128,10 @@ impl DenseIndex {
             }
         };
 
+        if scored.is_empty() {
+            return Vec::new();
+        }
+
         let effective_k = k.min(scored.len());
         scored.select_nth_unstable_by(effective_k.saturating_sub(1), |a, b| {
             a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -174,5 +182,15 @@ mod tests {
     fn empty_index() {
         let idx = DenseIndex::new(Vec::new());
         assert!(idx.query(&[1.0], 5, None).is_empty());
+    }
+
+    #[test]
+    fn empty_or_invalid_selector_returns_empty() {
+        let idx = index();
+        assert!(idx.query(&[1.0, 0.0, 0.0], 5, Some(&[])).is_empty());
+        assert!(
+            idx.query(&[1.0, 0.0, 0.0], 5, Some(&[usize::MAX]))
+                .is_empty()
+        );
     }
 }

@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail};
@@ -54,6 +54,10 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// setup so a broken settings entry gets prompt feedback.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_PARALLEL_MCP_CONNECTIONS: usize = 4;
+/// Stdio MCP servers are stateful and therefore remain isolated per
+/// worktree. Reap an idle connection instead of sharing it across sessions.
+const MCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const MCP_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_MCP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MCP_LOG_LINE_BYTES: usize = 16 * 1024;
 #[cfg(test)]
@@ -1355,6 +1359,13 @@ struct CachedConnection {
     generation: u64,
     health_generation: u64,
     reusable: bool,
+    last_used: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+impl CachedConnection {
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = std::time::Instant::now();
+    }
 }
 
 /// A config read is authorized only while both invalidation generations stay
@@ -1800,6 +1811,7 @@ impl ConnectionAttemptTask {
                     generation,
                     health_generation,
                     reusable: true,
+                    last_used: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
                 };
                 let installed = {
                     let mut state = connections.lock().await;
@@ -1888,7 +1900,66 @@ impl ConnectionAttemptTask {
 pub struct McpManager {
     connections: Arc<Mutex<ConnectionState>>,
     next_connection_generation: AtomicU64,
+    reaper_started: AtomicBool,
     logs: McpLogStore,
+}
+
+async fn reap_idle_connections(
+    connections: &Arc<Mutex<ConnectionState>>,
+    logs: &McpLogStore,
+    idle_timeout: std::time::Duration,
+) {
+    let quarantined = {
+        let mut state = connections.lock().await;
+        let keys = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                Arc::strong_count(&entry.connection) == 1
+                    && (!entry.reusable
+                        || entry.last_used.lock().unwrap().elapsed() >= idle_timeout)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| {
+                let entry = state.entries.get_mut(&key)?;
+                let was_reusable = entry.reusable;
+                entry.reusable = false;
+                Some((key, entry.clone(), was_reusable))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (key, entry, was_reusable) in quarantined {
+        match entry.connection.terminate().await {
+            Ok(()) => {
+                let mut state = connections.lock().await;
+                if state.entries.get(&key).is_some_and(|current| {
+                    current.generation == entry.generation && !current.reusable
+                }) {
+                    state.entries.remove(&key);
+                }
+                logs.push(
+                    &key.1,
+                    if was_reusable {
+                        "idle connection reaped"
+                    } else {
+                        "quarantined connection reaped on retry"
+                    },
+                );
+            }
+            Err(error) => {
+                // Keep the entry quarantined. A replacement must never overlap
+                // a process tree whose cleanup was not acknowledged.
+                tracing::warn!(
+                    server = %key.1,
+                    worktree = %key.0,
+                    "retaining idle MCP connection after cleanup failed: {error:#}"
+                );
+            }
+        }
+    }
 }
 
 impl McpManager {
@@ -1898,8 +1969,26 @@ impl McpManager {
         Self {
             connections: Arc::default(),
             next_connection_generation: AtomicU64::new(0),
+            reaper_started: AtomicBool::new(false),
             logs,
         }
+    }
+
+    fn start_reaper(&self) {
+        if self.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let connections = Arc::downgrade(&self.connections);
+        let logs = self.logs.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(MCP_REAP_INTERVAL).await;
+                let Some(connections) = connections.upgrade() else {
+                    break;
+                };
+                reap_idle_connections(&connections, &logs, MCP_IDLE_TIMEOUT).await;
+            }
+        });
     }
 
     /// The shared log store (also fed by settings health probes).
@@ -1915,6 +2004,7 @@ impl McpManager {
         server: &str,
         cancel: &CancellationToken,
     ) -> Result<CachedConnection> {
+        self.start_reaper();
         let worktree_key = worktree.to_string_lossy().to_string();
         loop {
             if cancel.is_cancelled() {
@@ -2008,6 +2098,7 @@ impl McpManager {
                     && existing.config == *config
                     && existing.reusable
                 {
+                    existing.touch();
                     ConnectionPlan::Ready(existing.clone())
                 } else if let Some(attempt) = state
                     .attempts
@@ -2407,6 +2498,7 @@ impl McpManager {
         worktree: &Path,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<ToolSpec> {
+        self.start_reaper();
         let (trusted, generations, skipped) = loop {
             if cancel.is_cancelled() {
                 return Vec::new();
@@ -2545,6 +2637,9 @@ impl McpManager {
             .connection
             .call_tool_controlled(tool, args, cancel, request_timeout)
             .await;
+        // Idle time starts when the operation finishes, not when the cached
+        // connection was acquired. Refresh on success and every error path.
+        connection.touch();
         if let Err(error) = &result
             && !error.connection_reusable
         {
@@ -3961,6 +4056,70 @@ for line in sys.stdin:
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn idle_reaper_retries_quarantined_cleanup_without_a_new_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("idle_retry_server.py");
+        let started = tmp.path().join("idle_retry.started");
+        std::fs::write(&script, CONFIG_RACE_TEST_SERVER).unwrap();
+        let config = config_race_test_config(&script, &started, None);
+        let manager = McpManager::default();
+        let key = (
+            tmp.path().to_string_lossy().into_owned(),
+            "fake".to_string(),
+        );
+        let connection = manager
+            .connection_with_config(tmp.path(), "fake", &config, &CancellationToken::new())
+            .await
+            .unwrap();
+        connection
+            .connection
+            .injected_terminate_failure
+            .store(true, Ordering::Relaxed);
+        *connection.last_used.lock().unwrap() = std::time::Instant::now()
+            .checked_sub(MCP_IDLE_TIMEOUT + std::time::Duration::from_secs(1))
+            .unwrap();
+        drop(connection);
+
+        reap_idle_connections(&manager.connections, manager.logs(), MCP_IDLE_TIMEOUT).await;
+        let retained = {
+            let state = manager.connections.lock().await;
+            let retained = state
+                .entries
+                .get(&key)
+                .expect("failed cleanup did not retain the connection");
+            assert!(!retained.reusable);
+            Arc::clone(&retained.connection)
+        };
+        retained
+            .injected_terminate_failure
+            .store(false, Ordering::Relaxed);
+        drop(retained);
+        {
+            let state = manager.connections.lock().await;
+            assert_eq!(
+                Arc::strong_count(&state.entries.get(&key).unwrap().connection),
+                1,
+                "test retained an MCP connection borrower before the retry"
+            );
+        }
+
+        reap_idle_connections(&manager.connections, manager.logs(), MCP_IDLE_TIMEOUT).await;
+        assert!(
+            manager.connections.lock().await.entries.is_empty(),
+            "quarantined idle cleanup was not retried"
+        );
+        assert!(
+            manager
+                .logs()
+                .lines("fake")
+                .last()
+                .is_some_and(|line| line.ends_with("quarantined connection reaped on retry")),
+            "retry cleanup was not classified in the lifecycle log"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn server_eviction_attempts_every_connection_and_aggregates_cleanup_failures() {
         let root = tempfile::tempdir().unwrap();
         let worktree_a = tempfile::tempdir().unwrap();
@@ -4680,7 +4839,125 @@ for line in sys.stdin:
             manager.logs.health("single-flight", &config),
             Some(("error".into(), "installed connection failed".into()))
         );
-        manager.evict_worktree(tmp.path()).await.unwrap();
+        let last_used = first.last_used.clone();
+        drop(cache_hit);
+        drop(connections);
+        *last_used.lock().unwrap() = std::time::Instant::now()
+            .checked_sub(MCP_IDLE_TIMEOUT + std::time::Duration::from_secs(1))
+            .unwrap();
+        reap_idle_connections(&manager.connections, manager.logs(), MCP_IDLE_TIMEOUT).await;
+        assert!(
+            manager.connections.lock().await.entries.is_empty(),
+            "the unreferenced idle connection remained cached"
+        );
+        assert!(
+            manager
+                .logs()
+                .lines("single-flight")
+                .last()
+                .is_some_and(|line| line.ends_with("idle connection reaped")),
+            "ordinary idle cleanup was misclassified in the lifecycle log"
+        );
+        assert!(
+            manager
+                .logs()
+                .lines("single-flight")
+                .last()
+                .is_some_and(|line| line.ends_with("idle connection reaped")),
+            "ordinary idle cleanup was misclassified in the lifecycle log"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn completed_long_running_call_gets_a_fresh_idle_window() {
+        let script = r#"
+import json, sys, time
+marker_path = sys.argv[1]
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "fake", "version": "0"}}
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
+    elif method == "tools/call":
+        with open(marker_path, "w") as marker:
+            marker.write("active")
+            marker.flush()
+        time.sleep(0.1)
+        result = {"content": [{"type": "text", "text": "done"}]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("long_running_mcp.py");
+        let marker_path = tmp.path().join("active.marker");
+        std::fs::write(&script_path, script).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_config_path(config_dir.path()),
+            serde_json::to_string(&json!({"mcpServers": {"fake": {
+                "command": "python3",
+                "args": [script_path.to_string_lossy(), marker_path.to_string_lossy()],
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(McpManager::default());
+        let worktree = tmp.path().to_path_buf();
+        let config_dir_path = config_dir.path().to_path_buf();
+        let call = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            let worktree = worktree.clone();
+            let config_dir = config_dir_path.clone();
+            async move {
+                manager
+                    .call(
+                        Some(&config_dir),
+                        None,
+                        &worktree,
+                        "mcp__fake__echo",
+                        &json!({}),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !marker_path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("long-running call did not start");
+
+        let last_used = manager
+            .connections
+            .lock()
+            .await
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .last_used
+            .clone();
+        *last_used.lock().unwrap() = std::time::Instant::now()
+            .checked_sub(MCP_IDLE_TIMEOUT + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(call.await.unwrap().unwrap().1, Value::String("done".into()));
+
+        reap_idle_connections(&manager.connections, manager.logs(), MCP_IDLE_TIMEOUT).await;
+        assert!(
+            !manager.connections.lock().await.entries.is_empty(),
+            "a just-completed call was treated as idle from its start time"
+        );
+        manager.evict_worktree(&worktree).await.unwrap();
     }
 
     #[cfg(target_os = "linux")]

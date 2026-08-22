@@ -25,11 +25,12 @@ const worker = javascript.find(({ name }) => name.startsWith("content-worker-"))
 // presentation preference, and Font Awesome icon UI; the PWA remains on the
 // original entry ceiling. Font assets have their own explicit budget below.
 const entryLimit = mode === "desktop" ? 856_000 : 850_000;
-// The durable team screen, creation flow, and validators bring the measured
-// desktop graph to 3,204,055 bytes. Keep only narrow deterministic-build
-// headroom; the PWA graph remains smaller.
-const totalJavaScriptLimit = 3_208_000;
-const totalStyleLimit = 182_000;
+// The combined product graph includes durable team coordination plus the
+// review-history, transcript-search, and detailed agent-activity surfaces. The
+// clean desktop build emits 3,220,085 B; preserve less than 2 kB of headroom.
+const totalJavaScriptLimit = 3_222_000;
+// Team and transcript-search styling emit 183,280 B in the clean build.
+const totalStyleLimit = 185_000;
 const limits = {
   entry: entryLimit,
   worker: 350_000,

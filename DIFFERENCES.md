@@ -7,6 +7,9 @@ quality benchmark (mean NDCG@10 within 0.0002, see [BENCHMARKS.md](BENCHMARKS.md
 The indexing and caching architecture underneath is a redesign. This document
 lists every deliberate difference and why it exists.
 
+Last audited against Semble v0.5.2 (`204ae4e`, 2026-07-21). Benchmark figures
+below refer to the v0.4.1 comparison recorded in [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Module map
 
 Where upstream behaviour lives in this codebase. Paths below are relative to
@@ -18,7 +21,7 @@ monorepo workspace.
 | --- | --- | --- |
 | `chunking/core.py`, `chunking/chunking.py` | `src/chunk.rs` | Identical chunk boundaries (parity-verified) |
 | `tokens.py` | `src/tokens.rs` | Identical tokens (parity-verified) |
-| `index/sparse.py` + `bm25s` dependency | `src/bm25.rs` | Scores within 1e-4 (parity-verified) |
+| `index/bm25.py` | `src/bm25.rs` | Scores within 1e-4 (parity-verified) |
 | `index/dense.py` + `model2vec` dependency | `src/dense.rs`, `src/embed.rs` | Bit-identical embeddings per text |
 | `ranking/boosting.py`, `penalties.py`, `weighting.py` | `src/ranking.rs` | Port |
 | `search.py` | `src/search.rs` | Port (same RRF fusion) |
@@ -30,17 +33,18 @@ monorepo workspace.
 
 ## Architectural differences
 
-### 1. Content-addressed chunk store instead of an all-or-nothing index cache
+### 1. Content-addressed chunk store instead of a checkout-local index cache
 
-Upstream pickles one cached index per path; if anything changed, the whole
-repository is re-chunked and re-embedded. trouve stores every per-file
-artifact (chunks, embedding rows, BM25 token lists) keyed by a hash of the
-file's *content* plus the indexing parameters (`src/store.rs`).
+Since v0.5.2, upstream records file mtimes and can reuse unchanged chunks and
+vectors while rebuilding one checkout. trouve stores every per-file artifact
+(chunks, embedding rows, BM25 token lists) keyed by a hash of the file's
+*content* plus the indexing parameters (`src/store.rs`).
 
-**Why:** incremental cost. Editing one file re-embeds one file; on
-kubernetes/kubernetes that is 0.86 s instead of ~3 minutes. This is the
-change that motivated the port — everything else in this section follows
-from it.
+**Why:** exact reuse across edits, branch switches, and worktrees. Editing one
+file re-embeds one file, while unchanged content is reusable even when its
+mtime or checkout path changes. The recorded v0.4.1 comparison measured
+0.86 s instead of ~3 minutes on kubernetes/kubernetes; upstream v0.5.2 is not
+represented by that historical timing.
 
 ### 2. Git-aware manifests: blob OIDs as content keys
 
@@ -61,7 +65,8 @@ time from the manifest rather than baked into stored entries.
 
 **Why:** branch switches and new worktrees only pay for content the store
 has never seen — identical content across 20 branches is stored once.
-Upstream would rebuild from scratch per checkout state.
+Upstream's reusable state remains tied to one checkout path and its file
+metadata.
 
 ### 4. Memory-mapped snapshots with incremental patching
 
@@ -75,7 +80,8 @@ bit-equal to a full rebuild.
 
 **Why:** warm-start latency. A fully warm kubernetes query is 0.55 s
 end-to-end, and RAM is bounded by what the OS pages in rather than the full
-index. Upstream deserializes its whole pickle on every process start.
+index. Upstream loads its persisted index structures into process memory on
+every process start.
 
 ### 5. Bounded cache: snapshot pruning + mark-and-sweep GC
 
@@ -90,7 +96,7 @@ Sweeping is always safe: the store is a cache, and a miss just recomputes.
 
 ### 6. In-house model2vec engine instead of the `model2vec` library
 
-Same model (`potion-code-16M`), same output, different plumbing: the
+Same model (`potion-code-16M-v2`), same output, different plumbing: the
 embedding table is memory-mapped from safetensors instead of copied, and
 pure-ASCII text (virtually all source code) goes through a byte-level
 WordPiece scanner with a sharded per-word memo instead of the HF
@@ -130,8 +136,8 @@ Same tool surface, plus: the in-process index cache holds up to 10 indexes
 proportional to build time, which the fast incremental rebuild makes cheap.
 The CLI adds a `stats` subcommand (index size, cache hit rate).
 
-**Why:** the revalidation policy leans on rebuilds being sub-second; upstream
-cannot re-validate cheaply, so it caches more conservatively.
+**Why:** git/content manifests and snapshot fast paths make repeated
+validation inexpensive, while the extra command makes cache behavior visible.
 
 ### 10. No remote repository support
 
@@ -162,11 +168,13 @@ single instance.
 
 ## What did *not* change
 
-- The embedding model (`potion-code-16M`) and its semantics.
+- The embedding model identifier (`potion-code-16M-v2`) and per-text output.
+  trouve embeds every text as a batch of one rather than using upstream batch
+  padding, as described above.
 - Chunking: same tree-sitter merge algorithm, same 750-byte target, same
-  line-based fallback, identical boundaries. (trouve bundles grammars for
-  more languages than upstream ships; for languages both support, boundaries
-  are identical.)
+  line-based fallback, identical boundaries where both use a grammar. trouve
+  compiles a curated native-grammar subset; other recognized languages use
+  the line fallback, while upstream's language pack covers more grammars.
 - BM25: same Lucene variant (k1=1.5, b=0.75), same identifier tokenization,
   same path/filename enrichment.
 - Hybrid fusion: same RRF (k=60), same alpha resolution.
@@ -192,10 +200,10 @@ touches:
 - **Model changes** (new potion model, different dimensions): configuration,
   not code — the engine reads any model2vec safetensors layout.
 - **CLI/MCP surface changes** (new tools, new flags): mechanical ports.
-- **Cache or index internals** (`cache.py`, `index/index.py`): do not apply.
-  That layer was deliberately replaced; an upstream fix there is either
-  already irrelevant or needs a from-scratch design against the store (as
-  the GC did).
+- **Cache or index internals** (`cache.py`, `index/index.py`): translate the
+  invariant, not the implementation. That layer was deliberately replaced;
+  an upstream fix may be irrelevant, already covered, or need a fresh design
+  against the content store and snapshots.
 
-Run `./scripts/fetch-reference.sh` to pin the upstream checkout that parity
-runs against.
+Run `./scripts/fetch-reference.sh` to update the upstream checkout and print
+the exact commit that parity runs against.

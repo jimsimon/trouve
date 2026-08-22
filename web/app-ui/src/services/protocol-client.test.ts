@@ -391,6 +391,7 @@ describe("ProtocolClient", () => {
 
   it("loads a bounded folded thread view with its exact stream cursor", async () => {
     const requests: Request[] = [];
+    const abort = new AbortController();
     const snapshot = {
       item_offset: 256,
       total_items: 512,
@@ -414,7 +415,7 @@ describe("ProtocolClient", () => {
       }),
     });
 
-    await expect(client.threadView("th/folded", 512)).resolves.toEqual({
+    await expect(client.threadView("th/folded", 512, { signal: abort.signal })).resolves.toEqual({
       cursor: 91,
       value: snapshot,
     });
@@ -423,6 +424,8 @@ describe("ProtocolClient", () => {
     expect(url.searchParams.get("limit")).toBe("256");
     expect(url.searchParams.get("turn_aligned")).toBe("true");
     expect(url.searchParams.get("before")).toBe("512");
+    abort.abort();
+    expect(requests[0]!.signal.aborted).toBe(true);
   });
 
   it("loads full details for one deferred historical tool call", async () => {
@@ -1142,11 +1145,11 @@ describe("ProtocolClient", () => {
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.11")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.13")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.12", "7.11.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.14", "7.13.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

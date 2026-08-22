@@ -14,10 +14,9 @@ The full story behind the name is in
 
 ## Why a port?
 
-Upstream Semble is excellent but its cache is all-or-nothing: touch one file
-and the whole repository is re-chunked and re-embedded. On a 20,000+ file
-codebase that means minutes per rebuild. trouve replaces the cached-index
-model with a **content-addressed chunk store**:
+trouve began as a redesign of Semble's original all-or-nothing cache. Semble
+v0.5.2 can now reuse unchanged files while reindexing one checkout; trouve's
+cache remains **content-addressed, branch-aware, and worktree-aware**:
 
 - Every per-file artifact (chunks, embedding rows, BM25 token lists) is keyed
   by content hash — a git blob OID for clean files (no file reads at all) or a
@@ -31,7 +30,7 @@ model with a **content-addressed chunk store**:
   embedding all run in parallel via rayon; BM25 corpus statistics are
   recomputed at assembly time (cheap relative to embedding).
 
-Retrieval behaviour is a faithful port: the same `potion-code-16M` model2vec
+Retrieval behaviour is a faithful port: the same `potion-code-16M-v2` model2vec
 embeddings (via an in-house engine with a memory-mapped embedding table and a
 word-caching WordPiece fast path, verified bit-identical to
 [model2vec-rs](https://github.com/MinishLab/model2vec-rs) per text),
@@ -45,14 +44,15 @@ loads embeddings and BM25 postings zero-copy, and an incremental build patches
 the previous snapshot — splicing unchanged rows out of the old mapping — so
 its cost is proportional to the edit, not the repository.
 
-Measured results
+Historical results against Semble v0.4.1
 ([BENCHMARKS.md](https://github.com/jimsimon/trouve/blob/main/BENCHMARKS.md))
 on kubernetes/kubernetes
-(30k files): cold indexing drops from ~3 minutes to 3.3 s (54x), an
+(30k files): cold indexing dropped from ~3 minutes to 3.3 s (54x), an
 incremental reindex after touching one file from ~3 minutes to 0.86 s (200x+),
-and a fully warm query from ~7 s to 0.55 s (13x). Retrieval quality is
-identical — mean NDCG@10 matches upstream to within 0.0002 on the upstream
-annotated benchmark, with identical chunk boundaries and BM25 scores.
+and a fully warm query from ~7 s to 0.55 s (13x). On that benchmark, mean
+NDCG@10 matched upstream to within 0.0002, with identical chunk boundaries and
+BM25 scores. Semble v0.5.2's newer incremental cache is not represented by
+those timing numbers.
 
 Everything runs on CPU, like upstream: model2vec static embeddings are table
 lookups plus mean pooling, so there is no neural forward pass to accelerate.
@@ -138,7 +138,7 @@ How to choose:
   entry in your agent's MCP config is all it takes.
   [INSTALL.md](https://github.com/jimsimon/trouve/blob/main/INSTALL.md#3-mcp-server-entry)
   lists the exact file and snippet
-  for 14 agents, plus optional `trouve-search` sub-agent files you can copy
+  for supported agents, plus optional `trouve-search` sub-agent files you can copy
   alongside.
 - **The CLI needs no setup at all** and is what sub-agents without tool
   access fall back to; every approach above shares the same on-disk index
@@ -210,7 +210,11 @@ two-line change (a dependency in `Cargo.toml` and a match arm in
 
 Resolved in order: `TROUVE_CACHE_LOCATION` (absolute path), then the platform
 cache dir (`~/.cache/trouve` on Linux). Set `TROUVE_MODEL_NAME` to override
-the embedding model.
+the embedding model. Processes wait up to five minutes for another process to
+finish downloading or repairing the same Hub model; set
+`TROUVE_HUB_MODEL_LOCK_TIMEOUT_SECS` to a positive integer number of seconds
+when a large model or slow network needs a longer wait, or when faster failure
+is preferred.
 
 The upstream semble environment variables (`SEMBLE_CACHE_LOCATION`,
 `SEMBLE_MODEL_NAME`) are still honoured as fallbacks when the corresponding
@@ -253,7 +257,7 @@ use as a native tool. trouve's retrieval behaviour is a faithful port of their
 design (see
 [DIFFERENCES.md](https://github.com/jimsimon/trouve/blob/main/DIFFERENCES.md)),
 and the
-[potion-code-16M](https://huggingface.co/minishlab/potion-code-16M) embedding
+[potion-code-16M-v2](https://huggingface.co/minishlab/potion-code-16M-v2) embedding
 model is theirs. If you find trouve useful, star their repo too.
 
 ## Citing
