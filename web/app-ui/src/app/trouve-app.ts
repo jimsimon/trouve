@@ -52,6 +52,7 @@ import {
 } from "../services/appearance-preferences.js";
 import { queryBrowserSystemFontFamilies } from "../services/system-fonts.js";
 import {
+  AttachmentOperationCapacityError,
   AttachmentEncodingError,
   base64DecodedByteLength,
   encodeAttachment,
@@ -188,6 +189,8 @@ import "../components/model-picker.js";
 
 const SESSION_TITLE_TIMEOUT_MS = 48_000;
 const VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 30_000;
+const VIDEO_ATTACHMENT_OPEN_CONCURRENCY = 1;
+const VIDEO_ATTACHMENT_OPEN_CAPACITY = 8;
 
 const deployment =
   import.meta.env.MODE === "pwa"
@@ -261,7 +264,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   );
   readonly #hostClient =
     deployment === "desktop" ? new HostClient(globalThis.location.origin) : undefined;
-  readonly #pendingVideoOpens = new PendingAttachmentOperations();
+  readonly #pendingVideoOpens = new PendingAttachmentOperations(
+    VIDEO_ATTACHMENT_OPEN_CONCURRENCY,
+    VIDEO_ATTACHMENT_OPEN_CAPACITY,
+  );
   readonly #desktopCoordinator = this.#hostClient === undefined
     ? undefined
     : new DesktopHostCoordinator(this.#hostClient, {
@@ -2578,7 +2584,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       if (pending === undefined) return;
       void pending
         .catch((error: unknown) => {
-          this.#shellNotice = error instanceof HostClientError && error.kind === "video-capacity"
+          this.#shellNotice = error instanceof AttachmentOperationCapacityError
+            || (error instanceof HostClientError && error.kind === "video-capacity")
             ? "Temporary video playback capacity is full. Restart trouve to open a different video."
             : "The video could not be opened in the system player.";
           this.requestUpdate();

@@ -10,18 +10,65 @@ export interface PendingAttachment {
 }
 
 /** Coalesces repeated attachment actions until their first operation settles. */
+export class AttachmentOperationCapacityError extends Error {
+  constructor() {
+    super("too many attachment operations are pending");
+    this.name = "AttachmentOperationCapacityError";
+  }
+}
+
 export class PendingAttachmentOperations {
   readonly #pending = new Map<string, Promise<unknown>>();
+  readonly #queue: Array<() => void> = [];
+  #active = 0;
+
+  constructor(
+    readonly maxConcurrent = Number.POSITIVE_INFINITY,
+    readonly maxPending = Number.POSITIVE_INFINITY,
+  ) {}
 
   run<T>(key: string, operation: () => Promise<T>): Promise<T> | undefined {
     if (this.#pending.has(key)) return undefined;
-    const pending = operation();
+    if (this.#pending.size >= this.maxPending) {
+      return Promise.reject(new AttachmentOperationCapacityError());
+    }
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const pending = new Promise<T>((accept, refuse) => {
+      resolve = accept;
+      reject = refuse;
+    });
     this.#pending.set(key, pending);
-    const finish = (): void => {
-      if (this.#pending.get(key) === pending) this.#pending.delete(key);
-    };
-    void pending.then(finish, finish);
+    this.#queue.push(() => {
+      this.#active += 1;
+      const finish = (): void => {
+        if (this.#pending.get(key) === pending) this.#pending.delete(key);
+        this.#active -= 1;
+        this.#drain();
+      };
+      void Promise.resolve()
+        .then(operation)
+        .then(
+          (value) => {
+            finish();
+            resolve(value);
+          },
+          (error: unknown) => {
+            finish();
+            reject(error);
+          },
+        );
+    });
+    this.#drain();
     return pending;
+  }
+
+  #drain(): void {
+    while (this.#active < this.maxConcurrent) {
+      const start = this.#queue.shift();
+      if (start === undefined) return;
+      start();
+    }
   }
 }
 

@@ -152,6 +152,22 @@ pub struct HostBootstrap {
     pub csrf_token: String,
 }
 
+#[derive(Serialize)]
+struct HostCapabilitiesWire {
+    #[serde(flatten)]
+    base: HostCapabilities,
+    /// Added in bridge v14. This remains wire-only so adding the optional
+    /// capability does not break downstream Rust struct literals.
+    open_video_attachment: bool,
+}
+
+#[derive(Serialize)]
+struct HostBootstrapWire {
+    capabilities: HostCapabilitiesWire,
+    font_families: Vec<String>,
+    csrf_token: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct LifecycleQuery {
     #[serde(default)]
@@ -216,7 +232,24 @@ pub fn host_openapi_json() -> serde_json::Value {
     let mut doc = HostApiDoc::openapi();
     doc.info.title = "trouve desktop host bridge".into();
     doc.info.version = crate::DESKTOP_BRIDGE_VERSION.to_string();
-    serde_json::to_value(doc).expect("host OpenAPI document serializes")
+    let mut value = serde_json::to_value(doc).expect("host OpenAPI document serializes");
+    let properties = value
+        .pointer_mut("/components/schemas/HostCapabilities/properties")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("HostCapabilities schema has object properties");
+    let video_schema = serde_json::json!({
+        "type": "boolean",
+        "description": "Added in bridge v14. Older desktop hosts omit it and must continue to\nbootstrap with external video playback disabled."
+    });
+    let mut ordered = serde_json::Map::new();
+    for (name, schema) in std::mem::take(properties) {
+        if name == "persistent_preferences" {
+            ordered.insert("open_video_attachment".into(), video_schema.clone());
+        }
+        ordered.insert(name, schema);
+    }
+    *properties = ordered;
+    value
 }
 
 #[derive(Debug, Error)]
@@ -339,7 +372,6 @@ impl HostGateway {
             capabilities.open_local_file = false;
             capabilities.reveal_local_file = false;
             capabilities.open_https_url = false;
-            capabilities.open_video_attachment = false;
             capabilities.native_notifications = false;
             capabilities.user_attention = false;
             capabilities.sleep_inhibition = false;
@@ -389,8 +421,6 @@ impl HostGateway {
             return;
         }
         self.state.capabilities.open_https_url = self.state.native_actions.can_open_https_url();
-        self.state.capabilities.open_video_attachment =
-            self.state.native_actions.can_open_video_attachment();
         self.state.capabilities.window_geometry =
             self.state.native_actions.can_manage_window_geometry();
         self.state.capabilities.file_picker = self.state.native_actions.can_pick_files();
@@ -679,8 +709,13 @@ async fn get_capabilities(
     headers: HeaderMap,
 ) -> Result<Response, GatewayRejection> {
     validate_read(&state, &headers)?;
-    let mut response = Json(HostBootstrap {
-        capabilities: state.capabilities,
+    let open_video_attachment = state.capabilities.kind != HostKind::Desktop
+        || state.native_actions.can_open_video_attachment();
+    let mut response = Json(HostBootstrapWire {
+        capabilities: HostCapabilitiesWire {
+            base: state.capabilities,
+            open_video_attachment,
+        },
         font_families: state
             .font_families
             .iter()
@@ -1180,7 +1215,6 @@ async fn open_video_attachment(
 ) -> Result<Response, GatewayRejection> {
     validate_mutation(&state, request.headers())?;
     if state.capabilities.kind != HostKind::Desktop
-        || !state.capabilities.open_video_attachment
         || !state.native_actions.can_open_video_attachment()
     {
         return Err(GatewayRejection::Missing);
@@ -2150,9 +2184,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        let bootstrap_value: serde_json::Value = response_json(bootstrap_response).await;
+        let bootstrap: HostBootstrap = serde_json::from_value(bootstrap_value.clone()).unwrap();
         assert!(!bootstrap.capabilities.open_https_url);
-        assert!(!bootstrap.capabilities.open_video_attachment);
+        assert_eq!(
+            bootstrap_value["capabilities"]["open_video_attachment"],
+            serde_json::Value::Bool(false),
+        );
 
         let response = app
             .clone()
@@ -2201,8 +2239,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
-        assert!(bootstrap.capabilities.open_video_attachment);
+        let bootstrap_value: serde_json::Value = response_json(bootstrap_response).await;
+        let bootstrap: HostBootstrap = serde_json::from_value(bootstrap_value.clone()).unwrap();
+        assert_eq!(
+            bootstrap_value["capabilities"]["open_video_attachment"],
+            serde_json::Value::Bool(true),
+        );
 
         let payload = AttachmentPayload {
             name: "clip.exe".into(),

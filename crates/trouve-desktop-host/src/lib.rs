@@ -111,11 +111,6 @@ pub struct HostCapabilities {
     pub open_local_file: bool,
     pub reveal_local_file: bool,
     pub open_https_url: bool,
-    /// Added in bridge v14. Older desktop hosts omit it and must continue to
-    /// bootstrap with external video playback disabled.
-    #[serde(default)]
-    #[schema(required = false)]
-    pub open_video_attachment: bool,
     pub native_notifications: bool,
     pub web_notifications: bool,
     pub user_attention: bool,
@@ -141,7 +136,6 @@ impl HostCapabilities {
             open_local_file: false,
             reveal_local_file: false,
             open_https_url: true,
-            open_video_attachment: true,
             native_notifications: false,
             web_notifications: false,
             user_attention: false,
@@ -169,7 +163,6 @@ impl HostCapabilities {
             open_local_file: false,
             reveal_local_file: false,
             open_https_url: false,
-            open_video_attachment: false,
             native_notifications: false,
             web_notifications: false,
             user_attention: false,
@@ -1784,22 +1777,36 @@ mod tests {
         assert!(!desktop.file_picker);
         assert!(!desktop.clipboard_image);
         assert!(!desktop.open_local_file);
-        assert!(!desktop.open_video_attachment);
         assert!(!desktop.native_notifications);
         assert!(!desktop.sleep_inhibition);
         assert!(!desktop.window_geometry);
     }
 
     #[test]
-    fn legacy_capabilities_default_external_video_playback_to_disabled() {
-        let mut value = serde_json::to_value(HostCapabilities::desktop()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("open_video_attachment");
+    fn published_capability_struct_literals_remain_source_compatible() {
+        let capabilities = HostCapabilities {
+            kind: HostKind::Desktop,
+            bridge_version: Some(DESKTOP_BRIDGE_VERSION),
+            directory_picker: false,
+            file_picker: false,
+            clipboard_image: false,
+            lifecycle_events: false,
+            close_confirmation: false,
+            open_local_file: false,
+            reveal_local_file: false,
+            open_https_url: false,
+            native_notifications: false,
+            web_notifications: false,
+            user_attention: false,
+            sleep_inhibition: false,
+            window_geometry: false,
+            visibility: false,
+            occlusion: false,
+            persistent_preferences: false,
+            installable: false,
+        };
 
-        let capabilities: HostCapabilities = serde_json::from_value(value).unwrap();
-        assert!(!capabilities.open_video_attachment);
+        assert_eq!(capabilities, HostCapabilities::desktop());
     }
 
     #[test]
