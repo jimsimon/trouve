@@ -77,13 +77,41 @@ const desktopUpdateIsBusy = (state: DesktopUpdateState | undefined): boolean =>
 
 const DESKTOP_UPDATE_BUSY_POLL_MS = 500;
 const DESKTOP_UPDATE_IDLE_POLL_MS = 30_000;
+const DESKTOP_UPDATE_RECONCILIATION_MAX_BACKOFF_EXPONENT = 6;
+
+const desktopUpdateStateFingerprint = (
+  state: DesktopUpdateState | undefined,
+): string => JSON.stringify(state === undefined
+  ? null
+  : [
+      state.currentVersion,
+      state.availableVersion,
+      state.phase,
+      state.message,
+      state.progressPercent,
+    ]);
+
+export const desktopUpdateConfirmsInstallAction = (
+  baseline: DesktopUpdateState | undefined,
+  state: DesktopUpdateState,
+): boolean => desktopUpdateIsBusy(state)
+  || desktopUpdateStateFingerprint(state) !== desktopUpdateStateFingerprint(baseline);
 
 export const desktopUpdatePollIntervalMs = (
   state: DesktopUpdateState | undefined,
-  installAcknowledgementOutstanding = false,
-): number => installAcknowledgementOutstanding || desktopUpdateIsBusy(state)
-  ? DESKTOP_UPDATE_BUSY_POLL_MS
-  : DESKTOP_UPDATE_IDLE_POLL_MS;
+  installReconciliationAttempt?: number,
+): number => {
+  if (desktopUpdateIsBusy(state)) return DESKTOP_UPDATE_BUSY_POLL_MS;
+  if (installReconciliationAttempt === undefined) return DESKTOP_UPDATE_IDLE_POLL_MS;
+  const exponent = Math.min(
+    Math.max(installReconciliationAttempt, 0),
+    DESKTOP_UPDATE_RECONCILIATION_MAX_BACKOFF_EXPONENT,
+  );
+  return Math.min(
+    DESKTOP_UPDATE_IDLE_POLL_MS,
+    DESKTOP_UPDATE_BUSY_POLL_MS * (2 ** exponent),
+  );
+};
 
 const desktopUpdatePhaseAnnouncement = (
   state: DesktopUpdateState | undefined,
@@ -122,7 +150,10 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #desktopUpdatePollIntervalMs: number | undefined;
   #desktopUpdateGeneration = 0;
   #desktopUpdateInitialAttempted = false;
-  #desktopUpdateInstallAcknowledgementOutstanding = false;
+  #desktopUpdateInstallReconciliation: {
+    baseline: DesktopUpdateState | undefined;
+    attempt: number;
+  } | undefined;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -156,7 +187,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     this.#desktopUpdateGeneration += 1;
     this.#desktopUpdateLoading = false;
     this.#desktopUpdateActionPending = false;
-    this.#desktopUpdateInstallAcknowledgementOutstanding = false;
+    this.#desktopUpdateInstallReconciliation = undefined;
     this.#stopDesktopUpdatePolling();
     super.disconnectedCallback();
   }
@@ -190,17 +221,25 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     try {
       const state = await action();
       if (generation !== this.#desktopUpdateGeneration) return;
-      this.#desktopUpdateState = state;
       this.#desktopUpdateError = "";
-      if (
-        this.#desktopUpdateInstallAcknowledgementOutstanding
-        && state.phase !== "available"
-      ) {
-        this.#desktopUpdateInstallAcknowledgementOutstanding = false;
+      let installReconciliationAttempt: number | undefined;
+      const reconciliation = this.#desktopUpdateInstallReconciliation;
+      if (reconciliation !== undefined) {
+        if (desktopUpdateConfirmsInstallAction(reconciliation.baseline, state)) {
+          this.#desktopUpdateInstallReconciliation = undefined;
+          this.#desktopUpdateState = state;
+        } else {
+          // Retain the explicit installing acknowledgement in the UI while
+          // the authoritative endpoint still returns the pre-action snapshot.
+          installReconciliationAttempt = reconciliation.attempt;
+          reconciliation.attempt += 1;
+        }
+      } else {
+        this.#desktopUpdateState = state;
       }
       this.#startDesktopUpdatePolling(desktopUpdatePollIntervalMs(
         state,
-        this.#desktopUpdateInstallAcknowledgementOutstanding,
+        installReconciliationAttempt,
       ));
     } catch {
       if (
@@ -210,11 +249,13 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
         this.#desktopUpdateError = "Update status could not be loaded.";
       }
       if (generation === this.#desktopUpdateGeneration) {
-        this.#startDesktopUpdatePolling(
-          this.#desktopUpdateInstallAcknowledgementOutstanding
-            ? DESKTOP_UPDATE_BUSY_POLL_MS
-            : DESKTOP_UPDATE_IDLE_POLL_MS,
-        );
+        const reconciliation = this.#desktopUpdateInstallReconciliation;
+        const installReconciliationAttempt = reconciliation?.attempt;
+        if (reconciliation !== undefined) reconciliation.attempt += 1;
+        this.#startDesktopUpdatePolling(desktopUpdatePollIntervalMs(
+          undefined,
+          installReconciliationAttempt,
+        ));
       }
     } finally {
       if (generation !== this.#desktopUpdateGeneration) return;
@@ -234,7 +275,12 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     this.#desktopUpdateGeneration += 1;
     const actionGeneration = this.#desktopUpdateGeneration;
     this.#desktopUpdateActionPending = true;
-    if (installing) this.#desktopUpdateInstallAcknowledgementOutstanding = true;
+    if (installing) {
+      this.#desktopUpdateInstallReconciliation = {
+        baseline: this.#desktopUpdateState,
+        attempt: 0,
+      };
+    }
     this.#desktopUpdateError = "";
     this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
     this.requestUpdate();
@@ -253,9 +299,12 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     } catch (error) {
       if (actionGeneration !== this.#desktopUpdateGeneration || !this.isConnected) return;
       if (error instanceof HostClientError && error.kind === "action-busy") {
+        // This request was not accepted. Reconcile once immediately, but do
+        // not retain install acknowledgement polling for someone else's work.
+        this.#desktopUpdateInstallReconciliation = undefined;
         keepPolling = true;
       } else {
-        if (installing) this.#desktopUpdateInstallAcknowledgementOutstanding = false;
+        if (installing) this.#desktopUpdateInstallReconciliation = undefined;
         this.#desktopUpdateError = installing
           ? "The update could not be installed. You can try again without leaving the app."
           : "The update check could not be completed.";
@@ -265,7 +314,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       this.#desktopUpdateActionPending = false;
       if (
         keepPolling
-        || this.#desktopUpdateInstallAcknowledgementOutstanding
+        || this.#desktopUpdateInstallReconciliation !== undefined
         || desktopUpdateIsBusy(this.#desktopUpdateState)
       ) {
         this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
@@ -403,6 +452,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     const notificationPreferences = readSignal(services.notificationPreferences);
     const updatePhase = this.#desktopUpdateState?.phase;
     const updateBusy = this.#desktopUpdateActionPending
+      || this.#desktopUpdateInstallReconciliation !== undefined
       || updatePhase === "checking"
       || updatePhase === "downloading"
       || updatePhase === "verifying"

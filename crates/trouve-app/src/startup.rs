@@ -1127,6 +1127,7 @@ impl UpdateManager {
         let install_cancellation = Arc::clone(&cancellation);
         let install_restart_handoff = Arc::clone(&restart_handoff_abandoned);
         let watchdog_cancellation = Arc::clone(&cancellation);
+        let watchdog_restart_handoff = Arc::clone(&restart_handoff_abandoned);
         match await_runtime_install(
             async move {
                 manager
@@ -1134,6 +1135,7 @@ impl UpdateManager {
                     .await
             },
             move || watchdog_cancellation.request_cancel(),
+            watchdog_restart_handoff,
             RUNTIME_INSTALL_TIMEOUT,
             RUNTIME_INSTALL_CANCEL_GRACE,
             RUNTIME_INSTALL_POST_COMMIT_HANDOFF_TIMEOUT,
@@ -1152,7 +1154,6 @@ impl UpdateManager {
                 update
             }
             RuntimeInstallOutcome::PostCommitTimedOut => {
-                restart_handoff_abandoned.store(true, Ordering::Release);
                 let update = state(
                     DesktopUpdatePhase::Error,
                     self.available_version(),
@@ -1333,6 +1334,7 @@ fn runtime_install_join_result<T>(
 async fn await_runtime_install<T>(
     install: impl std::future::Future<Output = T> + Send + 'static,
     request_cancel: impl FnOnce() -> bool,
+    restart_handoff_abandoned: Arc<AtomicBool>,
     operation_timeout: Duration,
     cancellation_grace: Duration,
     post_commit_handoff_timeout: Duration,
@@ -1350,12 +1352,25 @@ where
                 // how long the HTTP operation waits for restart handoff.
                 return match tokio::time::timeout(post_commit_handoff_timeout, &mut install).await {
                     Ok(update) => runtime_install_join_result(update),
-                    Err(_) => RuntimeInstallOutcome::PostCommitTimedOut,
+                    Err(_) => {
+                        // Publish abandonment before the detached worker can
+                        // choose its terminal state. The caller then overwrites
+                        // any boundary-race snapshot with the timeout state.
+                        restart_handoff_abandoned.store(true, Ordering::Release);
+                        RuntimeInstallOutcome::PostCommitTimedOut
+                    }
                 };
             }
             match tokio::time::timeout(cancellation_grace, &mut install).await {
                 Ok(update) => runtime_install_join_result(update),
-                Err(_) => RuntimeInstallOutcome::PreCommitTimedOut,
+                Err(_) => {
+                    // Cancellation is still reversible, so do not detach a
+                    // worker that could retain the action lock or overwrite
+                    // the retry state after this request returns.
+                    install.abort();
+                    let _ = install.await;
+                    RuntimeInstallOutcome::PreCommitTimedOut
+                }
             }
         }
     }
@@ -1673,11 +1688,26 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_install_watchdog_cancels_a_stalled_precommit_operation() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+
         let cancellation = Arc::new(trouve_update::InstallCancellation::default());
         let watchdog_cancellation = Arc::clone(&cancellation);
+        let (dropped, wait_for_drop) = tokio::sync::oneshot::channel();
+        let drop_signal = DropSignal(Some(dropped));
         let result = await_runtime_install(
-            std::future::pending::<()>(),
+            async move {
+                let _drop_signal = drop_signal;
+                std::future::pending::<()>().await;
+            },
             move || watchdog_cancellation.request_cancel(),
+            Arc::new(AtomicBool::new(false)),
             Duration::from_millis(5),
             Duration::from_millis(5),
             Duration::from_millis(5),
@@ -1685,24 +1715,31 @@ mod tests {
         .await;
         assert!(matches!(result, RuntimeInstallOutcome::PreCommitTimedOut));
         assert!(cancellation.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), wait_for_drop)
+            .await
+            .expect("pre-commit worker was not drained")
+            .expect("pre-commit worker dropped without its drain signal");
     }
 
     #[tokio::test]
     async fn runtime_install_watchdog_bounds_postcommit_handoff_without_aborting_recovery() {
         let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
         let (completed, wait_for_completion) = tokio::sync::oneshot::channel::<()>();
+        let restart_handoff_abandoned = Arc::new(AtomicBool::new(false));
         let result = await_runtime_install(
             async move {
                 let _ = wait_for_release.await;
                 let _ = completed.send(());
             },
             || false,
+            Arc::clone(&restart_handoff_abandoned),
             Duration::from_millis(5),
             Duration::from_millis(5),
             Duration::from_millis(5),
         )
         .await;
         assert!(matches!(result, RuntimeInstallOutcome::PostCommitTimedOut));
+        assert!(restart_handoff_abandoned.load(Ordering::Acquire));
 
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), wait_for_completion)

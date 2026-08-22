@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { DesktopUpdateState } from "../services/host-client.js";
 import {
   desktopUpdateCanRetryInstall,
+  desktopUpdateConfirmsInstallAction,
   desktopUpdatePollIntervalMs,
 } from "./settings-screen.js";
 
@@ -53,10 +54,30 @@ describe("desktop update status polling", () => {
     })).toBe(30_000);
   });
 
-  it("keeps polling quickly while an install acknowledgement is not yet authoritative", () => {
-    expect(desktopUpdatePollIntervalMs({
+  it("keeps polling quickly through stale install status, then backs off progressively", () => {
+    const available = {
       ...updateState("Version 4.1.0 is ready to install.", "4.1.0"),
       phase: "available",
-    }, true)).toBe(500);
+    } satisfies DesktopUpdateState;
+    expect(desktopUpdatePollIntervalMs(available, 0)).toBe(500);
+    expect(desktopUpdatePollIntervalMs(available, 1)).toBe(1_000);
+    expect(desktopUpdatePollIntervalMs(available, 20)).toBe(30_000);
+  });
+
+  it("requires status evidence from the accepted install before ending reconciliation", () => {
+    const retryError = updateState(
+      "Update installation failed: archive download stopped",
+      "4.1.0",
+    );
+    expect(desktopUpdateConfirmsInstallAction(retryError, { ...retryError })).toBe(false);
+    expect(desktopUpdateConfirmsInstallAction(retryError, {
+      ...retryError,
+      message: "Update installation failed: checksum mismatch",
+    })).toBe(true);
+    expect(desktopUpdateConfirmsInstallAction(retryError, {
+      ...retryError,
+      message: "Installing version 4.1.0…",
+      phase: "installing",
+    })).toBe(true);
   });
 });
