@@ -21,6 +21,7 @@ use super::AppEvent;
 
 const UPDATE_RESTART_ENV: &str = "TROUVE_UPDATE_RESTARTED_VERSION";
 const UPDATE_RELAUNCH_GATE_ENV: &str = "TROUVE_UPDATE_RELAUNCH_GATE";
+const UPDATE_RELAUNCH_GATE_V2_PREFIX: &str = "trouve-update-relaunch-v2-";
 const UPDATE_RELAUNCH_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_RELAUNCH_GATE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -506,8 +507,15 @@ fn wait_for_relaunch_gate_observed(
 ) -> Result<()> {
     use fs4::fs_std::FileExt as _;
 
-    let mut blocked = Some(blocked);
+    if !path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.starts_with(UPDATE_RELAUNCH_GATE_V2_PREFIX))
+    {
+        return wait_for_legacy_relaunch_gate(path, timeout, poll_interval, blocked);
+    }
 
+    let mut blocked = Some(blocked);
     let file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -539,8 +547,43 @@ fn wait_for_relaunch_gate_observed(
         }
     }
     drop(file);
-    let _ = std::fs::remove_file(path);
+    remove_relaunch_gate(path);
     Ok(())
+}
+
+fn wait_for_legacy_relaunch_gate(
+    path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+    blocked: impl FnOnce(),
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut blocked = Some(blocked);
+    while path
+        .try_exists()
+        .with_context(|| format!("checking legacy update relaunch gate {}", path.display()))?
+    {
+        if let Some(blocked) = blocked.take() {
+            blocked();
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for the previous trouve host to release update ownership"
+            );
+        }
+        std::thread::sleep(poll_interval);
+    }
+    Ok(())
+}
+
+fn remove_relaunch_gate(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "removing update relaunch gate failed");
+        }
+    }
 }
 
 pub(crate) struct UpdateRelaunchGate {
@@ -557,7 +600,7 @@ impl UpdateRelaunchGate {
             .unwrap_or_default()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "trouve-update-relaunch-{}-{nonce}.gate",
+            "{UPDATE_RELAUNCH_GATE_V2_PREFIX}{}-{nonce}.gate",
             std::process::id()
         ));
         let mut options = OpenOptions::new();
@@ -583,8 +626,9 @@ impl UpdateRelaunchGate {
     }
 
     fn release_lock(&mut self) {
-        self.lock.take();
-        let _ = std::fs::remove_file(&self.path);
+        if self.lock.take().is_some() {
+            remove_relaunch_gate(&self.path);
+        }
     }
 }
 
@@ -980,6 +1024,50 @@ mod tests {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
         gate.release();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn replacement_process_preserves_legacy_file_handoff_semantics() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "trouve-update-relaunch-{}-{nonce}.gate",
+            std::process::id()
+        ));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let wait_path = path.clone();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            finished_tx
+                .send(wait_for_relaunch_gate_observed(
+                    &wait_path,
+                    Duration::from_secs(1),
+                    Duration::from_millis(1),
+                    move || blocked_tx.send(()).unwrap(),
+                ))
+                .unwrap();
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(40)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        std::fs::remove_file(path).unwrap();
         assert!(
             finished_rx
                 .recv_timeout(Duration::from_secs(1))
