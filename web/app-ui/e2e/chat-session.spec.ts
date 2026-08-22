@@ -1478,7 +1478,7 @@ test("the YOLO warning remains centered and exposes its hover text", async ({ pa
   expect(alignment.warningToSelect).toBeLessThanOrEqual(1);
 });
 
-test("pending image and file attachments reuse submitted chip geometry", async ({ page }) => {
+test("pending media and file attachments reuse submitted chip geometry", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
@@ -1497,13 +1497,21 @@ test("pending image and file attachments reuse submitted chip geometry", async (
       mimeType: "text/plain",
       buffer: Buffer.from("attachment notes"),
     },
+    {
+      name: "clip.mp4",
+      mimeType: "video/mp4",
+      buffer: Buffer.from("video preview"),
+    },
   ]);
 
   const attachments = page.locator(".composer .pending-attachments");
-  const image = attachments.locator(".image-attachment");
+  const image = attachments.locator(".image-attachment").filter({ hasText: "image/png" });
+  const video = attachments.locator(".image-attachment").filter({ hasText: "video/mp4" });
   const file = attachments.locator(".file-attachment");
   await expect(image.locator("img")).toHaveAttribute("src", /^data:image\/png;base64,/u);
   await expect(image).toContainText("image/png");
+  await expect(video.locator("video")).toHaveAttribute("src", /^blob:/u);
+  await expect(video).toContainText("video/mp4");
   await expect(file.locator('[data-font-awesome-icon="file"]')).toBeVisible();
   await expect(file).toContainText("text/plain");
 
@@ -1617,6 +1625,45 @@ test("image attachment thumbnails open an accessible gallery", async ({ page }) 
   await dialog.getByRole("button", { name: "Close image preview" }).click();
   await expect(dialog).toBeHidden();
   await expect(trigger).toBeFocused();
+});
+
+test("lazy video thumbnails defer media requests until they approach the viewport", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page);
+  let requests = 0;
+  await page.route("**/v1/attachments/att_lazy_video", async (route) => {
+    requests += 1;
+    await route.fulfill({
+      contentType: "video/mp4",
+      body: Buffer.from("video preview"),
+    });
+  });
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    const preview = document.createElement("trouve-image-preview");
+    preview.id = "lazy-video-preview";
+    preview.source = "/v1/attachments/att_lazy_video";
+    preview.name = "lazy.mp4";
+    preview.mime = "video/mp4";
+    preview.video = true;
+    preview.lazy = true;
+    preview.style.position = "absolute";
+    preview.style.top = "3000px";
+    document.body.append(preview);
+  });
+
+  await page.waitForTimeout(250);
+  expect(requests).toBe(0);
+
+  const preview = page.locator("#lazy-video-preview");
+  await preview.evaluate((element) => element.scrollIntoView());
+  await expect.poll(() => requests).toBe(1);
+  await expect(preview.locator("video")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_lazy_video",
+  );
 });
 
 test("video attachments render thumbnails and open the browser player", async ({ page }) => {

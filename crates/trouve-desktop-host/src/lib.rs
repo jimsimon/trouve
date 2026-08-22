@@ -111,6 +111,10 @@ pub struct HostCapabilities {
     pub open_local_file: bool,
     pub reveal_local_file: bool,
     pub open_https_url: bool,
+    /// Added in bridge v14. Older desktop hosts omit it and must continue to
+    /// bootstrap with external video playback disabled.
+    #[serde(default)]
+    #[schema(required = false)]
     pub open_video_attachment: bool,
     pub native_notifications: bool,
     pub web_notifications: bool,
@@ -1765,6 +1769,18 @@ mod tests {
         assert!(!desktop.native_notifications);
         assert!(!desktop.sleep_inhibition);
         assert!(!desktop.window_geometry);
+    }
+
+    #[test]
+    fn legacy_capabilities_default_external_video_playback_to_disabled() {
+        let mut value = serde_json::to_value(HostCapabilities::desktop()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("open_video_attachment");
+
+        let capabilities: HostCapabilities = serde_json::from_value(value).unwrap();
+        assert!(!capabilities.open_video_attachment);
     }
 
     #[test]

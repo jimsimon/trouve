@@ -97,6 +97,23 @@ describe("HostClient", () => {
     });
   });
 
+  it("accepts bridge 13 bootstraps that predate external video playback", async () => {
+    const { open_video_attachment: _openVideoAttachment, ...legacyCapabilities } =
+      validCapabilities;
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        capabilities: { ...legacyCapabilities, bridge_version: 13 },
+        csrf_token: "v".repeat(64),
+      }),
+    );
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+
+    await expect(client.bootstrap()).resolves.toMatchObject({
+      bridgeVersion: 13,
+      openVideoAttachment: false,
+    });
+  });
+
   it("fails closed without including an invalid payload in diagnostics", async () => {
     const fakeFetch = vi.fn<typeof fetch>(async () =>
       Response.json({ prompt: "repository secret", csrf_token: "bad" }),

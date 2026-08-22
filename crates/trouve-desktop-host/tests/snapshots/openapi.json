@@ -654,7 +654,6 @@
           "open_local_file",
           "reveal_local_file",
           "open_https_url",
-          "open_video_attachment",
           "native_notifications",
           "web_notifications",
           "user_attention",
@@ -708,7 +707,8 @@
             "type": "boolean"
           },
           "open_video_attachment": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Added in bridge v14. Older desktop hosts omit it and must continue to\nbootstrap with external video playback disabled."
           },
           "persistent_preferences": {
             "type": "boolean"

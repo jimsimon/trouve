@@ -25,14 +25,14 @@ const worker = javascript.find(({ name }) => name.startsWith("content-worker-"))
 // presentation preference, and Font Awesome icon UI; the PWA remains on the
 // original entry ceiling. Font assets have their own explicit budget below.
 const entryLimit = mode === "desktop" ? 856_000 : 850_000;
-// The locked Vite/Rolldown graph emits 3,199,803 B with the evidence-backed
+// The locked Vite/Rolldown graph emits 3,200,933 B with the evidence-backed
 // review-history, churn-metrics, durable turn-phase, conditional-title,
 // route-scoped new-session lifecycle, outside-diff review, version-check,
 // per-thread transcript-search, attachment-gallery, and external-video
-// additions. Preserve less than 2 kB of headroom; entry, worker, and
-// largest-chunk budgets below still prevent one bundle from hiding in the
-// aggregate.
-const totalJavaScriptLimit = 3_201_000;
+// additions, including lazy video previews. Preserve less than 2 kB of
+// headroom; entry, worker, and largest-chunk budgets below still prevent one
+// bundle from hiding in the aggregate.
+const totalJavaScriptLimit = 3_202_000;
 // Version-check and transcript-search styling bring the clean artifact to
 // 182,349 B. Preserve less than 2 kB of headroom.
 const totalStyleLimit = 184_000;

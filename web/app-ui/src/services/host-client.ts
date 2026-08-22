@@ -212,7 +212,7 @@ export const mapHostCapabilities = (
     revealLocalFile: wire.reveal_local_file && hasLifecycleBridge,
     openHttpsUrl: wire.open_https_url,
     openVideoAttachment:
-      wire.open_video_attachment
+      wire.open_video_attachment === true
       && wire.bridge_version != null
       && wire.bridge_version >= VIDEO_ATTACHMENT_BRIDGE_VERSION,
     nativeNotifications: wire.native_notifications && hasLifecycleBridge,

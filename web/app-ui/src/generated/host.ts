@@ -323,7 +323,11 @@ export interface components {
             occlusion: boolean;
             open_https_url: boolean;
             open_local_file: boolean;
-            open_video_attachment: boolean;
+            /**
+             * @description Added in bridge v14. Older desktop hosts omit it and must continue to
+             *     bootstrap with external video playback disabled.
+             */
+            open_video_attachment?: boolean;
             persistent_preferences: boolean;
             reveal_local_file: boolean;
             sleep_inhibition: boolean;
