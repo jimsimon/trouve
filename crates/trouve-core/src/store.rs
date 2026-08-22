@@ -10321,6 +10321,16 @@ impl Store {
              JOIN code_review_jobs job ON job.id = rejection.job_id
              WHERE job.repository = ?1 AND job.pull_number = ?2
                AND job.id != ?3 AND job.status = 'succeeded'
+               AND (rejection.reason LIKE 'false_positive:%'
+                    OR rejection.reason LIKE 'pre_existing:%'
+                    OR rejection.reason LIKE 'internal_duplicate:%'
+                    OR rejection.reason LIKE 'external_duplicate:%'
+                    OR rejection.reason LIKE 'insufficient_evidence:%'
+                    OR rejection.reason LIKE 'non_actionable:%')
+               AND length(trim(substr(rejection.reason,
+                                      instr(rejection.reason, ':') + 1))) > 0
+               AND rejection.reason NOT LIKE '%did not provide a specific reason%'
+               AND rejection.reason NOT LIKE '%has no recorded reason%'
              ORDER BY job.publication_order DESC, job.completed_at DESC,
                       rejection.created_at DESC, job.created_at DESC, job.id DESC,
                       rejection.candidate_id DESC
@@ -11931,7 +11941,9 @@ impl Store {
                  JOIN code_review_jobs j ON j.id = r.job_id
                  WHERE j.status = 'succeeded'
                    AND (?1 IS NULL OR j.repository = ?1)
-                   AND (?2 IS NULL OR j.completed_at >= ?2)",
+                   AND (?2 IS NULL OR j.completed_at >= ?2)
+                   AND r.reason NOT LIKE '%did not provide a specific reason%'
+                   AND r.reason NOT LIKE '%has no recorded reason%'",
                 params![repository, start_param],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
@@ -21873,6 +21885,20 @@ mod tests {
                         title: "Unproven".into(),
                         body: "Missing a reachable sequence.".into(),
                         reason: "insufficient_evidence: no reachable sequence".into(),
+                    },
+                    trouve_protocol::CodeReviewCandidateRejection {
+                        candidate_id: "unadjudicated-legacy".into(),
+                        task_id: "task".into(),
+                        reviewer_id: "correctness".into(),
+                        reviewer_name: "Correctness".into(),
+                        path: "src/lib.rs".into(),
+                        line: 5,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Unknown decision".into(),
+                        body: "The coordinator did not adjudicate this candidate.".into(),
+                        reason: "insufficient_evidence: The final review editor did not retain this candidate and did not provide a specific reason.".into(),
                     },
                 ],
             )

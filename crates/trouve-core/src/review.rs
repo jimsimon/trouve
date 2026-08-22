@@ -145,6 +145,7 @@ const GITHUB_REST_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 const REVIEW_OUTPUT_FLUSH_BYTES: usize = 8 * 1024;
 const REVIEW_TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const REVIEW_COORDINATOR_ADJUDICATION_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_PROJECTION_DEBOUNCE: Duration = Duration::from_millis(750);
 const REVIEW_PROJECTION_REPAIR_LIMIT: usize = 25;
 const CHECK_ACTION_DESCRIPTION_MAX_CHARS: usize = 40;
@@ -5198,6 +5199,71 @@ impl Engine {
                 &coordinator_candidates,
                 &diff_files,
             );
+            let missing_adjudications =
+                unadjudicated_candidate_ids(&validated, &coordinator_candidates);
+            if !missing_adjudications.is_empty() {
+                let remaining = coordinator_timeout
+                    .saturating_sub(coordinator_started.elapsed())
+                    .min(REVIEW_COORDINATOR_ADJUDICATION_REPAIR_TIMEOUT);
+                if !remaining.is_zero() {
+                    let repair_prompt = coordinator_adjudication_repair_prompt(
+                        &missing_adjudications,
+                        &turn.output,
+                    );
+                    match self
+                        .run_timed_code_review_repair_turn(
+                            &job,
+                            &task.id,
+                            &coordinator.id,
+                            ReviewTurnRequest::json_repair(repair_prompt)
+                                .with_metrics_base(turn.metrics.clone()),
+                            superseded,
+                            active_threads,
+                            remaining,
+                            "final review editor adjudication repair",
+                        )
+                        .await
+                    {
+                        Ok(repaired) => {
+                            merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
+                            match parse_review_output(&repaired.output) {
+                                Ok(mut repaired_output) => {
+                                    repaired_output.findings = coordinator_validated_findings(
+                                        std::mem::take(&mut repaired_output.findings),
+                                        &coordinator_candidates,
+                                        &diff_files,
+                                    );
+                                    if unadjudicated_candidate_ids(
+                                        &repaired_output,
+                                        &coordinator_candidates,
+                                    )
+                                    .is_empty()
+                                    {
+                                        turn.output = repaired.output;
+                                        validated = repaired_output;
+                                    } else {
+                                        tracing::warn!(
+                                            job_id = %job.id,
+                                            candidate_ids = ?missing_adjudications,
+                                            "coordinator adjudication repair remained incomplete"
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    job_id = %job.id,
+                                    %error,
+                                    "coordinator adjudication repair returned malformed output"
+                                ),
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            job_id = %job.id,
+                            %error,
+                            "coordinator adjudication repair failed"
+                        ),
+                    }
+                }
+            }
             let (findings, invalid_finding_anchor_candidate_ids) = self
                 .retain_findings_with_valid_anchors(
                     Path::new(&session.worktree_path),
@@ -5216,7 +5282,16 @@ impl Engine {
                         reason: INVALID_OUTSIDE_ANCHOR_REJECTION.into(),
                     }),
             );
-            normalize_coordinator_output(&mut validated, &candidates, &previous_findings);
+            let unadjudicated =
+                normalize_coordinator_output(&mut validated, &candidates, &previous_findings);
+            if !unadjudicated.is_empty() {
+                tracing::warn!(
+                    job_id = %job.id,
+                    candidate_ids = ?unadjudicated,
+                    "coordinator left review candidates unadjudicated after repair"
+                );
+                append_unadjudicated_summary(&mut validated.summary, unadjudicated.len());
+            }
             turn.output = serde_json::to_string(&validated)?;
             let findings = std::mem::take(&mut validated.findings);
             if let Some(task) = self.store.finish_code_review_task(
@@ -5581,6 +5656,50 @@ impl Engine {
                         thread_id,
                         %error,
                         "failed to cancel timed-out code-review task"
+                    );
+                }
+                bail!(
+                    "{timeout_label} timed out after {}",
+                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_timed_code_review_repair_turn(
+        self: &Arc<Self>,
+        job: &trouve_protocol::CodeReviewJob,
+        task_id: &str,
+        thread_id: &str,
+        request: ReviewTurnRequest,
+        superseded: &CancellationToken,
+        active_threads: &Arc<Mutex<HashSet<String>>>,
+        timeout: Duration,
+        timeout_label: &str,
+    ) -> Result<ReviewTurnResult> {
+        match tokio::time::timeout(
+            timeout,
+            self.run_tracked_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                request,
+                superseded,
+                active_threads,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                active_threads.lock().unwrap().remove(thread_id);
+                if let Err(error) = self.cancel_turn(thread_id) {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        thread_id,
+                        %error,
+                        "failed to cancel timed-out code-review repair task"
                     );
                 }
                 bail!(
@@ -11227,11 +11346,77 @@ fn finding_origin_with_history(
     }
 }
 
+fn substantive_coordinator_rejection_reason(reason: &str) -> bool {
+    const CATEGORIES: [&str; 6] = [
+        "false_positive:",
+        "pre_existing:",
+        "internal_duplicate:",
+        "external_duplicate:",
+        "insufficient_evidence:",
+        "non_actionable:",
+    ];
+    let reason = reason.trim();
+    CATEGORIES.iter().any(|category| {
+        reason
+            .strip_prefix(category)
+            .is_some_and(|detail| !detail.trim().is_empty())
+    })
+}
+
+fn unadjudicated_candidate_ids(
+    output: &ReviewOutput,
+    candidates: &[CandidateFinding],
+) -> Vec<String> {
+    let candidate_ids = candidates
+        .iter()
+        .map(|candidate| candidate.candidate_id.as_str())
+        .collect::<HashSet<_>>();
+    let accepted = output
+        .findings
+        .iter()
+        .flat_map(|finding| finding.source_candidate_ids.iter())
+        .filter(|candidate_id| candidate_ids.contains(candidate_id.as_str()))
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let rejected = output
+        .rejected_candidates
+        .iter()
+        .filter(|rejection| {
+            candidate_ids.contains(rejection.candidate_id.as_str())
+                && !accepted.contains(rejection.candidate_id.as_str())
+                && substantive_coordinator_rejection_reason(&rejection.reason)
+        })
+        .map(|rejection| rejection.candidate_id.as_str())
+        .collect::<HashSet<_>>();
+    candidates
+        .iter()
+        .filter(|candidate| {
+            !accepted.contains(candidate.candidate_id.as_str())
+                && !rejected.contains(candidate.candidate_id.as_str())
+        })
+        .map(|candidate| candidate.candidate_id.clone())
+        .collect()
+}
+
+fn append_unadjudicated_summary(summary: &mut String, count: usize) {
+    let note = format!(
+        "The final editor left {count} candidate{} unadjudicated after one repair attempt; \
+         they were not treated as rejections or retained as future rejection precedent.",
+        if count == 1 { "" } else { "s" }
+    );
+    if summary.trim().is_empty() {
+        *summary = note;
+    } else {
+        summary.push_str("\n\n");
+        summary.push_str(&note);
+    }
+}
+
 fn normalize_coordinator_output(
     output: &mut ReviewOutput,
     candidates: &[CandidateFinding],
     previous_findings: &[trouve_protocol::CodeReviewFinding],
-) {
+) -> Vec<String> {
     let candidate_ids = candidates
         .iter()
         .map(|candidate| candidate.candidate_id.as_str())
@@ -11255,23 +11440,30 @@ fn normalize_coordinator_output(
             let reason = rejection.reason.trim();
             (candidate_ids.contains(rejection.candidate_id.as_str())
                 && !accepted.contains(rejection.candidate_id.as_str())
-                && !reason.is_empty())
+                && substantive_coordinator_rejection_reason(reason))
             .then_some((rejection.candidate_id.clone(), reason.to_owned()))
         })
         .collect::<HashMap<_, _>>();
     output.rejected_candidates = candidates
         .iter()
         .filter(|candidate| !accepted.contains(candidate.candidate_id.as_str()))
-        .map(|candidate| ReviewCandidateRejection {
-            candidate_id: candidate.candidate_id.clone(),
-            reason: supplied_reasons
+        .filter_map(|candidate| {
+            supplied_reasons
                 .get(candidate.candidate_id.as_str())
                 .cloned()
-                .unwrap_or_else(|| {
-                    "The final review editor did not retain this candidate and did not provide a specific reason."
-                        .into()
-                }),
+                .map(|reason| ReviewCandidateRejection {
+                    candidate_id: candidate.candidate_id.clone(),
+                    reason,
+                })
         })
+        .collect();
+    let unadjudicated = candidates
+        .iter()
+        .filter(|candidate| {
+            !accepted.contains(candidate.candidate_id.as_str())
+                && !supplied_reasons.contains_key(candidate.candidate_id.as_str())
+        })
+        .map(|candidate| candidate.candidate_id.clone())
         .collect();
 
     let previous_ids = previous_findings
@@ -11282,6 +11474,7 @@ fn normalize_coordinator_output(
     output
         .resolved_finding_ids
         .retain(|id| previous_ids.contains(id.as_str()) && seen.insert(id.clone()));
+    unadjudicated
 }
 
 /// Keeps only themes that genuinely span multiple findings: a non-empty root
@@ -11450,25 +11643,25 @@ fn candidate_rejections(
 
     candidates
         .iter()
-        .filter(|candidate| !accepted.contains(candidate.candidate_id.as_str()))
-        .map(|candidate| trouve_protocol::CodeReviewCandidateRejection {
-            candidate_id: candidate.candidate_id.clone(),
-            task_id: candidate.task_id.clone(),
-            reviewer_id: candidate.reviewer_id.clone(),
-            reviewer_name: candidate.reviewer_name.clone(),
-            path: candidate.finding.path.clone(),
-            line: candidate.finding.line,
-            side: candidate.finding.side.clone(),
-            severity: candidate.finding.severity.clone(),
-            confidence: candidate.finding.confidence.clone(),
-            title: candidate.finding.title.clone(),
-            body: candidate.finding.body.clone(),
-            reason: categorized_rejection_reason(
-                reasons
-                    .get(candidate.candidate_id.as_str())
-                    .copied()
-                    .unwrap_or("The candidate was not retained and has no recorded reason."),
-            ),
+        .filter_map(|candidate| {
+            if accepted.contains(candidate.candidate_id.as_str()) {
+                return None;
+            }
+            let reason = reasons.get(candidate.candidate_id.as_str()).copied()?;
+            Some(trouve_protocol::CodeReviewCandidateRejection {
+                candidate_id: candidate.candidate_id.clone(),
+                task_id: candidate.task_id.clone(),
+                reviewer_id: candidate.reviewer_id.clone(),
+                reviewer_name: candidate.reviewer_name.clone(),
+                path: candidate.finding.path.clone(),
+                line: candidate.finding.line,
+                side: candidate.finding.side.clone(),
+                severity: candidate.finding.severity.clone(),
+                confidence: candidate.finding.confidence.clone(),
+                title: candidate.finding.title.clone(),
+                body: candidate.finding.body.clone(),
+                reason: categorized_rejection_reason(reason),
+            })
         })
         .collect()
 }
@@ -12317,6 +12510,27 @@ fn review_output_repair_prompt(error: &anyhow::Error, malformed_output: &str) ->
          candidate, and preserve any shared root causes it already identified. Use empty arrays \
          when there are no findings, rejected candidates, resolved findings, or themes.\n\n\
          <malformed-review-output>\n{malformed_output}\n</malformed-review-output>"
+    )
+}
+
+fn coordinator_adjudication_repair_prompt(
+    unadjudicated_candidate_ids: &[String],
+    previous_output: &str,
+) -> String {
+    let candidate_ids =
+        serde_json::to_string(unadjudicated_candidate_ids).unwrap_or_else(|_| "[]".to_owned());
+    format!(
+        "Your previous final-editor JSON did not adjudicate every supplied candidate. The \
+         affected candidate ids are: {candidate_ids}.\n\nDo not perform more repository analysis and \
+         do not call tools. Return one corrected, complete JSON object with the same schema as \
+         your previous response. Preserve every existing supported finding, rejection, resolved \
+         finding, theme, and its structured evidence. Adjudicate each affected candidate exactly \
+         once: either retain it through a finding's `source_candidate_ids`, or include it in \
+         `rejected_candidates` with a concise, substantive reason prefixed by exactly one of \
+         `false_positive:`, `pre_existing:`, `internal_duplicate:`, `external_duplicate:`, \
+         `insufficient_evidence:`, or `non_actionable:`. An empty reason or a category without an \
+         explanation is not an adjudication. Return JSON only, with no Markdown fence.\n\n\
+         <previous-final-editor-output>\n{previous_output}\n</previous-final-editor-output>"
     )
 }
 
@@ -19572,7 +19786,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_rejection_details_cover_every_unselected_candidate() {
+    fn candidate_rejection_details_exclude_unadjudicated_candidates() {
         let candidate = |id: &str| CandidateFinding {
             candidate_id: id.into(),
             task_id: "rt_test".into(),
@@ -19615,7 +19829,7 @@ mod tests {
             rejected_candidates: vec![
                 ReviewCandidateRejection {
                     candidate_id: "explained".into(),
-                    reason: "Duplicate of the accepted finding.".into(),
+                    reason: "internal_duplicate: duplicate of the accepted finding".into(),
                 },
                 ReviewCandidateRejection {
                     candidate_id: "invented".into(),
@@ -19625,27 +19839,26 @@ mod tests {
             resolved_finding_ids: vec!["invented-finding".into()],
             themes: Vec::new(),
         };
-        normalize_coordinator_output(&mut review, &candidates, &[]);
+        let unadjudicated = normalize_coordinator_output(&mut review, &candidates, &[]);
         assert_eq!(review.findings[0].source_candidate_ids, ["accepted"]);
+        assert_eq!(unadjudicated, ["missing-reason"]);
         assert_eq!(
             review
                 .rejected_candidates
                 .iter()
                 .map(|rejection| rejection.candidate_id.as_str())
                 .collect::<Vec<_>>(),
-            ["explained", "missing-reason"]
+            ["explained"]
         );
         assert!(review.resolved_finding_ids.is_empty());
 
         let rejected = candidate_rejections(&review, &candidates);
-        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].candidate_id, "explained");
         assert_eq!(
             rejected[0].reason,
-            "internal_duplicate: Duplicate of the accepted finding."
+            "internal_duplicate: duplicate of the accepted finding"
         );
-        assert_eq!(rejected[1].candidate_id, "missing-reason");
-        assert!(rejected[1].reason.starts_with("insufficient_evidence:"));
 
         let unaccounted = ReviewOutput {
             summary: String::new(),
@@ -19655,12 +19868,7 @@ mod tests {
             themes: Vec::new(),
         };
         let rejected_without_reason = candidate_rejections(&unaccounted, &candidates[..1]);
-        assert_eq!(rejected_without_reason.len(), 1);
-        assert!(
-            rejected_without_reason[0]
-                .reason
-                .starts_with("false_positive:")
-        );
+        assert!(rejected_without_reason.is_empty());
 
         let inline = ReviewFinding {
             source_candidate_ids: vec![candidates[0].candidate_id.clone()],
@@ -19689,9 +19897,10 @@ mod tests {
             resolved_finding_ids: Vec::new(),
             themes: Vec::new(),
         };
-        normalize_coordinator_output(&mut anchor_filtered, &candidates, &[]);
+        let unadjudicated = normalize_coordinator_output(&mut anchor_filtered, &candidates, &[]);
+        assert_eq!(unadjudicated, ["missing-reason"]);
         let anchor_rejections = candidate_rejections(&anchor_filtered, &candidates);
-        assert_eq!(anchor_rejections.len(), 2);
+        assert_eq!(anchor_rejections.len(), 1);
         assert_eq!(anchor_rejections[0].candidate_id, "explained");
         assert_eq!(
             anchor_rejections[0].reason,
@@ -19726,11 +19935,12 @@ mod tests {
             resolved_finding_ids: Vec::new(),
             themes: Vec::new(),
         };
-        normalize_coordinator_output(
+        let unadjudicated = normalize_coordinator_output(
             &mut candidate_anchor_filtered,
             &candidates_with_invalid_anchor,
             &[],
         );
+        assert!(unadjudicated.is_empty());
         let candidate_anchor_rejections =
             candidate_rejections(&candidate_anchor_filtered, &candidates_with_invalid_anchor);
         assert_eq!(candidate_anchor_rejections.len(), 1);
@@ -19761,12 +19971,34 @@ mod tests {
             &candidates,
             &files,
         );
-        normalize_coordinator_output(&mut structurally_rejected, &candidates, &[]);
+        let unadjudicated =
+            normalize_coordinator_output(&mut structurally_rejected, &candidates, &[]);
 
         let rejected = candidate_rejections(&structurally_rejected, &candidates);
-        assert_eq!(rejected.len(), candidates.len());
-        assert_eq!(rejected[0].candidate_id, "accepted");
-        assert!(rejected[0].reason.starts_with("insufficient_evidence:"));
+        assert_eq!(unadjudicated.len(), candidates.len());
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn coordinator_adjudication_repair_is_narrow_and_requires_substantive_categories() {
+        assert!(substantive_coordinator_rejection_reason(
+            "false_positive: the named path is unreachable"
+        ));
+        assert!(!substantive_coordinator_rejection_reason(
+            "false_positive:   "
+        ));
+        assert!(!substantive_coordinator_rejection_reason(
+            "The editor omitted it"
+        ));
+
+        let prompt = coordinator_adjudication_repair_prompt(
+            &["candidate-1".into(), "candidate-2".into()],
+            r#"{"summary":"done","findings":[]}"#,
+        );
+        assert!(prompt.contains(r#"["candidate-1","candidate-2"]"#));
+        assert!(prompt.contains("Adjudicate each affected candidate exactly once"));
+        assert!(prompt.contains("do not call tools"));
+        assert!(prompt.contains("category without an explanation is not an adjudication"));
     }
 
     #[test]
