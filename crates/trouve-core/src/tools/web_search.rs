@@ -68,10 +68,7 @@ impl SearchProvider {
             }),
             ProviderKind::Exa => json!({
                 "query": query,
-                "type": "auto",
                 "numResults": max_results,
-                "livecrawl": "fallback",
-                "contextMaxCharacters": 12_000,
             }),
         }
     }
@@ -476,22 +473,55 @@ mod tests {
 
     use super::*;
 
-    async fn mock_server_with_delay(
+    async fn capturing_mock_server_with_delay(
         status: &'static str,
         body: impl Into<String>,
         response_delay: Duration,
-    ) -> (String, Arc<AtomicUsize>) {
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let body = body.into();
         tokio::spawn({
             let calls = calls.clone();
+            let requests = requests.clone();
             async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    let mut request = vec![0; 16 * 1024];
-                    let _ = socket.read(&mut request).await;
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let read = socket.read(&mut buffer).await.unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        let Some(headers_end) = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|position| position + 4)
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..headers_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':')
+                                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= headers_end + content_length {
+                            let value = serde_json::from_slice(
+                                &request[headers_end..headers_end + content_length],
+                            )
+                            .unwrap();
+                            requests.lock().unwrap().push(value);
+                            break;
+                        }
+                    }
                     tokio::time::sleep(response_delay).await;
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -501,7 +531,17 @@ mod tests {
                 }
             }
         });
-        (format!("http://{address}/mcp"), calls)
+        (format!("http://{address}/mcp"), calls, requests)
+    }
+
+    async fn mock_server_with_delay(
+        status: &'static str,
+        body: impl Into<String>,
+        response_delay: Duration,
+    ) -> (String, Arc<AtomicUsize>) {
+        let (endpoint, calls, _) =
+            capturing_mock_server_with_delay(status, body, response_delay).await;
+        (endpoint, calls)
     }
 
     async fn mock_server(
@@ -528,6 +568,35 @@ mod tests {
         assert!(arguments.get("session_id").is_none());
         assert!(arguments.get("max_results").is_none());
         assert!(arguments.get("numResults").is_none());
+    }
+
+    #[tokio::test]
+    async fn exa_request_uses_the_hosted_tool_schema() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"exa result"}]}}"#;
+        let (endpoint, _, requests) =
+            capturing_mock_server_with_delay("200 OK", body, Duration::ZERO).await;
+        let tool = WebSearch::new(vec![SearchProvider::exa(endpoint)], Duration::ZERO);
+
+        let result = tool
+            .run(
+                &ToolCtx::default(),
+                &json!({"query": "schema check", "max_results": 4}),
+            )
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["params"],
+            json!({
+                "name": "web_search_exa",
+                "arguments": {
+                    "query": "schema check",
+                    "numResults": 4,
+                },
+            })
+        );
     }
 
     #[tokio::test]
