@@ -82,13 +82,24 @@ def verify(
     targets: list[str] | None = None,
 ) -> None:
     present = checksum_assets(checksum_file.read_text(encoding="utf-8"))
+    required = expected_assets(
+        tag,
+        allow_missing_search=allow_missing_search,
+        targets=targets,
+    )
+    if allow_missing_search:
+        resolved_targets = release_targets() if targets is None else targets
+        search_assets = {
+            artifact_name("trouve-search", tag, target)
+            for target in resolved_targets
+        }
+        # Historical releases may have no search archives. Once any supported
+        # search archive exists, however, the matrix must be complete so no
+        # target silently loses its standalone updater.
+        if present & search_assets:
+            required.update(search_assets)
     missing = sorted(
-        expected_assets(
-            tag,
-            allow_missing_search=allow_missing_search,
-            targets=targets,
-        )
-        - present
+        required - present
     )
     if missing:
         raise AssetError(

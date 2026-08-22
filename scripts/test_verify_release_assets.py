@@ -69,6 +69,25 @@ class VerifyReleaseAssetsTests(unittest.TestCase):
                 targets=TARGETS,
             )
 
+    def test_backfill_rejects_partial_search_matrix(self) -> None:
+        expected = assets.expected_assets(
+            "v3.7.0", allow_missing_search=True, targets=TARGETS
+        )
+        expected.add(
+            assets.artifact_name("trouve-search", "v3.7.0", TARGETS[0])
+        )
+        missing = assets.artifact_name("trouve-search", "v3.7.0", TARGETS[1])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "SHA256SUMS"
+            path.write_text(checksums(expected), encoding="utf-8")
+            with self.assertRaisesRegex(assets.AssetError, missing):
+                assets.verify(
+                    path,
+                    "v3.7.0",
+                    allow_missing_search=True,
+                    targets=TARGETS,
+                )
+
     def test_rejects_noncanonical_tag_and_duplicate_checksum(self) -> None:
         with self.assertRaisesRegex(assets.AssetError, "canonical"):
             assets.expected_assets("release-3.7.0", targets=TARGETS)

@@ -1,10 +1,10 @@
-//! Checksummed self-updates for binaries published by the trouve release
+//! Authenticated self-updates for binaries published by the trouve release
 //! train (ADR 0042).
 //!
 //! A release is selected by its canonical `vX.Y.Z` tag and exact
 //! component/target asset. The archive is downloaded to a temporary
-//! directory, verified against the release's `SHA256SUMS`, and only then
-//! passed to the platform-aware executable replacement primitive.
+//! directory, verified against an Ed25519-signed `SHA256SUMS`, and only
+//! then passed to the platform-aware executable replacement primitive.
 
 use std::future::Future;
 use std::io::{Read, Write};
@@ -21,7 +21,9 @@ use sha2::{Digest as _, Sha256};
 
 const RELEASE_API: &str = "https://api.github.com/repos/jimsimon/trouve/releases/latest";
 const CHECKSUM_ASSET: &str = "SHA256SUMS";
+const CHECKSUM_SIGNATURE_ASSET: &str = "SHA256SUMS.sig";
 const MAX_CHECKSUM_BYTES: u64 = 1024 * 1024;
+const MAX_CHECKSUM_SIGNATURE_BYTES: u64 = 256;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = MAX_BINARY_BYTES + 64 * 1024 * 1024;
@@ -35,6 +37,7 @@ const RELEASE_ASSET_RETRY_ATTEMPTS: usize = 3;
 const AUTO_UPDATE_SUCCESS_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const AUTO_UPDATE_SUCCESS_JITTER: Duration = Duration::from_secs(60 * 60);
 const AUTO_UPDATE_FAILURE_BACKOFF: Duration = Duration::from_secs(15 * 60);
+const MAX_AUTO_UPDATE_COOLDOWN: Duration = Duration::from_secs(7 * 60 * 60);
 const MAX_AUTO_UPDATE_SCHEDULE_BYTES: u64 = 64;
 
 /// Set this to a truthy value to disable startup/background updates. Manual
@@ -49,7 +52,9 @@ pub const RELEASE_BUILD_ENV: &str = "TROUVE_RELEASE_BUILD";
 /// Whether this binary was built by the official release workflow with
 /// self-update support enabled.
 pub const fn self_update_enabled() -> bool {
-    !cfg!(debug_assertions) && option_env!("TROUVE_RELEASE_BUILD").is_some()
+    !cfg!(debug_assertions)
+        && option_env!("TROUVE_RELEASE_BUILD").is_some()
+        && option_env!("TROUVE_UPDATE_PUBLIC_KEY_HEX").is_some()
 }
 
 fn ensure_self_update_build() -> Result<()> {
@@ -228,8 +233,11 @@ pub struct Release {
     pub artifact_name: String,
     component: Component,
     checked_from: Version,
+    checked_executable: Option<PathBuf>,
+    checked_identity: Option<String>,
     artifact_url: String,
     checksum_url: String,
+    checksum_signature_url: String,
     binary_name: String,
     archive_kind: ArchiveKind,
 }
@@ -446,17 +454,14 @@ fn ensure_component_target_supported(component: Component, target: &str) -> Resu
 /// Query the latest stable release and resolve the exact artifact for this
 /// component and compile target.
 pub async fn check(component: Component, current_version: &str) -> Result<UpdateCheck> {
-    ensure_self_update_build()?;
-    let current = Version::parse(current_version)
-        .with_context(|| format!("invalid current version {current_version:?}"))?;
-    let compiled = Version::parse(env!("CARGO_PKG_VERSION"))
-        .context("the updater crate has an invalid compiled version")?;
-    if current != compiled {
-        bail!(
-            "the supplied current version {current} does not match this binary's compiled version {compiled}"
-        );
+    let baseline = InstallationBaseline::capture(current_version)?;
+    ensure_component_matches_executable(component, &baseline.executable)?;
+    let mut check = check_for_version(component, baseline.version.clone()).await?;
+    if let Some(release) = check.update.as_mut() {
+        release.checked_executable = Some(baseline.executable);
+        release.checked_identity = Some(baseline.identity);
     }
-    check_for_version(component, current).await
+    Ok(check)
 }
 
 async fn check_for_version(component: Component, current: Version) -> Result<UpdateCheck> {
@@ -610,7 +615,7 @@ pub async fn install_release_with_progress_and_cancel(
     ensure_self_update_build()?;
     validate_release_binding(release)?;
     ensure_not_cancelled(&cancellation)?;
-    let baseline = InstallationBaseline::capture(&release.checked_from.to_string())?;
+    let baseline = checked_installation_baseline(release)?;
     ensure_component_matches_executable(release.component, &baseline.executable)?;
     let lock = acquire_update_lock_at(baseline.executable.clone(), Some(Arc::clone(&cancellation)))
         .await?;
@@ -634,6 +639,18 @@ pub async fn install_release_with_progress_and_cancel(
         cancellation,
     )
     .await
+}
+
+fn checked_installation_baseline(release: &Release) -> Result<InstallationBaseline> {
+    Ok(InstallationBaseline {
+        executable: release.checked_executable.clone().ok_or_else(|| {
+            anyhow!("release is not bound to the executable checked by this process")
+        })?,
+        identity: release.checked_identity.clone().ok_or_else(|| {
+            anyhow!("release is not bound to the executable identity checked by this process")
+        })?,
+        version: release.checked_from.clone(),
+    })
 }
 
 fn validate_release_binding(release: &Release) -> Result<()> {
@@ -717,7 +734,9 @@ fn automatic_update_is_due(state_root: &Path, executable: &Path, now: u64) -> bo
         return true;
     }
     read_automatic_update_not_before(&automatic_update_schedule_path(state_root, executable))
-        .is_none_or(|not_before| now >= not_before)
+        .is_none_or(|not_before| {
+            now >= not_before || not_before.saturating_sub(now) > MAX_AUTO_UPDATE_COOLDOWN.as_secs()
+        })
 }
 
 fn read_automatic_update_not_before(path: &Path) -> Option<u64> {
@@ -1195,7 +1214,16 @@ async fn install_release_locked(
         &cancellation,
     )
     .await?;
+    let signature_text = download_text(
+        &client,
+        &release.checksum_signature_url,
+        MAX_CHECKSUM_SIGNATURE_BYTES,
+        "release checksum signature",
+        &cancellation,
+    )
+    .await?;
     ensure_not_cancelled(&cancellation)?;
+    verify_checksum_signature(&checksum_text, &signature_text)?;
     let expected = checksum_for(&checksum_text, &release.artifact_name)?;
 
     let stage = tempfile::tempdir().context("creating update staging directory")?;
@@ -1226,14 +1254,17 @@ async fn install_release_locked(
     let binary_name = release.binary_name.clone();
     let archive_kind = release.archive_kind;
     let replacement_for_extract = replacement.clone();
+    let extraction_cancellation = Arc::clone(&cancellation);
     ensure_not_cancelled(&cancellation)?;
     progress(InstallProgress::Extracting);
     tokio::task::spawn_blocking(move || {
-        extract_binary(
+        extract_binary_with_expanded_limit_and_cancel(
             &archive,
             archive_kind,
             &binary_name,
             &replacement_for_extract,
+            MAX_ARCHIVE_EXPANDED_BYTES,
+            &extraction_cancellation,
         )
     })
     .await
@@ -1346,6 +1377,7 @@ fn select_release(
     );
     let artifact_url = unique_asset_url(&release.assets, &artifact_name)?;
     let checksum_url = unique_asset_url(&release.assets, CHECKSUM_ASSET)?;
+    let checksum_signature_url = unique_asset_url(&release.assets, CHECKSUM_SIGNATURE_ASSET)?;
     Ok(UpdateCheck {
         current: current.clone(),
         latest: latest.clone(),
@@ -1355,8 +1387,11 @@ fn select_release(
             artifact_name,
             component,
             checked_from: current,
+            checked_executable: None,
+            checked_identity: None,
             artifact_url,
             checksum_url,
+            checksum_signature_url,
             binary_name: component.binary_name(target),
             archive_kind,
         }),
@@ -1400,6 +1435,32 @@ fn checksum_for(contents: &str, artifact_name: &str) -> Result<String> {
         }
     }
     found.ok_or_else(|| anyhow!("SHA256SUMS has no entry for {artifact_name}"))
+}
+
+fn verify_checksum_signature(contents: &str, signature_hex: &str) -> Result<()> {
+    let public_key_hex = option_env!("TROUVE_UPDATE_PUBLIC_KEY_HEX")
+        .ok_or_else(|| anyhow!("the official update verification key is not embedded"))?;
+    let public_key = hex::decode(public_key_hex)
+        .context("the embedded update verification key is not hexadecimal")?;
+    if public_key.len() != 32 {
+        bail!("the embedded update verification key is not 32 bytes");
+    }
+    verify_checksum_signature_with_key(contents, signature_hex, &public_key)
+}
+
+fn verify_checksum_signature_with_key(
+    contents: &str,
+    signature_hex: &str,
+    public_key: &[u8],
+) -> Result<()> {
+    let signature_hex = signature_hex.trim();
+    if signature_hex.len() != 128 || !signature_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("release checksum signature is not canonical Ed25519 hex");
+    }
+    let signature = hex::decode(signature_hex).context("decoding release checksum signature")?;
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+        .verify(contents.as_bytes(), &signature)
+        .map_err(|_| anyhow!("release checksum signature is invalid"))
 }
 
 fn client(version: &str) -> Result<reqwest::Client> {
@@ -1532,6 +1593,7 @@ async fn download_file(
     Ok(hex::encode(digest.finalize()))
 }
 
+#[cfg(test)]
 fn extract_binary(
     archive_path: &Path,
     kind: ArchiveKind,
@@ -1547,6 +1609,7 @@ fn extract_binary(
     )
 }
 
+#[cfg(test)]
 fn extract_binary_with_expanded_limit(
     archive_path: &Path,
     kind: ArchiveKind,
@@ -1554,6 +1617,25 @@ fn extract_binary_with_expanded_limit(
     destination: &Path,
     expanded_limit: u64,
 ) -> Result<()> {
+    extract_binary_with_expanded_limit_and_cancel(
+        archive_path,
+        kind,
+        binary_name,
+        destination,
+        expanded_limit,
+        &InstallCancellation::default(),
+    )
+}
+
+fn extract_binary_with_expanded_limit_and_cancel(
+    archive_path: &Path,
+    kind: ArchiveKind,
+    binary_name: &str,
+    destination: &Path,
+    expanded_limit: u64,
+    cancellation: &InstallCancellation,
+) -> Result<()> {
+    ensure_not_cancelled(cancellation)?;
     let packaged_binary = Path::new("bin").join(binary_name);
     let mut output = std::fs::File::create(destination)
         .with_context(|| format!("creating {}", destination.display()))?;
@@ -1565,6 +1647,7 @@ fn extract_binary_with_expanded_limit(
             let mut written = None;
             let mut expanded_bytes = 0_u64;
             for entry in archive.entries().context("reading update tar archive")? {
+                ensure_not_cancelled(cancellation)?;
                 let mut entry = entry.context("reading update tar entry")?;
                 expanded_bytes = add_archive_entry_size(
                     expanded_bytes,
@@ -1584,7 +1667,7 @@ fn extract_binary_with_expanded_limit(
                 if written.is_some() {
                     bail!("update archive contains duplicate {binary_name} entries");
                 }
-                written = Some(copy_limited(&mut entry, &mut output)?);
+                written = Some(copy_limited(&mut entry, &mut output, cancellation)?);
             }
             written.ok_or_else(|| anyhow!("update archive has no {binary_name}"))?
         }
@@ -1594,11 +1677,16 @@ fn extract_binary_with_expanded_limit(
             let mut archive =
                 zip::ZipArchive::new(archive_file).context("reading update zip archive")?;
             let packaged_binary = format!("bin/{binary_name}");
-            let matches = archive
-                .file_names()
-                .filter(|name| *name == binary_name || *name == packaged_binary)
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
+            let mut matches = Vec::new();
+            for index in 0..archive.len() {
+                ensure_not_cancelled(cancellation)?;
+                let entry = archive
+                    .by_index(index)
+                    .context("reading update zip entry")?;
+                if entry.name() == binary_name || entry.name() == packaged_binary {
+                    matches.push(entry.name().to_owned());
+                }
+            }
             if matches.len() != 1 {
                 bail!(
                     "update archive contains {} usable entries named {binary_name}; expected one",
@@ -1614,9 +1702,10 @@ fn extract_binary_with_expanded_limit(
             if !zip_mode_is_regular(entry.unix_mode()) {
                 bail!("update archive entry {binary_name} is not a regular file");
             }
-            copy_limited(&mut entry, &mut output)?
+            copy_limited(&mut entry, &mut output, cancellation)?
         }
     };
+    ensure_not_cancelled(cancellation)?;
     if written == 0 {
         bail!("update archive contains an empty {binary_name}");
     }
@@ -1655,9 +1744,29 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_limited(reader: &mut impl Read, writer: &mut impl Write) -> Result<u64> {
+fn copy_limited(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    cancellation: &InstallCancellation,
+) -> Result<u64> {
     let mut limited = reader.take(MAX_BINARY_BYTES + 1);
-    let written = std::io::copy(&mut limited, writer).context("extracting update binary")?;
+    let mut written = 0_u64;
+    let mut buffer = [0_u8; BINARY_COMPARE_CHUNK_BYTES];
+    loop {
+        ensure_not_cancelled(cancellation)?;
+        let read = limited
+            .read(&mut buffer)
+            .context("reading extracted update binary")?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..read])
+            .context("writing extracted update binary")?;
+        written = written
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow!("update binary byte count overflow"))?;
+    }
     if written > MAX_BINARY_BYTES {
         bail!("update binary exceeds the {MAX_BINARY_BYTES}-byte limit");
     }
@@ -1736,7 +1845,7 @@ mod tests {
         let file = std::fs::File::open(&executable).unwrap();
         assert!(linux_opened_executable_access_fallback(&file));
 
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o401)).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(!linux_opened_executable_access_fallback(&file));
     }
 
@@ -1756,6 +1865,7 @@ mod tests {
             assets: vec![
                 asset("trouve-server-v3.7.0-x86_64-unknown-linux-gnu.tar.gz"),
                 asset(CHECKSUM_ASSET),
+                asset(CHECKSUM_SIGNATURE_ASSET),
             ],
         };
         let check = select_release(
@@ -1797,6 +1907,27 @@ mod tests {
     }
 
     #[test]
+    fn newer_release_requires_a_detached_checksum_signature() {
+        let error = select_release(
+            GithubRelease {
+                tag_name: "v3.7.0".into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![
+                    asset("trouve-server-v3.7.0-x86_64-unknown-linux-gnu.tar.gz"),
+                    asset(CHECKSUM_ASSET),
+                ],
+            },
+            Component::Server,
+            Version::parse("3.6.0").unwrap(),
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(CHECKSUM_SIGNATURE_ASSET));
+        assert!(release_assets_are_pending(&error));
+    }
+
+    #[test]
     fn rejects_noncanonical_and_prerelease_channels() {
         for (tag, prerelease) in [
             ("3.7.0", false),
@@ -1835,6 +1966,22 @@ mod tests {
         assert_eq!(checksum_for(&contents, wanted).unwrap(), digest);
         assert!(checksum_for(&contents, "missing.tar.gz").is_err());
         assert!(checksum_for(&format!("not-a-hash  {wanted}"), wanted).is_err());
+    }
+
+    #[test]
+    fn checksum_signature_requires_the_embedded_key_identity() {
+        // RFC 8032 test vector 1 signs an empty message.
+        let public_key =
+            hex::decode("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+                .unwrap();
+        let signature = concat!(
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155",
+            "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        );
+        verify_checksum_signature_with_key("", signature, &public_key).unwrap();
+        let error =
+            verify_checksum_signature_with_key("tampered", signature, &public_key).unwrap_err();
+        assert!(error.to_string().contains("signature is invalid"));
     }
 
     #[test]
@@ -2160,6 +2307,36 @@ mod tests {
     }
 
     #[test]
+    fn archive_copy_checks_cancellation_between_chunks() {
+        struct CancellingReader {
+            cancellation: Arc<InstallCancellation>,
+            sent: bool,
+        }
+
+        impl Read for CancellingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent {
+                    return Ok(0);
+                }
+                buffer[0] = b'x';
+                self.sent = true;
+                assert!(self.cancellation.request_cancel());
+                Ok(1)
+            }
+        }
+
+        let cancellation = Arc::new(InstallCancellation::default());
+        let mut reader = CancellingReader {
+            cancellation: Arc::clone(&cancellation),
+            sent: false,
+        };
+        let mut output = Vec::new();
+        let error = copy_limited(&mut reader, &mut output, &cancellation).unwrap_err();
+        assert_eq!(error.to_string(), "update cancelled");
+        assert_eq!(output, b"x");
+    }
+
+    #[test]
     fn automatic_update_schedule_is_shared_by_executable_path() {
         let temp = tempfile::tempdir().unwrap();
         let state_root = temp.path().join("state");
@@ -2176,6 +2353,10 @@ mod tests {
         let schedule = automatic_update_schedule_path(&state_root, &executable);
         assert_eq!(read_automatic_update_not_before(&schedule), Some(700));
         assert_eq!(std::fs::read_dir(&state_root).unwrap().count(), 1);
+
+        let far_future = 500 + MAX_AUTO_UPDATE_COOLDOWN.as_secs() + 1;
+        record_automatic_update_not_before(&state_root, &executable, far_future).unwrap();
+        assert!(automatic_update_is_due(&state_root, &executable, 500));
     }
 
     #[test]
@@ -2230,6 +2411,34 @@ mod tests {
         assert_eq!(
             reconcile_observed_version(&baseline, "original", None).unwrap(),
             Version::parse("4.0.0").unwrap()
+        );
+    }
+
+    #[test]
+    fn interactive_release_requires_the_identity_captured_during_check() {
+        let release = select_release(
+            GithubRelease {
+                tag_name: "v3.7.0".into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![
+                    asset("trouve-server-v3.7.0-x86_64-unknown-linux-gnu.tar.gz"),
+                    asset(CHECKSUM_ASSET),
+                    asset(CHECKSUM_SIGNATURE_ASSET),
+                ],
+            },
+            Component::Server,
+            Version::parse("3.6.0").unwrap(),
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap()
+        .update
+        .unwrap();
+        let error = checked_installation_baseline(&release).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("executable checked by this process")
         );
     }
 

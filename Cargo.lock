@@ -7592,6 +7592,7 @@ dependencies = [
  "hex",
  "libc",
  "reqwest",
+ "ring",
  "rustls 0.23.42",
  "self-replace",
  "semver",

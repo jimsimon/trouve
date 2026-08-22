@@ -119,6 +119,15 @@ pub struct SleepInhibitionRequest {
     pub active: bool,
 }
 
+/// A client's desired preference snapshot paired with the exact snapshot it
+/// edited. The gateway rebases only intentional field changes onto the latest
+/// persisted state, so stale windows cannot overwrite newer unrelated edits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct HostPreferencesUpdate {
+    pub baseline: HostPreferences,
+    pub preferences: HostPreferences,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NativeNotificationRequest {
     pub notification_id: String,
@@ -186,6 +195,7 @@ struct LifecycleQuery {
         HostBootstrap,
         HostCapabilities,
         HostPreferences,
+        HostPreferencesUpdate,
         PickDirectoryResponse,
         AttachmentPayload,
         PickFilesResponse,
@@ -251,10 +261,6 @@ struct GatewayState {
     capabilities: HostCapabilities,
     font_families: Arc<[String]>,
     preferences: Arc<tokio::sync::Mutex<HostPreferences>>,
-    /// Snapshot last presented to this gateway's web client. Incoming PUTs
-    /// are full snapshots, so this baseline identifies which top-level fields
-    /// the client actually changed before merging with another process.
-    preference_baseline: Arc<tokio::sync::Mutex<HostPreferences>>,
     preference_path: Option<Arc<PathBuf>>,
     csrf_token: Arc<str>,
     protocol_upstream: Option<Url>,
@@ -365,8 +371,7 @@ impl HostGateway {
                 frontend: Arc::new(frontend.into()),
                 capabilities,
                 font_families: system_font_families(),
-                preferences: Arc::new(tokio::sync::Mutex::new(preferences.clone())),
-                preference_baseline: Arc::new(tokio::sync::Mutex::new(preferences)),
+                preferences: Arc::new(tokio::sync::Mutex::new(preferences)),
                 preference_path: None,
                 csrf_token: fresh_token().into(),
                 protocol_upstream: None,
@@ -711,7 +716,6 @@ async fn get_preferences(
 ) -> Result<Response, GatewayRejection> {
     validate_read(&state, &headers)?;
     let preferences = state.preferences.lock().await.clone();
-    *state.preference_baseline.lock().await = preferences.clone();
     let mut response = Json(preferences).into_response();
     response
         .headers_mut()
@@ -723,7 +727,7 @@ async fn get_preferences(
 #[utoipa::path(
     put,
     path = "/__trouve/host/v1/preferences",
-    request_body = HostPreferences,
+    request_body = HostPreferencesUpdate,
     responses((status = 200, body = HostPreferences), (status = 400))
 )]
 async fn put_preferences(
@@ -734,20 +738,21 @@ async fn put_preferences(
     let bytes = axum::body::to_bytes(request.into_body(), 64 * 1024)
         .await
         .map_err(|_| GatewayRejection::InvalidPreferences)?;
-    let mut preferences: HostPreferences =
+    let update: HostPreferencesUpdate =
         serde_json::from_slice(&bytes).map_err(|_| GatewayRejection::InvalidPreferences)?;
+    let client_baseline = update.baseline;
+    let mut preferences = update.preferences;
     // Serialize persistence and the in-memory replacement as one ordered
     // operation. Concurrent resize/theme writes can no longer complete out
     // of order or leave disk and memory on different versions.
     let mut current = state.preferences.lock().await;
-    let mut baseline = state.preference_baseline.lock().await;
     // Geometry is owned by the native window adapter. A web-client PUT is a
     // snapshot replacement for web-owned fields, so preserve a resize that
     // happened after the client read that snapshot.
     preferences.geometry = current.geometry.clone();
+    validate_preferences(&client_baseline).map_err(|_| GatewayRejection::InvalidPreferences)?;
     validate_preferences(&preferences).map_err(|_| GatewayRejection::InvalidPreferences)?;
     if let Some(path) = state.preference_path.clone() {
-        let client_baseline = baseline.clone();
         let incoming = preferences.clone();
         preferences = tokio::task::spawn_blocking(move || {
             merge_and_persist_preferences(&path, &client_baseline, &incoming, false)
@@ -755,10 +760,9 @@ async fn put_preferences(
         .await
         .map_err(|_| GatewayRejection::Internal)?
         .map_err(|_| GatewayRejection::Internal)?;
+    } else {
+        preferences = merge_preference_changes(&current, &client_baseline, &preferences, false);
     }
-    // Advance this client's baseline to what it submitted, while serving the
-    // merged snapshot so the frontend immediately learns concurrent changes.
-    *baseline = preferences.clone();
     *current = preferences.clone();
     let mut response = Json(preferences).into_response();
     response
@@ -2044,7 +2048,11 @@ mod tests {
             .await
             .unwrap();
         let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
-        let body = serde_json::to_vec(&HostPreferences::default()).unwrap();
+        let body = serde_json::to_vec(&HostPreferencesUpdate {
+            baseline: HostPreferences::default(),
+            preferences: HostPreferences::default(),
+        })
+        .unwrap();
 
         let rejected = app
             .clone()
@@ -3797,7 +3805,7 @@ mod tests {
             ["ready-to-merge", "drafts"]
         );
 
-        let mut updated = loaded;
+        let mut updated = loaded.clone();
         updated.appearance.theme = "colorblind-dark".into();
         updated.chat.collapse_sequential_tool_calls = false;
         updated.chat.collapse_thinking_with_tools = false;
@@ -3805,7 +3813,10 @@ mod tests {
             .put(format!("{origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &origin)
             .header(CSRF_HEADER, bootstrap.csrf_token)
-            .json(&updated)
+            .json(&HostPreferencesUpdate {
+                baseline: loaded,
+                preferences: updated,
+            })
             .send()
             .await
             .unwrap();
@@ -3963,6 +3974,7 @@ mod tests {
             .json()
             .await
             .unwrap();
+        let first_baseline = first_snapshot.clone();
         let mut second_snapshot: HostPreferences = client
             .get(format!("{second_origin}{PREFERENCES_PATH}"))
             .send()
@@ -3971,13 +3983,17 @@ mod tests {
             .json()
             .await
             .unwrap();
+        let second_baseline = second_snapshot.clone();
 
         first_snapshot.appearance.theme = "light".into();
         let first_response = client
             .put(format!("{first_origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &first_origin)
             .header(CSRF_HEADER, first_bootstrap.csrf_token)
-            .json(&first_snapshot)
+            .json(&HostPreferencesUpdate {
+                baseline: first_baseline,
+                preferences: first_snapshot,
+            })
             .send()
             .await
             .unwrap();
@@ -3993,7 +4009,10 @@ mod tests {
             .put(format!("{second_origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &second_origin)
             .header(CSRF_HEADER, &second_bootstrap.csrf_token)
-            .json(&second_snapshot)
+            .json(&HostPreferencesUpdate {
+                baseline: second_baseline,
+                preferences: second_snapshot,
+            })
             .send()
             .await
             .unwrap();
@@ -4003,15 +4022,17 @@ mod tests {
         assert_eq!(merged.navigation_width, 318.0);
 
         // HostClient rebases queued intent onto this merged response before
-        // sending it. Mirror that wire contract here; raw stale snapshots are
-        // indistinguishable from intentional reversions at the gateway.
+        // pairing it with the new baseline for the next request.
         queued_second_snapshot.appearance = merged.appearance.clone();
         queued_second_snapshot.resume = merged.resume.clone();
         let queued_response = client
             .put(format!("{second_origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &second_origin)
             .header(CSRF_HEADER, &second_bootstrap.csrf_token)
-            .json(&queued_second_snapshot)
+            .json(&HostPreferencesUpdate {
+                baseline: merged,
+                preferences: queued_second_snapshot,
+            })
             .send()
             .await
             .unwrap();
@@ -4027,6 +4048,82 @@ mod tests {
 
         first_task.abort();
         second_task.abort();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn one_gateway_rebases_each_window_against_its_own_baseline() {
+        let path = temporary_preference_path("same-gateway-window-baselines");
+        let assets = AssetManifest::new([(
+            "/index.html".into(),
+            asset("text/html", b"<html></html>", false),
+        )])
+        .unwrap();
+        let (address, server) = HostGateway::bind_loopback(
+            "127.0.0.1:0".parse().unwrap(),
+            assets,
+            HostCapabilities::desktop(),
+            HostPreferences::default(),
+            None,
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+        let task = tokio::spawn(server);
+        let client = reqwest::Client::new();
+        let origin = format!("http://{address}");
+        let bootstrap: HostBootstrap = client
+            .get(format!("{origin}{CAPABILITIES_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let first_baseline: HostPreferences = client
+            .get(format!("{origin}{PREFERENCES_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let second_baseline = first_baseline.clone();
+
+        let mut first_preferences = first_baseline.clone();
+        first_preferences.appearance.theme = "light".into();
+        let first_response = client
+            .put(format!("{origin}{PREFERENCES_PATH}"))
+            .header(ORIGIN, &origin)
+            .header(CSRF_HEADER, &bootstrap.csrf_token)
+            .json(&HostPreferencesUpdate {
+                baseline: first_baseline,
+                preferences: first_preferences,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+
+        let mut second_preferences = second_baseline.clone();
+        second_preferences.general.automatic_updates = false;
+        let second_response = client
+            .put(format!("{origin}{PREFERENCES_PATH}"))
+            .header(ORIGIN, &origin)
+            .header(CSRF_HEADER, &bootstrap.csrf_token)
+            .json(&HostPreferencesUpdate {
+                baseline: second_baseline,
+                preferences: second_preferences,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let merged: HostPreferences = second_response.json().await.unwrap();
+        assert_eq!(merged.appearance.theme, "light");
+        assert!(!merged.general.automatic_updates);
+
+        task.abort();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -4106,7 +4203,8 @@ mod tests {
             .unwrap();
         assert!(bootstrap.capabilities.window_geometry);
 
-        let mut frontend_update = preferences.snapshot().await;
+        let frontend_baseline = preferences.snapshot().await;
+        let mut frontend_update = frontend_baseline.clone();
         frontend_update.appearance.theme = "light".into();
         frontend_update.navigation_width = 318.0;
         let geometry = crate::WindowGeometry {
@@ -4127,7 +4225,10 @@ mod tests {
             .put(format!("{origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &origin)
             .header(CSRF_HEADER, bootstrap.csrf_token)
-            .json(&frontend_update)
+            .json(&HostPreferencesUpdate {
+                baseline: frontend_baseline,
+                preferences: frontend_update,
+            })
             .send()
             .await
             .unwrap();

@@ -2,7 +2,7 @@
 name = "trouve-update"
 version.workspace = true
 edition.workspace = true
-description = "Checksummed self-update support for trouve release binaries."
+description = "Authenticated self-update support for trouve release binaries."
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,7 @@ futures.workspace = true
 fs4.workspace = true
 hex.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rustls.workspace = true
 semver.workspace = true
 serde.workspace = true

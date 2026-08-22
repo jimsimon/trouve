@@ -152,6 +152,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   override disconnectedCallback(): void {
     globalThis.removeEventListener("focus", this.#refreshWebNotificationCapability);
     this.#desktopUpdateGeneration += 1;
+    this.#desktopUpdateLoading = false;
     this.#desktopUpdateActionPending = false;
     this.#stopDesktopUpdatePolling();
     super.disconnectedCallback();
@@ -200,6 +201,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
         this.#startDesktopUpdatePolling(DESKTOP_UPDATE_IDLE_POLL_MS);
       }
     } finally {
+      if (generation !== this.#desktopUpdateGeneration) return;
       this.#desktopUpdateLoading = false;
       if (this.isConnected) this.requestUpdate();
     }

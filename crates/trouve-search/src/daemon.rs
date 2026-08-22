@@ -39,7 +39,6 @@ pub fn serve_default(content: &[ContentType]) -> ExitCode {
 pub fn run_daemon(content: &[ContentType]) -> ExitCode {
     #[cfg(unix)]
     {
-        crate::cli::spawn_auto_update();
         unix::run_daemon(content)
     }
     #[cfg(not(unix))]
@@ -219,6 +218,9 @@ mod unix {
             // Another daemon already owns this socket; nothing to do.
             return ExitCode::SUCCESS;
         }
+        // Only the process that won daemon ownership needs an updater. Starting
+        // it earlier makes every contending proxy launch a redundant worker.
+        crate::cli::spawn_auto_update();
         if std::env::var_os(MANAGED_DAEMON_LOG_ENV).is_some()
             && let Err(e) = install_bounded_daemon_log(&sock)
         {

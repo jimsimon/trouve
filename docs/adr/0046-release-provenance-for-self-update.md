@@ -14,6 +14,9 @@ release selected earlier.
 
 The release matrix also publishes the Wry desktop only for glibc Linux while
 publishing standalone server and search binaries for both glibc and musl.
+In addition, a checksum downloaded beside an archive from the same mutable
+GitHub Release detects corruption but does not authenticate the publisher:
+release-write access could replace both files consistently.
 
 ## Decision
 
@@ -22,6 +25,14 @@ compile-time release marker may use self-update. Debug builds, local
 release-profile builds, and Cargo-built installations remain outside both
 automatic and manual update paths. The runtime opt-out remains a separate
 policy layered on top of this immutable build provenance.
+
+Official builds also embed the repository's Ed25519 update-verification public
+key. The release workflow signs the canonical `SHA256SUMS` bytes with the
+corresponding private key, publishes the detached signature, and refuses a
+release when the configured key pair does not match. The updater verifies that
+signature before trusting any checksum or archive. The private key is held in
+the release environment rather than in GitHub Release assets, so release-asset
+mutation alone cannot authorize executable code.
 
 An installation carries its component, checked version, eligible executable
 path, and observed executable identity from release selection through the
@@ -40,13 +51,18 @@ and search self-update retain musl support.
 - Official GitHub and npm-bundled native artifacts retain automatic and manual
   update support when installed in a user-owned location.
 - Adding a release build path requires setting the provenance marker and
-  satisfying the release-asset contract deliberately.
+  embedding the verification key while satisfying the signed release-asset
+  contract deliberately.
 - A changed executable or stale release requires a fresh process or check
   instead of guessing which version is safe to replace.
+- Compromise or accidental mutation of GitHub Release assets cannot forge a
+  valid updater manifest without the separately held signing key.
 
 ## Alternatives rejected
 
 - Inferring provenance from the Cargo profile or a writable path conflates
   local builds with distributed artifacts.
+- Trusting a checksum stored beside its archive authenticates neither file and
+  leaves automatic updates equivalent to unsigned executable downloads.
 - Publishing a musl Wry desktop would add an unsupported build target solely
   to make updater target selection appear uniform.

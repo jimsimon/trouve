@@ -10,15 +10,15 @@ fn version_requested() -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    if version_requested() {
+        println!("trouve {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if web_preview::run_update_relaunch_supervisor()? {
         return Ok(());
     }
     let update_ready_acknowledgement = web_preview::take_update_ready_acknowledgement()?;
     web_preview::wait_for_update_relaunch_gate()?;
-    if version_requested() {
-        println!("trouve {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
 
     web_preview::run(true, update_ready_acknowledgement)
 }

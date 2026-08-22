@@ -336,13 +336,26 @@ pub(crate) fn run(
                     if state.phase == trouve_desktop_host::DesktopUpdatePhase::Restarting
                         && let Some(version) = state.available_version.clone()
                     {
-                        match pending_update_relaunch.prepare(&update_executable, &version) {
-                            Ok(()) => {
+                        let relaunch_version = version.clone();
+                        let relaunch = tokio::task::spawn_blocking(move || {
+                            pending_update_relaunch
+                                .prepare(&update_executable, &relaunch_version)
+                        })
+                        .await;
+                        match relaunch {
+                            Ok(Ok(())) => {
                                 let _ = quit_proxy.send_event(AppEvent::QuitNow);
                             }
-                            Err(error) => {
+                            Ok(Err(error)) => {
                                 tracing::error!(%error, %version, "preparing restart after desktop update failed");
                                 state = updates.restart_failed(&version, &format!("{error:#}"));
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, %version, "desktop update relaunch worker was interrupted");
+                                state = updates.restart_failed(
+                                    &version,
+                                    &format!("relaunch worker was interrupted: {error}"),
+                                );
                             }
                         }
                     }

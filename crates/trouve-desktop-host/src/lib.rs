@@ -30,7 +30,7 @@ use utoipa::ToSchema;
 ///
 /// This is not the Trouve HTTP protocol version. Increment it only when the
 /// native capability request/response schema changes.
-pub const DESKTOP_BRIDGE_VERSION: u16 = 14;
+pub const DESKTOP_BRIDGE_VERSION: u16 = 15;
 
 /// Runtime desktop build selected by development and qualification hosts.
 pub const APP_UI_DIST_ENV: &str = "TROUVE_APP_UI_DIST";

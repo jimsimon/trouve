@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "14"
+    "version": "15"
   },
   "paths": {
     "/__trouve/host/v1/capabilities": {
@@ -328,7 +328,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/HostPreferences"
+                "$ref": "#/components/schemas/HostPreferencesUpdate"
               }
             }
           },
@@ -1085,6 +1085,22 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "HostPreferencesUpdate": {
+        "type": "object",
+        "description": "A client's desired preference snapshot paired with the exact snapshot it\nedited. The gateway rebases only intentional field changes onto the latest\npersisted state, so stale windows cannot overwrite newer unrelated edits.",
+        "required": [
+          "baseline",
+          "preferences"
+        ],
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/HostPreferences"
+          },
+          "preferences": {
+            "$ref": "#/components/schemas/HostPreferences"
           }
         }
       },

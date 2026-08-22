@@ -458,6 +458,15 @@ export interface components {
             resume?: components["schemas"]["ResumePreferences"];
             workspace_order?: string[];
         };
+        /**
+         * @description A client's desired preference snapshot paired with the exact snapshot it
+         *     edited. The gateway rebases only intentional field changes onto the latest
+         *     persisted state, so stale windows cannot overwrite newer unrelated edits.
+         */
+        HostPreferencesUpdate: {
+            baseline: components["schemas"]["HostPreferences"];
+            preferences: components["schemas"]["HostPreferences"];
+        };
         /** @enum {string} */
         LocalFileAction: "open" | "reveal";
         LocalFileActionRequest: {
@@ -958,7 +967,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["HostPreferences"];
+                "application/json": components["schemas"]["HostPreferencesUpdate"];
             };
         };
         responses: {

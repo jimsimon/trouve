@@ -19,7 +19,7 @@ import {
 import type { HostPreferences } from "./host-client.js";
 
 const validCapabilities = {
-  bridge_version: 14,
+  bridge_version: 15,
   clipboard_image: true,
   close_confirmation: true,
   directory_picker: true,
@@ -79,7 +79,7 @@ describe("HostClient", () => {
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await expect(client.bootstrap()).resolves.toMatchObject({
       kind: "desktop",
-      bridgeVersion: 14,
+      bridgeVersion: 15,
       directoryPicker: true,
       lifecycleEvents: true,
       selfUpdate: true,
@@ -175,6 +175,38 @@ describe("HostClient", () => {
     expect(requests.at(-1)?.headers.get("x-trouve-host-csrf")).toBe("u".repeat(64));
   });
 
+  it("aborts a desktop update request that exceeds its deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        if (request.url.endsWith("/capabilities")) {
+          return Response.json({
+            capabilities: validCapabilities,
+            csrf_token: "t".repeat(64),
+          });
+        }
+        return await new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener(
+            "abort",
+            () => reject(request.signal.reason),
+            { once: true },
+          );
+        });
+      });
+      const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+      await client.bootstrap();
+
+      const assertion = expect(client.getDesktopUpdate()).rejects.toMatchObject({
+        kind: "request-failed",
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("gates close acknowledgement on the independently versioned bridge", async () => {
     const legacyRequests: Request[] = [];
     const legacyFetch = vi.fn<typeof fetch>(async (input) => {
@@ -223,14 +255,18 @@ describe("HostClient", () => {
       if (request.url.endsWith("/capabilities")) {
         return Response.json({ capabilities: validCapabilities, csrf_token: "c".repeat(64) });
       }
+      if (request.method === "GET") return Response.json(preferences);
       writes += 1;
       if (writes === 1) await firstBlocked;
-      const value = await request.clone().json() as HostPreferences;
+      const { preferences: value } = await request.clone().json() as {
+        preferences: HostPreferences;
+      };
       writtenPreferences.push(value);
       return Response.json(value);
     });
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await client.bootstrap();
+    await client.getPreferences();
 
     const first = client.putPreferences(preferences);
     const second = client.putPreferences({
@@ -268,8 +304,11 @@ describe("HostClient", () => {
       if (request.url.endsWith("/capabilities")) {
         return Response.json({ capabilities: validCapabilities, csrf_token: "r".repeat(64) });
       }
+      if (request.method === "GET") return Response.json(preferences);
       writes += 1;
-      const value = await request.clone().json() as HostPreferences;
+      const { preferences: value } = await request.clone().json() as {
+        preferences: HostPreferences;
+      };
       written.push(value);
       if (writes === 1) {
         await firstBlocked;
@@ -286,6 +325,7 @@ describe("HostClient", () => {
     });
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await client.bootstrap();
+    await client.getPreferences();
 
     const first = client.putPreferences(preferences);
     const queued = client.putPreferences({
@@ -321,6 +361,7 @@ describe("HostClient", () => {
     });
     const written: HostPreferences[] = [];
     let putCount = 0;
+    let getCount = 0;
     const latest: HostPreferences = {
       ...preferences,
       appearance: { ...preferences.appearance, font_size: 17 },
@@ -330,9 +371,14 @@ describe("HostClient", () => {
       if (request.url.endsWith("/capabilities")) {
         return Response.json({ capabilities: validCapabilities, csrf_token: "f".repeat(64) });
       }
-      if (request.method === "GET") return Response.json(latest);
+      if (request.method === "GET") {
+        getCount += 1;
+        return Response.json(getCount === 1 ? preferences : latest);
+      }
       putCount += 1;
-      const value = await request.clone().json() as HostPreferences;
+      const { preferences: value } = await request.clone().json() as {
+        preferences: HostPreferences;
+      };
       written.push(value);
       if (putCount === 1) {
         await firstBlocked;
@@ -342,6 +388,7 @@ describe("HostClient", () => {
     });
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await client.bootstrap();
+    await client.getPreferences();
 
     const first = client.putPreferences(preferences);
     const queued = client.putPreferences({ ...preferences, navigation_width: 333 });

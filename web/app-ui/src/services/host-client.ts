@@ -50,6 +50,7 @@ type PickFilesResponseWire = HostComponents["schemas"]["PickFilesResponse"];
 type ReadClipboardImageResponseWire =
   HostComponents["schemas"]["ReadClipboardImageResponse"];
 export type HostPreferences = HostComponents["schemas"]["HostPreferences"];
+type HostPreferencesUpdate = HostComponents["schemas"]["HostPreferencesUpdate"];
 export type HostCloseDecision = HostComponents["schemas"]["CloseDecision"];
 export type HostLocalFileAction = HostComponents["schemas"]["LocalFileAction"];
 
@@ -259,6 +260,23 @@ const normalizeDesktopUpdateState = (
   progressPercent: wire.progress_percent ?? undefined,
 });
 
+const DESKTOP_UPDATE_REQUEST_TIMEOUT_MS = 30_000;
+
+const withDesktopUpdateDeadline = async <T>(
+  request: (signal: AbortSignal) => Promise<T>,
+): Promise<T> => {
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(
+    () => controller.abort(),
+    DESKTOP_UPDATE_REQUEST_TIMEOUT_MS,
+  );
+  try {
+    return await request(controller.signal);
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
+};
+
 const samePreferenceValue = (left: unknown, right: unknown): boolean =>
   JSON.stringify(left) === JSON.stringify(right);
 
@@ -452,6 +470,7 @@ export class HostClient {
   readonly #notificationActivations = new Map<string, () => void>();
   #preferenceWriteRunning = false;
   #pendingPreferenceWrite: PendingPreferenceWrite | undefined;
+  #preferenceBaseline: HostPreferences | undefined;
 
   constructor(baseUrl: string, fetchImplementation: typeof fetch = globalThis.fetch) {
     this.#client = createClient<HostPaths>({ baseUrl, fetch: fetchImplementation });
@@ -863,7 +882,9 @@ export class HostClient {
     );
     let result;
     try {
-      result = await this.#client.GET(HOST_DESKTOP_UPDATE_PATH);
+      result = await withDesktopUpdateDeadline((signal) =>
+        this.#client.GET(HOST_DESKTOP_UPDATE_PATH, { signal })
+      );
     } catch {
       throw new HostClientError("request-failed", "desktop update status failed");
     }
@@ -902,13 +923,17 @@ export class HostClient {
     );
     let result;
     try {
-      result = path === HOST_DESKTOP_UPDATE_CHECK_PATH
-        ? await this.#client.POST(HOST_DESKTOP_UPDATE_CHECK_PATH, {
-            headers: { [CSRF_HEADER]: csrfToken },
-          })
-        : await this.#client.POST(HOST_DESKTOP_UPDATE_INSTALL_PATH, {
-            headers: { [CSRF_HEADER]: csrfToken },
-          });
+      result = await withDesktopUpdateDeadline((signal) =>
+        path === HOST_DESKTOP_UPDATE_CHECK_PATH
+          ? this.#client.POST(HOST_DESKTOP_UPDATE_CHECK_PATH, {
+              headers: { [CSRF_HEADER]: csrfToken },
+              signal,
+            })
+          : this.#client.POST(HOST_DESKTOP_UPDATE_INSTALL_PATH, {
+              headers: { [CSRF_HEADER]: csrfToken },
+              signal,
+            })
+      );
     } catch {
       throw new HostClientError("request-failed", failureMessage);
     }
@@ -936,7 +961,9 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop preferences request failed");
     }
-    return validate<HostPreferences>("HostPreferences", result.data);
+    const preferences = validate<HostPreferences>("HostPreferences", result.data);
+    this.#preferenceBaseline = preferences;
+    return preferences;
   }
 
   putPreferences(preferences: HostPreferences): Promise<HostPreferences> {
@@ -1009,10 +1036,12 @@ export class HostClient {
         "desktop host must bootstrap before preference writes",
       );
     }
+    const baseline = this.#preferenceBaseline ?? await this.getPreferences();
+    const update: HostPreferencesUpdate = { baseline, preferences };
     let result;
     try {
       result = await this.#client.PUT(HOST_PREFERENCES_PATH, {
-        body: preferences,
+        body: update,
         headers: { [CSRF_HEADER]: this.#csrfToken },
       });
     } catch {
@@ -1021,7 +1050,9 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop preference update failed");
     }
-    return validate<HostPreferences>("HostPreferences", result.data);
+    const saved = validate<HostPreferences>("HostPreferences", result.data);
+    this.#preferenceBaseline = saved;
+    return saved;
   }
 
   mutationHeaders(): Readonly<Record<string, string>> {
