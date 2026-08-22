@@ -69,6 +69,10 @@ const SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(1)
 /// Repository identity changes rarely, but Git remotes remain mutable outside
 /// trouve. Revalidate periodically without spawning Git on every list poll.
 const WORKSPACE_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Repository identity is presentation metadata. Fall back to workspace
+/// identity instead of allowing a hostile or unhealthy Git probe to stall a
+/// workspace-list request indefinitely.
+const WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
 const PR_VERIFICATION_FAILURE_AUTH: &str = "authentication";
 const PR_VERIFICATION_FAILURE_CONTENTION: &str = "contention";
 const PR_VERIFICATION_FAILURE_EVIDENCE: &str = "evidence";
@@ -1888,6 +1892,9 @@ pub struct Engine {
     /// Cache repository identity so frequent workspace-list polls normally
     /// avoid Git while still observing external remote changes within a bound.
     workspace_list_cache: Mutex<HashMap<String, WorkspaceListCacheEntry>>,
+    /// Deduplicate expired repository-identity probes per workspace. Entries
+    /// are weak so closed or inactive workspaces do not grow this registry.
+    workspace_list_refresh_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute newly released or account-specific live models.
@@ -2331,6 +2338,7 @@ impl Engine {
             data_dir,
             config_dir,
             workspace_list_cache: Mutex::new(HashMap::new()),
+            workspace_list_refresh_locks: Mutex::new(HashMap::new()),
             model_catalog,
             providers: RwLock::new(providers),
             injected_providers: Mutex::new(injected_providers),
@@ -7324,8 +7332,12 @@ impl Engine {
 
     fn resolve_workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
         let repository = Path::new(&workspace.path);
-        let remote_identity = git::remote_url(repository, "origin")
-            .and_then(|remote| crate::github::parse_remote(&remote));
+        let (remote_url, common_directory) = git::workspace_repository_sources(
+            repository,
+            "origin",
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
+        let remote_identity = remote_url.and_then(|remote| crate::github::parse_remote(&remote));
         let (repository_key, repository_name) = if let Some((host, owner, name)) = remote_identity {
             (
                 format!(
@@ -7338,8 +7350,7 @@ impl Engine {
             )
         } else {
             (
-                git::common_directory(repository)
-                    .ok()
+                common_directory
                     .map(|directory| format!("local:{}", directory.to_string_lossy()))
                     .unwrap_or_else(|| format!("workspace:{}", workspace.id)),
                 workspace.name.clone(),
@@ -7354,8 +7365,18 @@ impl Engine {
         }
     }
 
-    fn refresh_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
-        let item = Self::resolve_workspace_list_item(workspace);
+    fn workspace_list_refresh_lock(&self, workspace_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.workspace_list_refresh_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(workspace_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(workspace_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn cache_workspace_list_item(&self, item: WorkspaceListItem) -> WorkspaceListItem {
         self.workspace_list_cache.lock().unwrap().insert(
             item.id.clone(),
             WorkspaceListCacheEntry {
@@ -7366,7 +7387,21 @@ impl Engine {
         item
     }
 
+    fn refresh_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        self.cache_workspace_list_item(Self::resolve_workspace_list_item(workspace))
+    }
+
     fn cached_workspace_list_item(&self, workspace: Workspace) -> WorkspaceListItem {
+        self.cached_workspace_list_item_with(workspace, Self::resolve_workspace_list_item)
+    }
+
+    fn cached_workspace_list_item_with(
+        &self,
+        workspace: Workspace,
+        resolve: impl FnOnce(Workspace) -> WorkspaceListItem,
+    ) -> WorkspaceListItem {
         let cached = self
             .workspace_list_cache
             .lock()
@@ -7374,7 +7409,23 @@ impl Engine {
             .get(&workspace.id)
             .filter(|entry| entry.refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL)
             .map(|entry| entry.item.clone());
-        cached.unwrap_or_else(|| self.refresh_workspace_list_item(workspace))
+        if let Some(cached) = cached {
+            return cached;
+        }
+
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        if let Some(cached) = self
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get(&workspace.id)
+            .filter(|entry| entry.refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL)
+            .map(|entry| entry.item.clone())
+        {
+            return cached;
+        }
+        self.cache_workspace_list_item(resolve(workspace))
     }
 
     pub fn register_workspace(
@@ -21795,6 +21846,55 @@ default_permission_mode = "ask"
                 .and_then(|workspace| workspace.repository_name.as_deref()),
             Some("Other")
         );
+    }
+
+    #[test]
+    fn workspace_list_identity_refresh_is_single_flight_per_workspace() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = Workspace {
+            id: "ws_single_flight".into(),
+            name: "single flight".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles = (0..2)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let workspace = workspace.clone();
+                let start = Arc::clone(&start);
+                let resolutions = Arc::clone(&resolutions);
+                std::thread::spawn(move || {
+                    start.wait();
+                    engine.cached_workspace_list_item_with(workspace, move |workspace| {
+                        resolutions.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        WorkspaceListItem {
+                            id: workspace.id,
+                            name: workspace.name,
+                            path: workspace.path,
+                            repository_key: Some("remote:github.com/acme/widgets".into()),
+                            repository_name: Some("widgets".into()),
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let items = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert!(items.iter().all(|item| {
+            item.repository_key.as_deref() == Some("remote:github.com/acme/widgets")
+        }));
     }
 
     #[test]

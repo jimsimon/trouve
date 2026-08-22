@@ -340,6 +340,12 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
 });
 
 test("session navigation shows configured branch names", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "trouve.workspace-list-preferences.v1",
+      JSON.stringify({ showStatus: false }),
+    );
+  });
   await page.goto("/");
   if (testInfo.project.name.startsWith("mobile")) {
     await page.getByRole("button", { name: "Sessions", exact: true }).click();
@@ -354,6 +360,10 @@ test("session navigation shows configured branch names", async ({ page }, testIn
   const age = row.locator(".session-age");
   const actions = wrapper.getByRole("button", { name: "Actions for Protocol ingress" });
   await expect(age).toHaveText(/^(?:now|\d+[mhdy])$/u);
+  await expect(row).toHaveClass(/without-status/u);
+  await expect(age).toHaveCSS("grid-column-start", "3");
+  expect(await row.evaluate((element) =>
+    getComputedStyle(element).gridTemplateColumns.split(" ").length)).toBe(3);
   if (testInfo.project.name.startsWith("mobile")) {
     await expect(age).toHaveCSS("opacity", "0");
     await expect(actions).toHaveCSS("opacity", "1");

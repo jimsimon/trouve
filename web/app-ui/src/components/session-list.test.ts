@@ -1,11 +1,28 @@
 import { readFileSync } from "node:fs";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type { AppStore, SessionListItem } from "../state/app-store.js";
 import {
   sessionIndicatorPresentation,
   type SessionIndicatorFields,
 } from "../state/session-indicator-model.js";
+import { enrichWorkspaceSessions } from "./session-list.js";
+
+const session = (id: string, workspaceId: string): SessionListItem => ({
+  id,
+  workspaceId,
+  title: id,
+  branch: "main",
+  archived: false,
+  active: false,
+  attention: "none",
+  outcome: "idle",
+  latestThreadId: undefined,
+  updatedAt: "2026-08-22T00:00:00Z",
+  state: "idle",
+  unread: false,
+});
 
 describe("session list component contract", () => {
   const read = (path: string): string =>
@@ -13,6 +30,27 @@ describe("session list component contract", () => {
   const component = read("./session-list.ts");
   const shell = read("../app/trouve-app.ts");
   const styles = read("../styles/app.css");
+
+  it("filters by workspace before deriving metadata and pull-request state", () => {
+    const sessionMetadata = vi.fn(() => undefined);
+    const sessionPullRequests = vi.fn(() => []);
+    const store = {
+      sessionMetadata,
+      sessionPullRequests,
+    } as unknown as Pick<AppStore, "sessionMetadata" | "sessionPullRequests">;
+
+    const enriched = enrichWorkspaceSessions(
+      store,
+      [session("se_first", "ws_first"), session("se_second", "ws_second")],
+      "ws_first",
+    );
+
+    expect(enriched.map(({ id }) => id)).toEqual(["se_first"]);
+    expect(sessionMetadata).toHaveBeenCalledOnce();
+    expect(sessionMetadata).toHaveBeenCalledWith("se_first");
+    expect(sessionPullRequests).toHaveBeenCalledOnce();
+    expect(sessionPullRequests).toHaveBeenCalledWith("se_first");
+  });
 
   it("renders archived sessions as a separate accessible disclosure", () => {
     expect(component).toContain("organizeWorkspaceSessions(organizedSessions");
