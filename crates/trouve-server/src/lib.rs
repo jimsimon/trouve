@@ -225,6 +225,7 @@ impl IntoResponse for ApiError {
         cancel_code_review_job,
         retry_code_review_job,
         retry_code_review_persona,
+        retry_code_review_final_editor,
         code_review_stats,
         configure_github_review_app,
         update_code_review_repository,
@@ -671,6 +672,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/code-review/jobs/{id}/reviewers/{reviewer_id}/retry",
             post(retry_code_review_persona),
+        )
+        .route(
+            "/v1/code-review/jobs/{id}/final-editor/retry",
+            post(retry_code_review_final_editor),
         )
         .route("/v1/code-review/requests", post(request_code_review))
         .route("/v1/code-review/stats", get(code_review_stats))
@@ -1124,6 +1129,16 @@ async fn retry_code_review_persona(
     Path((id, reviewer_id)): Path<(String, String)>,
 ) -> Result<Json<CodeReviewJob>, ApiError> {
     Ok(Json(engine.retry_review_persona(&id, &reviewer_id).await?))
+}
+
+#[utoipa::path(post, path = "/v1/code-review/jobs/{id}/final-editor/retry",
+    params(("id" = String, Path, description = "Review job id")),
+    responses((status = 200, body = CodeReviewJob), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn retry_code_review_final_editor(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<CodeReviewJob>, ApiError> {
+    Ok(Json(engine.retry_review_final_editor(&id).await?))
 }
 
 #[utoipa::path(get, path = "/v1/code-review/stats",

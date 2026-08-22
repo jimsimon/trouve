@@ -84,11 +84,16 @@ import {
 } from "./chat-layout.js";
 import {
   presentToolCall,
-  runningActivityLabel,
   toolDetailText,
   toolExecutionMetadata,
   type ToolPresentation,
 } from "./tool-presentation.js";
+import {
+  runningAgentActivity,
+  type AgentActivityPresentation,
+  type RunningAgentActivityInput,
+} from "./agent-activity-model.js";
+import "./agent-activity.js";
 import {
   applyComposerCompletion,
   composerCompletionToken,
@@ -188,7 +193,7 @@ type VirtualChatItem = VirtualItem & (
   | { readonly kind: "unit"; readonly unitIndex: number }
   | { readonly kind: "optimistic-prompt" }
   | { readonly kind: "compacting" }
-  | { readonly kind: "activity"; readonly label: string }
+  | { readonly kind: "activity"; readonly presentation: AgentActivityPresentation }
   | { readonly kind: "edge-spacer"; readonly edge: "start" }
 );
 
@@ -1852,6 +1857,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         view?.compacting ?? false,
         turnLabels,
         view?.turnModels ?? new Map<number, string>(),
+        view?.turnStartedAt ?? new Map<number, string>(),
         view?.turnDurationMs ?? new Map<number, number>(),
         turnControls.activityLabel
           ?? (view?.turnPhase === "connecting_tools" ? "Connecting tools…" : undefined),
@@ -2486,6 +2492,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     compacting: boolean,
     turnLabels: ReadonlyMap<number, string>,
     turnModels: ReadonlyMap<number, string>,
+    turnStartedAt: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     activityOverride: string | undefined,
     hasOlder: boolean,
@@ -2496,26 +2503,33 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const chatFindMatchIds = new Set(this.#chatFindUnitIds);
     const activeChatFindUnitId = this.#activeChatFindUnitId();
     let activeTurn: number | undefined;
-    let waitingForCapacity = false;
     for (const [turn, state] of presentation.turnStates) {
       if (
         (state.kind === "waiting-for-capacity" || state.kind === "running")
         && (activeTurn === undefined || turn > activeTurn)
       ) {
         activeTurn = turn;
-        waitingForCapacity = state.kind === "waiting-for-capacity";
       }
     }
-    const activityLabel = activityOverride
-      ?? (
-        turnRunning
-          ? waitingForCapacity
-            ? "Waiting for model capacity…"
-            : runningActivityLabel(items, thinking)
-          : undefined
-      );
+    const activityInput: RunningAgentActivityInput = {
+      items,
+      turnRunning,
+      thinking,
+      compacting,
+      turnModels,
+      turnStartedAt,
+      nowMs: Date.now(),
+    };
+    const liveActivityInput = activityOverride === undefined ? activityInput : undefined;
+    const activityPresentation = activityOverride === undefined
+      ? runningAgentActivity(activityInput)
+      : {
+          label: activityOverride,
+          detail: "",
+          announcementLabel: activityOverride,
+        };
     let nestedActivityUnitId: string | undefined;
-    if (activityLabel !== undefined && activeTurn !== undefined) {
+    if (activityPresentation !== undefined && activeTurn !== undefined) {
       for (let index = layout.units.length - 1; index >= 0; index -= 1) {
         const unit = layout.units[index];
         if (
@@ -2565,12 +2579,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         estimatedHeight: 32,
       });
     }
-    if (activityLabel !== undefined && nestedActivityUnitId === undefined) {
+    if (activityPresentation !== undefined && nestedActivityUnitId === undefined) {
       virtualItems.push({
         id: "ephemeral:activity",
         kind: "activity",
-        label: activityLabel,
-        estimatedHeight: 32,
+        presentation: activityPresentation,
+        estimatedHeight: activityPresentation.detail === "" ? 32 : 48,
       });
     }
     if (virtualItems.length > 0) {
@@ -2654,7 +2668,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               }
               if (item.kind === "activity") {
                 return html`<div data-virtual-id=${item.id} style=${style}>
-                  ${this.#renderActivityRow(item.label)}
+                  ${this.#renderActivityRow(item.presentation, liveActivityInput)}
                 </div>`;
               }
               const unit = layout.units[item.unitIndex];
@@ -2675,7 +2689,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     turnModels,
                     turnDurationMs,
                     presentation,
-                    unit.id === nestedActivityUnitId ? activityLabel : undefined,
+                    unit.id === nestedActivityUnitId ? activityPresentation : undefined,
+                    unit.id === nestedActivityUnitId ? liveActivityInput : undefined,
                     effectiveTurnRunning,
                     item.unitIndex === layout.units.length - 1,
                   )}</div>`;
@@ -2702,7 +2717,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
-    activityLabel: string | undefined,
+    activityPresentation: AgentActivityPresentation | undefined,
+    activityInput: RunningAgentActivityInput | undefined,
     checkpointRestoreDisabled: boolean,
     finalUnit: boolean,
   ) {
@@ -2721,7 +2737,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         turnModels,
         turnDurationMs,
         presentation,
-        activityLabel,
+        activityPresentation,
+        activityInput,
       )}
       ${finalUnit && trailingBoundary !== undefined
         ? this.#renderCheckpointRule(trailingBoundary, checkpointRestoreDisabled)
@@ -2866,7 +2883,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
-    activityLabel: string | undefined,
+    activityPresentation: AgentActivityPresentation | undefined,
+    activityInput: RunningAgentActivityInput | undefined,
   ) {
     this.#ensureMarkdown();
     const assistantItems = unit.items.filter(
@@ -2956,9 +2974,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 unit,
                 presentation,
               )}
-              ${activityLabel === undefined
+              ${activityPresentation === undefined
                 ? nothing
-                : this.#renderTransientActivityNode(activityLabel)}
+                : this.#renderTransientActivityNode(activityPresentation, activityInput)}
               ${unit.status === undefined
                 ? nothing
                 : this.#renderTerminalTurnState(unit.status)}
@@ -3084,28 +3102,37 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     </span>`;
   }
 
-  #renderActivityRow(label: string) {
-    return html`<p class="activity-row agent-activity" role="status">
+  #renderActivityRow(
+    activity: AgentActivityPresentation,
+    activityInput: RunningAgentActivityInput | undefined,
+  ) {
+    return html`<div class="activity-row agent-activity">
       <span class="activity-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-      <span>${label}</span>
-    </p>`;
+      <trouve-agent-activity
+        .presentation=${activity}
+        .input=${activityInput}
+        variant="row"
+      ></trouve-agent-activity>
+    </div>`;
   }
 
-  #renderTransientActivityNode(label: string) {
+  #renderTransientActivityNode(
+    activity: AgentActivityPresentation,
+    activityInput: RunningAgentActivityInput | undefined,
+  ) {
     return html`
-      <section
-        class="turn-rail-node turn-transient-activity"
-        role="status"
-        aria-live="polite"
-        aria-label=${label}
-      >
+      <section class="turn-rail-node turn-transient-activity">
         <span class="turn-rail-marker transient" aria-hidden="true">
           ${fontAwesomeIcon("spinner", {
             className: "turn-transient-spinner",
             spin: true,
           })}
         </span>
-        <header class="turn-node-header"><strong>${label}</strong></header>
+        <trouve-agent-activity
+          .presentation=${activity}
+          .input=${activityInput}
+          variant="transient"
+        ></trouve-agent-activity>
       </section>
     `;
   }
