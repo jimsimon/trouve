@@ -28,6 +28,7 @@ const DEFAULT_LOGIN_POLL_MS = 1_000;
 const DEFAULT_LOGIN_POLL_ATTEMPTS = 180;
 const PRESETS_ERROR = "Provider presets unavailable. Retrying.";
 const USAGE_ERROR = "Subscription usage unavailable.";
+const PROVIDERS_ERROR = "Provider settings unavailable. Retrying.";
 export const validatedHttpsUrl = (value: string): string | undefined => {
   try {
     const url = new URL(value);
@@ -889,11 +890,9 @@ export class TrouveProviderSettings extends LitElement {
     this.#loading = false;
     if (providers.status === "fulfilled") this.#providers = providers.value;
     if (providers.status === "rejected") {
-      this.#setNotice("Provider settings could not be loaded. Retrying automatically.", true);
+      this.#setNotice(PROVIDERS_ERROR, true);
       this.#scheduleRetry();
-    } else if (
-      this.#notice === "Provider settings could not be loaded. Retrying automatically."
-    ) {
+    } else if (this.#notice === PROVIDERS_ERROR) {
       this.#setNotice("", false);
     }
     this.requestUpdate();

@@ -6,6 +6,84 @@
 
 use super::*;
 
+/// Real adapters bound their own cancellation acknowledgement. This outer
+/// deadline also protects the dispatcher from injected/custom backends that
+/// violate `BackendTurn`'s cleanup contract.
+#[cfg(not(test))]
+const BACKEND_CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const BACKEND_CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Drain a cancelled backend through its cleanup acknowledgement. A backend
+/// that misses the deadline is detached from the turn's scheduler resources,
+/// but the session mutation lane stays fenced until its stream really closes.
+async fn drain_or_quarantine_backend(
+    mut stream: trouve_agents::BackendEventStream,
+    mutation_lane: Arc<tokio::sync::RwLock<()>>,
+    mutation_permits: Vec<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    backend_id: String,
+    thread_id: String,
+) -> bool {
+    if tokio::time::timeout(BACKEND_CANCEL_CLEANUP_TIMEOUT, async {
+        while stream.next().await.is_some() {}
+    })
+    .await
+    .is_ok()
+    {
+        return false;
+    }
+
+    tracing::warn!(
+        backend_id,
+        thread_id,
+        timeout_ms = BACKEND_CANCEL_CLEANUP_TIMEOUT.as_millis(),
+        "backend cancellation cleanup timed out; quarantining the session mutation lane"
+    );
+    if mutation_permits.is_empty() {
+        // Queue an exclusive waiter before the route returns. Tokio's fair
+        // RwLock then keeps every later tool access behind the quarantine even
+        // if another in-flight bridge tool owns the lane at this instant.
+        let (fenced, fenced_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            use std::future::Future as _;
+
+            let mut acquisition = Box::pin(mutation_lane.write_owned());
+            let first_poll = futures::future::poll_fn(|context| {
+                std::task::Poll::Ready(match acquisition.as_mut().poll(context) {
+                    std::task::Poll::Ready(permit) => Some(permit),
+                    std::task::Poll::Pending => None,
+                })
+            })
+            .await;
+            let _ = fenced.send(());
+            let _mutation_permit = match first_poll {
+                Some(permit) => permit,
+                None => acquisition.await,
+            };
+            while stream.next().await.is_some() {}
+            tracing::warn!(
+                backend_id,
+                thread_id,
+                "late backend cancellation cleanup completed; session lane released"
+            );
+        });
+        fenced_rx
+            .await
+            .expect("backend cleanup quarantine must fence the mutation lane before returning");
+    } else {
+        tokio::spawn(async move {
+            let _mutation_permits = mutation_permits;
+            while stream.next().await.is_some() {}
+            tracing::warn!(
+                backend_id,
+                thread_id,
+                "late backend cancellation cleanup completed; session lane released"
+            );
+        });
+    }
+    true
+}
+
 pub(super) fn unfinished_collaborator_reason(
     cancelled: bool,
     attempt_error: Option<&anyhow::Error>,
@@ -1118,7 +1196,7 @@ impl Engine {
                 )));
             }
         };
-        if startup_activity.is_some() {
+        let post_start_persistence_error = if startup_activity.is_some() {
             self.store
                 .append_event_async(
                     scope.clone(),
@@ -1127,8 +1205,11 @@ impl Engine {
                         phase: TurnPhase::Processing,
                     },
                 )
-                .await?;
-        }
+                .await
+                .err()
+        } else {
+            None
+        };
 
         let mut text = String::new();
         let mut segment = String::new();
@@ -1156,6 +1237,9 @@ impl Engine {
         let mut persisted = Vec::new();
         let mut persist_deadline = None;
         let event_loop_result: Result<()> = async {
+          if let Some(error) = post_start_persistence_error {
+              return Err(error);
+          }
           loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
             let input = tokio::select! {
@@ -1762,14 +1846,46 @@ impl Engine {
         .await;
         if abort_backend {
             attempt_cancel.cancel();
-            // BackendTurn's contract keeps the producer alive until process
-            // cleanup is acknowledged. Drain the bounded output to observe
-            // that producer completion before releasing mutation ownership
-            // or allowing another route to touch the same worktree.
-            while stream.next().await.is_some() {}
+            let mut mutation_permits = backend_mutation_permits
+                .drain()
+                .map(|(_, permit)| permit)
+                .collect::<Vec<_>>();
+            for collaborator in collaborators.values_mut() {
+                mutation_permits.extend(
+                    collaborator
+                        .mutation_permits
+                        .drain()
+                        .map(|(_, permit)| permit),
+                );
+            }
+            if drain_or_quarantine_backend(
+                stream,
+                self.tool_execution_lock(&session.id),
+                mutation_permits,
+                backend_id.clone(),
+                thread.id.clone(),
+            )
+            .await
+            {
+                let trigger = attempt_error
+                    .as_ref()
+                    .map(|error| format!("event processing failure: {error:#}"))
+                    .or_else(|| {
+                        backend_error
+                            .as_ref()
+                            .map(|error| format!("backend failure: {error}"))
+                    })
+                    .unwrap_or_else(|| "turn cancellation".into());
+                attempt_error = Some(anyhow!(
+                    "backend {backend_id} cleanup did not finish within {} ms after {trigger}; \
+                     session mutations are quarantined until cleanup completes",
+                    BACKEND_CANCEL_CLEANUP_TIMEOUT.as_millis()
+                ));
+            }
+        } else {
+            drop(stream);
+            backend_mutation_permits.clear();
         }
-        drop(stream);
-        backend_mutation_permits.clear();
         flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
         for collaborator in collaborators.values_mut() {
             if !collaborator.terminal {

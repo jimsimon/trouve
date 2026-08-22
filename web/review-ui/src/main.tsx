@@ -433,7 +433,7 @@ function App() {
         const staticModels = getModels()
           .then((models) => {
             setModelCatalog((current) =>
-              current.loaded ? current : { models, loaded: true, error: "" },
+              current.loaded ? current : { ...current, models, loaded: true },
             );
           })
           .catch((cause) => {

@@ -19375,6 +19375,12 @@ mod tests {
 
     struct StartupTestBackend;
 
+    struct StartupPersistenceFailureBackend {
+        store: Store,
+        cleanup_started: Arc<tokio::sync::Semaphore>,
+        cleanup_release: Arc<tokio::sync::Semaphore>,
+    }
+
     struct EventFailureUsageBackend {
         cleanup_started: Arc<tokio::sync::Semaphore>,
         cleanup_release: Arc<tokio::sync::Semaphore>,
@@ -19456,6 +19462,64 @@ mod tests {
                 usage: Usage::default(),
             })])
             .boxed())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for StartupPersistenceFailureBackend {
+        fn id(&self) -> &str {
+            "startup-persistence-failure-backend"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "startup-persistence-failure-backend/shared",
+                "Startup persistence failure backend model",
+            )]
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        async fn startup_activity(&self, _turn: &BackendTurn) -> Option<BackendStartupActivity> {
+            Some(BackendStartupActivity::ConnectingTools)
+        }
+
+        async fn start_login(
+            &self,
+        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+            unreachable!("startup persistence failure test never starts login")
+        }
+
+        async fn run_turn(
+            &self,
+            turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+            self.store.fail_next_async_append();
+            let cleanup_started = self.cleanup_started.clone();
+            let cleanup_release = self.cleanup_release.clone();
+            let (events, stream) = futures::channel::mpsc::unbounded::<
+                Result<BackendEvent, trouve_agents::BackendError>,
+            >();
+            tokio::spawn(async move {
+                turn.cancel.cancelled().await;
+                cleanup_started.add_permits(1);
+                cleanup_release
+                    .acquire_owned()
+                    .await
+                    .expect("cleanup release semaphore remains open")
+                    .forget();
+                drop(events);
+            });
+            Ok(stream.boxed())
         }
     }
 
@@ -20884,6 +20948,94 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(phases, [TurnPhase::ConnectingTools, TurnPhase::Processing]);
+    }
+
+    #[tokio::test]
+    async fn routed_post_start_persistence_failure_bounds_and_quarantines_cleanup() {
+        let data = tempfile::tempdir().unwrap();
+        init_engine_test_repo(data.path());
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_test_thread(
+            &store,
+            data.path(),
+            "startup_persistence_failure",
+            "auto/shared",
+        );
+        let cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .with_backend(
+                "startup-persistence-failure-backend",
+                Arc::new(StartupPersistenceFailureBackend {
+                    store: store.clone(),
+                    cleanup_started: cleanup_started.clone(),
+                    cleanup_release: cleanup_release.clone(),
+                }),
+            ),
+        );
+
+        engine
+            .send_message(&thread.id, "Fail after backend startup".into(), Vec::new())
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), cleanup_started.acquire())
+            .await
+            .expect("post-start persistence failure should cancel backend cleanup")
+            .expect("cleanup semaphore remains open")
+            .forget();
+        let failure = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failure = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|event| match event.event {
+                        Event::TurnFailed { turn: 1, error } => Some(error),
+                        _ => None,
+                    });
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if let (Some(failure), true) = (failure, inactive) {
+                    break failure;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup deadline should release turn scheduler resources");
+        assert!(failure.contains("cleanup did not finish"), "{failure}");
+
+        let phases = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                Event::TurnPhaseChanged { turn: 1, phase } => Some(phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(phases, [TurnPhase::ConnectingTools]);
+
+        let mutation_lane = engine.tool_execution_lock(&thread.session_id);
+        assert!(
+            mutation_lane.clone().try_write_owned().is_err(),
+            "timed-out backend cleanup must quarantine the mutation lane"
+        );
+        cleanup_release.add_permits(1);
+        let _released = tokio::time::timeout(Duration::from_secs(1), mutation_lane.write_owned())
+            .await
+            .expect("late backend cleanup should release the quarantined mutation lane");
     }
 
     #[test]

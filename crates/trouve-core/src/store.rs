@@ -3972,6 +3972,8 @@ pub struct Store {
     events_tx: broadcast::Sender<EventEnvelope>,
     scoped_events: ScopedEventSenders,
     append_tx: std::sync::mpsc::Sender<AppendRequest>,
+    #[cfg(test)]
+    fail_next_async_append: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -5659,6 +5661,7 @@ fn pending_events_require_isolation(events: &[PendingEvent]) -> bool {
             event.mutation.as_ref(),
             Some(
                 StoreMutation::CompleteSessionPrVerificationIntent { .. }
+                    | StoreMutation::AcceptPrompt { .. }
                     | StoreMutation::AcceptClaimedPrompt { .. }
                     | StoreMutation::AcceptAndFinishQueuedPrompt { .. }
                     | StoreMutation::FinishQueuedPrompt { .. }
@@ -5784,7 +5787,15 @@ impl Store {
             events_tx,
             scoped_events,
             append_tx,
+            #[cfg(test)]
+            fail_next_async_append: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_async_append(&self) {
+        self.fail_next_async_append
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     // --- event log --------------------------------------------------------
@@ -5957,6 +5968,13 @@ impl Store {
     ) -> Result<Vec<EventEnvelope>> {
         if events.is_empty() {
             return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_async_append
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            anyhow::bail!("injected asynchronous event append failure");
         }
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.append_tx
