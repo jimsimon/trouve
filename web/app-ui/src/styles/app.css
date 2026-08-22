@@ -92,6 +92,7 @@ trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto
 .workspace-list-options-menu label { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; color: var(--trouve-text-mid); font-size: 11px; }
 .workspace-list-options-menu select { min-width: 110px; height: 28px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 2px 5px; color: var(--trouve-text); background: var(--trouve-control-bg); font: inherit; }
 .workspace-list-options-menu .workspace-list-show-option { grid-template-columns: auto minmax(0, 1fr); }
+.repository-group-heading { margin: 12px 6px 0; color: var(--trouve-text-dim); font-size: 11px; font-weight: 700; letter-spacing: .02em; text-transform: uppercase; }
 .workspace-group { margin-top: 8px; }
 .navigation-panel .workspace-group { position: relative; }
 .workspace-drop-placeholder { height: 34px; margin-top: 8px; border: 1px dashed var(--trouve-accent); border-radius: var(--trouve-radius); background: var(--trouve-accent-veil); }

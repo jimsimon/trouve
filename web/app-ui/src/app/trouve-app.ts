@@ -180,6 +180,7 @@ import {
   WORKSPACE_PULL_REQUEST_FILTERS,
   WORKSPACE_STATUS_FILTERS,
 } from "../components/workspace-session-list-model.js";
+import { organizeWorkspaceList } from "../components/workspace-list-model.js";
 import {
   fontAwesomeIcon,
   type FontAwesomeIconName,
@@ -2795,6 +2796,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     readSignal(this.#workspaceOrder.order);
     const orderedWorkspaces = this.#workspaceOrder.ordered(knownWorkspaces);
     const workspaceListPreferences = readSignal(this.#workspaceListPreferences.current);
+    const workspaceGroups = organizeWorkspaceList(orderedWorkspaces, workspaceListPreferences.grouping);
+    const displayedWorkspaces = workspaceGroups.flatMap(({ workspaces }) => workspaces);
+    const repositoryGroupHeadings = new Map<string, string>(
+      workspaceGroups.flatMap((group) =>
+        group.repository && group.workspaces.length > 1 && group.workspaces[0] !== undefined
+          ? [[group.workspaces[0].id, group.label]]
+          : []),
+    );
     const capabilities = readSignal(this.#capabilities.current);
     const directoryPickerAvailable =
       capabilities.directoryPicker &&
@@ -2986,10 +2995,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               })}</button>
           </div>
           <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">${this.#workspaceOrderStatus}</p>
-          ${orderedWorkspaces.map(
+          ${displayedWorkspaces.map(
             (workspace, index) => {
               const collapsed = this.#collapsedWorkspaceIds.has(workspace.id);
               const workspaceFilters = this.#workspaceListPreferences.filtersFor(workspace.id);
+              const repositoryHeading = repositoryGroupHeadings.get(workspace.id);
               const dropTarget = this.#workspaceDropTarget === workspace.id;
               const placeholder = html`<div
                 class="workspace-drop-placeholder"
@@ -2999,6 +3009,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 @drop=${(event: DragEvent) => this.#dropWorkspace(event, workspace.id)}
               ></div>`;
               return html`
+                ${repositoryHeading === undefined
+                  ? nothing
+                  : html`<h2 class="repository-group-heading">${repositoryHeading}</h2>`}
                 ${dropTarget && !this.#workspaceDropAfter ? placeholder : nothing}
                 <section
                   class="workspace-group"
@@ -3138,6 +3151,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           ${orphanWorkspaceIds.map(
             (workspaceId, index) => {
               const collapsed = this.#collapsedWorkspaceIds.has(workspaceId);
+              const workspaceFilters = this.#workspaceListPreferences.filtersFor(workspaceId);
               return html`
                 <section
                   class="workspace-group"
@@ -3162,6 +3176,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     .ordering=${workspaceListPreferences.ordering}
                     .showBranches=${workspaceListPreferences.showBranches}
                     .showStatus=${workspaceListPreferences.showStatus}
+                    .statusFilter=${workspaceFilters.status}
+                    .pullRequestFilter=${workspaceFilters.pullRequest}
                     ?hidden=${collapsed}
                     @trouve-session-open=${() => this.#showMobilePane("thread")}
                   ></trouve-session-list>

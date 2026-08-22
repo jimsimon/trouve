@@ -21,6 +21,7 @@ use trouve_protocol::{
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
     TurnPhase, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
+    WorkspaceListItem,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -7310,11 +7311,43 @@ impl Engine {
 
     // --- workspaces ---------------------------------------------------------
 
+    fn workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
+        let repository = Path::new(&workspace.path);
+        let remote_identity = git::remote_url(repository, "origin")
+            .and_then(|remote| crate::github::parse_remote(&remote));
+        let (repository_key, repository_name) = if let Some((host, owner, name)) = remote_identity {
+            (
+                format!(
+                    "remote:{host}/{owner}/{name}",
+                    host = host.to_ascii_lowercase(),
+                    owner = owner.to_ascii_lowercase(),
+                    name = name.to_ascii_lowercase(),
+                ),
+                name,
+            )
+        } else {
+            (
+                git::common_directory(repository)
+                    .ok()
+                    .map(|directory| format!("local:{}", directory.to_string_lossy()))
+                    .unwrap_or_else(|| format!("workspace:{}", workspace.id)),
+                workspace.name.clone(),
+            )
+        };
+        WorkspaceListItem {
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+            repository_key: Some(repository_key),
+            repository_name: Some(repository_name),
+        }
+    }
+
     pub fn register_workspace(
         &self,
         path: &str,
         name: Option<String>,
-    ) -> Result<Workspace, EngineError> {
+    ) -> Result<WorkspaceListItem, EngineError> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| EngineError::BadRequest(format!("invalid path {path}: {e}")))?;
         if !git::is_git_repo(&canonical) {
@@ -7339,31 +7372,36 @@ impl Engine {
                     },
                 )?;
             }
-            return Ok(existing);
+            return Ok(Self::workspace_list_item(existing));
         }
-        let ws = Workspace {
+        let workspace = Workspace {
             id: new_id("ws"),
             name: name.unwrap_or_else(|| {
                 canonical
                     .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
+                    .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| "workspace".into())
             }),
             path: path_str.clone(),
         };
-        self.store.insert_workspace(&ws)?;
+        self.store.insert_workspace(&workspace)?;
         self.store.append_event(
             Scope::Server,
             Event::WorkspaceRegistered {
-                workspace_id: ws.id.clone(),
+                workspace_id: workspace.id.clone(),
                 path: path_str,
             },
         )?;
-        Ok(ws)
+        Ok(Self::workspace_list_item(workspace))
     }
 
-    pub fn list_workspaces(&self) -> Result<Vec<Workspace>, EngineError> {
-        Ok(self.store.list_workspaces()?)
+    pub fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>, EngineError> {
+        Ok(self
+            .store
+            .list_workspaces()?
+            .into_iter()
+            .map(Self::workspace_list_item)
+            .collect())
     }
 
     /// Capture authenticated hosts and register their cache handles as one
@@ -21634,6 +21672,47 @@ default_permission_mode = "ask"
         let evidence = pr_evidence_from_events(events, "github.com", "jimsimon", "trouve");
         assert_eq!(evidence.numbers, HashSet::from([267, 268, 271]));
         assert_eq!(evidence.successful_tool_args.len(), 3);
+    }
+
+    #[test]
+    fn workspace_list_items_share_normalized_remote_identity() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for repository in [first.path(), second.path()] {
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository);
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+            let mut remote = std::process::Command::new("git");
+            remote.arg("-C").arg(repository).args([
+                "remote",
+                "add",
+                "origin",
+                "git@GitHub.com:Acme/Widgets.git",
+            ]);
+            assert!(
+                trouve_process::output(&mut remote)
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first = engine
+            .register_workspace(first.path().to_str().unwrap(), Some("first clone".into()))
+            .unwrap();
+        let second = engine
+            .register_workspace(second.path().to_str().unwrap(), Some("second clone".into()))
+            .unwrap();
+
+        assert_eq!(first.repository_key, second.repository_key);
+        assert_eq!(first.repository_name.as_deref(), Some("Widgets"));
+        assert_eq!(second.repository_name.as_deref(), Some("Widgets"));
     }
 
     #[test]

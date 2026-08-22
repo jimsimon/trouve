@@ -18,6 +18,7 @@ import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   organizeWorkspaceSessions,
   pullRequestKind,
+  workspaceSessionSectionCollapsed,
   type WorkspaceSessionGrouping,
   type WorkspaceSessionListFields,
   type WorkspaceSessionOrdering,
@@ -214,7 +215,11 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     now: number,
   ) {
     const sectionKey = `${this.workspaceId}:${this.grouping}:${section.key}`;
-    const collapsed = section.label !== "" && this.#collapsedSessionSections.has(sectionKey);
+    const collapsed = workspaceSessionSectionCollapsed(
+      section,
+      this.#collapsedSessionSections.has(sectionKey),
+      selectedSessionId,
+    );
     const listId = `session-section-${this.#instanceId}-${section.key}`;
     return html`
       ${section.label === ""

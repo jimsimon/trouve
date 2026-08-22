@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   organizeWorkspaceSessions,
   pullRequestKind,
+  workspaceSessionSectionCollapsed,
   workspaceSessionStatus,
+  workspaceSessionUpdatedGroup,
   type WorkspaceSessionListFields,
 } from "./workspace-session-list-model.js";
 
@@ -46,6 +48,7 @@ describe("workspace session list model", () => {
       statusFilter: 0b1_1111,
       pullRequestFilter: 0b1_1111,
       now: Date.parse("2026-08-13T15:00:00Z"),
+      timeZone: "UTC",
     });
     expect(result.sections.map(({ key }) => key)).toEqual(["today", "yesterday"]);
     expect(result.sections[0]?.sessions.map(({ id }) => id)).toEqual(["working", "today"]);
@@ -66,5 +69,24 @@ describe("workspace session list model", () => {
     expect(result.sections.map(({ sessions }) => sessions.map(({ id }) => id))).toEqual([
       ["working"],
     ]);
+  });
+
+  it("uses calendar dates across daylight-saving transitions", () => {
+    expect(workspaceSessionUpdatedGroup(
+      "2026-03-08T06:30:00Z",
+      Date.parse("2026-03-09T04:30:00Z"),
+      "America/Detroit",
+    )[0]).toBe("yesterday");
+    expect(workspaceSessionUpdatedGroup(
+      "2026-11-01T04:30:00Z",
+      Date.parse("2026-11-02T05:30:00Z"),
+      "America/Detroit",
+    )[0]).toBe("yesterday");
+  });
+
+  it("keeps a selected session's stored-collapsed section visible", () => {
+    const section = { key: "today", label: "Today", sessions: [session("selected")] };
+    expect(workspaceSessionSectionCollapsed(section, true, "selected")).toBe(false);
+    expect(workspaceSessionSectionCollapsed(section, true, "other")).toBe(true);
   });
 });

@@ -96,20 +96,46 @@ const compare = (
   return newestUpdated() || left.id.localeCompare(right.id);
 };
 
-const updatedGroup = (updatedAt: string, now: number): readonly [string, string] => {
+const calendarDayOrdinal = (value: Date, timeZone?: string): number => {
+  if (timeZone === undefined) {
+    return Date.UTC(value.getFullYear(), value.getMonth(), value.getDate()) / 86_400_000;
+  }
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+  }).formatToParts(value);
+  const part = (type: Intl.DateTimeFormatPartTypes): number =>
+    Number(parts.find((candidate) => candidate.type === type)?.value);
+  return Date.UTC(part("year"), part("month") - 1, part("day")) / 86_400_000;
+};
+
+export const workspaceSessionUpdatedGroup = (
+  updatedAt: string,
+  now: number,
+  timeZone?: string,
+): readonly [string, string] => {
   const updated = new Date(updatedAt);
   const current = new Date(now);
   if (!Number.isFinite(updated.getTime()) || !Number.isFinite(current.getTime())) {
     return ["older", "Older"];
   }
-  updated.setHours(0, 0, 0, 0);
-  current.setHours(0, 0, 0, 0);
-  const age = Math.floor((current.getTime() - updated.getTime()) / 86_400_000);
+  const age = calendarDayOrdinal(current, timeZone) - calendarDayOrdinal(updated, timeZone);
   if (age <= 0) return ["today", "Today"];
   if (age === 1) return ["yesterday", "Yesterday"];
   if (age <= 7) return ["previous-7-days", "Previous 7 days"];
   return ["older", "Older"];
 };
+
+export const workspaceSessionSectionCollapsed = <T extends { readonly id: string }>(
+  section: WorkspaceSessionSection<T>,
+  storedCollapsed: boolean,
+  selectedSessionId: string | undefined,
+): boolean =>
+  section.label !== ""
+  && storedCollapsed
+  && !section.sessions.some(({ id }) => id === selectedSessionId);
 
 const statusLabel = (status: WorkspaceSessionStatus): string =>
   WORKSPACE_STATUS_FILTERS.find(([candidate]) => candidate === status)?.[1] ?? "Draft";
@@ -123,6 +149,7 @@ export const organizeWorkspaceSessions = <T extends WorkspaceSessionListFields>(
     readonly statusFilter: number;
     readonly pullRequestFilter: number;
     readonly now: number;
+    readonly timeZone?: string;
   },
 ): WorkspaceSessionOrganization<T> => {
   const visible = sessions.filter((session) =>
@@ -144,7 +171,7 @@ export const organizeWorkspaceSessions = <T extends WorkspaceSessionListFields>(
   const groups = new Map<string, { label: string; sessions: T[] }>();
   for (const session of active) {
     const [key, label] = options.grouping === "updated"
-      ? updatedGroup(session.updatedAt, options.now)
+      ? workspaceSessionUpdatedGroup(session.updatedAt, options.now, options.timeZone)
       : [workspaceSessionStatus(session), statusLabel(workspaceSessionStatus(session))];
     const group = groups.get(key) ?? { label, sessions: [] };
     group.sessions.push(session);
