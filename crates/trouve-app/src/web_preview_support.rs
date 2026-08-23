@@ -21,6 +21,66 @@ use trouve_protocol::PROTOCOL_VERSION;
 
 const SERVER_URL_ENV: &str = "TROUVE_SERVER_URL";
 
+#[cfg(any(target_os = "linux", test))]
+const BACKGROUND_NICE_INCREMENT: i32 = 5;
+
+#[cfg(any(target_os = "linux", test))]
+fn background_nice_value(current: i32) -> i32 {
+    current.saturating_add(BACKGROUND_NICE_INCREMENT).min(19)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn priority_result(value: i32, errno: i32) -> std::io::Result<i32> {
+    if value == -1 && errno != 0 {
+        Err(std::io::Error::from_raw_os_error(errno))
+    } else {
+        Ok(value)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_nice_value() -> std::io::Result<i32> {
+    // Linux exposes errno through thread-local storage. Clear it immediately
+    // before getpriority because -1 is both a valid niceness and its error
+    // sentinel, then snapshot it before another call can overwrite it.
+    // SAFETY: __errno_location returns the calling thread's errno slot.
+    let errno = unsafe { libc::__errno_location() };
+    unsafe {
+        *errno = 0;
+    }
+    // SAFETY: getpriority reads scheduler state for the calling Linux thread.
+    let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    // SAFETY: `errno` still points to this thread's valid errno slot.
+    let error_code = unsafe { *errno };
+    priority_result(current, error_code)
+}
+
+/// Lower only the runtime thread that invokes this hook. Linux inherits a
+/// thread's niceness when it spawns child processes, so agent subprocesses
+/// yield to the unchanged Tao/Wry event-loop thread under CPU contention.
+#[cfg(target_os = "linux")]
+fn deprioritize_background_thread() {
+    let current = match current_nice_value() {
+        Ok(current) => current,
+        Err(error) => {
+            tracing::warn!(%error, "could not read desktop runtime CPU priority");
+            return;
+        }
+    };
+    let target = background_nice_value(current);
+    if target == current {
+        return;
+    }
+    // SAFETY: setpriority updates the calling Linux thread when `who` is
+    // zero and retains no Rust pointers.
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, target) } != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "could not lower desktop runtime CPU priority"
+        );
+    }
+}
+
 /// Hardened loopback gateway and the runtime that owns it.
 ///
 /// Keep this value alive for the webview's full lifetime. Calling
@@ -64,10 +124,13 @@ impl WebPreviewHost {
         allow_embedded_server: bool,
     ) -> Result<Self> {
         trouve_server::install_crypto_provider();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            // The gateway, embedded server, and notification dispatcher are
-            // I/O-bound; four workers avoid per-core allocator arena growth.
-            .worker_threads(4)
+        let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+        // The gateway, embedded server, and notification dispatcher are
+        // I/O-bound; four workers avoid per-core allocator arena growth.
+        runtime_builder.worker_threads(4);
+        #[cfg(target_os = "linux")]
+        runtime_builder.on_thread_start(deprioritize_background_thread);
+        let runtime = runtime_builder
             .enable_all()
             .build()
             .context("creating the desktop host runtime")?;
@@ -275,6 +338,22 @@ mod tests {
         let error = configured_server_url(None, false).unwrap_err().to_string();
         assert!(error.contains(SERVER_URL_ENV));
         assert!(error.contains("never open the default database"));
+    }
+
+    #[test]
+    fn background_niceness_yields_without_exceeding_linux_limit() {
+        assert_eq!(background_nice_value(0), 5);
+        assert_eq!(background_nice_value(10), 15);
+        assert_eq!(background_nice_value(18), 19);
+        assert_eq!(background_nice_value(19), 19);
+    }
+
+    #[test]
+    fn failed_priority_reads_are_not_treated_as_valid_negative_niceness() {
+        const TEST_ERRNO: i32 = 5;
+        assert_eq!(priority_result(-1, 0).unwrap(), -1);
+        let error = priority_result(-1, TEST_ERRNO).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(TEST_ERRNO));
     }
 
     #[test]

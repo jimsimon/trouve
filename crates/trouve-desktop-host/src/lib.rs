@@ -30,7 +30,7 @@ use utoipa::ToSchema;
 ///
 /// This is not the Trouve HTTP protocol version. Increment it only when the
 /// native capability request/response schema changes.
-pub const DESKTOP_BRIDGE_VERSION: u16 = 13;
+pub const DESKTOP_BRIDGE_VERSION: u16 = 14;
 
 /// Runtime desktop build selected by development and qualification hosts.
 pub const APP_UI_DIST_ENV: &str = "TROUVE_APP_UI_DIST";
@@ -679,6 +679,10 @@ impl ExternalHttpsUrl {
 }
 
 type ExternalHttpsOpener = dyn Fn(&ExternalHttpsUrl) -> Result<(), String> + Send + Sync + 'static;
+type VideoAttachmentOpenerFuture =
+    Pin<Box<dyn Future<Output = Result<(), VideoAttachmentOpenError>> + Send + 'static>>;
+type VideoAttachmentOpener =
+    dyn Fn(NativeAttachment) -> VideoAttachmentOpenerFuture + Send + Sync + 'static;
 type DirectoryPickerFuture =
     Pin<Box<dyn Future<Output = Result<Option<PathBuf>, String>> + Send + 'static>>;
 type DirectoryPicker = dyn Fn() -> DirectoryPickerFuture + Send + Sync + 'static;
@@ -898,6 +902,38 @@ impl NativeAttachment {
         validate_native_attachment(&attachment)?;
         Ok(attachment)
     }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Safe extension selected from the validated MIME type. Native media
+    /// adapters use this instead of the uploaded filename extension so the
+    /// bridge cannot ask the operating system to open an executable payload.
+    pub fn video_extension(&self) -> Option<&'static str> {
+        match self.mime.to_ascii_lowercase().as_str() {
+            "video/mp4" => Some("mp4"),
+            "video/webm" => Some("webm"),
+            "video/ogg" => Some("ogv"),
+            "video/quicktime" => Some("mov"),
+            "video/x-matroska" => Some("mkv"),
+            "video/x-msvideo" => Some("avi"),
+            _ => None,
+        }
+    }
+}
+
+/// Failure classes exposed by the app-owned external-video adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum VideoAttachmentOpenError {
+    #[error("temporary video playback capacity is full")]
+    Capacity,
+    #[error("{0}")]
+    Failed(String),
 }
 
 pub(crate) fn validate_native_attachment(
@@ -955,6 +991,7 @@ pub struct HostNativeActions {
     file_picker: Option<Arc<FilePicker>>,
     clipboard_image_reader: Option<Arc<ClipboardImageReader>>,
     external_https_opener: Option<Arc<ExternalHttpsOpener>>,
+    video_attachment_opener: Option<Arc<VideoAttachmentOpener>>,
     close_acknowledgement_observer: Option<Arc<CloseAcknowledgementObserver>>,
     close_decision_observer: Option<Arc<CloseDecisionObserver>>,
     quit_handler: Option<Arc<QuitHandler>>,
@@ -1014,6 +1051,17 @@ impl HostNativeActions {
         F: Fn(&ExternalHttpsUrl) -> Result<(), String> + Send + Sync + 'static,
     {
         self.external_https_opener = Some(Arc::new(opener));
+        self
+    }
+
+    /// Attach external video playback without blocking a gateway runtime worker.
+    pub fn with_video_attachment_opener<F, Fut>(mut self, opener: F) -> Self
+    where
+        F: Fn(NativeAttachment) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), VideoAttachmentOpenError>> + Send + 'static,
+    {
+        self.video_attachment_opener =
+            Some(Arc::new(move |attachment| Box::pin(opener(attachment))));
         self
     }
 
@@ -1114,6 +1162,10 @@ impl HostNativeActions {
 
     pub fn can_open_https_url(&self) -> bool {
         self.external_https_opener.is_some()
+    }
+
+    pub fn can_open_video_attachment(&self) -> bool {
+        self.video_attachment_opener.is_some()
     }
 
     pub fn can_stream_lifecycle(&self) -> bool {
@@ -1263,6 +1315,16 @@ impl HostNativeActions {
         self.external_https_opener
             .as_ref()
             .ok_or_else(|| "external URL opener is unavailable".to_string())?(url)
+    }
+
+    pub(crate) async fn open_video_attachment(
+        &self,
+        attachment: NativeAttachment,
+    ) -> Result<(), VideoAttachmentOpenError> {
+        self.video_attachment_opener.as_ref().ok_or_else(|| {
+            VideoAttachmentOpenError::Failed("video attachment opener is unavailable".to_string())
+        })?(attachment)
+        .await
     }
 }
 
@@ -1721,6 +1783,33 @@ mod tests {
     }
 
     #[test]
+    fn published_capability_struct_literals_remain_source_compatible() {
+        let capabilities = HostCapabilities {
+            kind: HostKind::Desktop,
+            bridge_version: Some(DESKTOP_BRIDGE_VERSION),
+            directory_picker: false,
+            file_picker: false,
+            clipboard_image: false,
+            lifecycle_events: false,
+            close_confirmation: false,
+            open_local_file: false,
+            reveal_local_file: false,
+            open_https_url: false,
+            native_notifications: false,
+            web_notifications: false,
+            user_attention: false,
+            sleep_inhibition: false,
+            window_geometry: false,
+            visibility: false,
+            occlusion: false,
+            persistent_preferences: false,
+            installable: false,
+        };
+
+        assert_eq!(capabilities, HostCapabilities::desktop());
+    }
+
+    #[test]
     fn system_font_families_are_safe_sorted_and_deduplicated() {
         let names = normalize_system_font_families([
             "Zed Sans".to_owned(),
@@ -1765,6 +1854,19 @@ mod tests {
             ExternalHttpsUrl::parse("https://example.com/\nsecret"),
             Err(HostValidationError::InvalidUrl(_))
         ));
+    }
+
+    #[test]
+    fn native_video_extensions_ignore_uploaded_filename_extensions() {
+        let video = NativeAttachment::new("installer.exe", "VIDEO/MP4", b"video".to_vec())
+            .expect("bounded attachment");
+        assert_eq!(video.name(), "installer.exe");
+        assert_eq!(video.video_extension(), Some("mp4"));
+        assert_eq!(video.bytes(), b"video");
+
+        let image = NativeAttachment::new("photo.png", "image/png", b"image".to_vec())
+            .expect("bounded attachment");
+        assert_eq!(image.video_extension(), None);
     }
 
     #[test]

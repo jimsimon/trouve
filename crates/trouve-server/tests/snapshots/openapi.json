@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.13"
+    "version": "7.15"
   },
   "paths": {
     "/v1/approvals": {
@@ -5910,6 +5910,15 @@
               "null"
             ]
           },
+          "open_issue_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Total confirmed findings that remained open across the pull request\nafter this review was published. Absent while publication is pending\nand for legacy jobs that predate this snapshot. Consumers must treat\nabsence on a succeeded job as unknown, never as a clean review.",
+            "minimum": 0
+          },
           "pending_elapsed_ms": {
             "type": "integer",
             "format": "int64",
@@ -6091,6 +6100,13 @@
             "items": {
               "$ref": "#/components/schemas/CodeReviewTheme"
             }
+          },
+          "unadjudicated_candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewUnadjudicatedCandidate"
+            },
+            "description": "Candidates left without a final-editor decision after the bounded\nrepair attempt. Their presence means the review is incomplete."
           }
         }
       },
@@ -7090,6 +7106,61 @@
           "continuation",
           "recurrence"
         ]
+      },
+      "CodeReviewUnadjudicatedCandidate": {
+        "type": "object",
+        "description": "A reviewer candidate the final editor neither retained nor substantively\nrejected. This represents incomplete coordinator work, not a negative\ndecision about the candidate.",
+        "required": [
+          "candidate_id",
+          "task_id",
+          "reviewer_id",
+          "reviewer_name",
+          "path",
+          "line",
+          "side",
+          "severity",
+          "title",
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "candidate_id": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string",
+            "description": "Strength of the reviewer evidence, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."
+          },
+          "line": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          },
+          "reviewer_id": {
+            "type": "string"
+          },
+          "reviewer_name": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "side": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string",
+            "description": "Concise, generated one-line summary of the candidate issue."
+          }
+        }
       },
       "CommandInfo": {
         "type": "object",
