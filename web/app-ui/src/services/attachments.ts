@@ -9,15 +9,104 @@ export interface PendingAttachment {
   readonly size: number;
 }
 
+/** Coalesces repeated attachment actions until their first operation settles. */
+export class AttachmentOperationCapacityError extends Error {
+  constructor() {
+    super("too many attachment operations are pending");
+    this.name = "AttachmentOperationCapacityError";
+  }
+}
+
+export class PendingAttachmentOperations {
+  readonly #pending = new Map<string, Promise<unknown>>();
+  readonly #queue: Array<() => void> = [];
+  #active = 0;
+
+  constructor(
+    readonly maxConcurrent = Number.POSITIVE_INFINITY,
+    readonly maxPending = Number.POSITIVE_INFINITY,
+  ) {}
+
+  run<T>(key: string, operation: () => Promise<T>): Promise<T> | undefined {
+    if (this.#pending.has(key)) return undefined;
+    if (this.#pending.size >= this.maxPending) {
+      return Promise.reject(new AttachmentOperationCapacityError());
+    }
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const pending = new Promise<T>((accept, refuse) => {
+      resolve = accept;
+      reject = refuse;
+    });
+    this.#pending.set(key, pending);
+    this.#queue.push(() => {
+      this.#active += 1;
+      const finish = (): void => {
+        if (this.#pending.get(key) === pending) this.#pending.delete(key);
+        this.#active -= 1;
+        this.#drain();
+      };
+      void Promise.resolve()
+        .then(operation)
+        .then(
+          (value) => {
+            finish();
+            resolve(value);
+          },
+          (error: unknown) => {
+            finish();
+            reject(error);
+          },
+        );
+    });
+    this.#drain();
+    return pending;
+  }
+
+  #drain(): void {
+    while (this.#active < this.maxConcurrent) {
+      const start = this.#queue.shift();
+      if (start === undefined) return;
+      start();
+    }
+  }
+}
+
 const previewUrls = new WeakMap<PendingAttachment, string>();
 
-/** A CSP-compatible local preview for an image that has already been encoded
- * for upload. Non-images and malformed MIME types deliberately have no URL. */
+export const PREVIEWABLE_VIDEO_MIMES: ReadonlySet<string> = new Set([
+  "video/mp4",
+  "video/webm",
+  "video/ogg",
+  "video/quicktime",
+  "video/x-matroska",
+  "video/x-msvideo",
+]);
+
+export const isVideoMime = (mime: string): boolean =>
+  PREVIEWABLE_VIDEO_MIMES.has(mime.toLowerCase());
+
+/** Return the decoded byte length of canonical padded base64 without
+ * allocating its binary representation. Alphabet validation remains with the
+ * consumer that performs the single required decode. */
+export const base64DecodedByteLength = (data: string): number | undefined => {
+  if (data.length === 0 || data.length % 4 !== 0) return undefined;
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  const payloadLength = data.length - padding;
+  if (payloadLength === 0 || data.slice(0, payloadLength).includes("=")) return undefined;
+  const size = (data.length / 4) * 3 - padding;
+  return size > 0 ? size : undefined;
+};
+
+/** A CSP-compatible local preview for media that has already been encoded for
+ * upload. Files and malformed MIME types deliberately have no URL. */
 export const pendingAttachmentPreviewUrl = (
   attachment: PendingAttachment,
 ): string | undefined => {
   const mime = attachment.upload.mime.toLowerCase();
-  if (!/^image\/[a-z0-9!#$&^_.+-]+$/iu.test(mime) || attachment.upload.data === "") {
+  const previewable = /^image\/[a-z0-9!#$&^_.+-]+$/iu.test(mime)
+    || isVideoMime(mime);
+  if (!previewable || attachment.upload.data === "") {
     return undefined;
   }
   const cached = previewUrls.get(attachment);

@@ -12,7 +12,8 @@ export type PullRequestGroupKey =
   | "pending-review"
   | "ready-to-merge"
   | "needs-attention"
-  | "recently-merged";
+  | "recently-merged"
+  | "closed";
 
 export type PullRequestPillTone = "neutral" | "ok" | "warning" | "danger";
 
@@ -75,64 +76,56 @@ export interface PullRequestGroup extends PullRequestGroupDefinition {
   readonly pullRequests: readonly PullRequestRow[];
 }
 
+const pullRequestGroup = <Key extends PullRequestGroupKey>(
+  key: Key,
+  title: string,
+  description: string,
+  icon: FontAwesomeIconName,
+  tone: PullRequestGroupDefinition["tone"],
+  emptyText: string,
+): PullRequestGroupDefinition & { readonly key: Key } => ({
+  key, title, description, icon, tone, emptyText,
+});
+
 export const PULL_REQUEST_GROUPS = Object.freeze([
-  {
-    key: "review-requested",
-    title: "Review Requested",
-    description: "Pull requests where your review has been requested.",
-    icon: "circle-dot",
-    tone: "accent",
-    emptyText: "No reviews waiting on you.",
-  },
-  {
-    key: "drafts",
-    title: "Drafts",
-    description: "Open pull requests still marked as drafts.",
-    icon: "pen",
-    tone: "muted",
-    emptyText: "No draft pull requests right now.",
-  },
-  {
-    key: "needs-reviewers",
-    title: "Needs Reviewers",
-    description: "Open pull requests that do not have any reviewers yet.",
-    icon: "user-plus",
-    tone: "warning",
-    emptyText: "Every open pull request has a reviewer.",
-  },
-  {
-    key: "pending-review",
-    title: "Pending Review",
-    description: "Open pull requests waiting for review or approval.",
-    icon: "circle-half-stroke",
-    tone: "warning",
-    emptyText: "Nothing is waiting on review.",
-  },
-  {
-    key: "ready-to-merge",
-    title: "Ready to Merge",
-    description: "Fully approved pull requests with every check passing.",
-    icon: "check",
-    tone: "ok",
-    emptyText: "Nothing is ready to merge yet.",
-  },
-  {
-    key: "needs-attention",
-    title: "Needs Attention",
-    description: "Pull requests with merge conflicts, failing checks, or changes requested.",
-    icon: "triangle-exclamation",
-    tone: "danger",
-    emptyText: "Nothing needs attention — all clear.",
-  },
-  {
-    key: "recently-merged",
-    title: "Recently Merged",
-    description: "Pull requests merged in the last 24 hours.",
-    icon: "code-merge",
-    tone: "tint",
-    emptyText: "Nothing merged in the last 24 hours.",
-  },
-] as const satisfies readonly PullRequestGroupDefinition[]);
+  pullRequestGroup(
+    "review-requested", "Review Requested",
+    "Requested reviews.",
+    "circle-dot", "accent", "No reviews.",
+  ),
+  pullRequestGroup(
+    "drafts", "Drafts", "Open drafts.",
+    "pen", "muted", "No drafts.",
+  ),
+  pullRequestGroup(
+    "needs-reviewers", "Needs Reviewers",
+    "Without reviewers.",
+    "user-plus", "warning", "All have reviewers.",
+  ),
+  pullRequestGroup(
+    "pending-review", "Pending Review",
+    "Awaiting review.",
+    "circle-half-stroke", "warning", "None pending.",
+  ),
+  pullRequestGroup(
+    "ready-to-merge", "Ready to Merge",
+    "Approved and green.",
+    "check", "ok", "Nothing ready.",
+  ),
+  pullRequestGroup(
+    "needs-attention", "Needs Attention",
+    "Conflicts, failures, or changes.",
+    "triangle-exclamation", "danger", "All clear.",
+  ),
+  pullRequestGroup(
+    "recently-merged", "Recently Merged", "Merged in 24h.",
+    "code-merge", "tint", "No merges.",
+  ),
+  pullRequestGroup(
+    "closed", "Closed", "Latest 300 unmerged PRs.",
+    "code-pull-request", "danger", "No closed PRs.",
+  ),
+]);
 
 export const PULL_REQUEST_GROUP_KEYS = Object.freeze(
   PULL_REQUEST_GROUPS.map(({ key }) => key),
@@ -221,8 +214,7 @@ export const pullRequestMergePill = (
 };
 
 const validDateMilliseconds = (value: string | null | undefined): number | undefined => {
-  if (value === null || value === undefined || value === "") return undefined;
-  const milliseconds = Date.parse(value);
+  const milliseconds = Date.parse(value ?? "");
   return Number.isFinite(milliseconds) ? milliseconds : undefined;
 };
 
@@ -240,6 +232,7 @@ export const classifyPullRequest = (
       ? "recently-merged"
       : undefined;
   }
+  if (pr.state === "closed") return "closed";
   if (pr.state !== "open") return undefined;
   if (pr.mergeable === false && !pr.draft) return "needs-attention";
   if (viewer !== "" && requestedReviewers(pr).includes(viewer)) {
@@ -280,8 +273,8 @@ export const reconcilePullRequestGroupOrder = (
   const seen = new Set<PullRequestGroupKey>();
   const order: PullRequestGroupKey[] = [];
   for (const key of saved) {
-    if (!definitionByKey.has(key as PullRequestGroupKey)) continue;
-    const known = key as PullRequestGroupKey;
+    const known = (key === "recently-closed" ? "closed" : key) as PullRequestGroupKey;
+    if (!definitionByKey.has(known)) continue;
     if (seen.has(known)) continue;
     seen.add(known);
     order.push(known);

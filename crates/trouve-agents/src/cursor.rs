@@ -2660,7 +2660,9 @@ for line in sys.stdin:
             async move { apply_model_config(&server, "session-1", &turn, &cancel).await }
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !marker_path.exists() {
+            while std::fs::read_to_string(&marker_path).ok().as_deref()
+                != Some("session/set_config_option")
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })

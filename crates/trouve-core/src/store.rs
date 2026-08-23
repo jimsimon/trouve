@@ -550,6 +550,22 @@ CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
   created_at TEXT NOT NULL,
   PRIMARY KEY (job_id, candidate_id)
 );
+CREATE TABLE IF NOT EXISTS code_review_unadjudicated_candidates (
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  candidate_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  reviewer_id TEXT NOT NULL,
+  reviewer_name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  side TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  confidence TEXT NOT NULL DEFAULT 'medium',
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (job_id, candidate_id)
+);
 CREATE TABLE IF NOT EXISTS code_review_pr_state (
   repository TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
@@ -2870,11 +2886,54 @@ fn scoped_code_review_theme_id(
     theme_id: &str,
     existing_theme_ids: &HashSet<String>,
 ) -> String {
-    if existing_theme_ids.contains(theme_id) {
+    let scope_prefix = format!("{repository}#{pull_number}:");
+    if existing_theme_ids.contains(theme_id) || theme_id.starts_with(&scope_prefix) {
         theme_id.to_owned()
     } else {
-        format!("{repository}#{pull_number}:{theme_id}")
+        format!("{scope_prefix}{theme_id}")
     }
+}
+
+fn staged_code_review_theme_ids(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT theme_id FROM code_review_theme_observations WHERE job_id = ?1
+         UNION
+         SELECT theme_id FROM code_review_finding_themes WHERE linked_by_job_id = ?1
+         UNION
+         SELECT link.theme_id
+         FROM code_review_finding_themes link
+         JOIN code_review_findings finding ON finding.id = link.finding_id
+         WHERE finding.job_id = ?1",
+    )?;
+    Ok(stmt
+        .query_map(params![job_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn delete_orphan_code_review_themes(
+    tx: &rusqlite::Transaction<'_>,
+    theme_ids: Vec<String>,
+) -> Result<()> {
+    for theme_id in theme_ids {
+        tx.execute(
+            "DELETE FROM code_review_themes
+             WHERE id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_theme_observations WHERE theme_id = ?1
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_finding_themes WHERE theme_id = ?1
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_theme_transitions WHERE theme_id = ?1
+               )",
+            params![theme_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn publish_code_review_theme_observations(
@@ -3241,6 +3300,9 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             candidate_issue_count: r.get::<_, i64>(33)? as u64,
             issue_count: r.get::<_, i64>(34)? as u64,
             fixed_issue_count: r.get::<_, i64>(35)? as u64,
+            open_issue_count: r
+                .get::<_, Option<i64>>(56)?
+                .map(|value| value.max(0) as u64),
             error: r.get(18)?,
             created_at,
             started_at,
@@ -3252,7 +3314,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
-        can_retry_final_editor: r.get(56)?,
+        can_retry_final_editor: r.get(57)?,
         prompt: r.get(12)?,
         reviewers,
         summary: r.get(36)?,
@@ -3275,6 +3337,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
      review_published, blocking_review_cleanup_pending, publication_dispatched, \
+     publication_open_issue_count, \
      CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
             AND code_review_jobs.session_id IS NULL \
             AND EXISTS ( \
@@ -3305,6 +3368,33 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
                 ) \
             ) \
           THEN 1 ELSE 0 END AS can_retry_final_editor";
+
+/// Shared ownership predicate for accepting review results and claiming their
+/// publication. Keeping both transitions on one predicate prevents stale
+/// workers from persisting after cancellation or same-generation replacement.
+const CURRENT_CODE_REVIEW_JOB_PREDICATE: &str = concat!(
+    "code_review_jobs.id = ?1 ",
+    "AND code_review_jobs.status = 'running' ",
+    "AND code_review_jobs.cancel_requested = 0 ",
+    "AND code_review_jobs.publication_claimed = 0 ",
+    "AND NOT EXISTS (",
+    "  SELECT 1 FROM code_review_jobs AS newer ",
+    "  WHERE newer.repository = code_review_jobs.repository ",
+    "    AND newer.pull_number = code_review_jobs.pull_number ",
+    "    AND newer.head_sha = code_review_jobs.head_sha ",
+    "    AND (",
+    "      newer.publication_generation > code_review_jobs.publication_generation ",
+    "      OR (",
+    "        newer.publication_generation = code_review_jobs.publication_generation ",
+    "        AND newer.rowid > code_review_jobs.rowid",
+    "      )",
+    "    ) ",
+    "    AND newer.status IN ('queued', 'running', 'succeeded')",
+    ")",
+);
+
+const LEGACY_UNADJUDICATED_REASON_MARKER: &str = "did not provide a specific reason";
+const LEGACY_MISSING_REASON_MARKER: &str = "has no recorded reason";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -10044,33 +10134,121 @@ impl Store {
         themes: &[NewCodeReviewTheme],
         candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.save_code_review_result_with_adjudication(
+            job_id,
+            summary,
+            prompt_for_agents,
+            candidate_issue_count,
+            findings,
+            finding_details,
+            themes,
+            candidate_rejections,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_code_review_result_with_adjudication(
+        &self,
+        job_id: &str,
+        summary: &str,
+        prompt_for_agents: &str,
+        candidate_issue_count: u64,
+        findings: &[NewCodeReviewFinding],
+        finding_details: &[NewCodeReviewFindingDetails],
+        themes: &[NewCodeReviewTheme],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+        unadjudicated_candidates: &[trouve_protocol::CodeReviewUnadjudicatedCandidate],
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.save_code_review_result_with_adjudication_inner(
+            job_id,
+            summary,
+            prompt_for_agents,
+            candidate_issue_count,
+            findings,
+            finding_details,
+            themes,
+            candidate_rejections,
+            unadjudicated_candidates,
+            false,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("unguarded code-review result save was rejected"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_current_code_review_result_with_adjudication(
+        &self,
+        job_id: &str,
+        summary: &str,
+        prompt_for_agents: &str,
+        candidate_issue_count: u64,
+        findings: &[NewCodeReviewFinding],
+        finding_details: &[NewCodeReviewFindingDetails],
+        themes: &[NewCodeReviewTheme],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+        unadjudicated_candidates: &[trouve_protocol::CodeReviewUnadjudicatedCandidate],
+    ) -> Result<Option<Vec<trouve_protocol::CodeReviewFinding>>> {
+        self.save_code_review_result_with_adjudication_inner(
+            job_id,
+            summary,
+            prompt_for_agents,
+            candidate_issue_count,
+            findings,
+            finding_details,
+            themes,
+            candidate_rejections,
+            unadjudicated_candidates,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_code_review_result_with_adjudication_inner(
+        &self,
+        job_id: &str,
+        summary: &str,
+        prompt_for_agents: &str,
+        candidate_issue_count: u64,
+        findings: &[NewCodeReviewFinding],
+        finding_details: &[NewCodeReviewFindingDetails],
+        themes: &[NewCodeReviewTheme],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+        unadjudicated_candidates: &[trouve_protocol::CodeReviewUnadjudicatedCandidate],
+        require_current_job: bool,
+    ) -> Result<Option<Vec<trouve_protocol::CodeReviewFinding>>> {
         if !finding_details.is_empty() && finding_details.len() != findings.len() {
             anyhow::bail!("review finding details must align with findings");
         }
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        if require_current_job {
+            let current: bool = tx.query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM code_review_jobs
+                     WHERE {CURRENT_CODE_REVIEW_JOB_PREDICATE})"
+                ),
+                params![job_id],
+                |row| row.get(0),
+            )?;
+            if !current {
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
         let (repository, pull_number, head_sha): (String, i64, String) = tx.query_row(
             "SELECT repository, pull_number, head_sha FROM code_review_jobs WHERE id = ?1",
             params![job_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let mut existing_theme_ids = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM code_review_themes
-                 WHERE repository = ?1 AND pull_number = ?2",
-            )?;
-            stmt.query_map(params![repository, pull_number], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<HashSet<_>>>()?
-        };
+        let replaced_theme_ids = staged_code_review_theme_ids(&tx, job_id)?;
         tx.execute(
             "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
             params![job_id],
         )?;
         tx.execute(
             "DELETE FROM code_review_finding_themes
-             WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
+             WHERE linked_by_job_id = ?1
+                OR finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
             params![job_id],
         )?;
         tx.execute(
@@ -10087,11 +10265,26 @@ impl Store {
             params![job_id],
         )?;
         tx.execute(
+            "DELETE FROM code_review_unadjudicated_candidates WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
             "UPDATE code_review_tasks
              SET confirmed_issue_count = 0
              WHERE job_id = ?1",
             params![job_id],
         )?;
+        delete_orphan_code_review_themes(&tx, replaced_theme_ids)?;
+        let mut existing_theme_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM code_review_themes
+                 WHERE repository = ?1 AND pull_number = ?2",
+            )?;
+            stmt.query_map(params![repository, pull_number], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<HashSet<_>>>()?
+        };
         let now = chrono::Utc::now().to_rfc3339();
         let mut scoped_theme_ids = HashMap::<String, String>::new();
         for theme in themes {
@@ -10113,13 +10306,7 @@ impl Store {
                          first_seen_head, last_seen_head, resolved_head, recurrence_count,
                          created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6, '', 0, ?7, ?7)
-                 ON CONFLICT(id) DO UPDATE SET
-                     root_cause = excluded.root_cause,
-                     recommendation = excluded.recommendation
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM code_review_theme_observations existing
-                     WHERE existing.theme_id = excluded.id AND existing.published != 0
-                 )",
+                 ON CONFLICT(id) DO NOTHING",
                 params![
                     theme_id,
                     repository,
@@ -10251,6 +10438,29 @@ impl Store {
                 ],
             )?;
         }
+        for candidate in unadjudicated_candidates {
+            tx.execute(
+                "INSERT INTO code_review_unadjudicated_candidates
+                        (candidate_id, job_id, task_id, reviewer_id, reviewer_name,
+                         path, line, side, severity, confidence, title, body, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    candidate.candidate_id,
+                    job_id,
+                    candidate.task_id,
+                    candidate.reviewer_id,
+                    candidate.reviewer_name,
+                    candidate.path,
+                    candidate.line as i64,
+                    candidate.side,
+                    candidate.severity,
+                    candidate.confidence,
+                    candidate.title,
+                    candidate.body,
+                    now,
+                ],
+            )?;
+        }
         tx.execute(
             "UPDATE code_review_jobs
              SET summary = ?2, prompt_for_agents = ?3,
@@ -10266,7 +10476,76 @@ impl Store {
         )?;
         tx.commit()?;
         drop(conn);
-        self.code_review_findings(job_id)
+        Ok(Some(self.code_review_findings(job_id)?))
+    }
+
+    /// Discards a staged coordinator result before any GitHub publication was
+    /// dispatched. A failed post-persistence live revision check uses this to
+    /// remove every unaccepted result artifact and release any local claim.
+    pub fn discard_unaccepted_code_review_result(&self, job_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let discardable: bool = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs
+               WHERE id = ?1 AND publication_dispatched = 0
+                 AND publication_accepted = 0 AND review_published = 0
+             )",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        if !discardable {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let affected_theme_ids = staged_code_review_theme_ids(&tx, job_id)?;
+        tx.execute(
+            "DELETE FROM code_review_theme_observations WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_finding_themes
+             WHERE linked_by_job_id = ?1
+                OR finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_finding_sources
+             WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_findings WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_candidate_rejections WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_unadjudicated_candidates WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "UPDATE code_review_tasks SET confirmed_issue_count = 0 WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        let reset = tx.execute(
+            "UPDATE code_review_jobs
+             SET summary = '', prompt_for_agents = '', candidate_issue_count = 0,
+                 issue_count = 0, publication_claimed = 0,
+                 publication_dispatched = 0, publication_accepted = 0,
+                 publication_order = 0
+             WHERE id = ?1 AND publication_dispatched = 0
+               AND publication_accepted = 0 AND review_published = 0",
+            params![job_id],
+        )?;
+        if reset == 0 {
+            return Ok(false);
+        }
+        delete_orphan_code_review_themes(&tx, affected_theme_ids)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     fn code_review_candidate_rejections(
@@ -10298,6 +10577,102 @@ impl Store {
                     reason: row.get(11)?,
                 })
             })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn code_review_unadjudicated_candidates(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewUnadjudicatedCandidate>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT candidate_id, task_id, reviewer_id, reviewer_name,
+                    path, line, side, severity, confidence, title, body
+             FROM code_review_unadjudicated_candidates
+             WHERE job_id = ?1
+             ORDER BY reviewer_name, path, line, candidate_id",
+        )?;
+        Ok(stmt
+            .query_map(params![job_id], |row| {
+                Ok(trouve_protocol::CodeReviewUnadjudicatedCandidate {
+                    candidate_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    reviewer_id: row.get(2)?,
+                    reviewer_name: row.get(3)?,
+                    path: row.get(4)?,
+                    line: row.get::<_, i64>(5)? as u64,
+                    side: row.get(6)?,
+                    severity: row.get(7)?,
+                    confidence: row.get(8)?,
+                    title: row.get(9)?,
+                    body: row.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Returns newest-first coordinator adjudications from successful prior
+    /// review rounds for the same pull request.
+    pub fn code_review_candidate_rejection_history_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        excluded_job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewCandidateRejection>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT rejection.candidate_id, rejection.task_id,
+                    rejection.reviewer_id, rejection.reviewer_name,
+                    rejection.path, rejection.line, rejection.side,
+                    rejection.severity, rejection.confidence,
+                    rejection.title, rejection.body, rejection.reason
+             FROM code_review_candidate_rejections rejection
+             JOIN code_review_jobs job ON job.id = rejection.job_id
+             WHERE job.repository = ?1 AND job.pull_number = ?2
+               AND job.id != ?3 AND job.status = 'succeeded'
+               AND (rejection.reason LIKE 'false_positive:%'
+                    OR rejection.reason LIKE 'pre_existing:%'
+                    OR rejection.reason LIKE 'internal_duplicate:%'
+                    OR rejection.reason LIKE 'external_duplicate:%'
+                    OR rejection.reason LIKE 'insufficient_evidence:%'
+                    OR rejection.reason LIKE 'non_actionable:%')
+               AND length(trim(substr(rejection.reason,
+                                      instr(rejection.reason, ':') + 1))) > 0
+               AND rejection.reason NOT LIKE '%' || ?5 || '%'
+               AND rejection.reason NOT LIKE '%' || ?6 || '%'
+             ORDER BY job.publication_order DESC, job.completed_at DESC,
+                      rejection.created_at DESC, job.created_at DESC, job.id DESC,
+                      rejection.candidate_id DESC
+             LIMIT ?4",
+        )?;
+        Ok(stmt
+            .query_map(
+                params![
+                    repository,
+                    pull_number as i64,
+                    excluded_job_id,
+                    limit as i64,
+                    LEGACY_UNADJUDICATED_REASON_MARKER,
+                    LEGACY_MISSING_REASON_MARKER,
+                ],
+                |row| {
+                    Ok(trouve_protocol::CodeReviewCandidateRejection {
+                        candidate_id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        reviewer_id: row.get(2)?,
+                        reviewer_name: row.get(3)?,
+                        path: row.get(4)?,
+                        line: row.get::<_, i64>(5)? as u64,
+                        side: row.get(6)?,
+                        severity: row.get(7)?,
+                        confidence: row.get(8)?,
+                        title: row.get(9)?,
+                        body: row.get(10)?,
+                        reason: row.get(11)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<_>>()?)
     }
 
@@ -11462,6 +11837,7 @@ impl Store {
         let findings = self.code_review_findings(id)?;
         let themes = self.code_review_themes_for_job(id)?;
         let candidate_rejections = self.code_review_candidate_rejections(id)?;
+        let unadjudicated_candidates = self.code_review_unadjudicated_candidates(id)?;
         let routing_decisions = self.code_review_routing_decisions(id)?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
             job: record.job,
@@ -11471,6 +11847,7 @@ impl Store {
             findings,
             themes,
             candidate_rejections,
+            unadjudicated_candidates,
             routing_decisions,
             summary: record.summary,
             prompt_for_agents: record.prompt_for_agents,
@@ -11878,8 +12255,15 @@ impl Store {
                  JOIN code_review_jobs j ON j.id = r.job_id
                  WHERE j.status = 'succeeded'
                    AND (?1 IS NULL OR j.repository = ?1)
-                   AND (?2 IS NULL OR j.completed_at >= ?2)",
-                params![repository, start_param],
+                   AND (?2 IS NULL OR j.completed_at >= ?2)
+                   AND r.reason NOT LIKE '%' || ?3 || '%'
+                   AND r.reason NOT LIKE '%' || ?4 || '%'",
+                params![
+                    repository,
+                    start_param,
+                    LEGACY_UNADJUDICATED_REASON_MARKER,
+                    LEGACY_MISSING_REASON_MARKER,
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             let (
@@ -12227,7 +12611,7 @@ impl Store {
     }
 
     pub fn claim_code_review_publication(&self, id: &str) -> Result<bool> {
-        Ok(self.conn.lock().unwrap().execute(
+        let sql = format!(
             "UPDATE code_review_jobs
              SET publication_claimed = 1, publication_dispatched = 0,
                  publication_order = CASE
@@ -12239,24 +12623,9 @@ impl Store {
                        AND existing.pull_number = code_review_jobs.pull_number
                    )
                  END
-             WHERE id = ?1 AND status = 'running'
-               AND cancel_requested = 0 AND publication_claimed = 0
-               AND NOT EXISTS (
-                 SELECT 1 FROM code_review_jobs AS newer
-                 WHERE newer.repository = code_review_jobs.repository
-                   AND newer.pull_number = code_review_jobs.pull_number
-                   AND newer.head_sha = code_review_jobs.head_sha
-                   AND (
-                     newer.publication_generation > code_review_jobs.publication_generation
-                     OR (
-                       newer.publication_generation = code_review_jobs.publication_generation
-                       AND newer.rowid > code_review_jobs.rowid
-                     )
-                   )
-                   AND newer.status IN ('queued', 'running', 'succeeded')
-               )",
-            params![id],
-        )? > 0)
+             WHERE {CURRENT_CODE_REVIEW_JOB_PREDICATE}"
+        );
+        Ok(self.conn.lock().unwrap().execute(&sql, params![id])? > 0)
     }
 
     /// Crosses the last durable boundary before the GitHub review POST. A
@@ -20827,6 +21196,282 @@ mod tests {
     }
 
     #[test]
+    fn current_result_save_rejects_cancelled_or_replaced_jobs_before_writing() {
+        let store = Store::open_in_memory().unwrap();
+        let cancelled = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            cancelled.id
+        );
+        store
+            .request_code_review_job_cancel(&cancelled.id)
+            .unwrap()
+            .unwrap();
+        let save_empty_result = |job_id: &str, summary: &str| {
+            store.save_current_code_review_result_with_adjudication(
+                job_id,
+                summary,
+                "prompt",
+                0,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+        };
+        assert!(
+            save_empty_result(&cancelled.id, "cancelled result")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .code_review_job(&cancelled.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .is_empty()
+        );
+
+        let mut older_request = backoff_test_job_request();
+        older_request.dedupe_key = "acme/widgets#42:older-result".into();
+        let older = store
+            .enqueue_code_review_job(&older_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            older.id
+        );
+        let mut replacement_request = backoff_test_job_request();
+        replacement_request.dedupe_key = "acme/widgets#42:replacement-result".into();
+        store
+            .enqueue_code_review_job(&replacement_request)
+            .unwrap()
+            .unwrap();
+        assert!(
+            save_empty_result(&older.id, "replaced result")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .code_review_job(&older.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn current_result_save_accepts_the_current_running_job() {
+        let store = Store::open_in_memory().unwrap();
+        let current = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            current.id
+        );
+
+        let saved = store
+            .save_current_code_review_result_with_adjudication(
+                &current.id,
+                "Current result",
+                "Current prompt",
+                0,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        assert!(saved.is_some());
+        let record = store.code_review_job(&current.id).unwrap().unwrap();
+        assert_eq!(record.summary, "Current result");
+        assert_eq!(record.prompt_for_agents, "Current prompt");
+    }
+
+    #[test]
+    fn staged_result_can_be_discarded_before_publication() {
+        let store = Store::open_in_memory().unwrap();
+        let current = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            current.id
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_review_themes
+                    (id, repository, pull_number, root_cause, recommendation, status,
+                     first_seen_head, last_seen_head, resolved_head, recurrence_count,
+                     created_at, updated_at)
+                 VALUES ('transition-theme', ?1, ?2, 'original root cause',
+                         'original recommendation', 'open', ?3, ?3, '', 0, ?4, ?4)",
+                params![
+                    current.repository,
+                    current.pull_number as i64,
+                    current.head_sha,
+                    now,
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO code_review_theme_transitions
+                    (theme_id, job_id, status, last_seen_head, resolved_head,
+                     recurrence_count, transitioned_at)
+                 VALUES ('transition-theme', ?1, 'open', ?2, '', 0, ?3)",
+                params![current.id, current.head_sha, now],
+            )
+            .unwrap();
+        }
+        let findings = [NewCodeReviewFinding {
+            path: "src/lib.rs".into(),
+            line: 7,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Staged finding".into(),
+            body: "Only valid for the staged revision.".into(),
+            prompt_for_agents: "Fix the staged finding.".into(),
+            sources: Vec::new(),
+        }];
+        let finding_details = [NewCodeReviewFindingDetails {
+            theme_ids: vec!["staged-theme".into(), "transition-theme".into()],
+            ..Default::default()
+        }];
+        let themes = [
+            NewCodeReviewTheme {
+                id: "staged-theme".into(),
+                root_cause: "staged root cause".into(),
+                recommendation: "staged recommendation".into(),
+                observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                previous_finding_ids: Vec::new(),
+            },
+            NewCodeReviewTheme {
+                id: "transition-theme".into(),
+                root_cause: "rejected replacement root cause".into(),
+                recommendation: "rejected replacement recommendation".into(),
+                observation_kind: trouve_protocol::CodeReviewThemeObservationKind::Continuation,
+                previous_finding_ids: Vec::new(),
+            },
+        ];
+        let rejections = [trouve_protocol::CodeReviewCandidateRejection {
+            candidate_id: "rejected".into(),
+            task_id: "task".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            path: "src/lib.rs".into(),
+            line: 8,
+            side: "RIGHT".into(),
+            severity: "low".into(),
+            confidence: "high".into(),
+            title: "Rejected candidate".into(),
+            body: "Not actionable.".into(),
+            reason: "non_actionable: no current defect".into(),
+        }];
+        let unadjudicated = [trouve_protocol::CodeReviewUnadjudicatedCandidate {
+            candidate_id: "unresolved".into(),
+            task_id: "task".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            path: "src/lib.rs".into(),
+            line: 9,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Unresolved candidate".into(),
+            body: "The editor omitted a decision.".into(),
+        }];
+
+        let saved = store
+            .save_current_code_review_result_with_adjudication(
+                &current.id,
+                "Staged result",
+                "Staged prompt",
+                3,
+                &findings,
+                &finding_details,
+                &themes,
+                &rejections,
+                &unadjudicated,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(saved.len(), 1);
+        let staged = store.code_review_job(&current.id).unwrap().unwrap();
+        assert!(!staged.publication_claimed);
+        let staged_detail = store.code_review_job_detail(&current.id).unwrap().unwrap();
+        assert_eq!(staged_detail.findings.len(), 1);
+        assert_eq!(staged_detail.candidate_rejections.len(), 1);
+        assert_eq!(staged_detail.unadjudicated_candidates.len(), 1);
+        let mut replacement_request = backoff_test_job_request();
+        replacement_request.dedupe_key = "acme/widgets#42:replacement-after-stage".into();
+        store
+            .enqueue_code_review_job(&replacement_request)
+            .unwrap()
+            .unwrap();
+        assert!(!store.claim_code_review_publication(&current.id).unwrap());
+        assert!(
+            store
+                .discard_unaccepted_code_review_result(&current.id)
+                .unwrap()
+        );
+
+        let discarded = store.code_review_job(&current.id).unwrap().unwrap();
+        assert!(!discarded.publication_claimed);
+        assert_eq!(discarded.summary, "");
+        assert_eq!(discarded.prompt_for_agents, "");
+        assert_eq!(discarded.job.candidate_issue_count, 0);
+        assert_eq!(discarded.job.issue_count, 0);
+        let detail = store.code_review_job_detail(&current.id).unwrap().unwrap();
+        assert!(detail.findings.is_empty());
+        assert!(detail.candidate_rejections.is_empty());
+        assert!(detail.unadjudicated_candidates.is_empty());
+        let conn = store.conn.lock().unwrap();
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_review_theme_observations WHERE job_id = ?1",
+                params![current.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let orphan_themes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_review_themes WHERE root_cause = 'staged root cause'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained_theme: (String, String) = conn
+            .query_row(
+                "SELECT root_cause, recommendation FROM code_review_themes
+                 WHERE id = 'transition-theme'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let transitions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_review_theme_transitions
+                 WHERE theme_id = 'transition-theme'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 0);
+        assert_eq!(orphan_themes, 0);
+        assert_eq!(retained_theme.0, "original root cause");
+        assert_eq!(retained_theme.1, "original recommendation");
+        assert_eq!(transitions, 1);
+    }
+
+    #[test]
     fn watermark_backfill_uses_last_published_head_not_effective_base() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
@@ -21412,7 +22057,7 @@ mod tests {
                 .unwrap()
         );
         let findings = store
-            .save_code_review_result_with_themes(
+            .save_code_review_result_with_adjudication(
                 &queued.id,
                 "One issue",
                 "Fix every confirmed issue.",
@@ -21466,6 +22111,19 @@ mod tests {
                     body: "This branch could be simplified.".into(),
                     reason: "This is a non-actionable style preference.".into(),
                 }],
+                &[trouve_protocol::CodeReviewUnadjudicatedCandidate {
+                    candidate_id: "candidate-3".into(),
+                    task_id: task.id.clone(),
+                    reviewer_id: "correctness".into(),
+                    reviewer_name: "Correctness".into(),
+                    path: "src/lib.rs".into(),
+                    line: 21,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Unresolved behavior".into(),
+                    body: "The final editor did not decide this candidate.".into(),
+                }],
             )
             .unwrap();
         assert_eq!(findings.len(), 1);
@@ -21475,6 +22133,11 @@ mod tests {
         assert_eq!(detail.tasks[0].output, "candidate output");
         assert_eq!(detail.personas[0].candidate_issue_count, 1);
         assert_eq!(detail.candidate_rejections.len(), 1);
+        assert_eq!(detail.unadjudicated_candidates.len(), 1);
+        assert_eq!(
+            detail.unadjudicated_candidates[0].candidate_id,
+            "candidate-3"
+        );
         assert_eq!(detail.candidate_rejections[0].confidence, "high");
         assert_eq!(
             detail.candidate_rejections[0].reason,
@@ -21821,6 +22484,22 @@ mod tests {
                         body: "Missing a reachable sequence.".into(),
                         reason: "insufficient_evidence: no reachable sequence".into(),
                     },
+                    trouve_protocol::CodeReviewCandidateRejection {
+                        candidate_id: "unadjudicated-legacy".into(),
+                        task_id: "task".into(),
+                        reviewer_id: "correctness".into(),
+                        reviewer_name: "Correctness".into(),
+                        path: "src/lib.rs".into(),
+                        line: 5,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        confidence: "high".into(),
+                        title: "Unknown decision".into(),
+                        body: "The coordinator did not adjudicate this candidate.".into(),
+                        reason: format!(
+                            "insufficient_evidence: The final review editor did not retain this candidate and {LEGACY_UNADJUDICATED_REASON_MARKER}."
+                        ),
+                    },
                 ],
             )
             .unwrap();
@@ -21846,6 +22525,30 @@ mod tests {
         store
             .finish_code_review_job(&first.id, "succeeded", "https://example.test/review/1", "")
             .unwrap();
+        let prior_rejections = store
+            .code_review_candidate_rejection_history_for_pull(
+                &first.repository,
+                first.pull_number,
+                &legacy.id,
+                10,
+            )
+            .unwrap();
+        assert_eq!(prior_rejections.len(), 2);
+        assert!(prior_rejections.iter().any(|rejection| {
+            rejection.candidate_id == "weak"
+                && rejection.reason.starts_with("insufficient_evidence:")
+        }));
+        assert!(
+            store
+                .code_review_candidate_rejection_history_for_pull(
+                    &first.repository,
+                    first.pull_number,
+                    &first.id,
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
 
         let second = enqueue(
             "acme/widgets#42:churn-round-2",
@@ -21892,6 +22595,24 @@ mod tests {
         };
         assert_eq!(publication_open_issue_count(&first.id), Some(3));
         assert_eq!(publication_open_issue_count(&second.id), Some(0));
+        assert_eq!(
+            store
+                .code_review_job(&first.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .open_issue_count,
+            Some(3)
+        );
+        assert_eq!(
+            store
+                .code_review_job(&second.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .open_issue_count,
+            Some(0)
+        );
 
         let stats = store
             .code_review_stats(
@@ -21909,6 +22630,54 @@ mod tests {
         assert_eq!(stats.churn.clean_pull_request_count, 1);
         assert_eq!(stats.churn.average_rounds_to_clean, 2.0);
         assert_eq!(stats.churn.max_rounds_to_clean, 2);
+
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_review_candidate_rejections
+                        (job_id, candidate_id, task_id, reviewer_id, reviewer_name,
+                         path, line, side, severity, confidence, title, body, reason, created_at)
+                 SELECT ?1, candidate_id, ?2, reviewer_id, reviewer_name,
+                        path, line, side, severity, confidence, title, body, reason, created_at
+                 FROM code_review_candidate_rejections
+                 WHERE job_id = ?3 AND candidate_id = 'weak'",
+                params![second.id, "second-task", first.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET completed_at = CASE id
+                         WHEN ?1 THEN '2026-08-22T00:00:00Z'
+                         ELSE '2026-08-21T23:59:58Z'
+                     END,
+                     created_at = CASE id
+                         WHEN ?1 THEN '2026-08-21T23:59:59Z'
+                         ELSE '2026-08-21T23:59:57Z'
+                     END
+                 WHERE id IN (?1, ?2)",
+                params![first.id, second.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_candidate_rejections
+                 SET created_at = CASE job_id
+                         WHEN ?1 THEN '2026-08-22T00:00:00Z'
+                         ELSE '2026-08-21T23:59:56Z'
+                     END
+                 WHERE job_id IN (?1, ?2)",
+                params![first.id, second.id],
+            )
+            .unwrap();
+        }
+        let limited = store
+            .code_review_candidate_rejection_history_for_pull(
+                &first.repository,
+                first.pull_number,
+                &legacy.id,
+                1,
+            )
+            .unwrap();
+        assert_eq!(limited[0].task_id, "second-task");
     }
 
     #[test]

@@ -87,8 +87,7 @@ pub fn resolve_model_name() -> String {
         .unwrap_or_else(|| DEFAULT_MODEL_NAME.to_string())
 }
 
-/// Return the chunk containing `line` in `file_path`, or None.
-pub fn resolve_chunk<'a>(chunks: &'a [Chunk], file_path: &str, line: u32) -> Option<&'a Chunk> {
+fn resolve_chunk_exact<'a>(chunks: &'a [Chunk], file_path: &str, line: u32) -> Option<&'a Chunk> {
     let mut fallback: Option<&Chunk> = None;
     for chunk in chunks {
         if chunk.file_path == file_path && chunk.start_line <= line && line <= chunk.end_line {
@@ -102,6 +101,19 @@ pub fn resolve_chunk<'a>(chunks: &'a [Chunk], file_path: &str, line: u32) -> Opt
         }
     }
     fallback
+}
+
+/// Return the chunk containing `line` in `file_path`, or None.
+///
+/// Search results always use forward slashes, but tolerate a manually entered
+/// Windows-style path after giving a literal path match precedence.
+pub fn resolve_chunk<'a>(chunks: &'a [Chunk], file_path: &str, line: u32) -> Option<&'a Chunk> {
+    resolve_chunk_exact(chunks, file_path, line).or_else(|| {
+        file_path
+            .contains('\\')
+            .then(|| file_path.replace('\\', "/"))
+            .and_then(|normalized| resolve_chunk_exact(chunks, &normalized, line))
+    })
 }
 
 /// Render results as a flat JSONable object.
@@ -198,6 +210,12 @@ mod tests {
         assert_eq!(resolve_chunk(&chunks, "a.py", 20).unwrap().start_line, 10);
         assert!(resolve_chunk(&chunks, "a.py", 99).is_none());
         assert!(resolve_chunk(&chunks, "missing.py", 1).is_none());
+    }
+
+    #[test]
+    fn resolves_chunk_across_path_separator_styles() {
+        let chunks = vec![chunk("src/a.py", 1, 10)];
+        assert!(resolve_chunk(&chunks, "src\\a.py", 5).is_some());
     }
 
     #[test]

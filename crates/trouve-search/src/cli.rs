@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::index::TrouveIndex;
 use crate::stats::{clear_savings, format_savings_report};
-use crate::store::{clear_all_stores, resolve_cache_folder};
+use crate::store::{clear_all_stores, clear_orphan_stores, resolve_cache_folder};
 use crate::types::ContentType;
 use crate::utils::{format_results, is_git_url, resolve_chunk};
 
@@ -101,7 +101,7 @@ enum CliCommand {
     /// Clear the index cache.
     Clear {
         /// Type of cache to clear.
-        #[arg(value_parser = ["all", "index", "savings"])]
+        #[arg(value_parser = ["all", "index", "orphans", "savings"])]
         r#type: String,
     },
     /// Show token savings and usage stats.
@@ -211,6 +211,19 @@ fn run_find_related(
 }
 
 fn run_clear(clear_type: &str) -> ExitCode {
+    if clear_type == "orphans" {
+        let removed = clear_orphan_stores();
+        if removed.is_empty() {
+            println!(
+                "No orphaned index stores found in `{}`",
+                resolve_cache_folder().display()
+            );
+        } else {
+            for path in removed {
+                println!("Cleared orphaned index store at `{}`", path.display());
+            }
+        }
+    }
     if clear_type == "index" || clear_type == "all" {
         let removed = clear_all_stores();
         if removed.is_empty() {
@@ -361,5 +374,19 @@ fn run_debug(command: DebugCommand) -> ExitCode {
             println!("{}", serde_json::to_string(&scores).unwrap());
             ExitCode::SUCCESS
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_accepts_orphans() {
+        let cli = Cli::try_parse_from(["trouve-search", "clear", "orphans"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Clear { r#type }) if r#type == "orphans"
+        ));
     }
 }

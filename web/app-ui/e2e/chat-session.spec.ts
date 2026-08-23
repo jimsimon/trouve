@@ -1478,7 +1478,7 @@ test("the YOLO warning remains centered and exposes its hover text", async ({ pa
   expect(alignment.warningToSelect).toBeLessThanOrEqual(1);
 });
 
-test("pending image and file attachments reuse submitted chip geometry", async ({ page }) => {
+test("pending media and file attachments reuse submitted chip geometry", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
@@ -1497,13 +1497,24 @@ test("pending image and file attachments reuse submitted chip geometry", async (
       mimeType: "text/plain",
       buffer: Buffer.from("attachment notes"),
     },
+    {
+      name: "clip.mp4",
+      mimeType: "video/mp4",
+      buffer: Buffer.from("video preview"),
+    },
   ]);
 
   const attachments = page.locator(".composer .pending-attachments");
-  const image = attachments.locator(".image-attachment");
+  const image = attachments.locator(".image-attachment").filter({ hasText: "image/png" });
+  const video = attachments.locator(".image-attachment").filter({ hasText: "video/mp4" });
   const file = attachments.locator(".file-attachment");
   await expect(image.locator("img")).toHaveAttribute("src", /^data:image\/png;base64,/u);
   await expect(image).toContainText("image/png");
+  await expect(video.locator("video")).toHaveAttribute(
+    "src",
+    /^data:video\/mp4;base64,/u,
+  );
+  await expect(video).toContainText("video/mp4");
   await expect(file.locator('[data-font-awesome-icon="file"]')).toBeVisible();
   await expect(file).toContainText("text/plain");
 
@@ -1539,7 +1550,7 @@ test("pending image and file attachments reuse submitted chip geometry", async (
   expect(geometry.filePadding).toBe(geometry.imagePadding);
 });
 
-test("image attachment thumbnails open an accessible full-size preview", async ({ page }) => {
+test("image attachment thumbnails open an accessible gallery", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
@@ -1554,10 +1565,291 @@ test("image attachment thumbnails open an accessible full-size preview", async (
       type: "user.message",
       turn: 8,
       content: "Preview this image",
+      attachments: [
+        {
+          id: "att_preview_1",
+          name: "full-size-preview.png",
+          mime: "image/png",
+          size_bytes: 68,
+        },
+        {
+          id: "att_preview_2",
+          name: "alternate-preview.gif",
+          mime: "image/gif",
+          size_bytes: 68,
+        },
+      ],
+    }),
+    threadEvent(18, {
+      type: "turn.completed",
+      turn: 8,
+      usage: { input_tokens: 4, output_tokens: 0, cost_usd: 0 },
+      checkpoint_id: null,
+    }),
+  ]);
+
+  const message = page.locator(".user-message").filter({ hasText: "Preview this image" });
+  const preview = message.locator("trouve-image-preview").first();
+  const trigger = preview.getByRole("button", {
+    name: "View full-size image: full-size-preview.png",
+  });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+
+  const dialog = preview.locator("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toHaveAccessibleName(
+    "Full-size preview of full-size-preview.png",
+  );
+  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_preview_1",
+  );
+  await expect(dialog.locator(".image-preview-full")).toHaveCSS("object-fit", "contain");
+  await expect(dialog.getByRole("button", { name: "Close image preview" })).toBeFocused();
+  await expect(dialog.locator(".image-preview-counter")).toHaveText("1 of 2");
+  await dialog.getByRole("button", { name: "Next image" }).click();
+  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_preview_2",
+  );
+  await expect(dialog.locator(".image-preview-counter")).toHaveText("2 of 2");
+  await page.keyboard.press("ArrowLeft");
+  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_preview_1",
+  );
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await dialog.getByRole("button", { name: "Close image preview" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+});
+
+test("lazy video thumbnails defer media requests until they approach the viewport", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page);
+  let requests = 0;
+  await page.route("**/v1/attachments/att_lazy_video", async (route) => {
+    requests += 1;
+    await route.fulfill({
+      contentType: "video/mp4",
+      body: Buffer.from("video preview"),
+    });
+  });
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    const preview = document.createElement("trouve-image-preview");
+    preview.id = "lazy-video-preview";
+    preview.source = "/v1/attachments/att_lazy_video";
+    preview.name = "lazy.mp4";
+    preview.mime = "video/mp4";
+    preview.video = true;
+    preview.lazy = true;
+    preview.style.position = "absolute";
+    preview.style.top = "3000px";
+    document.body.append(preview);
+  });
+
+  await page.waitForTimeout(250);
+  expect(requests).toBe(0);
+
+  const preview = page.locator("#lazy-video-preview");
+  await preview.evaluate((element) => element.scrollIntoView());
+  await expect.poll(() => requests).toBe(1);
+  await expect(preview.locator("video")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_lazy_video",
+  );
+});
+
+test("stale lazy-video observers cannot activate a replacement source", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.addInitScript(() => {
+    type ObserverRecord = {
+      readonly callback: IntersectionObserverCallback;
+      readonly observer: IntersectionObserver;
+      disconnected: boolean;
+    };
+    const observers: ObserverRecord[] = [];
+    class ControllableIntersectionObserver {
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+      readonly record: ObserverRecord;
+
+      constructor(callback: IntersectionObserverCallback) {
+        this.record = {
+          callback,
+          observer: this as unknown as IntersectionObserver,
+          disconnected: false,
+        };
+        observers.push(this.record);
+      }
+
+      disconnect(): void {
+        this.record.disconnected = true;
+      }
+
+      observe(): void {}
+      unobserve(): void {}
+      takeRecords(): IntersectionObserverEntry[] {
+        return [];
+      }
+    }
+    Object.defineProperty(globalThis, "IntersectionObserver", {
+      value: ControllableIntersectionObserver,
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, "__trouveVideoObservers", {
+      value: observers,
+      configurable: true,
+    });
+  });
+  await page.goto("/");
+
+  const state = await page.evaluate(async () => {
+    const preview = document.createElement("trouve-image-preview");
+    preview.source = "/v1/attachments/first-video";
+    preview.name = "first.mp4";
+    preview.mime = "video/mp4";
+    preview.video = true;
+    preview.lazy = true;
+    document.body.append(preview);
+    await preview.updateComplete;
+    preview.source = "/v1/attachments/second-video";
+    await preview.updateComplete;
+
+    const observers = (globalThis as typeof globalThis & {
+      __trouveVideoObservers: Array<{
+        callback: IntersectionObserverCallback;
+        observer: IntersectionObserver;
+        disconnected: boolean;
+      }>;
+    }).__trouveVideoObservers;
+    const first = observers[0];
+    const second = observers[1];
+    if (first === undefined || second === undefined) throw new Error("missing observers");
+    first.callback([{ isIntersecting: true } as IntersectionObserverEntry], first.observer);
+    await preview.updateComplete;
+    return {
+      observerCount: observers.length,
+      replacementDisconnected: second.disconnected,
+      source: preview.renderRoot.querySelector("video")?.getAttribute("src") ?? null,
+    };
+  });
+
+  expect(state).toEqual({
+    observerCount: 2,
+    replacementDisconnected: false,
+    source: null,
+  });
+});
+
+test("video thumbnails restore their media source after reconnecting", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.evaluate(() => {
+    const pending = document.createElement("trouve-image-preview");
+    pending.id = "reconnect-pending-video";
+    pending.source = "data:video/mp4;base64,dmlkZW8=";
+    pending.name = "pending.mp4";
+    pending.mime = "video/mp4";
+    pending.video = true;
+
+    const durable = document.createElement("trouve-image-preview");
+    durable.id = "reconnect-durable-video";
+    durable.source = "/v1/attachments/att_reconnect_video";
+    durable.name = "durable.mp4";
+    durable.mime = "video/mp4";
+    durable.video = true;
+    durable.lazy = true;
+    durable.style.position = "fixed";
+    durable.style.top = "0";
+
+    document.body.append(pending, durable);
+  });
+
+  const pending = page.locator("#reconnect-pending-video");
+  const durable = page.locator("#reconnect-durable-video");
+  await expect(pending.locator("video")).toHaveAttribute(
+    "src",
+    "data:video/mp4;base64,dmlkZW8=",
+  );
+  await expect(durable.locator("video")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_reconnect_video",
+  );
+
+  await page.evaluate(() => {
+    const pending = document.querySelector("#reconnect-pending-video");
+    const durable = document.querySelector("#reconnect-durable-video");
+    if (pending === null || durable === null) throw new Error("missing video previews");
+    pending.remove();
+    durable.remove();
+    document.body.append(pending, durable);
+  });
+
+  await expect(pending.locator("video")).toHaveAttribute(
+    "src",
+    "data:video/mp4;base64,dmlkZW8=",
+  );
+  await expect(durable.locator("video")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_reconnect_video",
+  );
+});
+
+test("video attachments render thumbnails and open the browser player", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.addInitScript(() => {
+    const opened: string[] = [];
+    Object.defineProperty(globalThis, "__trouveOpenedVideos", {
+      value: opened,
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, "__trouveBlockVideoWindows", {
+      value: false,
+      writable: true,
+      configurable: true,
+    });
+    globalThis.open = (() => {
+      if ((globalThis as typeof globalThis & { __trouveBlockVideoWindows: boolean })
+        .__trouveBlockVideoWindows) return null;
+      return {
+        opener: globalThis,
+        location: {
+          replace: (url: string | URL) => opened.push(String(url)),
+        },
+        close: () => undefined,
+      } as unknown as Window;
+    }) as typeof globalThis.open;
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Play this video",
       attachments: [{
-        id: "att_preview_1",
-        name: "full-size-preview.png",
-        mime: "image/png",
+        id: "att_video_1",
+        name: "demo.mp4",
+        mime: "video/mp4",
         size_bytes: 68,
       }],
     }),
@@ -1569,33 +1861,30 @@ test("image attachment thumbnails open an accessible full-size preview", async (
     }),
   ]);
 
-  const message = page.locator(".user-message").filter({ hasText: "Preview this image" });
-  const preview = message.locator("trouve-image-preview");
-  const trigger = preview.getByRole("button", {
-    name: "View full-size image: full-size-preview.png",
-  });
-  await expect(trigger).toBeVisible();
-  await trigger.click();
-
-  const dialog = preview.getByRole("dialog", {
-    name: "Full-size preview of full-size-preview.png",
-  });
-  await expect(dialog).toBeVisible();
-  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+  const message = page.locator(".user-message").filter({ hasText: "Play this video" });
+  const preview = message.locator("trouve-image-preview[video]");
+  await expect(preview.locator("video")).toHaveAttribute(
     "src",
-    "/v1/attachments/att_preview_1",
+    "/v1/attachments/att_video_1",
   );
-  await expect(dialog.locator(".image-preview-full")).toHaveCSS("object-fit", "contain");
-  await expect(dialog.getByRole("button", { name: "Close image preview" })).toBeFocused();
+  await preview.getByRole("button", {
+    name: "Open video in external player: demo.mp4",
+  }).click();
+  await expect.poll(() => page.evaluate(
+    () => (globalThis as typeof globalThis & { __trouveOpenedVideos: string[] })
+      .__trouveOpenedVideos,
+  )).toEqual(["http://127.0.0.1:4173/v1/attachments/att_video_1"]);
 
-  await page.keyboard.press("Escape");
-  await expect(dialog).toBeHidden();
-  await expect(trigger).toBeFocused();
-
-  await trigger.click();
-  await dialog.getByRole("button", { name: "Close image preview" }).click();
-  await expect(dialog).toBeHidden();
-  await expect(trigger).toBeFocused();
+  await page.evaluate(() => {
+    (globalThis as typeof globalThis & { __trouveBlockVideoWindows: boolean })
+      .__trouveBlockVideoWindows = true;
+  });
+  await preview.getByRole("button", {
+    name: "Open video in external player: demo.mp4",
+  }).click();
+  await expect(page.getByRole("status").filter({
+    hasText: "The browser blocked video playback. Allow pop-ups for trouve and try again.",
+  })).toBeVisible();
 });
 
 test("unsubmitted composer drafts persist per thread across navigation and reload", async ({
@@ -3152,7 +3441,7 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   await expect(group.getByText("Ran 4 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
   await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
-  await expect(transientActivity).toContainText("Waiting for model…");
+  await expect(transientActivity).toContainText("Agent is working…");
 });
 
 test("context compaction is an animated durable boundary between tool groups", async ({
