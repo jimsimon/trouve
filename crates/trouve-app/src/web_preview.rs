@@ -17,7 +17,7 @@ mod startup;
 pub(crate) mod web_preview_support;
 
 use std::cell::RefCell;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::web_preview_support::WebPreviewHost;
+use fs4::fs_std::FileExt as _;
 use rfd::AsyncFileDialog;
+use sha2::{Digest as _, Sha256};
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -36,7 +38,7 @@ use tokio::sync::{oneshot, watch};
 use trouve_desktop_host::{
     CloseDecision, FrontendSource, HostLifecycleHandle, HostNativeActions,
     MAX_NATIVE_ATTACHMENT_BYTES, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS,
-    NativeAttachment, NativeNotification, WindowGeometry,
+    NativeAttachment, NativeNotification, VideoAttachmentOpenError, WindowGeometry,
 };
 use wry::{NewWindowResponse, WebViewBuilder};
 
@@ -63,6 +65,528 @@ pub(crate) enum AppEvent {
 
 const MAX_CLIPBOARD_RGBA_BYTES: usize = 64 * 1024 * 1024;
 const CLOSE_CONFIRMATION_GRACE: Duration = Duration::from_secs(5);
+const MAX_VIDEO_PLAYBACK_CACHE_FILES: usize = 8;
+const MAX_VIDEO_PLAYBACK_CACHE_BYTES: usize = 4 * MAX_NATIVE_ATTACHMENT_BYTES;
+const VIDEO_PLAYBACK_DIRECTORY_PREFIX: &str = "trouve-video-";
+const VIDEO_PLAYBACK_OWNER_LOCK: &str = ".owner.lock";
+const MAX_STALE_VIDEO_DIRECTORIES_PER_STARTUP: usize = 64;
+const STALE_VIDEO_DIRECTORY_MIN_AGE: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug)]
+struct VideoPlaybackCacheEntry {
+    path: PathBuf,
+    identity: [u8; 32],
+    size: usize,
+    modified: SystemTime,
+    active_leases: usize,
+    launched: bool,
+}
+
+#[derive(Debug)]
+struct VideoPlaybackLease {
+    path: PathBuf,
+    identity: [u8; 32],
+}
+
+#[derive(Debug)]
+struct VideoMaterializationError {
+    error: std::io::Error,
+    cleanup_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct VideoPlaybackOpenError {
+    message: String,
+    retain_path: bool,
+}
+
+impl From<String> for VideoPlaybackOpenError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retain_path: false,
+        }
+    }
+}
+
+impl From<opener::OpenAttemptError> for VideoPlaybackOpenError {
+    fn from(error: opener::OpenAttemptError) -> Self {
+        let retain_path = error.retain_path();
+        Self {
+            message: error.to_string(),
+            retain_path,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct VideoPlaybackCache {
+    _owner_lock: File,
+    directory: tempfile::TempDir,
+    entries: Vec<VideoPlaybackCacheEntry>,
+    pending_cleanup: Vec<PathBuf>,
+    next_sequence: u64,
+    max_files: usize,
+    max_bytes: usize,
+}
+
+impl VideoPlaybackCache {
+    fn new() -> std::io::Result<Self> {
+        Self::with_limits(
+            MAX_VIDEO_PLAYBACK_CACHE_FILES,
+            MAX_VIDEO_PLAYBACK_CACHE_BYTES,
+        )
+    }
+
+    /// Successful launches stay retained until the host exits so an external
+    /// player can keep reading for as long as playback lasts.
+    fn with_limits(max_files: usize, max_bytes: usize) -> std::io::Result<Self> {
+        Self::with_limits_in(&std::env::temp_dir(), max_files, max_bytes)
+    }
+
+    fn with_limits_in(
+        parent: &std::path::Path,
+        max_files: usize,
+        max_bytes: usize,
+    ) -> std::io::Result<Self> {
+        if let Err(error) = cleanup_stale_video_directories(parent) {
+            tracing::warn!(%error, parent = %parent.display(), "could not sweep stale video directories");
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix(VIDEO_PLAYBACK_DIRECTORY_PREFIX)
+            .tempdir_in(parent)?;
+        let owner_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join(VIDEO_PLAYBACK_OWNER_LOCK))?;
+        owner_lock.lock_exclusive()?;
+
+        Ok(Self {
+            _owner_lock: owner_lock,
+            directory,
+            entries: Vec::new(),
+            pending_cleanup: Vec::new(),
+            next_sequence: 0,
+            max_files,
+            max_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn open_with<F>(
+        &mut self,
+        attachment: &NativeAttachment,
+        mut open: F,
+    ) -> Result<(), VideoAttachmentOpenError>
+    where
+        F: FnMut(&std::path::Path) -> Result<(), String>,
+    {
+        let lease = self.prepare(attachment)?;
+        let result = open(&lease.path).map_err(VideoAttachmentOpenError::Failed);
+        self.complete(lease, result)
+    }
+
+    #[cfg(test)]
+    fn open_with_cleanup<F, R>(
+        &mut self,
+        attachment: &NativeAttachment,
+        mut open: F,
+        mut remove: R,
+    ) -> Result<(), VideoAttachmentOpenError>
+    where
+        F: FnMut(&std::path::Path) -> Result<(), String>,
+        R: FnMut(&std::path::Path) -> bool,
+    {
+        let lease = self.prepare_with_cleanup(attachment, &mut remove)?;
+        let result = open(&lease.path).map_err(VideoAttachmentOpenError::Failed);
+        self.complete_with_cleanup(lease, result, &mut remove)
+    }
+
+    fn prepare(
+        &mut self,
+        attachment: &NativeAttachment,
+    ) -> Result<VideoPlaybackLease, VideoAttachmentOpenError> {
+        self.prepare_with_cleanup(attachment, remove_temporary_video)
+    }
+
+    fn prepare_with_cleanup<R>(
+        &mut self,
+        attachment: &NativeAttachment,
+        remove: R,
+    ) -> Result<VideoPlaybackLease, VideoAttachmentOpenError>
+    where
+        R: FnMut(&std::path::Path) -> bool,
+    {
+        self.prepare_with_storage(attachment, remove, materialize_temporary_video)
+    }
+
+    fn prepare_with_storage<R, M>(
+        &mut self,
+        attachment: &NativeAttachment,
+        mut remove: R,
+        mut materialize: M,
+    ) -> Result<VideoPlaybackLease, VideoAttachmentOpenError>
+    where
+        R: FnMut(&std::path::Path) -> bool,
+        M: FnMut(
+            &std::path::Path,
+            &std::path::Path,
+            &[u8],
+        ) -> Result<SystemTime, VideoMaterializationError>,
+    {
+        let extension = attachment.video_extension().ok_or_else(|| {
+            VideoAttachmentOpenError::Failed("unsupported video attachment type".to_string())
+        })?;
+        let identity = video_attachment_identity(extension, attachment.bytes());
+        self.pending_cleanup.retain(|path| !remove(path));
+        self.entries.retain(|entry| {
+            entry.active_leases > 0 || retained_video_is_usable(entry) || !remove(&entry.path)
+        });
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity == identity)
+        {
+            if !retained_video_is_usable(entry) {
+                return Err(VideoAttachmentOpenError::Failed(
+                    "stale temporary video could not be replaced".to_string(),
+                ));
+            }
+            entry.active_leases = entry.active_leases.checked_add(1).ok_or_else(|| {
+                VideoAttachmentOpenError::Failed(
+                    "video playback lease count overflowed".to_string(),
+                )
+            })?;
+            return Ok(VideoPlaybackLease {
+                path: entry.path.clone(),
+                identity,
+            });
+        }
+
+        // Do not accumulate more untracked disk usage while a prior partial
+        // materialization still cannot be removed.
+        if !self.pending_cleanup.is_empty() {
+            return Err(VideoAttachmentOpenError::Failed(
+                "temporary video cleanup is still pending".to_string(),
+            ));
+        }
+
+        let retained_bytes = self
+            .entries
+            .iter()
+            .try_fold(0usize, |total, entry| total.checked_add(entry.size))
+            .ok_or_else(|| {
+                VideoAttachmentOpenError::Failed("video playback cache size overflowed".to_string())
+            })?;
+        let next_bytes = retained_bytes
+            .checked_add(attachment.bytes().len())
+            .ok_or_else(|| {
+                VideoAttachmentOpenError::Failed("video playback cache size overflowed".to_string())
+            })?;
+        if self.entries.len() >= self.max_files || next_bytes > self.max_bytes {
+            return Err(VideoAttachmentOpenError::Capacity);
+        }
+
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let path = self
+            .directory
+            .path()
+            .join(format!("{sequence}.{extension}"));
+        let staging_path = self
+            .directory
+            .path()
+            .join(format!(".{sequence}.{extension}.part"));
+        let modified = match materialize(&staging_path, &path, attachment.bytes()) {
+            Ok(modified) => modified,
+            Err(failure) => {
+                if !remove(&failure.cleanup_path)
+                    && !self.pending_cleanup.contains(&failure.cleanup_path)
+                {
+                    self.pending_cleanup.push(failure.cleanup_path);
+                }
+                return Err(VideoAttachmentOpenError::Failed(failure.error.to_string()));
+            }
+        };
+        self.entries.push(VideoPlaybackCacheEntry {
+            path: path.clone(),
+            identity,
+            size: attachment.bytes().len(),
+            modified,
+            active_leases: 1,
+            launched: false,
+        });
+        Ok(VideoPlaybackLease { path, identity })
+    }
+
+    fn complete(
+        &mut self,
+        lease: VideoPlaybackLease,
+        result: Result<(), VideoAttachmentOpenError>,
+    ) -> Result<(), VideoAttachmentOpenError> {
+        let retain_path = result.is_ok();
+        self.complete_with_retention(lease, result, retain_path)
+    }
+
+    fn complete_with_retention(
+        &mut self,
+        lease: VideoPlaybackLease,
+        result: Result<(), VideoAttachmentOpenError>,
+        retain_path: bool,
+    ) -> Result<(), VideoAttachmentOpenError> {
+        self.complete_with_cleanup_and_retention(lease, result, retain_path, remove_temporary_video)
+    }
+
+    #[cfg(test)]
+    fn complete_with_cleanup<R>(
+        &mut self,
+        lease: VideoPlaybackLease,
+        result: Result<(), VideoAttachmentOpenError>,
+        remove: R,
+    ) -> Result<(), VideoAttachmentOpenError>
+    where
+        R: FnMut(&std::path::Path) -> bool,
+    {
+        let retain_path = result.is_ok();
+        self.complete_with_cleanup_and_retention(lease, result, retain_path, remove)
+    }
+
+    fn complete_with_cleanup_and_retention<R>(
+        &mut self,
+        lease: VideoPlaybackLease,
+        result: Result<(), VideoAttachmentOpenError>,
+        retain_path: bool,
+        mut remove: R,
+    ) -> Result<(), VideoAttachmentOpenError>
+    where
+        R: FnMut(&std::path::Path) -> bool,
+    {
+        let mut remove_failed_entry = false;
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity == lease.identity && entry.path == lease.path)
+        {
+            entry.active_leases = entry.active_leases.checked_sub(1).ok_or_else(|| {
+                VideoAttachmentOpenError::Failed(
+                    "video playback lease was already reconciled".to_string(),
+                )
+            })?;
+            if retain_path {
+                entry.launched = true;
+            } else {
+                remove_failed_entry = entry.active_leases == 0 && !entry.launched;
+            }
+        }
+        if remove_failed_entry && remove(&lease.path) {
+            self.entries.retain(|entry| entry.path != lease.path);
+        }
+        result
+    }
+}
+
+fn cleanup_stale_video_directories(parent: &std::path::Path) -> std::io::Result<()> {
+    cleanup_stale_video_directories_with_age(parent, STALE_VIDEO_DIRECTORY_MIN_AGE)
+}
+
+fn cleanup_stale_video_directories_with_age(
+    parent: &std::path::Path,
+    minimum_age: Duration,
+) -> std::io::Result<()> {
+    let mut inspected = 0usize;
+    for entry in std::fs::read_dir(parent)? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .is_some_and(|name| name.starts_with(VIDEO_PLAYBACK_DIRECTORY_PREFIX))
+            || !entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+        {
+            continue;
+        }
+        if inspected >= MAX_STALE_VIDEO_DIRECTORIES_PER_STARTUP {
+            break;
+        }
+        inspected += 1;
+
+        let old_enough = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age >= minimum_age);
+        if !old_enough {
+            continue;
+        }
+
+        let Ok(owner_lock) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path().join(VIDEO_PLAYBACK_OWNER_LOCK))
+        else {
+            // Directories created by versions without ownership locks are
+            // ambiguous and must not be removed while that version may run.
+            continue;
+        };
+        if !owner_lock.try_lock_exclusive().unwrap_or(false) {
+            continue;
+        }
+        drop(owner_lock);
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+    Ok(())
+}
+
+struct VideoPlaybackLeaseGuard {
+    cache: Arc<Mutex<VideoPlaybackCache>>,
+    lease: Option<VideoPlaybackLease>,
+}
+
+impl VideoPlaybackLeaseGuard {
+    fn new(cache: Arc<Mutex<VideoPlaybackCache>>, lease: VideoPlaybackLease) -> Self {
+        Self {
+            cache,
+            lease: Some(lease),
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.lease.as_ref().expect("unreconciled lease").path
+    }
+
+    fn complete(
+        mut self,
+        result: Result<(), VideoAttachmentOpenError>,
+        retain_path: bool,
+    ) -> Result<(), VideoAttachmentOpenError> {
+        let cache = Arc::clone(&self.cache);
+        let mut cache = cache.lock().map_err(|_| {
+            VideoAttachmentOpenError::Failed("video playback cache is unavailable".to_string())
+        })?;
+        let lease = self.lease.take().expect("unreconciled lease");
+        cache.complete_with_retention(lease, result, retain_path)
+    }
+}
+
+impl Drop for VideoPlaybackLeaseGuard {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = cache.complete(
+            lease,
+            Err(VideoAttachmentOpenError::Failed(
+                "video playback request was cancelled".to_string(),
+            )),
+        );
+    }
+}
+
+async fn open_video_attachment(
+    cache: Arc<Mutex<VideoPlaybackCache>>,
+    attachment: NativeAttachment,
+) -> Result<(), VideoAttachmentOpenError> {
+    open_video_attachment_with(cache, attachment, |path| async move {
+        opener::open_confirmed(path).await.map_err(Into::into)
+    })
+    .await
+}
+
+async fn open_video_attachment_with<F, Fut>(
+    cache: Arc<Mutex<VideoPlaybackCache>>,
+    attachment: NativeAttachment,
+    open: F,
+) -> Result<(), VideoAttachmentOpenError>
+where
+    F: FnOnce(PathBuf) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), VideoPlaybackOpenError>> + Send + 'static,
+{
+    // The launcher, not the HTTP request, owns the playback lease. Dropping a
+    // disconnected request detaches this task; it does not reclaim the file
+    // while a blocking system launcher may still consume its path.
+    tokio::spawn(drive_video_attachment(cache, attachment, open))
+        .await
+        .map_err(|_| {
+            VideoAttachmentOpenError::Failed("video playback worker was interrupted".to_string())
+        })?
+}
+
+async fn drive_video_attachment<F, Fut>(
+    cache: Arc<Mutex<VideoPlaybackCache>>,
+    attachment: NativeAttachment,
+    open: F,
+) -> Result<(), VideoAttachmentOpenError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = Result<(), VideoPlaybackOpenError>>,
+{
+    let lease = {
+        let mut cache = cache.lock().map_err(|_| {
+            VideoAttachmentOpenError::Failed("video playback cache is unavailable".to_string())
+        })?;
+        cache.prepare(&attachment)?
+    };
+    let lease = VideoPlaybackLeaseGuard::new(cache, lease);
+    let opened = open(lease.path().to_owned()).await;
+    let retain_path = opened.is_ok() || opened.as_ref().is_err_and(|error| error.retain_path);
+    let result = opened.map_err(|error| VideoAttachmentOpenError::Failed(error.message));
+    lease.complete(result, retain_path)
+}
+
+fn materialize_temporary_video(
+    staging_path: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<SystemTime, VideoMaterializationError> {
+    std::fs::write(staging_path, bytes).map_err(|error| VideoMaterializationError {
+        error,
+        cleanup_path: staging_path.to_owned(),
+    })?;
+    std::fs::rename(staging_path, path).map_err(|error| VideoMaterializationError {
+        error,
+        cleanup_path: staging_path.to_owned(),
+    })?;
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| VideoMaterializationError {
+            error,
+            cleanup_path: path.to_owned(),
+        })
+}
+
+fn retained_video_is_usable(entry: &VideoPlaybackCacheEntry) -> bool {
+    File::open(&entry.path)
+        .and_then(|file| file.metadata())
+        .is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.len() == entry.size as u64
+                && metadata
+                    .modified()
+                    .is_ok_and(|modified| modified == entry.modified)
+        })
+}
+
+fn video_attachment_identity(extension: &str, bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((extension.len() as u64).to_le_bytes());
+    hasher.update(extension.as_bytes());
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn remove_temporary_video(path: &std::path::Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
 
 #[derive(Debug, Default)]
 struct CloseConfirmationWatchdog {
@@ -235,6 +759,8 @@ pub(crate) fn run(
     let sleep_inhibitor = Arc::new(Mutex::new(sleep::SleepInhibitor::default()));
     let pending_update_relaunch = Arc::new(startup::UpdateRelaunchHandoff::default());
     let sleep_for_action = sleep_inhibitor.clone();
+    let video_playback_cache = Arc::new(Mutex::new(VideoPlaybackCache::new()?));
+    let video_playback_cache_for_action = Arc::clone(&video_playback_cache);
     let mut native_actions = HostNativeActions::default()
         .with_window_geometry()
         // Tao exposes focus and foreground transitions but no desktop
@@ -305,6 +831,9 @@ pub(crate) fn run(
                 .await
                 .map_err(|_| "desktop clipboard worker was interrupted".to_string())?
         })
+        .with_video_attachment_opener(move |attachment| {
+            open_video_attachment(Arc::clone(&video_playback_cache_for_action), attachment)
+        })
         .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
     if product_host && trouve_update::self_update_enabled() && startup.self_update_available {
         // Preserve the installed pathname before a runtime update replaces it.
@@ -325,14 +854,14 @@ pub(crate) fn run(
                 let updates = check_updates.clone();
                 async move { Ok(updates.check().await) }
             },
-            move || {
+            move |operation_id| {
                 let updates = install_updates.clone();
                 let quit_proxy = quit_proxy.clone();
                 let pending_update_relaunch =
                     Arc::clone(&pending_update_relaunch_for_action);
                 let update_executable = update_executable_for_action.clone();
                 async move {
-                    let mut state = updates.install_and_restart().await;
+                    let mut state = updates.install_and_restart(operation_id).await;
                     if state.phase == trouve_desktop_host::DesktopUpdatePhase::Restarting
                         && let Some(version) = state.available_version.clone()
                     {
@@ -348,11 +877,16 @@ pub(crate) fn run(
                             }
                             Ok(Err(error)) => {
                                 tracing::error!(%error, %version, "preparing restart after desktop update failed");
-                                state = updates.restart_failed(&version, &format!("{error:#}"));
+                                state = updates.restart_failed(
+                                    state.operation_id,
+                                    &version,
+                                    &format!("{error:#}"),
+                                );
                             }
                             Err(error) => {
                                 tracing::error!(%error, %version, "desktop update relaunch worker was interrupted");
                                 state = updates.restart_failed(
+                                    state.operation_id,
                                     &version,
                                     &format!("relaunch worker was interrupted: {error}"),
                                 );
@@ -805,6 +1339,318 @@ fn read_clipboard_image_attachment() -> Result<Option<NativeAttachment>, String>
 #[cfg(test)]
 mod close_confirmation_tests {
     use super::*;
+
+    fn video_attachment(name: &str, bytes: &[u8]) -> NativeAttachment {
+        NativeAttachment::new(name, "video/mp4", bytes.to_vec()).unwrap()
+    }
+
+    fn video_file_count(directory: &std::path::Path) -> usize {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != VIDEO_PLAYBACK_OWNER_LOCK)
+            .count()
+    }
+
+    #[test]
+    fn video_playback_startup_removes_stale_owned_directories_only() {
+        let parent = tempfile::tempdir().unwrap();
+        let active =
+            VideoPlaybackCache::with_limits_in(parent.path(), 2, MAX_NATIVE_ATTACHMENT_BYTES)
+                .unwrap();
+        let active_path = active.directory.path().to_owned();
+        let stale_path = parent.path().join("trouve-video-stale");
+        std::fs::create_dir(&stale_path).unwrap();
+        File::create(stale_path.join(VIDEO_PLAYBACK_OWNER_LOCK)).unwrap();
+        let legacy_path = parent.path().join("trouve-video-legacy");
+        std::fs::create_dir(&legacy_path).unwrap();
+
+        cleanup_stale_video_directories(parent.path()).unwrap();
+        assert!(stale_path.exists());
+        cleanup_stale_video_directories_with_age(parent.path(), Duration::ZERO).unwrap();
+        let replacement =
+            VideoPlaybackCache::with_limits_in(parent.path(), 2, MAX_NATIVE_ATTACHMENT_BYTES)
+                .unwrap();
+
+        assert!(active_path.exists());
+        assert!(!stale_path.exists());
+        assert!(legacy_path.exists());
+        assert_ne!(replacement.directory.path(), active_path);
+    }
+
+    #[test]
+    fn video_playback_cache_reuses_identical_attachments() {
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        let attachment = video_attachment("demo.mp4", b"video");
+        let mut opened = Vec::new();
+
+        cache
+            .open_with(&attachment, |path| {
+                opened.push(path.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        cache
+            .open_with(&attachment, |path| {
+                opened.push(path.to_owned());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(opened.len(), 2);
+        assert_eq!(opened[0], opened[1]);
+    }
+
+    #[test]
+    fn video_playback_cache_removes_failed_new_launches() {
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        let attachment = video_attachment("demo.mp4", b"video");
+
+        assert_eq!(
+            cache.open_with(&attachment, |_| Err("no system player".into())),
+            Err(VideoAttachmentOpenError::Failed("no system player".into()))
+        );
+        assert!(cache.entries.is_empty());
+        assert_eq!(video_file_count(cache.directory.path()), 0);
+    }
+
+    #[test]
+    fn video_playback_cache_retries_partial_materialization_cleanup() {
+        for fail_after_final_name in [false, true] {
+            let mut cache =
+                VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+            let attachment = video_attachment("demo.mp4", b"video");
+            let result = cache.prepare_with_storage(
+                &attachment,
+                |_| false,
+                |staging_path, path, _| {
+                    let cleanup_path = if fail_after_final_name {
+                        std::fs::write(path, b"partial metadata result").unwrap();
+                        path
+                    } else {
+                        std::fs::write(staging_path, b"partial write").unwrap();
+                        staging_path
+                    };
+                    Err(VideoMaterializationError {
+                        error: std::io::Error::other("injected materialization failure"),
+                        cleanup_path: cleanup_path.to_owned(),
+                    })
+                },
+            );
+
+            assert_eq!(
+                result.unwrap_err(),
+                VideoAttachmentOpenError::Failed("injected materialization failure".into())
+            );
+            assert_eq!(cache.pending_cleanup.len(), 1);
+            assert_eq!(video_file_count(cache.directory.path()), 1);
+            assert_eq!(
+                cache
+                    .prepare_with_storage(
+                        &attachment,
+                        |_| false,
+                        |_, _, _| panic!("materialization must wait for cleanup"),
+                    )
+                    .unwrap_err(),
+                VideoAttachmentOpenError::Failed("temporary video cleanup is still pending".into(),)
+            );
+            assert_eq!(video_file_count(cache.directory.path()), 1);
+
+            let lease = cache.prepare(&attachment).unwrap();
+            cache.complete(lease, Ok(())).unwrap();
+            assert!(cache.pending_cleanup.is_empty());
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(video_file_count(cache.directory.path()), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_video_request_leaves_lease_with_the_launcher() {
+        let cache = Arc::new(Mutex::new(
+            VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap(),
+        ));
+        let attachment = video_attachment("cancelled.mp4", b"cancelled");
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let task_cache = Arc::clone(&cache);
+        let task = tokio::spawn(async move {
+            open_video_attachment_with(task_cache, attachment, move |_| async move {
+                let _ = started.send(());
+                let _ = release_rx.await;
+                Err(VideoPlaybackOpenError::from(
+                    "cancelled test launcher".to_string(),
+                ))
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        {
+            let cache = cache.lock().unwrap();
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.entries[0].active_leases, 1);
+            assert!(cache.entries[0].path.exists());
+        }
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cache.lock().unwrap().entries.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(video_file_count(cache.lock().unwrap().directory.path()), 0);
+
+        open_video_attachment_with(
+            Arc::clone(&cache),
+            video_attachment("replacement.mp4", b"replacement"),
+            |_| async { Ok::<(), VideoPlaybackOpenError>(()) },
+        )
+        .await
+        .unwrap();
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].active_leases, 0);
+        assert!(cache.entries[0].launched);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_launcher_failure_retains_the_cache_path() {
+        let cache = Arc::new(Mutex::new(
+            VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap(),
+        ));
+        let result = open_video_attachment_with(
+            Arc::clone(&cache),
+            video_attachment("ambiguous.mp4", b"ambiguous"),
+            |_| async {
+                Err(VideoPlaybackOpenError {
+                    message: "launcher state is ambiguous".into(),
+                    retain_path: true,
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(VideoAttachmentOpenError::Failed(
+                "launcher state is ambiguous".into(),
+            ))
+        );
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].active_leases, 0);
+        assert!(cache.entries[0].launched);
+        assert!(cache.entries[0].path.exists());
+    }
+
+    #[test]
+    fn video_playback_leases_keep_shared_launches_alive_until_reconciled() {
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        let attachment = video_attachment("demo.mp4", b"video");
+        let failed_lease = cache.prepare(&attachment).unwrap();
+        let successful_lease = cache.prepare(&attachment).unwrap();
+
+        assert_eq!(failed_lease.path, successful_lease.path);
+        assert_eq!(cache.entries[0].active_leases, 2);
+        assert_eq!(
+            cache.complete(
+                failed_lease,
+                Err(VideoAttachmentOpenError::Failed("no player".into())),
+            ),
+            Err(VideoAttachmentOpenError::Failed("no player".into()))
+        );
+        assert_eq!(cache.entries[0].active_leases, 1);
+        assert!(cache.entries[0].path.exists());
+
+        cache.complete(successful_lease, Ok(())).unwrap();
+        assert_eq!(cache.entries[0].active_leases, 0);
+        assert!(cache.entries[0].launched);
+        assert!(cache.entries[0].path.exists());
+    }
+
+    #[test]
+    fn video_playback_cache_bounds_distinct_retained_files() {
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        for bytes in [b"first".as_slice(), b"second".as_slice()] {
+            cache
+                .open_with(&video_attachment("demo.mp4", bytes), |_| Ok(()))
+                .unwrap();
+        }
+
+        assert!(
+            cache
+                .open_with(&video_attachment("demo.mp4", b"third"), |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(video_file_count(cache.directory.path()), 2);
+    }
+
+    #[test]
+    fn video_playback_cache_retains_successful_files_for_the_host_lifetime() {
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        cache
+            .open_with(&video_attachment("first.mp4", b"first"), |_| Ok(()))
+            .unwrap();
+        let first_path = cache.entries[0].path.clone();
+        cache
+            .open_with(&video_attachment("second.mp4", b"second"), |_| Ok(()))
+            .unwrap();
+
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(std::fs::read(first_path).unwrap(), b"first");
+    }
+
+    #[test]
+    fn video_playback_cache_rematerializes_a_deleted_retained_file() {
+        let mut cache = VideoPlaybackCache::with_limits(2, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        let attachment = video_attachment("demo.mp4", b"video");
+        cache.open_with(&attachment, |_| Ok(())).unwrap();
+        let stale_path = cache.entries[0].path.clone();
+        std::fs::remove_file(&stale_path).unwrap();
+
+        let mut reopened_path = None;
+        cache
+            .open_with(&attachment, |path| {
+                reopened_path = Some(path.to_owned());
+                Ok(())
+            })
+            .unwrap();
+
+        let reopened_path = reopened_path.unwrap();
+        assert_ne!(reopened_path, stale_path);
+        assert_eq!(std::fs::read(reopened_path).unwrap(), b"video");
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn video_playback_cache_retries_stale_cleanup_before_capacity_checks() {
+        let mut cache = VideoPlaybackCache::with_limits(1, MAX_NATIVE_ATTACHMENT_BYTES).unwrap();
+        cache
+            .open_with(&video_attachment("first.mp4", b"first"), |_| Ok(()))
+            .unwrap();
+        let stale_path = cache.entries[0].path.clone();
+        std::fs::write(&stale_path, b"changed length").unwrap();
+        let second = video_attachment("second.mp4", b"second");
+
+        assert_eq!(
+            cache.open_with_cleanup(&second, |_| Ok(()), |_| false),
+            Err(VideoAttachmentOpenError::Capacity)
+        );
+        cache.open_with(&second, |_| Ok(())).unwrap();
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(std::fs::read(&cache.entries[0].path).unwrap(), b"second");
+        assert_ne!(cache.entries[0].path, stale_path);
+    }
 
     #[test]
     fn optimized_qualification_hosts_allow_runtime_frontend_sources() {

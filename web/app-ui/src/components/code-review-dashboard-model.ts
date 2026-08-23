@@ -21,6 +21,7 @@ export interface ReviewJobSummary {
   readonly repository: string;
   readonly status: string;
   readonly created_at: string;
+  readonly open_issue_count?: number | null;
 }
 
 export interface ReviewJobGroup<T extends ReviewJobSummary = ReviewJobSummary> {
@@ -230,6 +231,12 @@ export const codeReviewStatusLabel = (status: string): string => {
     ? "Unknown"
     : `${normalized[0]?.toUpperCase() ?? ""}${normalized.slice(1)}`;
 };
+
+export const codeReviewNeedsAttention = (
+  job: Pick<ReviewJobSummary, "status" | "open_issue_count">,
+): boolean =>
+  job.status === "succeeded" &&
+  job.open_issue_count !== 0;
 
 /** Only absolute, credential-free HTTPS links may cross the native boundary. */
 export const safeCodeReviewHref = (value: string | null | undefined): string | undefined => {

@@ -12,7 +12,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "4.0.0"
+version = "4.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/jimsimon/trouve"
@@ -58,17 +58,17 @@ xattr = "1.6.1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
 # Internal crates
-trouve-protocol = { path = "crates/trouve-protocol", version = "4.0.0" }
-trouve-search = { path = "crates/trouve-search", version = "4.0.0" }
-trouve-agents = { path = "crates/trouve-agents", version = "4.0.0" }
-trouve-core = { path = "crates/trouve-core", version = "4.0.0" }
-trouve-providers = { path = "crates/trouve-providers", version = "4.0.0" }
-trouve-server = { path = "crates/trouve-server", version = "4.0.0" }
-trouve-client-core = { path = "crates/trouve-client-core", version = "4.0.0" }
-trouve-thread-view = { path = "crates/trouve-thread-view", version = "4.0.0" }
-trouve-desktop-host = { path = "crates/trouve-desktop-host", version = "4.0.0" }
-trouve-process = { path = "crates/trouve-process", version = "4.0.0" }
-trouve-update = { path = "crates/trouve-update", version = "4.0.0" }
+trouve-protocol = { path = "crates/trouve-protocol", version = "4.1.0" }
+trouve-search = { path = "crates/trouve-search", version = "4.1.0" }
+trouve-agents = { path = "crates/trouve-agents", version = "4.1.0" }
+trouve-core = { path = "crates/trouve-core", version = "4.1.0" }
+trouve-providers = { path = "crates/trouve-providers", version = "4.1.0" }
+trouve-server = { path = "crates/trouve-server", version = "4.1.0" }
+trouve-client-core = { path = "crates/trouve-client-core", version = "4.1.0" }
+trouve-thread-view = { path = "crates/trouve-thread-view", version = "4.1.0" }
+trouve-desktop-host = { path = "crates/trouve-desktop-host", version = "4.1.0" }
+trouve-process = { path = "crates/trouve-process", version = "4.1.0" }
+trouve-update = { path = "crates/trouve-update", version = "4.1.0" }
 
 [profile.release]
 lto = "thin"

@@ -80,12 +80,9 @@ const DESKTOP_UPDATE_IDLE_POLL_MS = 30_000;
 const DESKTOP_UPDATE_RECONCILIATION_MAX_BACKOFF_EXPONENT = 6;
 
 export const desktopUpdateConfirmsInstallAction = (
-  baseline: DesktopUpdateState | undefined,
+  operationId: number,
   state: DesktopUpdateState,
-): boolean => desktopUpdateIsBusy(state)
-  || baseline === undefined
-  || state.phase !== baseline.phase
-  || state.message !== baseline.message;
+): boolean => state.operationId === operationId;
 
 export const desktopUpdatePollIntervalMs = (
   state: DesktopUpdateState | undefined,
@@ -140,7 +137,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
   #desktopUpdateGeneration = 0;
   #desktopUpdateInitialAttempted = false;
   #desktopUpdateInstallReconciliation: {
-    baseline: DesktopUpdateState | undefined;
+    operationId: number;
     attempt: number;
   } | undefined;
 
@@ -214,7 +211,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       let installReconciliationAttempt: number | undefined;
       const reconciliation = this.#desktopUpdateInstallReconciliation;
       if (reconciliation !== undefined) {
-        if (desktopUpdateConfirmsInstallAction(reconciliation.baseline, state)) {
+        if (desktopUpdateConfirmsInstallAction(reconciliation.operationId, state)) {
           this.#desktopUpdateInstallReconciliation = undefined;
           this.#desktopUpdateState = state;
         } else {
@@ -264,12 +261,6 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     this.#desktopUpdateGeneration += 1;
     const actionGeneration = this.#desktopUpdateGeneration;
     this.#desktopUpdateActionPending = true;
-    if (installing) {
-      this.#desktopUpdateInstallReconciliation = {
-        baseline: this.#desktopUpdateState,
-        attempt: 0,
-      };
-    }
     this.#desktopUpdateError = "";
     this.#startDesktopUpdatePolling(DESKTOP_UPDATE_BUSY_POLL_MS);
     this.requestUpdate();
@@ -281,6 +272,12 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
       this.#desktopUpdateGeneration += 1;
       completionGeneration = this.#desktopUpdateGeneration;
       this.#desktopUpdateState = state;
+      if (installing && state.operationId !== undefined) {
+        this.#desktopUpdateInstallReconciliation = {
+          operationId: state.operationId,
+          attempt: 0,
+        };
+      }
       // Install POST acknowledges a host-owned background operation. Poll the
       // authoritative status immediately even if its first snapshot still
       // shows the previously available release.
@@ -803,6 +800,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                                 ["Open local files", currentCapabilities.openLocalFile],
                                 ["Reveal local files", currentCapabilities.revealLocalFile],
                                 ["Open HTTPS links", currentCapabilities.openHttpsUrl],
+                                ["Open videos externally", currentCapabilities.openVideoAttachment],
                                 ["Native notifications", currentCapabilities.nativeNotifications],
                                 ["Web notifications", currentCapabilities.webNotifications],
                                 ["Request user attention", currentCapabilities.userAttention],

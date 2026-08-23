@@ -1120,7 +1120,7 @@ impl UpdateManager {
         }
     }
 
-    pub async fn install_and_restart(&self) -> DesktopUpdateState {
+    pub async fn install_and_restart(&self, operation_id: u64) -> DesktopUpdateState {
         let cancellation = Arc::new(trouve_update::InstallCancellation::default());
         let restart_handoff_abandoned = Arc::new(AtomicBool::new(false));
         let manager = self.clone();
@@ -1131,7 +1131,11 @@ impl UpdateManager {
         match await_runtime_install(
             async move {
                 manager
-                    .install_and_restart_inner(install_cancellation, install_restart_handoff)
+                    .install_and_restart_inner(
+                        operation_id,
+                        install_cancellation,
+                        install_restart_handoff,
+                    )
                     .await
             },
             move || watchdog_cancellation.request_cancel(),
@@ -1143,18 +1147,43 @@ impl UpdateManager {
         .await
         {
             RuntimeInstallOutcome::Completed(update) => update,
-            RuntimeInstallOutcome::PreCommitTimedOut => {
-                let update = state(
-                    DesktopUpdatePhase::Error,
+            RuntimeInstallOutcome::PreCommitCancelling(recovery) => {
+                // Cancellation-aware blocking work still owns the update lock
+                // and staging directory. Keep the operation nonterminal until
+                // that worker exits and publishes its authoritative result.
+                let update = operation_state(
+                    operation_id,
+                    DesktopUpdatePhase::Installing,
                     self.available_version(),
-                    "Update installation stopped after exceeding its time limit. You can try again without leaving the app.",
+                    "Update installation exceeded its time limit and is still stopping safely. Wait before trying again.",
                     None,
                 );
                 self.set_state(update.clone());
+                let manager = self.clone();
+                tokio::spawn(async move {
+                    let terminal = match recovery.await {
+                        Ok(update) => update,
+                        Err(error) => operation_state(
+                            operation_id,
+                            DesktopUpdatePhase::Error,
+                            manager.available_version(),
+                            &format!(
+                                "Update installation stopped unexpectedly: {}",
+                                concise_error(&error.to_string())
+                            ),
+                            None,
+                        ),
+                    };
+                    // The watchdog publishes the nonterminal handoff before
+                    // this observer runs, so the final worker result always
+                    // wins even when blocking cleanup finished at the boundary.
+                    manager.set_state(terminal);
+                });
                 update
             }
             RuntimeInstallOutcome::PostCommitTimedOut => {
-                let update = state(
+                let update = operation_state(
+                    operation_id,
                     DesktopUpdatePhase::Error,
                     self.available_version(),
                     "The update replaced, or may have replaced, the executable but did not finish reporting before restart. Keep using this window and restart trouve manually after the update operation settles.",
@@ -1164,7 +1193,8 @@ impl UpdateManager {
                 update
             }
             RuntimeInstallOutcome::TaskFailed(error) => {
-                let update = state(
+                let update = operation_state(
+                    operation_id,
                     DesktopUpdatePhase::Error,
                     self.available_version(),
                     &format!(
@@ -1181,6 +1211,7 @@ impl UpdateManager {
 
     async fn install_and_restart_inner(
         &self,
+        operation_id: u64,
         cancellation: Arc<trouve_update::InstallCancellation>,
         restart_handoff_abandoned: Arc<AtomicBool>,
     ) -> DesktopUpdateState {
@@ -1206,14 +1237,21 @@ impl UpdateManager {
             move |progress| {
                 let (phase, message, percent) =
                     runtime_install_stage(&version, &artifact, progress);
-                progress_manager.set_state(state(phase, Some(version.clone()), &message, percent));
+                progress_manager.set_state(operation_state(
+                    operation_id,
+                    phase,
+                    Some(version.clone()),
+                    &message,
+                    percent,
+                ));
             },
             cancellation,
         )
         .await;
 
         if let Err(error) = install {
-            let update = state(
+            let update = operation_state(
+                operation_id,
                 DesktopUpdatePhase::Error,
                 Some(release.version.to_string()),
                 &format!(
@@ -1228,7 +1266,8 @@ impl UpdateManager {
 
         let version = release.version.to_string();
         let update = if restart_handoff_abandoned.load(Ordering::Acquire) {
-            state(
+            operation_state(
+                operation_id,
                 DesktopUpdatePhase::Error,
                 Some(version.clone()),
                 &format!(
@@ -1237,7 +1276,8 @@ impl UpdateManager {
                 Some(100),
             )
         } else {
-            state(
+            operation_state(
+                operation_id,
                 DesktopUpdatePhase::Restarting,
                 Some(version.clone()),
                 &format!("Version {version} is installed. Restarting…"),
@@ -1248,8 +1288,13 @@ impl UpdateManager {
         update
     }
 
-    pub fn restart_failed(&self, version: &str, error: &str) -> DesktopUpdateState {
-        let update = state(
+    pub fn restart_failed(
+        &self,
+        operation_id: Option<u64>,
+        version: &str,
+        error: &str,
+    ) -> DesktopUpdateState {
+        let mut update = state(
             DesktopUpdatePhase::Error,
             Some(version.to_string()),
             &format!(
@@ -1258,6 +1303,7 @@ impl UpdateManager {
             ),
             None,
         );
+        update.operation_id = operation_id;
         self.set_state(update.clone());
         update
     }
@@ -1317,7 +1363,7 @@ impl UpdateManager {
 
 enum RuntimeInstallOutcome<T> {
     Completed(T),
-    PreCommitTimedOut,
+    PreCommitCancelling(tokio::task::JoinHandle<T>),
     PostCommitTimedOut,
     TaskFailed(String),
 }
@@ -1364,12 +1410,12 @@ where
             match tokio::time::timeout(cancellation_grace, &mut install).await {
                 Ok(update) => runtime_install_join_result(update),
                 Err(_) => {
-                    // Cancellation is still reversible, so do not detach a
-                    // worker that could retain the action lock or overwrite
-                    // the retry state after this request returns.
-                    install.abort();
-                    let _ = install.await;
-                    RuntimeInstallOutcome::PreCommitTimedOut
+                    // A spawned blocking child cannot be aborted with its
+                    // async parent. Detach the complete operation so it keeps
+                    // the action lock and staging ownership until every
+                    // cancellation-aware child has exited. The caller keeps
+                    // status nonterminal until that worker publishes a result.
+                    RuntimeInstallOutcome::PreCommitCancelling(install)
                 }
             }
         }
@@ -1449,10 +1495,23 @@ fn state(
     DesktopUpdateState {
         current_version: env!("CARGO_PKG_VERSION").into(),
         available_version,
+        operation_id: None,
         phase,
         message: concise_error(message),
         progress_percent,
     }
+}
+
+fn operation_state(
+    operation_id: u64,
+    phase: DesktopUpdatePhase,
+    available_version: Option<String>,
+    message: &str,
+    progress_percent: Option<u8>,
+) -> DesktopUpdateState {
+    let mut state = state(phase, available_version, message, progress_percent);
+    state.operation_id = Some(operation_id);
+    state
 }
 
 fn idle_state(message: &str) -> DesktopUpdateState {
@@ -1679,15 +1738,16 @@ mod tests {
     #[test]
     fn failed_runtime_restart_keeps_a_recoverable_update_state() {
         let manager = UpdateManager::new(idle_state("ready"));
-        let update = manager.restart_failed("4.1.0", "spawn failed");
+        let update = manager.restart_failed(Some(7), "4.1.0", "spawn failed");
         assert_eq!(update.phase, DesktopUpdatePhase::Error);
+        assert_eq!(update.operation_id, Some(7));
         assert_eq!(update.available_version.as_deref(), Some("4.1.0"));
         assert!(update.message.contains("Keep using this window"));
         assert_eq!(manager.status(), update);
     }
 
     #[tokio::test]
-    async fn runtime_install_watchdog_cancels_a_stalled_precommit_operation() {
+    async fn runtime_install_watchdog_retains_precommit_blocking_work_until_it_stops() {
         struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
         impl Drop for DropSignal {
             fn drop(&mut self) {
@@ -1699,26 +1759,53 @@ mod tests {
 
         let cancellation = Arc::new(trouve_update::InstallCancellation::default());
         let watchdog_cancellation = Arc::clone(&cancellation);
-        let (dropped, wait_for_drop) = tokio::sync::oneshot::channel();
+        let (blocking_started, wait_for_blocking_start) = tokio::sync::oneshot::channel();
+        let (release_blocking, wait_for_blocking_release) = std::sync::mpsc::channel();
+        let (completed, wait_for_completion) = tokio::sync::oneshot::channel();
+        let (dropped, mut wait_for_drop) = tokio::sync::oneshot::channel();
         let drop_signal = DropSignal(Some(dropped));
         let result = await_runtime_install(
             async move {
                 let _drop_signal = drop_signal;
-                std::future::pending::<()>().await;
+                tokio::task::spawn_blocking(move || {
+                    let _ = blocking_started.send(());
+                    let _ = wait_for_blocking_release.recv();
+                })
+                .await
+                .unwrap();
+                let _ = completed.send(());
             },
             move || watchdog_cancellation.request_cancel(),
             Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(5),
+            Duration::from_millis(50),
             Duration::from_millis(5),
             Duration::from_millis(5),
         )
         .await;
-        assert!(matches!(result, RuntimeInstallOutcome::PreCommitTimedOut));
+        let RuntimeInstallOutcome::PreCommitCancelling(recovery) = result else {
+            panic!("expected detached pre-commit recovery ownership");
+        };
         assert!(cancellation.is_cancelled());
+        wait_for_blocking_start
+            .await
+            .expect("blocking child did not start");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut wait_for_drop)
+                .await
+                .is_err(),
+            "pre-commit operation released ownership before its blocking child stopped"
+        );
+
+        release_blocking.send(()).unwrap();
+        recovery.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), wait_for_completion)
+            .await
+            .expect("detached pre-commit operation did not finish")
+            .expect("detached pre-commit operation dropped its completion signal");
         tokio::time::timeout(Duration::from_secs(1), wait_for_drop)
             .await
-            .expect("pre-commit worker was not drained")
-            .expect("pre-commit worker dropped without its drain signal");
+            .expect("pre-commit operation retained ownership after completion")
+            .expect("pre-commit operation dropped without its ownership signal");
     }
 
     #[tokio::test]

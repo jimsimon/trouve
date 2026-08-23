@@ -30,6 +30,8 @@ const MIN_REVALIDATE_INTERVAL: Duration = Duration::from_millis(250);
 
 const REPO_DESCRIPTION: &str = "A local directory path to index and search. The index is \
     cached after the first call, so repeat queries are fast.";
+const CONTENT_DESCRIPTION: &str = "What to search: code, docs (documentation and prose), \
+    config (YAML/TOML/etc.), or all. Omit to use the server's configured content.";
 
 const INSTRUCTIONS: &str = "Instant code search for any local git repository. Call \
     `search` once with a focused query, it returns the file path and exact line. Navigate \
@@ -78,45 +80,70 @@ fn index_is_fresh(index: &BuiltIndex) -> bool {
 
 /// LRU cache of built indexes, re-validated after a cooldown. Internally
 /// synchronized: the map-level lock is held only for entry lookup, insert,
-/// and eviction, and each repo has its own entry lock, so sessions touching
-/// different repos never serialize on each other's builds or searches.
+/// and eviction, and each repo/content pair has its own entry lock, so
+/// sessions touching different index variants never serialize on each
+/// other's builds or searches.
 /// Public so embedders (e.g. the trouve harness's native tools) can share
 /// one cache across in-process [`call_tool`] invocations.
-pub struct IndexCache {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    repo: String,
     content: Vec<ContentType>,
-    entries: Mutex<HashMap<String, Arc<RepoEntry>>>,
+}
+
+pub struct IndexCache {
+    default_content: Vec<ContentType>,
+    entries: Mutex<HashMap<CacheKey, Arc<RepoEntry>>>,
     shared_indexes: Mutex<HashMap<crate::index::IndexIdentity, Weak<TrouveIndex>>>,
     max_heap_bytes: usize,
+}
+
+fn normalized_content(content: &[ContentType]) -> Vec<ContentType> {
+    let mut content = content.to_vec();
+    if content.is_empty() {
+        content.push(ContentType::Code);
+    }
+    content.sort_unstable();
+    content.dedup();
+    content
 }
 
 impl IndexCache {
     pub fn new(content: Vec<ContentType>) -> IndexCache {
         IndexCache {
-            content,
+            default_content: normalized_content(&content),
             entries: Mutex::new(HashMap::new()),
             shared_indexes: Mutex::new(HashMap::new()),
             max_heap_bytes: CACHE_MAX_HEAP_BYTES,
         }
     }
 
-    fn cache_key(&self, repo: &str) -> String {
-        PathBuf::from(repo)
+    fn cache_key(&self, repo: &str, content: &[ContentType]) -> CacheKey {
+        let repo = PathBuf::from(repo)
             .canonicalize()
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| repo.to_string())
+            .unwrap_or_else(|_| repo.to_string());
+        CacheKey {
+            repo,
+            content: normalized_content(content),
+        }
     }
 
-    /// Look up or create the repo's entry, holding the map lock only for
-    /// that. Eviction removes the LRU entry from the map; in-flight calls
+    /// Look up or create the repo/content entry, holding the map lock only
+    /// for that. Eviction removes the LRU entry from the map; in-flight calls
     /// keep their `Arc` alive until they finish.
-    fn entry(&self, repo: &str) -> Result<(String, Arc<RepoEntry>), String> {
+    fn entry(
+        &self,
+        repo: &str,
+        content: &[ContentType],
+    ) -> Result<(CacheKey, Arc<RepoEntry>), String> {
         if is_git_url(repo) {
             return Err(format!(
                 "Remote git URLs are not supported; only local directory paths are accepted as \
                  `repo`. Clone the repository and pass the local path. Got: {repo:?}"
             ));
         }
-        let key = self.cache_key(repo);
+        let key = self.cache_key(repo, content);
         let mut entries = lock_unpoisoned(&self.entries);
         if let Some(entry) = entries.get(&key) {
             *lock_unpoisoned(&entry.last_used) = Instant::now();
@@ -187,8 +214,13 @@ impl IndexCache {
     /// if needed. Fresh-index queries share a read lock; only incremental
     /// revalidation is exclusive, so parallel tool calls against one repo do
     /// not queue behind each other after the initial build.
-    fn with_index<R>(&self, repo: &str, f: impl FnOnce(&TrouveIndex) -> R) -> Result<R, String> {
-        let (_, entry) = self.entry(repo)?;
+    fn with_index<R>(
+        &self,
+        repo: &str,
+        content: &[ContentType],
+        f: impl FnOnce(&TrouveIndex) -> R,
+    ) -> Result<R, String> {
+        let (key, entry) = self.entry(repo, content)?;
         let mut f = Some(f);
         let mut rebuilt = false;
         let result = (|| {
@@ -207,7 +239,7 @@ impl IndexCache {
                 // waited for the write lock.
                 if !built.as_ref().is_some_and(index_is_fresh) {
                     let start = Instant::now();
-                    let index = TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
+                    let index = TrouveIndex::from_path(&PathBuf::from(repo), &key.content, None)
                         .map_err(|e| format!("Failed to index {repo:?}: {e}"))?;
                     let index = self.intern_index(index);
                     *built = Some(BuiltIndex {
@@ -239,7 +271,7 @@ impl IndexCache {
     }
 }
 
-fn retained_heap_bytes(entries: &HashMap<String, Arc<RepoEntry>>) -> usize {
+fn retained_heap_bytes(entries: &HashMap<CacheKey, Arc<RepoEntry>>) -> usize {
     let mut unique = HashMap::<usize, usize>::new();
     for entry in entries.values() {
         if let Some(built) = read_unpoisoned(&entry.built).as_ref() {
@@ -273,7 +305,8 @@ fn tool_definitions() -> Value {
                     "query": {"type": "string", "description": "Natural language or code query."},
                     "repo": {"type": "string", "description": REPO_DESCRIPTION},
                     "top_k": {"type": "integer", "description": "Number of results to return.", "minimum": 1, "maximum": MAX_TOOL_TOP_K, "default": 5},
-                    "max_snippet_lines": {"type": "integer", "description": snippet_desc, "minimum": 0, "maximum": MAX_TOOL_SNIPPET_LINES, "default": 10}
+                    "max_snippet_lines": {"type": "integer", "description": snippet_desc, "minimum": 0, "maximum": MAX_TOOL_SNIPPET_LINES, "default": 10},
+                    "content": {"type": "string", "enum": ["code", "docs", "config", "all"], "description": CONTENT_DESCRIPTION}
                 },
                 "required": ["query", "repo"]
             }
@@ -291,7 +324,8 @@ fn tool_definitions() -> Value {
                     "line": {"type": "integer", "description": "Line number (1-indexed)."},
                     "repo": {"type": "string", "description": REPO_DESCRIPTION},
                     "top_k": {"type": "integer", "description": "Number of similar chunks to return.", "minimum": 1, "maximum": MAX_TOOL_TOP_K, "default": 5},
-                    "max_snippet_lines": {"type": "integer", "description": snippet_desc, "minimum": 0, "maximum": MAX_TOOL_SNIPPET_LINES, "default": 10}
+                    "max_snippet_lines": {"type": "integer", "description": snippet_desc, "minimum": 0, "maximum": MAX_TOOL_SNIPPET_LINES, "default": 10},
+                    "content": {"type": "string", "enum": ["code", "docs", "config", "all"], "description": CONTENT_DESCRIPTION}
                 },
                 "required": ["file_path", "line", "repo"]
             }
@@ -324,11 +358,22 @@ fn arg_snippet_lines(args: &Value) -> Option<usize> {
     }
 }
 
+fn arg_content(cache: &IndexCache, args: &Value) -> Result<Vec<ContentType>, String> {
+    match args.get("content") {
+        None | Some(Value::Null) => Ok(cache.default_content.clone()),
+        Some(Value::String(value)) if value == "all" => Ok(ContentType::ALL.to_vec()),
+        Some(Value::String(value)) => ContentType::parse(value)
+            .map(|content| vec![content])
+            .ok_or_else(|| "`content` must be one of: code, docs, config, all.".to_string()),
+        Some(_) => Err("`content` must be one of: code, docs, config, all.".to_string()),
+    }
+}
+
 /// Run the `search` / `find_related` tool with MCP-shaped arguments;
 /// `Err` becomes an `isError: true` tool result (or an embedder's tool
 /// error). Public for in-process embedding alongside [`IndexCache`];
 /// the cache synchronizes internally, so concurrent calls only serialize
-/// when they touch the same repo.
+/// when they touch the same repo/content variant.
 pub fn call_tool(cache: &IndexCache, name: &str, args: &Value) -> Result<String, String> {
     match name {
         "search" => {
@@ -340,7 +385,8 @@ pub fn call_tool(cache: &IndexCache, name: &str, args: &Value) -> Result<String,
             };
             let top_k = arg_top_k(args)?;
             let max_snippet_lines = arg_snippet_lines(args);
-            cache.with_index(repo, |index| {
+            let content = arg_content(cache, args)?;
+            cache.with_index(repo, &content, |index| {
                 let results = index.search(query, top_k, None, None, None, None, max_snippet_lines);
                 if results.is_empty() {
                     "No results found.".to_string()
@@ -361,7 +407,8 @@ pub fn call_tool(cache: &IndexCache, name: &str, args: &Value) -> Result<String,
             };
             let top_k = arg_top_k(args)?;
             let max_snippet_lines = arg_snippet_lines(args);
-            cache.with_index(repo, |index| {
+            let content = arg_content(cache, args)?;
+            cache.with_index(repo, &content, |index| {
                 let Some(chunk) = resolve_chunk(&index.chunks, file_path, line as u32).cloned()
                 else {
                     return Err(format!(
@@ -512,6 +559,12 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "search");
         assert_eq!(tools[1]["name"], "find_related");
+        for tool in tools {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["content"]["enum"],
+                json!(["code", "docs", "config", "all"])
+            );
+        }
     }
 
     #[test]
@@ -538,9 +591,69 @@ mod tests {
             "ssh://git@host/repo",
             "git@github.com:org/repo.git",
         ] {
-            let err = cache.entry(repo).err().unwrap();
+            let err = cache.entry(repo, &[ContentType::Code]).err().unwrap();
             assert!(err.contains("not supported"), "repo: {repo}, got: {err}");
         }
+    }
+
+    #[test]
+    fn content_defaults_to_normalized_cache_configuration_and_validates_overrides() {
+        let cache = IndexCache::new(vec![
+            ContentType::Docs,
+            ContentType::Code,
+            ContentType::Docs,
+        ]);
+        let configured = vec![ContentType::Code, ContentType::Docs];
+        assert_eq!(arg_content(&cache, &json!({})).unwrap(), configured);
+        assert_eq!(
+            arg_content(&cache, &json!({"content": null})).unwrap(),
+            configured
+        );
+        assert_eq!(
+            arg_content(&cache, &json!({"content": "config"})).unwrap(),
+            vec![ContentType::Config]
+        );
+        assert_eq!(
+            arg_content(&cache, &json!({"content": "all"})).unwrap(),
+            ContentType::ALL
+        );
+        for invalid in [json!("source"), json!(42)] {
+            let error = arg_content(&cache, &json!({"content": invalid})).unwrap_err();
+            assert!(error.contains("code, docs, config, all"));
+        }
+    }
+
+    #[test]
+    fn entry_cache_keys_by_repo_and_normalized_content_set() {
+        let cache = test_cache();
+        let repo = "/definitely-missing/content-key-repo";
+
+        let (code_key, code_entry) = cache.entry(repo, &[ContentType::Code]).unwrap();
+        let (duplicate_key, duplicate_entry) = cache
+            .entry(repo, &[ContentType::Code, ContentType::Code])
+            .unwrap();
+        assert_eq!(code_key, duplicate_key);
+        assert!(Arc::ptr_eq(&code_entry, &duplicate_entry));
+
+        let (docs_key, docs_entry) = cache.entry(repo, &[ContentType::Docs]).unwrap();
+        assert_ne!(code_key, docs_key);
+        assert!(!Arc::ptr_eq(&code_entry, &docs_entry));
+
+        let (all_key, all_entry) = cache.entry(repo, &ContentType::ALL).unwrap();
+        let (unordered_key, unordered_entry) = cache
+            .entry(
+                repo,
+                &[
+                    ContentType::Config,
+                    ContentType::Code,
+                    ContentType::Docs,
+                    ContentType::Code,
+                ],
+            )
+            .unwrap();
+        assert_eq!(all_key, unordered_key);
+        assert!(Arc::ptr_eq(&all_entry, &unordered_entry));
+        assert_eq!(lock_unpoisoned(&cache.entries).len(), 3);
     }
 
     #[test]
@@ -549,21 +662,29 @@ mod tests {
         for index in 0..=CACHE_MAX_SIZE {
             drop(
                 cache
-                    .entry(&format!("/definitely-missing/repo-{index}"))
+                    .entry(
+                        &format!("/definitely-missing/repo-{index}"),
+                        &[ContentType::Code],
+                    )
                     .unwrap(),
             );
         }
+        let oldest = cache.cache_key("/definitely-missing/repo-0", &[ContentType::Code]);
+        let newest = cache.cache_key(
+            &format!("/definitely-missing/repo-{CACHE_MAX_SIZE}"),
+            &[ContentType::Code],
+        );
         let entries = lock_unpoisoned(&cache.entries);
         assert_eq!(entries.len(), CACHE_MAX_SIZE);
-        assert!(!entries.contains_key("/definitely-missing/repo-0"));
-        assert!(entries.contains_key(&format!("/definitely-missing/repo-{CACHE_MAX_SIZE}")));
+        assert!(!entries.contains_key(&oldest));
+        assert!(entries.contains_key(&newest));
     }
 
     #[test]
     fn concurrent_entries_trim_after_the_last_active_call() {
         const RETAINED_BYTES: usize = 128;
         let cache = Arc::new(IndexCache {
-            content: vec![ContentType::Code],
+            default_content: vec![ContentType::Code],
             entries: Mutex::new(HashMap::new()),
             shared_indexes: Mutex::new(HashMap::new()),
             max_heap_bytes: RETAINED_BYTES,
@@ -576,7 +697,10 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     let (_, entry) = cache
-                        .entry(&format!("/definitely-missing/concurrent-repo-{index}"))
+                        .entry(
+                            &format!("/definitely-missing/concurrent-repo-{index}"),
+                            &[ContentType::Code],
+                        )
                         .unwrap();
                     let identity = if index < 2 { 1 } else { index };
                     *lock_unpoisoned(&entry.retained_heap_override) =
@@ -622,6 +746,10 @@ mod tests {
             (
                 json!({"name": "search", "arguments": {"query": "x", "repo": "/n", "top_k": 101}}),
                 "`top_k`",
+            ),
+            (
+                json!({"name": "search", "arguments": {"query": "x", "repo": "/n", "content": "source"}}),
+                "`content`",
             ),
         ] {
             let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params});

@@ -22,6 +22,7 @@ export interface HostCapabilities {
   readonly openLocalFile: boolean;
   readonly revealLocalFile: boolean;
   readonly openHttpsUrl: boolean;
+  readonly openVideoAttachment: boolean;
   readonly nativeNotifications: boolean;
   readonly webNotifications: boolean;
   readonly userAttention: boolean;
@@ -51,6 +52,7 @@ export const browserCapabilities = (
     openLocalFile: false,
     revealLocalFile: false,
     openHttpsUrl: kind !== "desktop",
+    openVideoAttachment: kind !== "desktop",
     nativeNotifications: false,
     webNotifications:
       kind !== "desktop" && browserNotificationCapability(notifications),

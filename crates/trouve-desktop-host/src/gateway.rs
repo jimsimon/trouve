@@ -1,6 +1,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -27,8 +28,8 @@ use crate::{
     FrontendSource, GatewayOrigin, HostCapabilities, HostKind, HostLifecycleEnvelope,
     HostLifecycleState, HostNativeActions, HostPreferences, HostValidationError, LocalFileAction,
     MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS, MAX_SYSTEM_FONT_FAMILIES,
-    NativeAttachment, NativeNotification, system_font_families, valid_session_relative_path,
-    validate_native_attachment,
+    NativeAttachment, NativeNotification, VideoAttachmentOpenError, system_font_families,
+    valid_session_relative_path, validate_native_attachment,
 };
 
 pub const HOST_API_PREFIX: &str = "/__trouve/host/v1";
@@ -50,7 +51,9 @@ const OPEN_HTTPS_URL_PATH: &str = "/__trouve/host/v1/open-https-url";
 const DESKTOP_UPDATE_PATH: &str = "/__trouve/host/v1/update";
 const DESKTOP_UPDATE_CHECK_PATH: &str = "/__trouve/host/v1/update/check";
 const DESKTOP_UPDATE_INSTALL_PATH: &str = "/__trouve/host/v1/update/install";
+const OPEN_VIDEO_ATTACHMENT_PATH: &str = "/__trouve/host/v1/open-video-attachment";
 const MAX_NATIVE_PATH_BYTES: usize = 32 * 1024;
+const MAX_VIDEO_ATTACHMENT_ACTION_BYTES: usize = 14 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct OpenHttpsUrlRequest {
@@ -162,6 +165,25 @@ pub struct HostBootstrap {
     pub csrf_token: String,
 }
 
+#[derive(Serialize)]
+struct HostCapabilitiesWire {
+    #[serde(flatten)]
+    base: HostCapabilities,
+    /// Added in bridge v14. This remains wire-only so adding the optional
+    /// capability does not break downstream Rust struct literals.
+    open_video_attachment: bool,
+    /// Added in bridge v15. Keep this wire-only for the same source-
+    /// compatibility guarantee as other optional native capabilities.
+    self_update: bool,
+}
+
+#[derive(Serialize)]
+struct HostBootstrapWire {
+    capabilities: HostCapabilitiesWire,
+    font_families: Vec<String>,
+    csrf_token: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct LifecycleQuery {
     #[serde(default)]
@@ -189,7 +211,8 @@ struct LifecycleQuery {
         open_https_url,
         get_desktop_update,
         check_desktop_update,
-        install_desktop_update
+        install_desktop_update,
+        open_video_attachment
     ),
     components(schemas(
         HostBootstrap,
@@ -231,7 +254,43 @@ pub fn host_openapi_json() -> serde_json::Value {
     let mut doc = HostApiDoc::openapi();
     doc.info.title = "trouve desktop host bridge".into();
     doc.info.version = crate::DESKTOP_BRIDGE_VERSION.to_string();
-    serde_json::to_value(doc).expect("host OpenAPI document serializes")
+    let mut value = serde_json::to_value(doc).expect("host OpenAPI document serializes");
+    let properties = value
+        .pointer_mut("/components/schemas/HostCapabilities/properties")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("HostCapabilities schema has object properties");
+    let video_schema = serde_json::json!({
+        "type": "boolean",
+        "description": "Added in bridge v14. Older desktop hosts omit it and must continue to\nbootstrap with external video playback disabled."
+    });
+    let self_update_schema = serde_json::json!({
+        "type": "boolean",
+        "description": "Added in bridge v15. Older desktop hosts omit it and must continue to\nbootstrap with desktop self-update disabled."
+    });
+    let mut ordered = serde_json::Map::new();
+    let mut inserted_video_schema = false;
+    let mut inserted_self_update_schema = false;
+    for (name, schema) in std::mem::take(properties) {
+        if name == "persistent_preferences" {
+            ordered.insert("open_video_attachment".into(), video_schema.clone());
+            inserted_video_schema = true;
+        }
+        if name == "sleep_inhibition" {
+            ordered.insert("self_update".into(), self_update_schema.clone());
+            inserted_self_update_schema = true;
+        }
+        ordered.insert(name, schema);
+    }
+    assert!(
+        inserted_video_schema,
+        "HostCapabilities schema is missing the video capability anchor"
+    );
+    assert!(
+        inserted_self_update_schema,
+        "HostCapabilities schema is missing the self-update capability anchor"
+    );
+    *properties = ordered;
+    value
 }
 
 #[derive(Debug, Error)]
@@ -270,6 +329,7 @@ struct GatewayState {
     native_picker_permit: Arc<tokio::sync::Semaphore>,
     clipboard_image_permit: Arc<tokio::sync::Semaphore>,
     desktop_update_permit: Arc<tokio::sync::Semaphore>,
+    desktop_update_operation_sequence: Arc<AtomicU64>,
 }
 
 /// Whether a configured protocol upstream is owned by this desktop app.
@@ -357,7 +417,6 @@ impl HostGateway {
             capabilities.window_geometry = false;
             capabilities.visibility = false;
             capabilities.occlusion = false;
-            capabilities.self_update = false;
         }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -381,6 +440,7 @@ impl HostGateway {
                 native_picker_permit: Arc::new(tokio::sync::Semaphore::new(1)),
                 clipboard_image_permit: Arc::new(tokio::sync::Semaphore::new(1)),
                 desktop_update_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+                desktop_update_operation_sequence: Arc::new(AtomicU64::new(0)),
             },
         })
     }
@@ -415,7 +475,6 @@ impl HostGateway {
         self.state.capabilities.sleep_inhibition = self.state.native_actions.can_inhibit_sleep();
         self.state.capabilities.visibility = self.state.native_actions.can_report_visibility();
         self.state.capabilities.occlusion = self.state.native_actions.can_report_occlusion();
-        self.state.capabilities.self_update = self.state.native_actions.can_self_update();
         // Only the app-owned embedded/elected server is known to share this
         // process's filesystem namespace. An explicit upstream can be a
         // loopback tunnel or container port-forward, so fail closed for every
@@ -487,6 +546,7 @@ impl HostGateway {
             .route(DESKTOP_UPDATE_PATH, get(get_desktop_update))
             .route(DESKTOP_UPDATE_CHECK_PATH, post(check_desktop_update))
             .route(DESKTOP_UPDATE_INSTALL_PATH, post(install_desktop_update))
+            .route(OPEN_VIDEO_ATTACHMENT_PATH, post(open_video_attachment))
             .route("/v1/{*path}", any(proxy_protocol))
             .fallback(any(serve_frontend))
             .with_state(self.state.clone())
@@ -654,6 +714,7 @@ enum GatewayRejection {
     Busy,
     Missing,
     BadGateway,
+    VideoPlaybackCapacity,
     Internal,
 }
 
@@ -666,6 +727,10 @@ impl IntoResponse for GatewayRejection {
             Self::Busy => (StatusCode::CONFLICT, "native action already in progress"),
             Self::Missing => (StatusCode::NOT_FOUND, "not found"),
             Self::BadGateway => (StatusCode::BAD_GATEWAY, "protocol server unavailable"),
+            Self::VideoPlaybackCapacity => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "temporary video playback capacity is full",
+            ),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "host gateway failure"),
         };
         let mut response = (status, message).into_response();
@@ -687,8 +752,16 @@ async fn get_capabilities(
     headers: HeaderMap,
 ) -> Result<Response, GatewayRejection> {
     validate_read(&state, &headers)?;
-    let mut response = Json(HostBootstrap {
-        capabilities: state.capabilities,
+    let open_video_attachment = state.capabilities.kind == HostKind::Desktop
+        && state.native_actions.can_open_video_attachment();
+    let self_update =
+        state.capabilities.kind == HostKind::Desktop && state.native_actions.can_self_update();
+    let mut response = Json(HostBootstrapWire {
+        capabilities: HostCapabilitiesWire {
+            base: state.capabilities,
+            open_video_attachment,
+            self_update,
+        },
         font_families: state
             .font_families
             .iter()
@@ -844,7 +917,15 @@ async fn install_desktop_update(
         .native_actions
         .desktop_update_status()
         .map_err(|_| GatewayRejection::Internal)?;
+    if desktop_update_phase_is_busy(update.phase) {
+        return Err(GatewayRejection::Busy);
+    }
+    let operation_id = state
+        .desktop_update_operation_sequence
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
     let accepted = DesktopUpdateState {
+        operation_id: Some(operation_id),
         phase: DesktopUpdatePhase::Installing,
         message: update.available_version.as_ref().map_or_else(
             || "Update installation started.".into(),
@@ -856,18 +937,26 @@ async fn install_desktop_update(
     let native_actions = state.native_actions.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        if let Err(error) = native_actions.install_desktop_update().await {
+        if let Err(error) = native_actions.install_desktop_update(operation_id).await {
             tracing::error!(%error, "desktop update operation failed");
         }
     });
     json_no_store(accepted)
 }
 
+fn desktop_update_phase_is_busy(phase: DesktopUpdatePhase) -> bool {
+    matches!(
+        phase,
+        DesktopUpdatePhase::Checking
+            | DesktopUpdatePhase::Downloading
+            | DesktopUpdatePhase::Verifying
+            | DesktopUpdatePhase::Installing
+            | DesktopUpdatePhase::Restarting
+    )
+}
+
 fn require_desktop_updater(state: &GatewayState) -> Result<(), GatewayRejection> {
-    if state.capabilities.kind == HostKind::Desktop
-        && state.capabilities.self_update
-        && state.native_actions.can_self_update()
-    {
+    if state.capabilities.kind == HostKind::Desktop && state.native_actions.can_self_update() {
         Ok(())
     } else {
         Err(GatewayRejection::Missing)
@@ -1277,6 +1366,41 @@ async fn open_https_url(
     no_content()
 }
 
+#[utoipa::path(
+    post,
+    path = "/__trouve/host/v1/open-video-attachment",
+    request_body = AttachmentPayload,
+    responses((status = 204), (status = 400), (status = 403), (status = 404), (status = 500), (status = 507))
+)]
+async fn open_video_attachment(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+) -> Result<Response, GatewayRejection> {
+    validate_mutation(&state, request.headers())?;
+    if state.capabilities.kind != HostKind::Desktop
+        || !state.native_actions.can_open_video_attachment()
+    {
+        return Err(GatewayRejection::Missing);
+    }
+    let payload: AttachmentPayload =
+        read_json_action(request, MAX_VIDEO_ATTACHMENT_ACTION_BYTES).await?;
+    let attachment =
+        native_attachment_from_payload(payload).map_err(|_| GatewayRejection::InvalidAction)?;
+    if attachment.video_extension().is_none() {
+        return Err(GatewayRejection::InvalidAction);
+    }
+    state
+        .native_actions
+        .open_video_attachment(attachment)
+        .await
+        .map_err(|error| match error {
+            VideoAttachmentOpenError::Capacity => GatewayRejection::VideoPlaybackCapacity,
+            VideoAttachmentOpenError::Failed(_) => GatewayRejection::Internal,
+        })?;
+
+    no_content()
+}
+
 fn validate_picked_directory(path: &Path) -> Result<String, ()> {
     let Some(path) = path.to_str() else {
         return Err(());
@@ -1362,6 +1486,16 @@ fn native_attachment_payload(attachment: NativeAttachment) -> Result<AttachmentP
         data: base64::engine::general_purpose::STANDARD.encode(attachment.bytes),
         size_bytes,
     })
+}
+
+fn native_attachment_from_payload(payload: AttachmentPayload) -> Result<NativeAttachment, ()> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.data)
+        .map_err(|_| ())?;
+    if u64::try_from(bytes.len()).map_err(|_| ())? != payload.size_bytes {
+        return Err(());
+    }
+    NativeAttachment::new(payload.name, payload.mime, bytes).map_err(|_| ())
 }
 
 fn json_no_store<T: Serialize>(value: T) -> Result<Response, GatewayRejection> {
@@ -1893,11 +2027,11 @@ fn apply_security_headers_with_development_websocket(
 ) -> Result<(), GatewayRejection> {
     let content_security_policy = development_websocket_origin.map_or_else(
         || {
-            "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'".to_owned()
+            "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self' blob: data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'".to_owned()
         },
         |websocket_origin| {
             format!(
-                "default-src 'self'; base-uri 'none'; connect-src 'self' {websocket_origin}; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+                "default-src 'self'; base-uri 'none'; connect-src 'self' {websocket_origin}; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self' blob: data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
             )
         },
     );
@@ -2223,8 +2357,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        let bootstrap_value: serde_json::Value = response_json(bootstrap_response).await;
+        let bootstrap: HostBootstrap = serde_json::from_value(bootstrap_value.clone()).unwrap();
         assert!(!bootstrap.capabilities.open_https_url);
+        assert_eq!(
+            bootstrap_value["capabilities"]["open_video_attachment"],
+            serde_json::Value::Bool(false),
+        );
 
         let response = app
             .clone()
@@ -2242,6 +2381,257 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn video_attachment_action_is_bounded_typed_and_csrf_protected() {
+        let opened = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let opened_for_action = Arc::clone(&opened);
+        let app = gateway()
+            .with_native_actions(HostNativeActions::default().with_video_attachment_opener(
+                move |attachment| {
+                    let opened_for_action = Arc::clone(&opened_for_action);
+                    async move {
+                        opened_for_action.lock().unwrap().push((
+                            attachment.video_extension().unwrap().to_string(),
+                            attachment.bytes().to_vec(),
+                        ));
+                        Ok(())
+                    }
+                },
+            ))
+            .router();
+        let bootstrap_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap_value: serde_json::Value = response_json(bootstrap_response).await;
+        let bootstrap: HostBootstrap = serde_json::from_value(bootstrap_value.clone()).unwrap();
+        assert_eq!(
+            bootstrap_value["capabilities"]["open_video_attachment"],
+            serde_json::Value::Bool(true),
+        );
+
+        let payload = AttachmentPayload {
+            name: "clip.exe".into(),
+            mime: "video/mp4".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+            size_bytes: 5,
+        };
+        let body = serde_json::to_vec(&payload).unwrap();
+        let missing_proof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_proof.status(), StatusCode::FORBIDDEN);
+        assert!(opened.lock().unwrap().is_empty());
+
+        let wrong_size = app
+            .clone()
+            .oneshot(json_action_request(
+                OPEN_VIDEO_ATTACHMENT_PATH,
+                &bootstrap.csrf_token,
+                AttachmentPayload {
+                    name: "clip.mp4".into(),
+                    mime: "video/mp4".into(),
+                    data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+                    size_bytes: 4,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_size.status(), StatusCode::BAD_REQUEST);
+        assert!(opened.lock().unwrap().is_empty());
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .header(ORIGIN, "http://127.0.0.1:43127")
+                    .header(CSRF_HEADER, &bootstrap.csrf_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            [("mp4".into(), b"video".to_vec())]
+        );
+
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .header(ORIGIN, "http://127.0.0.1:43127")
+                    .header(CSRF_HEADER, &bootstrap.csrf_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&AttachmentPayload {
+                            name: "payload.exe".into(),
+                            mime: "application/x-executable".into(),
+                            data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+                            size_bytes: 5,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(opened.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn video_attachment_launcher_does_not_block_gateway_reads() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_for_action = Arc::clone(&started);
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let release_rx_for_action = Arc::clone(&release_rx);
+        let app = gateway()
+            .with_native_actions(HostNativeActions::default().with_video_attachment_opener(
+                move |_| {
+                    let started = Arc::clone(&started_for_action);
+                    let release_rx = release_rx_for_action.lock().unwrap().take().unwrap();
+                    async move {
+                        started.notify_one();
+                        release_rx.await.map_err(|_| {
+                            VideoAttachmentOpenError::Failed(
+                                "test launcher release was dropped".to_string(),
+                            )
+                        })?;
+                        Ok(())
+                    }
+                },
+            ))
+            .router();
+        let bootstrap_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        let body = serde_json::to_vec(&AttachmentPayload {
+            name: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+            size_bytes: 5,
+        })
+        .unwrap();
+
+        let launch_app = app.clone();
+        let csrf_token = bootstrap.csrf_token.clone();
+        let launch = tokio::spawn(async move {
+            launch_app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                        .header(HOST, "127.0.0.1:43127")
+                        .header(ORIGIN, "http://127.0.0.1:43127")
+                        .header(CSRF_HEADER, csrf_token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        started.notified().await;
+
+        let capabilities = app
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+
+        release.send(()).unwrap();
+        assert_eq!(launch.await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn video_attachment_capacity_has_a_distinct_actionable_response() {
+        let app = gateway()
+            .with_native_actions(HostNativeActions::default().with_video_attachment_opener(
+                |_| async { Err(VideoAttachmentOpenError::Capacity) },
+            ))
+            .router();
+        let bootstrap_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        let body = serde_json::to_vec(&AttachmentPayload {
+            name: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"video"),
+            size_bytes: 5,
+        })
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(OPEN_VIDEO_ATTACHMENT_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .header(ORIGIN, "http://127.0.0.1:43127")
+                    .header(CSRF_HEADER, bootstrap.csrf_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "temporary video playback capacity is full"
+        );
     }
 
     #[tokio::test]
@@ -2462,6 +2852,7 @@ mod tests {
         let status = DesktopUpdateState {
             current_version: "4.0.0".into(),
             available_version: Some("4.1.0".into()),
+            operation_id: None,
             phase: DesktopUpdatePhase::Available,
             message: "Version 4.1.0 is ready to install.".into(),
             progress_percent: None,
@@ -2487,13 +2878,18 @@ mod tests {
                     let checked = checked.clone();
                     async move { Ok(checked) }
                 },
-                move || {
-                    let installed = installed.clone();
+                move |operation_id| {
+                    let mut installed = installed.clone();
+                    installed.operation_id = Some(operation_id);
                     let install_status = Arc::clone(&install_status);
                     let install_started = Arc::clone(&install_started_for_action);
                     let install_release = Arc::clone(&install_release_for_action);
                     async move {
-                        install_status.lock().unwrap().phase = DesktopUpdatePhase::Installing;
+                        {
+                            let mut status = install_status.lock().unwrap();
+                            status.operation_id = Some(operation_id);
+                            status.phase = DesktopUpdatePhase::Installing;
+                        }
                         install_started.notify_one();
                         install_release.notified().await;
                         *install_status.lock().unwrap() = installed.clone();
@@ -2513,8 +2909,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
-        assert!(bootstrap.capabilities.self_update);
+        let bootstrap: serde_json::Value = response_json(bootstrap_response).await;
+        assert_eq!(
+            bootstrap.pointer("/capabilities/self_update"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let csrf_token = bootstrap["csrf_token"].as_str().unwrap().to_owned();
 
         let current = app
             .clone()
@@ -2545,33 +2945,25 @@ mod tests {
 
         let checked = app
             .clone()
-            .oneshot(action_request(
-                DESKTOP_UPDATE_CHECK_PATH,
-                &bootstrap.csrf_token,
-            ))
+            .oneshot(action_request(DESKTOP_UPDATE_CHECK_PATH, &csrf_token))
             .await
             .unwrap();
         assert_eq!(response_json::<DesktopUpdateState>(checked).await, status);
         let accepted = app
             .clone()
-            .oneshot(action_request(
-                DESKTOP_UPDATE_INSTALL_PATH,
-                &bootstrap.csrf_token,
-            ))
+            .oneshot(action_request(DESKTOP_UPDATE_INSTALL_PATH, &csrf_token))
             .await
             .unwrap();
         let accepted = response_json::<DesktopUpdateState>(accepted).await;
         assert_eq!(accepted.phase, DesktopUpdatePhase::Installing);
+        assert_eq!(accepted.operation_id, Some(1));
         assert_eq!(accepted.message, "Installing version 4.1.0…");
         tokio::time::timeout(Duration::from_secs(1), install_started.notified())
             .await
             .unwrap();
         let busy = app
             .clone()
-            .oneshot(action_request(
-                DESKTOP_UPDATE_INSTALL_PATH,
-                &bootstrap.csrf_token,
-            ))
+            .oneshot(action_request(DESKTOP_UPDATE_INSTALL_PATH, &csrf_token))
             .await
             .unwrap();
         assert_eq!(busy.status(), StatusCode::CONFLICT);
@@ -2599,6 +2991,11 @@ mod tests {
         })
         .await
         .unwrap();
+        let terminal_busy = app
+            .oneshot(action_request(DESKTOP_UPDATE_INSTALL_PATH, &csrf_token))
+            .await
+            .unwrap();
+        assert_eq!(terminal_busy.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -3108,7 +3505,8 @@ mod tests {
                 .with_external_https_opener(move |_| {
                     *opened_for_action.lock().unwrap() = true;
                     Ok(())
-                }),
+                })
+                .with_video_attachment_opener(|_| async { Ok(()) }),
         )
         .router();
         let bootstrap_response = app
@@ -3122,7 +3520,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
+        let bootstrap_value: serde_json::Value = response_json(bootstrap_response).await;
+        let bootstrap: HostBootstrap = serde_json::from_value(bootstrap_value.clone()).unwrap();
         // PWA/browser opening is a browser feature, not permission to call a
         // desktop native action.
         assert!(bootstrap.capabilities.open_https_url);
@@ -3134,6 +3533,10 @@ mod tests {
         assert!(!bootstrap.capabilities.reveal_local_file);
         assert!(!bootstrap.capabilities.native_notifications);
         assert!(!bootstrap.capabilities.sleep_inhibition);
+        assert_eq!(
+            bootstrap_value["capabilities"]["open_video_attachment"],
+            serde_json::Value::Bool(false),
+        );
 
         let response = app
             .clone()
@@ -3623,7 +4026,12 @@ mod tests {
             response.headers()[CACHE_CONTROL],
             HeaderValue::from_static("public, max-age=31536000, immutable")
         );
-        assert!(response.headers().contains_key("content-security-policy"));
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("media-src 'self' blob: data:")
+        );
 
         let shell = app
             .oneshot(

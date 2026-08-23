@@ -1864,7 +1864,9 @@ export interface components {
         /** @description Local branches of a workspace repository, for base-ref selection. */
         BranchList: {
             branches: string[];
-            /** @description The branch HEAD currently points at (default selection). */
+            /** @description The default branch advertised by the repository's origin remote. */
+            default_branch?: string | null;
+            /** @description The branch or commit HEAD currently points at. */
             head: string;
         };
         CheckRun: {
@@ -2095,6 +2097,14 @@ export interface components {
             issue_count?: number;
             lifecycle_comment_url?: string;
             model?: string | null;
+            /**
+             * Format: int64
+             * @description Total confirmed findings that remained open across the pull request
+             *     after this review was published. Absent while publication is pending
+             *     and for legacy jobs that predate this snapshot. Consumers must treat
+             *     absence on a succeeded job as unknown, never as a clean review.
+             */
+            open_issue_count?: number | null;
             /** Format: int64 */
             pending_elapsed_ms?: number;
             /** Format: int64 */
@@ -2172,6 +2182,11 @@ export interface components {
             summary?: string;
             tasks?: components["schemas"]["CodeReviewTask"][];
             themes?: components["schemas"]["CodeReviewTheme"][];
+            /**
+             * @description Candidates left without a final-editor decision after the bounded
+             *     repair attempt. Their presence means the review is incomplete.
+             */
+            unadjudicated_candidates?: components["schemas"]["CodeReviewUnadjudicatedCandidate"][];
         };
         CodeReviewJobList: {
             jobs: components["schemas"]["CodeReviewJob"][];
@@ -2558,6 +2573,30 @@ export interface components {
          * @enum {string}
          */
         CodeReviewThemeObservationKind: "new" | "continuation" | "recurrence";
+        /**
+         * @description A reviewer candidate the final editor neither retained nor substantively
+         *     rejected. This represents incomplete coordinator work, not a negative
+         *     decision about the candidate.
+         */
+        CodeReviewUnadjudicatedCandidate: {
+            body: string;
+            candidate_id: string;
+            /**
+             * @description Strength of the reviewer evidence, independently of impact.
+             *     `high`, `medium`, or `low`; legacy records default to `medium`.
+             */
+            confidence?: string;
+            /** Format: int64 */
+            line: number;
+            path: string;
+            reviewer_id: string;
+            reviewer_name: string;
+            severity: string;
+            side: string;
+            task_id: string;
+            /** @description Concise, generated one-line summary of the candidate issue. */
+            title: string;
+        };
         /**
          * @description One slash command / skill the vendor harness accepts in prompts (e.g.
          *     "/simplify"), surfaced by clients as prompt-box completions.

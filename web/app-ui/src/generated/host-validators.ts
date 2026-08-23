@@ -4,7 +4,7 @@
 export const hostBootstrap = validate52;
 const schema19 = {"$id":"urn:trouve:host-validator:hostBootstrap","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/HostBootstrap"};
 const schema21 = {"type":"object","required":["capabilities","csrf_token"],"properties":{"capabilities":{"$ref":"#/components/schemas/HostCapabilities"},"csrf_token":{"type":"string","description":"Ephemeral, origin-bound credential required on every gateway mutation.\nIt is neither persisted nor forwarded to the Trouve protocol server."},"font_families":{"type":"array","items":{"type":"string"},"description":"Installed system UI font families available to the shared frontend.\nOlder bridge bootstraps omit this field and fall back to the platform\ndefault font.","maxItems":4096}}};
-const schema22 = {"type":"object","description":"Capabilities are explicit so the PWA never pretends to have native access.","required":["kind","directory_picker","file_picker","clipboard_image","lifecycle_events","close_confirmation","open_local_file","reveal_local_file","open_https_url","native_notifications","web_notifications","user_attention","sleep_inhibition","window_geometry","visibility","occlusion","persistent_preferences","installable"],"properties":{"bridge_version":{"type":["integer","null"],"format":"int32","minimum":0},"clipboard_image":{"type":"boolean"},"close_confirmation":{"type":"boolean"},"directory_picker":{"type":"boolean"},"file_picker":{"type":"boolean"},"installable":{"type":"boolean"},"kind":{"$ref":"#/components/schemas/HostKind"},"lifecycle_events":{"type":"boolean"},"native_notifications":{"type":"boolean"},"occlusion":{"type":"boolean"},"open_https_url":{"type":"boolean"},"open_local_file":{"type":"boolean"},"persistent_preferences":{"type":"boolean"},"reveal_local_file":{"type":"boolean"},"self_update":{"type":"boolean","description":"The native product host can check, verify, install, and restart into\nrepository release updates. Preview hosts and PWAs leave this false."},"sleep_inhibition":{"type":"boolean"},"user_attention":{"type":"boolean"},"visibility":{"type":"boolean"},"web_notifications":{"type":"boolean"},"window_geometry":{"type":"boolean"}}};
+const schema22 = {"type":"object","description":"Capabilities are explicit so the PWA never pretends to have native access.","required":["kind","directory_picker","file_picker","clipboard_image","lifecycle_events","close_confirmation","open_local_file","reveal_local_file","open_https_url","native_notifications","web_notifications","user_attention","sleep_inhibition","window_geometry","visibility","occlusion","persistent_preferences","installable"],"properties":{"bridge_version":{"type":["integer","null"],"format":"int32","minimum":0},"clipboard_image":{"type":"boolean"},"close_confirmation":{"type":"boolean"},"directory_picker":{"type":"boolean"},"file_picker":{"type":"boolean"},"installable":{"type":"boolean"},"kind":{"$ref":"#/components/schemas/HostKind"},"lifecycle_events":{"type":"boolean"},"native_notifications":{"type":"boolean"},"occlusion":{"type":"boolean"},"open_https_url":{"type":"boolean"},"open_local_file":{"type":"boolean"},"open_video_attachment":{"type":"boolean","description":"Added in bridge v14. Older desktop hosts omit it and must continue to\nbootstrap with external video playback disabled."},"persistent_preferences":{"type":"boolean"},"reveal_local_file":{"type":"boolean"},"self_update":{"type":"boolean","description":"Added in bridge v15. Older desktop hosts omit it and must continue to\nbootstrap with desktop self-update disabled."},"sleep_inhibition":{"type":"boolean"},"user_attention":{"type":"boolean"},"visibility":{"type":"boolean"},"web_notifications":{"type":"boolean"},"window_geometry":{"type":"boolean"}}};
 const schema23 = {"type":"string","description":"Where the shared Lit application is running.","enum":["desktop","pwa","browser"]};
 
 function validate56(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -202,10 +202,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.persistent_preferences !== undefined){
+if(data.open_video_attachment !== undefined){
 const _errs24 = errors;
-if(typeof data.persistent_preferences !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/persistent_preferences",schemaPath:"#/properties/persistent_preferences/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.open_video_attachment !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/open_video_attachment",schemaPath:"#/properties/open_video_attachment/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs24 === errors;
@@ -214,10 +214,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.reveal_local_file !== undefined){
+if(data.persistent_preferences !== undefined){
 const _errs26 = errors;
-if(typeof data.reveal_local_file !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/reveal_local_file",schemaPath:"#/properties/reveal_local_file/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.persistent_preferences !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/persistent_preferences",schemaPath:"#/properties/persistent_preferences/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs26 === errors;
@@ -226,10 +226,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.self_update !== undefined){
+if(data.reveal_local_file !== undefined){
 const _errs28 = errors;
-if(typeof data.self_update !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/self_update",schemaPath:"#/properties/self_update/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.reveal_local_file !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/reveal_local_file",schemaPath:"#/properties/reveal_local_file/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs28 === errors;
@@ -238,10 +238,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.sleep_inhibition !== undefined){
+if(data.self_update !== undefined){
 const _errs30 = errors;
-if(typeof data.sleep_inhibition !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/sleep_inhibition",schemaPath:"#/properties/sleep_inhibition/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.self_update !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/self_update",schemaPath:"#/properties/self_update/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs30 === errors;
@@ -250,10 +250,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.user_attention !== undefined){
+if(data.sleep_inhibition !== undefined){
 const _errs32 = errors;
-if(typeof data.user_attention !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/user_attention",schemaPath:"#/properties/user_attention/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.sleep_inhibition !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/sleep_inhibition",schemaPath:"#/properties/sleep_inhibition/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs32 === errors;
@@ -262,10 +262,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.visibility !== undefined){
+if(data.user_attention !== undefined){
 const _errs34 = errors;
-if(typeof data.visibility !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/visibility",schemaPath:"#/properties/visibility/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.user_attention !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/user_attention",schemaPath:"#/properties/user_attention/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs34 === errors;
@@ -274,10 +274,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.web_notifications !== undefined){
+if(data.visibility !== undefined){
 const _errs36 = errors;
-if(typeof data.web_notifications !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/web_notifications",schemaPath:"#/properties/web_notifications/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.visibility !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/visibility",schemaPath:"#/properties/visibility/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs36 === errors;
@@ -286,16 +286,29 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.window_geometry !== undefined){
+if(data.web_notifications !== undefined){
 const _errs38 = errors;
-if(typeof data.window_geometry !== "boolean"){
-validate55.errors = [{instancePath:instancePath+"/window_geometry",schemaPath:"#/properties/window_geometry/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.web_notifications !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/web_notifications",schemaPath:"#/properties/web_notifications/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs38 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.window_geometry !== undefined){
+const _errs40 = errors;
+if(typeof data.window_geometry !== "boolean"){
+validate55.errors = [{instancePath:instancePath+"/window_geometry",schemaPath:"#/properties/window_geometry/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs40 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -326,7 +339,7 @@ return false;
 validate55.errors = vErrors;
 return errors === 0;
 }
-validate55.evaluated = {"props":{"bridge_version":true,"clipboard_image":true,"close_confirmation":true,"directory_picker":true,"file_picker":true,"installable":true,"kind":true,"lifecycle_events":true,"native_notifications":true,"occlusion":true,"open_https_url":true,"open_local_file":true,"persistent_preferences":true,"reveal_local_file":true,"self_update":true,"sleep_inhibition":true,"user_attention":true,"visibility":true,"web_notifications":true,"window_geometry":true},"dynamicProps":false,"dynamicItems":false};
+validate55.evaluated = {"props":{"bridge_version":true,"clipboard_image":true,"close_confirmation":true,"directory_picker":true,"file_picker":true,"installable":true,"kind":true,"lifecycle_events":true,"native_notifications":true,"occlusion":true,"open_https_url":true,"open_local_file":true,"open_video_attachment":true,"persistent_preferences":true,"reveal_local_file":true,"self_update":true,"sleep_inhibition":true,"user_attention":true,"visibility":true,"web_notifications":true,"window_geometry":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate54(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -2353,7 +2366,7 @@ validate77.evaluated = {"props":{"cursor":true,"events":true,"state":true},"dyna
 
 export const desktopUpdateState = validate88;
 const schema39 = {"$id":"urn:trouve:host-validator:desktopUpdateState","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/DesktopUpdateState"};
-const schema40 = {"type":"object","description":"Bounded, presentation-ready updater state exposed to the Lit desktop UI.","required":["current_version","available_version","phase","message","progress_percent"],"properties":{"available_version":{"type":["string","null"]},"current_version":{"type":"string"},"message":{"type":"string"},"phase":{"$ref":"#/components/schemas/DesktopUpdatePhase"},"progress_percent":{"type":["integer","null"],"format":"int32","description":"Whole-number download/install progress. `None` means indeterminate.","maximum":100,"minimum":0}}};
+const schema40 = {"type":"object","description":"Bounded, presentation-ready updater state exposed to the Lit desktop UI.","required":["current_version","available_version","operation_id","phase","message","progress_percent"],"properties":{"available_version":{"type":["string","null"]},"current_version":{"type":"string"},"message":{"type":"string"},"operation_id":{"type":["integer","null"],"format":"int64","description":"Host-owned installation generation. Install acknowledgements and every\nauthoritative state produced by that operation share this identifier.","minimum":1},"phase":{"$ref":"#/components/schemas/DesktopUpdatePhase"},"progress_percent":{"type":["integer","null"],"format":"int32","description":"Whole-number download/install progress. `None` means indeterminate.","maximum":100,"minimum":0}}};
 const schema41 = {"type":"string","description":"Ephemeral state of the native desktop updater. This is deliberately host\nbridge state rather than durable harness protocol state.","enum":["disabled","idle","checking","available","downloading","verifying","installing","restarting","error"]};
 
 function validate90(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -2393,7 +2406,7 @@ evaluated0.items = undefined;
 if(errors === 0){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing0;
-if((((((data.current_version === undefined) && (missing0 = "current_version")) || ((data.available_version === undefined) && (missing0 = "available_version"))) || ((data.phase === undefined) && (missing0 = "phase"))) || ((data.message === undefined) && (missing0 = "message"))) || ((data.progress_percent === undefined) && (missing0 = "progress_percent"))){
+if(((((((data.current_version === undefined) && (missing0 = "current_version")) || ((data.available_version === undefined) && (missing0 = "available_version"))) || ((data.operation_id === undefined) && (missing0 = "operation_id"))) || ((data.phase === undefined) && (missing0 = "phase"))) || ((data.message === undefined) && (missing0 = "message"))) || ((data.progress_percent === undefined) && (missing0 = "progress_percent"))){
 validate89.errors = [{instancePath,schemaPath:"#/required",keyword:"required",params:{missingProperty: missing0},message:"must have required property '"+missing0+"'"}];
 return false;
 }
@@ -2435,11 +2448,20 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.phase !== undefined){
+if(data.operation_id !== undefined){
+let data3 = data.operation_id;
 const _errs7 = errors;
-if(!(validate90(data.phase, {instancePath:instancePath+"/phase",parentData:data,parentDataProperty:"phase",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate90.errors : vErrors.concat(validate90.errors);
-errors = vErrors.length;
+if((!((typeof data3 == "number") && (!(data3 % 1) && !isNaN(data3)))) && (data3 !== null)){
+validate89.errors = [{instancePath:instancePath+"/operation_id",schemaPath:"#/properties/operation_id/type",keyword:"type",params:{type: schema40.properties.operation_id.type},message:"must be integer,null"}];
+return false;
+}
+if(errors === _errs7){
+if(typeof data3 == "number"){
+if(data3 < 1 || isNaN(data3)){
+validate89.errors = [{instancePath:instancePath+"/operation_id",schemaPath:"#/properties/operation_id/minimum",keyword:"minimum",params:{comparison: ">=", limit: 1},message:"must be >= 1"}];
+return false;
+}
+}
 }
 var valid0 = _errs7 === errors;
 }
@@ -2447,31 +2469,44 @@ else {
 var valid0 = true;
 }
 if(valid0){
+if(data.phase !== undefined){
+const _errs9 = errors;
+if(!(validate90(data.phase, {instancePath:instancePath+"/phase",parentData:data,parentDataProperty:"phase",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate90.errors : vErrors.concat(validate90.errors);
+errors = vErrors.length;
+}
+var valid0 = _errs9 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
 if(data.progress_percent !== undefined){
-let data4 = data.progress_percent;
-const _errs8 = errors;
-if((!((typeof data4 == "number") && (!(data4 % 1) && !isNaN(data4)))) && (data4 !== null)){
+let data5 = data.progress_percent;
+const _errs10 = errors;
+if((!((typeof data5 == "number") && (!(data5 % 1) && !isNaN(data5)))) && (data5 !== null)){
 validate89.errors = [{instancePath:instancePath+"/progress_percent",schemaPath:"#/properties/progress_percent/type",keyword:"type",params:{type: schema40.properties.progress_percent.type},message:"must be integer,null"}];
 return false;
 }
-if(errors === _errs8){
-if(typeof data4 == "number"){
-if(data4 > 100 || isNaN(data4)){
+if(errors === _errs10){
+if(typeof data5 == "number"){
+if(data5 > 100 || isNaN(data5)){
 validate89.errors = [{instancePath:instancePath+"/progress_percent",schemaPath:"#/properties/progress_percent/maximum",keyword:"maximum",params:{comparison: "<=", limit: 100},message:"must be <= 100"}];
 return false;
 }
 else {
-if(data4 < 0 || isNaN(data4)){
+if(data5 < 0 || isNaN(data5)){
 validate89.errors = [{instancePath:instancePath+"/progress_percent",schemaPath:"#/properties/progress_percent/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
 return false;
 }
 }
 }
 }
-var valid0 = _errs8 === errors;
+var valid0 = _errs10 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -2487,7 +2522,7 @@ return false;
 validate89.errors = vErrors;
 return errors === 0;
 }
-validate89.evaluated = {"props":{"available_version":true,"current_version":true,"message":true,"phase":true,"progress_percent":true},"dynamicProps":false,"dynamicItems":false};
+validate89.evaluated = {"props":{"available_version":true,"current_version":true,"message":true,"operation_id":true,"phase":true,"progress_percent":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate88(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -2508,7 +2543,7 @@ errors = vErrors.length;
 validate88.errors = vErrors;
 return errors === 0;
 }
-validate88.evaluated = {"props":{"available_version":true,"current_version":true,"message":true,"phase":true,"progress_percent":true},"dynamicProps":false,"dynamicItems":false};
+validate88.evaluated = {"props":{"available_version":true,"current_version":true,"message":true,"operation_id":true,"phase":true,"progress_percent":true},"dynamicProps":false,"dynamicItems":false};
 
 export const pickDirectoryResponse = validate93;
 const schema42 = {"$id":"urn:trouve:host-validator:pickDirectoryResponse","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/PickDirectoryResponse"};

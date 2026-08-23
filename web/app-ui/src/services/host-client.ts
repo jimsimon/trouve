@@ -36,6 +36,7 @@ import {
   MAX_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENTS,
+  isVideoMime,
   type PendingAttachment,
 } from "./attachments.js";
 import { normalizeSystemFontFamilies } from "./system-fonts.js";
@@ -111,6 +112,7 @@ export type DesktopUpdatePhase =
 export interface DesktopUpdateState {
   readonly currentVersion: string;
   readonly availableVersion: string | undefined;
+  readonly operationId: number | undefined;
   readonly phase: DesktopUpdatePhase;
   readonly message: string;
   readonly progressPercent: number | undefined;
@@ -129,6 +131,8 @@ const HOST_PICK_FILES_PATH = "/__trouve/host/v1/pick-files" as const;
 const HOST_READ_CLIPBOARD_IMAGE_PATH =
   "/__trouve/host/v1/read-clipboard-image" as const;
 const HOST_OPEN_HTTPS_URL_PATH = "/__trouve/host/v1/open-https-url" as const;
+const HOST_OPEN_VIDEO_ATTACHMENT_PATH =
+  "/__trouve/host/v1/open-video-attachment" as const;
 const HOST_LIFECYCLE_PATH = "/__trouve/host/v1/lifecycle" as const;
 const HOST_CLOSE_ACKNOWLEDGEMENT_PATH =
   "/__trouve/host/v1/close-acknowledgement" as const;
@@ -149,7 +153,8 @@ const DIRECTORY_PICKER_BRIDGE_VERSION = 3;
 const NATIVE_ATTACHMENT_BRIDGE_VERSION = 4;
 const NATIVE_LIFECYCLE_BRIDGE_VERSION = 5;
 const CLOSE_ACKNOWLEDGEMENT_BRIDGE_VERSION = 13;
-const SELF_UPDATE_BRIDGE_VERSION = 14;
+const SELF_UPDATE_BRIDGE_VERSION = 16;
+const VIDEO_ATTACHMENT_BRIDGE_VERSION = 14;
 const MAX_LIFECYCLE_WAIT_MS = 25_000;
 const MAX_LIFECYCLE_EVENTS = 128;
 const MAX_HOST_ID_BYTES = 256;
@@ -192,6 +197,7 @@ export class HostClientError extends Error {
       | "invalid-request"
       | "not-bootstrapped"
       | "capability-unavailable"
+      | "video-capacity"
       | "action-busy",
     message: string,
   ) {
@@ -234,6 +240,10 @@ export const mapHostCapabilities = (
     openLocalFile: wire.open_local_file && hasLifecycleBridge,
     revealLocalFile: wire.reveal_local_file && hasLifecycleBridge,
     openHttpsUrl: wire.open_https_url,
+    openVideoAttachment:
+      wire.open_video_attachment === true
+      && wire.bridge_version != null
+      && wire.bridge_version >= VIDEO_ATTACHMENT_BRIDGE_VERSION,
     nativeNotifications: wire.native_notifications && hasLifecycleBridge,
     webNotifications: wire.web_notifications,
     userAttention: wire.user_attention && hasLifecycleBridge,
@@ -255,6 +265,7 @@ const normalizeDesktopUpdateState = (
 ): DesktopUpdateState => Object.freeze({
   currentVersion: wire.current_version,
   availableVersion: wire.available_version ?? undefined,
+  operationId: wire.operation_id ?? undefined,
   phase: wire.phase,
   message: wire.message,
   progressPercent: wire.progress_percent ?? undefined,
@@ -456,6 +467,7 @@ export class HostClient {
   #filePickerAvailable = false;
   #clipboardImageAvailable = false;
   #openHttpsUrlAvailable = false;
+  #openVideoAttachmentAvailable = false;
   #lifecycleAvailable = false;
   #closeConfirmationAvailable = false;
   #closeAcknowledgementAvailable = false;
@@ -494,6 +506,7 @@ export class HostClient {
     this.#filePickerAvailable = capabilities.filePicker;
     this.#clipboardImageAvailable = capabilities.clipboardImage;
     this.#openHttpsUrlAvailable = capabilities.openHttpsUrl;
+    this.#openVideoAttachmentAvailable = capabilities.openVideoAttachment;
     this.#lifecycleAvailable = capabilities.lifecycleEvents;
     this.#closeConfirmationAvailable = capabilities.closeConfirmation;
     this.#closeAcknowledgementAvailable = capabilities.closeConfirmation
@@ -655,6 +668,45 @@ export class HostClient {
     }
     if (!result.response.ok) {
       throw new HostClientError("request-failed", "desktop external URL open failed");
+    }
+  }
+
+  async openVideoAttachment(attachment: PendingAttachment): Promise<void> {
+    const csrfToken = this.#nativeActionToken(
+      this.#openVideoAttachmentAvailable,
+      "desktop video playback is unavailable",
+    );
+    const body: AttachmentPayloadWire = {
+      name: attachment.upload.name,
+      mime: attachment.upload.mime,
+      data: attachment.upload.data,
+      size_bytes: attachment.size,
+    };
+    try {
+      pendingAttachment(body, false);
+    } catch {
+      throw new HostClientError("invalid-request", "invalid desktop video attachment");
+    }
+    if (!isVideoMime(body.mime)) {
+      throw new HostClientError("invalid-request", "invalid desktop video attachment");
+    }
+    let result;
+    try {
+      result = await this.#client.POST(HOST_OPEN_VIDEO_ATTACHMENT_PATH, {
+        body,
+        headers: { [CSRF_HEADER]: csrfToken },
+      });
+    } catch {
+      throw new HostClientError("request-failed", "desktop video playback failed");
+    }
+    if (!result.response.ok) {
+      if (result.response.status === 507) {
+        throw new HostClientError(
+          "video-capacity",
+          "temporary video playback capacity is full",
+        );
+      }
+      throw new HostClientError("request-failed", "desktop video playback failed");
     }
   }
 
@@ -891,12 +943,13 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop update status failed");
     }
-    return normalizeDesktopUpdateState(
+    const state = normalizeDesktopUpdateState(
       validate<HostComponents["schemas"]["DesktopUpdateState"]>(
         "DesktopUpdateState",
         result.data,
       ),
     );
+    return state;
   }
 
   async checkDesktopUpdate(): Promise<DesktopUpdateState> {
@@ -943,12 +996,19 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", failureMessage);
     }
-    return normalizeDesktopUpdateState(
+    const state = normalizeDesktopUpdateState(
       validate<HostComponents["schemas"]["DesktopUpdateState"]>(
         "DesktopUpdateState",
         result.data,
       ),
     );
+    if (path === HOST_DESKTOP_UPDATE_INSTALL_PATH && state.operationId === undefined) {
+      throw new HostClientError(
+        "request-failed",
+        "desktop update installation acknowledgement is missing its operation identifier",
+      );
+    }
+    return state;
   }
 
   async getPreferences(): Promise<HostPreferences> {

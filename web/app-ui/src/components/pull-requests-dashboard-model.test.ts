@@ -71,7 +71,7 @@ describe("pull request dashboard model", () => {
       state: "merged",
       merged_at: "2026-07-17T11:00:00Z",
     }), "viewer", now)).toBeUndefined();
-    expect(classifyPullRequest(pr({ state: "closed" }), "viewer", now)).toBeUndefined();
+    expect(classifyPullRequest(pr({ state: "closed" }), "viewer", now)).toBe("closed");
   });
 
   it("preserves conflict priority while keeping conflicted drafts in Drafts", () => {
@@ -108,7 +108,7 @@ describe("pull request dashboard model", () => {
     expect(pullRequestMergePill(pr({ state: "merged" }))).toBeUndefined();
   });
 
-  it("reconciles and reorders the seven stable groups", () => {
+  it("reconciles and reorders the eight stable groups", () => {
     const reconciled = reconcilePullRequestGroupOrder([
       "ready-to-merge",
       "missing",
@@ -124,6 +124,7 @@ describe("pull request dashboard model", () => {
       "pending-review",
       "needs-attention",
       "recently-merged",
+      "closed",
     ]);
     expect(movePullRequestGroup(reconciled.order, "drafts", -1).slice(0, 2))
       .toEqual(["drafts", "ready-to-merge"]);
@@ -133,6 +134,19 @@ describe("pull request dashboard model", () => {
       "drafts",
       false,
     ).slice(0, 3)).toEqual(["ready-to-merge", "recently-merged", "drafts"]);
+
+    const migrated = reconcilePullRequestGroupOrder([
+      "drafts",
+      "recently-closed",
+      "ready-to-merge",
+      "closed",
+    ]);
+    expect(migrated.changed).toBe(true);
+    expect(migrated.order.slice(0, 3)).toEqual([
+      "drafts",
+      "closed",
+      "ready-to-merge",
+    ]);
   });
 
   it("builds filtered, newest-first rows with chat and first-party review data", () => {

@@ -116,6 +116,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/__trouve/host/v1/open-video-attachment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["open_video_attachment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/__trouve/host/v1/pick-directory": {
         parameters: {
             query?: never;
@@ -330,6 +346,12 @@ export interface components {
             available_version: string | null;
             current_version: string;
             message: string;
+            /**
+             * Format: int64
+             * @description Host-owned installation generation. Install acknowledgements and every
+             *     authoritative state produced by that operation share this identifier.
+             */
+            operation_id: number | null;
             phase: components["schemas"]["DesktopUpdatePhase"];
             /**
              * Format: int32
@@ -375,11 +397,16 @@ export interface components {
             occlusion: boolean;
             open_https_url: boolean;
             open_local_file: boolean;
+            /**
+             * @description Added in bridge v14. Older desktop hosts omit it and must continue to
+             *     bootstrap with external video playback disabled.
+             */
+            open_video_attachment?: boolean;
             persistent_preferences: boolean;
             reveal_local_file: boolean;
             /**
-             * @description The native product host can check, verify, install, and restart into
-             *     repository release updates. Preview hosts and PWAs leave this false.
+             * @description Added in bridge v15. Older desktop hosts omit it and must continue to
+             *     bootstrap with desktop self-update disabled.
              */
             self_update?: boolean;
             sleep_inhibition: boolean;
@@ -840,6 +867,57 @@ export interface operations {
                 content?: never;
             };
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    open_video_attachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachmentPayload"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            507: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -14,6 +14,7 @@ const updateState = (
   availableVersion,
   currentVersion: "4.0.0",
   message,
+  operationId: undefined,
   phase: "error",
   progressPercent: undefined,
 });
@@ -64,20 +65,21 @@ describe("desktop update status polling", () => {
     expect(desktopUpdatePollIntervalMs(available, 20)).toBe(30_000);
   });
 
-  it("requires status evidence from the accepted install before ending reconciliation", () => {
+  it("requires the accepted host operation before ending reconciliation", () => {
     const retryError = updateState(
       "Update installation failed: archive download stopped",
       "4.1.0",
     );
-    expect(desktopUpdateConfirmsInstallAction(retryError, { ...retryError })).toBe(false);
-    expect(desktopUpdateConfirmsInstallAction(retryError, {
+    expect(desktopUpdateConfirmsInstallAction(42, { ...retryError })).toBe(false);
+    expect(desktopUpdateConfirmsInstallAction(42, {
       ...retryError,
-      message: "Update installation failed: checksum mismatch",
-    })).toBe(true);
-    expect(desktopUpdateConfirmsInstallAction(retryError, {
-      ...retryError,
+      operationId: 41,
       message: "Installing version 4.1.0…",
       phase: "installing",
+    })).toBe(false);
+    expect(desktopUpdateConfirmsInstallAction(42, {
+      ...retryError,
+      operationId: 42,
     })).toBe(true);
   });
 });

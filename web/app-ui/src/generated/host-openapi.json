@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "15"
+    "version": "16"
   },
   "paths": {
     "/__trouve/host/v1/capabilities": {
@@ -236,6 +236,42 @@
             "description": ""
           },
           "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/open-video-attachment": {
+      "post": {
+        "tags": [],
+        "operationId": "open_video_attachment",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachmentPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          },
+          "507": {
             "description": ""
           }
         }
@@ -683,6 +719,7 @@
         "required": [
           "current_version",
           "available_version",
+          "operation_id",
           "phase",
           "message",
           "progress_percent"
@@ -699,6 +736,15 @@
           },
           "message": {
             "type": "string"
+          },
+          "operation_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Host-owned installation generation. Install acknowledgements and every\nauthoritative state produced by that operation share this identifier.",
+            "minimum": 1
           },
           "phase": {
             "$ref": "#/components/schemas/DesktopUpdatePhase"
@@ -817,6 +863,10 @@
           "open_local_file": {
             "type": "boolean"
           },
+          "open_video_attachment": {
+            "type": "boolean",
+            "description": "Added in bridge v14. Older desktop hosts omit it and must continue to\nbootstrap with external video playback disabled."
+          },
           "persistent_preferences": {
             "type": "boolean"
           },
@@ -825,7 +875,7 @@
           },
           "self_update": {
             "type": "boolean",
-            "description": "The native product host can check, verify, install, and restart into\nrepository release updates. Preview hosts and PWAs leave this false."
+            "description": "Added in bridge v15. Older desktop hosts omit it and must continue to\nbootstrap with desktop self-update disabled."
           },
           "sleep_inhibition": {
             "type": "boolean"
