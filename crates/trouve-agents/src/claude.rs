@@ -511,7 +511,7 @@ fn line_is_result(line: &str) -> bool {
 
 /// One persistent `claude` process serving one trouve thread.
 struct ClaudeProc {
-    stdin: Mutex<ChildStdin>,
+    input: Mutex<ClaudeInputState>,
     /// Routes stdout lines to the active consumer; owns the receiver for
     /// the process's whole life.
     router: Arc<StdoutRouter>,
@@ -519,6 +519,9 @@ struct ClaudeProc {
     /// False as soon as any path decides this transport must be recycled.
     /// The pool retains a false entry until full-tree cleanup is acknowledged.
     reusable: std::sync::atomic::AtomicBool,
+    /// Explicit turn readiness. This is set before `run_turn` returns its
+    /// lazy stream, so steering can be accepted at the advertised boundary.
+    active_turn: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     injected_terminate_failure: std::sync::atomic::AtomicBool,
     /// Claude reads user MCP credentials from this owner-only file. Keeping
@@ -534,7 +537,44 @@ struct ClaudeProc {
     stderr_tail: Arc<std::sync::Mutex<String>>,
 }
 
+struct ClaudeInputState {
+    stdin: ChildStdin,
+    prompt_sent: bool,
+    pending_steers: Vec<Value>,
+}
+
+struct ClaudeTurnGuard {
+    proc_: Arc<ClaudeProc>,
+}
+
+impl Drop for ClaudeTurnGuard {
+    fn drop(&mut self) {
+        self.proc_
+            .active_turn
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl ClaudeProc {
+    async fn begin_turn(self: &Arc<Self>) -> Result<ClaudeTurnGuard, BackendError> {
+        let mut input = self.input.lock().await;
+        self.active_turn
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| {
+                BackendError::Protocol("claude process already has an active turn".into())
+            })?;
+        input.prompt_sent = false;
+        input.pending_steers.clear();
+        Ok(ClaudeTurnGuard {
+            proc_: self.clone(),
+        })
+    }
+
     fn quarantine(&self) {
         self.reusable
             .store(false, std::sync::atomic::Ordering::Release);
@@ -715,16 +755,6 @@ impl AgentBackend for ClaudeBackend {
                 steer.session
             ))
         })?;
-        // The active turn owns the line receiver for its whole lifetime. An
-        // idle pooled process must reject steering rather than interpreting
-        // the input as a new turn that the engine is not observing.
-        if proc_.lines.try_lock().is_ok() {
-            return Err(BackendError::Protocol(format!(
-                "claude steer: session {} has no active turn",
-                steer.session
-            )));
-        }
-
         let mut content = Vec::with_capacity(1 + steer.attachments.len());
         if !steer.prompt.is_empty() {
             content.push(json!({ "type": "text", "text": steer.prompt }));
@@ -751,10 +781,20 @@ impl AgentBackend for ClaudeBackend {
             biased;
             _ = steer.cancel.cancelled() => Err(BackendError::Cancelled),
             result = async {
-                let mut stdin = proc_.stdin.lock().await;
-                stdin.write_all(message.to_string().as_bytes()).await?;
-                stdin.write_all(b"\n").await?;
-                stdin.flush().await
+                let mut input = proc_.input.lock().await;
+                if !proc_.active_turn.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(std::io::Error::other(format!(
+                        "claude steer: session {} has no active turn",
+                        steer.session
+                    )));
+                }
+                if !input.prompt_sent {
+                    input.pending_steers.push(message);
+                    return Ok(());
+                }
+                input.stdin.write_all(message.to_string().as_bytes()).await?;
+                input.stdin.write_all(b"\n").await?;
+                input.stdin.flush().await
             } => result.map_err(BackendError::Io),
         }
     }
@@ -844,6 +884,7 @@ impl AgentBackend for ClaudeBackend {
             pool.terminate_and_remove(&thread_id, &proc_).await?;
             return Err(BackendError::Cancelled);
         }
+        let active_turn = proc_.begin_turn().await?;
         let prompt = turn.prompt.clone();
         // Anthropic-style base64 image blocks, alongside the text block.
         let mut content = vec![json!({ "type": "text", "text": prompt })];
@@ -860,6 +901,7 @@ impl AgentBackend for ClaudeBackend {
 
         let attach = turn.attach_background;
         let stream = async_stream(move |tx| async move {
+            let _active_turn = active_turn;
             let (turn_tx, mut lines) = mpsc::channel::<String>(1024);
             match proc_.router.register(turn_tx, attach) {
                 Ok(RouterRegistration::Streaming) => {}
@@ -905,10 +947,16 @@ impl AgentBackend for ClaudeBackend {
                         return;
                     }
                     sent = async {
-                        let mut stdin = proc_.stdin.lock().await;
-                        stdin.write_all(msg.to_string().as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        stdin.flush().await
+                        let mut input = proc_.input.lock().await;
+                        input.stdin.write_all(msg.to_string().as_bytes()).await?;
+                        input.stdin.write_all(b"\n").await?;
+                        for steer in std::mem::take(&mut input.pending_steers) {
+                            input.stdin.write_all(steer.to_string().as_bytes()).await?;
+                            input.stdin.write_all(b"\n").await?;
+                        }
+                        input.stdin.flush().await?;
+                        input.prompt_sent = true;
+                        Ok::<(), std::io::Error>(())
                     } => sent,
                 };
                 if let Err(e) = sent {
@@ -1430,10 +1478,15 @@ impl ClaudeBackend {
         });
 
         Ok(ClaudeProc {
-            stdin: Mutex::new(stdin),
+            input: Mutex::new(ClaudeInputState {
+                stdin,
+                prompt_sent: false,
+                pending_steers: Vec::new(),
+            }),
             router,
             child: Mutex::new(child),
             reusable: std::sync::atomic::AtomicBool::new(true),
+            active_turn: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             injected_terminate_failure: std::sync::atomic::AtomicBool::new(false),
             _mcp_config: mcp_config_file,

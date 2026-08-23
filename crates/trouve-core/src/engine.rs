@@ -1782,6 +1782,12 @@ struct ActiveTurnSteerer {
     mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
 }
 
+struct PendingNativeTurnSteerer {
+    turn: u64,
+    receiver: tokio::sync::mpsc::Receiver<SteerTurnCommand>,
+    mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SteerMutationLaneState {
     Idle,
@@ -2157,6 +2163,10 @@ pub struct Engine {
     /// additional user input during an active turn. The turn number protects
     /// cleanup from removing a newer registration for the same thread.
     turn_steerers: Mutex<HashMap<String, ActiveTurnSteerer>>,
+    /// Native-provider receivers installed before their steerable
+    /// `turn.started` event becomes visible. `run_turn` claims the receiver;
+    /// the public sender is already ready when clients observe the event.
+    pending_native_steerers: Mutex<HashMap<String, PendingNativeTurnSteerer>>,
     /// Threads where a new prompt arrived after cancellation was requested.
     /// The cancelling dispatcher consumes this marker and resumes the queue
     /// instead of leaving that explicitly submitted follow-up paused.
@@ -2571,6 +2581,7 @@ impl Engine {
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             turn_steerers: Mutex::new(HashMap::new()),
+            pending_native_steerers: Mutex::new(HashMap::new()),
             resume_after_cancel: Mutex::new(HashSet::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
@@ -9885,6 +9896,68 @@ impl Engine {
         ])
     }
 
+    fn register_native_turn_steerer(&self, thread_id: &str, turn: u64) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let (mutation_lane_state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+        let pending = PendingNativeTurnSteerer {
+            turn,
+            receiver,
+            mutation_lane_state: mutation_lane_state.clone(),
+        };
+        if let Some(replaced) = self
+            .pending_native_steerers
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), pending)
+        {
+            replaced
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+        if let Some(replaced) = self.turn_steerers.lock().unwrap().insert(
+            thread_id.to_string(),
+            ActiveTurnSteerer {
+                turn,
+                sender,
+                mutation_lane_state,
+            },
+        ) {
+            replaced
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+    }
+
+    fn take_native_turn_steerer(
+        &self,
+        thread_id: &str,
+        turn: u64,
+    ) -> Option<PendingNativeTurnSteerer> {
+        let mut pending = self.pending_native_steerers.lock().unwrap();
+        pending
+            .get(thread_id)
+            .is_some_and(|entry| entry.turn == turn)
+            .then(|| pending.remove(thread_id).expect("matching pending steerer"))
+    }
+
+    fn unregister_native_turn_steerer(&self, thread_id: &str, turn: u64) {
+        if let Some(pending) = self.take_native_turn_steerer(thread_id, turn) {
+            pending
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+        let mut active = self.turn_steerers.lock().unwrap();
+        if active
+            .get(thread_id)
+            .is_some_and(|entry| entry.turn == turn)
+            && let Some(removed) = active.remove(thread_id)
+        {
+            removed
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+    }
+
     /// Append user guidance to the exact backend turn currently running on a
     /// thread. The backend loop owns acceptance and durable ordering so a
     /// steer cannot jump ahead of output already received from the vendor.
@@ -10042,7 +10115,14 @@ impl Engine {
         let payload = match serde_json::to_value(Message::User(provider_prompt)) {
             Ok(payload) => payload,
             Err(error) => {
-                let error = anyhow::Error::from(error);
+                let mut message = error.to_string();
+                if let Err(cleanup) = self.rollback_materialized_attachments(session, &materialized)
+                {
+                    message.push_str(&format!(
+                        "; materialized attachment rollback failed: {cleanup}"
+                    ));
+                }
+                let error = anyhow!(message);
                 let _ = response.send(Err(error.to_string()));
                 return Err(error);
             }
@@ -10059,7 +10139,12 @@ impl Engine {
             attachment_rows,
             attachment_cleanup.claim(),
         ) {
-            let message = error.to_string();
+            let mut message = error.to_string();
+            if let Err(cleanup) = self.rollback_materialized_attachments(session, &materialized) {
+                message.push_str(&format!(
+                    "; materialized attachment rollback failed: {cleanup}"
+                ));
+            }
             let _ = response.send(Err(message));
             return Err(error);
         }
@@ -10254,6 +10339,13 @@ impl Engine {
 
         active.insert(thread_id.to_string(), thread.session_id.clone());
         let cancel = self.register_cancel(thread_id);
+        let native_steering = started_tools_enabled && self.backend_for(&thread.model).is_none();
+        if native_steering {
+            // Install the receiver before committing TurnStarted. Once that
+            // event is visible, an immediate steering request must have a
+            // live destination even if the provider task has not been polled.
+            self.register_native_turn_steerer(thread_id, turn);
+        }
         let accepted = self.store.accept_prompt_with_events(
             PromptAcceptance {
                 prompt,
@@ -10266,6 +10358,9 @@ impl Engine {
             events,
         );
         if let Err(error) = accepted {
+            if native_steering {
+                self.unregister_native_turn_steerer(thread_id, turn);
+            }
             active.remove(thread_id);
             self.clear_cancel(thread_id);
             drop(active);
@@ -10431,6 +10526,35 @@ impl Engine {
             })
             .await
             .map_err(|error| EngineError::Internal(anyhow!(error)))
+    }
+
+    fn rollback_materialized_attachments(
+        &self,
+        session: &Session,
+        materialized: &[MaterializedAttachment],
+    ) -> Result<(), String> {
+        if materialized.is_empty() {
+            return Ok(());
+        }
+        let paths = materialized
+            .iter()
+            .map(|file| file.absolute_path.clone())
+            .collect::<Vec<_>>();
+        self.rollback_materialized_attachment_paths(session, &paths)
+    }
+
+    fn rollback_materialized_attachment_paths(
+        &self,
+        session: &Session,
+        paths: &[PathBuf],
+    ) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let root = PathBuf::from(&session.worktree_path)
+            .join(".trouve")
+            .join("attachments");
+        self.executor.rollback_attachment_files(&root, paths)
     }
 
     /// Publish the thread's current queue on its event stream.
@@ -11161,6 +11285,36 @@ impl Engine {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
         let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
+        let native_steering = tools_enabled && self.backend_for(&thread.model).is_none();
+        if native_steering && !prompt_persisted.load(Ordering::Acquire) {
+            // Queued prompts publish their shell only when claimed. Register
+            // before that publication for the same readiness guarantee as an
+            // immediately-started prompt.
+            self.register_native_turn_steerer(&thread.id, turn);
+        }
+        let pending_native_steerer = if native_steering {
+            self.take_native_turn_steerer(&thread.id, turn).or_else(|| {
+                // Defensive recovery for a process-local registry loss: keep
+                // the active turn steerable, though ordinary sends always
+                // install this before TurnStarted is committed.
+                self.register_native_turn_steerer(&thread.id, turn);
+                self.take_native_turn_steerer(&thread.id, turn)
+            })
+        } else {
+            None
+        };
+        let (mut native_steer_rx, native_steer_mutation_lane_state) =
+            if let Some(pending) = pending_native_steerer {
+                (Some(pending.receiver), pending.mutation_lane_state)
+            } else {
+                let (state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+                (None, state)
+            };
+        let native_steerer_guard = native_steering.then(|| ActiveTurnSteererGuard {
+            registry: &self.turn_steerers,
+            thread_id: thread.id.clone(),
+            turn,
+        });
         if !prompt_persisted.load(Ordering::Acquire) {
             self.store
                 .append_events_async(
@@ -11384,33 +11538,6 @@ impl Engine {
         // multi-tool turn many-fold; the final request carries the whole
         // transcript, so its context size is the useful value.
         let mut context_input_tokens = 0u64;
-        let mut native_steer_rx = None;
-        let (native_steer_mutation_lane_state, _) =
-            tokio::sync::watch::channel(SteerMutationLaneState::Idle);
-        let native_steerer_guard = if tools_enabled {
-            let (sender, receiver) = tokio::sync::mpsc::channel(8);
-            let replaced = self.turn_steerers.lock().unwrap().insert(
-                thread.id.clone(),
-                ActiveTurnSteerer {
-                    turn,
-                    sender,
-                    mutation_lane_state: native_steer_mutation_lane_state.clone(),
-                },
-            );
-            if let Some(replaced) = replaced {
-                replaced
-                    .mutation_lane_state
-                    .send_replace(SteerMutationLaneState::Ended);
-            }
-            native_steer_rx = Some(receiver);
-            Some(ActiveTurnSteererGuard {
-                registry: &self.turn_steerers,
-                thread_id: thread.id.clone(),
-                turn,
-            })
-        } else {
-            None
-        };
         // Becomes false when the loop ends because the model stopped calling
         // tools (or was cancelled); stays true only if we exhaust the
         // iteration budget mid-work, which we then surface to the user.
@@ -13735,6 +13862,10 @@ impl Engine {
                             }
                         }
                     };
+                    let materialized_paths = materialized
+                        .iter()
+                        .map(|file| file.absolute_path.clone())
+                        .collect::<Vec<_>>();
                     let (images, files): (Vec<_>, Vec<_>) = materialized
                         .into_iter()
                         .partition(|file| file.attachment.mime.starts_with("image/"));
@@ -13755,7 +13886,16 @@ impl Engine {
                     let payload = match serde_json::to_value(Message::User(backend_prompt.clone())) {
                         Ok(payload) => payload,
                         Err(error) => {
-                            let error = anyhow::Error::from(error);
+                            let mut message = error.to_string();
+                            if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                                session,
+                                &materialized_paths,
+                            ) {
+                                message.push_str(&format!(
+                                    "; materialized attachment rollback failed: {cleanup}"
+                                ));
+                            }
+                            let error = anyhow!(message);
                             let _ = response.send(Err(error.to_string()));
                             return Err(error);
                         }
@@ -13772,7 +13912,15 @@ impl Engine {
                         attachment_rows,
                         attachment_cleanup.claim(),
                     ) {
-                        let message = error.to_string();
+                        let mut message = error.to_string();
+                        if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                            session,
+                            &materialized_paths,
+                        ) {
+                            message.push_str(&format!(
+                                "; materialized attachment rollback failed: {cleanup}"
+                            ));
+                        }
                         let _ = response.send(Err(message));
                         return Err(error);
                     }

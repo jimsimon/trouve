@@ -28,6 +28,7 @@ struct StaticThenLiveModelProvider {
 
 struct SteerableNativeProvider {
     calls: AtomicUsize,
+    model_discovery_gate: Option<Arc<tokio::sync::Semaphore>>,
     first_stream_started: Arc<tokio::sync::Semaphore>,
     finish_first_stream: Arc<tokio::sync::Notify>,
     messages_seen: std::sync::Mutex<Vec<Vec<Message>>>,
@@ -138,6 +139,13 @@ impl Provider for SteerableNativeProvider {
             "native-steering/test-model",
             "Native steering test model",
         )]
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        if let Some(gate) = &self.model_discovery_gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        self.models()
     }
 
     async fn stream_chat(
@@ -474,6 +482,7 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
 
     let provider = Arc::new(SteerableNativeProvider {
         calls: AtomicUsize::new(0),
+        model_discovery_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
         first_stream_started: Arc::new(tokio::sync::Semaphore::new(0)),
         finish_first_stream: Arc::new(tokio::sync::Notify::new()),
         messages_seen: std::sync::Mutex::new(Vec::new()),
@@ -532,6 +541,25 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
         .await
         .unwrap();
     assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    let steer_client = client.clone();
+    let steer_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_steer = tokio::spawn(async move {
+        steer_client
+            .post(steer_url)
+            .json(&serde_json::json!({"content": "Change direction now."}))
+            .send()
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !pending_steer.is_finished(),
+        "steering was rejected after TurnStarted but before provider startup"
+    );
+    provider
+        .model_discovery_gate
+        .as_ref()
+        .unwrap()
+        .add_permits(8);
     provider
         .first_stream_started
         .acquire()
@@ -545,21 +573,6 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
     assert!(before.iter().any(|event| {
         event["type"] == "turn.started" && event["turn"] == 1 && event["supports_steering"] == true
     }));
-
-    let steer_client = client.clone();
-    let steer_url = format!("{base}/threads/{thread_id}/steer");
-    let pending_steer = tokio::spawn(async move {
-        steer_client
-            .post(steer_url)
-            .json(&serde_json::json!({"content": "Change direction now."}))
-            .send()
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !pending_steer.is_finished(),
-        "steering interrupted the current provider response"
-    );
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     provider.finish_first_stream.notify_one();
     let steered = tokio::time::timeout(Duration::from_secs(10), pending_steer)
@@ -607,10 +620,13 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
         .iter()
         .position(|event| event["type"] == "tool.completed" && event["call_id"] == "boundary-read")
         .unwrap();
-    assert!(boundary_index < tool_completed_index && tool_completed_index < steering_index);
+    assert!(steering_index < boundary_index && boundary_index < tool_completed_index);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 
     let messages_seen = provider.messages_seen.lock().unwrap();
+    assert!(messages_seen[0].iter().any(|message| {
+        matches!(message, Message::User(content) if content == "Change direction now.")
+    }));
     let resumed = &messages_seen[1];
     assert!(resumed.iter().any(|message| {
         matches!(message, Message::User(content) if content == "Change direction now.")

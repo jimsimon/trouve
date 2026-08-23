@@ -2391,14 +2391,16 @@ cat >/dev/null
     assert!(backend.supports_steering());
 
     let mut stream = start_turn(&backend, || {
-        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+        turn(
+            tmp.path().to_path_buf(),
+            Some("sess-steer"),
+            BackendPermission::Ask,
+        )
     })
     .await;
-    assert!(matches!(
-        stream.next().await.unwrap().unwrap(),
-        BackendEvent::SessionStarted { session_id } if session_id == "sess-steer"
-    ));
-
+    // Steering is advertised with TurnStarted, before the returned backend
+    // stream is first polled. The adapter must queue this behind the initial
+    // prompt instead of rejecting it or writing it first.
     backend
         .steer_turn(BackendSteer {
             cancel: Default::default(),
@@ -2411,8 +2413,9 @@ cat >/dev/null
 
     let mut redirected = false;
     while let Some(event) = stream.next().await {
+        let event = event.unwrap();
         redirected |= matches!(
-            event.unwrap(),
+            event,
             BackendEvent::TextDelta(ref text) if text == "redirected"
         );
     }
