@@ -17970,6 +17970,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_admission_exceeds_the_former_global_and_provider_limits() {
+        const TURN_COUNT: usize = 27;
+        let scheduler = Arc::new(TurnScheduler::new());
+        let admitted = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider_release = Arc::new(tokio::sync::Barrier::new(TURN_COUNT + 1));
+        let mut turns = Vec::with_capacity(TURN_COUNT);
+
+        for _ in 0..TURN_COUNT {
+            let scheduler = Arc::clone(&scheduler);
+            let admitted = Arc::clone(&admitted);
+            let provider_release = Arc::clone(&provider_release);
+            turns.push(tokio::spawn(async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                scheduler.admit("provider/model", &cancel).await.unwrap();
+                admitted.add_permits(1);
+                provider_release.wait().await;
+            }));
+        }
+
+        let all_admitted = tokio::time::timeout(
+            Duration::from_secs(1),
+            admitted.acquire_many(TURN_COUNT.try_into().unwrap()),
+        )
+        .await
+        .expect("all turns should pass admission before provider work is released")
+        .unwrap();
+        drop(all_admitted);
+        provider_release.wait().await;
+        for turn in turns {
+            turn.await.unwrap();
+        }
+    }
+
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
             display_name: display_name.into(),
