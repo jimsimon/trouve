@@ -324,6 +324,15 @@ fn bounded_review_task_concurrency(limit: usize) -> usize {
     limit.min(tokio::sync::Semaphore::MAX_PERMITS)
 }
 
+fn coordinator_adjudication_repair_timeout(
+    coordinator_timeout: Duration,
+    execution_elapsed: Duration,
+) -> Duration {
+    coordinator_timeout
+        .saturating_sub(execution_elapsed)
+        .min(REVIEW_COORDINATOR_ADJUDICATION_REPAIR_TIMEOUT)
+}
+
 fn review_task_concurrency() -> usize {
     *REVIEW_TASK_CONCURRENCY.get_or_init(|| {
         let requested = positive_concurrency_from_env(
@@ -5060,7 +5069,7 @@ impl Engine {
                         engine.emit_code_review_task(&job.id, task.clone())?;
                         let timeout_label =
                             format!("reviewer {} batch {}", reviewer.name, batch_index + 1);
-                        let (turn, parsed) = engine
+                        let (turn, parsed, _execution_elapsed) = engine
                             .run_timed_parsed_code_review_turn(
                                 &job,
                                 &task.id,
@@ -5314,7 +5323,7 @@ impl Engine {
                     return Err(error);
                 }
             };
-            let (mut turn, mut validated) = turn;
+            let (mut turn, mut validated, coordinator_execution_elapsed) = turn;
             validated.findings = coordinator_validated_findings(
                 std::mem::take(&mut validated.findings),
                 &coordinator_candidates,
@@ -5323,9 +5332,10 @@ impl Engine {
             let missing_adjudications =
                 unadjudicated_candidate_ids(&validated, &coordinator_candidates);
             if !missing_adjudications.is_empty() {
-                let remaining = coordinator_timeout
-                    .saturating_sub(coordinator_started.elapsed())
-                    .min(REVIEW_COORDINATOR_ADJUDICATION_REPAIR_TIMEOUT);
+                let remaining = coordinator_adjudication_repair_timeout(
+                    coordinator_timeout,
+                    coordinator_execution_elapsed,
+                );
                 if !remaining.is_zero() {
                     let repair_prompt = coordinator_adjudication_repair_prompt(
                         &missing_adjudications,
@@ -5831,9 +5841,10 @@ impl Engine {
         max_tool_calls: u64,
         timeout: Duration,
         timeout_label: &str,
-    ) -> Result<(ReviewTurnResult, ReviewOutput)> {
+    ) -> Result<(ReviewTurnResult, ReviewOutput, Duration)> {
         with_review_turn_capacity(superseded, || async {
-            match tokio::time::timeout(
+            let execution_started = Instant::now();
+            let result = match tokio::time::timeout(
                 timeout,
                 self.run_parsed_code_review_turn(
                     job,
@@ -5863,7 +5874,8 @@ impl Engine {
                         compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
                     )
                 }
-            }
+            }?;
+            Ok((result.0, result.1, execution_started.elapsed()))
         })
         .await
     }
@@ -22014,6 +22026,24 @@ mod tests {
         assert!(operation_started.load(Ordering::SeqCst));
         tokio::time::advance(Duration::from_millis(500)).await;
         waiter.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn coordinator_repair_budget_uses_execution_time_only() {
+        assert_eq!(
+            coordinator_adjudication_repair_timeout(
+                Duration::from_secs(90),
+                Duration::from_secs(20)
+            ),
+            REVIEW_COORDINATOR_ADJUDICATION_REPAIR_TIMEOUT
+        );
+        assert_eq!(
+            coordinator_adjudication_repair_timeout(
+                Duration::from_secs(30),
+                Duration::from_secs(20)
+            ),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]
