@@ -258,11 +258,13 @@ interactive capacity at the model provider instead.
 The review service bounds top-level work with
 `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` and
 `TROUVE_CODE_REVIEW_TASK_CONCURRENCY`. All limits must be positive and require
-a server restart. The task limit is one process-wide reviewer-persona budget,
-shared by every running review job, so increasing job concurrency does not
-multiply reviewer fan-out. Review-job concurrency has a hard maximum of 32;
-larger persisted, API, or `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are
-reduced to 32 with a server warning.
+a server restart. The task limit is one process-wide review model-turn budget,
+shared by every `Engine` and every running job. It covers semantic routing,
+reviewer personas, coordination, final editing, and JSON repair, so increasing
+job concurrency does not multiply provider fan-out. Review-job concurrency has
+a hard maximum of 32; larger persisted, API, or
+`TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are reduced to 32 with a server
+warning.
 
 ## Backup and upgrades
 

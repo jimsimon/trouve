@@ -96,6 +96,8 @@ const REVIEW_COLLAPSE_GROUP_CONCURRENCY: usize = 4;
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
 const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 24;
+static REVIEW_TASK_CONCURRENCY: OnceLock<usize> = OnceLock::new();
+static REVIEW_TURN_CAPACITY: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
 // Bump when batch identity or composition changes so interrupted jobs never
@@ -317,6 +319,49 @@ fn positive_concurrency_from_env(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn bounded_review_task_concurrency(limit: usize) -> usize {
+    limit.min(tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+fn review_task_concurrency() -> usize {
+    *REVIEW_TASK_CONCURRENCY.get_or_init(|| {
+        let requested = positive_concurrency_from_env(
+            REVIEW_TASK_CONCURRENCY_ENV,
+            DEFAULT_REVIEW_TASK_CONCURRENCY,
+        );
+        let bounded = bounded_review_task_concurrency(requested);
+        if bounded != requested {
+            tracing::warn!(
+                variable = REVIEW_TASK_CONCURRENCY_ENV,
+                requested,
+                maximum = tokio::sync::Semaphore::MAX_PERMITS,
+                "code-review task concurrency exceeds Tokio's semaphore limit; reducing it"
+            );
+        }
+        bounded
+    })
+}
+
+fn review_turn_capacity() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(
+        REVIEW_TURN_CAPACITY
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(review_task_concurrency()))),
+    )
+}
+
+async fn acquire_review_turn_capacity(
+    cancel: &CancellationToken,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    let capacity = review_turn_capacity();
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow!(SupersededReviewTask)),
+        permit = capacity.acquire_owned() => {
+            permit.map_err(|_| anyhow!("code-review turn capacity closed"))
+        }
+    }
+}
+
 fn bounded_review_job_concurrency(limit: u32, source: &'static str) -> u32 {
     if limit > MAX_PARALLEL_REVIEWS {
         tracing::warn!(
@@ -340,10 +385,6 @@ pub struct CodeReviewRuntime {
     reconcile_lock: tokio::sync::Mutex<()>,
     poll_wake: Notify,
     job_wake: Notify,
-    /// One reviewer-task budget for the whole process. Job concurrency controls
-    /// how many pull requests make progress, while this gate prevents their
-    /// persona fan-out from multiplying into an unbounded provider burst.
-    review_task_capacity: OnceLock<Arc<tokio::sync::Semaphore>>,
     warned_job_concurrency_override: AtomicUsize,
     thread_reconciled_at: Mutex<HashMap<(String, u64), Instant>>,
     thread_reconciliation_failures: Mutex<HashMap<(String, u64), u32>>,
@@ -657,29 +698,6 @@ impl ReviewDiffCache {
 }
 
 impl CodeReviewRuntime {
-    fn review_task_capacity(&self) -> Arc<tokio::sync::Semaphore> {
-        Arc::clone(self.review_task_capacity.get_or_init(|| {
-            Arc::new(tokio::sync::Semaphore::new(positive_concurrency_from_env(
-                REVIEW_TASK_CONCURRENCY_ENV,
-                DEFAULT_REVIEW_TASK_CONCURRENCY,
-            )))
-        }))
-    }
-
-    async fn acquire_review_task_capacity(
-        &self,
-        cancel: &CancellationToken,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        let capacity = self.review_task_capacity();
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(anyhow!(SupersededReviewTask)),
-            permit = capacity.acquire_owned() => {
-                permit.map_err(|_| anyhow!("code-review task capacity closed"))
-            }
-        }
-    }
-
     fn projection_lock(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.projection_locks.lock().unwrap();
         locks.retain(|_, lock| lock.strong_count() > 0);
@@ -4969,10 +4987,7 @@ impl Engine {
             elapsed_since_ms(preparation_started),
         )?;
         let reviewers_started = Instant::now();
-        let task_concurrency = positive_concurrency_from_env(
-            REVIEW_TASK_CONCURRENCY_ENV,
-            DEFAULT_REVIEW_TASK_CONCURRENCY,
-        );
+        let task_concurrency = review_task_concurrency();
         let reviewer_timeout = Duration::from_secs(review_settings.reviewer_timeout_seconds);
         let executed_results = stream::iter(planned.into_iter().map(
             |(reviewer, batch_index, prompt, applies, skip_reason, existing_task)| {
@@ -5010,10 +5025,6 @@ impl Engine {
                         return Ok::<_, anyhow::Error>(Vec::new());
                     }
                     let result = async {
-                        let _review_task_capacity = engine
-                            .code_review
-                            .acquire_review_task_capacity(&superseded)
-                            .await?;
                         let thread = engine.create_thread(CreateThreadRequest {
                             session_id,
                             title: None,
@@ -5731,6 +5742,10 @@ impl Engine {
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
     ) -> Result<ReviewTurnResult> {
+        // This is the common admission point for reviewer, router,
+        // coordinator, final-editor, and JSON-repair model calls. The static
+        // holder makes the configured budget process-wide across Engines.
+        let _review_turn_capacity = acquire_review_turn_capacity(superseded).await?;
         active_threads.lock().unwrap().insert(thread_id.to_owned());
         let result = self
             .run_code_review_turn(job, task_id, thread_id, request, superseded)
@@ -5951,10 +5966,7 @@ impl Engine {
             }
         };
         let batch_count = batches.len();
-        let task_concurrency = positive_concurrency_from_env(
-            REVIEW_TASK_CONCURRENCY_ENV,
-            DEFAULT_REVIEW_TASK_CONCURRENCY,
-        );
+        let task_concurrency = review_task_concurrency();
         let candidates = semantic_routing_candidates(job, reviewers)
             .into_iter()
             .cloned()
@@ -21939,33 +21951,17 @@ mod tests {
         assert!(cancel.is_cancelled());
     }
 
-    #[tokio::test]
-    async fn reviewer_task_capacity_is_shared_across_jobs() {
-        let runtime = CodeReviewRuntime::default();
-        let capacity = Arc::new(tokio::sync::Semaphore::new(2));
-        assert!(
-            runtime
-                .review_task_capacity
-                .set(Arc::clone(&capacity))
-                .is_ok()
+    #[test]
+    fn review_turn_capacity_is_process_global_and_bounded() {
+        assert_eq!(
+            bounded_review_task_concurrency(tokio::sync::Semaphore::MAX_PERMITS + 1),
+            tokio::sync::Semaphore::MAX_PERMITS
         );
-        let first_job = CancellationToken::new();
-        let second_job = CancellationToken::new();
+        assert_eq!(bounded_review_task_concurrency(24), 24);
 
-        let first = runtime
-            .acquire_review_task_capacity(&first_job)
-            .await
-            .unwrap();
-        let second = runtime
-            .acquire_review_task_capacity(&second_job)
-            .await
-            .unwrap();
-        assert_eq!(capacity.available_permits(), 0);
-        assert!(Arc::clone(&capacity).try_acquire_owned().is_err());
-
-        drop(first);
-        assert_eq!(capacity.available_permits(), 1);
-        drop(second);
+        let first_engine_capacity = review_turn_capacity();
+        let second_engine_capacity = review_turn_capacity();
+        assert!(Arc::ptr_eq(&first_engine_capacity, &second_engine_capacity));
     }
 
     #[test]
