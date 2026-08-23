@@ -1631,7 +1631,7 @@ function JobDetailPane({
         </div>
         {detail.summary && <p class="summary">{detail.summary}</p>}
         {unadjudicatedCandidates.length > 0 && (
-          <div class="banner warning" role="alert">
+          <div class="banner warning stacked" role="alert">
             {job.status === "running" || job.status === "queued" ? (
               <>
                 <strong>Final-editor retry in progress</strong>
