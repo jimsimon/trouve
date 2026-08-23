@@ -1539,14 +1539,17 @@ async fn wait_for_review_turn_event<T, Fut>(
 where
     Fut: Future<Output = T>,
 {
+    if superseded.is_cancelled() {
+        return ReviewTurnWait::Superseded;
+    }
     if let Some(deadline) = timeout_deadline {
         if deadline <= tokio::time::Instant::now() {
             return ReviewTurnWait::TimedOut;
         }
         tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(deadline) => ReviewTurnWait::TimedOut,
             _ = superseded.cancelled() => ReviewTurnWait::Superseded,
+            _ = tokio::time::sleep_until(deadline) => ReviewTurnWait::TimedOut,
             event = event => ReviewTurnWait::Event(event),
             _ = tokio::time::sleep(progress_wait) => ReviewTurnWait::Progress,
         }
@@ -6420,6 +6423,9 @@ impl Engine {
                         CodeReviewModelTiming::Reset,
                     )
                     .await?;
+                    if superseded.is_cancelled() {
+                        bail!("stale: review was superseded while the model was running");
+                    }
                     if timed_out {
                         return Err(review_turn_timeout_error(
                             timeout.expect("a timed-out review turn has a timeout"),
@@ -6454,6 +6460,9 @@ impl Engine {
                             "failed to persist terminal progress after model turn failure"
                         );
                     }
+                    if superseded.is_cancelled() {
+                        bail!("stale: review was superseded while the model was running");
+                    }
                     if timed_out {
                         return Err(review_turn_timeout_error(
                             timeout.expect("a timed-out review turn has a timeout"),
@@ -6484,13 +6493,13 @@ impl Engine {
                             "failed to persist terminal progress after model turn cancellation"
                         );
                     }
+                    if superseded.is_cancelled() {
+                        bail!("stale: review was superseded while the model was running");
+                    }
                     if timed_out {
                         return Err(review_turn_timeout_error(
                             timeout.expect("a timed-out review turn has a timeout"),
                         ));
-                    }
-                    if superseded.is_cancelled() {
-                        bail!("stale: review was superseded while the model was running");
                     }
                     bail!("model review was cancelled");
                 }
@@ -22124,6 +22133,24 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, ReviewTurnWait::TimedOut));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_supersession_wins_over_an_expired_timeout() {
+        let superseded = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        superseded.cancel();
+
+        let outcome = wait_for_review_turn_event(
+            std::future::ready(42),
+            Duration::ZERO,
+            &superseded,
+            Some(deadline),
+        )
+        .await;
+
+        assert!(matches!(outcome, ReviewTurnWait::Superseded));
     }
 
     #[test]
