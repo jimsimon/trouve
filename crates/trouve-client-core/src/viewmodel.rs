@@ -897,7 +897,6 @@ impl ThreadViewModel {
             } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
-                self.finish_thinking();
                 // Call ids are expected to be unique, but resetting here makes
                 // a reused id deterministic instead of inheriting stale output.
                 self.tool_outputs.remove(call_id);
@@ -2123,7 +2122,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_splits_active_thinking_at_the_causal_boundary() {
+    fn tool_requests_do_not_split_an_open_thinking_item() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
@@ -2140,31 +2139,32 @@ mod tests {
             turn: 1,
             text: " running.".into(),
         }));
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "read".into(),
+            tool: "read_file".into(),
+            args: serde_json::json!({ "path": "src/lib.rs" }),
+            requires_approval: false,
+        }));
         vm.apply(&env(Event::AssistantThinkingCompleted { turn: 1 }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            text: "A separate reasoning block.".into(),
+        }));
 
-        let thoughts = vm
-            .items
-            .iter()
-            .filter(|item| matches!(item, ChatItem::Thinking { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(thoughts.len(), 2);
         assert!(matches!(
-            thoughts[0],
-            ChatItem::Thinking {
-                content,
-                complete: true,
-                ..
-            } if content == "The final overlap pass is still"
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { content, complete: true, .. },
+                ChatItem::ToolCall { call_id: first, .. },
+                ChatItem::ToolCall { call_id: second, .. },
+                ChatItem::Thinking { content: separate, complete: false, .. },
+            ] if content == "The final overlap pass is still running."
+                && first == "search"
+                && second == "read"
+                && separate == "A separate reasoning block."
         ));
-        assert!(matches!(
-            thoughts[1],
-            ChatItem::Thinking {
-                content,
-                complete: true,
-                ..
-            } if content == " running."
-        ));
-        assert!(!vm.thinking);
+        assert!(vm.thinking);
     }
 
     #[test]

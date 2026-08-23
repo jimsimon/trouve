@@ -805,7 +805,6 @@ export class ThreadViewModel {
       case "tool.requested":
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
-        this.finishThinking();
         this.appendItem({
           id: `tool:${envelope.call_id}`,
           kind: "tool",

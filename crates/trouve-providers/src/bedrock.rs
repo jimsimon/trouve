@@ -360,12 +360,22 @@ fn bedrock_events(
                                 .push_str(delta.input());
                         }
                         Some(aws::ContentBlockDelta::ReasoningContent(delta)) => {
+                            if !reasoning.contains_key(&index) {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ThinkingStarted {
+                                        id: index.to_string(),
+                                    }))
+                                    .await;
+                            }
                             let state = reasoning.entry(index).or_default();
                             match delta {
                                 aws::ReasoningContentBlockDelta::Text(text) => {
                                     state.text.push_str(text);
                                     let _ = tx
-                                        .send(Ok(ProviderEvent::ThinkingDelta(text.clone())))
+                                        .send(Ok(ProviderEvent::ThinkingDelta {
+                                            id: index.to_string(),
+                                            text: text.clone(),
+                                        }))
                                         .await;
                                 }
                                 aws::ReasoningContentBlockDelta::Signature(signature) => {
@@ -395,6 +405,11 @@ fn bedrock_events(
                     if let Some(reasoning) = reasoning.remove(&index) {
                         let _ = tx
                             .send(Ok(ProviderEvent::Reasoning(reasoning_json(reasoning))))
+                            .await;
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: index.to_string(),
+                            }))
                             .await;
                     }
                 }

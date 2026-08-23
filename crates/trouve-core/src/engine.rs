@@ -497,6 +497,54 @@ const STREAM_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from
 /// stream can produce output forever without yielding Pending.
 const MAX_BACKEND_EVENTS_BEFORE_STEER: usize = 32;
 
+#[derive(Default)]
+struct ProviderThinkingState {
+    active: Option<(String, bool)>,
+}
+
+impl ProviderThinkingState {
+    fn start(&mut self, id: String, turn: u64, events: &mut Vec<Event>) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(active, _)| active == &id)
+        {
+            return;
+        }
+        self.finish(turn, events);
+        self.active = Some((id, false));
+    }
+
+    fn delta(&mut self, id: String, text: String, turn: u64, events: &mut Vec<Event>) {
+        if !self
+            .active
+            .as_ref()
+            .is_some_and(|(active, _)| active == &id)
+        {
+            self.start(id, turn, events);
+        }
+        if text.is_empty() {
+            return;
+        }
+        if let Some((_, displayed)) = self.active.as_mut() {
+            *displayed = true;
+        }
+        events.push(Event::AssistantThinking { turn, text });
+    }
+
+    fn complete(&mut self, id: &str, turn: u64, events: &mut Vec<Event>) {
+        if self.active.as_ref().is_some_and(|(active, _)| active == id) {
+            self.finish(turn, events);
+        }
+    }
+
+    fn finish(&mut self, turn: u64, events: &mut Vec<Event>) {
+        if self.active.take().is_some_and(|(_, displayed)| displayed) {
+            events.push(Event::AssistantThinkingCompleted { turn });
+        }
+    }
+}
+
 /// SQLite's busy handler does not cover every `SQLITE_LOCKED` collision. A
 /// checkpoint is post-response bookkeeping, so briefly retry those transient
 /// conflicts instead of turning an otherwise successful model turn into a
@@ -12806,7 +12854,7 @@ impl Engine {
             // persist and replay verbatim — Anthropic rejects a follow-up
             // tool-use turn whose thinking blocks aren't preserved.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
-            let mut thinking_streamed = false;
+            let mut thinking = ProviderThinkingState::default();
             let mut pending_events = Vec::new();
             let mut persist_deadline = None;
             let mut pending_native_steer = None;
@@ -12845,6 +12893,7 @@ impl Engine {
                 let event = match ev {
                     Ok(event) => event,
                     Err(error) => {
+                        thinking.finish(turn, &mut pending_events);
                         flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                         return Err(anyhow!("provider stream error: {error}"));
                     }
@@ -12856,9 +12905,14 @@ impl Engine {
                         pending_events.push(Event::AssistantDelta { turn, text: delta });
                     }
                     // Display-only; never joins the provider transcript.
-                    ProviderEvent::ThinkingDelta(delta) => {
-                        thinking_streamed = true;
-                        pending_events.push(Event::AssistantThinking { turn, text: delta });
+                    ProviderEvent::ThinkingStarted { id } => {
+                        thinking.start(id, turn, &mut pending_events);
+                    }
+                    ProviderEvent::ThinkingDelta { id, text } => {
+                        thinking.delta(id, text, turn, &mut pending_events);
+                    }
+                    ProviderEvent::ThinkingCompleted { id } => {
+                        thinking.complete(&id, turn, &mut pending_events);
                     }
                     // Kept out of the UI (already streamed as ThinkingDelta);
                     // carried in the transcript for replay only.
@@ -12881,9 +12935,9 @@ impl Engine {
                     persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
                 }
             }
-            if thinking_streamed {
-                pending_events.push(Event::AssistantThinkingCompleted { turn });
-            }
+            // Malformed or legacy-compatible streams may end without an
+            // explicit item completion. Close only the still-active item.
+            thinking.finish(turn, &mut pending_events);
             flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
 
             // Catch every message that arrived at the exact response boundary.
@@ -13111,7 +13165,7 @@ impl Engine {
                 None => {}
                 Some(Ok(stream)) => {
                     let mut stream = trouve_providers::coalesce_event_stream(stream);
-                    let mut thinking_streamed = false;
+                    let mut thinking = ProviderThinkingState::default();
                     let mut pending_events = Vec::new();
                     let mut persist_deadline = None;
                     loop {
@@ -13134,9 +13188,14 @@ impl Engine {
                                 final_text.push_str(&delta);
                                 pending_events.push(Event::AssistantDelta { turn, text: delta });
                             }
-                            Ok(ProviderEvent::ThinkingDelta(delta)) => {
-                                thinking_streamed = true;
-                                pending_events.push(Event::AssistantThinking { turn, text: delta });
+                            Ok(ProviderEvent::ThinkingStarted { id }) => {
+                                thinking.start(id, turn, &mut pending_events);
+                            }
+                            Ok(ProviderEvent::ThinkingDelta { id, text }) => {
+                                thinking.delta(id, text, turn, &mut pending_events);
+                            }
+                            Ok(ProviderEvent::ThinkingCompleted { id }) => {
+                                thinking.complete(&id, turn, &mut pending_events);
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
                             Ok(ProviderEvent::Completed { mut usage }) => {
@@ -13166,9 +13225,7 @@ impl Engine {
                             persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
                         }
                     }
-                    if thinking_streamed {
-                        pending_events.push(Event::AssistantThinkingCompleted { turn });
-                    }
+                    thinking.finish(turn, &mut pending_events);
                     flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                 }
                 Some(Err(e)) => tracing::warn!("iteration-limit summary failed: {e}"),
@@ -19714,6 +19771,40 @@ mod tests {
         for turn in turns {
             turn.await.unwrap();
         }
+    }
+
+    #[test]
+    fn provider_reasoning_identity_survives_interleaved_tool_events() {
+        let mut thinking = ProviderThinkingState::default();
+        let mut events = Vec::new();
+
+        thinking.start("reasoning-a".into(), 7, &mut events);
+        thinking.delta("reasoning-a".into(), "first".into(), 7, &mut events);
+        events.push(Event::ToolRequested {
+            turn: 7,
+            call_id: "read".into(),
+            tool: "read_file".into(),
+            args: serde_json::json!({}),
+            requires_approval: false,
+        });
+        thinking.delta("reasoning-a".into(), " second".into(), 7, &mut events);
+        thinking.complete("reasoning-a", 7, &mut events);
+        thinking.start("reasoning-b".into(), 7, &mut events);
+        thinking.delta("reasoning-b".into(), "separate".into(), 7, &mut events);
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Event::AssistantThinking { text: first, .. },
+                Event::ToolRequested { call_id, .. },
+                Event::AssistantThinking { text: second, .. },
+                Event::AssistantThinkingCompleted { .. },
+                Event::AssistantThinking { text: separate, .. },
+            ] if first == "first"
+                && call_id == "read"
+                && second == " second"
+                && separate == "separate"
+        ));
     }
 
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {

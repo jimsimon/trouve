@@ -604,6 +604,7 @@ fn async_stream(
         let mut buf = crate::sse::LineBuffer::default();
         let mut partials: Vec<PartialToolCall> = Vec::new();
         let mut usage = Usage::default();
+        let mut thinking_active = false;
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
@@ -621,6 +622,13 @@ fn async_stream(
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    if thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                    }
                     for p in partials.drain(..) {
                         let arguments: Value =
                             serde_json::from_str(&p.arguments).unwrap_or(Value::Null);
@@ -661,6 +669,14 @@ fn async_stream(
                 if let Some(text) = delta.get("content").and_then(Value::as_str)
                     && !text.is_empty()
                 {
+                    if thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                        thinking_active = false;
+                    }
                     let _ = tx
                         .send(Ok(ProviderEvent::TextDelta(text.to_string())))
                         .await;
@@ -669,11 +685,30 @@ fn async_stream(
                 if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str)
                     && !text.is_empty()
                 {
+                    if !thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingStarted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                        thinking_active = true;
+                    }
                     let _ = tx
-                        .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
+                        .send(Ok(ProviderEvent::ThinkingDelta {
+                            id: "reasoning".into(),
+                            text: text.to_string(),
+                        }))
                         .await;
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                    if thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                        thinking_active = false;
+                    }
                     for call in calls {
                         let idx = call["index"].as_u64().unwrap_or(0) as usize;
                         while partials.len() <= idx {
@@ -696,6 +731,13 @@ fn async_stream(
             }
         }
         // Stream ended without [DONE]; still flush what we have.
+        if thinking_active {
+            let _ = tx
+                .send(Ok(ProviderEvent::ThinkingCompleted {
+                    id: "reasoning".into(),
+                }))
+                .await;
+        }
         for p in partials.drain(..) {
             let arguments: Value = serde_json::from_str(&p.arguments).unwrap_or(Value::Null);
             let _ = tx
@@ -714,6 +756,39 @@ fn async_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reasoning_lifecycle_closes_before_a_tool_call() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",",
+            "\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let source = futures::stream::iter([Ok::<_, reqwest::Error>(bytes::Bytes::from(payload))]);
+        let events: Vec<_> = async_stream(source).collect().await;
+
+        assert_eq!(events.len(), 5);
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::ThinkingStarted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(
+            &events[1],
+            Ok(ProviderEvent::ThinkingDelta { id, text })
+                if id == "reasoning" && text == "inspect"
+        ));
+        assert!(matches!(
+            &events[2],
+            Ok(ProviderEvent::ThinkingCompleted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(
+            &events[3],
+            Ok(ProviderEvent::ToolCall(call))
+                if call.id == "call-1" && call.name == "read_file"
+        ));
+        assert!(matches!(&events[4], Ok(ProviderEvent::Completed { .. })));
+    }
 
     #[test]
     fn custom_header_and_query_auth_replace_bearer_auth() {

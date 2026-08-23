@@ -331,7 +331,6 @@ impl ThreadProjection {
             } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress(*turn);
-                self.finish_thinking();
                 let idx = self.push(ThreadViewItem::ToolCall {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
@@ -1878,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_is_a_causal_boundary_between_thinking_items() {
+    fn tool_requests_do_not_split_an_open_thinking_item() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
@@ -1910,33 +1909,41 @@ mod tests {
         projection.apply(&envelope(
             4,
             30,
+            Event::ToolRequested {
+                turn: 4,
+                call_id: "read".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                requires_approval: false,
+            },
+        ));
+        projection.apply(&envelope(
+            5,
+            40,
             Event::AssistantThinkingCompleted { turn: 4 },
         ));
+        projection.apply(&envelope(
+            6,
+            50,
+            Event::AssistantThinking {
+                turn: 4,
+                text: "A separate reasoning block.".into(),
+            },
+        ));
 
-        let thoughts = projection
-            .snapshot
-            .items
-            .iter()
-            .filter(|item| matches!(item, ThreadViewItem::Thinking { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(thoughts.len(), 2);
         assert!(matches!(
-            thoughts[0],
-            ThreadViewItem::Thinking {
-                content,
-                complete: true,
-                ..
-            } if content == "The final overlap pass is still"
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { content, complete: true, .. },
+                ThreadViewItem::ToolCall { call_id: first, .. },
+                ThreadViewItem::ToolCall { call_id: second, .. },
+                ThreadViewItem::Thinking { content: separate, complete: false, .. },
+            ] if content == "The final overlap pass is still running."
+                && first == "search"
+                && second == "read"
+                && separate == "A separate reasoning block."
         ));
-        assert!(matches!(
-            thoughts[1],
-            ThreadViewItem::Thinking {
-                content,
-                complete: true,
-                ..
-            } if content == " running."
-        ));
-        assert!(!projection.snapshot.thinking);
+        assert!(projection.snapshot.thinking);
     }
 
     #[test]

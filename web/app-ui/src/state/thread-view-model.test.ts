@@ -463,9 +463,9 @@ describe("ThreadViewModel", () => {
     })]);
   });
 
-  it("closes thinking at tool and steering causal boundaries", () => {
+  it("grows reasoning in place across tools and starts a new block after completion", () => {
     const view = new ThreadViewModel();
-    view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before tool" }));
+    view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before " }));
     view.apply(envelope(2, {
       type: "tool.requested",
       turn: 2,
@@ -474,16 +474,22 @@ describe("ThreadViewModel", () => {
       args: {},
       requires_approval: false,
     }));
-    view.apply(envelope(3, { type: "assistant.thinking", turn: 2, text: "after tool" }));
+    view.apply(envelope(3, { type: "assistant.thinking", turn: 2, text: "and after" }));
     view.apply(envelope(4, {
-      type: "turn.steered",
+      type: "tool.requested",
       turn: 2,
-      content: "new direction",
-      attachments: [],
+      call_id: "search",
+      tool: "search",
+      args: {},
+      requires_approval: false,
     }));
-    view.apply(envelope(5, { type: "assistant.thinking", turn: 2, text: "after steer" }));
-    expect(view.items.map((item) => item.kind)).toEqual([
-      "thinking", "tool", "thinking", "steered", "thinking",
+    view.apply(envelope(5, { type: "assistant.thinking_completed", turn: 2 }));
+    view.apply(envelope(6, { type: "assistant.thinking", turn: 2, text: "separate" }));
+    expect(view.items).toEqual([
+      expect.objectContaining({ kind: "thinking", content: "before and after", complete: true }),
+      expect.objectContaining({ kind: "tool", callId: "read" }),
+      expect.objectContaining({ kind: "tool", callId: "search" }),
+      expect.objectContaining({ kind: "thinking", content: "separate", complete: false }),
     ]);
   });
 
@@ -770,7 +776,7 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
-  it("uses an interleaved tool request as a thought boundary", () => {
+  it("keeps an interleaved tool request beneath the growing thought", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "assistant.thinking",
@@ -798,12 +804,7 @@ describe("ThreadViewModel", () => {
     expect(vm.items.filter((item) => item.kind === "thinking")).toMatchObject([
       {
         kind: "thinking",
-        content: "The final overlap pass is still",
-        complete: true,
-      },
-      {
-        kind: "thinking",
-        content: " running.",
+        content: "The final overlap pass is still running.",
         complete: true,
       },
     ]);

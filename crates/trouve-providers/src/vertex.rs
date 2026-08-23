@@ -308,6 +308,7 @@ fn vertex_events(
         let mut buffer = crate::sse::LineBuffer::default();
         let mut usage = Usage::default();
         let mut call_index = 0_u64;
+        let mut thinking_active = false;
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -325,6 +326,13 @@ fn vertex_events(
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    if thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                    }
                     let _ = tx.send(Ok(ProviderEvent::Completed { usage })).await;
                     return;
                 }
@@ -353,14 +361,42 @@ fn vertex_events(
                             .await;
                     }
                     if let Some(text) = part["text"].as_str().filter(|text| !text.is_empty()) {
-                        let event = if part["thought"].as_bool() == Some(true) {
-                            ProviderEvent::ThinkingDelta(text.into())
+                        if part["thought"].as_bool() == Some(true) {
+                            if !thinking_active {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ThinkingStarted {
+                                        id: "reasoning".into(),
+                                    }))
+                                    .await;
+                                thinking_active = true;
+                            }
+                            let _ = tx
+                                .send(Ok(ProviderEvent::ThinkingDelta {
+                                    id: "reasoning".into(),
+                                    text: text.into(),
+                                }))
+                                .await;
                         } else {
-                            ProviderEvent::TextDelta(text.into())
-                        };
-                        let _ = tx.send(Ok(event)).await;
+                            if thinking_active {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ThinkingCompleted {
+                                        id: "reasoning".into(),
+                                    }))
+                                    .await;
+                                thinking_active = false;
+                            }
+                            let _ = tx.send(Ok(ProviderEvent::TextDelta(text.into()))).await;
+                        }
                     }
                     if let Some(call) = part.get("functionCall") {
+                        if thinking_active {
+                            let _ = tx
+                                .send(Ok(ProviderEvent::ThinkingCompleted {
+                                    id: "reasoning".into(),
+                                }))
+                                .await;
+                            thinking_active = false;
+                        }
                         let name = call["name"].as_str().unwrap_or("vertex-tool");
                         let id = call["id"].as_str().map(String::from).unwrap_or_else(|| {
                             call_index += 1;
@@ -376,6 +412,13 @@ fn vertex_events(
                     }
                 }
             }
+        }
+        if thinking_active {
+            let _ = tx
+                .send(Ok(ProviderEvent::ThinkingCompleted {
+                    id: "reasoning".into(),
+                }))
+                .await;
         }
         let _ = tx.send(Ok(ProviderEvent::Completed { usage })).await;
     });
