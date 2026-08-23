@@ -36,7 +36,7 @@ reliability under long-running workloads.
   idle MCP cleanup, completed Codex thread cleanup, lower initial response
   latency, and runtime thread prioritization reduce retained memory and keep
   the desktop responsive under CPU contention.
-- **Client/server compatibility**: protocol compatibility advances to 7.13.
+- **Client/server compatibility**: protocol compatibility advances to 7.15.
   Upgrade the desktop or PWA client and `trouve-server` together.
 
 ### Fixed
