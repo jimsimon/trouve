@@ -6045,7 +6045,7 @@ impl Engine {
             job_id: job.id.clone(),
             role: trouve_protocol::CodeReviewTaskRole::Analyst,
             reviewer_id: None,
-            reviewer_name: "PR analyst".into(),
+            reviewer_name: "PR diff analyst".into(),
             batch_index: 0,
             batch_count: 1,
             model: Some(model.clone()),
