@@ -12,7 +12,8 @@ use trouve_agents::claude::ClaudeBackend;
 use trouve_agents::codex::CodexBackend;
 use trouve_agents::cursor::CursorBackend;
 use trouve_agents::{
-    AgentBackend, BackendCollaboratorEvent, BackendEvent, BackendPermission, BackendTurn,
+    AgentBackend, BackendCollaboratorEvent, BackendEvent, BackendPermission, BackendSteer,
+    BackendTurn,
 };
 
 fn write_stub(dir: &Path, name: &str, script: &str) -> String {
@@ -2369,6 +2370,58 @@ done
     assert_eq!(spawns.lines().count(), 2, "{spawns}");
 }
 
+#[tokio::test]
+async fn claude_adapter_steers_the_active_stream_json_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-steer",
+        r#"#!/bin/bash
+IFS= read -r first
+echo "$first" >> "$0.stdin"
+echo '{"type":"system","subtype":"init","session_id":"sess-steer"}'
+IFS= read -r steer
+echo "$steer" >> "$0.stdin"
+echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"redirected"}}}'
+echo '{"type":"result","subtype":"success","session_id":"sess-steer","usage":{"input_tokens":1,"output_tokens":1}}'
+cat >/dev/null
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    assert!(backend.supports_steering());
+
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        BackendEvent::SessionStarted { session_id } if session_id == "sess-steer"
+    ));
+
+    backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-steer".into(),
+            prompt: "change direction".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let mut redirected = false;
+    while let Some(event) = stream.next().await {
+        redirected |= matches!(
+            event.unwrap(),
+            BackendEvent::TextDelta(ref text) if text == "redirected"
+        );
+    }
+    assert!(redirected);
+    let stdin = std::fs::read_to_string(format!("{stub}.stdin")).unwrap();
+    assert_eq!(stdin.lines().count(), 2, "{stdin}");
+    assert!(stdin.contains("change direction"), "{stdin}");
+}
+
 #[test]
 fn backend_tool_free_capabilities_match_vendor_protocols() {
     let claude = ClaudeBackend::new("claude-code", Some("/nonexistent/claude".into()));
@@ -2376,6 +2429,7 @@ fn backend_tool_free_capabilities_match_vendor_protocols() {
     let codex = CodexBackend::new("codex", Some("/nonexistent/codex".into()));
 
     assert!(claude.supports_tool_free_turns());
+    assert!(claude.supports_steering());
     assert!(!cursor.supports_tool_free_turns());
     assert!(!codex.supports_tool_free_turns());
     assert!(!claude.confines_read_only_turns());

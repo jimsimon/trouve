@@ -26,6 +26,13 @@ struct StaticThenLiveModelProvider {
     live_calls: Arc<AtomicUsize>,
 }
 
+struct SteerableNativeProvider {
+    calls: AtomicUsize,
+    first_stream_started: Arc<tokio::sync::Semaphore>,
+    finish_first_stream: Arc<tokio::sync::Notify>,
+    messages_seen: std::sync::Mutex<Vec<Vec<Message>>>,
+}
+
 fn catalog_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
     trouve_protocol::ModelInfo {
         id: id.into(),
@@ -117,6 +124,61 @@ impl Provider for ScriptedProvider {
             ],
         };
         Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for SteerableNativeProvider {
+    fn id(&self) -> &str {
+        "native-steering"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![catalog_model(
+            "native-steering/test-model",
+            "Native steering test model",
+        )]
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.messages_seen.lock().unwrap().push(messages.to_vec());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.first_stream_started.add_permits(1);
+            let finish_first_stream = self.finish_first_stream.clone();
+            return Ok(Box::pin(
+                futures::stream::iter(vec![Ok(ProviderEvent::TextDelta(
+                    "Initial direction.".into(),
+                ))])
+                .chain(futures::stream::once(async move {
+                    finish_first_stream.notified().await;
+                    Ok(ProviderEvent::TextDelta(" Boundary completion.".into()))
+                }))
+                .chain(futures::stream::iter(vec![
+                    Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                        id: "boundary-read".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "README.md"}),
+                    })),
+                    Ok(ProviderEvent::Completed {
+                        usage: Usage::default(),
+                    }),
+                ])),
+            ));
+        }
+
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ProviderEvent::TextDelta("Redirected result.".into())),
+            Ok(ProviderEvent::Completed {
+                usage: Usage::default(),
+            }),
+        ])))
     }
 }
 
@@ -401,6 +463,161 @@ async fn wait_for_event(
     tokio::time::timeout(Duration::from_secs(30), fut)
         .await
         .expect("timed out waiting for event")
+}
+
+#[tokio::test]
+async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let provider = Arc::new(SteerableNativeProvider {
+        calls: AtomicUsize::new(0),
+        first_stream_started: Arc::new(tokio::sync::Semaphore::new(0)),
+        finish_first_stream: Arc::new(tokio::sync::Notify::new()),
+        messages_seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("native-steering", provider.clone())
+            .with_default_model("native-steering/test-model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": "Native steer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({
+            "session_id": session["id"],
+            "permission_mode": "yolo",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Begin in the initial direction."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    provider
+        .first_stream_started
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+    let before = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.delta"
+    })
+    .await;
+    assert!(before.iter().any(|event| {
+        event["type"] == "turn.started" && event["turn"] == 1 && event["supports_steering"] == true
+    }));
+
+    let steer_client = client.clone();
+    let steer_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_steer = tokio::spawn(async move {
+        steer_client
+            .post(steer_url)
+            .json(&serde_json::json!({"content": "Change direction now."}))
+            .send()
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !pending_steer.is_finished(),
+        "steering interrupted the current provider response"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    provider.finish_first_stream.notify_one();
+    let steered = tokio::time::timeout(Duration::from_secs(10), pending_steer)
+        .await
+        .expect("boundary steering did not resume after the provider response")
+        .unwrap()
+        .unwrap();
+    assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        steered.json::<serde_json::Value>().await.unwrap()["turn"],
+        1
+    );
+
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed"
+    })
+    .await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "turn.started")
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| event["type"] == "turn.cancelled"));
+    assert!(events.iter().any(|event| {
+        event["type"] == "turn.steered"
+            && event["turn"] == 1
+            && event["content"] == "Change direction now."
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant.delta" && event["text"] == "Redirected result."
+    }));
+    let boundary_index = events
+        .iter()
+        .position(|event| {
+            event["type"] == "assistant.delta" && event["text"] == " Boundary completion."
+        })
+        .unwrap();
+    let steering_index = events
+        .iter()
+        .position(|event| event["type"] == "turn.steered")
+        .unwrap();
+    let tool_completed_index = events
+        .iter()
+        .position(|event| event["type"] == "tool.completed" && event["call_id"] == "boundary-read")
+        .unwrap();
+    assert!(boundary_index < tool_completed_index && tool_completed_index < steering_index);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+    let messages_seen = provider.messages_seen.lock().unwrap();
+    let resumed = &messages_seen[1];
+    assert!(resumed.iter().any(|message| {
+        matches!(message, Message::User(content) if content == "Change direction now.")
+    }));
+    assert!(resumed.iter().any(|message| {
+        matches!(message, Message::Assistant { content, .. } if content == "Initial direction. Boundary completion.")
+    }));
 }
 
 #[tokio::test]

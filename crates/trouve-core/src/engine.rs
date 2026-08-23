@@ -9861,7 +9861,7 @@ impl Engine {
                                 .into_iter()
                                 .find(|model| model.id == thread.model)
                         }),
-                    false,
+                    tools_enabled,
                 )
             };
         if selected_model.is_some() {
@@ -9961,6 +9961,111 @@ impl Engine {
             thread_id: thread_id.to_string(),
             turn: active.turn,
         })
+    }
+
+    async fn accept_native_steer_command(
+        &self,
+        session: &Session,
+        thread: &Thread,
+        turn: u64,
+        cancel: &tokio_util::sync::CancellationToken,
+        mutation_lane_state: &tokio::sync::watch::Sender<SteerMutationLaneState>,
+        command: SteerTurnCommand,
+    ) -> Result<()> {
+        let scope = Scope::Thread(thread.id.clone());
+        let SteerTurnCommand {
+            content,
+            attachments,
+            attachment_rows,
+            mut attachment_cleanup,
+            response,
+        } = command;
+        if cancel.is_cancelled() {
+            let _ = response.send(Err("turn cancelled".into()));
+            return Ok(());
+        }
+
+        let staged = attachment_rows
+            .iter()
+            .map(|(attachment, path)| AttachmentMaterializationFile {
+                attachment: attachment.clone(),
+                source: PathBuf::from(path),
+            })
+            .collect::<Vec<_>>();
+        let materialized = if staged.is_empty() {
+            Vec::new()
+        } else {
+            let lane = self.tool_execution_lock(&session.id);
+            let permit = match lane.try_write_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    mutation_lane_state.send_replace(SteerMutationLaneState::Waiting);
+                    let lane = self.tool_execution_lock(&session.id);
+                    let permit = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
+                            let _ = response.send(Err("turn cancelled".into()));
+                            return Ok(());
+                        }
+                        permit = lane.write_owned() => permit,
+                    };
+                    mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
+                    permit
+                }
+            };
+            let result = self
+                .executor
+                .materialize_attachments(&AttachmentMaterialization {
+                    source_root: self.data_dir.join("attachments"),
+                    managed_worktree_root: self.data_dir.join("worktrees"),
+                    worktree: PathBuf::from(&session.worktree_path),
+                    files: staged,
+                    cancel: cancel.clone(),
+                })
+                .await;
+            drop(permit);
+            match result {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    let _ = response.send(Err(error.clone()));
+                    bail!("steering attachment materialization failed: {error}");
+                }
+            }
+        };
+
+        let prompt_files = materialized
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let provider_prompt = annotate_attachments(content.clone(), &prompt_files);
+        let payload = match serde_json::to_value(Message::User(provider_prompt)) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let error = anyhow::Error::from(error);
+                let _ = response.send(Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.store.append_event_with_message(
+            scope,
+            Event::TurnSteered {
+                turn,
+                content,
+                attachments,
+            },
+            &thread.id,
+            &payload,
+            attachment_rows,
+            attachment_cleanup.claim(),
+        ) {
+            let message = error.to_string();
+            let _ = response.send(Err(message));
+            return Err(error);
+        }
+        attachment_cleanup.disarm();
+        let _ = response.send(Ok(()));
+        Ok(())
     }
 
     /// Whether the current turn has accepted attachment-bearing steering and
@@ -11279,6 +11384,33 @@ impl Engine {
         // multi-tool turn many-fold; the final request carries the whole
         // transcript, so its context size is the useful value.
         let mut context_input_tokens = 0u64;
+        let mut native_steer_rx = None;
+        let (native_steer_mutation_lane_state, _) =
+            tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+        let native_steerer_guard = if tools_enabled {
+            let (sender, receiver) = tokio::sync::mpsc::channel(8);
+            let replaced = self.turn_steerers.lock().unwrap().insert(
+                thread.id.clone(),
+                ActiveTurnSteerer {
+                    turn,
+                    sender,
+                    mutation_lane_state: native_steer_mutation_lane_state.clone(),
+                },
+            );
+            if let Some(replaced) = replaced {
+                replaced
+                    .mutation_lane_state
+                    .send_replace(SteerMutationLaneState::Ended);
+            }
+            native_steer_rx = Some(receiver);
+            Some(ActiveTurnSteererGuard {
+                registry: &self.turn_steerers,
+                thread_id: thread.id.clone(),
+                turn,
+            })
+        } else {
+            None
+        };
         // Becomes false when the loop ends because the model stopped calling
         // tools (or was cancelled); stays true only if we exhaust the
         // iteration budget mid-work, which we then surface to the user.
@@ -11288,6 +11420,28 @@ impl Engine {
             if cancel.is_cancelled() {
                 hit_iteration_limit = false;
                 break;
+            }
+            // Guidance received while tools were finishing belongs before the
+            // next model invocation. Drain every already-accepted message so
+            // the rebuilt transcript presents them in arrival order.
+            loop {
+                let command = match native_steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                    Some(Ok(command)) => command,
+                    Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                        native_steer_rx = None;
+                        break;
+                    }
+                    Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
+                };
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &native_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
             }
             // Rebuild the transcript each iteration; the store is the truth.
             let mut messages = vec![Message::System(system.clone())];
@@ -11321,17 +11475,37 @@ impl Engine {
             let mut thinking_streamed = false;
             let mut pending_events = Vec::new();
             let mut persist_deadline = None;
+            let mut pending_native_steer = None;
+            let mut consecutive_provider_events = 0usize;
+            let mut boundary_steers = Vec::new();
             loop {
                 let flush_at = persist_deadline.unwrap_or_else(Instant::now);
+                let steer_reserved = !cancel.is_cancelled()
+                    && reserve_ready_steer_after_event_budget(
+                        &mut native_steer_rx,
+                        &mut pending_native_steer,
+                        &mut consecutive_provider_events,
+                    );
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
+                    ev = stream.next(), if !steer_reserved => ev,
                     _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                         flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                         persist_deadline = None;
                         continue;
                     }
-                    ev = stream.next() => ev,
+                    steer = receive_steer_command(
+                        &mut native_steer_rx,
+                        &mut pending_native_steer,
+                        true,
+                    ), if !cancel.is_cancelled() => {
+                        match steer {
+                            Some(command) => boundary_steers.push(command),
+                            None => native_steer_rx = None,
+                        }
+                        continue;
+                    }
                 };
                 let Some(ev) = ev else { break };
                 let event = match ev {
@@ -11341,6 +11515,7 @@ impl Engine {
                         return Err(anyhow!("provider stream error: {error}"));
                     }
                 };
+                consecutive_provider_events += 1;
                 match event {
                     ProviderEvent::TextDelta(delta) => {
                         text.push_str(&delta);
@@ -11376,6 +11551,22 @@ impl Engine {
                 pending_events.push(Event::AssistantThinkingCompleted { turn });
             }
             flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+
+            // Catch every message that arrived at the exact response boundary.
+            // They remain pending until this provider turn, including its tool
+            // batch, has settled.
+            if !cancel.is_cancelled() {
+                loop {
+                    match native_steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                        Some(Ok(command)) => boundary_steers.push(command),
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                            native_steer_rx = None;
+                            break;
+                        }
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
+                    }
+                }
+            }
 
             // Interrupted mid-stream: keep any streamed text for display, but
             // drop the (unexecuted) tool calls so we don't strand tool_use
@@ -11440,8 +11631,22 @@ impl Engine {
             }
 
             if tool_calls.is_empty() {
-                hit_iteration_limit = false;
-                break;
+                if boundary_steers.is_empty() {
+                    hit_iteration_limit = false;
+                    break;
+                }
+                for command in boundary_steers {
+                    self.accept_native_steer_command(
+                        &session,
+                        thread,
+                        turn,
+                        &cancel,
+                        &native_steer_mutation_lane_state,
+                        command,
+                    )
+                    .await?;
+                }
+                continue;
             }
 
             // Providers may request independent calls in one response. Poll
@@ -11465,7 +11670,23 @@ impl Engine {
                     })?,
                 )?;
             }
+            for command in boundary_steers {
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &native_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
+            }
         }
+
+        // The bounded final-report pass is not an agent loop and cannot apply
+        // further guidance. Close the capability before entering it so a late
+        // request fails instead of waiting behind a response-only call.
+        drop(native_steerer_guard);
 
         // Truncated mid-work at the iteration budget: make one final
         // tool-free provider pass over the last tool results so the user gets

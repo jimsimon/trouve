@@ -37,7 +37,8 @@ use trouve_protocol::{ModelInfo, Usage};
 use crate::process_env::{ProcessTreeChild, spawn_process_tree};
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, spawn_claude_login,
+    BackendStatus, BackendSteer, BackendTurn, async_stream, binary_on_path, format_reset,
+    spawn_claude_login,
 };
 
 /// Most live processes kept at once; the least recently used is evicted.
@@ -691,6 +692,71 @@ impl AgentBackend for ClaudeBackend {
 
     fn supports_tool_free_turns(&self) -> bool {
         true
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
+        let proc_ = {
+            let procs = self.pool.procs.lock().await;
+            procs
+                .values()
+                .find(|proc_| {
+                    proc_.is_reusable()
+                        && proc_.session.lock().unwrap().as_deref() == Some(&steer.session)
+                })
+                .cloned()
+        }
+        .ok_or_else(|| {
+            BackendError::Protocol(format!(
+                "claude steer: no live process owns session {}",
+                steer.session
+            ))
+        })?;
+        // The active turn owns the line receiver for its whole lifetime. An
+        // idle pooled process must reject steering rather than interpreting
+        // the input as a new turn that the engine is not observing.
+        if proc_.lines.try_lock().is_ok() {
+            return Err(BackendError::Protocol(format!(
+                "claude steer: session {} has no active turn",
+                steer.session
+            )));
+        }
+
+        let mut content = Vec::with_capacity(1 + steer.attachments.len());
+        if !steer.prompt.is_empty() {
+            content.push(json!({ "type": "text", "text": steer.prompt }));
+        }
+        for attachment in steer.attachments {
+            let data = attachment.base64();
+            content.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": attachment.mime,
+                    "data": data,
+                }
+            }));
+        }
+        let message = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": content,
+            }
+        });
+        tokio::select! {
+            biased;
+            _ = steer.cancel.cancelled() => Err(BackendError::Cancelled),
+            result = async {
+                let mut stdin = proc_.stdin.lock().await;
+                stdin.write_all(message.to_string().as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.flush().await
+            } => result.map_err(BackendError::Io),
+        }
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
