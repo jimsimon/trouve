@@ -1153,7 +1153,7 @@ struct ProviderTurnCapacity {
 
 #[derive(Default)]
 struct ProviderBackoff {
-    until: Option<Instant>,
+    until: Option<tokio::time::Instant>,
     delay: std::time::Duration,
 }
 
@@ -1216,15 +1216,17 @@ impl TurnScheduler {
         model: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<TurnCapacityGuard> {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let provider = self.provider(model);
         loop {
+            let now = tokio::time::Instant::now();
             let cooldown = provider
                 .backoff
                 .lock()
                 .unwrap()
                 .until
-                .and_then(|until| until.checked_duration_since(Instant::now()));
+                .filter(|until| *until > now)
+                .map(|until| until - now);
             let Some(cooldown) = cooldown else {
                 break;
             };
@@ -1261,8 +1263,12 @@ impl TurnScheduler {
             } else {
                 (backoff.delay * 2).min(std::time::Duration::from_secs(30))
             };
-            backoff.until = Some(Instant::now() + backoff.delay);
-        } else if error.is_none() && backoff.until.is_none_or(|until| Instant::now() >= until) {
+            backoff.until = Some(tokio::time::Instant::now() + backoff.delay);
+        } else if error.is_none()
+            && backoff
+                .until
+                .is_none_or(|until| tokio::time::Instant::now() >= until)
+        {
             backoff.delay /= 2;
             backoff.until = None;
         }
