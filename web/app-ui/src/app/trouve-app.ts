@@ -3569,7 +3569,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   ? html`<option value="">Loading branches…</option>`
                   : nothing}
                 ${this.#newSessionBranches.map(
-                  (branch) => html`<option value=${branch}>${branch}</option>`,
+                  (branch) => html`<option
+                    value=${branch}
+                    .selected=${live(branch === this.#newSessionBaseRef)}
+                  >${branch}</option>`,
                 )}
               </select>
             </label>

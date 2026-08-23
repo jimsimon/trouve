@@ -815,10 +815,11 @@ describe("new session model", () => {
     ).modelId).toBe("cursor/default");
   });
 
-  it("chooses an explicit base, repository default, unavailable default, then conventional trunks", () => {
+  it("chooses an explicit base, repository default, then conventional trunks", () => {
     expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "main")).toBe("main");
     expect(resolveNewSessionBaseRef(["feature", "master", "main"], "master", "main")).toBe("master");
-    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "deadbeef")).toBe("HEAD");
+    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "deadbeef")).toBe("main");
+    expect(resolveNewSessionBaseRef(["feature", "master"], "", "deadbeef")).toBe("master");
     expect(resolveNewSessionBaseRef(["feature", "main"])).toBe("main");
     expect(resolveNewSessionBaseRef(["feature", "master"])).toBe("master");
     expect(resolveNewSessionBaseRef(["feature"])).toBe("HEAD");
