@@ -9761,12 +9761,18 @@ impl Engine {
                 .take()
                 .expect("an active queue prompt must have a cancellation token");
             let prompt_persisted = AtomicBool::new(shell_persisted);
+            // Review admission is acquired inside `run_turn`, after any
+            // provider-specific cooldown. Keep the permit in the dispatcher
+            // so cancellation and failure cleanup remain capacity-accounted
+            // through their durable terminal transition.
+            let review_turn_capacity = Mutex::new(None);
             let result = std::panic::AssertUnwindSafe(self.run_turn(
                 &thread,
                 turn,
                 &prompt,
                 cancel.clone(),
                 &prompt_persisted,
+                &review_turn_capacity,
             ))
             .catch_unwind()
             .await;
@@ -9875,6 +9881,7 @@ impl Engine {
             // or acknowledged cancellation cleanup. Release its disposable
             // review policy before an unrelated queued prompt can start.
             drop(automated_review_tool_budget.take());
+            review_turn_capacity.lock().unwrap().take();
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
             let (next, next_cancel) = {
@@ -10056,6 +10063,7 @@ impl Engine {
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
+        review_turn_capacity: &Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -10116,7 +10124,18 @@ impl Engine {
             _ = cancel.cancelled() => bail!("turn cancelled"),
             guard = session_lifecycle.read() => guard,
         };
-        let turn_capacity = self.turn_scheduler.acquire(&thread.model, &cancel).await?;
+        let turn_capacity = if background {
+            let (turn_capacity, permit) = crate::review::acquire_review_turn_capacity_after(
+                self.turn_scheduler.acquire(&thread.model, &cancel),
+                crate::review::review_turn_capacity(),
+                &cancel,
+            )
+            .await?;
+            *review_turn_capacity.lock().unwrap() = Some(permit);
+            turn_capacity
+        } else {
+            self.turn_scheduler.acquire(&thread.model, &cancel).await?
+        };
         if background
             && let Some(progress) = self
                 .store

@@ -333,6 +333,14 @@ fn coordinator_adjudication_repair_timeout(
         .min(REVIEW_COORDINATOR_ADJUDICATION_REPAIR_TIMEOUT)
 }
 
+fn review_turn_timeout_error(timeout: ReviewTurnTimeout<'_>) -> anyhow::Error {
+    anyhow!(
+        "{} timed out after {}",
+        timeout.label,
+        compact_elapsed(timeout.duration.as_millis().try_into().unwrap_or(u64::MAX))
+    )
+}
+
 fn review_task_concurrency() -> usize {
     *REVIEW_TASK_CONCURRENCY.get_or_init(|| {
         let requested = positive_concurrency_from_env(
@@ -352,38 +360,37 @@ fn review_task_concurrency() -> usize {
     })
 }
 
-fn review_turn_capacity() -> Arc<tokio::sync::Semaphore> {
+pub(crate) fn review_turn_capacity() -> Arc<tokio::sync::Semaphore> {
     Arc::clone(
         REVIEW_TURN_CAPACITY
             .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(review_task_concurrency()))),
     )
 }
 
-async fn with_review_turn_capacity_from<T, F, Fut>(
+pub(crate) async fn acquire_review_turn_capacity_from(
     capacity: Arc<tokio::sync::Semaphore>,
     cancel: &CancellationToken,
-    operation: F,
-) -> Result<T>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    let _permit = tokio::select! {
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {
         biased;
-        _ = cancel.cancelled() => return Err(anyhow!(SupersededReviewTask)),
+        _ = cancel.cancelled() => Err(anyhow!(SupersededReviewTask)),
         permit = capacity.acquire_owned() => {
-            permit.map_err(|_| anyhow!("code-review turn capacity closed"))?
+            permit.map_err(|_| anyhow!("code-review turn capacity closed"))
         }
-    };
-    operation().await
+    }
 }
 
-async fn with_review_turn_capacity<T, F, Fut>(cancel: &CancellationToken, operation: F) -> Result<T>
+pub(crate) async fn acquire_review_turn_capacity_after<T, Fut>(
+    provider_wait: Fut,
+    capacity: Arc<tokio::sync::Semaphore>,
+    cancel: &CancellationToken,
+) -> Result<(T, tokio::sync::OwnedSemaphorePermit)>
 where
-    F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    with_review_turn_capacity_from(review_turn_capacity(), cancel, operation).await
+    let provider_capacity = provider_wait.await?;
+    let review_capacity = acquire_review_turn_capacity_from(capacity, cancel).await?;
+    Ok((provider_capacity, review_capacity))
 }
 
 fn bounded_review_job_concurrency(limit: u32, source: &'static str) -> u32 {
@@ -1507,6 +1514,13 @@ struct CandidateFinding {
 struct ReviewTurnResult {
     output: String,
     metrics: CodeReviewTaskMetrics,
+    execution_elapsed: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct ReviewTurnTimeout<'a> {
+    duration: Duration,
+    label: &'a str,
 }
 
 #[derive(Debug)]
@@ -5758,6 +5772,7 @@ impl Engine {
         Ok(published_review.url)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_tracked_code_review_turn(
         self: &Arc<Self>,
         job: &trouve_protocol::CodeReviewJob,
@@ -5766,10 +5781,11 @@ impl Engine {
         request: ReviewTurnRequest,
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
+        timeout: Option<ReviewTurnTimeout<'_>>,
     ) -> Result<ReviewTurnResult> {
         active_threads.lock().unwrap().insert(thread_id.to_owned());
         let result = self
-            .run_code_review_turn(job, task_id, thread_id, request, superseded)
+            .run_code_review_turn(job, task_id, thread_id, request, superseded, timeout)
             .await;
         active_threads.lock().unwrap().remove(thread_id);
         result
@@ -5785,6 +5801,8 @@ impl Engine {
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
         max_tool_calls: u64,
+        timeout: Duration,
+        timeout_label: &str,
     ) -> Result<(ReviewTurnResult, ReviewOutput)> {
         let mut turn = self
             .run_tracked_code_review_turn(
@@ -5794,6 +5812,10 @@ impl Engine {
                 ReviewTurnRequest::review(prompt, max_tool_calls),
                 superseded,
                 active_threads,
+                Some(ReviewTurnTimeout {
+                    duration: timeout,
+                    label: timeout_label,
+                }),
             )
             .await?;
         let initial_error = match parse_review_output(&turn.output) {
@@ -5813,12 +5835,19 @@ impl Engine {
                 .with_metrics_base(turn.metrics.clone()),
                 superseded,
                 active_threads,
+                Some(ReviewTurnTimeout {
+                    duration: timeout.saturating_sub(turn.execution_elapsed),
+                    label: timeout_label,
+                }),
             )
             .await
             .with_context(|| {
                 format!("repairing malformed model review output after: {initial_error:#}")
             })?;
         merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
+        turn.execution_elapsed = turn
+            .execution_elapsed
+            .saturating_add(repaired.execution_elapsed);
         turn.output = repaired.output;
         let parsed = parse_review_output(&turn.output).with_context(|| {
             format!(
@@ -5842,42 +5871,21 @@ impl Engine {
         timeout: Duration,
         timeout_label: &str,
     ) -> Result<(ReviewTurnResult, ReviewOutput, Duration)> {
-        with_review_turn_capacity(superseded, || async {
-            let execution_started = Instant::now();
-            let result = match tokio::time::timeout(
+        let (turn, parsed) = self
+            .run_parsed_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                prompt,
+                superseded,
+                active_threads,
+                max_tool_calls,
                 timeout,
-                self.run_parsed_code_review_turn(
-                    job,
-                    task_id,
-                    thread_id,
-                    prompt,
-                    superseded,
-                    active_threads,
-                    max_tool_calls,
-                ),
+                timeout_label,
             )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    active_threads.lock().unwrap().remove(thread_id);
-                    if let Err(error) = self.cancel_turn(thread_id) {
-                        tracing::warn!(
-                            job_id = %job.id,
-                            thread_id,
-                            %error,
-                            "failed to cancel timed-out code-review task"
-                        );
-                    }
-                    bail!(
-                        "{timeout_label} timed out after {}",
-                        compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
-                    )
-                }
-            }?;
-            Ok((result.0, result.1, execution_started.elapsed()))
-        })
-        .await
+            .await?;
+        let execution_elapsed = turn.execution_elapsed;
+        Ok((turn, parsed, execution_elapsed))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5892,38 +5900,18 @@ impl Engine {
         timeout: Duration,
         timeout_label: &str,
     ) -> Result<ReviewTurnResult> {
-        with_review_turn_capacity(superseded, || async {
-            match tokio::time::timeout(
-                timeout,
-                self.run_tracked_code_review_turn(
-                    job,
-                    task_id,
-                    thread_id,
-                    request,
-                    superseded,
-                    active_threads,
-                ),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    active_threads.lock().unwrap().remove(thread_id);
-                    if let Err(error) = self.cancel_turn(thread_id) {
-                        tracing::warn!(
-                            job_id = %job.id,
-                            thread_id,
-                            %error,
-                            "failed to cancel timed-out code-review repair task"
-                        );
-                    }
-                    bail!(
-                        "{timeout_label} timed out after {}",
-                        compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
-                    )
-                }
-            }
-        })
+        self.run_tracked_code_review_turn(
+            job,
+            task_id,
+            thread_id,
+            request,
+            superseded,
+            active_threads,
+            Some(ReviewTurnTimeout {
+                duration: timeout,
+                label: timeout_label,
+            }),
+        )
         .await
     }
 
@@ -5936,49 +5924,51 @@ impl Engine {
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
     ) -> Result<(ReviewTurnResult, SemanticRoutingOutput)> {
-        with_review_turn_capacity(superseded, || async {
-            let mut turn = self
-                .run_tracked_code_review_turn(
-                    job,
-                    task_id,
-                    thread_id,
-                    ReviewTurnRequest::json_repair(prompt),
-                    superseded,
-                    active_threads,
-                )
-                .await?;
-            let initial_error = match parse_semantic_routing_output(&turn.output) {
-                Ok(parsed) => return Ok((turn, parsed)),
-                Err(error) => error,
-            };
-            let repaired = self
-                .run_tracked_code_review_turn(
-                    job,
-                    task_id,
-                    thread_id,
-                    ReviewTurnRequest::json_repair(semantic_routing_repair_prompt(
-                        &initial_error,
-                        &turn.output,
-                    ))
-                    .with_metrics_base(turn.metrics.clone()),
-                    superseded,
-                    active_threads,
-                )
-                .await
-                .with_context(|| {
-                    format!("repairing malformed semantic routing output after: {initial_error:#}")
-                })?;
-            merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
-            turn.output = repaired.output;
-            let parsed = parse_semantic_routing_output(&turn.output).with_context(|| {
-                format!(
-                    "semantic routing remained invalid after one JSON repair attempt; \
-                     initial response error: {initial_error:#}"
-                )
+        let mut turn = self
+            .run_tracked_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                ReviewTurnRequest::json_repair(prompt),
+                superseded,
+                active_threads,
+                None,
+            )
+            .await?;
+        let initial_error = match parse_semantic_routing_output(&turn.output) {
+            Ok(parsed) => return Ok((turn, parsed)),
+            Err(error) => error,
+        };
+        let repaired = self
+            .run_tracked_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                ReviewTurnRequest::json_repair(semantic_routing_repair_prompt(
+                    &initial_error,
+                    &turn.output,
+                ))
+                .with_metrics_base(turn.metrics.clone()),
+                superseded,
+                active_threads,
+                None,
+            )
+            .await
+            .with_context(|| {
+                format!("repairing malformed semantic routing output after: {initial_error:#}")
             })?;
-            Ok((turn, parsed))
-        })
-        .await
+        merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
+        turn.execution_elapsed = turn
+            .execution_elapsed
+            .saturating_add(repaired.execution_elapsed);
+        turn.output = repaired.output;
+        let parsed = parse_semantic_routing_output(&turn.output).with_context(|| {
+            format!(
+                "semantic routing remained invalid after one JSON repair attempt; \
+                     initial response error: {initial_error:#}"
+            )
+        })?;
+        Ok((turn, parsed))
     }
 
     async fn semantic_routing_for_batches(
@@ -6156,6 +6146,7 @@ impl Engine {
         thread_id: &str,
         request: ReviewTurnRequest,
         superseded: &CancellationToken,
+        timeout: Option<ReviewTurnTimeout<'_>>,
     ) -> Result<ReviewTurnResult> {
         let ReviewTurnRequest {
             prompt,
@@ -6208,6 +6199,9 @@ impl Engine {
         let mut tool_call_count = 0_u64;
         let mut projected = ReviewOutputBuffer::new();
         let mut cancellation_requested = false;
+        let mut timed_out = false;
+        let mut execution_started = None;
+        let mut timeout_deadline = None;
         loop {
             if superseded.is_cancelled() && !cancellation_requested {
                 let _ = self.cancel_turn(thread_id);
@@ -6222,6 +6216,23 @@ impl Engine {
                         tokio::select! {
                             received = events.recv() => Some(received),
                             _ = tokio::time::sleep(progress_wait) => None,
+                        }
+                    } else if let Some(deadline) = timeout_deadline {
+                        tokio::select! {
+                            biased;
+                            received = events.recv() => Some(received),
+                            _ = tokio::time::sleep(progress_wait) => None,
+                            _ = superseded.cancelled() => {
+                                let _ = self.cancel_turn(thread_id);
+                                cancellation_requested = true;
+                                continue;
+                            }
+                            _ = tokio::time::sleep_until(deadline) => {
+                                let _ = self.cancel_turn(thread_id);
+                                cancellation_requested = true;
+                                timed_out = true;
+                                continue;
+                            }
                         }
                     } else {
                         tokio::select! {
@@ -6294,6 +6305,9 @@ impl Engine {
                     observed_stage = initial_stage;
                     coalesce_observed_stage = false;
                     last_progress_persisted = Instant::now();
+                    execution_started.get_or_insert_with(Instant::now);
+                    timeout_deadline =
+                        timeout.map(|timeout| tokio::time::Instant::now() + timeout.duration);
                 }
                 Event::TurnStarted {
                     turn: event_turn, ..
@@ -6373,6 +6387,11 @@ impl Engine {
                         CodeReviewModelTiming::Reset,
                     )
                     .await?;
+                    if timed_out {
+                        return Err(review_turn_timeout_error(
+                            timeout.expect("a timed-out review turn has a timeout"),
+                        ));
+                    }
                     usage = event_usage;
                     break;
                 }
@@ -6402,6 +6421,11 @@ impl Engine {
                             "failed to persist terminal progress after model turn failure"
                         );
                     }
+                    if timed_out {
+                        return Err(review_turn_timeout_error(
+                            timeout.expect("a timed-out review turn has a timeout"),
+                        ));
+                    }
                     bail!("model review failed: {error}");
                 }
                 Event::TurnCancelled { turn: event_turn } if event_turn == turn => {
@@ -6426,6 +6450,11 @@ impl Engine {
                             error = %progress_error,
                             "failed to persist terminal progress after model turn cancellation"
                         );
+                    }
+                    if timed_out {
+                        return Err(review_turn_timeout_error(
+                            timeout.expect("a timed-out review turn has a timeout"),
+                        ));
                     }
                     if superseded.is_cancelled() {
                         bail!("stale: review was superseded while the model was running");
@@ -6474,6 +6503,8 @@ impl Engine {
                 tool_call_count,
                 Some(&usage),
             ),
+            execution_elapsed: execution_started
+                .map_or(Duration::ZERO, |started| started.elapsed()),
         })
     }
 
@@ -14198,6 +14229,7 @@ mod tests {
                             REVIEWER_MAX_TOOL_CALLS,
                         ),
                         &superseded,
+                        None,
                     )
                     .await
             }
@@ -21997,35 +22029,52 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn review_capacity_wait_precedes_the_operation_timeout() {
+    async fn review_capacity_wait_does_not_consume_a_permit_early() {
         let capacity = Arc::new(tokio::sync::Semaphore::new(1));
         let blocker = Arc::clone(&capacity).acquire_owned().await.unwrap();
-        let operation_started = Arc::new(AtomicBool::new(false));
-        let started = Arc::clone(&operation_started);
         let cancel = CancellationToken::new();
-        let waiter = tokio::spawn(async move {
-            with_review_turn_capacity_from(capacity, &cancel, move || async move {
-                started.store(true, Ordering::SeqCst);
-                tokio::time::timeout(Duration::from_secs(1), async {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    Ok::<_, anyhow::Error>(())
-                })
-                .await
-                .map_err(|_| anyhow!("model operation timed out"))?
-            })
-            .await
-        });
+        let waiter =
+            tokio::spawn(async move { acquire_review_turn_capacity_from(capacity, &cancel).await });
 
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(!operation_started.load(Ordering::SeqCst));
         assert!(!waiter.is_finished());
 
         drop(blocker);
         tokio::task::yield_now().await;
-        assert!(operation_started.load(Ordering::SeqCst));
-        tokio::time::advance(Duration::from_millis(500)).await;
-        waiter.await.unwrap().unwrap();
+        let permit = waiter.await.unwrap().unwrap();
+        assert_eq!(permit.num_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_cooldown_wait_does_not_block_healthy_review_capacity() {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let (release_provider, provider_wait) = tokio::sync::oneshot::channel::<()>();
+        let delayed = tokio::spawn({
+            let capacity = Arc::clone(&capacity);
+            async move {
+                acquire_review_turn_capacity_after(
+                    async move {
+                        provider_wait.await.unwrap();
+                        Ok::<_, anyhow::Error>(())
+                    },
+                    capacity,
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        let healthy = Arc::clone(&capacity)
+            .try_acquire_owned()
+            .expect("provider cooldown must finish before consuming review capacity");
+        assert!(!delayed.is_finished());
+        drop(healthy);
+
+        release_provider.send(()).unwrap();
+        let (_, permit) = delayed.await.unwrap().unwrap();
+        assert_eq!(permit.num_permits(), 1);
     }
 
     #[test]

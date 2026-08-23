@@ -261,8 +261,12 @@ The review service bounds top-level work with
 a server restart. The task limit is one process-wide review model-turn budget,
 shared by every `Engine` and every running job. It covers semantic routing,
 reviewer personas, coordination, final editing, and JSON repair, so increasing
-job concurrency does not multiply provider fan-out. Review-job concurrency has
-a hard maximum of 32; larger persisted, API, or
+job concurrency does not multiply provider fan-out. Provider-specific cooldown
+waits happen before a task consumes this process-wide budget, preserving slots
+for healthy providers. A task retains its slot through timeout cancellation and
+terminal cleanup; its model timeout starts only after both cooldown and review
+admission complete. Review-job concurrency has a hard maximum of 32; larger
+persisted, API, or
 `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are reduced to 32 with a server
 warning.
 
