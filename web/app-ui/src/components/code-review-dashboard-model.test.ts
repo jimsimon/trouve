@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   codeReviewSettingsDraft,
   codeReviewSettingsRequest,
+  codeReviewChurnSoakPending,
   codeReviewNeedsAttention,
   codeReviewStatusClass,
   groupCodeReviewJobs,
@@ -29,6 +30,28 @@ describe("code-review dashboard model", () => {
     expect(codeReviewNeedsAttention({ status: "succeeded", open_issue_count: null })).toBe(true);
     expect(codeReviewNeedsAttention({ status: "succeeded" })).toBe(true);
     expect(codeReviewNeedsAttention({ status: "running", open_issue_count: 2 })).toBe(false);
+  });
+
+  it("treats a clean round inside a fix-churn soak as needing attention", () => {
+    const soaking = {
+      finding_round_streak: 4,
+      recurring_paths: ["crates/core/src/engine.rs"],
+      clean_rounds: 1,
+      required_clean_rounds: 2,
+    };
+    const settled = { ...soaking, clean_rounds: 2 };
+    expect(codeReviewChurnSoakPending({ churn: soaking })).toBe(true);
+    expect(codeReviewChurnSoakPending({ churn: settled })).toBe(false);
+    expect(codeReviewChurnSoakPending({})).toBe(false);
+    expect(
+      codeReviewNeedsAttention({ status: "succeeded", open_issue_count: 0, churn: soaking }),
+    ).toBe(true);
+    expect(
+      codeReviewNeedsAttention({ status: "succeeded", open_issue_count: 0, churn: settled }),
+    ).toBe(false);
+    expect(
+      codeReviewNeedsAttention({ status: "running", open_issue_count: 0, churn: soaking }),
+    ).toBe(false);
   });
 
   it("groups by repository with active and newest jobs first", () => {

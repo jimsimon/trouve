@@ -645,12 +645,18 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+function reviewChurnSoakPending(job: Pick<ReviewJob, "churn">): boolean {
+  return job.churn != null && job.churn.clean_rounds < job.churn.required_clean_rounds;
+}
+
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, "status" | "open_issue_count">,
-): "open" | "unknown" | null {
+  job: Pick<ReviewJob, "status" | "open_issue_count" | "churn">,
+): "open" | "churn" | "unknown" | null {
   if (job.status !== "succeeded") return null;
+  if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
+  if (reviewChurnSoakPending(job)) return "churn";
   if (job.open_issue_count == null) return "unknown";
-  return job.open_issue_count > 0 ? "open" : null;
+  return null;
 }
 
 function JobRow({ job, now }: { job: ReviewJob; now: number }) {
@@ -661,6 +667,8 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
       {attentionState === "open" ? (
         <span class="status failed">needs attention</span>
+      ) : attentionState === "churn" ? (
+        <span class="status warning">fix churn</span>
       ) : attentionState === "unknown" ? (
         <span class="status warning">status unknown</span>
       ) : (
@@ -1430,6 +1438,7 @@ function JobDetailPane({
         <div>
           <StatusPill status={job.status} />
           {attentionState === "open" && <span class="status failed">needs attention</span>}
+          {attentionState === "churn" && <span class="status warning">fix churn</span>}
           {attentionState === "unknown" && <span class="status warning">status unknown</span>}
           <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
@@ -1558,6 +1567,29 @@ function JobDetailPane({
           <strong>PR-wide open issue status is unknown</strong>
           <p>
             This legacy review predates PR-wide finding snapshots. It cannot establish that older findings are resolved, even when this round found no new issues.
+          </p>
+        </div>
+      )}
+      {job.status === "succeeded" && job.churn && (
+        <div class="banner warning stacked" role="alert">
+          <strong>
+            Recurring instability: {job.churn.finding_round_streak} consecutive round
+            {job.churn.finding_round_streak === 1 ? "" : "s"} confirmed new issues
+          </strong>
+          <p>
+            Incremental fixes appear to be relocating the defect rather than resolving it
+            {(job.churn.recurring_paths ?? []).length > 0 && (
+              <> — recurring in {(job.churn.recurring_paths ?? []).map((path, index) => (
+                <span key={path}>
+                  {index > 0 && ", "}
+                  <code>{path}</code>
+                </span>
+              ))}</>
+            )}
+            . Consider a design-level pass over the affected area instead of another point fix.{" "}
+            {reviewChurnSoakPending(job)
+              ? `The check run stays neutral until ${job.churn.required_clean_rounds} consecutive review rounds are clean (${job.churn.clean_rounds}/${job.churn.required_clean_rounds} so far).`
+              : `The clean-round soak is complete (${job.churn.clean_rounds}/${job.churn.required_clean_rounds}).`}
           </p>
         </div>
       )}

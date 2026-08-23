@@ -1947,6 +1947,46 @@ export interface components {
             /** @description Concise, generated one-line summary of the candidate issue. */
             title: string;
         };
+        /**
+         * @description Fix-churn signal derived by the server from a pull request's published
+         *     review round history. A round is one published review job; a "finding
+         *     round" is a round that confirmed at least one new finding. The signal is
+         *     reported while consecutive finding rounds indicate that incremental fixes
+         *     are relocating defects rather than resolving them, and through the
+         *     clean-round soak that must complete before the check run may report
+         *     success again.
+         */
+        CodeReviewChurnSignal: {
+            /**
+             * Format: int64
+             * @description Consecutive clean published rounds since the streak ended, including
+             *     the round carrying this signal when it was clean. Zero while churn is
+             *     active.
+             */
+            clean_rounds: number;
+            /**
+             * Format: int64
+             * @description Consecutive published finding rounds, counted backwards from the most
+             *     recent finding round. Bounded by the server's history window.
+             */
+            finding_round_streak: number;
+            /**
+             * Format: int64
+             * @description Median seconds between consecutive rounds of the streak. Absent when
+             *     the streak is too short to measure.
+             */
+            median_round_interval_seconds?: number | null;
+            /**
+             * @description Paths whose findings recurred across enough distinct rounds of the
+             *     streak to indicate a defect being relocated within the same area.
+             */
+            recurring_paths?: string[];
+            /**
+             * Format: int64
+             * @description Clean rounds required before the check run may report success again.
+             */
+            required_clean_rounds: number;
+        };
         /** @description Signals that measure repeated review work rather than raw issue volume. */
         CodeReviewChurnStats: {
             /** Format: double */
@@ -2075,6 +2115,7 @@ export interface components {
             check_run_id?: number | null;
             check_run_url?: string;
             check_sync_error?: string;
+            churn?: null | components["schemas"]["CodeReviewChurnSignal"];
             /** Format: date-time */
             completed_at?: string | null;
             /** Format: int64 */

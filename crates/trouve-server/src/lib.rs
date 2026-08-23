@@ -383,6 +383,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::CodeReviewStatsBucket,
         trouve_protocol::CodeReviewPersonaModelStats,
         trouve_protocol::CodeReviewRepositoryStats,
+        trouve_protocol::CodeReviewChurnSignal,
         trouve_protocol::CodeReviewChurnStats,
         trouve_protocol::CodeReviewStats,
         trouve_protocol::CodeReviewMode,

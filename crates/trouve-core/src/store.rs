@@ -353,6 +353,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   issue_count INTEGER NOT NULL DEFAULT 0,
   fixed_issue_count INTEGER NOT NULL DEFAULT 0,
   publication_open_issue_count INTEGER,
+  publication_churn_signal TEXT,
   summary TEXT NOT NULL DEFAULT '',
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   publication_claimed INTEGER NOT NULL DEFAULT 0,
@@ -759,6 +760,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE session_pr_verification_intents ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_churn_signal TEXT",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
@@ -3036,6 +3038,166 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
     Ok(())
 }
 
+/// Most recent published review rounds inspected for fix churn.
+const CODE_REVIEW_CHURN_ROUND_WINDOW: usize = 12;
+/// Consecutive finding rounds that indicate churn when their findings recur
+/// in shared paths.
+const CODE_REVIEW_CHURN_MIN_STREAK: u64 = 3;
+/// Consecutive finding rounds that indicate churn even when the findings move
+/// between unrelated paths every round.
+const CODE_REVIEW_CHURN_PERSISTENT_STREAK: u64 = 5;
+/// Distinct streak rounds a path must produce findings in to count as
+/// recurring.
+const CODE_REVIEW_CHURN_RECURRING_ROUNDS: usize = 3;
+/// Reported recurring paths are capped to keep persisted payloads bounded.
+const CODE_REVIEW_CHURN_MAX_RECURRING_PATHS: usize = 5;
+/// Clean rounds required before a churning pull request's check run may
+/// report success again.
+const CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS: u64 = 2;
+
+/// One published review round of a pull request.
+#[derive(Debug, Clone)]
+struct CodeReviewChurnRound {
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    issue_count: u64,
+    finding_paths: Vec<String>,
+}
+
+/// Derive the fix-churn signal from a pull request's published rounds,
+/// ordered newest first. Returns `None` when the recent history does not
+/// match the churn heuristics, or once the clean soak has completed on an
+/// earlier round (`clean_rounds` strictly greater than the requirement), so
+/// the signal disappears instead of trailing the pull request forever.
+fn compute_code_review_churn_signal(
+    rounds: &[CodeReviewChurnRound],
+) -> Option<trouve_protocol::CodeReviewChurnSignal> {
+    let clean_rounds = rounds
+        .iter()
+        .take_while(|round| round.issue_count == 0)
+        .count();
+    let streak_rounds = rounds[clean_rounds.min(rounds.len())..]
+        .iter()
+        .take_while(|round| round.issue_count > 0)
+        .collect::<Vec<_>>();
+    let finding_round_streak = streak_rounds.len() as u64;
+    let mut rounds_per_path = BTreeMap::<&str, usize>::new();
+    for round in &streak_rounds {
+        let mut round_paths = round
+            .finding_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        round_paths.sort_unstable();
+        round_paths.dedup();
+        for path in round_paths {
+            *rounds_per_path.entry(path).or_default() += 1;
+        }
+    }
+    let mut recurring = rounds_per_path
+        .into_iter()
+        .filter(|(_, rounds)| *rounds >= CODE_REVIEW_CHURN_RECURRING_ROUNDS)
+        .collect::<Vec<_>>();
+    recurring.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    let recurring_paths = recurring
+        .into_iter()
+        .take(CODE_REVIEW_CHURN_MAX_RECURRING_PATHS)
+        .map(|(path, _)| path.to_string())
+        .collect::<Vec<_>>();
+    let churning = (finding_round_streak >= CODE_REVIEW_CHURN_MIN_STREAK
+        && !recurring_paths.is_empty())
+        || finding_round_streak >= CODE_REVIEW_CHURN_PERSISTENT_STREAK;
+    if !churning || clean_rounds as u64 > CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS {
+        return None;
+    }
+    let mut intervals = streak_rounds
+        .windows(2)
+        .filter_map(|pair| Some((pair[0].created_at?, pair[1].created_at?)))
+        .map(|(newer, older)| newer.signed_duration_since(older).num_seconds().max(0) as u64)
+        .collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let median_round_interval_seconds = if intervals.is_empty() {
+        None
+    } else {
+        Some(intervals[intervals.len() / 2])
+    };
+    Some(trouve_protocol::CodeReviewChurnSignal {
+        finding_round_streak,
+        recurring_paths,
+        median_round_interval_seconds,
+        clean_rounds: clean_rounds as u64,
+        required_clean_rounds: CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS,
+    })
+}
+
+/// Load the published-round window for churn analysis, newest first by the
+/// per-PR publication sequence. Unpublished jobs never appear, so a running
+/// job's in-progress round is naturally excluded.
+fn load_code_review_churn_rounds(
+    conn: &rusqlite::Connection,
+    repository: &str,
+    pull_number: u64,
+) -> Result<Vec<CodeReviewChurnRound>> {
+    let mut rounds_statement = conn.prepare(
+        "SELECT id, created_at, issue_count
+         FROM code_review_jobs
+         WHERE repository = ?1 AND pull_number = ?2 AND review_published != 0
+         ORDER BY publication_order DESC, created_at DESC, id DESC
+         LIMIT ?3",
+    )?;
+    let rows = rounds_statement
+        .query_map(
+            params![
+                repository,
+                pull_number as i64,
+                CODE_REVIEW_CHURN_ROUND_WINDOW as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut paths_statement =
+        conn.prepare("SELECT DISTINCT path FROM code_review_findings WHERE job_id = ?1")?;
+    rows.into_iter()
+        .map(|(job_id, created_at, issue_count)| {
+            let issue_count = issue_count.max(0) as u64;
+            let finding_paths = if issue_count == 0 {
+                Vec::new()
+            } else {
+                paths_statement
+                    .query_map(params![job_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok(CodeReviewChurnRound {
+                created_at: parse_optional_datetime(Some(created_at)),
+                issue_count,
+                finding_paths,
+            })
+        })
+        .collect()
+}
+
+fn record_code_review_churn_signal(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    repository: &str,
+    pull_number: u64,
+) -> Result<()> {
+    let rounds = load_code_review_churn_rounds(tx, repository, pull_number)?;
+    let serialized = compute_code_review_churn_signal(&rounds)
+        .map(|signal| serde_json::to_string(&signal))
+        .transpose()?;
+    tx.execute(
+        "UPDATE code_review_jobs SET publication_churn_signal = ?2 WHERE id = ?1",
+        params![job_id, serialized],
+    )?;
+    Ok(())
+}
+
 fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
     value.and_then(|value| value.parse().ok())
 }
@@ -3303,6 +3465,9 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             open_issue_count: r
                 .get::<_, Option<i64>>(56)?
                 .map(|value| value.max(0) as u64),
+            churn: r
+                .get::<_, Option<String>>(57)?
+                .and_then(|value| serde_json::from_str(&value).ok()),
             error: r.get(18)?,
             created_at,
             started_at,
@@ -3314,7 +3479,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
-        can_retry_final_editor: r.get(57)?,
+        can_retry_final_editor: r.get(58)?,
         prompt: r.get(12)?,
         reviewers,
         summary: r.get(36)?,
@@ -3337,7 +3502,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
      review_published, blocking_review_cleanup_pending, publication_dispatched, \
-     publication_open_issue_count, \
+     publication_open_issue_count, publication_churn_signal, \
      CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
             AND code_review_jobs.session_id IS NULL \
             AND EXISTS ( \
@@ -11174,6 +11339,19 @@ impl Store {
         self.code_review_findings_for_pull_with_status(repository, pull_number, None)
     }
 
+    /// Fix-churn signal derived from the pull request's already published
+    /// rounds. Used while a new round is still running, so the in-progress
+    /// round itself is not part of the streak.
+    pub fn code_review_pull_churn_signal(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Option<trouve_protocol::CodeReviewChurnSignal>> {
+        let conn = self.conn.lock().unwrap();
+        let rounds = load_code_review_churn_rounds(&conn, repository, pull_number)?;
+        Ok(compute_code_review_churn_signal(&rounds))
+    }
+
     pub fn code_review_finding_history_for_pull(
         &self,
         repository: &str,
@@ -12852,6 +13030,7 @@ impl Store {
             &published_at,
         )?;
         record_code_review_open_issue_count(&tx, id)?;
+        record_code_review_churn_signal(&tx, id, &repository, pull_number as u64)?;
         tx.execute(
             "INSERT INTO code_review_pr_state
                         (repository, pull_number, last_reviewed_head_sha,
@@ -13208,6 +13387,7 @@ impl Store {
             &published_at,
         )?;
         record_code_review_open_issue_count(&tx, id)?;
+        record_code_review_churn_signal(&tx, id, repository, pull_number)?;
         tx.execute(
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
@@ -22678,6 +22858,245 @@ mod tests {
             )
             .unwrap();
         assert_eq!(limited[0].task_id, "second-task");
+    }
+
+    fn publish_churn_test_round(
+        store: &Store,
+        dedupe_key: &str,
+        head_sha: &str,
+        finding_paths: &[&str],
+        resolved_finding_ids: &[&str],
+    ) -> (
+        trouve_protocol::CodeReviewJob,
+        Vec<trouve_protocol::CodeReviewFinding>,
+    ) {
+        let job = store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: dedupe_key.into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: head_sha.into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: Some("provider/default".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: "Review it".into(),
+                reviewers: Vec::new(),
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = finding_paths
+            .iter()
+            .map(|path| NewCodeReviewFinding {
+                path: (*path).into(),
+                line: 12,
+                side: "RIGHT".into(),
+                severity: "high".into(),
+                confidence: "high".into(),
+                title: "Relocated defect".into(),
+                body: "The lifecycle invariant is violated.".into(),
+                prompt_for_agents: "Restore the invariant.".into(),
+                sources: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let stored = store
+            .save_code_review_result(
+                &job.id,
+                "Round result.",
+                "",
+                finding_paths.len() as u64,
+                &findings,
+                &[],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example.test/review",
+                false,
+                resolved_finding_ids,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "https://example.test/review", "")
+            .unwrap();
+        (job, stored)
+    }
+
+    #[test]
+    fn review_fix_churn_signal_tracks_streaks_and_clean_soak() {
+        let store = Store::open_in_memory().unwrap();
+        let churn = |job_id: &str| store.code_review_job(job_id).unwrap().unwrap().job.churn;
+
+        let mut open_finding_ids = Vec::new();
+        let (round1, findings) = publish_churn_test_round(
+            &store,
+            "acme/widgets#42:signal-round-1",
+            "2222222222222222222222222222222222222222",
+            &["crates/core/src/engine.rs"],
+            &[],
+        );
+        open_finding_ids.extend(findings.into_iter().map(|finding| finding.id));
+        assert_eq!(churn(&round1.id), None);
+
+        let (round2, findings) = publish_churn_test_round(
+            &store,
+            "acme/widgets#42:signal-round-2",
+            "3333333333333333333333333333333333333333",
+            &["crates/core/src/engine.rs", "crates/core/src/store.rs"],
+            &[],
+        );
+        open_finding_ids.extend(findings.into_iter().map(|finding| finding.id));
+        assert_eq!(churn(&round2.id), None, "two rounds are not yet a streak");
+
+        let (round3, findings) = publish_churn_test_round(
+            &store,
+            "acme/widgets#42:signal-round-3",
+            "4444444444444444444444444444444444444444",
+            &["crates/core/src/engine.rs"],
+            &[],
+        );
+        open_finding_ids.extend(findings.into_iter().map(|finding| finding.id));
+        let signal = churn(&round3.id).expect("three recurring rounds trip the signal");
+        assert_eq!(signal.finding_round_streak, 3);
+        assert_eq!(
+            signal.recurring_paths,
+            vec!["crates/core/src/engine.rs".to_string()]
+        );
+        assert_eq!(signal.clean_rounds, 0);
+        assert_eq!(signal.required_clean_rounds, 2);
+
+        // The prior-round view a still-running job would consult reports the
+        // same streak.
+        assert_eq!(
+            store
+                .code_review_pull_churn_signal("acme/widgets", 42)
+                .unwrap()
+                .expect("prior-round churn signal")
+                .finding_round_streak,
+            3
+        );
+
+        let resolved = open_finding_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let (round4, _) = publish_churn_test_round(
+            &store,
+            "acme/widgets#42:signal-round-4",
+            "5555555555555555555555555555555555555555",
+            &[],
+            &resolved,
+        );
+        let signal = churn(&round4.id).expect("the soak keeps the signal visible");
+        assert_eq!(signal.finding_round_streak, 3);
+        assert_eq!(signal.clean_rounds, 1);
+        assert_eq!(
+            store
+                .code_review_job(&round4.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .open_issue_count,
+            Some(0),
+            "the soak is what keeps this round from reading as settled"
+        );
+
+        let (round5, _) = publish_churn_test_round(
+            &store,
+            "acme/widgets#42:signal-round-5",
+            "6666666666666666666666666666666666666666",
+            &[],
+            &[],
+        );
+        let signal = churn(&round5.id).expect("the completing soak round still reports the signal");
+        assert_eq!(signal.clean_rounds, 2);
+
+        let (round6, _) = publish_churn_test_round(
+            &store,
+            "acme/widgets#42:signal-round-6",
+            "7777777777777777777777777777777777777777",
+            &[],
+            &[],
+        );
+        assert_eq!(
+            churn(&round6.id),
+            None,
+            "a settled pull request stops carrying the signal"
+        );
+    }
+
+    #[test]
+    fn review_fix_churn_signal_heuristics_cover_shifting_paths_and_intervals() {
+        let round = |minutes_ago: i64, paths: &[&str]| CodeReviewChurnRound {
+            created_at: Some(
+                "2026-08-23T12:00:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+                    - chrono::Duration::minutes(minutes_ago),
+            ),
+            issue_count: paths.len() as u64,
+            finding_paths: paths.iter().map(|path| (*path).to_string()).collect(),
+        };
+
+        // Four rounds whose findings never share a path stay below the
+        // persistent-streak threshold.
+        let shifting = [
+            round(0, &["a.rs"]),
+            round(10, &["b.rs"]),
+            round(20, &["c.rs"]),
+            round(30, &["d.rs"]),
+        ];
+        assert_eq!(compute_code_review_churn_signal(&shifting), None);
+
+        // A fifth consecutive finding round trips the signal even without a
+        // recurring path.
+        let persistent = [
+            round(0, &["a.rs"]),
+            round(10, &["b.rs"]),
+            round(20, &["c.rs"]),
+            round(40, &["d.rs"]),
+            round(80, &["e.rs"]),
+        ];
+        let signal = compute_code_review_churn_signal(&persistent)
+            .expect("persistent streaks trip the signal without recurring paths");
+        assert_eq!(signal.finding_round_streak, 5);
+        assert!(signal.recurring_paths.is_empty());
+        assert_eq!(signal.median_round_interval_seconds, Some(20 * 60));
+        assert_eq!(signal.clean_rounds, 0);
+
+        // An interrupted streak resets: clean rounds older than the streak do
+        // not belong to the soak.
+        let interrupted = [
+            round(0, &["a.rs"]),
+            round(10, &["a.rs"]),
+            round(20, &[]),
+            round(30, &["a.rs"]),
+        ];
+        assert_eq!(compute_code_review_churn_signal(&interrupted), None);
     }
 
     #[test]

@@ -304,7 +304,10 @@ pub use requests::*;
 // final-editor repair so clients can represent incomplete reviews (additive).
 // 7.15: code-review jobs expose the PR-wide open-finding count captured after
 // publication so a clean incremental round cannot hide older findings.
-pub const PROTOCOL_VERSION: &str = "7.15";
+// 7.16: code-review jobs expose the server-derived per-PR fix-churn signal so
+// clients and the check run can distinguish a settled clean state from a
+// single clean round inside a fix-churn loop (additive).
+pub const PROTOCOL_VERSION: &str = "7.16";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

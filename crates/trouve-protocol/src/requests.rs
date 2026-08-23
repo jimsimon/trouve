@@ -1855,6 +1855,34 @@ pub struct CodeReviewProgress {
     pub percent: u8,
 }
 
+/// Fix-churn signal derived by the server from a pull request's published
+/// review round history. A round is one published review job; a "finding
+/// round" is a round that confirmed at least one new finding. The signal is
+/// reported while consecutive finding rounds indicate that incremental fixes
+/// are relocating defects rather than resolving them, and through the
+/// clean-round soak that must complete before the check run may report
+/// success again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewChurnSignal {
+    /// Consecutive published finding rounds, counted backwards from the most
+    /// recent finding round. Bounded by the server's history window.
+    pub finding_round_streak: u64,
+    /// Paths whose findings recurred across enough distinct rounds of the
+    /// streak to indicate a defect being relocated within the same area.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recurring_paths: Vec<String>,
+    /// Median seconds between consecutive rounds of the streak. Absent when
+    /// the streak is too short to measure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_round_interval_seconds: Option<u64>,
+    /// Consecutive clean published rounds since the streak ended, including
+    /// the round carrying this signal when it was clean. Zero while churn is
+    /// active.
+    pub clean_rounds: u64,
+    /// Clean rounds required before the check run may report success again.
+    pub required_clean_rounds: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewTaskRole {
@@ -2331,6 +2359,14 @@ pub struct CodeReviewJob {
     /// absence on a succeeded job as unknown, never as a clean review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_issue_count: Option<u64>,
+    /// Server-derived fix-churn signal for this pull request, snapshotted
+    /// when the review was published. Present while recent published rounds
+    /// match the churn heuristics (consecutive rounds each confirming new
+    /// findings, typically in recurring paths) and through the clean-round
+    /// soak that follows. Absent for unpublished or legacy jobs and for
+    /// pull requests with no detected churn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub churn: Option<CodeReviewChurnSignal>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     pub created_at: chrono::DateTime<chrono::Utc>,

@@ -73,6 +73,15 @@ export interface Progress {
   percent: number;
 }
 
+/** Server-derived per-PR fix-churn signal snapshotted at publication. */
+export interface ReviewChurnSignal {
+  finding_round_streak: number;
+  recurring_paths?: string[];
+  median_round_interval_seconds?: number | null;
+  clean_rounds: number;
+  required_clean_rounds: number;
+}
+
 export interface ReviewJob {
   id: string;
   installation_id: number;
@@ -112,6 +121,7 @@ export interface ReviewJob {
   issue_count: number;
   fixed_issue_count: number;
   open_issue_count?: number | null;
+  churn?: ReviewChurnSignal | null;
   error: string;
   created_at: string;
   started_at?: string;

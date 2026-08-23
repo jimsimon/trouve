@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.15"
+    "version": "7.16"
   },
   "paths": {
     "/v1/approvals": {
@@ -5483,6 +5483,51 @@
           }
         }
       },
+      "CodeReviewChurnSignal": {
+        "type": "object",
+        "description": "Fix-churn signal derived by the server from a pull request's published\nreview round history. A round is one published review job; a \"finding\nround\" is a round that confirmed at least one new finding. The signal is\nreported while consecutive finding rounds indicate that incremental fixes\nare relocating defects rather than resolving them, and through the\nclean-round soak that must complete before the check run may report\nsuccess again.",
+        "required": [
+          "finding_round_streak",
+          "clean_rounds",
+          "required_clean_rounds"
+        ],
+        "properties": {
+          "clean_rounds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Consecutive clean published rounds since the streak ended, including\nthe round carrying this signal when it was clean. Zero while churn is\nactive.",
+            "minimum": 0
+          },
+          "finding_round_streak": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Consecutive published finding rounds, counted backwards from the most\nrecent finding round. Bounded by the server's history window.",
+            "minimum": 0
+          },
+          "median_round_interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Median seconds between consecutive rounds of the streak. Absent when\nthe streak is too short to measure.",
+            "minimum": 0
+          },
+          "recurring_paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Paths whose findings recurred across enough distinct rounds of the\nstreak to indicate a defect being relocated within the same area."
+          },
+          "required_clean_rounds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Clean rounds required before the check run may report success again.",
+            "minimum": 0
+          }
+        }
+      },
       "CodeReviewChurnStats": {
         "type": "object",
         "description": "Signals that measure repeated review work rather than raw issue volume.",
@@ -5838,6 +5883,17 @@
           },
           "check_sync_error": {
             "type": "string"
+          },
+          "churn": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CodeReviewChurnSignal",
+                "description": "Server-derived fix-churn signal for this pull request, snapshotted\nwhen the review was published. Present while recent published rounds\nmatch the churn heuristics (consecutive rounds each confirming new\nfindings, typically in recurring paths) and through the clean-round\nsoak that follows. Absent for unpublished or legacy jobs and for\npull requests with no detected churn."
+              }
+            ]
           },
           "completed_at": {
             "type": [
