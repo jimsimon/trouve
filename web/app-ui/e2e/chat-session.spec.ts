@@ -6390,7 +6390,7 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   ]);
 });
 
-test("cancellation before capacity stays pending until the terminal event", async ({ page }) => {
+test("cancellation before provider admission stays pending until the terminal event", async ({ page }) => {
   const cancelledThreadIds: string[] = [];
   await installProtocolFixtures(page, { cancelledThreadIds });
   await page.goto("/");
@@ -6405,14 +6405,14 @@ test("cancellation before capacity stays pending until the terminal event", asyn
     threadEvent(17, {
       type: "user.message",
       turn: 8,
-      content: "Wait for capacity",
+      content: "Wait for provider admission",
       attachments: [],
     }),
   ]);
 
   const submit = page.locator("wa-button.composer-submit");
   await expect(page.locator(".turn-transient-activity"))
-    .toContainText("Waiting for model capacity…");
+    .toContainText("Waiting for provider admission…");
   await expect(submit).toHaveText("Cancel");
   await submit.click();
   await expect.poll(() => cancelledThreadIds).toEqual(["th_fixture"]);
