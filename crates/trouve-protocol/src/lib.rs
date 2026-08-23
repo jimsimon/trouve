@@ -306,7 +306,9 @@ pub use requests::*;
 // publication so a clean incremental round cannot hide older findings.
 // 7.16: code-review jobs expose the server-derived per-PR fix-churn signal so
 // clients and the check run can distinguish a settled clean state from a
-// single clean round inside a fix-churn loop (additive).
+// single clean round inside a fix-churn loop; jobs and repositories carry the
+// implementation-analyst model/thinking configuration and tasks gain the
+// `analyst` role.
 pub const PROTOCOL_VERSION: &str = "7.16";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";

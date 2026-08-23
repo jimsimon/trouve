@@ -5859,6 +5859,20 @@
           "created_at"
         ],
         "properties": {
+          "analyst_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model snapshotted for the per-round implementation analyst. Absent\ninherits `model`."
+          },
+          "analyst_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Thinking level snapshotted for the implementation analyst."
+          },
           "base_ref": {
             "type": "string"
           },
@@ -6423,6 +6437,20 @@
           "repository"
         ],
         "properties": {
+          "analyst_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-qualified model used by the per-round implementation\nanalyst. Absent inherits `model`."
+          },
+          "analyst_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preferred thinking level or fixed token budget for the implementation\nanalyst. Absent inherits the review mode's default."
+          },
           "coordinator_thinking_level": {
             "type": [
               "string",
@@ -7050,6 +7078,7 @@
         "type": "string",
         "enum": [
           "router",
+          "analyst",
           "reviewer",
           "coordinator"
         ]
@@ -13494,6 +13523,18 @@
           "mode"
         ],
         "properties": {
+          "analyst_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "analyst_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "coordinator_thinking_level": {
             "type": [
               "string",

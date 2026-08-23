@@ -1775,6 +1775,14 @@ pub struct CodeReviewRepository {
     /// triage. Absent inherits the review mode's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Provider-qualified model used by the per-round implementation
+    /// analyst. Absent inherits `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    /// Preferred thinking level or fixed token budget for the implementation
+    /// analyst. Absent inherits the review mode's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
     /// Extra repository-specific review instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
@@ -1814,6 +1822,10 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub router_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
     #[serde(default)]
     pub prompt: String,
     /// Omitted by older clients to preserve the current/default selection.
@@ -1887,6 +1899,9 @@ pub struct CodeReviewChurnSignal {
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewTaskRole {
     Router,
+    /// Per-round implementation analysis over the full-branch diff, derived
+    /// fresh each round and consumed only by the coordinator.
+    Analyst,
     Reviewer,
     Coordinator,
 }
@@ -2313,6 +2328,13 @@ pub struct CodeReviewJob {
     /// Thinking level snapshotted for semantic persona triage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Model snapshotted for the per-round implementation analyst. Absent
+    /// inherits `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    /// Thinking level snapshotted for the implementation analyst.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
     /// Reviewer profiles are snapshotted internally; their stable ids are
     /// exposed here for history and diagnostics. Additive/Automatic jobs
     /// snapshot the candidate catalog; routing decisions record which

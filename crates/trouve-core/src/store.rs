@@ -286,6 +286,8 @@ CREATE TABLE IF NOT EXISTS code_review_repositories (
   coordinator_thinking_level TEXT,
   router_model TEXT,
   router_thinking_level TEXT,
+  analyst_model TEXT,
+  analyst_thinking_level TEXT,
   prompt TEXT NOT NULL DEFAULT '',
   identity_ids TEXT NOT NULL DEFAULT '["correctness","security","concurrency","api-compatibility","testing"]',
   routing_mode TEXT NOT NULL DEFAULT 'additive',
@@ -323,6 +325,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   coordinator_thinking_level TEXT,
   router_model TEXT,
   router_thinking_level TEXT,
+  analyst_model TEXT,
+  analyst_thinking_level TEXT,
   prompt TEXT NOT NULL DEFAULT '',
   identities TEXT NOT NULL DEFAULT '[]',
   config_hash TEXT NOT NULL DEFAULT '',
@@ -763,6 +767,10 @@ const MIGRATIONS: &[&str] = &[
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_churn_signal TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN pull_body TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_repositories ADD COLUMN analyst_model TEXT",
+    "ALTER TABLE code_review_repositories ADD COLUMN analyst_thinking_level TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN analyst_model TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN analyst_thinking_level TEXT",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
@@ -3289,6 +3297,8 @@ fn row_to_code_review_repository(
         router_model: r.get(12)?,
         router_thinking_level: r.get(13)?,
         coordinator_thinking_level: r.get(14)?,
+        analyst_model: r.get(15)?,
+        analyst_thinking_level: r.get(16)?,
     })
 }
 
@@ -3315,6 +3325,8 @@ pub struct NewCodeReviewJob {
     pub coordinator_thinking_level: Option<String>,
     pub router_model: Option<String>,
     pub router_thinking_level: Option<String>,
+    pub analyst_model: Option<String>,
+    pub analyst_thinking_level: Option<String>,
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub routing_mode: trouve_protocol::CodeReviewRoutingMode,
@@ -3446,6 +3458,8 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_thinking_level: r.get(49)?,
             router_model: r.get(47)?,
             router_thinking_level: r.get(48)?,
+            analyst_model: r.get(59)?,
+            analyst_thinking_level: r.get(60)?,
             reviewer_ids: reviewers
                 .iter()
                 .map(|reviewer| reviewer.id.clone())
@@ -3489,7 +3503,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
-        can_retry_final_editor: r.get(59)?,
+        can_retry_final_editor: r.get(61)?,
         prompt: r.get(12)?,
         pull_body: r.get(58)?,
         reviewers,
@@ -3514,6 +3528,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
      review_published, blocking_review_cleanup_pending, publication_dispatched, \
      publication_open_issue_count, publication_churn_signal, pull_body, \
+     analyst_model, analyst_thinking_level, \
      CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
             AND code_review_jobs.session_id IS NULL \
             AND EXISTS ( \
@@ -3611,6 +3626,7 @@ pub enum CodeReviewJobPhase {
 fn code_review_task_role_str(role: trouve_protocol::CodeReviewTaskRole) -> &'static str {
     match role {
         trouve_protocol::CodeReviewTaskRole::Router => "router",
+        trouve_protocol::CodeReviewTaskRole::Analyst => "analyst",
         trouve_protocol::CodeReviewTaskRole::Reviewer => "reviewer",
         trouve_protocol::CodeReviewTaskRole::Coordinator => "coordinator",
     }
@@ -3619,6 +3635,7 @@ fn code_review_task_role_str(role: trouve_protocol::CodeReviewTaskRole) -> &'sta
 fn code_review_task_role_from(value: &str) -> trouve_protocol::CodeReviewTaskRole {
     match value {
         "router" => trouve_protocol::CodeReviewTaskRole::Router,
+        "analyst" => trouve_protocol::CodeReviewTaskRole::Analyst,
         "coordinator" => trouve_protocol::CodeReviewTaskRole::Coordinator,
         _ => trouve_protocol::CodeReviewTaskRole::Reviewer,
     }
@@ -8314,7 +8331,8 @@ impl Store {
             "SELECT repository, installation_id, private, mode, model, prompt,
                     identity_ids, routing_mode, semantic_routing,
                     included_reviewer_ids, excluded_reviewer_ids, reviewer_overrides,
-                    router_model, router_thinking_level, coordinator_thinking_level
+                    router_model, router_thinking_level, coordinator_thinking_level,
+                    analyst_model, analyst_thinking_level
              FROM code_review_repositories ORDER BY repository",
         )?;
         let rows = stmt.query_map([], row_to_code_review_repository)?;
@@ -8355,11 +8373,12 @@ impl Store {
                      identity_ids, routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids,
                      reviewer_overrides, router_model, router_thinking_level,
-                     coordinator_thinking_level, updated_at)
+                     coordinator_thinking_level, analyst_model,
+                     analyst_thinking_level, updated_at)
              VALUES (?1, ?2, 0, ?3, ?4, ?5,
                      COALESCE(?6, ?16), COALESCE(?7, 'additive'),
                      COALESCE(?8, 1), COALESCE(?9, '[]'),
-                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14, ?15)
+                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14, ?17, ?18, ?15)
              ON CONFLICT(repository) DO UPDATE SET
                installation_id = excluded.installation_id,
                mode = excluded.mode,
@@ -8377,6 +8396,8 @@ impl Store {
                router_model = excluded.router_model,
                router_thinking_level = excluded.router_thinking_level,
                coordinator_thinking_level = excluded.coordinator_thinking_level,
+               analyst_model = excluded.analyst_model,
+               analyst_thinking_level = excluded.analyst_thinking_level,
                updated_at = excluded.updated_at",
             params![
                 request.repository,
@@ -8395,6 +8416,8 @@ impl Store {
                 request.coordinator_thinking_level,
                 chrono::Utc::now().to_rfc3339(),
                 default_reviewer_ids,
+                request.analyst_model,
+                request.analyst_thinking_level,
             ],
         )?;
         Ok(())
@@ -8676,13 +8699,14 @@ impl Store {
                      routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
                      router_thinking_level, coordinator_thinking_level,
-                     review_watermark_sha, pull_body)
+                     review_watermark_sha, pull_body, analyst_model,
+                     analyst_thinking_level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                      (SELECT COALESCE(MAX(publication_generation), 0) + 1
                       FROM code_review_jobs
                       WHERE repository = ?4 AND pull_number = ?5 AND head_sha = ?8),
-                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17, ?28)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17, ?28, ?29, ?30)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -8712,6 +8736,8 @@ impl Store {
                 new_job.router_thinking_level,
                 new_job.coordinator_thinking_level,
                 new_job.pull_body,
+                new_job.analyst_model,
+                new_job.analyst_thinking_level,
             ],
         )?;
         if inserted == 0 {
@@ -12726,7 +12752,8 @@ impl Store {
                      publication_generation,
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
-                     coordinator_thinking_level, review_watermark_sha)
+                     coordinator_thinking_level, review_watermark_sha, pull_body,
+                     analyst_model, analyst_thinking_level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'retry',
                     'queued', ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
                     (SELECT COALESCE(MAX(generation.publication_generation), 0) + 1
@@ -12734,7 +12761,7 @@ impl Store {
                      WHERE generation.repository = ?4
                        AND generation.pull_number = ?5
                        AND generation.head_sha = ?8),
-                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?16)",
+                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?16, ?27, ?28, ?29)",
             params![
                 new_id,
                 new_job.dedupe_key,
@@ -12762,6 +12789,9 @@ impl Store {
                 new_job.router_model,
                 new_job.router_thinking_level,
                 new_job.coordinator_thinking_level,
+                new_job.pull_body,
+                new_job.analyst_model,
+                new_job.analyst_thinking_level,
             ],
         )?;
         let linked = tx.execute(
@@ -14279,6 +14309,8 @@ mod tests {
             coordinator_thinking_level: job.coordinator_thinking_level,
             router_model: job.router_model,
             router_thinking_level: job.router_thinking_level,
+            analyst_model: job.analyst_model,
+            analyst_thinking_level: job.analyst_thinking_level,
             prompt: record.prompt,
             reviewers: record.reviewers,
             routing_mode: job.routing_mode,
@@ -18052,6 +18084,8 @@ mod tests {
             coordinator_thinking_level: None,
             router_model: None,
             router_thinking_level: None,
+            analyst_model: None,
+            analyst_thinking_level: None,
             prompt: "keep this".into(),
             reviewer_ids: Some(vec!["custom".into()]),
             routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
@@ -18076,6 +18110,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "preserve empty selection".into(),
                 reviewer_ids: Some(Vec::new()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -18094,6 +18130,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec!["reliability".into()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -18177,6 +18215,8 @@ mod tests {
                 coordinator_thinking_level: Some("high".into()),
                 router_model: Some("anthropic/router".into()),
                 router_thinking_level: Some("low".into()),
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "focus on concurrency".into(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -18253,6 +18293,8 @@ mod tests {
             coordinator_thinking_level: configured.coordinator_thinking_level,
             router_model: configured.router_model,
             router_thinking_level: configured.router_thinking_level,
+            analyst_model: None,
+            analyst_thinking_level: None,
             prompt: configured.prompt,
             reviewers,
             routing_mode: configured.routing_mode,
@@ -21370,6 +21412,8 @@ mod tests {
             coordinator_thinking_level: None,
             router_model: None,
             router_thinking_level: None,
+            analyst_model: None,
+            analyst_thinking_level: None,
             prompt: "Review it".into(),
             reviewers: crate::reviewers::built_in_reviewers()
                 .into_iter()
@@ -21881,6 +21925,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -21954,6 +22000,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec![reviewer.id.clone()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -21978,6 +22026,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -22051,6 +22101,8 @@ mod tests {
                 coordinator_thinking_level: Some("medium".into()),
                 router_model: Some("provider/router".into()),
                 router_thinking_level: Some("low".into()),
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers,
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -22572,6 +22624,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: "Review it".into(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -22908,6 +22962,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers: Vec::new(),
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -23142,6 +23198,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -23703,6 +23761,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -24030,6 +24090,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -24157,6 +24219,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -24316,6 +24380,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -24455,6 +24521,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -24626,6 +24694,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,

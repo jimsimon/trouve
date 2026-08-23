@@ -211,7 +211,7 @@ function taskAttemptLabel(tasks: ReviewTask[], task: ReviewTask): string {
       candidate.role === task.role && candidate.batch_index === task.batch_index,
   );
   const base =
-    task.role === "coordinator"
+    task.role === "coordinator" || task.role === "analyst"
       ? "Attempt"
       : task.role === "router"
         ? `Routing ${task.batch_index + 1}`
@@ -1327,6 +1327,19 @@ function JobDetailPane({
       tasks: routerTasks,
     });
   }
+  const analystTasks = detail.tasks.filter((task) => task.role === "analyst");
+  if (analystTasks.length) {
+    const analystTask = analystTasks[analystTasks.length - 1];
+    activityGroups.push({
+      id: "analyst",
+      name: "Implementation analyst",
+      status: analystTask.status,
+      subtitle: `Full-branch analysis · ${duration(
+        liveElapsed(analystTask.elapsed_ms, analystTask.status, analystTask.started_at, now),
+      )}`,
+      tasks: analystTasks,
+    });
+  }
   activityGroups.push(
     ...detail.personas.map((persona) => ({
       id: `persona:${persona.reviewer_id}`,
@@ -1476,6 +1489,14 @@ function JobDetailPane({
         <div>
           <dt>Router thinking</dt>
           <dd>{job.router_thinking_level || "Review persona default"}</dd>
+        </div>
+        <div>
+          <dt>Analyst model</dt>
+          <dd>{job.analyst_model || job.model || "Missing configuration"}</dd>
+        </div>
+        <div>
+          <dt>Analyst thinking</dt>
+          <dd>{job.analyst_thinking_level || "Review persona default"}</dd>
         </div>
         <div>
           <dt>Pending</dt>
@@ -2272,6 +2293,10 @@ function RepositoryEditor({
     (model) => model.id === (draft.router_model || draft.model),
   );
   const routerThinking = thinkingOptions(effectiveRouterModel);
+  const effectiveAnalystModel = models.find(
+    (model) => model.id === (draft.analyst_model || draft.model),
+  );
+  const analystThinking = thinkingOptions(effectiveAnalystModel);
   const compatibleThinking = (
     configured: string | undefined,
     model: Model | undefined,
@@ -2365,6 +2390,9 @@ function RepositoryEditor({
                 const selectedRouterModel = models.find(
                   (candidate) => candidate.id === (draft.router_model || model),
                 );
+                const selectedAnalystModel = models.find(
+                  (candidate) => candidate.id === (draft.analyst_model || model),
+                );
                 setDraft({
                   ...draft,
                   model,
@@ -2375,6 +2403,10 @@ function RepositoryEditor({
                   router_thinking_level: compatibleThinking(
                     draft.router_thinking_level,
                     selectedRouterModel,
+                  ),
+                  analyst_thinking_level: compatibleThinking(
+                    draft.analyst_thinking_level,
+                    selectedAnalystModel,
                   ),
                   reviewer_overrides: (draft.reviewer_overrides ?? []).map((override) => {
                     const profile = reviewers.find(
@@ -2480,6 +2512,58 @@ function RepositoryEditor({
               Controls reasoning for semantic triage. Inherit review default follows the Review
               mode setting.
               {!semanticRouterConfigEnabled && ` ${semanticRouterRequirement}`}
+            </small>
+          </label>
+          <label>
+            Implementation analyst model
+            <select
+              value={draft.analyst_model ?? ""}
+              onChange={(event) => {
+                const analystModel = event.currentTarget.value || undefined;
+                const selectedAnalystModel = models.find(
+                  (candidate) => candidate.id === (analystModel || draft.model),
+                );
+                setDraft({
+                  ...draft,
+                  analyst_model: analystModel,
+                  analyst_thinking_level: compatibleThinking(
+                    draft.analyst_thinking_level,
+                    selectedAnalystModel,
+                  ),
+                });
+              }}
+            >
+              <option value="">Inherit coordinator/fallback model</option>
+              {models.map((model) => (
+                <option value={model.id} key={model.id}>
+                  {model.display_name} · {model.id}
+                </option>
+              ))}
+            </select>
+            <small>
+              Runs one tool-free pass per round that derives what the pull request builds from the
+              full-branch diff. The result gives the coordinator whole-PR context and the observed
+              counterpoint to the author's description.
+            </small>
+          </label>
+          <label>
+            {analystThinking.budget
+              ? "Implementation analyst thinking budget (tokens)"
+              : "Implementation analyst thinking"}
+            <ThinkingSetting
+              options={analystThinking}
+              value={draft.analyst_thinking_level ?? ""}
+              inheritLabel="Inherit review default"
+              onChange={(value) =>
+                setDraft({
+                  ...draft,
+                  analyst_thinking_level: value || undefined,
+                })
+              }
+            />
+            <small>
+              Controls reasoning for the implementation analysis. Inherit review default follows
+              the Review mode setting.
             </small>
           </label>
         </div>

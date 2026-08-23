@@ -6497,6 +6497,8 @@ async fn code_review_job_overview_loads_task_content_separately() {
             coordinator_thinking_level: Some("medium".into()),
             router_model: Some("provider/router".into()),
             router_thinking_level: Some("low".into()),
+            analyst_model: None,
+            analyst_thinking_level: None,
             prompt: "Review it".into(),
             reviewers: Vec::new(),
             routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,

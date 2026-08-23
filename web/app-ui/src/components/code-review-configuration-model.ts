@@ -23,6 +23,8 @@ export interface RepositoryDraft {
   readonly coordinatorThinkingLevel: string;
   readonly routerModel: string;
   readonly routerThinkingLevel: string;
+  readonly analystModel: string;
+  readonly analystThinkingLevel: string;
   readonly prompt: string;
   readonly reviewerIds: readonly string[];
   readonly routingMode: CodeReviewRoutingMode;
@@ -70,6 +72,8 @@ export const repositoryDraft = (
   coordinatorThinkingLevel: repository.coordinator_thinking_level ?? "",
   routerModel: repository.router_model ?? "",
   routerThinkingLevel: repository.router_thinking_level ?? "",
+  analystModel: repository.analyst_model ?? "",
+  analystThinkingLevel: repository.analyst_thinking_level ?? "",
   prompt: repository.prompt ?? "",
   reviewerIds: unique(repository.reviewer_ids ?? []),
   routingMode: repository.routing_mode ?? "additive",
@@ -107,6 +111,8 @@ export const repositoryUpdateRequest = (
     coordinator_thinking_level: optionalValue(draft.coordinatorThinkingLevel),
     router_model: optionalValue(draft.routerModel),
     router_thinking_level: optionalValue(draft.routerThinkingLevel),
+    analyst_model: optionalValue(draft.analystModel),
+    analyst_thinking_level: optionalValue(draft.analystThinkingLevel),
     prompt: draft.prompt,
     reviewer_ids: [...unique(draft.reviewerIds)],
     routing_mode: draft.routingMode,
