@@ -6391,7 +6391,7 @@ impl Engine {
                     .await?;
                     if let Some(error) = review_turn_terminal_error(
                         superseded.is_cancelled(),
-                        tool_budget.timed_out(),
+                        tool_budget.timed_out().await,
                         timeout,
                     ) {
                         return Err(error);
@@ -6427,7 +6427,7 @@ impl Engine {
                     }
                     if let Some(error) = review_turn_terminal_error(
                         superseded.is_cancelled(),
-                        tool_budget.timed_out(),
+                        tool_budget.timed_out().await,
                         timeout,
                     ) {
                         return Err(error);
@@ -6459,7 +6459,7 @@ impl Engine {
                     }
                     if let Some(error) = review_turn_terminal_error(
                         superseded.is_cancelled(),
-                        tool_budget.timed_out(),
+                        tool_budget.timed_out().await,
                         timeout,
                     ) {
                         return Err(error);

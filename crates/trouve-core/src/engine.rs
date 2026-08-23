@@ -1846,7 +1846,7 @@ struct AutomatedReviewToolBudget {
     remaining: u64,
     dispatcher_claimed: bool,
     timeout: Option<Duration>,
-    timeout_state: Arc<AtomicU8>,
+    timeout_state: Arc<AutomatedReviewTimeoutState>,
 }
 
 #[derive(Default)]
@@ -1867,7 +1867,7 @@ impl AutomatedReviewToolBudgets {
                 bail!("automated-review tool budget is already active for thread {thread_id}");
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let timeout_state = Arc::new(AtomicU8::new(REVIEW_TIMEOUT_ACTIVE));
+                let timeout_state = Arc::new(AutomatedReviewTimeoutState::new());
                 entry.insert(AutomatedReviewToolBudget {
                     limit,
                     remaining: limit,
@@ -1920,17 +1920,27 @@ pub(crate) struct AutomatedReviewToolBudgetGuard {
     thread_id: String,
     owner: AutomatedReviewToolBudgetOwner,
     timeout: Option<Duration>,
-    timeout_state: Arc<AtomicU8>,
+    timeout_state: Arc<AutomatedReviewTimeoutState>,
 }
 
 impl AutomatedReviewToolBudgetGuard {
-    fn timeout_supervision(&self) -> Option<(Duration, Arc<AtomicU8>)> {
+    fn timeout_supervision(&self) -> Option<(Duration, Arc<AutomatedReviewTimeoutState>)> {
         self.timeout
             .map(|timeout| (timeout, Arc::clone(&self.timeout_state)))
     }
 
-    pub(crate) fn timed_out(&self) -> bool {
-        self.timeout_state.load(Ordering::Acquire) == REVIEW_TIMEOUT_FIRED
+    pub(crate) async fn timed_out(&self) -> bool {
+        if self.timeout.is_none() {
+            return false;
+        }
+        loop {
+            match self.timeout_state.phase.load(Ordering::Acquire) {
+                REVIEW_TIMEOUT_FIRED => return true,
+                REVIEW_TIMEOUT_FINISHED => return false,
+                REVIEW_TIMEOUT_ACTIVE => self.timeout_state.settled.notified().await,
+                _ => unreachable!("invalid automated-review timeout state"),
+            }
+        }
     }
 }
 
@@ -1938,9 +1948,41 @@ const REVIEW_TIMEOUT_ACTIVE: u8 = 0;
 const REVIEW_TIMEOUT_FIRED: u8 = 1;
 const REVIEW_TIMEOUT_FINISHED: u8 = 2;
 
+struct AutomatedReviewTimeoutState {
+    phase: AtomicU8,
+    settled: tokio::sync::Notify,
+}
+
+impl AutomatedReviewTimeoutState {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(REVIEW_TIMEOUT_ACTIVE),
+            settled: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn settle(&self, terminal_state: u8) -> bool {
+        let settled = self
+            .phase
+            .compare_exchange(
+                REVIEW_TIMEOUT_ACTIVE,
+                terminal_state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if settled {
+            // There is one observer per review turn. notify_one also retains a
+            // permit when terminal publication wins the scheduling race.
+            self.settled.notify_one();
+        }
+        settled
+    }
+}
+
 struct AutomatedReviewTimeoutSupervisor {
     deadline: tokio::time::Instant,
-    state: Arc<AtomicU8>,
+    state: Arc<AutomatedReviewTimeoutState>,
     cancel: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
@@ -1948,7 +1990,7 @@ struct AutomatedReviewTimeoutSupervisor {
 impl AutomatedReviewTimeoutSupervisor {
     fn start(
         timeout: Duration,
-        state: Arc<AtomicU8>,
+        state: Arc<AutomatedReviewTimeoutState>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -1956,15 +1998,7 @@ impl AutomatedReviewTimeoutSupervisor {
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
-            if task_state
-                .compare_exchange(
-                    REVIEW_TIMEOUT_ACTIVE,
-                    REVIEW_TIMEOUT_FIRED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
+            if task_state.settle(REVIEW_TIMEOUT_FIRED) {
                 task_cancel.cancel();
             }
         });
@@ -1982,17 +2016,7 @@ impl AutomatedReviewTimeoutSupervisor {
         } else {
             REVIEW_TIMEOUT_FINISHED
         };
-        if self
-            .state
-            .compare_exchange(
-                REVIEW_TIMEOUT_ACTIVE,
-                terminal_state,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-            && terminal_state == REVIEW_TIMEOUT_FIRED
-        {
+        if self.state.settle(terminal_state) && terminal_state == REVIEW_TIMEOUT_FIRED {
             self.cancel.cancel();
         }
         self.task.abort();
@@ -10165,7 +10189,7 @@ impl Engine {
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
         review_turn_capacity: &Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
-        review_timeout: Option<(Duration, Arc<AtomicU8>)>,
+        review_timeout: Option<(Duration, Arc<AutomatedReviewTimeoutState>)>,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -10712,9 +10736,6 @@ impl Engine {
             )?;
         }
 
-        if let Some(supervisor) = review_timeout_supervisor.as_mut() {
-            supervisor.finish();
-        }
         if cancel.is_cancelled() {
             return Ok(());
         }
@@ -10749,6 +10770,11 @@ impl Engine {
                 },
             )
             .await?;
+        if let Some(supervisor) = review_timeout_supervisor.as_mut() {
+            // Settle only after the terminal event is durable. The observer
+            // waits for this state before accepting TurnCompleted.
+            supervisor.finish();
+        }
         Ok(())
     }
 
@@ -13406,9 +13432,6 @@ impl Engine {
         )
         .await;
 
-        if let Some(supervisor) = review_timeout_supervisor.as_mut() {
-            supervisor.finish();
-        }
         if cancel.is_cancelled() {
             if !segment.is_empty() {
                 self.store.append_event(
@@ -13490,6 +13513,11 @@ impl Engine {
                 checkpoint_id,
             },
         )?;
+        if let Some(supervisor) = review_timeout_supervisor.as_mut() {
+            // Keep deadline enforcement active through result persistence,
+            // checkpointing, and durable terminal publication.
+            supervisor.finish();
+        }
         Ok(())
     }
 
@@ -17031,7 +17059,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn automated_review_timeout_supervisor_runs_independently_of_the_observer() {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let timeout_state = Arc::new(AtomicU8::new(REVIEW_TIMEOUT_ACTIVE));
+        let timeout_state = Arc::new(AutomatedReviewTimeoutState::new());
         let _supervisor = AutomatedReviewTimeoutSupervisor::start(
             Duration::from_secs(1),
             Arc::clone(&timeout_state),
@@ -17044,14 +17072,17 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
 
-        assert_eq!(timeout_state.load(Ordering::Acquire), REVIEW_TIMEOUT_FIRED);
+        assert_eq!(
+            timeout_state.phase.load(Ordering::Acquire),
+            REVIEW_TIMEOUT_FIRED
+        );
         assert!(cancel.is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]
     async fn automated_review_timeout_drop_resolves_an_expired_timer_synchronously() {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let timeout_state = Arc::new(AtomicU8::new(REVIEW_TIMEOUT_ACTIVE));
+        let timeout_state = Arc::new(AutomatedReviewTimeoutState::new());
         let supervisor = AutomatedReviewTimeoutSupervisor::start(
             Duration::from_secs(1),
             Arc::clone(&timeout_state),
@@ -17063,8 +17094,30 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         drop(supervisor);
 
-        assert_eq!(timeout_state.load(Ordering::Acquire), REVIEW_TIMEOUT_FIRED);
+        assert_eq!(
+            timeout_state.phase.load(Ordering::Acquire),
+            REVIEW_TIMEOUT_FIRED
+        );
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automated_review_terminal_observer_waits_for_timeout_settlement() {
+        let budgets = Arc::new(AutomatedReviewToolBudgets::default());
+        let guard = budgets
+            .arm("review-thread", 1, Some(Duration::from_secs(1)))
+            .unwrap();
+        let (timeout, timeout_state) = guard.timeout_supervision().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut supervisor =
+            AutomatedReviewTimeoutSupervisor::start(timeout, Arc::clone(&timeout_state), cancel);
+        let observer = tokio::spawn(async move { guard.timed_out().await });
+
+        tokio::task::yield_now().await;
+        assert!(!observer.is_finished());
+
+        supervisor.finish();
+        assert!(!observer.await.unwrap());
     }
 
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
