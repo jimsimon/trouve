@@ -6484,6 +6484,7 @@ async fn code_review_job_overview_loads_task_content_separately() {
             repository: "acme/widgets".into(),
             pull_number: 42,
             pull_title: "Ship widgets".into(),
+            pull_body: String::new(),
             pull_url: "https://github.com/acme/widgets/pull/42".into(),
             head_sha: "2222222222222222222222222222222222222222".into(),
             review_base_sha: "1111111111111111111111111111111111111111".into(),

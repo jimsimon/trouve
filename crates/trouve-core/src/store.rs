@@ -312,6 +312,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   repository TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
   pull_title TEXT NOT NULL,
+  pull_body TEXT NOT NULL DEFAULT '',
   pull_url TEXT NOT NULL,
   head_sha TEXT NOT NULL,
   base_ref TEXT NOT NULL,
@@ -761,6 +762,7 @@ const MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_churn_signal TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN pull_body TEXT NOT NULL DEFAULT ''",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
@@ -3297,6 +3299,10 @@ pub struct NewCodeReviewJob {
     pub repository: String,
     pub pull_number: u64,
     pub pull_title: String,
+    /// Author-written pull-request description, already bounded by the
+    /// enqueue path. Untrusted claimed intent for review prompts only; it is
+    /// never exposed through the protocol.
+    pub pull_body: String,
     pub pull_url: String,
     pub head_sha: String,
     pub review_base_sha: String,
@@ -3329,6 +3335,10 @@ pub struct CodeReviewJobRecord {
     pub job: trouve_protocol::CodeReviewJob,
     pub can_retry_final_editor: bool,
     pub prompt: String,
+    /// Author-written pull-request description snapshotted at enqueue.
+    /// Untrusted claimed intent for review prompts; never serialized to the
+    /// protocol.
+    pub pull_body: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub summary: String,
     pub prompt_for_agents: String,
@@ -3479,8 +3489,9 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
-        can_retry_final_editor: r.get(58)?,
+        can_retry_final_editor: r.get(59)?,
         prompt: r.get(12)?,
+        pull_body: r.get(58)?,
         reviewers,
         summary: r.get(36)?,
         prompt_for_agents: r.get(37)?,
@@ -3502,7 +3513,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
      review_published, blocking_review_cleanup_pending, publication_dispatched, \
-     publication_open_issue_count, publication_churn_signal, \
+     publication_open_issue_count, publication_churn_signal, pull_body, \
      CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
             AND code_review_jobs.session_id IS NULL \
             AND EXISTS ( \
@@ -8665,13 +8676,13 @@ impl Store {
                      routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
                      router_thinking_level, coordinator_thinking_level,
-                     review_watermark_sha)
+                     review_watermark_sha, pull_body)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                      (SELECT COALESCE(MAX(publication_generation), 0) + 1
                       FROM code_review_jobs
                       WHERE repository = ?4 AND pull_number = ?5 AND head_sha = ?8),
-                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17, ?28)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -8700,6 +8711,7 @@ impl Store {
                 new_job.router_model,
                 new_job.router_thinking_level,
                 new_job.coordinator_thinking_level,
+                new_job.pull_body,
             ],
         )?;
         if inserted == 0 {
@@ -14254,6 +14266,7 @@ mod tests {
             repository: job.repository,
             pull_number: job.pull_number,
             pull_title: job.pull_title,
+            pull_body: record.pull_body,
             pull_url: job.pull_url,
             head_sha: job.head_sha,
             review_base_sha: job.review_base_sha,
@@ -18227,6 +18240,7 @@ mod tests {
             repository: "acme/widgets".into(),
             pull_number: 42,
             pull_title: "Ship widgets".into(),
+            pull_body: String::new(),
             pull_url: "https://github.com/acme/widgets/pull/42".into(),
             head_sha: "1111111111111111111111111111111111111111".into(),
             review_base_sha: "0000000000000000000000000000000000000000".into(),
@@ -21343,6 +21357,7 @@ mod tests {
             repository: "acme/widgets".into(),
             pull_number: 42,
             pull_title: "Ship widgets".into(),
+            pull_body: String::new(),
             pull_url: "https://github.com/acme/widgets/pull/42".into(),
             head_sha: "2222222222222222222222222222222222222222".into(),
             review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -21853,6 +21868,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: "1111111111111111111111111111111111111111".into(),
                     review_base_sha: "0000000000000000000000000000000000000000".into(),
@@ -22022,6 +22038,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: "2222222222222222222222222222222222222222".into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -22542,6 +22559,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: head_sha.into(),
                     review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -22877,6 +22895,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: head_sha.into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -23110,6 +23129,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: "2222222222222222222222222222222222222222".into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -23670,6 +23690,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: "2222222222222222222222222222222222222222".into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -23996,6 +24017,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: "2222222222222222222222222222222222222222".into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -24122,6 +24144,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: format!("https://github.com/acme/widgets/pull/{pull_number}"),
                     head_sha: "2222222222222222222222222222222222222222".into(),
                     review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -24280,6 +24303,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: "head-2".into(),
                     review_base_sha: "base-2".into(),
@@ -24418,6 +24442,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: head_sha.into(),
                     review_base_sha: base_ref.into(),
@@ -24588,6 +24613,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: "head".into(),
                     review_base_sha: "base".into(),
