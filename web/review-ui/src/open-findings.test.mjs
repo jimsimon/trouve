@@ -27,6 +27,18 @@ test("unknown PR-wide status is visually distinct from review failure", () => {
   assert.doesNotMatch(source, /open_issue_count !== 0/u);
 });
 
+test("attention replaces succeeded and job rows reserve its full width", () => {
+  assert.match(
+    source,
+    /attentionState === "open" \? \(\s*<span class="status warning">needs attention<\/span>\s*\) : attentionState === "unknown"/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /<StatusPill status=\{job\.status\} \/>\s*\{attentionState === "open"/u,
+  );
+  assert.match(styles, /\.job-row \{[\s\S]*grid-template-columns: max-content minmax\(0, 1fr\) 92px;/u);
+});
+
 test("multi-line review warnings use a stacked banner", () => {
   assert.match(
     source,
