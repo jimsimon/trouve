@@ -1935,6 +1935,7 @@ impl AutomatedReviewToolBudgetGuard {
         }
         loop {
             match self.timeout_state.phase.load(Ordering::Acquire) {
+                REVIEW_TIMEOUT_PRESTART => return false,
                 REVIEW_TIMEOUT_FIRED => return true,
                 REVIEW_TIMEOUT_FINISHED => return false,
                 REVIEW_TIMEOUT_ACTIVE => self.timeout_state.settled.notified().await,
@@ -1944,9 +1945,10 @@ impl AutomatedReviewToolBudgetGuard {
     }
 }
 
-const REVIEW_TIMEOUT_ACTIVE: u8 = 0;
-const REVIEW_TIMEOUT_FIRED: u8 = 1;
-const REVIEW_TIMEOUT_FINISHED: u8 = 2;
+const REVIEW_TIMEOUT_PRESTART: u8 = 0;
+const REVIEW_TIMEOUT_ACTIVE: u8 = 1;
+const REVIEW_TIMEOUT_FIRED: u8 = 2;
+const REVIEW_TIMEOUT_FINISHED: u8 = 3;
 
 struct AutomatedReviewTimeoutState {
     phase: AtomicU8,
@@ -1956,7 +1958,7 @@ struct AutomatedReviewTimeoutState {
 impl AutomatedReviewTimeoutState {
     fn new() -> Self {
         Self {
-            phase: AtomicU8::new(REVIEW_TIMEOUT_ACTIVE),
+            phase: AtomicU8::new(REVIEW_TIMEOUT_PRESTART),
             settled: tokio::sync::Notify::new(),
         }
     }
@@ -1978,6 +1980,17 @@ impl AutomatedReviewTimeoutState {
         }
         settled
     }
+
+    fn activate(&self) {
+        self.phase
+            .compare_exchange(
+                REVIEW_TIMEOUT_PRESTART,
+                REVIEW_TIMEOUT_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("automated-review timeout supervision starts exactly once");
+    }
 }
 
 struct AutomatedReviewTimeoutSupervisor {
@@ -1993,6 +2006,7 @@ impl AutomatedReviewTimeoutSupervisor {
         state: Arc<AutomatedReviewTimeoutState>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
+        state.activate();
         let deadline = tokio::time::Instant::now() + timeout;
         let task_state = Arc::clone(&state);
         let task_cancel = cancel.clone();
@@ -17118,6 +17132,16 @@ mod tests {
 
         supervisor.finish();
         assert!(!observer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn automated_review_timeout_is_not_active_before_supervision_starts() {
+        let budgets = Arc::new(AutomatedReviewToolBudgets::default());
+        let guard = budgets
+            .arm("review-thread", 1, Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(!guard.timed_out().await);
     }
 
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {

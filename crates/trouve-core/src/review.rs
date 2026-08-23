@@ -6389,11 +6389,10 @@ impl Engine {
                         CodeReviewModelTiming::Reset,
                     )
                     .await?;
-                    if let Some(error) = review_turn_terminal_error(
-                        superseded.is_cancelled(),
-                        tool_budget.timed_out().await,
-                        timeout,
-                    ) {
+                    let superseded = superseded.is_cancelled();
+                    let timed_out = !superseded && tool_budget.timed_out().await;
+                    if let Some(error) = review_turn_terminal_error(superseded, timed_out, timeout)
+                    {
                         return Err(error);
                     }
                     usage = event_usage;
@@ -6425,11 +6424,10 @@ impl Engine {
                             "failed to persist terminal progress after model turn failure"
                         );
                     }
-                    if let Some(error) = review_turn_terminal_error(
-                        superseded.is_cancelled(),
-                        tool_budget.timed_out().await,
-                        timeout,
-                    ) {
+                    let superseded = superseded.is_cancelled();
+                    let timed_out = !superseded && tool_budget.timed_out().await;
+                    if let Some(error) = review_turn_terminal_error(superseded, timed_out, timeout)
+                    {
                         return Err(error);
                     }
                     bail!("model review failed: {error}");
@@ -6457,11 +6455,10 @@ impl Engine {
                             "failed to persist terminal progress after model turn cancellation"
                         );
                     }
-                    if let Some(error) = review_turn_terminal_error(
-                        superseded.is_cancelled(),
-                        tool_budget.timed_out().await,
-                        timeout,
-                    ) {
+                    let superseded = superseded.is_cancelled();
+                    let timed_out = !superseded && tool_budget.timed_out().await;
+                    if let Some(error) = review_turn_terminal_error(superseded, timed_out, timeout)
+                    {
                         return Err(error);
                     }
                     bail!("model review was cancelled");
