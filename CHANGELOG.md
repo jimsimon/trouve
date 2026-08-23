@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Checksummed self-updates**: packaged desktop, server, and search binaries
+  share a verified release updater. The Wry desktop performs updates behind a
+  pre-main-window progress splash, exposes automatic-update and manual actions
+  under General settings, and never restarts while the user is active unless
+  they explicitly choose **Install and restart**. Development builds skip all
+  self-update checks.
+
 ## [4.1.0] - 2026-08-23
 
 This release adds faster ways to find and understand work, broadens attachment

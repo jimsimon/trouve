@@ -11,8 +11,10 @@ mod native_notification;
 mod opener;
 #[path = "sleep.rs"]
 mod sleep;
+#[path = "startup.rs"]
+mod startup;
 #[path = "web_preview_support.rs"]
-mod web_preview_support;
+pub(crate) mod web_preview_support;
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
@@ -45,7 +47,8 @@ include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 type DirectoryPickerReply = oneshot::Sender<Result<Option<PathBuf>, String>>;
 type FilePickerReply = oneshot::Sender<Result<Option<Vec<NativeAttachment>>, String>>;
 
-enum AppEvent {
+pub(crate) enum AppEvent {
+    Startup(startup::Event),
     PickDirectory(DirectoryPickerReply),
     PickFiles(FilePickerReply),
     NativePickerClosed,
@@ -702,10 +705,28 @@ fn allow_unbundled_frontend(product_host: bool, debug_build: bool) -> bool {
 
 #[allow(dead_code)] // Used only by the explicit `trouve-web-preview` target.
 fn main() -> anyhow::Result<()> {
-    run(false)
+    wait_for_update_relaunch_gate()?;
+    run(false, None)
 }
 
-pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
+pub(crate) fn wait_for_update_relaunch_gate() -> anyhow::Result<()> {
+    startup::wait_for_update_relaunch_gate()
+}
+
+#[allow(dead_code)] // Used by the product entry point, not the preview binary.
+pub(crate) fn run_update_relaunch_supervisor() -> anyhow::Result<bool> {
+    startup::run_update_relaunch_supervisor()
+}
+
+#[allow(dead_code)] // Used by the product entry point, not the preview binary.
+pub(crate) fn take_update_ready_acknowledgement() -> anyhow::Result<Option<PathBuf>> {
+    startup::take_update_ready_acknowledgement()
+}
+
+pub(crate) fn run(
+    product_host: bool,
+    update_ready_acknowledgement: Option<PathBuf>,
+) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -719,6 +740,14 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     )?;
 
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let startup = if product_host {
+        startup::run_preflight(&mut event_loop)?
+    } else {
+        startup::PreflightResult::continue_without_update()
+    };
+    if startup.exit_process {
+        return Ok(());
+    }
     let directory_proxy = event_loop.create_proxy();
     let file_proxy = event_loop.create_proxy();
     let quit_proxy = event_loop.create_proxy();
@@ -728,10 +757,11 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let lifecycle = HostLifecycleHandle::default();
     let notification_lifecycle = lifecycle.clone();
     let sleep_inhibitor = Arc::new(Mutex::new(sleep::SleepInhibitor::default()));
+    let pending_update_relaunch = Arc::new(startup::UpdateRelaunchHandoff::default());
     let sleep_for_action = sleep_inhibitor.clone();
     let video_playback_cache = Arc::new(Mutex::new(VideoPlaybackCache::new()?));
     let video_playback_cache_for_action = Arc::clone(&video_playback_cache);
-    let native_actions = HostNativeActions::default()
+    let mut native_actions = HostNativeActions::default()
         .with_window_geometry()
         // Tao exposes focus and foreground transitions but no desktop
         // occlusion event, so that capability remains explicitly false.
@@ -805,6 +835,69 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
             open_video_attachment(Arc::clone(&video_playback_cache_for_action), attachment)
         })
         .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
+    if product_host && trouve_update::self_update_enabled() && startup.self_update_available {
+        // Preserve the installed pathname before a runtime update replaces it.
+        let update_executable = std::env::current_exe().map_err(|error| {
+            anyhow::anyhow!("locating the desktop executable before update: {error}")
+        })?;
+        let updates = startup::UpdateManager::new(startup.update_state);
+        updates.spawn_runtime_poll(web_preview_support::preference_path());
+        let status_updates = updates.clone();
+        let check_updates = updates.clone();
+        let install_updates = updates.clone();
+        let pending_update_relaunch_for_action = Arc::clone(&pending_update_relaunch);
+        let update_executable_for_action = update_executable.clone();
+        let quit_proxy = event_loop.create_proxy();
+        native_actions = native_actions.with_desktop_updater(
+            move || Ok(status_updates.status()),
+            move || {
+                let updates = check_updates.clone();
+                async move { Ok(updates.check().await) }
+            },
+            move |operation_id| {
+                let updates = install_updates.clone();
+                let quit_proxy = quit_proxy.clone();
+                let pending_update_relaunch =
+                    Arc::clone(&pending_update_relaunch_for_action);
+                let update_executable = update_executable_for_action.clone();
+                async move {
+                    let mut state = updates.install_and_restart(operation_id).await;
+                    if state.phase == trouve_desktop_host::DesktopUpdatePhase::Restarting
+                        && let Some(version) = state.available_version.clone()
+                    {
+                        let relaunch_version = version.clone();
+                        let relaunch = tokio::task::spawn_blocking(move || {
+                            pending_update_relaunch
+                                .prepare(&update_executable, &relaunch_version)
+                        })
+                        .await;
+                        match relaunch {
+                            Ok(Ok(())) => {
+                                let _ = quit_proxy.send_event(AppEvent::QuitNow);
+                            }
+                            Ok(Err(error)) => {
+                                tracing::error!(%error, %version, "preparing restart after desktop update failed");
+                                state = updates.restart_failed(
+                                    state.operation_id,
+                                    &version,
+                                    &format!("{error:#}"),
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, %version, "desktop update relaunch worker was interrupted");
+                                state = updates.restart_failed(
+                                    state.operation_id,
+                                    &version,
+                                    &format!("relaunch worker was interrupted: {error}"),
+                                );
+                            }
+                        }
+                    }
+                    Ok(state)
+                }
+            },
+        );
+    }
     let host = if product_host {
         WebPreviewHost::start_product_with_native_actions(frontend, native_actions)?
     } else {
@@ -892,6 +985,9 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("system webview window has no GTK container"))?;
         builder.build_gtk(container)?
     };
+    if product_host {
+        startup::signal_update_ready(update_ready_acknowledgement.as_deref())?;
+    }
 
     let window_for_events = window.clone();
     let geometry_for_events = geometry.clone();
@@ -915,6 +1011,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
             close_confirmation.deadline(),
         );
         match event {
+            Event::UserEvent(AppEvent::Startup(_)) => {}
             Event::UserEvent(AppEvent::PickDirectory(reply)) => {
                 let dialog = AsyncFileDialog::new()
                     .set_title("Open workspace (git repository)")
@@ -1054,6 +1151,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     drop(webview);
     drop(window);
     host.shutdown();
+    pending_update_relaunch.release();
     if exit_code != 0 {
         anyhow::bail!("desktop webview event loop exited with status {exit_code}");
     }

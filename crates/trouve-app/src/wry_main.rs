@@ -14,6 +14,11 @@ fn main() -> anyhow::Result<()> {
         println!("trouve {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if web_preview::run_update_relaunch_supervisor()? {
+        return Ok(());
+    }
+    let update_ready_acknowledgement = web_preview::take_update_ready_acknowledgement()?;
+    web_preview::wait_for_update_relaunch_gate()?;
 
-    web_preview::run(true)
+    web_preview::run(true, update_ready_acknowledgement)
 }

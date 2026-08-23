@@ -12,7 +12,7 @@ pub use gateway::{
     HOST_API_PREFIX, HostBootstrap, HostGateway, HostGatewayBindError, HostGatewayError,
     HostLifecycleBatch, HostPreferencesHandle, LocalFileActionRequest, NativeNotificationRequest,
     OpenHttpsUrlRequest, PickDirectoryResponse, PickFilesResponse, ProtocolUpstreamOwnership,
-    ReadClipboardImageResponse, SleepInhibitionRequest, host_openapi_json,
+    ReadClipboardImageResponse, SleepInhibitionRequest, host_openapi_json, load_host_preferences,
 };
 
 use std::collections::{BTreeMap, VecDeque};
@@ -30,7 +30,7 @@ use utoipa::ToSchema;
 ///
 /// This is not the Trouve HTTP protocol version. Increment it only when the
 /// native capability request/response schema changes.
-pub const DESKTOP_BRIDGE_VERSION: u16 = 14;
+pub const DESKTOP_BRIDGE_VERSION: u16 = 16;
 
 /// Runtime desktop build selected by development and qualification hosts.
 pub const APP_UI_DIST_ENV: &str = "TROUVE_APP_UI_DIST";
@@ -245,14 +245,51 @@ pub struct ChatScrollBookmark {
 pub struct GeneralPreferences {
     #[serde(default = "default_true")]
     pub prevent_sleep_while_running: bool,
+    /// Check and install verified desktop updates before the product UI starts.
+    #[serde(default = "default_true")]
+    pub automatic_updates: bool,
 }
 
 impl Default for GeneralPreferences {
     fn default() -> Self {
         Self {
             prevent_sleep_while_running: true,
+            automatic_updates: true,
         }
     }
+}
+
+/// Ephemeral state of the native desktop updater. This is deliberately host
+/// bridge state rather than durable harness protocol state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopUpdatePhase {
+    Disabled,
+    Idle,
+    Checking,
+    Available,
+    Downloading,
+    Verifying,
+    Installing,
+    Restarting,
+    Error,
+}
+
+/// Bounded, presentation-ready updater state exposed to the Lit desktop UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DesktopUpdateState {
+    pub current_version: String,
+    #[schema(required = true, nullable = true)]
+    pub available_version: Option<String>,
+    /// Host-owned installation generation. Install acknowledgements and every
+    /// authoritative state produced by that operation share this identifier.
+    #[schema(required = true, nullable = true, minimum = 1)]
+    pub operation_id: Option<u64>,
+    pub phase: DesktopUpdatePhase,
+    pub message: String,
+    /// Whole-number download/install progress. `None` means indeterminate.
+    #[schema(required = true, nullable = true, minimum = 0, maximum = 100)]
+    pub progress_percent: Option<u8>,
 }
 
 /// Chat transcript presentation remains client-owned and does not affect the
@@ -700,6 +737,11 @@ type SleepInhibitor = dyn Fn(bool) -> Result<(), String> + Send + Sync + 'static
 type NativeNotificationSender =
     dyn Fn(NativeNotification) -> Result<(), String> + Send + Sync + 'static;
 type UserAttentionRequester = dyn Fn() -> Result<(), String> + Send + Sync + 'static;
+type DesktopUpdateStatus = dyn Fn() -> Result<DesktopUpdateState, String> + Send + Sync + 'static;
+type DesktopUpdateFuture =
+    Pin<Box<dyn Future<Output = Result<DesktopUpdateState, String>> + Send + 'static>>;
+type DesktopUpdateAction = dyn Fn() -> DesktopUpdateFuture + Send + Sync + 'static;
+type DesktopUpdateInstallAction = dyn Fn(u64) -> DesktopUpdateFuture + Send + Sync + 'static;
 type SessionFileResolverFuture =
     Pin<Box<dyn Future<Output = Result<VerifiedSessionFile, String>> + Send + 'static>>;
 type SessionFileResolver =
@@ -998,6 +1040,9 @@ pub struct HostNativeActions {
     sleep_inhibitor: Option<Arc<SleepInhibitor>>,
     native_notification_sender: Option<Arc<NativeNotificationSender>>,
     user_attention_requester: Option<Arc<UserAttentionRequester>>,
+    desktop_update_status: Option<Arc<DesktopUpdateStatus>>,
+    desktop_update_checker: Option<Arc<DesktopUpdateAction>>,
+    desktop_update_installer: Option<Arc<DesktopUpdateInstallAction>>,
     session_file_resolver: Option<Arc<SessionFileResolver>>,
     local_file_handler: Option<Arc<LocalFileHandler>>,
     window_geometry: bool,
@@ -1118,6 +1163,30 @@ impl HostNativeActions {
         self
     }
 
+    /// Attach the product updater. Status reads are synchronous snapshots;
+    /// checks are request-bound, while installs are launched as serialized
+    /// host-owned operations and observed through the status snapshot.
+    pub fn with_desktop_updater<S, C, CFut, I, IFut>(
+        mut self,
+        status: S,
+        check: C,
+        install: I,
+    ) -> Self
+    where
+        S: Fn() -> Result<DesktopUpdateState, String> + Send + Sync + 'static,
+        C: Fn() -> CFut + Send + Sync + 'static,
+        CFut: Future<Output = Result<DesktopUpdateState, String>> + Send + 'static,
+        I: Fn(u64) -> IFut + Send + Sync + 'static,
+        IFut: Future<Output = Result<DesktopUpdateState, String>> + Send + 'static,
+    {
+        self.desktop_update_status = Some(Arc::new(status));
+        self.desktop_update_checker = Some(Arc::new(move || Box::pin(check())));
+        self.desktop_update_installer = Some(Arc::new(move |operation_id| {
+            Box::pin(install(operation_id))
+        }));
+        self
+    }
+
     pub fn with_session_file_resolver<F, Fut>(mut self, resolver: F) -> Self
     where
         F: Fn(String, String) -> Fut + Send + Sync + 'static,
@@ -1200,6 +1269,12 @@ impl HostNativeActions {
 
     pub fn can_request_user_attention(&self) -> bool {
         self.user_attention_requester.is_some()
+    }
+
+    pub fn can_self_update(&self) -> bool {
+        self.desktop_update_status.is_some()
+            && self.desktop_update_checker.is_some()
+            && self.desktop_update_installer.is_some()
     }
 
     pub fn can_open_session_files(&self) -> bool {
@@ -1285,6 +1360,29 @@ impl HostNativeActions {
         self.user_attention_requester
             .as_ref()
             .ok_or_else(|| "user attention is unavailable".to_string())?()
+    }
+
+    pub(crate) fn desktop_update_status(&self) -> Result<DesktopUpdateState, String> {
+        self.desktop_update_status
+            .as_ref()
+            .ok_or_else(|| "desktop updater is unavailable".to_string())?()
+    }
+
+    pub(crate) async fn check_desktop_update(&self) -> Result<DesktopUpdateState, String> {
+        self.desktop_update_checker
+            .as_ref()
+            .ok_or_else(|| "desktop updater is unavailable".to_string())?()
+        .await
+    }
+
+    pub(crate) async fn install_desktop_update(
+        &self,
+        operation_id: u64,
+    ) -> Result<DesktopUpdateState, String> {
+        self.desktop_update_installer
+            .as_ref()
+            .ok_or_else(|| "desktop updater is unavailable".to_string())?(operation_id)
+        .await
     }
 
     pub(crate) async fn resolve_session_file(

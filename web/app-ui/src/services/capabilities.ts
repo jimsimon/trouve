@@ -32,6 +32,7 @@ export interface HostCapabilities {
   readonly occlusion: boolean;
   readonly persistentPreferences: boolean;
   readonly installable: boolean;
+  readonly selfUpdate: boolean;
 }
 
 export const browserCapabilities = (
@@ -62,6 +63,7 @@ export const browserCapabilities = (
     occlusion: false,
     persistentPreferences: kind !== "desktop",
     installable: kind === "pwa",
+    selfUpdate: false,
   });
 
 export class HostCapabilitiesController {

@@ -21,6 +21,10 @@ use trouve_protocol::PROTOCOL_VERSION;
 
 const SERVER_URL_ENV: &str = "TROUVE_SERVER_URL";
 
+pub(crate) fn preference_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|directory| directory.join("trouve").join("web-preferences.json"))
+}
+
 #[cfg(any(target_os = "linux", test))]
 const BACKGROUND_NICE_INCREMENT: i32 = 5;
 
@@ -196,8 +200,7 @@ impl WebPreviewHost {
             native_actions
         };
 
-        let preference_path = dirs::config_dir()
-            .map(|directory| directory.join("trouve").join("web-preferences.json"));
+        let preference_path = preference_path();
         let (gateway_address, gateway, preferences) = runtime.block_on(
             HostGateway::bind_loopback_with_protocol_ownership_and_preferences(
                 "127.0.0.1:0"

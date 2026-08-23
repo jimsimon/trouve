@@ -80,6 +80,8 @@ trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto
 .primary-links button[aria-current="page"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
 .primary-links button > span { width: 20px; color: var(--trouve-text-mid); font-size: 14px; text-align: center; }
 .primary-links button > .settings-link-icon { font-size: 18px; }
+.primary-links button.has-update { position: relative; padding-inline-end: 55px; }
+.update-badge { position: absolute; inset-inline-end: 6px; top: 50%; width: auto !important; transform: translateY(-50%); border-radius: 999px; padding: 2px 6px; color: var(--trouve-text-hi) !important; background: var(--trouve-accent); font-size: 9px !important; font-weight: 700; line-height: 1; text-align: center; }
 .primary-links button strong { min-width: 0; overflow: hidden; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-list-heading { height: 34px; display: flex; align-items: center; gap: 8px; }
 .workspace-list-heading > strong { min-width: 0; flex: 1; color: var(--trouve-text-hi); font-size: 15px; }
@@ -941,6 +943,13 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .nested-toggles.disabled .settings-toggle-row { cursor: not-allowed; }
 .nested-toggles.disabled .settings-toggle-row input:disabled + .toggle-state { border-color: var(--trouve-border); color: var(--trouve-text-faint); background: var(--trouve-control-bg); }
 .settings-actions { display: flex; align-items: center; gap: 10px; min-height: 30px; }
+.desktop-update-card { display: grid; gap: 9px; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 12px; background: var(--trouve-panel-bg); }
+.desktop-update-heading { display: flex; align-items: center; gap: 8px; }
+.desktop-update-heading strong { min-width: 0; flex: 1; color: var(--trouve-text-hi); font-size: 13px; }
+.desktop-update-version { color: var(--trouve-text-soft); font: 11px var(--trouve-font-mono); }
+.desktop-update-card progress { width: 100%; height: 8px; accent-color: var(--trouve-accent); }
+.desktop-update-card .settings-note[role="alert"] { color: var(--trouve-err); }
+.mobile-update-dot { color: var(--trouve-warn); font-weight: 800; }
 .settings-provider-shell { display: grid; align-content: start; gap: 12px; }
 .settings-provider-header { display: flex; align-items: center; gap: 12px; }
 .settings-provider-header h1 { min-width: 0; flex: 1; margin: 0; color: var(--trouve-text-hi); font-size: 16px; }

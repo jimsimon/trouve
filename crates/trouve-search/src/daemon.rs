@@ -31,6 +31,7 @@ pub fn serve_default(content: &[ContentType]) -> ExitCode {
     if unix::daemon_enabled() {
         return unix::proxy_stdio(content);
     }
+    crate::cli::spawn_auto_update();
     crate::mcp::serve(content)
 }
 
@@ -54,8 +55,9 @@ pub fn run_daemon(content: &[ContentType]) -> ExitCode {
 #[cfg(unix)]
 mod unix {
     use std::fs;
-    use std::io::{BufRead, BufReader, ErrorKind, Write};
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -75,6 +77,8 @@ mod unix {
     const DEFAULT_IDLE: Duration = Duration::from_secs(15 * 60);
     /// How long a proxy waits for a freshly spawned daemon to bind.
     const SPAWN_WAIT: Duration = Duration::from_secs(10);
+    const MAX_DAEMON_LOG_BYTES: u64 = 1024 * 1024;
+    const MANAGED_DAEMON_LOG_ENV: &str = "TROUVE_MANAGED_DAEMON_LOG";
 
     pub(super) fn daemon_enabled() -> bool {
         !matches!(
@@ -131,6 +135,68 @@ mod unix {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
     }
 
+    fn open_daemon_log(sock: &Path) -> std::io::Result<fs::File> {
+        let log_path = sock.with_extension("log");
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)?;
+        fs::set_permissions(log_path, fs::Permissions::from_mode(0o600))?;
+        Ok(log)
+    }
+
+    fn write_bounded_daemon_log(
+        mut source: impl Read,
+        mut log: fs::File,
+        limit: u64,
+    ) -> std::io::Result<()> {
+        let mut length = log.metadata()?.len();
+        if length > limit {
+            log.set_len(0)?;
+            length = 0;
+        }
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let bytes = if read as u64 >= limit {
+                log.set_len(0)?;
+                length = 0;
+                &buffer[read - limit as usize..read]
+            } else {
+                if length.saturating_add(read as u64) > limit {
+                    log.set_len(0)?;
+                    length = 0;
+                }
+                &buffer[..read]
+            };
+            log.write_all(bytes)?;
+            log.flush()?;
+            length += bytes.len() as u64;
+        }
+        Ok(())
+    }
+
+    fn install_bounded_daemon_log(sock: &Path) -> std::io::Result<()> {
+        let log = open_daemon_log(sock)?;
+        let (reader, writer) = UnixStream::pair()?;
+        std::thread::Builder::new()
+            .name("trouve-daemon-log".into())
+            .spawn(move || {
+                let _ = write_bounded_daemon_log(reader, log, MAX_DAEMON_LOG_BYTES);
+            })?;
+        // SAFETY: both descriptors are valid. dup2 atomically replaces only
+        // this process's stderr; the dedicated reader thread was started
+        // first, so no diagnostic bytes can be stranded without a consumer.
+        if unsafe { libc::dup2(writer.as_raw_fd(), libc::STDERR_FILENO) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     // ---------------------------------------------------------------- daemon
 
     pub(super) fn run_daemon(content: &[ContentType]) -> ExitCode {
@@ -151,6 +217,15 @@ mod unix {
         if lock.try_lock().is_err() {
             // Another daemon already owns this socket; nothing to do.
             return ExitCode::SUCCESS;
+        }
+        // Only the process that won daemon ownership needs an updater. Starting
+        // it earlier makes every contending proxy launch a redundant worker.
+        crate::cli::spawn_auto_update();
+        if std::env::var_os(MANAGED_DAEMON_LOG_ENV).is_some()
+            && let Err(e) = install_bounded_daemon_log(&sock)
+        {
+            eprintln!("cannot install bounded daemon log: {e}");
+            return ExitCode::FAILURE;
         }
         // Holding the lock proves any existing socket file is a leftover
         // from a crashed daemon, so removing it is safe.
@@ -272,9 +347,11 @@ mod unix {
                 cmd.arg(ct.as_str());
             }
         }
+        let log = open_daemon_log(sock)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(log))
+            .env(MANAGED_DAEMON_LOG_ENV, "1")
             // Don't pin whatever directory the agent launched us in.
             .current_dir("/");
         // Detach into its own session so the daemon survives the agent
@@ -295,28 +372,46 @@ mod unix {
         Ok(())
     }
 
-    fn connect_or_spawn(sock: &Path, content: &[ContentType]) -> Option<DaemonConn> {
+    struct ConnectResult {
+        connection: Option<DaemonConn>,
+    }
+
+    fn connect_or_spawn(sock: &Path, content: &[ContentType]) -> ConnectResult {
         match DaemonConn::open(sock) {
-            Ok(conn) => return Some(conn),
+            Ok(connection) => {
+                return ConnectResult {
+                    connection: Some(connection),
+                };
+            }
             // The socket path exceeds sockaddr_un's limit (104 bytes on
             // macOS): no daemon can ever bind it, so don't spawn one and
             // wait — serve in-process straight away.
-            Err(e) if e.kind() == ErrorKind::InvalidInput => return None,
+            Err(error) if error.kind() == ErrorKind::InvalidInput => {
+                return ConnectResult { connection: None };
+            }
             Err(_) => {}
         }
-        spawn_daemon(sock, content).ok()?;
+        if spawn_daemon(sock, content).is_err() {
+            return ConnectResult { connection: None };
+        }
         // Wait for a daemon to bind — ours, or a competing proxy's whose
         // daemon won the lock (just as good).
         let deadline = Instant::now() + SPAWN_WAIT;
         loop {
             std::thread::sleep(Duration::from_millis(50));
-            if let Ok(conn) = DaemonConn::open(sock) {
-                return Some(conn);
+            if let Ok(connection) = DaemonConn::open(sock) {
+                return ConnectResult {
+                    connection: Some(connection),
+                };
             }
             if Instant::now() >= deadline {
-                return None;
+                return ConnectResult { connection: None };
             }
         }
+    }
+
+    fn schedule_local_fallback_update() {
+        crate::cli::spawn_auto_update();
     }
 
     /// Absolute form of a relative `repo` argument. The daemon runs in its
@@ -362,9 +457,13 @@ mod unix {
             Daemon(DaemonConn),
             Local(IndexCache),
         }
-        let mut backend = match connect_or_spawn(&sock, content) {
+        let connection = connect_or_spawn(&sock, content);
+        let mut backend = match connection.connection {
             Some(conn) => Backend::Daemon(conn),
-            None => Backend::Local(IndexCache::new(content.to_vec())),
+            None => {
+                schedule_local_fallback_update();
+                Backend::Local(IndexCache::new(content.to_vec()))
+            }
         };
 
         let stdin = std::io::stdin();
@@ -421,7 +520,11 @@ mod unix {
         match conn.roundtrip(line, expects_response) {
             Ok(response) => Ok((response, None)),
             Err(_) => {
-                let mut fresh = connect_or_spawn(sock, content).ok_or(())?;
+                let connection = connect_or_spawn(sock, content);
+                let Some(mut fresh) = connection.connection else {
+                    schedule_local_fallback_update();
+                    return Err(());
+                };
                 let response = fresh.roundtrip(line, expects_response).map_err(|_| ())?;
                 Ok((response, Some(fresh)))
             }
@@ -484,6 +587,42 @@ mod unix {
                 fs::metadata(dir).unwrap().permissions().mode() & 0o777,
                 0o700
             );
+        }
+
+        #[test]
+        fn daemon_log_is_private_and_persistent() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("daemon");
+            let sock = dir.join("mcp-test.sock");
+            ensure_daemon_dir(&sock).unwrap();
+            let log_path = sock.with_extension("log");
+            let mut log = open_daemon_log(&sock).unwrap();
+            writeln!(log, "automatic update failed").unwrap();
+            assert_eq!(
+                fs::metadata(&log_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(
+                fs::read_to_string(log_path)
+                    .unwrap()
+                    .contains("automatic update failed")
+            );
+        }
+        #[test]
+        fn managed_daemon_writer_keeps_the_active_log_within_the_size_limit() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("daemon");
+            let sock = dir.join("mcp-test.sock");
+            ensure_daemon_dir(&sock).unwrap();
+            let log_path = sock.with_extension("log");
+            let mut input = vec![b'x'; 48];
+            input.extend_from_slice(b"latest diagnostics");
+            write_bounded_daemon_log(&input[..], open_daemon_log(&sock).unwrap(), 32).unwrap();
+
+            let retained = fs::read(&log_path).unwrap();
+            assert!(retained.len() <= 32);
+            assert!(retained.ends_with(b"latest diagnostics"));
+            assert!(!log_path.with_extension("log.1").exists());
         }
 
         #[test]

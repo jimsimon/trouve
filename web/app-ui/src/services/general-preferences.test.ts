@@ -11,6 +11,7 @@ describe("general frontend preferences", () => {
   it("normalizes untrusted state against the product default", () => {
     expect(normalizeGeneralPreferences({ preventSleepWhileRunning: false })).toEqual({
       preventSleepWhileRunning: false,
+      automaticUpdates: true,
     });
     expect(normalizeGeneralPreferences({
       preventSleepWhileRunning: "yes" as unknown as boolean,
@@ -24,8 +25,11 @@ describe("general frontend preferences", () => {
       setItem: vi.fn((key: string, value: string) => values.set(key, value)),
     };
     const adapter = browserGeneralPreferenceStorage(storage);
-    adapter.save({ preventSleepWhileRunning: false });
-    expect(adapter.load()).toEqual({ preventSleepWhileRunning: false });
+    adapter.save({ preventSleepWhileRunning: false, automaticUpdates: false });
+    expect(adapter.load()).toEqual({
+      preventSleepWhileRunning: false,
+      automaticUpdates: false,
+    });
     values.set("trouve.general.v1", "null");
     expect(adapter.load()).toBeUndefined();
   });

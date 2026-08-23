@@ -228,6 +228,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/__trouve/host/v1/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_desktop_update"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__trouve/host/v1/update/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["check_desktop_update"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__trouve/host/v1/update/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["install_desktop_update"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -288,10 +336,36 @@ export interface components {
             request_id: number;
         };
         /**
+         * @description Ephemeral state of the native desktop updater. This is deliberately host
+         *     bridge state rather than durable harness protocol state.
+         * @enum {string}
+         */
+        DesktopUpdatePhase: "disabled" | "idle" | "checking" | "available" | "downloading" | "verifying" | "installing" | "restarting" | "error";
+        /** @description Bounded, presentation-ready updater state exposed to the Lit desktop UI. */
+        DesktopUpdateState: {
+            available_version: string | null;
+            current_version: string;
+            message: string;
+            /**
+             * Format: int64
+             * @description Host-owned installation generation. Install acknowledgements and every
+             *     authoritative state produced by that operation share this identifier.
+             */
+            operation_id: number | null;
+            phase: components["schemas"]["DesktopUpdatePhase"];
+            /**
+             * Format: int32
+             * @description Whole-number download/install progress. `None` means indeterminate.
+             */
+            progress_percent: number | null;
+        };
+        /**
          * @description General desktop-only behavior persisted by the stable native host rather
          *     than by an ephemeral loopback browser origin.
          */
         GeneralPreferences: {
+            /** @description Check and install verified desktop updates before the product UI starts. */
+            automatic_updates?: boolean;
             prevent_sleep_while_running?: boolean;
         };
         HostBootstrap: {
@@ -330,6 +404,11 @@ export interface components {
             open_video_attachment?: boolean;
             persistent_preferences: boolean;
             reveal_local_file: boolean;
+            /**
+             * @description Added in bridge v15. Older desktop hosts omit it and must continue to
+             *     bootstrap with desktop self-update disabled.
+             */
+            self_update?: boolean;
             sleep_inhibition: boolean;
             user_attention: boolean;
             visibility: boolean;
@@ -405,6 +484,15 @@ export interface components {
             pull_request_group_order?: string[];
             resume?: components["schemas"]["ResumePreferences"];
             workspace_order?: string[];
+        };
+        /**
+         * @description A client's desired preference snapshot paired with the exact snapshot it
+         *     edited. The gateway rebases only intentional field changes onto the latest
+         *     persisted state, so stale windows cannot overwrite newer unrelated edits.
+         */
+        HostPreferencesUpdate: {
+            baseline: components["schemas"]["HostPreferences"];
+            preferences: components["schemas"]["HostPreferences"];
         };
         /** @enum {string} */
         LocalFileAction: "open" | "reveal";
@@ -957,7 +1045,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["HostPreferences"];
+                "application/json": components["schemas"]["HostPreferencesUpdate"];
             };
         };
         responses: {
@@ -1099,6 +1187,129 @@ export interface operations {
                 content?: never;
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_desktop_update: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DesktopUpdateState"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    check_desktop_update: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DesktopUpdateState"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    install_desktop_update: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DesktopUpdateState"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
