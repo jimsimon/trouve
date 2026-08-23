@@ -645,11 +645,27 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+function reviewJobAttentionState(
+  job: Pick<ReviewJob, "status" | "open_issue_count">,
+): "open" | "unknown" | null {
+  if (job.status !== "succeeded") return null;
+  if (job.open_issue_count == null) return "unknown";
+  return job.open_issue_count > 0 ? "open" : null;
+}
+
 function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   const elapsed = liveElapsed(job.running_elapsed_ms, job.status, job.started_at, now);
+  const openIssueCount = job.open_issue_count;
+  const attentionState = reviewJobAttentionState(job);
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
-      <StatusPill status={job.status} />
+      {attentionState === "open" ? (
+        <span class="status failed">needs attention</span>
+      ) : attentionState === "unknown" ? (
+        <span class="status warning">status unknown</span>
+      ) : (
+        <StatusPill status={job.status} />
+      )}
       <span class="job-main">
         <strong>
           {job.repository} #{job.pull_number}
@@ -658,7 +674,11 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
         {(job.status === "running" || job.status === "queued") && <ProgressBar job={job} />}
       </span>
       <span class="job-meta">
-        <b>{job.issue_count} issues</b>
+        <b>
+          {openIssueCount == null
+            ? `Open status unknown · ${job.issue_count} new`
+            : `${openIssueCount} open · ${job.issue_count} new`}
+        </b>
         <small>{job.status === "queued" ? duration(job.pending_elapsed_ms) : duration(elapsed)}</small>
       </span>
     </button>
@@ -738,6 +758,7 @@ function JobsPage({
         {selectedId && (
           <JobDetailPane
             jobId={selectedId}
+            finalEditorRetryable={(dashboard.final_editor_retryable_job_ids ?? []).includes(selectedId)}
             onClose={() => navigate("jobs")}
             onChanged={() => {
               void load();
@@ -752,10 +773,12 @@ function JobsPage({
 
 function JobDetailPane({
   jobId,
+  finalEditorRetryable,
   onClose,
   onChanged,
 }: {
   jobId: string;
+  finalEditorRetryable: boolean;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -1250,10 +1273,11 @@ function JobDetailPane({
     ),
   );
   const candidateRejections = detail.candidate_rejections ?? [];
+  const unadjudicatedCandidates = detail.unadjudicated_candidates ?? [];
   const routingDecisions = detail.routing_decisions ?? [];
   const unrecordedCandidateDecisions = Math.max(
     0,
-    job.candidate_issue_count - acceptedCandidateIds.size - candidateRejections.length,
+    job.candidate_issue_count - acceptedCandidateIds.size - candidateRejections.length - unadjudicatedCandidates.length,
   );
   const activityGroups: Array<{
     id: string;
@@ -1364,15 +1388,6 @@ function JobDetailPane({
       tasks: coordinatorTasks,
     });
   }
-  const latestReviewerTasks = new Map<string, ReviewTask>();
-  detail.tasks
-    .filter((task) => task.role === "reviewer" && task.reviewer_id)
-    .forEach((task) => {
-      latestReviewerTasks.set(`${task.reviewer_id}:${task.batch_index}`, task);
-    });
-  const finalEditorRetryBlocked = [...latestReviewerTasks.values()].some(
-    (task) => !["succeeded", "not_applicable"].includes(task.status),
-  );
   const selectedTaskSummary =
     detail.tasks.find((task) => task.id === selectedTaskId) ?? detail.tasks[0];
   const retainedTask = selectedTaskSummary ? taskDetails[selectedTaskSummary.id] : undefined;
@@ -1397,6 +1412,11 @@ function JobDetailPane({
             decision.batch_index === selectedTask.batch_index,
         )
       : undefined;
+  const openIssueCount = job.open_issue_count;
+  const attentionState = reviewJobAttentionState(job);
+  const hasOpenIssues =
+    job.status === "succeeded" && openIssueCount != null && openIssueCount > 0;
+  const openIssueStatusUnknown = job.status === "succeeded" && openIssueCount == null;
   const selectPreferredTask = (tasks: ReviewTask[]): void => {
     const preferred = pickPreferredTask(tasks);
     if (preferred) setSelectedTaskId(preferred.id);
@@ -1409,6 +1429,8 @@ function JobDetailPane({
       <header class="detail-header">
         <div>
           <StatusPill status={job.status} />
+          {attentionState === "open" && <span class="status failed">needs attention</span>}
+          {attentionState === "unknown" && <span class="status warning">status unknown</span>}
           <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
           </h2>
@@ -1498,9 +1520,16 @@ function JobDetailPane({
           </>
         )}
         {!["running", "queued"].includes(job.status) && (
-          <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
-            {busy === "retry" ? "Retrying…" : "Retry"}
-          </button>
+          <>
+            {finalEditorRetryable && (
+              <button type="button" disabled={Boolean(busy)} onClick={() => void retryFailedFinalEditor()}>
+                {busy === "final-editor" ? "Retrying…" : "Retry final editor"}
+              </button>
+            )}
+            <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
+              {busy === "retry" ? "Retrying…" : unadjudicatedCandidates.length > 0 ? "Rerun all reviewers" : "Retry"}
+            </button>
+          </>
         )}
         <button class="ghost" type="button" disabled={Boolean(busy)} onClick={() => void act("full")}>
           {busy === "full" ? "Requesting…" : "Full branch review"}
@@ -1514,6 +1543,24 @@ function JobDetailPane({
         <ExternalLink href={job.check_run_url}>Open Check Run ↗</ExternalLink>
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
+      {hasOpenIssues && (
+        <div class="banner warning stacked" role="alert">
+          <strong>
+            {openIssueCount} confirmed issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
+          </strong>
+          <p>
+            This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean incremental result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
+          </p>
+        </div>
+      )}
+      {openIssueStatusUnknown && (
+        <div class="banner warning stacked" role="alert">
+          <strong>PR-wide open issue status is unknown</strong>
+          <p>
+            This legacy review predates PR-wide finding snapshots. It cannot establish that older findings are resolved, even when this round found no new issues.
+          </p>
+        </div>
+      )}
       {routingDecisions.length > 0 && (
         <details
           class="routing-decisions"
@@ -1571,9 +1618,11 @@ function JobDetailPane({
           <div>
             <h2>{job.status === "running" || job.status === "queued" ? "Review overview" : "Completed overview"}</h2>
             <p>
-              {job.issue_count} confirmed findings · {acceptedCandidateIds.size} selected candidates
+              {job.issue_count} new confirmed findings
+              {openIssueCount != null && ` · ${openIssueCount} open across pull request`}
+              {` · ${acceptedCandidateIds.size} selected candidates`}
               {" · "}
-              {candidateRejections.length} rejected · {job.fixed_issue_count} fixed
+              {candidateRejections.length} rejected · {unadjudicatedCandidates.length} unresolved · {job.fixed_issue_count} fixed
             </p>
           </div>
           {detail.prompt_for_agents && (
@@ -1581,6 +1630,25 @@ function JobDetailPane({
           )}
         </div>
         {detail.summary && <p class="summary">{detail.summary}</p>}
+        {unadjudicatedCandidates.length > 0 && (
+          <div class="banner warning stacked" role="alert">
+            {job.status === "running" || job.status === "queued" ? (
+              <>
+                <strong>Final-editor retry in progress</strong>
+                <p>
+                  The prior unresolved candidates remain visible until the replacement final-editor decision completes.
+                </p>
+              </>
+            ) : (
+              <>
+                <strong>Review incomplete</strong>
+                <p>
+                  The final editor did not decide {unadjudicatedCandidates.length} candidate issue{unadjudicatedCandidates.length === 1 ? "" : "s"}. No clean verdict was published, and these candidates will not become rejection precedent.
+                </p>
+              </>
+            )}
+          </div>
+        )}
         {(detail.themes ?? []).length > 0 && (
           <div class="theme-list">
             {(detail.themes ?? []).map((theme) => (
@@ -1674,6 +1742,29 @@ function JobDetailPane({
             </div>
           </details>
         )}
+        {unadjudicatedCandidates.length > 0 && (
+          <details class="candidate-decisions unresolved" open>
+            <summary>
+              <strong>{unadjudicatedCandidates.length} unresolved final-editor decision{unadjudicatedCandidates.length === 1 ? "" : "s"}</strong>
+              <span>Reviewer evidence awaiting adjudication</span>
+            </summary>
+            <div class="rejection-list">
+              {unadjudicatedCandidates.map((candidate) => (
+                <article class="candidate-rejection candidate-unadjudicated" key={candidate.candidate_id}>
+                  <header>
+                    <strong>{candidate.title}</strong>
+                    <span>{candidate.reviewer_name}</span>
+                  </header>
+                  <small>
+                    {candidate.path}:{candidate.line} · Severity: {candidate.severity.toUpperCase()} · Confidence: {(candidate.confidence ?? "medium").toUpperCase()}
+                  </small>
+                  <p>{candidate.body}</p>
+                  <div><b>Status:</b> Awaiting a final-editor decision</div>
+                </article>
+              ))}
+            </div>
+          </details>
+        )}
         {unrecordedCandidateDecisions > 0 &&
           !["running", "queued"].includes(job.status) && (
             <p class="decision-note">
@@ -1701,7 +1792,7 @@ function JobDetailPane({
               {activityGroups.map((group) => {
                 const active = group.id === selectedGroup?.id;
                 const coordinatorRetryBlocked =
-                  group.id === "coordinator" && finalEditorRetryBlocked;
+                  group.id === "coordinator" && !finalEditorRetryable;
                 const retryable =
                   group.persona
                     ? job.status === "failed" &&
