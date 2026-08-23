@@ -120,6 +120,7 @@ button.compact { padding: 6px 9px; font-size: 12px; }
 .status.queued, .status.manual, .status.automatic { color: #ffd78c; border-color: #705728; background: #3a2d17; }
 .status.succeeded, .status.ready, .status.success, .status.open { color: #9cf0c6; border-color: #2d7558; background: #183d31; }
 .status.failed, .status.failure, .status.credentials.required { color: #ffabb7; border-color: #883b49; background: #46212a; }
+.status.warning { color: #ffd78c; border-color: #705728; background: #3a2d17; }
 .status.cancelled, .status.stale, .status.disabled, .status.fixed { color: #afb6c4; }
 .progress { position: relative; height: 18px; margin-top: 8px; border-radius: 4px; overflow: hidden; background: #0c111b; }
 .progress > span { display: block; width: 100%; height: 100%; transform-origin: left center; background: linear-gradient(90deg, #397bc5, #65b2ff); transition: transform .25s; }
@@ -310,6 +311,8 @@ th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spa
 .login-card form { margin-top: 12px; }
 
 .banner { display: flex; justify-content: space-between; gap: 15px; margin: 12px 0; padding: 11px 13px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); }
+.banner.stacked { flex-direction: column; justify-content: flex-start; }
+.banner.stacked p { margin: 0; }
 .banner.error { border-color: #733443; background: #341c24; color: #ffbdc6; }
 .error-text { color: #ff9aaa; }
 .warning { color: #ffd17c; }

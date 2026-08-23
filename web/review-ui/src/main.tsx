@@ -645,19 +645,27 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
-function reviewJobNeedsAttention(
+function reviewJobAttentionState(
   job: Pick<ReviewJob, "status" | "open_issue_count">,
-): boolean {
-  return job.status === "succeeded" && job.open_issue_count !== 0;
+): "open" | "unknown" | null {
+  if (job.status !== "succeeded") return null;
+  if (job.open_issue_count == null) return "unknown";
+  return job.open_issue_count > 0 ? "open" : null;
 }
 
 function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   const elapsed = liveElapsed(job.running_elapsed_ms, job.status, job.started_at, now);
   const openIssueCount = job.open_issue_count;
-  const needsAttention = reviewJobNeedsAttention(job);
+  const attentionState = reviewJobAttentionState(job);
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
-      {needsAttention ? <span class="status failed">needs attention</span> : <StatusPill status={job.status} />}
+      {attentionState === "open" ? (
+        <span class="status failed">needs attention</span>
+      ) : attentionState === "unknown" ? (
+        <span class="status warning">status unknown</span>
+      ) : (
+        <StatusPill status={job.status} />
+      )}
       <span class="job-main">
         <strong>
           {job.repository} #{job.pull_number}
@@ -750,6 +758,7 @@ function JobsPage({
         {selectedId && (
           <JobDetailPane
             jobId={selectedId}
+            finalEditorRetryable={(dashboard.final_editor_retryable_job_ids ?? []).includes(selectedId)}
             onClose={() => navigate("jobs")}
             onChanged={() => {
               void load();
@@ -764,10 +773,12 @@ function JobsPage({
 
 function JobDetailPane({
   jobId,
+  finalEditorRetryable,
   onClose,
   onChanged,
 }: {
   jobId: string;
+  finalEditorRetryable: boolean;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -1377,22 +1388,6 @@ function JobDetailPane({
       tasks: coordinatorTasks,
     });
   }
-  const latestReviewerTasks = new Map<string, ReviewTask>();
-  detail.tasks
-    .filter((task) => task.role === "reviewer")
-    .forEach((task) => {
-      const reviewerKey = task.reviewer_id || task.reviewer_name || task.id;
-      latestReviewerTasks.set(`${reviewerKey}:${task.batch_index}`, task);
-    });
-  const finalEditorRetryBlocked = [...latestReviewerTasks.values()].some(
-    (task) => !["succeeded", "not_applicable"].includes(task.status),
-  );
-  const latestCoordinatorTask = coordinatorTasks[coordinatorTasks.length - 1];
-  const finalEditorRetryable =
-    ["failed", "cancelled"].includes(job.status) &&
-    latestCoordinatorTask !== undefined &&
-    ["failed", "cancelled"].includes(latestCoordinatorTask.status) &&
-    !finalEditorRetryBlocked;
   const selectedTaskSummary =
     detail.tasks.find((task) => task.id === selectedTaskId) ?? detail.tasks[0];
   const retainedTask = selectedTaskSummary ? taskDetails[selectedTaskSummary.id] : undefined;
@@ -1418,7 +1413,7 @@ function JobDetailPane({
         )
       : undefined;
   const openIssueCount = job.open_issue_count;
-  const needsAttention = reviewJobNeedsAttention(job);
+  const attentionState = reviewJobAttentionState(job);
   const hasOpenIssues =
     job.status === "succeeded" && openIssueCount != null && openIssueCount > 0;
   const openIssueStatusUnknown = job.status === "succeeded" && openIssueCount == null;
@@ -1434,7 +1429,8 @@ function JobDetailPane({
       <header class="detail-header">
         <div>
           <StatusPill status={job.status} />
-          {needsAttention && <span class="status failed">needs attention</span>}
+          {attentionState === "open" && <span class="status failed">needs attention</span>}
+          {attentionState === "unknown" && <span class="status warning">status unknown</span>}
           <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
           </h2>
@@ -1525,7 +1521,7 @@ function JobDetailPane({
         )}
         {!["running", "queued"].includes(job.status) && (
           <>
-            {finalEditorRetryable && unadjudicatedCandidates.length > 0 && (
+            {finalEditorRetryable && (
               <button type="button" disabled={Boolean(busy)} onClick={() => void retryFailedFinalEditor()}>
                 {busy === "final-editor" ? "Retrying…" : "Retry final editor"}
               </button>
@@ -1548,7 +1544,7 @@ function JobDetailPane({
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
       {hasOpenIssues && (
-        <div class="banner warning" role="alert">
+        <div class="banner warning stacked" role="alert">
           <strong>
             {openIssueCount} confirmed issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
           </strong>
@@ -1558,7 +1554,7 @@ function JobDetailPane({
         </div>
       )}
       {openIssueStatusUnknown && (
-        <div class="banner warning" role="alert">
+        <div class="banner warning stacked" role="alert">
           <strong>PR-wide open issue status is unknown</strong>
           <p>
             This legacy review predates PR-wide finding snapshots. It cannot establish that older findings are resolved, even when this round found no new issues.
@@ -1796,7 +1792,7 @@ function JobDetailPane({
               {activityGroups.map((group) => {
                 const active = group.id === selectedGroup?.id;
                 const coordinatorRetryBlocked =
-                  group.id === "coordinator" && finalEditorRetryBlocked;
+                  group.id === "coordinator" && !finalEditorRetryable;
                 const retryable =
                   group.persona
                     ? job.status === "failed" &&

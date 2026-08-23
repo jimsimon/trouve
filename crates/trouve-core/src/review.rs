@@ -3913,6 +3913,36 @@ impl Engine {
         Ok(())
     }
 
+    async fn revalidate_staged_code_review_result(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+        superseded: &CancellationToken,
+        result_label: &str,
+    ) -> Result<()> {
+        let accepted_revision = async {
+            self.revalidate_code_review_publication(api, job).await?;
+            ensure_review_current(superseded)
+        }
+        .await;
+        if let Err(error) = accepted_revision {
+            match self.store.discard_unaccepted_code_review_result(&job.id) {
+                Ok(true) => return Err(error),
+                Ok(false) => {
+                    return Err(error).context(format!(
+                        "{result_label} could not be discarded after failed revalidation"
+                    ));
+                }
+                Err(discard_error) => {
+                    return Err(error).context(format!(
+                        "discarding {result_label} after failed revalidation: {discard_error:#}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn poll_manual_review_comments(
         &self,
         api: &GithubApi,
@@ -5493,6 +5523,12 @@ impl Engine {
         let candidate_rejections = candidate_rejections(&parsed, &candidates);
         let unadjudicated_candidates = unadjudicated_candidates(&parsed, &candidates);
         if !unadjudicated_candidates.is_empty() {
+            ensure_review_current(superseded)?;
+            let api = self.installation_api(job.installation_id).await.context(
+                "refreshing GitHub App credentials before incomplete result persistence",
+            )?;
+            self.revalidate_code_review_publication(&api, &job).await?;
+            ensure_review_current(superseded)?;
             let Some(_) = self
                 .store
                 .save_current_code_review_result_with_adjudication(
@@ -5509,6 +5545,13 @@ impl Engine {
             else {
                 bail!("stale: review was cancelled or replaced before result persistence");
             };
+            self.revalidate_staged_code_review_result(
+                &api,
+                &job,
+                superseded,
+                "incomplete review result",
+            )
+            .await?;
             bail!(
                 "final review editor left {} candidate decision(s) unresolved after repair; retry the coordinator",
                 unadjudicated_candidates.len()
@@ -5548,25 +5591,8 @@ impl Engine {
         else {
             bail!("stale: review was cancelled or replaced before result persistence");
         };
-        let accepted_revision = async {
-            self.revalidate_code_review_publication(&api, &job).await?;
-            ensure_review_current(superseded)
-        }
-        .await;
-        if let Err(error) = accepted_revision {
-            match self.store.discard_unaccepted_code_review_result(&job.id) {
-                Ok(true) => return Err(error),
-                Ok(false) => {
-                    return Err(error)
-                        .context("staged review result could not be discarded before publication");
-                }
-                Err(discard_error) => {
-                    return Err(error).context(format!(
-                        "discarding staged review result after failed revalidation: {discard_error:#}"
-                    ));
-                }
-            }
-        }
+        self.revalidate_staged_code_review_result(&api, &job, superseded, "staged review result")
+            .await?;
         if !self.store.claim_code_review_publication(&job.id)? {
             let discarded = match self.store.discard_unaccepted_code_review_result(&job.id) {
                 Ok(discarded) => discarded,
@@ -7493,6 +7519,11 @@ impl Engine {
             .code_review
             .projection_lock(format!("check:{}", job.id));
         let _guard = lock.lock().await;
+        let record = self
+            .store
+            .code_review_job(&job.id)?
+            .ok_or_else(|| anyhow!("review job no longer exists"))?;
+        let final_editor_retryable = record.can_retry_final_editor;
         let detail = self
             .store
             .code_review_job_detail(&job.id)?
@@ -7575,33 +7606,7 @@ impl Engine {
             );
             check_body["conclusion"] = serde_json::Value::String(conclusion.into());
             check_body["completed_at"] = serde_json::Value::String(Utc::now().to_rfc3339());
-            check_body["actions"] = if needs_adjudication {
-                serde_json::json!([
-                    {
-                        "label": "Retry final editor",
-                        "description": RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION,
-                        "identifier": "retry_final_editor"
-                    },
-                    {
-                        "label": "Full branch review",
-                        "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
-                        "identifier": "full_review"
-                    }
-                ])
-            } else {
-                serde_json::json!([
-                    {
-                        "label": "Run again",
-                        "description": RETRY_CHECK_ACTION_DESCRIPTION,
-                        "identifier": "retry"
-                    },
-                    {
-                        "label": "Full branch review",
-                        "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
-                        "identifier": "full_review"
-                    }
-                ])
-            };
+            check_body["actions"] = review_check_actions(final_editor_retryable);
         }
         if status == "in_progress" {
             check_body["started_at"] =
@@ -9021,6 +9026,36 @@ fn review_check_conclusion(
     }
 }
 
+fn review_check_actions(final_editor_retryable: bool) -> serde_json::Value {
+    if final_editor_retryable {
+        serde_json::json!([
+            {
+                "label": "Retry final editor",
+                "description": RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION,
+                "identifier": "retry_final_editor"
+            },
+            {
+                "label": "Full branch review",
+                "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
+                "identifier": "full_review"
+            }
+        ])
+    } else {
+        serde_json::json!([
+            {
+                "label": "Run again",
+                "description": RETRY_CHECK_ACTION_DESCRIPTION,
+                "identifier": "retry"
+            },
+            {
+                "label": "Full branch review",
+                "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
+                "identifier": "full_review"
+            }
+        ])
+    }
+}
+
 fn review_has_unresolved_findings(
     current_finding_count: usize,
     previous_finding_ids: &[&str],
@@ -9264,13 +9299,21 @@ fn append_unadjudicated_candidate_section(
     for candidate in candidates {
         section.push_str(&format!(
             "- **{}** — `{}`:{} · {} · severity {} · confidence {}\n  {}\n",
-            markdown_table_cell(&candidate.title),
-            markdown_table_cell(&candidate.path),
+            markdown_table_cell(&safe_public_model_markdown(&candidate.title, 512, "…")),
+            safe_public_inline_code(&candidate.path, 512),
             candidate.line,
-            markdown_table_cell(&candidate.reviewer_name),
-            markdown_table_cell(&candidate.severity),
-            markdown_table_cell(&candidate.confidence),
-            markdown_table_cell(&candidate.body),
+            markdown_table_cell(&safe_public_model_markdown(
+                &candidate.reviewer_name,
+                512,
+                "…",
+            )),
+            markdown_table_cell(&safe_public_model_markdown(&candidate.severity, 128, "…",)),
+            markdown_table_cell(&safe_public_model_markdown(&candidate.confidence, 128, "…",)),
+            markdown_table_cell(&safe_public_model_markdown(
+                &candidate.body,
+                LIFECYCLE_FINDING_BODY_MAX_BYTES,
+                "… _(candidate text truncated)_",
+            )),
         ));
     }
     body.push_str(&bounded_utf8(
@@ -15177,6 +15220,58 @@ mod tests {
     }
 
     #[test]
+    fn check_actions_follow_server_final_editor_retry_eligibility() {
+        let retryable = review_check_actions(true);
+        assert_eq!(retryable[0]["identifier"], "retry_final_editor");
+        assert_eq!(retryable[1]["identifier"], "full_review");
+
+        let whole_review = review_check_actions(false);
+        assert_eq!(whole_review[0]["identifier"], "retry");
+        assert_eq!(whole_review[1]["identifier"], "full_review");
+    }
+
+    #[test]
+    fn unresolved_candidate_publication_sanitizes_model_authored_fields() {
+        let candidate = trouve_protocol::CodeReviewUnadjudicatedCandidate {
+            candidate_id: "candidate".into(),
+            task_id: "task".into(),
+            reviewer_id: "security".into(),
+            reviewer_name: "@review-team".into(),
+            path: "src/`unsafe`@path.rs".into(),
+            line: 42,
+            side: "RIGHT".into(),
+            severity: "<high>".into(),
+            confidence: "api_key=secret-value".into(),
+            title: "<img src=x> @octocat https://example.test".into(),
+            body: "password=body-secret <script>alert(1)</script> @everyone http://example.test"
+                .into(),
+        };
+        let mut rendered = String::new();
+
+        append_unadjudicated_candidate_section(&mut rendered, &[candidate]);
+
+        for unsafe_text in [
+            "<img",
+            "<script",
+            "@octocat",
+            "@review-team",
+            "@everyone",
+            "https://",
+            "http://",
+            "secret-value",
+            "body-secret",
+            "`unsafe`",
+        ] {
+            assert!(
+                !rendered.contains(unsafe_text),
+                "{unsafe_text} was not sanitized"
+            );
+        }
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("&lt;high&gt;"));
+    }
+
+    #[test]
     fn lifecycle_comment_renders_each_finding_under_its_publication_outcome() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let queued = enqueue_test_review_job(&store, "acme/widgets#42:finding-outcomes");
@@ -19506,6 +19601,91 @@ mod tests {
             .await
             .unwrap();
         await_mock_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn changed_revision_discards_staged_incomplete_review_results() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:incomplete-stale");
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        let candidate = trouve_protocol::CodeReviewUnadjudicatedCandidate {
+            candidate_id: "candidate".into(),
+            task_id: "task".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            path: "src/lib.rs".into(),
+            line: 7,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Needs a decision".into(),
+            body: "The final editor omitted this candidate.".into(),
+        };
+        engine
+            .store
+            .save_current_code_review_result_with_adjudication(
+                &job.id,
+                "Incomplete result",
+                "",
+                1,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[candidate],
+            )
+            .unwrap()
+            .unwrap();
+        let body = serde_json::json!({
+            "number": 42,
+            "title": "Ship widgets",
+            "html_url": "https://github.com/acme/widgets/pull/42",
+            "draft": false,
+            "state": "open",
+            "base": {"ref": "main", "sha": "main"},
+            "head": {
+                "ref": "ship",
+                "sha": "3333333333333333333333333333333333333333"
+            }
+        })
+        .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(listener, vec![body]);
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let error = engine
+            .revalidate_staged_code_review_result(
+                &api,
+                &job,
+                &CancellationToken::new(),
+                "incomplete review result",
+            )
+            .await
+            .unwrap_err();
+
+        await_mock_server(server).await;
+        assert!(code_review_error_is_stale(&error));
+        let detail = engine
+            .store
+            .code_review_job_detail(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(detail.unadjudicated_candidates.is_empty());
+        assert!(detail.findings.is_empty());
+        assert_eq!(detail.summary, "");
+        assert_eq!(detail.job.candidate_issue_count, 0);
+        assert_eq!(detail.job.issue_count, 0);
     }
 
     #[tokio::test]

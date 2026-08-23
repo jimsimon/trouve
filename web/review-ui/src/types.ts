@@ -335,6 +335,7 @@ export interface Dashboard {
   reviewers: ReviewerProfile[];
   repositories: Repository[];
   jobs: ReviewJob[];
+  final_editor_retryable_job_ids?: string[];
 }
 
 export interface StatusCounts {
