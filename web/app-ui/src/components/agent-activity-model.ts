@@ -118,6 +118,12 @@ export const runningAgentActivity = (
       }
     }
   }
+  if (activeState === undefined && turn !== undefined) {
+    const turnBoundary = input.items.findIndex((item) =>
+      "turn" in item && item.turn === turn
+    );
+    if (turnBoundary >= 0) start = turnBoundary;
+  }
   const current = input.items.slice(start);
   const model = runningModelName(input.turnModels, turn);
 
@@ -155,6 +161,23 @@ export const runningAgentActivity = (
     const item = current[index];
     if (item?.kind !== "tool" || item.status !== "running") continue;
     return activity(runningToolActivityLabel(item.tool, item.args));
+  }
+
+  let latestWork: ThreadChatItem | undefined;
+  for (let index = current.length - 1; index >= 0; index -= 1) {
+    const item = current[index];
+    if (
+      item === undefined
+      || ["user", "steered", "turn-status", "compaction", "todo"].includes(item.kind)
+    ) continue;
+    latestWork = item;
+    break;
+  }
+  if (latestWork?.kind === "tool") {
+    return activity(
+      "Agent is working…",
+      "The agent is processing tool activity.",
+    );
   }
 
   const modelHasResponded = current.some((item) =>
