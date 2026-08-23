@@ -28,9 +28,17 @@ test("unknown PR-wide status is visually distinct from review failure", () => {
 });
 
 test("multi-line review warnings use a stacked banner", () => {
-  assert.equal(
-    source.match(/class="banner warning stacked"/gu)?.length,
-    3,
+  assert.match(
+    source,
+    /unadjudicatedCandidates\.length > 0 && \(\s*<div class="banner warning stacked"/u,
+  );
+  assert.match(
+    source,
+    /hasOpenIssues && \(\s*<div class="banner warning stacked"/u,
+  );
+  assert.match(
+    source,
+    /openIssueStatusUnknown && \(\s*<div class="banner warning stacked"/u,
   );
   assert.match(styles, /\.banner\.stacked \{ flex-direction: column;/u);
 });
