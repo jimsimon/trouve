@@ -150,7 +150,7 @@ describe("agent activity presentation", () => {
     });
   });
 
-  it("ignores stale activity from earlier turns and recognizes response gaps", () => {
+  it("ignores stale activity from earlier turns and distinguishes response gaps from tool work", () => {
     const items: ThreadChatItem[] = [
       tool("WebSearch", {}, "running"),
       status(4, { kind: "running" }),
@@ -172,6 +172,12 @@ describe("agent activity presentation", () => {
       label: "Waiting for gpt-5…",
       detail: "The model is between visible response or tool events.",
       announcementLabel: "Waiting for gpt-5…",
+    });
+    items.push(tool("read_file", {}, "ok"));
+    expect(presentation({ items, turnModels: new Map([[4, "codex/gpt-5"]]) })).toEqual({
+      label: "Agent is working…",
+      detail: "The agent is processing tool activity.",
+      announcementLabel: "Agent is working…",
     });
   });
 

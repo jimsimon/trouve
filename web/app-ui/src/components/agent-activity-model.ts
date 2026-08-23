@@ -157,6 +157,16 @@ export const runningAgentActivity = (
     return activity(runningToolActivityLabel(item.tool, item.args));
   }
 
+  const latestWork = current.findLast((item) =>
+    !["user", "steered", "turn-status", "compaction"].includes(item.kind)
+  );
+  if (latestWork?.kind === "tool") {
+    return activity(
+      "Agent is working…",
+      "The agent is processing tool activity.",
+    );
+  }
+
   const modelHasResponded = current.some((item) =>
     !["user", "steered", "turn-status", "compaction"].includes(item.kind)
   );
