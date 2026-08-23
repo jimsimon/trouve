@@ -157,9 +157,16 @@ export const runningAgentActivity = (
     return activity(runningToolActivityLabel(item.tool, item.args));
   }
 
-  const latestWork = current.findLast((item) =>
-    !["user", "steered", "turn-status", "compaction"].includes(item.kind)
-  );
+  let latestWork: ThreadChatItem | undefined;
+  for (let index = current.length - 1; index >= 0; index -= 1) {
+    const item = current[index];
+    if (
+      item === undefined
+      || ["user", "steered", "turn-status", "compaction"].includes(item.kind)
+    ) continue;
+    latestWork = item;
+    break;
+  }
   if (latestWork?.kind === "tool") {
     return activity(
       "Agent is working…",
