@@ -15,8 +15,8 @@ test("repositories and jobs model the implementation-analyst settings", () => {
 });
 
 test("the settings form offers analyst model and thinking pickers", () => {
-  assert.match(source, /PR diff analyst model/u);
-  assert.match(source, /PR diff analyst thinking/u);
+  assert.match(source, /Change analyst model/u);
+  assert.match(source, /Change analyst thinking/u);
   assert.match(source, /analyst_model: analystModel,/u);
   // Changing the fallback model keeps an incompatible analyst level from
   // being silently persisted, matching router behavior.
@@ -27,10 +27,10 @@ test("the settings form offers analyst model and thinking pickers", () => {
 });
 
 test("job details surface the analyst task and its configuration", () => {
-  assert.match(source, /<dt>PR diff analyst model<\/dt>/u);
-  assert.match(source, /<dt>PR diff analyst thinking<\/dt>/u);
+  assert.match(source, /<dt>Change analyst model<\/dt>/u);
+  assert.match(source, /<dt>Change analyst thinking<\/dt>/u);
   assert.match(source, /task\.role === "analyst"/u);
-  assert.match(source, /"PR diff analyst"/u);
+  assert.match(source, /"Change analyst"/u);
   // The settings explain the pass like other model settings do.
   assert.match(source, /derives what the\s+PR actually builds/u);
   assert.match(source, /advisory only/u);

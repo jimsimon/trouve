@@ -424,12 +424,12 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
                 <input autocomplete="off" spellcheck="false" placeholder="Inherit, level, or token budget" .value=${draft.routerThinkingLevel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { routerThinkingLevel: (event.currentTarget as HTMLInputElement).value })} />
               </label>
               <label>
-                PR diff analyst model
+                Change analyst model
                 <input list="code-review-models" autocomplete="off" spellcheck="false" placeholder="Inherit coordinator model" .value=${draft.analystModel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { analystModel: (event.currentTarget as HTMLInputElement).value })} />
                 <small>Derives what the PR builds from the full branch diff each round; the final editor uses it as whole-PR context.</small>
               </label>
               <label>
-                PR diff analyst thinking
+                Change analyst thinking
                 <input autocomplete="off" spellcheck="false" placeholder="Inherit, level, or token budget" .value=${draft.analystThinkingLevel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { analystThinkingLevel: (event.currentTarget as HTMLInputElement).value })} />
               </label>
             </div>

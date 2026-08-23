@@ -1332,7 +1332,7 @@ function JobDetailPane({
     const analystTask = analystTasks[analystTasks.length - 1];
     activityGroups.push({
       id: "analyst",
-      name: "PR diff analyst",
+      name: "Change analyst",
       status: analystTask.status,
       subtitle: `Full-branch analysis · ${duration(
         liveElapsed(analystTask.elapsed_ms, analystTask.status, analystTask.started_at, now),
@@ -1491,11 +1491,11 @@ function JobDetailPane({
           <dd>{job.router_thinking_level || "Review persona default"}</dd>
         </div>
         <div>
-          <dt>PR diff analyst model</dt>
+          <dt>Change analyst model</dt>
           <dd>{job.analyst_model || job.model || "Missing configuration"}</dd>
         </div>
         <div>
-          <dt>PR diff analyst thinking</dt>
+          <dt>Change analyst thinking</dt>
           <dd>{job.analyst_thinking_level || "Review persona default"}</dd>
         </div>
         <div>
@@ -2515,7 +2515,7 @@ function RepositoryEditor({
             </small>
           </label>
           <label>
-            PR diff analyst model
+            Change analyst model
             <select
               value={draft.analyst_model ?? ""}
               onChange={(event) => {
@@ -2550,8 +2550,8 @@ function RepositoryEditor({
           </label>
           <label>
             {analystThinking.budget
-              ? "PR diff analyst thinking budget (tokens)"
-              : "PR diff analyst thinking"}
+              ? "Change analyst thinking budget (tokens)"
+              : "Change analyst thinking"}
             <ThinkingSetting
               options={analystThinking}
               value={draft.analyst_thinking_level ?? ""}
