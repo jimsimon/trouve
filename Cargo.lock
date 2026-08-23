@@ -7434,6 +7434,7 @@ dependencies = [
  "dirs",
  "fs4",
  "keepawake",
+ "libc",
  "mime_guess",
  "notify-rust",
  "open",
