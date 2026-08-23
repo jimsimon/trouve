@@ -2799,6 +2799,13 @@ export interface components {
             /** Format: int64 */
             wait_ms: number;
         } | {
+            /** Format: int64 */
+            provider_wait_ms: number;
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "turn.admitted";
+        } | {
             mode: string;
             model: string;
             /**

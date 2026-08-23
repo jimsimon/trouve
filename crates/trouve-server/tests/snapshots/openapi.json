@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.23"
+    "version": "7.24"
   },
   "paths": {
     "/v1/approvals": {
@@ -7501,7 +7501,7 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "Shared/provider capacity has been acquired for this turn. Interactive\nturns use the foreground lane; unattended review tasks use background.",
+            "description": "Legacy admission marker written by protocol 7.15 and earlier. New\nservers retain this variant only to replay existing durable event logs.",
             "required": [
               "turn",
               "wait_ms",
@@ -7527,6 +7527,33 @@
                 "type": "integer",
                 "format": "int64",
                 "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Provider admission is complete for this turn. `provider_wait_ms` is\ntime spent waiting for a shared throttling cooldown; zero means the\nturn was admitted immediately.",
+            "required": [
+              "turn",
+              "provider_wait_ms",
+              "type"
+            ],
+            "properties": {
+              "provider_wait_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.admitted"
+                ]
               }
             }
           },

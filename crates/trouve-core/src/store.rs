@@ -30033,20 +30033,18 @@ mod tests {
         store
             .append_event(
                 first_scope,
-                Event::TurnCapacityAcquired {
+                Event::TurnAdmitted {
                     turn: 1,
-                    wait_ms: 7,
-                    background: false,
+                    provider_wait_ms: 7,
                 },
             )
             .unwrap();
         let received = first.recv().await.unwrap();
         assert!(matches!(
             received.event,
-            Event::TurnCapacityAcquired {
+            Event::TurnAdmitted {
                 turn: 1,
-                wait_ms: 7,
-                background: false
+                provider_wait_ms: 7,
             }
         ));
         assert!(matches!(

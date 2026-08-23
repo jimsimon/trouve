@@ -533,6 +533,10 @@ const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_SUBAGENT_DEPTH: usize = 4;
 const MAX_CONCURRENT_CHILDREN: usize = 4;
 const MAX_ACTIVE_DESCENDANTS: usize = 16;
+/// Bounds durable task and thread setup bursts across planned review turns.
+/// Permits are released before model dispatch, so this does not cap active
+/// reviewer turns.
+const PLANNED_TURN_SETUP_CONCURRENCY: usize = 24;
 const REMOVED_TURN_CONCURRENCY_ENVS: [&str; 4] = [
     "TROUVE_TURN_CONCURRENCY",
     "TROUVE_BACKGROUND_TURN_CONCURRENCY",
@@ -1162,11 +1166,12 @@ struct ProviderBackoff {
 /// immediately: desktop engines rely on provider capacity, while the review
 /// service bounds work through its configurable job scheduler.
 struct TurnScheduler {
+    planned_setups: Arc<tokio::sync::Semaphore>,
     providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
 }
 
-struct TurnCapacityGuard {
-    wait_ms: u64,
+struct TurnAdmission {
+    provider_wait_ms: u64,
 }
 
 impl TurnScheduler {
@@ -1180,6 +1185,7 @@ impl TurnScheduler {
             );
         }
         Self {
+            planned_setups: Arc::new(tokio::sync::Semaphore::new(PLANNED_TURN_SETUP_CONCURRENCY)),
             providers: Mutex::new(HashMap::new()),
         }
     }
@@ -1211,11 +1217,11 @@ impl TurnScheduler {
             .clone()
     }
 
-    async fn acquire(
+    async fn admit(
         &self,
         model: &str,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<TurnCapacityGuard> {
+    ) -> Result<TurnAdmission> {
         let started = tokio::time::Instant::now();
         let provider = self.provider(model);
         loop {
@@ -1239,8 +1245,8 @@ impl TurnScheduler {
         if cancel.is_cancelled() {
             bail!("turn cancelled");
         }
-        Ok(TurnCapacityGuard {
-            wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        Ok(TurnAdmission {
+            provider_wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
     }
 
@@ -11106,21 +11112,20 @@ impl Engine {
             _ = cancel.cancelled() => bail!("turn cancelled"),
             guard = session_lifecycle.read() => guard,
         };
-        let turn_capacity = self.turn_scheduler.acquire(&thread.model, &cancel).await?;
+        let admission = self.turn_scheduler.admit(&thread.model, &cancel).await?;
         if background
             && let Some(progress) = self
                 .store
-                .set_code_review_task_provider_wait(&thread.id, turn_capacity.wait_ms)?
+                .set_code_review_task_provider_wait(&thread.id, admission.provider_wait_ms)?
         {
             self.emit_code_review_task_progress(progress).await?;
         }
         self.store
             .append_event_async(
                 scope.clone(),
-                Event::TurnCapacityAcquired {
+                Event::TurnAdmitted {
                     turn,
-                    wait_ms: turn_capacity.wait_ms,
-                    background,
+                    provider_wait_ms: admission.provider_wait_ms,
                 },
             )
             .await?;
@@ -12394,10 +12399,9 @@ impl Engine {
             .append_events_async(
                 Scope::Thread(collaborator.thread.id.clone()),
                 vec![
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: collaborator.turn,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     },
                     Event::TurnStarted {
                         turn: collaborator.turn,
@@ -17937,7 +17941,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let waiter = {
             let scheduler = Arc::clone(&scheduler);
-            tokio::spawn(async move { scheduler.acquire("provider/model", &cancel).await })
+            tokio::spawn(async move { scheduler.admit("provider/model", &cancel).await })
         };
 
         tokio::task::yield_now().await;
@@ -17958,7 +17962,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
 
-        let result = scheduler.acquire("provider/model", &cancel).await;
+        let result = scheduler.admit("provider/model", &cancel).await;
 
         assert_eq!(
             result.err().map(|error| error.to_string()).as_deref(),
@@ -20698,27 +20702,26 @@ mod tests {
         let child_lifecycle = store
             .events_after(&Scope::Thread(child.id.clone()), 0)
             .unwrap();
-        let capacity_cursor = child_lifecycle
+        let admission_cursor = child_lifecycle
             .iter()
             .find_map(|event| {
                 matches!(
                     event.event,
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: 1,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     }
                 )
                 .then_some(event.cursor)
             })
-            .expect("native collaborator inherits the parent turn's capacity");
+            .expect("native collaborator inherits the parent turn's admission");
         let started_cursor = child_lifecycle
             .iter()
             .find_map(|event| {
                 matches!(event.event, Event::TurnStarted { turn: 1, .. }).then_some(event.cursor)
             })
             .expect("native collaborator turn starts");
-        assert!(capacity_cursor < started_cursor);
+        assert!(admission_cursor < started_cursor);
 
         // Child activity can create the projection before Codex emits its
         // formal collaborator-start notification. Publishing is tracked
@@ -21502,24 +21505,23 @@ default_permission_mode = "ask"
         let grandchild_events = store
             .events_after(&Scope::Thread(grandchild.id.clone()), 0)
             .unwrap();
-        let grandchild_capacity = grandchild_events
+        let grandchild_admission = grandchild_events
             .iter()
             .position(|event| {
                 matches!(
                     event.event,
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: 1,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     }
                 )
             })
-            .expect("nested collaborator inherits capacity");
+            .expect("nested collaborator inherits admission");
         let grandchild_started = grandchild_events
             .iter()
             .position(|event| matches!(event.event, Event::TurnStarted { turn: 1, .. }))
             .expect("nested collaborator starts");
-        assert!(grandchild_capacity < grandchild_started);
+        assert!(grandchild_admission < grandchild_started);
         engine
             .publish_backend_collaborator_spawn(&parent, 1, "vendor-grandchild", &mut collaborators)
             .await

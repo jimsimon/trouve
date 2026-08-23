@@ -143,9 +143,12 @@ requires a protocol version bump.
 
 Thread scope:
 
-- `turn.capacity_acquired` `{turn, wait_ms, background}` — shared/provider
-  capacity was acquired; background review work uses a lane that reserves
-  capacity for interactive desktop turns
+- `turn.admitted` `{turn, provider_wait_ms}` — provider admission completed;
+  the wait measures time spent behind a shared throttling cooldown and is zero
+  for immediate admission
+- `turn.capacity_acquired` `{turn, wait_ms, background}` — legacy protocol
+  7.15-and-earlier marker retained only when replaying existing durable logs;
+  new servers do not emit it
 - `turn.started` `{turn, mode, model, thinking_level?}` (the effective
   provider-native thinking selection for that turn) / `turn.usage_updated`
   `{turn, usage}`
