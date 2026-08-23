@@ -89,7 +89,7 @@ describe("agent activity presentation", () => {
   it("uses snapshot metadata when the active marker is outside the item window", () => {
     const startedAt = "2026-07-31T16:00:00.000Z";
     expect(presentation({
-      items: [prompt(3)],
+      items: [tool("shell", {}, "ok"), prompt(3)],
       turnModels: new Map([[2, "openai/o3"], [3, "codex/gpt-5.6-sol"]]),
       turnStartedAt: new Map([[3, startedAt]]),
       nowMs: Date.parse(startedAt) + 42_000,

@@ -118,6 +118,12 @@ export const runningAgentActivity = (
       }
     }
   }
+  if (activeState === undefined && turn !== undefined) {
+    const turnBoundary = input.items.findIndex((item) =>
+      "turn" in item && item.turn === turn
+    );
+    if (turnBoundary >= 0) start = turnBoundary;
+  }
   const current = input.items.slice(start);
   const model = runningModelName(input.turnModels, turn);
 
