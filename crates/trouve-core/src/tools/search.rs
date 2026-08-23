@@ -165,7 +165,7 @@ advertised separately when available.";
 
 /// One cache for the whole executor: indexes are expensive to build and
 /// cheap to re-validate, so every session shares them. The cache locks
-/// per repo internally, so sessions searching different repos don't
+/// per repo/content variant internally, so unrelated searches don't
 /// serialize on each other.
 pub fn shared_cache() -> Arc<IndexCache> {
     Arc::new(IndexCache::new(vec![ContentType::Code]))
@@ -214,6 +214,8 @@ const REPO_PARAM: &str = "Workspace-relative directory to search. \
      Default: the session worktree.";
 const SNIPPET_PARAM: &str = "Lines of source per result. Default (10): signature + first \
      body lines. 0: path and line range only.";
+const CONTENT_PARAM: &str = "What to search: code, docs (documentation and prose), config \
+     (YAML/TOML/etc.), or all. Omit to use the configured default.";
 
 pub struct Search {
     pub(super) cache: Arc<IndexCache>,
@@ -238,7 +240,8 @@ impl Tool for Search {
                 "query": {"type": "string", "description": "Natural language or code query."},
                 "repo": {"type": "string", "description": REPO_PARAM},
                 "top_k": {"type": "integer", "description": "Number of results.", "minimum": 1, "maximum": 100, "default": 5},
-                "max_snippet_lines": {"type": "integer", "description": SNIPPET_PARAM, "minimum": 0, "maximum": 1000, "default": 10}
+                "max_snippet_lines": {"type": "integer", "description": SNIPPET_PARAM, "minimum": 0, "maximum": 1000, "default": 10},
+                "content": {"type": "string", "enum": ["code", "docs", "config", "all"], "description": CONTENT_PARAM}
             },
             "required": ["query"]
         })
@@ -274,7 +277,8 @@ impl Tool for FindRelated {
                 "line": {"type": "integer", "description": "Line number (1-indexed)."},
                 "repo": {"type": "string", "description": REPO_PARAM},
                 "top_k": {"type": "integer", "description": "Number of results.", "minimum": 1, "maximum": 100, "default": 5},
-                "max_snippet_lines": {"type": "integer", "description": SNIPPET_PARAM, "minimum": 0, "maximum": 1000, "default": 10}
+                "max_snippet_lines": {"type": "integer", "description": SNIPPET_PARAM, "minimum": 0, "maximum": 1000, "default": 10},
+                "content": {"type": "string", "enum": ["code", "docs", "config", "all"], "description": CONTENT_PARAM}
             },
             "required": ["file_path", "line"]
         })
@@ -313,5 +317,25 @@ mod tests {
         );
         assert!(resolve_repo(&ctx, &json!({"repo": "/etc"})).is_err());
         assert!(resolve_repo(&ctx, &json!({"repo": "../up"})).is_err());
+    }
+
+    #[test]
+    fn search_tools_advertise_per_call_content_selection() {
+        let expected = json!(["code", "docs", "config", "all"]);
+        let search = Search {
+            cache: shared_cache(),
+        };
+        let related = FindRelated {
+            cache: shared_cache(),
+        };
+        for parameters in [search.parameters(), related.parameters()] {
+            assert_eq!(parameters["properties"]["content"]["enum"], expected);
+            assert!(
+                !parameters["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("content"))
+            );
+        }
     }
 }

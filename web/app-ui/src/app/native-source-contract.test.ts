@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { PREVIEWABLE_VIDEO_MIMES } from "../services/attachments.js";
+
 const repositoryRoot = fileURLToPath(new URL("../../../../", import.meta.url));
 
 const sourceRoots = [
@@ -111,6 +113,22 @@ describe("native frontend-host source contract", () => {
 
     expect([...nativeEvents].sort()).toEqual(Object.keys(rustEventToWire).sort());
     expect([...webEvents].sort()).toEqual(Object.values(rustEventToWire).sort());
+  });
+
+  it("keeps browser, server, and native video MIME allowlists aligned", () => {
+    const nativeHost = readRepositoryFile("crates/trouve-desktop-host/src/lib.rs");
+    const server = readRepositoryFile("crates/trouve-server/src/lib.rs");
+    const nativeMimes = new Set(
+      [...nativeHost.matchAll(/"(video\/[^"]+)" => Some\("[^"]+"\)/gu)]
+        .map((match) => match[1]!),
+    );
+    const serverMimes = new Set(
+      [...server.matchAll(/"(video\/[^"]+)" => Some\("video\/[^"]+"\)/gu)]
+        .map((match) => match[1]!),
+    );
+
+    expect([...nativeMimes].sort()).toEqual([...PREVIEWABLE_VIDEO_MIMES].sort());
+    expect([...serverMimes].sort()).toEqual([...PREVIEWABLE_VIDEO_MIMES].sort());
   });
 
   it("resolves the repository root used by the inventory", () => {

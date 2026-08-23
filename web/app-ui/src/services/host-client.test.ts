@@ -19,7 +19,7 @@ import {
 import type { HostPreferences } from "./host-client.js";
 
 const validCapabilities = {
-  bridge_version: 8,
+  bridge_version: 14,
   clipboard_image: true,
   close_confirmation: true,
   directory_picker: true,
@@ -31,6 +31,7 @@ const validCapabilities = {
   occlusion: true,
   open_https_url: true,
   open_local_file: true,
+  open_video_attachment: true,
   persistent_preferences: true,
   reveal_local_file: true,
   sleep_inhibition: true,
@@ -52,6 +53,13 @@ const imageAttachment = {
   mime: "image/png",
   data: "cG5n",
   size_bytes: 3,
+} as const;
+
+const videoAttachment = {
+  name: "demo.mp4",
+  mime: "video/mp4",
+  data: "dmlkZW8=",
+  size_bytes: 5,
 } as const;
 
 const preferences: HostPreferences = {
@@ -78,13 +86,31 @@ describe("HostClient", () => {
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await expect(client.bootstrap()).resolves.toMatchObject({
       kind: "desktop",
-      bridgeVersion: 8,
+      bridgeVersion: 14,
       directoryPicker: true,
       lifecycleEvents: true,
+      openVideoAttachment: true,
     });
     expect(client.systemFontFamilies()).toEqual(["Noto Sans", "Zed Sans"]);
     expect(client.mutationHeaders()).toEqual({
       "x-trouve-host-csrf": "a".repeat(64),
+    });
+  });
+
+  it("accepts bridge 13 bootstraps that predate external video playback", async () => {
+    const { open_video_attachment: _openVideoAttachment, ...legacyCapabilities } =
+      validCapabilities;
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        capabilities: { ...legacyCapabilities, bridge_version: 13 },
+        csrf_token: "v".repeat(64),
+      }),
+    );
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+
+    await expect(client.bootstrap()).resolves.toMatchObject({
+      bridgeVersion: 13,
+      openVideoAttachment: false,
     });
   });
 
@@ -530,6 +556,7 @@ describe("HostClient", () => {
       lifecycleEvents: false,
       closeConfirmation: false,
       nativeNotifications: false,
+      openVideoAttachment: false,
     });
     await expect(stale.pickFiles()).rejects.toMatchObject({
       kind: "capability-unavailable",
@@ -588,6 +615,65 @@ describe("HostClient", () => {
       expect(error).toMatchObject({ kind });
       expect(String(error)).not.toContain("secret");
     }
+  });
+
+  it("opens validated video attachments through the versioned native action", async () => {
+    const requests: Request[] = [];
+    const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      if (request.url.endsWith("/capabilities")) {
+        return Response.json({
+          capabilities: validCapabilities,
+          csrf_token: "v".repeat(64),
+        });
+      }
+      return new Response(null, { status: 204 });
+    });
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+    await client.bootstrap();
+    await client.openVideoAttachment({
+      upload: {
+        name: videoAttachment.name,
+        mime: videoAttachment.mime,
+        data: videoAttachment.data,
+      },
+      size: videoAttachment.size_bytes,
+    });
+    const action = requests.at(-1);
+    expect(action?.url).toContain("/open-video-attachment");
+    expect(action?.headers.get("x-trouve-host-csrf")).toBe("v".repeat(64));
+    await expect(action?.clone().json()).resolves.toEqual(videoAttachment);
+
+    await expect(client.openVideoAttachment({
+      upload: { name: "payload.exe", mime: "application/x-executable", data: "dmlkZW8=" },
+      size: 5,
+    })).rejects.toMatchObject({ kind: "invalid-request" });
+    expect(requests).toHaveLength(2);
+  });
+
+  it("surfaces video playback capacity as an actionable error kind", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      if (request.url.endsWith("/capabilities")) {
+        return Response.json({
+          capabilities: validCapabilities,
+          csrf_token: "c".repeat(64),
+        });
+      }
+      return new Response("temporary video playback capacity is full", { status: 507 });
+    });
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+    await client.bootstrap();
+
+    await expect(client.openVideoAttachment({
+      upload: {
+        name: videoAttachment.name,
+        mime: videoAttachment.mime,
+        data: videoAttachment.data,
+      },
+      size: videoAttachment.size_bytes,
+    })).rejects.toMatchObject({ kind: "video-capacity" });
   });
 
   it("polls validated lifecycle state and applies typed native actions with CSRF", async () => {

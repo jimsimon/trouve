@@ -78,6 +78,7 @@ trouve-search search "deployment guide" ./my-project --content docs
 trouve-search find-related src/auth.py 42 ./my-project
 trouve-search stats ./my-project        # index + cache-hit stats
 trouve-search savings                   # token savings report
+trouve-search clear orphans             # remove stores for deleted repositories
 trouve-search clear all                 # wipe stores + savings
 trouve-search                           # run as an MCP stdio server
 ```
@@ -94,7 +95,9 @@ idle minutes (`TROUVE_DAEMON_IDLE_SECONDS` overrides; `0` disables). Set
 case on Windows).
 
 `--content` selects what to index: `code` (default), `docs`, `config`, or
-`all`.
+`all`. The MCP and native `search` / `find_related` tools accept the same
+optional `content` value per call. Omitting it uses the server or plugin's
+configured default; each repository/content combination is cached separately.
 
 ## Agent integrations
 
@@ -194,13 +197,13 @@ Natively supported languages:
 | --- | --- |
 | Systems | C, C++, D, Fortran, Go, Objective-C, Rust, Swift, Zig |
 | Managed / JVM | C#, Groovy, Java, Kotlin, Scala |
-| Scripting | Bash, Lua, Perl, PHP, PowerShell, Python, R, Ruby |
-| Web | CSS, HTML, JavaScript/JSX, Svelte, TSX, TypeScript |
+| Scripting | Bash/Zsh, Lua, Perl, PHP, PowerShell, Python, R, Ruby |
+| Web | Astro, CSS/SCSS, HTML, JavaScript/JSX, Svelte, TSX, TypeScript |
 | Functional | Elixir, Elm, Erlang, Gleam, Haskell, OCaml (incl. `.mli`) |
 | Mobile / other | Dart, Julia, Solidity, SQL |
-| Config / IaC | CMake, HCL/Terraform, Make, Nix, TOML, YAML |
-| Data / markup | GraphQL, JSON, Markdown, Protocol Buffers, XML (incl. DTD) |
-| Templates | ERB/EJS (embedded templates) |
+| Config / IaC | CMake, HCL/Terraform, INI, Java properties, Make, Nix, Starlark, TOML, YAML |
+| Data / markup | AsciiDoc, GraphQL, JSON, Jsonnet, Markdown, Protocol Buffers, reStructuredText, Typst, XML (incl. DTD) |
+| Templates | ERB/EJS (embedded templates), HEEx, Jinja2 |
 
 Grammars are chosen for maintained crates.io releases; adding one is a
 two-line change (a dependency in `Cargo.toml` and a match arm in
@@ -209,9 +212,15 @@ two-line change (a dependency in `Cargo.toml` and a match arm in
 ## Cache location
 
 Resolved in order: `TROUVE_CACHE_LOCATION` (absolute path), then the platform
-cache dir (`~/.cache/trouve` on Linux). Set `TROUVE_MODEL_NAME` to override
-the embedding model. Processes wait up to five minutes for another process to
-finish downloading or repairing the same Hub model; set
+cache dir (`~/.cache/trouve` on Linux). `TROUVE_MODEL_NAME` accepts either a
+Hugging Face model repository ID or a local Model2Vec-compatible directory.
+Local layouts may keep `config.json` (or
+`config_sentence_transformers.json`), `tokenizer.json`, and
+`model.safetensors` together. Sentence-transformers layouts may instead keep
+the config at the root and the tokenizer/model files in
+`0_StaticEmbedding`. A local path is never downloaded or modified when
+validation fails. Processes wait up to five minutes for another
+process to finish downloading or repairing the same Hub model; set
 `TROUVE_HUB_MODEL_LOCK_TIMEOUT_SECS` to a positive integer number of seconds
 when a large model or slow network needs a longer wait, or when faster failure
 is preferred.
@@ -225,6 +234,10 @@ The store garbage-collects itself: after a snapshot write (at most once per
 day per store), entries not referenced by any kept snapshot are deleted, with
 a one-hour grace period protecting concurrent builds. Deleted entries are
 never wrong — the store is a cache, and a miss just recomputes the file.
+`trouve-search clear orphans` removes whole stores whose recorded repository
+identity no longer exists. It leaves legacy stores without identity metadata,
+unreadable or malformed metadata, and filesystem entries it cannot verify
+untouched.
 
 ## Development
 

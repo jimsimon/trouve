@@ -1057,11 +1057,11 @@ describe("ProtocolClient", () => {
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.12")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.15")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.11", "7.13", "7.12.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

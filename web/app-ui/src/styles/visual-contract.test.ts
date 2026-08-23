@@ -779,7 +779,7 @@ describe("Trouve visual contract", () => {
     expect(app).not.toContain(".composer-option select:hover {");
   });
 
-  it("reuses submitted attachment-card geometry for pending images and files", () => {
+  it("reuses submitted attachment-card geometry for pending media and files", () => {
     expect(thread).toContain('class="attachment-list pending-attachments"');
     expect(shell).toContain('class="attachment-list pending-attachments"');
     expect(thread).toContain("pendingAttachmentPreviewUrl(attachment)");
@@ -793,13 +793,14 @@ describe("Trouve visual contract", () => {
       /\.image-preview-trigger \{[^}]*width:\s*64px[^}]*height:\s*48px/s,
     );
     expect(imagePreview).toMatch(
-      /\.image-preview-trigger img \{[^}]*object-fit:\s*cover/s,
+      /\.image-preview-trigger img,\s*\.image-preview-trigger video \{[^}]*object-fit:\s*cover/s,
     );
     expect(imagePreview).toMatch(
       /\.image-preview-full \{[^}]*object-fit:\s*contain/s,
     );
     expect(imagePreview).toContain("dialog.showModal()");
     expect(imagePreview).toContain("View full-size image:");
+    expect(imagePreview).toContain("Open video in external player:");
     expect(app).toMatch(
       /\.attachment-icon \{[^}]*width:\s*64px[^}]*height:\s*48px[^}]*display:\s*grid[^}]*place-items:\s*center/s,
     );
