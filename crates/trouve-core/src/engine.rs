@@ -1840,11 +1840,13 @@ struct GlobalDefaults {
     permission_mode: trouve_protocol::PermissionMode,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AutomatedReviewToolBudget {
     limit: u64,
     remaining: u64,
     dispatcher_claimed: bool,
+    timeout: Option<Duration>,
+    timeout_fired: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -1857,6 +1859,7 @@ impl AutomatedReviewToolBudgets {
         self: &Arc<Self>,
         thread_id: &str,
         limit: u64,
+        timeout: Option<Duration>,
     ) -> Result<AutomatedReviewToolBudgetGuard> {
         let mut active = self.active.lock().unwrap();
         match active.entry(thread_id.to_string()) {
@@ -1864,18 +1867,23 @@ impl AutomatedReviewToolBudgets {
                 bail!("automated-review tool budget is already active for thread {thread_id}");
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
+                let timeout_fired = Arc::new(AtomicBool::new(false));
                 entry.insert(AutomatedReviewToolBudget {
                     limit,
                     remaining: limit,
                     dispatcher_claimed: false,
+                    timeout,
+                    timeout_fired: Arc::clone(&timeout_fired),
                 });
+                Ok(AutomatedReviewToolBudgetGuard {
+                    budgets: self.clone(),
+                    thread_id: thread_id.to_string(),
+                    owner: AutomatedReviewToolBudgetOwner::PreDispatch,
+                    timeout,
+                    timeout_fired,
+                })
             }
         }
-        Ok(AutomatedReviewToolBudgetGuard {
-            budgets: self.clone(),
-            thread_id: thread_id.to_string(),
-            owner: AutomatedReviewToolBudgetOwner::PreDispatch,
-        })
     }
 
     fn claim_dispatch(self: &Arc<Self>, thread_id: &str) -> Option<AutomatedReviewToolBudgetGuard> {
@@ -1889,6 +1897,8 @@ impl AutomatedReviewToolBudgets {
             budgets: self.clone(),
             thread_id: thread_id.to_string(),
             owner: AutomatedReviewToolBudgetOwner::Dispatcher,
+            timeout: budget.timeout,
+            timeout_fired: Arc::clone(&budget.timeout_fired),
         })
     }
 
@@ -1909,6 +1919,42 @@ pub(crate) struct AutomatedReviewToolBudgetGuard {
     budgets: Arc<AutomatedReviewToolBudgets>,
     thread_id: String,
     owner: AutomatedReviewToolBudgetOwner,
+    timeout: Option<Duration>,
+    timeout_fired: Arc<AtomicBool>,
+}
+
+impl AutomatedReviewToolBudgetGuard {
+    fn timeout_supervision(&self) -> Option<(Duration, Arc<AtomicBool>)> {
+        self.timeout
+            .map(|timeout| (timeout, Arc::clone(&self.timeout_fired)))
+    }
+
+    pub(crate) fn timed_out(&self) -> bool {
+        self.timeout_fired.load(Ordering::Acquire)
+    }
+}
+
+struct AutomatedReviewTimeoutSupervisor(tokio::task::JoinHandle<()>);
+
+impl AutomatedReviewTimeoutSupervisor {
+    fn start(
+        timeout: Duration,
+        timeout_fired: Arc<AtomicBool>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        let deadline = tokio::time::Instant::now() + timeout;
+        Self(tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            timeout_fired.store(true, Ordering::Release);
+            cancel.cancel();
+        }))
+    }
+}
+
+impl Drop for AutomatedReviewTimeoutSupervisor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 enum AutomatedReviewToolBudgetOwner {
@@ -9766,6 +9812,9 @@ impl Engine {
             // so cancellation and failure cleanup remain capacity-accounted
             // through their durable terminal transition.
             let review_turn_capacity = Mutex::new(None);
+            let review_timeout = automated_review_tool_budget
+                .as_ref()
+                .and_then(AutomatedReviewToolBudgetGuard::timeout_supervision);
             let result = std::panic::AssertUnwindSafe(self.run_turn(
                 &thread,
                 turn,
@@ -9773,6 +9822,7 @@ impl Engine {
                 cancel.clone(),
                 &prompt_persisted,
                 &review_turn_capacity,
+                review_timeout,
             ))
             .catch_unwind()
             .await;
@@ -10033,8 +10083,10 @@ impl Engine {
         &self,
         thread_id: &str,
         limit: u64,
+        timeout: Option<Duration>,
     ) -> Result<AutomatedReviewToolBudgetGuard> {
-        self.automated_review_tool_budgets.arm(thread_id, limit)
+        self.automated_review_tool_budgets
+            .arm(thread_id, limit, timeout)
     }
 
     /// Server-scope `session.activity` event — session lists light up (or
@@ -10056,6 +10108,7 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         self: &Arc<Self>,
         thread: &Thread,
@@ -10064,6 +10117,7 @@ impl Engine {
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
         review_turn_capacity: &Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+        review_timeout: Option<(Duration, Arc<AtomicBool>)>,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -10136,6 +10190,9 @@ impl Engine {
         } else {
             self.turn_scheduler.acquire(&thread.model, &cancel).await?
         };
+        let _review_timeout_supervisor = review_timeout.map(|(timeout, timeout_fired)| {
+            AutomatedReviewTimeoutSupervisor::start(timeout, timeout_fired, cancel.clone())
+        });
         if background
             && let Some(progress) = self
                 .store
@@ -16915,6 +16972,26 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn automated_review_timeout_supervisor_runs_independently_of_the_observer() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let timeout_fired = Arc::new(AtomicBool::new(false));
+        let _supervisor = AutomatedReviewTimeoutSupervisor::start(
+            Duration::from_secs(1),
+            Arc::clone(&timeout_fired),
+            cancel.clone(),
+        );
+
+        // No observer future is polled while time advances. The engine-owned
+        // supervisor must still request cancellation on schedule.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(timeout_fired.load(Ordering::Acquire));
+        assert!(cancel.is_cancelled());
+    }
+
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
             display_name: display_name.into(),
@@ -17884,7 +17961,7 @@ mod tests {
     #[test]
     fn automated_review_tool_budget_is_atomic_across_parallel_reservations() {
         let budgets = Arc::new(AutomatedReviewToolBudgets::default());
-        let guard = budgets.arm("review-thread", 4).unwrap();
+        let guard = budgets.arm("review-thread", 4, None).unwrap();
         let allowed = std::thread::scope(|scope| {
             let handles = (0..8)
                 .map(|_| {
@@ -17904,7 +17981,7 @@ mod tests {
         drop(guard);
         assert!(budgets.reserve("review-thread").is_ok());
 
-        let pre_dispatch = budgets.arm("zero-call-review", 0).unwrap();
+        let pre_dispatch = budgets.arm("zero-call-review", 0, None).unwrap();
         let dispatcher = budgets
             .claim_dispatch("zero-call-review")
             .expect("dispatcher claims the armed budget");
