@@ -3209,11 +3209,15 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       result: {},
     }),
     threadEvent(47, {
+      type: "assistant.thinking_completed",
+      turn: 11,
+    }),
+    threadEvent(48, {
       type: "assistant.thinking",
       turn: 11,
       text: "Continue from the compacted context",
     }),
-    threadEvent(48, {
+    threadEvent(49, {
       type: "tool.requested",
       turn: 11,
       call_id: "after_legacy_compaction",
@@ -3221,7 +3225,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       args: { command: "after" },
       requires_approval: false,
     }),
-    threadEvent(49, {
+    threadEvent(50, {
       type: "tool.completed",
       call_id: "after_legacy_compaction",
       status: "ok",

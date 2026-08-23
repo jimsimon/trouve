@@ -701,14 +701,6 @@ fn async_stream(
                         .await;
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                    if thinking_active {
-                        let _ = tx
-                            .send(Ok(ProviderEvent::ThinkingCompleted {
-                                id: "reasoning".into(),
-                            }))
-                            .await;
-                        thinking_active = false;
-                    }
                     for call in calls {
                         let idx = call["index"].as_u64().unwrap_or(0) as usize;
                         while partials.len() <= idx {
@@ -758,17 +750,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn reasoning_lifecycle_closes_before_a_tool_call() {
+    async fn reasoning_lifecycle_survives_interleaved_tool_call_deltas() {
         let payload = concat!(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",",
             "\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" continue\"}}]}\n\n",
             "data: [DONE]\n\n",
         );
         let source = futures::stream::iter([Ok::<_, reqwest::Error>(bytes::Bytes::from(payload))]);
         let events: Vec<_> = async_stream(source).collect().await;
 
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
         assert!(matches!(
             &events[0],
             Ok(ProviderEvent::ThinkingStarted { id }) if id == "reasoning"
@@ -780,14 +773,19 @@ mod tests {
         ));
         assert!(matches!(
             &events[2],
-            Ok(ProviderEvent::ThinkingCompleted { id }) if id == "reasoning"
+            Ok(ProviderEvent::ThinkingDelta { id, text })
+                if id == "reasoning" && text == " continue"
         ));
         assert!(matches!(
             &events[3],
+            Ok(ProviderEvent::ThinkingCompleted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(
+            &events[4],
             Ok(ProviderEvent::ToolCall(call))
                 if call.id == "call-1" && call.name == "read_file"
         ));
-        assert!(matches!(&events[4], Ok(ProviderEvent::Completed { .. })));
+        assert!(matches!(&events[5], Ok(ProviderEvent::Completed { .. })));
     }
 
     #[test]

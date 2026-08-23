@@ -389,14 +389,6 @@ fn vertex_events(
                         }
                     }
                     if let Some(call) = part.get("functionCall") {
-                        if thinking_active {
-                            let _ = tx
-                                .send(Ok(ProviderEvent::ThinkingCompleted {
-                                    id: "reasoning".into(),
-                                }))
-                                .await;
-                            thinking_active = false;
-                        }
                         let name = call["name"].as_str().unwrap_or("vertex-tool");
                         let id = call["id"].as_str().map(String::from).unwrap_or_else(|| {
                             call_index += 1;
@@ -428,6 +420,45 @@ fn vertex_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reasoning_lifecycle_survives_interleaved_function_calls() {
+        let payload = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"inspect\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call-1\",",
+            "\"name\":\"read_file\",\"args\":{}}}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\" continue\"}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let source = futures::stream::iter([Ok::<_, reqwest::Error>(bytes::Bytes::from(payload))]);
+        let events: Vec<_> = vertex_events(source).collect().await;
+
+        assert_eq!(events.len(), 6);
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::ThinkingStarted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(
+            &events[1],
+            Ok(ProviderEvent::ThinkingDelta { id, text })
+                if id == "reasoning" && text == "inspect"
+        ));
+        assert!(matches!(
+            &events[2],
+            Ok(ProviderEvent::ToolCall(call))
+                if call.id == "call-1" && call.name == "read_file"
+        ));
+        assert!(matches!(
+            &events[3],
+            Ok(ProviderEvent::ThinkingDelta { id, text })
+                if id == "reasoning" && text == " continue"
+        ));
+        assert!(matches!(
+            &events[4],
+            Ok(ProviderEvent::ThinkingCompleted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(&events[5], Ok(ProviderEvent::Completed { .. })));
+    }
 
     #[test]
     fn request_maps_tools_and_native_thinking_config() {
