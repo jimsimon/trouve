@@ -1332,7 +1332,7 @@ function JobDetailPane({
     const analystTask = analystTasks[analystTasks.length - 1];
     activityGroups.push({
       id: "analyst",
-      name: "Implementation analyst",
+      name: "PR analyst",
       status: analystTask.status,
       subtitle: `Full-branch analysis · ${duration(
         liveElapsed(analystTask.elapsed_ms, analystTask.status, analystTask.started_at, now),
@@ -1491,11 +1491,11 @@ function JobDetailPane({
           <dd>{job.router_thinking_level || "Review persona default"}</dd>
         </div>
         <div>
-          <dt>Analyst model</dt>
+          <dt>PR analyst model</dt>
           <dd>{job.analyst_model || job.model || "Missing configuration"}</dd>
         </div>
         <div>
-          <dt>Analyst thinking</dt>
+          <dt>PR analyst thinking</dt>
           <dd>{job.analyst_thinking_level || "Review persona default"}</dd>
         </div>
         <div>
@@ -2515,7 +2515,7 @@ function RepositoryEditor({
             </small>
           </label>
           <label>
-            Implementation analyst model
+            PR analyst model
             <select
               value={draft.analyst_model ?? ""}
               onChange={(event) => {
@@ -2541,15 +2541,17 @@ function RepositoryEditor({
               ))}
             </select>
             <small>
-              Runs one tool-free pass per round that derives what the pull request builds from the
-              full-branch diff. The result gives the coordinator whole-PR context and the observed
-              counterpoint to the author's description.
+              Once per review round, reads the full pull-request branch diff and derives what the
+              PR actually builds. The final review editor uses the result as whole-PR context and
+              as the observed counterpoint to the author's stated intent. It never sees the PR
+              title or description, and its output is advisory only — never evidence for or
+              against a finding.
             </small>
           </label>
           <label>
             {analystThinking.budget
-              ? "Implementation analyst thinking budget (tokens)"
-              : "Implementation analyst thinking"}
+              ? "PR analyst thinking budget (tokens)"
+              : "PR analyst thinking"}
             <ThinkingSetting
               options={analystThinking}
               value={draft.analyst_thinking_level ?? ""}
@@ -2562,8 +2564,8 @@ function RepositoryEditor({
               }
             />
             <small>
-              Controls reasoning for the implementation analysis. Inherit review default follows
-              the Review mode setting.
+              Controls reasoning for the PR analysis pass. Inherit review default follows the
+              Review mode setting.
             </small>
           </label>
         </div>
