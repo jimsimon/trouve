@@ -4,6 +4,66 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-08-23
+
+This release adds faster ways to find and understand work, broadens attachment
+and code-search workflows, and strengthens automated review safety and
+reliability under long-running workloads.
+
+### Added
+
+- **Transcript search and richer activity**: each thread now has bounded,
+  reload-safe chat search, while live status distinguishes model waits, tool
+  work, and other agent phases. Pull request views retain recently closed
+  work and show PR and session status together.
+- **Attachment galleries and video handoff**: image attachments open in a
+  gallery, and desktop video attachments can be handed to the system player
+  through a bounded, cancellation-safe native cache.
+- **Expanded code search**: search supports additional web, configuration,
+  markup, and template grammars; callers can select code, docs, config, or all
+  content per request; local Model2Vec layouts are supported; and
+  `trouve-search clear orphans` safely removes stores for deleted repositories.
+- **Visible release identity**: the desktop About surface and server/search
+  version commands now report the shared workspace release version.
+
+### Changed
+
+- **Evidence-grounded reviews**: automated review routing and adjudication use
+  stronger dependency, API, performance, and prior-rejection evidence.
+  Outside-diff and previously unresolved findings remain visible, and
+  incomplete coordinator decisions cannot be mistaken for a clean review.
+- **Responsive long-running sessions**: shared and bounded search indexes,
+  idle MCP cleanup, completed Codex thread cleanup, lower initial response
+  latency, and runtime thread prioritization reduce retained memory and keep
+  the desktop responsive under CPU contention.
+- **Client/server compatibility**: protocol compatibility advances to 7.15.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+
+### Fixed
+
+- **Review retry and publication recovery**: final-editor and coordinator
+  retries reuse successful reviewer work, publication failures retain the
+  blocking verdict, and retry/cancellation recovery avoids stale or duplicate
+  outcomes.
+- **New-session lifecycle**: navigation safely dismisses setup without losing
+  retryable state, creation retries are idempotent after uncertain responses,
+  repository defaults stay synchronized, and feature checkouts no longer
+  replace the repository's default base branch.
+- **Model and title defaults**: inherited thinking budgets resolve correctly,
+  generated titles recover from reasoning wrappers and reject truncated
+  output, and the frontend protocol guard remains synchronized with the
+  server.
+- **Search cache recovery**: Hugging Face model downloads coordinate across
+  processes, repair corrupt or undersized cached weights, bound lock waits,
+  and never modify invalid local model directories.
+
+### Security
+
+- **Prompt-injection-resistant reviews**: automated reviews enforce an
+  authoritative tool allowlist and reserved tool budgets, fail closed for
+  unconfined vendor backends, and redact complete credential fragments from
+  review context.
+
 ## [4.0.0] - 2026-08-20
 
 This release unifies interactive modes and review profiles as reusable
@@ -758,6 +818,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.1.0]: https://github.com/jimsimon/trouve/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/jimsimon/trouve/compare/v3.8.0...v4.0.0
 [3.8.0]: https://github.com/jimsimon/trouve/compare/v3.7.0...v3.8.0
 [3.7.0]: https://github.com/jimsimon/trouve/compare/v3.6.0...v3.7.0
