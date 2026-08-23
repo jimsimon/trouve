@@ -1523,6 +1523,43 @@ struct ReviewTurnTimeout<'a> {
     label: &'a str,
 }
 
+enum ReviewTurnWait<T> {
+    Event(T),
+    Progress,
+    Superseded,
+    TimedOut,
+}
+
+async fn wait_for_review_turn_event<T, Fut>(
+    event: Fut,
+    progress_wait: Duration,
+    superseded: &CancellationToken,
+    timeout_deadline: Option<tokio::time::Instant>,
+) -> ReviewTurnWait<T>
+where
+    Fut: Future<Output = T>,
+{
+    if let Some(deadline) = timeout_deadline {
+        if deadline <= tokio::time::Instant::now() {
+            return ReviewTurnWait::TimedOut;
+        }
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => ReviewTurnWait::TimedOut,
+            _ = superseded.cancelled() => ReviewTurnWait::Superseded,
+            event = event => ReviewTurnWait::Event(event),
+            _ = tokio::time::sleep(progress_wait) => ReviewTurnWait::Progress,
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = superseded.cancelled() => ReviewTurnWait::Superseded,
+            event = event => ReviewTurnWait::Event(event),
+            _ = tokio::time::sleep(progress_wait) => ReviewTurnWait::Progress,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SupersededReviewTask;
 
@@ -6217,30 +6254,26 @@ impl Engine {
                             received = events.recv() => Some(received),
                             _ = tokio::time::sleep(progress_wait) => None,
                         }
-                    } else if let Some(deadline) = timeout_deadline {
-                        tokio::select! {
-                            biased;
-                            received = events.recv() => Some(received),
-                            _ = tokio::time::sleep(progress_wait) => None,
-                            _ = superseded.cancelled() => {
+                    } else {
+                        match wait_for_review_turn_event(
+                            events.recv(),
+                            progress_wait,
+                            superseded,
+                            timeout_deadline,
+                        )
+                        .await
+                        {
+                            ReviewTurnWait::Event(received) => Some(received),
+                            ReviewTurnWait::Progress => None,
+                            ReviewTurnWait::Superseded => {
                                 let _ = self.cancel_turn(thread_id);
                                 cancellation_requested = true;
                                 continue;
                             }
-                            _ = tokio::time::sleep_until(deadline) => {
+                            ReviewTurnWait::TimedOut => {
                                 let _ = self.cancel_turn(thread_id);
                                 cancellation_requested = true;
                                 timed_out = true;
-                                continue;
-                            }
-                        }
-                    } else {
-                        tokio::select! {
-                            received = events.recv() => Some(received),
-                            _ = tokio::time::sleep(progress_wait) => None,
-                            _ = superseded.cancelled() => {
-                                let _ = self.cancel_turn(thread_id);
-                                cancellation_requested = true;
                                 continue;
                             }
                         }
@@ -22075,6 +22108,22 @@ mod tests {
         release_provider.send(()).unwrap();
         let (_, permit) = delayed.await.unwrap().unwrap();
         assert_eq!(permit.num_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_review_timeout_wins_over_a_ready_event_backlog() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let outcome = wait_for_review_turn_event(
+            std::future::ready(42),
+            Duration::ZERO,
+            &CancellationToken::new(),
+            Some(deadline),
+        )
+        .await;
+
+        assert!(matches!(outcome, ReviewTurnWait::TimedOut));
     }
 
     #[test]
