@@ -174,6 +174,14 @@ describe("agent activity presentation", () => {
       announcementLabel: "Waiting for gpt-5…",
     });
     items.push(tool("read_file", {}, "ok"));
+    items.push({
+      id: "todo-completed",
+      kind: "todo",
+      turn: 4,
+      todoId: "inspect",
+      content: "Inspect the activity state",
+      state: "completed",
+    });
     expect(presentation({ items, turnModels: new Map([[4, "codex/gpt-5"]]) })).toEqual({
       label: "Agent is working…",
       detail: "The agent is processing tool activity.",

@@ -162,7 +162,7 @@ export const runningAgentActivity = (
     const item = current[index];
     if (
       item === undefined
-      || ["user", "steered", "turn-status", "compaction"].includes(item.kind)
+      || ["user", "steered", "turn-status", "compaction", "todo"].includes(item.kind)
     ) continue;
     latestWork = item;
     break;
