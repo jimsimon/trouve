@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -1846,7 +1846,7 @@ struct AutomatedReviewToolBudget {
     remaining: u64,
     dispatcher_claimed: bool,
     timeout: Option<Duration>,
-    timeout_fired: Arc<AtomicBool>,
+    timeout_state: Arc<AtomicU8>,
 }
 
 #[derive(Default)]
@@ -1867,20 +1867,20 @@ impl AutomatedReviewToolBudgets {
                 bail!("automated-review tool budget is already active for thread {thread_id}");
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let timeout_fired = Arc::new(AtomicBool::new(false));
+                let timeout_state = Arc::new(AtomicU8::new(REVIEW_TIMEOUT_ACTIVE));
                 entry.insert(AutomatedReviewToolBudget {
                     limit,
                     remaining: limit,
                     dispatcher_claimed: false,
                     timeout,
-                    timeout_fired: Arc::clone(&timeout_fired),
+                    timeout_state: Arc::clone(&timeout_state),
                 });
                 Ok(AutomatedReviewToolBudgetGuard {
                     budgets: self.clone(),
                     thread_id: thread_id.to_string(),
                     owner: AutomatedReviewToolBudgetOwner::PreDispatch,
                     timeout,
-                    timeout_fired,
+                    timeout_state,
                 })
             }
         }
@@ -1898,7 +1898,7 @@ impl AutomatedReviewToolBudgets {
             thread_id: thread_id.to_string(),
             owner: AutomatedReviewToolBudgetOwner::Dispatcher,
             timeout: budget.timeout,
-            timeout_fired: Arc::clone(&budget.timeout_fired),
+            timeout_state: Arc::clone(&budget.timeout_state),
         })
     }
 
@@ -1920,40 +1920,88 @@ pub(crate) struct AutomatedReviewToolBudgetGuard {
     thread_id: String,
     owner: AutomatedReviewToolBudgetOwner,
     timeout: Option<Duration>,
-    timeout_fired: Arc<AtomicBool>,
+    timeout_state: Arc<AtomicU8>,
 }
 
 impl AutomatedReviewToolBudgetGuard {
-    fn timeout_supervision(&self) -> Option<(Duration, Arc<AtomicBool>)> {
+    fn timeout_supervision(&self) -> Option<(Duration, Arc<AtomicU8>)> {
         self.timeout
-            .map(|timeout| (timeout, Arc::clone(&self.timeout_fired)))
+            .map(|timeout| (timeout, Arc::clone(&self.timeout_state)))
     }
 
     pub(crate) fn timed_out(&self) -> bool {
-        self.timeout_fired.load(Ordering::Acquire)
+        self.timeout_state.load(Ordering::Acquire) == REVIEW_TIMEOUT_FIRED
     }
 }
 
-struct AutomatedReviewTimeoutSupervisor(tokio::task::JoinHandle<()>);
+const REVIEW_TIMEOUT_ACTIVE: u8 = 0;
+const REVIEW_TIMEOUT_FIRED: u8 = 1;
+const REVIEW_TIMEOUT_FINISHED: u8 = 2;
+
+struct AutomatedReviewTimeoutSupervisor {
+    deadline: tokio::time::Instant,
+    state: Arc<AtomicU8>,
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
 
 impl AutomatedReviewTimeoutSupervisor {
     fn start(
         timeout: Duration,
-        timeout_fired: Arc<AtomicBool>,
+        state: Arc<AtomicU8>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
         let deadline = tokio::time::Instant::now() + timeout;
-        Self(tokio::spawn(async move {
+        let task_state = Arc::clone(&state);
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
-            timeout_fired.store(true, Ordering::Release);
-            cancel.cancel();
-        }))
+            if task_state
+                .compare_exchange(
+                    REVIEW_TIMEOUT_ACTIVE,
+                    REVIEW_TIMEOUT_FIRED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                task_cancel.cancel();
+            }
+        });
+        Self {
+            deadline,
+            state,
+            cancel,
+            task,
+        }
+    }
+
+    fn finish(&mut self) {
+        let terminal_state = if tokio::time::Instant::now() >= self.deadline {
+            REVIEW_TIMEOUT_FIRED
+        } else {
+            REVIEW_TIMEOUT_FINISHED
+        };
+        if self
+            .state
+            .compare_exchange(
+                REVIEW_TIMEOUT_ACTIVE,
+                terminal_state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            && terminal_state == REVIEW_TIMEOUT_FIRED
+        {
+            self.cancel.cancel();
+        }
+        self.task.abort();
     }
 }
 
 impl Drop for AutomatedReviewTimeoutSupervisor {
     fn drop(&mut self) {
-        self.0.abort();
+        self.finish();
     }
 }
 
@@ -10117,7 +10165,7 @@ impl Engine {
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
         review_turn_capacity: &Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
-        review_timeout: Option<(Duration, Arc<AtomicBool>)>,
+        review_timeout: Option<(Duration, Arc<AtomicU8>)>,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -10190,9 +10238,6 @@ impl Engine {
         } else {
             self.turn_scheduler.acquire(&thread.model, &cancel).await?
         };
-        let _review_timeout_supervisor = review_timeout.map(|(timeout, timeout_fired)| {
-            AutomatedReviewTimeoutSupervisor::start(timeout, timeout_fired, cancel.clone())
-        });
         if background
             && let Some(progress) = self
                 .store
@@ -10210,6 +10255,9 @@ impl Engine {
                 },
             )
             .await?;
+        let mut review_timeout_supervisor = review_timeout.map(|(timeout, timeout_state)| {
+            AutomatedReviewTimeoutSupervisor::start(timeout, timeout_state, cancel.clone())
+        });
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
@@ -10229,6 +10277,7 @@ impl Engine {
                     cancel,
                     &prompt.id,
                     tools_enabled,
+                    &mut review_timeout_supervisor,
                 )
                 .await;
         }
@@ -10663,6 +10712,9 @@ impl Engine {
             )?;
         }
 
+        if let Some(supervisor) = review_timeout_supervisor.as_mut() {
+            supervisor.finish();
+        }
         if cancel.is_cancelled() {
             return Ok(());
         }
@@ -12151,6 +12203,7 @@ impl Engine {
         cancel: tokio_util::sync::CancellationToken,
         queued_prompt_id: &str,
         tools_enabled: bool,
+        review_timeout_supervisor: &mut Option<AutomatedReviewTimeoutSupervisor>,
     ) -> Result<()> {
         let startup_started = Instant::now();
         let scope = Scope::Thread(thread.id.clone());
@@ -13353,6 +13406,9 @@ impl Engine {
         )
         .await;
 
+        if let Some(supervisor) = review_timeout_supervisor.as_mut() {
+            supervisor.finish();
+        }
         if cancel.is_cancelled() {
             if !segment.is_empty() {
                 self.store.append_event(
@@ -16975,10 +17031,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn automated_review_timeout_supervisor_runs_independently_of_the_observer() {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let timeout_fired = Arc::new(AtomicBool::new(false));
+        let timeout_state = Arc::new(AtomicU8::new(REVIEW_TIMEOUT_ACTIVE));
         let _supervisor = AutomatedReviewTimeoutSupervisor::start(
             Duration::from_secs(1),
-            Arc::clone(&timeout_fired),
+            Arc::clone(&timeout_state),
             cancel.clone(),
         );
 
@@ -16988,7 +17044,26 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
 
-        assert!(timeout_fired.load(Ordering::Acquire));
+        assert_eq!(timeout_state.load(Ordering::Acquire), REVIEW_TIMEOUT_FIRED);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automated_review_timeout_drop_resolves_an_expired_timer_synchronously() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let timeout_state = Arc::new(AtomicU8::new(REVIEW_TIMEOUT_ACTIVE));
+        let supervisor = AutomatedReviewTimeoutSupervisor::start(
+            Duration::from_secs(1),
+            Arc::clone(&timeout_state),
+            cancel.clone(),
+        );
+        // Simulate the dispatcher completing while the deadline task is ready
+        // but has not run. Drop must arbitrate against the absolute deadline.
+        supervisor.task.abort();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(supervisor);
+
+        assert_eq!(timeout_state.load(Ordering::Acquire), REVIEW_TIMEOUT_FIRED);
         assert!(cancel.is_cancelled());
     }
 
