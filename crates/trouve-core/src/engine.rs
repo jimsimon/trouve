@@ -1236,6 +1236,9 @@ impl TurnScheduler {
                 _ = tokio::time::sleep(cooldown) => {}
             }
         }
+        if cancel.is_cancelled() {
+            bail!("turn cancelled");
+        }
         Ok(TurnCapacityGuard {
             wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
@@ -17947,6 +17950,20 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1_500)).await;
         tokio::task::yield_now().await;
         assert!(waiter.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_capacity_rejects_an_already_cancelled_turn() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let result = scheduler.acquire("provider/model", &cancel).await;
+
+        assert_eq!(
+            result.err().map(|error| error.to_string()).as_deref(),
+            Some("turn cancelled")
+        );
     }
 
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
