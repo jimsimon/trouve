@@ -10,6 +10,7 @@ import {
 import {
   AttachmentEncodingError,
   encodeAttachment,
+  isVideoMime,
   pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
@@ -519,6 +520,7 @@ export class TrouveNewThreadSetup extends LitElement {
                 ${this.#draft.attachments.map(
                   (attachment, index) => {
                     const preview = pendingAttachmentPreviewUrl(attachment);
+                    const video = isVideoMime(attachment.upload.mime);
                     return html`
                       <li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
                         ${preview === undefined
@@ -526,6 +528,8 @@ export class TrouveNewThreadSetup extends LitElement {
                           : html`<trouve-image-preview
                               .source=${preview}
                               .name=${attachment.upload.name}
+                              .mime=${attachment.upload.mime}
+                              .video=${video}
                             ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>

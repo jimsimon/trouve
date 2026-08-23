@@ -7,7 +7,7 @@ quality benchmark (mean NDCG@10 within 0.0002, see [BENCHMARKS.md](BENCHMARKS.md
 The indexing and caching architecture underneath is a redesign. This document
 lists every deliberate difference and why it exists.
 
-Last audited against Semble v0.5.2 (`204ae4e`, 2026-07-21). Benchmark figures
+Last audited against Semble v0.5.5 (`9218491`, 2026-08-12). Benchmark figures
 below refer to the v0.4.1 comparison recorded in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Module map
@@ -27,7 +27,7 @@ monorepo workspace.
 | `search.py` | `src/search.rs` | Port (same RRF fusion) |
 | `index/file_walker.py` | `src/walker.rs` | Port (gitignore semantics) |
 | `stats.py` | `src/stats.rs` | Port |
-| `cli.py`, `mcp.py` | `src/cli.rs`, `src/mcp.rs` | Port, plus a `stats` subcommand |
+| `cli.py`, `mcp.py` | `src/cli.rs`, `src/mcp.rs` | Port; orphan cleanup is adapted to the store design, plus `stats` |
 | `installer/` | — | **Dropped**: manual per-agent setup is documented in [INSTALL.md](INSTALL.md) instead |
 | `cache.py`, `index/index.py`, `index/create.py`, `index/files.py` | `src/store.rs`, `src/manifest.rs`, `src/snapshot.rs`, `src/index.rs` | **Redesigned** (everything below) |
 
@@ -87,12 +87,15 @@ every process start.
 
 Only the 4 newest snapshots are kept per store, and a daily mark-and-sweep
 pass deletes store entries not referenced by any kept snapshot (one-hour
-grace period for concurrent builds).
+grace period for concurrent builds). `trouve-search clear orphans`
+conservatively removes whole stores whose recorded repository identity no
+longer exists, while skipping legacy, corrupt, mismatched, symlinked, or
+otherwise unverifiable stores.
 
 **Why:** the content-addressed store would otherwise grow without bound as
-branches churn. Upstream has no equivalent problem (one cache per path,
-overwritten in place) — this is the cost of difference #1, paid back here.
-Sweeping is always safe: the store is a cache, and a miss just recomputes.
+branches churn. Upstream's orphan cleanup removes stale checkout caches;
+trouve additionally needs entry-level GC inside each shared store. Sweeping is
+always safe: the store is a cache, and a miss just recomputes.
 
 ### 6. In-house model2vec engine instead of the `model2vec` library
 
@@ -131,10 +134,13 @@ dominated the cold path at this speed.
 
 ### 9. MCP server details
 
-Same tool surface, plus: the in-process index cache holds up to 10 indexes
-(LRU by canonicalized repo path) and re-validates repos after a cooldown
-proportional to build time, which the fast incremental rebuild makes cheap.
-The CLI adds a `stats` subcommand (index size, cache hit rate).
+Like upstream, both MCP tools accept a per-call
+`content=code|docs|config|all` override, with the server configuration used
+when it is omitted. trouve's in-process index cache holds up to 10 indexes
+(LRU by canonicalized repo path plus normalized content selection) and
+re-validates repos after a cooldown proportional to build time, which the fast
+incremental rebuild makes cheap. The CLI adds a `stats` subcommand (index
+size, cache hit rate).
 
 **Why:** git/content manifests and snapshot fast paths make repeated
 validation inexpensive, while the extra command makes cache behavior visible.
@@ -205,5 +211,6 @@ touches:
   an upstream fix may be irrelevant, already covered, or need a fresh design
   against the content store and snapshots.
 
-Run `./scripts/fetch-reference.sh` to update the upstream checkout and print
-the exact commit that parity runs against.
+Run `./scripts/fetch-reference.sh` to check out the audited upstream commit and
+print the exact reference used for parity. Set `SEMBLE_REFERENCE_REF=main` for
+an explicit rolling comparison against upstream HEAD.

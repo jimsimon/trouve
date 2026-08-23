@@ -29,7 +29,10 @@ web-preview = ["dep:tao", "dep:trouve-desktop-host", "dep:wry"]
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+fs4.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 trouve-client-core.workspace = true
@@ -59,3 +62,8 @@ png = "0.18.1"
 # targets can build without WebKitGTK/WebView2.
 tao = { version = "0.36.0", optional = true }
 wry = { version = "0.56.0", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux niceness is per-thread. Runtime workers are lowered independently so
+# the Tao/Wry event-loop thread retains normal scheduling priority.
+libc = "0.2.186"

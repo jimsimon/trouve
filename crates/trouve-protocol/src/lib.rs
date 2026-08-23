@@ -298,13 +298,19 @@ pub use requests::*;
 // retaining successful reviewer task outputs (additive).
 // 7.12: code-review jobs expose the server-authoritative final-editor retry
 // capability derived from their latest durable task attempts (additive).
-// 7.13: provider-neutral `auto/<model>` selections expose their concrete routes,
+// 7.13: workspace branch listings expose the origin remote's default branch
+// for session base selection (additive).
+// 7.14: code-review details expose reviewer candidates left unresolved after
+// final-editor repair so clients can represent incomplete reviews (additive).
+// 7.15: code-review jobs expose the PR-wide open-finding count captured after
+// publication so a clean incremental round cannot hide older findings.
+// 7.16: provider-neutral `auto/<model>` selections expose their concrete routes,
 // persist sticky thread affinity, and emit route-selection events with a
 // closed reason enum; provider-order updates require an explicit array
 // (additive because all affected routes and wire shapes are new).
-// 7.14: provider-order writes can carry an optimistic concurrency precondition
+// 7.17: provider-order writes can carry an optimistic concurrency precondition
 // so simultaneous settings clients cannot silently overwrite one another.
-pub const PROTOCOL_VERSION: &str = "7.14";
+pub const PROTOCOL_VERSION: &str = "7.17";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -2074,6 +2074,28 @@ pub struct CodeReviewCandidateRejection {
     pub reason: String,
 }
 
+/// A reviewer candidate the final editor neither retained nor substantively
+/// rejected. This represents incomplete coordinator work, not a negative
+/// decision about the candidate.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewUnadjudicatedCandidate {
+    pub candidate_id: String,
+    pub task_id: String,
+    pub reviewer_id: String,
+    pub reviewer_name: String,
+    pub path: String,
+    pub line: u64,
+    pub side: String,
+    pub severity: String,
+    /// Strength of the reviewer evidence, independently of impact.
+    /// `high`, `medium`, or `low`; legacy records default to `medium`.
+    #[serde(default = "default_code_review_confidence")]
+    pub confidence: String,
+    /// Concise, generated one-line summary of the candidate issue.
+    pub title: String,
+    pub body: String,
+}
+
 /// Concrete evidence that makes a confirmed finding independently verifiable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewFindingEvidence {
@@ -2307,6 +2329,12 @@ pub struct CodeReviewJob {
     pub issue_count: u64,
     #[serde(default)]
     pub fixed_issue_count: u64,
+    /// Total confirmed findings that remained open across the pull request
+    /// after this review was published. Absent while publication is pending
+    /// and for legacy jobs that predate this snapshot. Consumers must treat
+    /// absence on a succeeded job as unknown, never as a clean review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_issue_count: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -2346,6 +2374,10 @@ pub struct CodeReviewJobDetail {
     pub themes: Vec<CodeReviewTheme>,
     #[serde(default)]
     pub candidate_rejections: Vec<CodeReviewCandidateRejection>,
+    /// Candidates left without a final-editor decision after the bounded
+    /// repair attempt. Their presence means the review is incomplete.
+    #[serde(default)]
+    pub unadjudicated_candidates: Vec<CodeReviewUnadjudicatedCandidate>,
     #[serde(default)]
     pub routing_decisions: Vec<CodeReviewRoutingDecision>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2590,8 +2622,11 @@ pub struct CodeReviewDashboard {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchList {
     pub branches: Vec<String>,
-    /// The branch HEAD currently points at (default selection).
+    /// The branch or commit HEAD currently points at.
     pub head: String,
+    /// The default branch advertised by the repository's origin remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
 }
 
 // --- provider configuration -------------------------------------------------

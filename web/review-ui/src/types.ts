@@ -111,6 +111,7 @@ export interface ReviewJob {
   candidate_issue_count: number;
   issue_count: number;
   fixed_issue_count: number;
+  open_issue_count?: number | null;
   error: string;
   created_at: string;
   started_at?: string;
@@ -288,6 +289,20 @@ export interface CandidateRejection {
   reason: string;
 }
 
+export interface UnadjudicatedCandidate {
+  candidate_id: string;
+  task_id: string;
+  reviewer_id: string;
+  reviewer_name: string;
+  path: string;
+  line: number;
+  side: string;
+  severity: string;
+  confidence?: string;
+  title: string;
+  body: string;
+}
+
 export interface RoutingReason {
   source: RoutingSource;
   detail: string;
@@ -309,6 +324,7 @@ export interface JobDetail {
   findings: Finding[];
   themes?: ReviewTheme[];
   candidate_rejections?: CandidateRejection[];
+  unadjudicated_candidates?: UnadjudicatedCandidate[];
   routing_decisions?: RoutingDecision[];
   summary: string;
   prompt_for_agents: string;
@@ -319,6 +335,7 @@ export interface Dashboard {
   reviewers: ReviewerProfile[];
   repositories: Repository[];
   jobs: ReviewJob[];
+  final_editor_retryable_job_ids?: string[];
 }
 
 export interface StatusCounts {

@@ -467,6 +467,14 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     void this.#initialize();
   }
 
+  protected override updated(): void {
+    const services = this.#services.value;
+    if (services === undefined) return;
+    const saved = readSignal(services.pullRequestGroupOrder);
+    const migrated = reconcilePullRequestGroupOrder(saved);
+    if (migrated.changed) services.setPullRequestGroupOrder(migrated.order);
+  }
+
   override disconnectedCallback(): void {
     if (this.#tickTimer !== undefined) clearInterval(this.#tickTimer);
     if (this.#copyTimer !== undefined) clearTimeout(this.#copyTimer);

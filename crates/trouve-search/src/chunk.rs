@@ -27,8 +27,13 @@ pub struct ChunkBoundary {
 /// Return the tree-sitter language for an upstream language name, if bundled.
 fn language_for(name: &str) -> Option<Language> {
     let lang = match name {
-        "bash" => tree_sitter_bash::LANGUAGE,
+        // These crates still expose the pre-LanguageFn API.
+        "asciidoc" => return Some(tree_sitter_asciidoc::language()),
+        "scss" => return Some(tree_sitter_scss::language()),
+        "astro" => tree_sitter_astro_next::LANGUAGE,
+        "bash" | "zsh" => tree_sitter_bash::LANGUAGE,
         "c" => tree_sitter_c::LANGUAGE,
+        "clojure" => tree_sitter_clojure_orchard::LANGUAGE,
         "cmake" => tree_sitter_cmake::LANGUAGE,
         "cpp" => tree_sitter_cpp::LANGUAGE,
         "csharp" => tree_sitter_c_sharp::LANGUAGE,
@@ -48,10 +53,14 @@ fn language_for(name: &str) -> Option<Language> {
         "haskell" => tree_sitter_haskell::LANGUAGE,
         // Terraform's .tf syntax is HCL; both names share one grammar.
         "hcl" | "terraform" => tree_sitter_hcl::LANGUAGE,
+        "heex" => tree_sitter_heex::LANGUAGE,
         "html" => tree_sitter_html::LANGUAGE,
+        "ini" => tree_sitter_ini::LANGUAGE,
         "java" => tree_sitter_java::LANGUAGE,
         "javascript" => tree_sitter_javascript::LANGUAGE,
+        "jinja2" => tree_sitter_jinja2::LANGUAGE,
         "json" => tree_sitter_json::LANGUAGE,
+        "jsonnet" => tree_sitter_jsonnet::LANGUAGE,
         "julia" => tree_sitter_julia::LANGUAGE,
         "kotlin" => tree_sitter_kotlin_ng::LANGUAGE,
         "lua" => tree_sitter_lua::LANGUAGE,
@@ -65,18 +74,23 @@ fn language_for(name: &str) -> Option<Language> {
         "php" => tree_sitter_php::LANGUAGE_PHP,
         "powershell" => tree_sitter_powershell::LANGUAGE,
         "proto" => tree_sitter_proto::LANGUAGE,
+        "properties" => tree_sitter_properties::LANGUAGE,
         "python" => tree_sitter_python::LANGUAGE,
         "r" => tree_sitter_r::LANGUAGE,
+        "rst" => tree_sitter_rst::LANGUAGE,
         "ruby" => tree_sitter_ruby::LANGUAGE,
         "rust" => tree_sitter_rust::LANGUAGE,
         "scala" => tree_sitter_scala::LANGUAGE,
         "solidity" => tree_sitter_solidity::LANGUAGE,
         "sql" => tree_sitter_sequel::LANGUAGE,
+        "starlark" => tree_sitter_starlark::LANGUAGE,
         "svelte" => tree_sitter_svelte_ng::LANGUAGE,
         "swift" => tree_sitter_swift::LANGUAGE,
         "toml" => tree_sitter_toml_ng::LANGUAGE,
         "tsx" => tree_sitter_typescript::LANGUAGE_TSX,
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+        "typst" => codebook_tree_sitter_typst::LANGUAGE,
+        "vue" => tree_sitter_vue_next::LANGUAGE,
         "xml" => tree_sitter_xml::LANGUAGE_XML,
         "yaml" => tree_sitter_yaml::LANGUAGE,
         "zig" => tree_sitter_zig::LANGUAGE,
@@ -543,6 +557,118 @@ mod tests {
             assert!(!chunks.is_empty(), "no chunks for {lang}");
             let combined_len: usize = chunks.iter().map(|c| c.content.len()).sum();
             assert!(combined_len > 0, "empty chunks for {lang}");
+        }
+    }
+
+    #[test]
+    fn ported_grammars_are_supported() {
+        for lang in [
+            "asciidoc",
+            "astro",
+            "clojure",
+            "heex",
+            "ini",
+            "jinja2",
+            "jsonnet",
+            "properties",
+            "rst",
+            "scss",
+            "starlark",
+            "typst",
+            "vue",
+            "zsh",
+        ] {
+            assert!(is_supported_language(lang), "expected grammar for {lang}");
+        }
+    }
+
+    #[test]
+    fn ported_grammars_parse_and_chunk() {
+        let samples: &[(&str, &str)] = &[
+            ("asciidoc", "= Heading\n\n== Section\n\nSome text.\n"),
+            (
+                "astro",
+                "---\nconst title = \"Hello\";\n---\n<h1>{title}</h1>\n",
+            ),
+            (
+                "clojure",
+                "(ns example.core)\n\n(defn greet [name]\n  (str \"Hello, \" name))\n",
+            ),
+            ("heex", "<div :if={@user}>\n  <%= @user.name %>\n</div>\n"),
+            ("ini", "[server]\nhost = localhost\nport = 8080\n"),
+            (
+                "jinja2",
+                "{% for user in users %}\n  <p>{{ user.name }}</p>\n{% endfor %}\n",
+            ),
+            (
+                "jsonnet",
+                "local greeting(name) = 'Hello ' + name;\n{ message: greeting('world') }\n",
+            ),
+            ("properties", "server.host=localhost\nserver.port=8080\n"),
+            (
+                "rst",
+                "Heading\n=======\n\nSection\n-------\n\nSome text.\n",
+            ),
+            (
+                "scss",
+                "$color: #333;\n.card { color: $color; &:hover { color: white; } }\n",
+            ),
+            (
+                "starlark",
+                "def rule_impl(ctx):\n    return [DefaultInfo(files = depset(ctx.files.srcs))]\n",
+            ),
+            (
+                "typst",
+                "#set heading(numbering: \"1.\")\n= Heading\nHello, *world*!\n",
+            ),
+            (
+                "vue",
+                "<template>\n  <main>{{ message }}</main>\n</template>\n<script>\nexport default { data() { return { message: \"Hello\" }; } };\n</script>\n<style>\nmain { color: red; }\n</style>\n",
+            ),
+            ("zsh", "greet() {\n  print \"hello $1\"\n}\n"),
+        ];
+
+        for (lang, source) in samples {
+            let grammar = language_for(lang).expect("grammar should be bundled");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&grammar)
+                .expect("grammar should match the tree-sitter ABI");
+            let tree = parser.parse(source, None).expect("source should parse");
+            assert!(
+                !tree.root_node().has_error(),
+                "sample should parse without errors for {lang}"
+            );
+
+            let chunks = chunk_source(&source.repeat(30), "sample", Some(lang));
+            assert!(!chunks.is_empty(), "no chunks for {lang}");
+        }
+    }
+
+    #[test]
+    fn vue_and_html_grammars_parse_in_the_same_binary() {
+        let samples = [
+            (
+                "html",
+                "<!doctype html>\n<html><body><main>Hello</main></body></html>\n",
+            ),
+            (
+                "vue",
+                "<template>\n  <main>{{ message }}</main>\n</template>\n<script>\nexport default { data() { return { message: \"Hello\" }; } };\n</script>\n",
+            ),
+        ];
+
+        for (language, source) in samples {
+            let grammar = language_for(language).expect("grammar should be bundled");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&grammar)
+                .expect("grammar should match the tree-sitter ABI");
+            let tree = parser.parse(source, None).expect("source should parse");
+            assert!(
+                !tree.root_node().has_error(),
+                "sample should parse without errors for {language}"
+            );
         }
     }
 }
