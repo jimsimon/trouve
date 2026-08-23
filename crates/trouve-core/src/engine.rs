@@ -520,6 +520,21 @@ const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_SUBAGENT_DEPTH: usize = 4;
 const MAX_CONCURRENT_CHILDREN: usize = 4;
 const MAX_ACTIVE_DESCENDANTS: usize = 16;
+const REMOVED_TURN_CONCURRENCY_ENV_VARS: [&str; 4] = [
+    "TROUVE_TURN_CONCURRENCY",
+    "TROUVE_BACKGROUND_TURN_CONCURRENCY",
+    "TROUVE_PROVIDER_TURN_CONCURRENCY",
+    "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY",
+];
+
+fn removed_turn_concurrency_settings(
+    mut read: impl FnMut(&str) -> Option<String>,
+) -> Vec<(&'static str, String)> {
+    REMOVED_TURN_CONCURRENCY_ENV_VARS
+        .into_iter()
+        .filter_map(|name| read(name).map(|value| (name, value)))
+        .collect()
+}
 
 fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
     let id = session_id.strip_prefix("se_").unwrap_or(session_id);
@@ -1138,6 +1153,14 @@ struct TurnCapacityGuard {
 
 impl TurnScheduler {
     fn new() -> Self {
+        for (variable, value) in removed_turn_concurrency_settings(|name| std::env::var(name).ok())
+        {
+            tracing::warn!(
+                variable,
+                value,
+                "legacy turn-concurrency setting is ignored; configure provider-side capacity for interactive turns and TROUVE_CODE_REVIEW_JOB_CONCURRENCY/TROUVE_CODE_REVIEW_TASK_CONCURRENCY for review work"
+            );
+        }
         Self {
             providers: Mutex::new(HashMap::new()),
         }
@@ -16855,6 +16878,23 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_turn_concurrency_settings_are_detected_for_migration_warnings() {
+        let settings = removed_turn_concurrency_settings(|name| match name {
+            "TROUVE_TURN_CONCURRENCY" => Some("12".into()),
+            "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY" => Some("3".into()),
+            _ => None,
+        });
+
+        assert_eq!(
+            settings,
+            vec![
+                ("TROUVE_TURN_CONCURRENCY", "12".into()),
+                ("TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY", "3".into()),
+            ]
+        );
+    }
 
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {

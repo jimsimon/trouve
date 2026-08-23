@@ -249,12 +249,20 @@ run until their configured model provider applies its own capacity or rate
 limit. Provider throttle responses still activate shared exponential cooldown
 so concurrent turns do not become an immediate retry storm.
 
+The former `TROUVE_TURN_CONCURRENCY`,
+`TROUVE_BACKGROUND_TURN_CONCURRENCY`, `TROUVE_PROVIDER_TURN_CONCURRENCY`, and
+`TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY` settings are ignored. A server
+that finds any of them logs an explicit migration warning. Configure
+interactive capacity at the model provider instead.
+
 The review service bounds top-level work with
 `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` and
 `TROUVE_CODE_REVIEW_TASK_CONCURRENCY`. All limits must be positive and require
-a server restart. Review-job concurrency has a hard maximum of 32; larger
-persisted, API, or `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are reduced to
-32 with a server warning.
+a server restart. The task limit is one process-wide reviewer-persona budget,
+shared by every running review job, so increasing job concurrency does not
+multiply reviewer fan-out. Review-job concurrency has a hard maximum of 32;
+larger persisted, API, or `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are
+reduced to 32 with a server warning.
 
 ## Backup and upgrades
 
