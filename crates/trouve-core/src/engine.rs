@@ -533,6 +533,12 @@ const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_SUBAGENT_DEPTH: usize = 4;
 const MAX_CONCURRENT_CHILDREN: usize = 4;
 const MAX_ACTIVE_DESCENDANTS: usize = 16;
+const REMOVED_TURN_CONCURRENCY_ENVS: [&str; 4] = [
+    "TROUVE_TURN_CONCURRENCY",
+    "TROUVE_BACKGROUND_TURN_CONCURRENCY",
+    "TROUVE_PROVIDER_TURN_CONCURRENCY",
+    "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY",
+];
 
 fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
     let id = session_id.strip_prefix("se_").unwrap_or(session_id);
@@ -1165,6 +1171,14 @@ struct TurnCapacityGuard {
 
 impl TurnScheduler {
     fn new() -> Self {
+        for variable in
+            configured_removed_turn_concurrency_settings(|name| std::env::var_os(name).is_some())
+        {
+            tracing::warn!(
+                variable,
+                "removed turn-concurrency setting is ignored; engine turn admission is uncapped"
+            );
+        }
         Self {
             providers: Mutex::new(HashMap::new()),
         }
@@ -1204,13 +1218,16 @@ impl TurnScheduler {
     ) -> Result<TurnCapacityGuard> {
         let started = Instant::now();
         let provider = self.provider(model);
-        let cooldown = provider
-            .backoff
-            .lock()
-            .unwrap()
-            .until
-            .and_then(|until| until.checked_duration_since(Instant::now()));
-        if let Some(cooldown) = cooldown {
+        loop {
+            let cooldown = provider
+                .backoff
+                .lock()
+                .unwrap()
+                .until
+                .and_then(|until| until.checked_duration_since(Instant::now()));
+            let Some(cooldown) = cooldown else {
+                break;
+            };
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => bail!("turn cancelled"),
@@ -1250,6 +1267,15 @@ impl TurnScheduler {
             backoff.until = None;
         }
     }
+}
+
+fn configured_removed_turn_concurrency_settings(
+    mut is_set: impl FnMut(&str) -> bool,
+) -> Vec<&'static str> {
+    REMOVED_TURN_CONCURRENCY_ENVS
+        .into_iter()
+        .filter(|name| is_set(name))
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -17877,6 +17903,44 @@ mod tests {
 
         drop(permits.pop());
         let _replacement = scheduler.acquire_planned_setup(&cancel).await.unwrap();
+    }
+
+    #[test]
+    fn removed_turn_concurrency_settings_are_detected_for_migration_warnings() {
+        let configured = configured_removed_turn_concurrency_settings(|name| {
+            name == "TROUVE_TURN_CONCURRENCY"
+                || name == "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY"
+        });
+
+        assert_eq!(
+            configured,
+            vec![
+                "TROUVE_TURN_CONCURRENCY",
+                "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY"
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_cooldown_wait_observes_extensions() {
+        let scheduler = Arc::new(TurnScheduler::new());
+        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter = {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move { scheduler.acquire("provider/model", &cancel).await })
+        };
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tokio::time::advance(Duration::from_millis(1_500)).await;
+        tokio::task::yield_now().await;
+        assert!(waiter.await.unwrap().is_ok());
     }
 
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {

@@ -249,6 +249,11 @@ run until their configured model provider applies its own capacity or rate
 limit. Provider throttle responses still activate shared exponential cooldown
 so concurrent turns do not become an immediate retry storm.
 
+The retired `TROUVE_TURN_CONCURRENCY`, `TROUVE_BACKGROUND_TURN_CONCURRENCY`,
+`TROUVE_PROVIDER_TURN_CONCURRENCY`, and
+`TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY` settings are ignored with a
+startup warning.
+
 The review service bounds top-level work with
 `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` and
 `TROUVE_CODE_REVIEW_TASK_CONCURRENCY`. All limits must be positive and require
