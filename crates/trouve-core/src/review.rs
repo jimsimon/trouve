@@ -137,7 +137,9 @@ const REVIEW_DIFF_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_DIFF_MAX_FILES: usize = 250;
 const REVIEW_DIFF_MAX_CHANGED_LINES: u64 = 20_000;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
-const REVIEWER_MAX_TOOL_CALLS: u64 = 12;
+// Release reviews can span every synchronized first-party manifest. Preserve
+// a hard bound while leaving enough room to inspect those independent files.
+const REVIEWER_MAX_TOOL_CALLS: u64 = 24;
 const COORDINATOR_MAX_TOOL_CALLS: u64 = 4;
 const REVIEW_ANCHOR_TREE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_ANCHOR_MAX_DISTINCT_BLOBS: usize = MAX_CANDIDATE_FINDINGS;
@@ -178,7 +180,7 @@ const RETRY_CHECK_ACTION_DESCRIPTION: &str = "Retry this review on the current P
 const RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION: &str = "Retry only the final review editor";
 const FULL_REVIEW_CHECK_ACTION_DESCRIPTION: &str = "Review full branch against the PR base";
 const REVIEWER_EXECUTION_GUIDANCE: &str = "\
-Time and exploration budget: finish this review in about three minutes. Use no more than 12 \
+Time and exploration budget: finish this review in about three minutes. Use no more than 24 \
 tool calls total. Treat the supplied diff as the primary evidence; do not inventory the \
 repository, recreate the diff, make a todo list, or run builds/tests. Batch independent reads or \
 searches when the tool supports it. If the budget is nearly exhausted, stop exploring and return \
@@ -21391,7 +21393,8 @@ mod tests {
     #[test]
     fn review_prompts_bound_exploration_to_fit_the_latency_target() {
         assert!(REVIEWER_EXECUTION_GUIDANCE.contains("about three minutes"));
-        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("no more than 12 tool calls"));
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("no more than 24 tool calls"));
+        assert_eq!(REVIEWER_MAX_TOOL_CALLS, 24);
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("about one minute"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("no more than 4 tool calls"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("checked-in code"));
