@@ -248,16 +248,6 @@ pub enum Event {
     /// the existing activity row; it is not a transcript or tool-rail item.
     #[serde(rename = "turn.phase_changed")]
     TurnPhaseChanged { turn: u64, phase: TurnPhase },
-    /// The concrete provider route selected for an automatic model. Another
-    /// event for the same turn records a safe failover to a different route.
-    #[serde(rename = "model.route_selected")]
-    ModelRouteSelected {
-        turn: u64,
-        model: String,
-        provider_id: String,
-        provider_model: String,
-        reason: ModelRouteReason,
-    },
     /// Live usage from the most recently completed model request in a running
     /// turn. Thread snapshots add its billing counters to `active_usage` while
     /// replacing only the context fields. `last_usage` remains unchanged until
@@ -603,6 +593,18 @@ pub enum Event {
     /// Carries a full replacement snapshot for replay and reconnect.
     #[serde(rename = "settings.code_review_updated")]
     CodeReviewSettingsUpdated { settings: crate::CodeReviewSettings },
+    /// The concrete provider route selected for an automatic model. Another
+    /// event for the same turn records a safe failover to a different route.
+    /// New event variants are appended so generated validators retain stable
+    /// identifiers for the existing closed union.
+    #[serde(rename = "model.route_selected")]
+    ModelRouteSelected {
+        turn: u64,
+        model: String,
+        provider_id: String,
+        provider_model: String,
+        reason: ModelRouteReason,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

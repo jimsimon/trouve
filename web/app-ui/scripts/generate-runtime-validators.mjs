@@ -158,7 +158,6 @@ const protocolValidators = {
   personas: componentArray(protocolSchemaId, "AgentPersona"),
   personaInfos: componentArray(protocolSchemaId, "PersonaInfo"),
   models: componentArray(protocolSchemaId, "ModelInfo"),
-  modelRoutes: componentArray(protocolSchemaId, "RoutedModelInfo"),
   thread: componentRef(protocolSchemaId, "Thread"),
   threads: componentArray(protocolSchemaId, "Thread"),
   threadStatuses: componentArray(protocolSchemaId, "ThreadStatus"),
@@ -219,6 +218,9 @@ const protocolValidators = {
       eventEnvelopeFields,
     ],
   },
+  // Append new root validators so AJV's generated identifiers for existing
+  // exports remain stable and protocol additions produce reviewable diffs.
+  modelRoutes: componentArray(protocolSchemaId, "RoutedModelInfo"),
 };
 
 const protocolSource = generateModule({

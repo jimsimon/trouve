@@ -2753,15 +2753,6 @@ export interface components {
             /** @enum {string} */
             type: "turn.phase_changed";
         } | {
-            model: string;
-            provider_id: string;
-            provider_model: string;
-            reason: components["schemas"]["ModelRouteReason"];
-            /** Format: int64 */
-            turn: number;
-            /** @enum {string} */
-            type: "model.route_selected";
-        } | {
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
@@ -3086,6 +3077,15 @@ export interface components {
             settings: components["schemas"]["CodeReviewSettings"];
             /** @enum {string} */
             type: "settings.code_review_updated";
+        } | {
+            model: string;
+            provider_id: string;
+            provider_model: string;
+            reason: components["schemas"]["ModelRouteReason"];
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "model.route_selected";
         };
         /** @description The envelope every event is delivered in (and persisted as). */
         EventEnvelope: components["schemas"]["Event"] & {
