@@ -2377,6 +2377,9 @@ fn backend_tool_free_capabilities_match_vendor_protocols() {
     assert!(claude.supports_tool_free_turns());
     assert!(!cursor.supports_tool_free_turns());
     assert!(!codex.supports_tool_free_turns());
+    assert!(!claude.confines_read_only_turns());
+    assert!(cursor.confines_read_only_turns());
+    assert!(!codex.confines_read_only_turns());
 }
 
 #[tokio::test]
