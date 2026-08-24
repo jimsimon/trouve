@@ -398,6 +398,18 @@ pub enum BackendError {
     Io(#[from] std::io::Error),
 }
 
+impl BackendError {
+    /// Whether the vendor harness positively reported exhausted request
+    /// capacity. Generic protocol and I/O errors are intentionally terminal
+    /// because their side-effect outcome may be unknown.
+    pub fn is_capacity_exhausted(&self) -> bool {
+        let Self::Protocol(message) = self else {
+            return false;
+        };
+        trouve_providers::is_capacity_exhaustion_message(message)
+    }
+}
+
 pub type BackendEventStream = BoxStream<'static, Result<BackendEvent, BackendError>>;
 
 /// Best-effort provider health. Implementations should keep this fast;
@@ -430,6 +442,12 @@ pub struct BackendLogin {
 pub trait AgentBackend: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("codex/gpt-5.4").
     fn id(&self) -> &str;
+
+    /// Catalog-backed provider-neutral identity for a runnable model.
+    /// Transport-owned choices return `None` and remain concrete selections.
+    fn shared_model_identity(&self, _model: &str) -> Option<String> {
+        None
+    }
 
     /// Canonical model metadata snapshot: instant and offline-safe, used when
     /// the vendor cannot report current availability.
@@ -1116,6 +1134,14 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
+
+    #[test]
+    fn backend_capacity_errors_use_the_shared_classifier() {
+        assert!(BackendError::Protocol("HTTP 429".into()).is_capacity_exhausted());
+        assert!(BackendError::Protocol("quota_exceeded".into()).is_capacity_exhausted());
+        assert!(!BackendError::Protocol("HTTP 14290".into()).is_capacity_exhausted());
+        assert!(!BackendError::Io(std::io::Error::other("HTTP 429")).is_capacity_exhausted());
+    }
 
     #[tokio::test]
     async fn coalesces_delta_kinds_without_reordering_controls() {

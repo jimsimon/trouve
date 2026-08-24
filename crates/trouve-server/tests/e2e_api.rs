@@ -1062,6 +1062,14 @@ impl Provider for CompactingProvider {
         }]
     }
 
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        let mut models = self.models();
+        // Exercise compaction's route-specific metadata fallback: the routed
+        // catalog has no window, while the provider's static metadata does.
+        models[0].context_window = 0;
+        models
+    }
+
     async fn stream_chat(
         &self,
         _model: &str,
@@ -1082,15 +1090,24 @@ impl Provider for CompactingProvider {
                     },
                 }),
             ],
-            // Compaction summarization request.
-            1 => vec![
-                Ok(ProviderEvent::TextDelta(
-                    "Summary of everything so far.".into(),
-                )),
-                Ok(ProviderEvent::Completed {
-                    usage: Usage::default(),
-                }),
-            ],
+            // Compaction summarizes only earlier turns. The newly accepted
+            // turn remains a separate tail message for its real request.
+            1 => {
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::User(text) if text == "second")),
+                    "compaction must not consume the current user message"
+                );
+                vec![
+                    Ok(ProviderEvent::TextDelta(
+                        "Summary of everything so far.".into(),
+                    )),
+                    Ok(ProviderEvent::Completed {
+                        usage: Usage::default(),
+                    }),
+                ]
+            }
             // Turn 2 proper: history must be the compacted summary + the new
             // user message.
             _ => {
@@ -1100,6 +1117,20 @@ impl Provider for CompactingProvider {
                         Message::User(text) if text.contains("Summary of everything so far.")
                     )),
                     "turn 2 should run against the compacted transcript"
+                );
+                assert!(
+                    matches!(messages.last(), Some(Message::User(text)) if text == "second"),
+                    "turn 2 should retain its user message after compaction"
+                );
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(
+                            |message| matches!(message, Message::User(text) if text == "second")
+                        )
+                        .count(),
+                    1,
+                    "the accepted current message must appear exactly once"
                 );
                 vec![
                     Ok(ProviderEvent::TextDelta("Second answer.".into())),
@@ -1537,6 +1568,40 @@ async fn session_and_thread_updates_and_provider_config() {
             .iter()
             .any(|p| p["id"] == "openrouter")
     );
+
+    // Provider routing preference is a persisted, ordered subset. The
+    // response appends unlisted providers deterministically for settings UI.
+    let resp = client
+        .put(format!("{base}/config/provider-order"))
+        .json(&serde_json::json!({
+            "provider_ids": ["openrouter", "scripted"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let providers: serde_json::Value = client
+        .get(format!("{base}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(providers["provider_order"][0], "openrouter");
+    assert_eq!(providers["provider_order"][1], "scripted");
+    let config_text = std::fs::read_to_string(&config_file).unwrap();
+    assert!(config_text.contains("provider_order"));
+
+    let resp = client
+        .put(format!("{base}/config/provider-order"))
+        .json(&serde_json::json!({
+            "provider_ids": ["openrouter", "openrouter"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 
     // Global defaults persist together in one config-file update.
     let resp = client

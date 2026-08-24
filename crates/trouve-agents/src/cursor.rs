@@ -315,6 +315,21 @@ impl AgentBackend for CursorBackend {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        [
+            ("anthropic", OptionsDialect::ClaudeCli),
+            ("openai", OptionsDialect::CodexCli),
+            ("google", OptionsDialect::Gemini),
+            ("xai", OptionsDialect::OpenAi),
+        ]
+        .into_iter()
+        .find_map(|(provider, dialect)| {
+            self.catalog
+                .model(provider, &self.id, model, dialect)
+                .map(|_| model.to_string())
+        })
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
         // Cursor is a distinct serving surface, like Codex: a trouve-owned
         // static roster inherits public metadata where possible and owns
@@ -2448,6 +2463,17 @@ mod tests {
             composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(true))
         );
+    }
+
+    #[test]
+    fn shared_model_identity_includes_catalog_backed_xai_models() {
+        let backend = CursorBackend::new("cursor", None, None);
+
+        assert_eq!(
+            backend.shared_model_identity("grok-4.5").as_deref(),
+            Some("grok-4.5")
+        );
+        assert_eq!(backend.shared_model_identity("grok-future"), None);
     }
 
     #[test]

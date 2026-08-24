@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS threads (
   permission_mode TEXT NOT NULL,
   model_options TEXT NOT NULL DEFAULT '{}',
   todos TEXT NOT NULL DEFAULT '[]',
+  route_provider_id TEXT,
+  route_provider_model TEXT,
   last_turn INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
@@ -140,6 +142,16 @@ CREATE TABLE IF NOT EXISTS backend_sessions (
   seen_messages INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (thread_id, backend)
 );
+CREATE TABLE IF NOT EXISTS route_health (
+  provider_id TEXT NOT NULL,
+  provider_model TEXT NOT NULL,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  retry_after INTEGER,             -- UTC unix seconds; NULL = not cooling down
+  last_success_at INTEGER,         -- UTC unix seconds; sticky healthy-route hint
+  last_failure_at INTEGER,         -- UTC unix microseconds; diagnostic observation time
+  last_outcome_started_at INTEGER, -- hybrid logical attempt order; rejects stale outcomes
+  PRIMARY KEY (provider_id, provider_model)
+);
 CREATE TABLE IF NOT EXISTS queued_prompts (
   id TEXT PRIMARY KEY,
   thread_id TEXT NOT NULL REFERENCES threads(id),
@@ -147,6 +159,7 @@ CREATE TABLE IF NOT EXISTS queued_prompts (
   content TEXT NOT NULL,
   attachments TEXT NOT NULL DEFAULT '[]',  -- JSON [trouve_protocol::Attachment]
   claimed INTEGER NOT NULL DEFAULT 0,
+  accepted_turn INTEGER,
   tools_enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
@@ -621,6 +634,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE queued_prompts ADD COLUMN accepted_turn INTEGER",
     "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN next_attempt_at TEXT",
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_until TEXT",
@@ -639,6 +653,18 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE threads ADD COLUMN title TEXT",
+    "ALTER TABLE threads ADD COLUMN route_provider_id TEXT",
+    "ALTER TABLE threads ADD COLUMN route_provider_model TEXT",
+    "CREATE TABLE IF NOT EXISTS route_health (
+       provider_id TEXT NOT NULL,
+       provider_model TEXT NOT NULL,
+       consecutive_failures INTEGER NOT NULL DEFAULT 0,
+       retry_after INTEGER,
+       last_success_at INTEGER,
+       PRIMARY KEY (provider_id, provider_model)
+     )",
+    "ALTER TABLE route_health ADD COLUMN last_failure_at INTEGER",
+    "ALTER TABLE route_health ADD COLUMN last_outcome_started_at INTEGER",
     "ALTER TABLE thread_statuses ADD COLUMN started_at TEXT",
     "ALTER TABLE thread_statuses ADD COLUMN completed_at TEXT",
     "ALTER TABLE thread_view_items ADD COLUMN turn_start INTEGER NOT NULL DEFAULT 0",
@@ -3991,6 +4017,20 @@ pub enum UsageScope<'a> {
     Session(&'a str),
 }
 
+/// Persisted circuit-breaker state for one concrete provider/model route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHealthRow {
+    pub provider_id: String,
+    pub provider_model: String,
+    pub consecutive_failures: u32,
+    pub retry_after: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub last_failure_at: Option<i64>,
+    /// Hybrid logical order of the newest admitted attempt whose outcome was
+    /// recorded. The backing column keeps its original migration name.
+    pub last_outcome_order: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CheckpointRow {
     pub id: String,
@@ -4022,6 +4062,8 @@ pub struct Store {
     events_tx: broadcast::Sender<EventEnvelope>,
     scoped_events: ScopedEventSenders,
     append_tx: std::sync::mpsc::Sender<AppendRequest>,
+    #[cfg(test)]
+    fail_next_async_append: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -4227,12 +4269,19 @@ pub(crate) struct PersonaDeletionClaim {
 
 const PERSONA_DELETION_CLAIM_MINUTES: i64 = 5;
 
+pub(crate) struct AcceptedPrompt {
+    pub id: String,
+    pub turn: u64,
+    pub message: String,
+}
+
 pub(crate) struct PromptAcceptance {
     pub prompt: trouve_protocol::QueuedPrompt,
     pub tools_enabled: bool,
     pub attachments: Vec<(trouve_protocol::Attachment, String)>,
     pub claim_prompt_id: Option<String>,
     pub expected_previous_turn: Option<u64>,
+    pub accepted_prompt: Option<AcceptedPrompt>,
     pub staging_cleanup_claim: Option<ArtifactCleanupClaim>,
 }
 
@@ -4299,7 +4348,20 @@ enum StoreMutation {
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         claim_prompt_id: Option<String>,
         expected_previous_turn: Option<u64>,
+        accepted_prompt: Option<AcceptedPrompt>,
         staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    },
+    AcceptClaimedPrompt {
+        thread_id: String,
+        prompt_id: String,
+        turn: u64,
+        message: String,
+    },
+    AcceptAndFinishQueuedPrompt {
+        thread_id: String,
+        prompt_id: String,
+        turn: u64,
+        message: String,
     },
     AppendCheckpoint {
         checkpoint: Box<CheckpointRow>,
@@ -4309,6 +4371,12 @@ enum StoreMutation {
         payload: String,
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    },
+    FinishQueuedPrompt {
+        id: String,
+    },
+    ReleaseQueuedPrompt {
+        id: String,
     },
 }
 
@@ -4692,6 +4760,14 @@ fn update_thread_row(
     let updated = conn.execute(
         "UPDATE threads
          SET mode = COALESCE(?2, mode),
+             route_provider_id = CASE
+                 WHEN ?3 IS NOT NULL AND ?3 <> model THEN NULL
+                 ELSE route_provider_id
+             END,
+             route_provider_model = CASE
+                 WHEN ?3 IS NOT NULL AND ?3 <> model THEN NULL
+                 ELSE route_provider_model
+             END,
              model = COALESCE(?3, model),
              model_options = COALESCE(?4, model_options),
              permission_mode = COALESCE(?5, permission_mode)
@@ -4973,6 +5049,7 @@ fn apply_store_mutation(
             attachments,
             claim_prompt_id,
             expected_previous_turn,
+            accepted_prompt,
             staging_cleanup_claim,
         } => {
             for (attachment, path) in attachments {
@@ -5024,6 +5101,29 @@ fn apply_store_mutation(
                 )?;
                 anyhow::ensure!(updated == 1, "turn changed while accepting message");
             }
+            if let Some(accepted) = accepted_prompt {
+                let marked = conn.execute(
+                    "UPDATE queued_prompts SET accepted_turn = ?3
+                     WHERE id = ?1 AND thread_id = ?2 AND claimed = 1
+                       AND accepted_turn IS NULL",
+                    params![accepted.id, prompt.thread_id, accepted.turn as i64],
+                )?;
+                anyhow::ensure!(
+                    marked == 1,
+                    "queued prompt {} changed while accepting turn {}",
+                    accepted.id,
+                    accepted.turn
+                );
+                conn.execute(
+                    "INSERT INTO messages (thread_id, seq, payload)
+                     VALUES (
+                         ?1,
+                         (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE thread_id = ?1),
+                         ?2
+                     )",
+                    params![prompt.thread_id, accepted.message],
+                )?;
+            }
             if let Some(claim) = staging_cleanup_claim {
                 let deleted = conn.execute(
                     "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
@@ -5035,6 +5135,58 @@ fn apply_store_mutation(
                     claim.id
                 );
             }
+        }
+        StoreMutation::AcceptClaimedPrompt {
+            thread_id,
+            prompt_id,
+            turn,
+            message,
+        } => {
+            let marked = conn.execute(
+                "UPDATE queued_prompts SET accepted_turn = ?3
+                 WHERE id = ?1 AND thread_id = ?2 AND claimed = 1
+                   AND accepted_turn IS NULL",
+                params![prompt_id, thread_id, *turn as i64],
+            )?;
+            anyhow::ensure!(
+                marked == 1,
+                "queued prompt {prompt_id} changed while accepting turn {turn}"
+            );
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, payload)
+                 VALUES (
+                     ?1,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE thread_id = ?1),
+                     ?2
+                 )",
+                params![thread_id, message],
+            )?;
+        }
+        StoreMutation::AcceptAndFinishQueuedPrompt {
+            thread_id,
+            prompt_id,
+            turn,
+            message,
+        } => {
+            let deleted = conn.execute(
+                "DELETE FROM queued_prompts
+                 WHERE id = ?1 AND thread_id = ?2 AND claimed = 1
+                   AND accepted_turn IS NULL",
+                params![prompt_id, thread_id],
+            )?;
+            anyhow::ensure!(
+                deleted == 1,
+                "queued prompt {prompt_id} changed while cancelling turn {turn}"
+            );
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, payload)
+                 VALUES (
+                     ?1,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE thread_id = ?1),
+                     ?2
+                 )",
+                params![thread_id, message],
+            )?;
         }
         StoreMutation::AppendCheckpoint { checkpoint } => {
             append_checkpoint_row(conn, checkpoint, timestamp)?;
@@ -5081,6 +5233,32 @@ fn apply_store_mutation(
                     claim.id
                 );
             }
+        }
+        StoreMutation::FinishQueuedPrompt { id } => {
+            conn.execute(
+                "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 1",
+                params![id],
+            )?;
+            let remains = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM queued_prompts WHERE id = ?1)",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            anyhow::ensure!(
+                !remains,
+                "queued prompt {id} is no longer claimed and cannot be consumed"
+            );
+        }
+        StoreMutation::ReleaseQueuedPrompt { id } => {
+            let released = conn.execute(
+                "UPDATE queued_prompts SET claimed = 0
+                 WHERE id = ?1 AND claimed = 1 AND accepted_turn IS NULL",
+                params![id],
+            )?;
+            anyhow::ensure!(
+                released == 1,
+                "queued prompt {id} is no longer claimed and cannot be released"
+            );
         }
     }
     Ok(StoreMutationOutcome::AppendEvent)
@@ -5567,6 +5745,22 @@ fn serialize_lifecycle_events(
     Ok(pending)
 }
 
+fn pending_events_require_isolation(events: &[PendingEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.mutation.as_ref(),
+            Some(
+                StoreMutation::CompleteSessionPrVerificationIntent { .. }
+                    | StoreMutation::AcceptPrompt { .. }
+                    | StoreMutation::AcceptClaimedPrompt { .. }
+                    | StoreMutation::AcceptAndFinishQueuedPrompt { .. }
+                    | StoreMutation::FinishQueuedPrompt { .. }
+                    | StoreMutation::ReleaseQueuedPrompt { .. }
+            )
+        )
+    })
+}
+
 /// Reserve SQLite's writer slot before a write transaction reads state.
 ///
 /// The event log uses a dedicated connection. A deferred transaction could
@@ -5577,6 +5771,50 @@ fn serialize_lifecycle_events(
 /// snapshot it can commit.
 fn write_transaction(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
     rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+}
+
+/// Close turns whose prompt acceptance committed before the process stopped.
+/// Their user message and shell are durable, so replay would duplicate intent.
+fn recover_accepted_prompts(conn: &Connection) -> Result<()> {
+    let accepted = {
+        let mut statement = conn.prepare(
+            "SELECT id, thread_id, accepted_turn
+             FROM queued_prompts
+             WHERE accepted_turn IS NOT NULL
+             ORDER BY thread_id, accepted_turn, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if accepted.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now();
+    let events = accepted
+        .into_iter()
+        .map(|(prompt_id, thread_id, turn)| {
+            let turn = u64::try_from(turn).context("accepted turn is negative")?;
+            let event = Event::TurnFailed {
+                turn,
+                error: "turn interrupted by server restart before completion".into(),
+            };
+            Ok(PendingEvent {
+                scope: Scope::Thread(thread_id),
+                ts: now,
+                payload: serde_json::to_string(&event)?,
+                event,
+                mutation: Some(StoreMutation::FinishQueuedPrompt { id: prompt_id }),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _ = insert_event_batch(conn, events.iter(), events.len(), std::iter::empty())?;
+    Ok(())
 }
 
 impl Store {
@@ -5591,11 +5829,12 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&mut conn)?;
-        // Claims belong to dispatcher tasks in this process. After a crash
-        // there is no worker to own them, so make the prompts visible and
-        // explicitly dispatchable again instead of losing them.
+        // Terminalize already-accepted prompts rather than replaying or
+        // silently discarding their in-flight lifecycle.
+        recover_accepted_prompts(&conn)?;
         conn.execute(
-            "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
+            "UPDATE queued_prompts SET claimed = 0
+             WHERE claimed != 0 AND accepted_turn IS NULL",
             [],
         )?;
         let writer_conn = Connection::open(path)
@@ -5612,8 +5851,10 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&mut conn)?;
+        recover_accepted_prompts(&conn)?;
         conn.execute(
-            "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
+            "UPDATE queued_prompts SET claimed = 0
+             WHERE claimed != 0 AND accepted_turn IS NULL",
             [],
         )?;
         Ok(Self::from_connections(conn, None))
@@ -5636,7 +5877,15 @@ impl Store {
             events_tx,
             scoped_events,
             append_tx,
+            #[cfg(test)]
+            fail_next_async_append: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_async_append(&self) {
+        self.fail_next_async_append
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     // --- event log --------------------------------------------------------
@@ -5654,6 +5903,123 @@ impl Store {
         Ok(envelopes.pop().expect("single append returns one event"))
     }
 
+    /// Persist a terminal event and consume its claimed prompt in one event-
+    /// writer transaction. A prompt already consumed by normal provider
+    /// startup is accepted idempotently; a still-visible prompt rejects and
+    /// rolls back the event so the two durable states cannot diverge.
+    pub(crate) fn append_event_finishing_queued_prompt(
+        &self,
+        scope: Scope,
+        event: Event,
+        prompt_id: &str,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(scope, event)],
+            StoreMutation::FinishQueuedPrompt {
+                id: prompt_id.to_string(),
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one terminal event returns one envelope"))
+    }
+
+    /// Async batch form used when cancellation must synthesize the accepted
+    /// turn shell as well as its terminal event.
+    pub(crate) async fn append_events_finishing_queued_prompt(
+        &self,
+        scope: Scope,
+        events: Vec<Event>,
+        prompt_id: &str,
+    ) -> Result<Vec<EventEnvelope>> {
+        let pending = serialize_lifecycle_events(
+            events
+                .into_iter()
+                .map(|event| (scope.clone(), event))
+                .collect(),
+            StoreMutation::FinishQueuedPrompt {
+                id: prompt_id.to_string(),
+            },
+        )?;
+        self.append_pending_events_async(pending).await
+    }
+
+    /// Commit a claimed prompt's shell, provider transcript entry, and
+    /// acceptance marker together. The marker is a crash-recovery tombstone:
+    /// startup consumes it instead of making the already-accepted prompt
+    /// dispatchable again.
+    pub(crate) async fn append_events_accepting_claimed_prompt(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        prompt_id: &str,
+        message: String,
+        events: Vec<Event>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let scope = Scope::Thread(thread_id.to_string());
+        let pending = serialize_lifecycle_events(
+            events
+                .into_iter()
+                .map(|event| (scope.clone(), event))
+                .collect(),
+            StoreMutation::AcceptClaimedPrompt {
+                thread_id: thread_id.to_string(),
+                prompt_id: prompt_id.to_string(),
+                turn,
+                message,
+            },
+        )?;
+        self.append_pending_events_async(pending).await
+    }
+
+    /// Cancellation may win before ordinary acceptance. Commit the
+    /// synthesized shell and transcript while consuming the claim so the
+    /// cancelled prompt is neither lost from history nor replayed.
+    pub(crate) async fn append_events_accepting_and_finishing_queued_prompt(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        prompt_id: &str,
+        message: String,
+        events: Vec<Event>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let scope = Scope::Thread(thread_id.to_string());
+        let pending = serialize_lifecycle_events(
+            events
+                .into_iter()
+                .map(|event| (scope.clone(), event))
+                .collect(),
+            StoreMutation::AcceptAndFinishQueuedPrompt {
+                thread_id: thread_id.to_string(),
+                prompt_id: prompt_id.to_string(),
+                turn,
+                message,
+            },
+        )?;
+        self.append_pending_events_async(pending).await
+    }
+
+    /// Persist a pre-acceptance failure and make its claimed prompt visible
+    /// again in the same transaction.
+    pub(crate) fn append_event_releasing_queued_prompt(
+        &self,
+        scope: Scope,
+        event: Event,
+        prompt_id: &str,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(scope, event)],
+            StoreMutation::ReleaseQueuedPrompt {
+                id: prompt_id.to_string(),
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one terminal event returns one envelope"))
+    }
+
     /// Persist a same-scope batch synchronously. Use this for cancellation
     /// guards whose lifecycle must not be split after enqueue by dropping an
     /// async future.
@@ -5665,12 +6031,13 @@ impl Store {
     }
 
     fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
+        let isolated = pending_events_require_isolation(&events);
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
                 events,
                 code_review_outbox_ids: Vec::new(),
-                isolated: false,
+                isolated,
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -5691,6 +6058,13 @@ impl Store {
     ) -> Result<Vec<EventEnvelope>> {
         if events.is_empty() {
             return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_async_append
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            anyhow::bail!("injected asynchronous event append failure");
         }
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.append_tx
@@ -5733,12 +6107,7 @@ impl Store {
         &self,
         events: Vec<PendingEvent>,
     ) -> Result<Vec<EventEnvelope>> {
-        let isolated = events.iter().any(|event| {
-            matches!(
-                event.mutation.as_ref(),
-                Some(StoreMutation::CompleteSessionPrVerificationIntent { .. })
-            )
-        });
+        let isolated = pending_events_require_isolation(&events);
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.append_tx
             .send(AppendRequest {
@@ -7096,6 +7465,55 @@ impl Store {
             .expect("one lifecycle event returns one envelope"))
     }
 
+    /// Last successful concrete route for this thread's automatic model.
+    /// Model changes clear the two columns in the same update statement.
+    pub fn thread_route_affinity(&self, id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT route_provider_id, route_provider_model FROM threads WHERE id = ?1",
+            params![id],
+            |row| {
+                let provider_id: Option<String> = row.get(0)?;
+                let provider_model: Option<String> = row.get(1)?;
+                Ok(provider_id.zip(provider_model))
+            },
+        )
+        .optional()
+        .map(|row| row.flatten())
+        .map_err(Into::into)
+    }
+
+    pub fn set_thread_route_affinity(
+        &self,
+        id: &str,
+        expected_model: &str,
+        provider_id: &str,
+        provider_model: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE threads
+             SET route_provider_id = ?3, route_provider_model = ?4
+             WHERE id = ?1 AND model = ?2",
+            params![id, expected_model, provider_id, provider_model],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub fn clear_thread_route_affinity_if_matches(
+        &self,
+        id: &str,
+        provider_id: &str,
+        provider_model: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE threads
+             SET route_provider_id = NULL, route_provider_model = NULL
+             WHERE id = ?1 AND route_provider_id = ?2 AND route_provider_model = ?3",
+            params![id, provider_id, provider_model],
+        )?;
+        Ok(updated == 1)
+    }
+
     /// Replace the current todo snapshot for exactly one thread.
     pub fn update_thread_todos(&self, id: &str, todos: &[trouve_protocol::TodoItem]) -> Result<()> {
         self.conn.lock().unwrap().execute(
@@ -7254,6 +7672,7 @@ impl Store {
             attachments,
             claim_prompt_id,
             expected_previous_turn,
+            accepted_prompt,
             staging_cleanup_claim,
         } = acceptance;
         let pending = serialize_lifecycle_events(
@@ -7264,6 +7683,7 @@ impl Store {
                 attachments,
                 claim_prompt_id,
                 expected_previous_turn,
+                accepted_prompt,
                 staging_cleanup_claim,
             },
         )?;
@@ -7667,7 +8087,8 @@ impl Store {
     pub fn release_queued_prompt(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE queued_prompts SET claimed = 0 WHERE id = ?1 AND claimed = 1",
+            "UPDATE queued_prompts SET claimed = 0
+             WHERE id = ?1 AND claimed = 1 AND accepted_turn IS NULL",
             params![id],
         )?;
         Ok(n > 0)
@@ -13675,6 +14096,37 @@ impl Store {
         Ok(out)
     }
 
+    /// Replace the final accepted user row only after its attachment paths
+    /// exist. The tombstone and expected payload fence later transcript work.
+    pub fn materialize_accepted_prompt_message(
+        &self,
+        thread_id: &str,
+        prompt_id: &str,
+        turn: u64,
+        expected: &str,
+        materialized: &str,
+    ) -> Result<()> {
+        let turn = i64::try_from(turn).context("accepted turn exceeds SQLite range")?;
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE messages SET payload = ?5
+             WHERE thread_id = ?1
+               AND seq = (SELECT MAX(seq) FROM messages WHERE thread_id = ?1)
+               AND payload = ?4
+               AND EXISTS(
+                   SELECT 1 FROM queued_prompts
+                   WHERE id = ?2 AND thread_id = ?1 AND claimed = 1
+                     AND accepted_turn = ?3
+               )",
+            params![thread_id, prompt_id, turn, expected, materialized],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "accepted prompt {prompt_id} transcript changed before attachment materialization"
+        );
+        Ok(())
+    }
+
     /// Atomically replace a thread's provider transcript (context compaction).
     pub fn replace_messages(&self, thread_id: &str, payloads: &[serde_json::Value]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -13728,18 +14180,63 @@ impl Store {
         backend_session_id: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO backend_sessions (thread_id, backend, backend_session_id)
-             VALUES (?1, ?2, ?3)
+        let tx = write_transaction(&conn)?;
+        tx.execute(
+            "INSERT INTO backend_sessions
+                 (thread_id, backend, backend_session_id, seen_messages)
+             VALUES (
+                 ?1, ?2, ?3,
+                 COALESCE(
+                     (SELECT seen_messages FROM backend_sessions
+                      WHERE thread_id = ?1 AND backend = ?2),
+                     (SELECT seen_messages FROM backend_sessions
+                      WHERE thread_id = ?1 AND backend = ''
+                        AND backend_session_id = ?3),
+                     0
+                 )
+             )
              ON CONFLICT(thread_id, backend)
                DO UPDATE SET backend_session_id = excluded.backend_session_id",
             params![thread_id, backend, backend_session_id],
         )?;
         // A properly keyed row supersedes any migrated legacy fallback.
-        conn.execute(
+        tx.execute(
             "DELETE FROM backend_sessions WHERE thread_id = ?1 AND backend = ''",
             params![thread_id],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist a newly reported vendor session together with the transcript
+    /// watermark that was submitted to that session. Writing both values in
+    /// one upsert prevents a restart from replaying already-consumed history.
+    pub fn set_backend_session_at_watermark(
+        &self,
+        thread_id: &str,
+        backend: &str,
+        backend_session_id: &str,
+        seen: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let seen = i64::try_from(seen).context("backend seen_messages exceeds SQLite range")?;
+        let tx = write_transaction(&conn)?;
+        tx.execute(
+            "INSERT INTO backend_sessions
+                 (thread_id, backend, backend_session_id, seen_messages)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(thread_id, backend)
+               DO UPDATE SET
+                 backend_session_id = excluded.backend_session_id,
+                 seen_messages = excluded.seen_messages",
+            params![thread_id, backend, backend_session_id, seen],
+        )?;
+        // A properly keyed row supersedes any migrated legacy fallback.
+        tx.execute(
+            "DELETE FROM backend_sessions WHERE thread_id = ?1 AND backend = ''",
+            params![thread_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -13754,6 +14251,171 @@ impl Store {
             "UPDATE backend_sessions SET seen_messages = ?3
              WHERE thread_id = ?1 AND backend = ?2",
             params![thread_id, backend, seen],
+        )?;
+        Ok(())
+    }
+
+    // --- provider route health -----------------------------------------------
+
+    /// Circuit-breaker snapshots keyed by concrete provider/model route.
+    pub fn route_health(&self) -> Result<HashMap<(String, String), RouteHealthRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT provider_id, provider_model, consecutive_failures,
+                    retry_after, last_success_at, last_failure_at,
+                    last_outcome_started_at
+             FROM route_health",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let provider_id: String = row.get(0)?;
+            let provider_model: String = row.get(1)?;
+            Ok(RouteHealthRow {
+                provider_id: provider_id.clone(),
+                provider_model: provider_model.clone(),
+                consecutive_failures: row.get::<_, i64>(2)?.max(0) as u32,
+                retry_after: row.get(3)?,
+                last_success_at: row.get(4)?,
+                last_failure_at: row.get(5)?,
+                last_outcome_order: row.get(6)?,
+            })
+        })?;
+        let mut health = HashMap::new();
+        for row in rows {
+            let row = row?;
+            health.insert((row.provider_id.clone(), row.provider_model.clone()), row);
+        }
+        Ok(health)
+    }
+
+    /// Open or extend a route's cooldown with capped exponential backoff.
+    /// Returns the current row so callers can include the retry horizon in
+    /// diagnostics without querying again, including when this outcome was
+    /// older than one already recorded.
+    pub fn record_route_failure(
+        &self,
+        provider_id: &str,
+        provider_model: &str,
+        attempt_order: i64,
+        base_cooldown_secs: i64,
+        max_cooldown_secs: i64,
+    ) -> Result<RouteHealthRow> {
+        let conn = self.conn.lock().unwrap();
+        let previous = conn
+            .query_row(
+                "SELECT consecutive_failures, retry_after, last_success_at,
+                        last_failure_at, last_outcome_started_at
+                 FROM route_health
+                 WHERE provider_id = ?1 AND provider_model = ?2",
+                params![provider_id, provider_model],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if previous
+            .as_ref()
+            .and_then(|(_, _, _, _, order)| *order)
+            .is_some_and(|order| order >= attempt_order)
+        {
+            let (failures, retry_after, last_success_at, last_failure_at, last_outcome) =
+                previous.unwrap();
+            return Ok(RouteHealthRow {
+                provider_id: provider_id.into(),
+                provider_model: provider_model.into(),
+                consecutive_failures: failures.max(0) as u32,
+                retry_after,
+                last_success_at,
+                last_failure_at,
+                last_outcome_order: last_outcome,
+            });
+        }
+        let consecutive_failures = previous
+            .as_ref()
+            .map(|(failures, _, _, _, _)| failures.saturating_add(1))
+            .unwrap_or(1)
+            .max(1);
+        let exponent = u32::try_from(consecutive_failures.saturating_sub(1).min(20)).unwrap_or(20);
+        let multiplier = 1i64.checked_shl(exponent).unwrap_or(i64::MAX);
+        let cooldown = base_cooldown_secs
+            .max(1)
+            .saturating_mul(multiplier)
+            .min(max_cooldown_secs.max(1));
+        let retry_after = chrono::Utc::now().timestamp().saturating_add(cooldown);
+        let last_failure_at = chrono::Utc::now().timestamp_micros();
+        conn.execute(
+            "INSERT INTO route_health
+                 (provider_id, provider_model, consecutive_failures, retry_after,
+                  last_success_at, last_failure_at, last_outcome_started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(provider_id, provider_model) DO UPDATE SET
+                 consecutive_failures = excluded.consecutive_failures,
+                 retry_after = excluded.retry_after,
+                 last_failure_at = excluded.last_failure_at,
+                 last_outcome_started_at = excluded.last_outcome_started_at",
+            params![
+                provider_id,
+                provider_model,
+                consecutive_failures,
+                retry_after,
+                previous.as_ref().and_then(|(_, _, success, _, _)| *success),
+                last_failure_at,
+                attempt_order,
+            ],
+        )?;
+        Ok(RouteHealthRow {
+            provider_id: provider_id.into(),
+            provider_model: provider_model.into(),
+            consecutive_failures: consecutive_failures as u32,
+            retry_after: Some(retry_after),
+            last_success_at: previous.and_then(|(_, _, success, _, _)| success),
+            last_failure_at: Some(last_failure_at),
+            last_outcome_order: Some(attempt_order),
+        })
+    }
+
+    /// Close a route's circuit and remember it as a proven-good choice, but
+    /// only when no newer attempt has failed in the meantime.
+    pub fn record_route_success(
+        &self,
+        provider_id: &str,
+        provider_model: &str,
+        attempt_order: i64,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO route_health
+                 (provider_id, provider_model, consecutive_failures, retry_after,
+                  last_success_at, last_failure_at, last_outcome_started_at)
+             VALUES (?1, ?2, 0, NULL, ?3, NULL, ?4)
+             ON CONFLICT(provider_id, provider_model) DO UPDATE SET
+                 consecutive_failures = 0,
+                 retry_after = NULL,
+                 last_success_at = excluded.last_success_at,
+                 last_failure_at = NULL,
+                 last_outcome_started_at = excluded.last_outcome_started_at
+             WHERE route_health.last_outcome_started_at IS NULL
+                OR route_health.last_outcome_started_at < ?4",
+            params![
+                provider_id,
+                provider_model,
+                chrono::Utc::now().timestamp(),
+                attempt_order,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Configuration changes invalidate failures learned under the previous
+    /// credentials or endpoint.
+    pub fn clear_route_health(&self, provider_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM route_health WHERE provider_id = ?1",
+            params![provider_id],
         )?;
         Ok(())
     }
@@ -16927,15 +17589,27 @@ mod tests {
         seed_thread(&store, "th_bs");
 
         store
-            .set_backend_session("th_bs", "cursor", "cursor-sess")
+            .set_backend_session_at_watermark("th_bs", "cursor", "cursor-sess", 3)
             .unwrap();
         store
             .set_backend_session("th_bs", "claude", "claude-sess")
             .unwrap();
+        assert_eq!(
+            store.backend_session("th_bs", "cursor").unwrap(),
+            Some(("cursor-sess".into(), 3))
+        );
         store.mark_backend_seen("th_bs", "cursor", 4).unwrap();
         assert_eq!(
             store.backend_session("th_bs", "cursor").unwrap(),
             Some(("cursor-sess".into(), 4))
+        );
+        store
+            .set_backend_session("th_bs", "cursor", "cursor-sess-rotated")
+            .unwrap();
+        assert_eq!(
+            store.backend_session("th_bs", "cursor").unwrap(),
+            Some(("cursor-sess-rotated".into(), 4)),
+            "updating only the vendor session id must preserve its transcript watermark"
         );
         assert_eq!(
             store.backend_session("th_bs", "claude").unwrap(),
@@ -16973,6 +17647,205 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keyed_backend_session_preserves_matching_legacy_watermark() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_legacy_watermark");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO backend_sessions
+                    (thread_id, backend, backend_session_id, seen_messages)
+                 VALUES ('th_legacy_watermark', '', 'legacy-sess', 7)",
+                [],
+            )
+            .unwrap();
+
+        store
+            .set_backend_session("th_legacy_watermark", "cursor", "legacy-sess")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .backend_session("th_legacy_watermark", "cursor")
+                .unwrap(),
+            Some(("legacy-sess".into(), 7))
+        );
+        assert_eq!(
+            store
+                .backend_session("th_legacy_watermark", "claude")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn route_health_persists_backoff_success_and_config_reset() {
+        let store = Store::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let first_attempt = chrono::Utc::now().timestamp_micros();
+        let first = store
+            .record_route_failure("provider", "model", first_attempt, 10, 25)
+            .unwrap();
+        assert_eq!(first.consecutive_failures, 1);
+        assert!(first.retry_after.unwrap() >= now + 10);
+
+        let second = store
+            .record_route_failure("provider", "model", first_attempt.saturating_add(1), 10, 25)
+            .unwrap();
+        assert_eq!(second.consecutive_failures, 2);
+        assert!(second.retry_after.unwrap() >= now + 20);
+
+        let third = store
+            .record_route_failure("provider", "model", first_attempt.saturating_add(2), 10, 25)
+            .unwrap();
+        assert_eq!(third.consecutive_failures, 3);
+        let third_retry_after = third.retry_after.unwrap();
+        assert!(third_retry_after >= now + 25);
+        assert!(third_retry_after <= chrono::Utc::now().timestamp() + 25);
+
+        let successful_attempt = first_attempt.saturating_add(3);
+        store
+            .record_route_success("provider", "model", successful_attempt)
+            .unwrap();
+        let health = store.route_health().unwrap();
+        let route = &health[&("provider".to_string(), "model".to_string())];
+        assert_eq!(route.consecutive_failures, 0);
+        assert_eq!(route.retry_after, None);
+        assert!(route.last_success_at.is_some());
+        assert_eq!(route.last_failure_at, None);
+
+        store.clear_route_health("provider").unwrap();
+        assert!(store.route_health().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrations_upgrade_legacy_route_health_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE route_health (
+               provider_id TEXT NOT NULL,
+               provider_model TEXT NOT NULL,
+               consecutive_failures INTEGER NOT NULL DEFAULT 0,
+               retry_after INTEGER,
+               last_success_at INTEGER,
+               PRIMARY KEY (provider_id, provider_model)
+             );",
+        )
+        .unwrap();
+
+        conn.execute_batch(SCHEMA).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let ordering_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('route_health')
+                 WHERE name IN ('last_failure_at', 'last_outcome_started_at')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ordering_columns, 2);
+    }
+
+    #[test]
+    fn older_route_success_cannot_erase_a_newer_failure() {
+        let store = Store::open_in_memory().unwrap();
+        let attempt_order = chrono::Utc::now().timestamp_micros();
+        let failure = store
+            .record_route_failure("provider", "model", attempt_order.saturating_add(1), 10, 25)
+            .unwrap();
+
+        store
+            .record_route_success("provider", "model", attempt_order)
+            .unwrap();
+        let route = &store.route_health().unwrap()[&("provider".to_string(), "model".to_string())];
+        assert_eq!(route.consecutive_failures, 1);
+        assert_eq!(route.last_failure_at, failure.last_failure_at);
+
+        store
+            .record_route_success("provider", "model", attempt_order.saturating_add(2))
+            .unwrap();
+        let route = &store.route_health().unwrap()[&("provider".to_string(), "model".to_string())];
+        assert_eq!(route.consecutive_failures, 0);
+        assert_eq!(route.last_failure_at, None);
+    }
+
+    #[test]
+    fn older_route_failure_cannot_overwrite_a_newer_success() {
+        let store = Store::open_in_memory().unwrap();
+        let older_attempt = chrono::Utc::now().timestamp_micros();
+        let newer_attempt = older_attempt.saturating_add(1);
+        store
+            .record_route_success("provider", "model", newer_attempt)
+            .unwrap();
+
+        let route = store
+            .record_route_failure("provider", "model", older_attempt, 10, 25)
+            .unwrap();
+        assert_eq!(route.consecutive_failures, 0);
+        assert_eq!(route.retry_after, None);
+        assert!(route.last_success_at.is_some());
+        assert_eq!(route.last_failure_at, None);
+        assert_eq!(route.last_outcome_order, Some(newer_attempt));
+    }
+
+    #[test]
+    fn thread_route_affinity_persists_until_the_model_changes() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_affinity");
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+
+        assert!(
+            store
+                .set_thread_route_affinity("th_affinity", "p/m", "codex", "gpt-5.6-sol",)
+                .unwrap()
+        );
+        assert_eq!(
+            store.thread_route_affinity("th_affinity").unwrap(),
+            Some(("codex".into(), "gpt-5.6-sol".into()))
+        );
+
+        store
+            .update_thread("th_affinity", Some("plan"), None, None, None)
+            .unwrap();
+        assert!(
+            store
+                .thread_route_affinity("th_affinity")
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .update_thread("th_affinity", None, Some("p/m"), None, None)
+            .unwrap();
+        assert!(
+            store
+                .thread_route_affinity("th_affinity")
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .update_thread(
+                "th_affinity",
+                None,
+                Some("auto/claude-sonnet-4-5"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+        assert!(
+            !store
+                .set_thread_route_affinity("th_affinity", "p/m", "codex", "gpt-5.6-sol",)
+                .unwrap()
+        );
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+    }
+
     /// Opening a database created before backend_sessions was keyed by
     /// (thread, backend) rebuilds the table and keeps the rows.
     #[test]
@@ -16997,6 +17870,69 @@ mod tests {
             store.backend_session("th_old", "anything").unwrap(),
             Some(("vendor-legacy".into(), 0))
         );
+    }
+
+    #[test]
+    fn thread_route_affinity_migrates_legacy_schema_repeat_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy-affinity.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (
+                   id TEXT PRIMARY KEY,
+                   name TEXT NOT NULL,
+                   path TEXT NOT NULL UNIQUE,
+                   closed INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                   title TEXT NOT NULL,
+                   branch TEXT NOT NULL,
+                   worktree_path TEXT NOT NULL,
+                   base_ref TEXT NOT NULL,
+                   undo_pos INTEGER,
+                   archived INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE threads (
+                   id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL REFERENCES sessions(id),
+                   title TEXT,
+                   mode TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   permission_mode TEXT NOT NULL,
+                   model_options TEXT NOT NULL DEFAULT '{}',
+                   todos TEXT NOT NULL DEFAULT '[]',
+                   last_turn INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 INSERT INTO workspaces (id, name, path, created_at)
+                 VALUES ('ws_old', 'Legacy', '/tmp/legacy-affinity', '2026-01-01T00:00:00Z');
+                 INSERT INTO sessions
+                   (id, workspace_id, title, branch, worktree_path, base_ref, created_at)
+                 VALUES
+                   ('se_old', 'ws_old', 'Legacy', 'legacy', '/tmp/legacy-affinity-wt', 'main', '2026-01-01T00:00:00Z');
+                 INSERT INTO threads
+                   (id, session_id, mode, model, permission_mode, created_at)
+                 VALUES ('th_old', 'se_old', 'code', 'auto/shared', 'ask', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            store
+                .set_thread_route_affinity("th_old", "auto/shared", "codex", "shared")
+                .unwrap();
+            assert_eq!(
+                store.thread_route_affinity("th_old").unwrap(),
+                Some(("codex".into(), "shared".into()))
+            );
+            drop(store);
+        }
     }
 
     /// Workspace + session + thread rows so FK-checked inserts succeed.
@@ -17160,6 +18096,407 @@ mod tests {
     }
 
     #[test]
+    fn terminal_event_and_claimed_prompt_finish_commit_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_terminal_prompt");
+        let prompt = store
+            .enqueue_prompt("th_terminal_prompt", "fail once", &[])
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_queued_prompt("th_terminal_prompt")
+                .unwrap()
+                .unwrap()
+                .id,
+            prompt.id
+        );
+
+        store
+            .append_event_finishing_queued_prompt(
+                Scope::Thread("th_terminal_prompt".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "provider unavailable".into(),
+                },
+                &prompt.id,
+            )
+            .unwrap();
+
+        assert!(store.queued_prompt_thread(&prompt.id).unwrap().is_none());
+        let events = store
+            .events_after(&Scope::Thread("th_terminal_prompt".into()), 0)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].event, Event::TurnFailed { turn: 1, .. }));
+    }
+
+    #[tokio::test]
+    async fn accepting_claimed_prompt_commits_marker_transcript_and_events() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_direct_accept");
+        let prompt = store
+            .enqueue_prompt("th_direct_accept", "accepted", &[])
+            .unwrap();
+        store
+            .claim_queued_prompt("th_direct_accept")
+            .unwrap()
+            .unwrap();
+        let message =
+            serde_json::to_string(&trouve_providers::Message::User(prompt.content.clone()))
+                .unwrap();
+
+        store
+            .append_events_accepting_claimed_prompt(
+                "th_direct_accept",
+                3,
+                &prompt.id,
+                message.clone(),
+                vec![Event::TurnStarted {
+                    turn: 3,
+                    mode: "code".into(),
+                    model: "provider/model".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let accepted_turn = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT accepted_turn FROM queued_prompts WHERE id = ?1",
+                params![prompt.id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap();
+        assert_eq!(accepted_turn, Some(3));
+        assert!(store.queued_prompts("th_direct_accept").unwrap().is_empty());
+        let materialized = serde_json::to_string(&trouve_providers::Message::User(
+            "accepted\n\n.trouve/attachments/at_1.txt".into(),
+        ))
+        .unwrap();
+        store
+            .materialize_accepted_prompt_message(
+                "th_direct_accept",
+                &prompt.id,
+                3,
+                &message,
+                &materialized,
+            )
+            .unwrap();
+        assert_eq!(
+            store.messages("th_direct_accept").unwrap(),
+            [serde_json::from_str::<serde_json::Value>(&materialized).unwrap()]
+        );
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread("th_direct_accept".into()), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_claimed_prompt_rolls_back_when_unclaimed_or_already_accepted() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_direct_accept_rollback");
+        let unclaimed = store
+            .enqueue_prompt("th_direct_accept_rollback", "unclaimed", &[])
+            .unwrap();
+        let event = Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "provider/model".into(),
+            thinking_level: None,
+            supports_steering: false,
+        };
+        let message =
+            serde_json::to_string(&trouve_providers::Message::User(unclaimed.content.clone()))
+                .unwrap();
+        assert!(
+            store
+                .append_events_accepting_claimed_prompt(
+                    "th_direct_accept_rollback",
+                    1,
+                    &unclaimed.id,
+                    message.clone(),
+                    vec![event.clone()],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.queued_prompts("th_direct_accept_rollback").unwrap(),
+            std::slice::from_ref(&unclaimed)
+        );
+        assert!(
+            store
+                .messages("th_direct_accept_rollback")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .events_after(&Scope::Thread("th_direct_accept_rollback".into()), 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .claim_queued_prompt("th_direct_accept_rollback")
+            .unwrap()
+            .unwrap();
+        store
+            .append_events_accepting_claimed_prompt(
+                "th_direct_accept_rollback",
+                1,
+                &unclaimed.id,
+                message.clone(),
+                vec![event.clone()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .append_events_accepting_claimed_prompt(
+                    "th_direct_accept_rollback",
+                    1,
+                    &unclaimed.id,
+                    message,
+                    vec![event],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.messages("th_direct_accept_rollback").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread("th_direct_accept_rollback".into()), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_and_finishing_claimed_prompt_commits_once() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_direct_cancel");
+        let prompt = store
+            .enqueue_prompt("th_direct_cancel", "cancelled", &[])
+            .unwrap();
+        store
+            .claim_queued_prompt("th_direct_cancel")
+            .unwrap()
+            .unwrap();
+        let message =
+            serde_json::to_string(&trouve_providers::Message::User(prompt.content.clone()))
+                .unwrap();
+
+        store
+            .append_events_accepting_and_finishing_queued_prompt(
+                "th_direct_cancel",
+                4,
+                &prompt.id,
+                message,
+                vec![Event::TurnCancelled { turn: 4 }],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.queued_prompt_thread(&prompt.id).unwrap().is_none());
+        assert_eq!(store.messages("th_direct_cancel").unwrap().len(), 1);
+        assert!(matches!(
+            store
+                .events_after(&Scope::Thread("th_direct_cancel".into()), 0)
+                .unwrap()
+                .as_slice(),
+            [EventEnvelope {
+                event: Event::TurnCancelled { turn: 4 },
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepting_and_finishing_rolls_back_for_invalid_claim_state() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_direct_cancel_rollback");
+        let prompt = store
+            .enqueue_prompt("th_direct_cancel_rollback", "cancelled", &[])
+            .unwrap();
+        let message =
+            serde_json::to_string(&trouve_providers::Message::User(prompt.content.clone()))
+                .unwrap();
+        assert!(
+            store
+                .append_events_accepting_and_finishing_queued_prompt(
+                    "th_direct_cancel_rollback",
+                    5,
+                    &prompt.id,
+                    message.clone(),
+                    vec![Event::TurnCancelled { turn: 5 }],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.queued_prompts("th_direct_cancel_rollback").unwrap(),
+            std::slice::from_ref(&prompt)
+        );
+        assert!(
+            store
+                .messages("th_direct_cancel_rollback")
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .claim_queued_prompt("th_direct_cancel_rollback")
+            .unwrap()
+            .unwrap();
+        store
+            .append_events_accepting_claimed_prompt(
+                "th_direct_cancel_rollback",
+                5,
+                &prompt.id,
+                message.clone(),
+                vec![Event::TurnStarted {
+                    turn: 5,
+                    mode: "code".into(),
+                    model: "provider/model".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .append_events_accepting_and_finishing_queued_prompt(
+                    "th_direct_cancel_rollback",
+                    5,
+                    &prompt.id,
+                    message,
+                    vec![Event::TurnCancelled { turn: 5 }],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.messages("th_direct_cancel_rollback").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread("th_direct_cancel_rollback".into()), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_event_and_prompt_release_commit_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_terminal_release");
+        let prompt = store
+            .enqueue_prompt("th_terminal_release", "retry later", &[])
+            .unwrap();
+        store
+            .claim_queued_prompt("th_terminal_release")
+            .unwrap()
+            .unwrap();
+
+        store
+            .append_event_releasing_queued_prompt(
+                Scope::Thread("th_terminal_release".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "setup failed".into(),
+                },
+                &prompt.id,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.queued_prompts("th_terminal_release").unwrap(),
+            [prompt]
+        );
+        let events = store
+            .events_after(&Scope::Thread("th_terminal_release".into()), 0)
+            .unwrap();
+        assert!(matches!(events[0].event, Event::TurnFailed { turn: 1, .. }));
+    }
+
+    #[test]
+    fn terminal_event_can_finish_an_already_consumed_prompt() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_terminal_consumed");
+        let prompt = store
+            .enqueue_prompt("th_terminal_consumed", "already started", &[])
+            .unwrap();
+        store
+            .claim_queued_prompt("th_terminal_consumed")
+            .unwrap()
+            .unwrap();
+        assert!(store.finish_queued_prompt(&prompt.id).unwrap());
+
+        store
+            .append_event_finishing_queued_prompt(
+                Scope::Thread("th_terminal_consumed".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "provider failed".into(),
+                },
+                &prompt.id,
+            )
+            .unwrap();
+
+        let events = store
+            .events_after(&Scope::Thread("th_terminal_consumed".into()), 0)
+            .unwrap();
+        assert!(matches!(events[0].event, Event::TurnFailed { turn: 1, .. }));
+    }
+
+    #[test]
+    fn terminal_event_rolls_back_when_prompt_is_no_longer_claimed() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_terminal_rollback");
+        let prompt = store
+            .enqueue_prompt("th_terminal_rollback", "still visible", &[])
+            .unwrap();
+
+        let result = store.append_event_finishing_queued_prompt(
+            Scope::Thread("th_terminal_rollback".into()),
+            Event::TurnFailed {
+                turn: 1,
+                error: "provider unavailable".into(),
+            },
+            &prompt.id,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            store.queued_prompts("th_terminal_rollback").unwrap(),
+            [prompt]
+        );
+        assert!(
+            store
+                .events_after(&Scope::Thread("th_terminal_rollback".into()), 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn prompt_acceptance_commits_queue_turn_attachments_and_events_atomically() {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_accept");
@@ -17212,6 +18549,14 @@ mod tests {
                     attachments: vec![(attachment.clone(), "/tmp/at_accept.png".into())],
                     claim_prompt_id: Some(prompt.id.clone()),
                     expected_previous_turn: Some(0),
+                    accepted_prompt: Some(AcceptedPrompt {
+                        id: prompt.id.clone(),
+                        turn: 1,
+                        message: serde_json::to_string(&trouve_providers::Message::User(
+                            prompt.content.clone(),
+                        ))
+                        .unwrap(),
+                    }),
                     staging_cleanup_claim: None,
                 },
                 events,
@@ -17221,6 +18566,7 @@ mod tests {
         assert_eq!(store.last_turn("th_accept").unwrap(), 1);
         assert!(store.queued_prompts("th_accept").unwrap().is_empty());
         assert!(!store.queued_prompt_tools_enabled(&prompt.id).unwrap());
+        assert_eq!(store.messages("th_accept").unwrap().len(), 1);
         assert_eq!(
             store.attachment(&attachment.id).unwrap().unwrap().0,
             attachment
@@ -17267,6 +18613,7 @@ mod tests {
                 attachments: vec![(attachment.clone(), "/tmp/at_accept_rollback.txt".into())],
                 claim_prompt_id: Some("qp_accept_rollback".into()),
                 expected_previous_turn: Some(99),
+                accepted_prompt: None,
                 staging_cleanup_claim: None,
             },
             vec![(
@@ -17292,6 +18639,72 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reopening_terminalizes_accepted_prompt_without_replaying_user_message() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("accepted-prompt-recovery.sqlite3");
+        {
+            let store = Store::open(&database).unwrap();
+            seed_thread(&store, "th_accept_reopen");
+            let prompt = trouve_protocol::QueuedPrompt {
+                id: "qp_accept_reopen".into(),
+                thread_id: "th_accept_reopen".into(),
+                position: 1,
+                content: "accepted exactly once".into(),
+                attachments: Vec::new(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            store
+                .accept_prompt_with_events(
+                    PromptAcceptance {
+                        prompt: prompt.clone(),
+                        tools_enabled: true,
+                        attachments: Vec::new(),
+                        claim_prompt_id: Some(prompt.id.clone()),
+                        expected_previous_turn: Some(0),
+                        accepted_prompt: Some(AcceptedPrompt {
+                            id: prompt.id,
+                            turn: 1,
+                            message: serde_json::to_string(&trouve_providers::Message::User(
+                                prompt.content,
+                            ))
+                            .unwrap(),
+                        }),
+                        staging_cleanup_claim: None,
+                    },
+                    vec![(
+                        Scope::Thread("th_accept_reopen".into()),
+                        Event::TurnStarted {
+                            turn: 1,
+                            mode: "code".into(),
+                            model: "auto/shared".into(),
+                            thinking_level: None,
+                            supports_steering: false,
+                        },
+                    )],
+                )
+                .unwrap();
+        }
+
+        let reopened = Store::open(&database).unwrap();
+        assert!(
+            reopened
+                .queued_prompts("th_accept_reopen")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reopened.messages("th_accept_reopen").unwrap().len(), 1);
+        assert_eq!(reopened.last_turn("th_accept_reopen").unwrap(), 1);
+        let events = reopened
+            .events_after(&Scope::Thread("th_accept_reopen".into()), 0)
+            .unwrap();
+        assert!(matches!(
+            events.last().map(|event| &event.event),
+            Some(Event::TurnFailed { turn: 1, error })
+                if error == "turn interrupted by server restart before completion"
+        ));
     }
 
     #[test]

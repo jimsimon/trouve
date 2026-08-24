@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.15"
+    "version": "7.17"
   },
   "paths": {
     "/v1/approvals": {
@@ -1448,6 +1448,47 @@
         }
       }
     },
+    "/v1/config/provider-order": {
+      "put": {
+        "tags": [],
+        "operationId": "set_provider_order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProviderOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/github/prs/refresh": {
       "post": {
         "tags": [],
@@ -2083,6 +2124,27 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/McpLogs"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model-routes": {
+      "get": {
+        "tags": [],
+        "operationId": "list_model_routes",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RoutedModelInfo"
+                  }
                 }
               }
             }
@@ -7301,7 +7363,7 @@
               "string",
               "null"
             ],
-            "description": "Provider/model identifier, e.g. \"openai/gpt-4.1\"."
+            "description": "Model id from `/v1/model-routes`. `auto/<model>` selects dynamically;\n`provider/<model>` explicitly pins the thread to that route. Bare\nneutral ids remain accepted for compatibility."
           },
           "model_options": {
             "type": "object",
@@ -8804,7 +8866,7 @@
           },
           {
             "type": "object",
-            "description": "The server's internet reachability changed (it is the one talking to\nmodel vendors, so it owns this state). While offline, `/v1/models`\nlists only models that can run without internet (local provider,\nloopback endpoints); clients gate prompt entry on having usable\nmodels and announce recovery. `ServerInfo.online` carries the same\nstate for initial fetches.",
+            "description": "The server's internet reachability changed (it is the one talking to\nmodel vendors, so it owns this state). While offline, `/v1/models`\nlists only models that can run without internet (the managed `local`\nprovider and user-configured local endpoints); clients gate prompt\nentry on having usable models and announce recovery.\n`ServerInfo.online` carries the same\nstate for initial fetches.",
             "required": [
               "online",
               "type"
@@ -8855,6 +8917,43 @@
                 "type": "string",
                 "enum": [
                   "settings.code_review_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The concrete provider route selected for an automatic model. Another\nevent for the same turn records a safe failover to a different route.\nNew event variants are appended so generated validators retain stable\nidentifiers for the existing closed union.",
+            "required": [
+              "turn",
+              "model",
+              "provider_id",
+              "provider_model",
+              "reason",
+              "type"
+            ],
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "provider_id": {
+                "type": "string"
+              },
+              "provider_model": {
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/ModelRouteReason"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "model.route_selected"
                 ]
               }
             }
@@ -9679,6 +9778,31 @@
             "type": "boolean"
           }
         }
+      },
+      "ModelRouteInfo": {
+        "type": "object",
+        "description": "One concrete provider route for an automatic or pinned model selection.\n`provider_model` is the provider's own model id, without trouve's\nprovider prefix, and is the value passed to that provider at execution.",
+        "required": [
+          "provider_id",
+          "provider_model"
+        ],
+        "properties": {
+          "provider_id": {
+            "type": "string"
+          },
+          "provider_model": {
+            "type": "string"
+          }
+        }
+      },
+      "ModelRouteReason": {
+        "type": "string",
+        "description": "Why an automatic model selected a concrete provider route.",
+        "enum": [
+          "initial",
+          "capacity_failover",
+          "route_failover"
+        ]
       },
       "OpenTerminalRequest": {
         "type": "object",
@@ -11431,7 +11555,7 @@
         "properties": {
           "default_model": {
             "type": "string",
-            "description": "Default model for new threads, e.g. \"openai/gpt-4.1-mini\"."
+            "description": "Default model for new threads. `auto/<model>` selects dynamically and\n`provider/<model>` pins one route. Bare neutral values remain accepted."
           },
           "default_permission_mode": {
             "$ref": "#/components/schemas/PermissionMode",
@@ -11443,6 +11567,13 @@
               "null"
             ],
             "description": "Global thinking level for new threads. None leaves the selected\nmodel at its own default."
+          },
+          "provider_order": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Provider ids in preferred routing order. Every currently configured\nprovider is present; providers not explicitly ordered on the server\nare appended deterministically."
           },
           "providers": {
             "type": "array",
@@ -11747,6 +11878,60 @@
           "append",
           "replace"
         ]
+      },
+      "RoutedModelInfo": {
+        "type": "object",
+        "description": "A model-picker entry. Automatic entries contain every compatible route;\nconcrete provider entries contain exactly one. [`ModelInfo`] remains the\nprovider-qualified compatibility catalog.",
+        "required": [
+          "id",
+          "display_name",
+          "context_window",
+          "supports_tools",
+          "options_schema",
+          "routes"
+        ],
+        "properties": {
+          "context_window": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Smallest context window across the available routes, so clients never\nadvertise a limit that the selected provider cannot honor.",
+            "minimum": 0
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "`auto/<model>` for dynamic routing, or `provider/<model>` for a hard\npin. Models without a safe shared identity have only concrete entries."
+          },
+          "input_price_per_mtok": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Prices are present only when every route reports the same value."
+          },
+          "options_schema": {
+            "description": "Provider-neutral options schema. Provider-specific option names are\ntranslated after the harness selects a route."
+          },
+          "output_price_per_mtok": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRouteInfo"
+            }
+          },
+          "supports_tools": {
+            "type": "boolean"
+          }
+        }
       },
       "Scope": {
         "oneOf": [
@@ -12166,7 +12351,7 @@
           },
           "model": {
             "type": "string",
-            "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+            "description": "`auto/<model>` id, or a provider-qualified id to pin a route."
           }
         }
       },
@@ -12261,6 +12446,31 @@
               "null"
             ],
             "description": "Required for workspace scope: whose `.agents/.mcp.json` to edit."
+          }
+        }
+      },
+      "SetProviderOrderRequest": {
+        "type": "object",
+        "description": "Replace the global preference prefix used for provider-neutral routing.\nOmitted configured providers remain eligible after the listed providers.",
+        "required": [
+          "provider_ids"
+        ],
+        "properties": {
+          "expected_provider_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Full resolved order observed before this edit. When present, the\nserver rejects the write if another client or provider mutation has\nchanged that order in the meantime."
+          },
+          "provider_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -13603,7 +13813,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "`auto/<model>` selects dynamically; `provider/<model>` is a hard pin.\nChanging this value clears the thread's automatic route affinity."
           },
           "model_options": {
             "type": [

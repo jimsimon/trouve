@@ -41,16 +41,16 @@ use trouve_protocol::{
     PROTOCOL_VERSION, PersonaInfo, PrActionRequest, PrDetail, PrDetailSection, PrFileDiff, PrInfo,
     ProviderInfo, ProvidersResponse, QueuedPrompt, RefreshGithubPrsQuery, RegisterWorkspaceRequest,
     ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
-    SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
-    SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest, SetLocalEnabledRequest,
-    SetMcpServerEnabledRequest, SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus,
-    ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertPersonaRequest,
-    UpsertProviderRequest, UsageSummary, Workspace,
+    ReviewerProfile, RoutedModelInfo, Scope, SendMessageRequest, ServerInfo, ServerProjection,
+    Session, SessionDiff, SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff,
+    SessionSummariesSnapshot, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
+    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest,
+    SetLocalEnabledRequest, SetMcpServerEnabledRequest, SetProviderOrderRequest, SteerAccepted,
+    SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalReplayStart,
+    TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails, ThreadViewQuery,
+    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertPersonaRequest, UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -143,6 +143,7 @@ impl IntoResponse for ApiError {
         resolve_approval,
         resolve_question,
         list_models,
+        list_model_routes,
         refresh_models,
         list_personas,
         list_persona_infos,
@@ -152,6 +153,7 @@ impl IntoResponse for ApiError {
         known_providers,
         upsert_provider,
         delete_provider,
+        set_provider_order,
         start_login,
         complete_login,
         login_status,
@@ -271,6 +273,8 @@ impl IntoResponse for ApiError {
         trouve_protocol::QuestionAnswer,
         trouve_protocol::CommandInfo,
         ModelInfo,
+        trouve_protocol::ModelRouteInfo,
+        RoutedModelInfo,
         ProviderInfo,
         ProvidersResponse,
         KnownProvider,
@@ -291,6 +295,7 @@ impl IntoResponse for ApiError {
         SetDefaultPermissionModeRequest,
         CodeReviewSettings,
         SetCodeReviewSettingsRequest,
+        SetProviderOrderRequest,
         trouve_protocol::TitleModelLoadBehavior,
         trouve_protocol::TitleModelStatus,
         GitWorktreeSettings,
@@ -613,6 +618,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/mcp-servers/{name}/logs", get(mcp_server_logs))
         .route("/v1/subscriptions", get(subscription_health))
         .route("/v1/models", get(list_models))
+        .route("/v1/model-routes", get(list_model_routes))
         .route("/v1/models/refresh", get(refresh_models))
         .route("/v1/personas", get(list_personas))
         .route("/v1/persona-infos", get(list_persona_infos))
@@ -622,6 +628,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/known", get(known_providers))
+        .route(
+            "/v1/config/provider-order",
+            axum::routing::put(set_provider_order),
+        )
         .route(
             "/v1/providers/{id}",
             axum::routing::put(upsert_provider).delete(delete_provider),
@@ -1778,6 +1788,11 @@ async fn list_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> 
     Json(engine.list_models().await)
 }
 
+#[utoipa::path(get, path = "/v1/model-routes", responses((status = 200, body = [RoutedModelInfo])))]
+async fn list_model_routes(State(engine): State<Arc<Engine>>) -> Json<Vec<RoutedModelInfo>> {
+    Json(engine.list_model_routes().await)
+}
+
 #[utoipa::path(get, path = "/v1/models/refresh", responses((status = 200, body = [ModelInfo])))]
 async fn refresh_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> {
     Json(engine.refresh_models().await)
@@ -2105,6 +2120,18 @@ async fn set_code_review_settings(
 ) -> Result<impl IntoResponse, ApiError> {
     let (cursor, settings) = engine.set_code_review_settings(req)?;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
+}
+
+#[utoipa::path(put, path = "/v1/config/provider-order",
+    request_body = SetProviderOrderRequest,
+    responses((status = 204), (status = 400, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn set_provider_order(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetProviderOrderRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.set_provider_order(&req.provider_ids, req.expected_provider_ids.as_deref())?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(get, path = "/v1/config/git-worktrees",

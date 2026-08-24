@@ -218,6 +218,9 @@ const protocolValidators = {
       eventEnvelopeFields,
     ],
   },
+  // Append new root validators so AJV's generated identifiers for existing
+  // exports remain stable and protocol additions produce reviewable diffs.
+  modelRoutes: componentArray(protocolSchemaId, "RoutedModelInfo"),
 };
 
 const protocolSource = generateModule({

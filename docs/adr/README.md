@@ -51,3 +51,5 @@ sequentially.
 | [0039](0039-retire-servo-qualification-hosts.md) | Retire Servo qualification hosts | Accepted |
 | [0040](0040-durable-root-cause-history-for-code-review.md) | Durable root-cause history for code review | Accepted |
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
+| [0042](0042-policy-ordered-cross-adapter-model-routing.md) | Policy-ordered cross-adapter model routing | Partially superseded by 0043 |
+| [0043](0043-explicit-and-sticky-model-route-selection.md) | Explicit and sticky model route selection | Accepted |

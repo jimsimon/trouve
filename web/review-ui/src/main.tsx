@@ -16,6 +16,7 @@ import {
   getJob,
   getJobs,
   getKnownProviders,
+  getModelRoutes,
   getPersonaInfos,
   getModels,
   getProviders,
@@ -50,6 +51,10 @@ import {
 import type { CliInfo, CliInstallStatus } from "./cli";
 import {
   defaultThinkingSelection,
+  modelCatalogStatusMessage,
+  modelForSelection,
+  modelSelectionValue,
+  supplementalModelSelection,
   thinkingLevelLabel,
   thinkingOptions,
   thinkingSelectionIsValid,
@@ -129,6 +134,31 @@ function navigate(section: Section, id = ""): void {
 
 function formatDate(value?: string): string {
   return value ? new Date(value).toLocaleString() : "—";
+}
+
+function ModelOptions({
+  models,
+  selection,
+}: {
+  models: readonly Model[];
+  selection?: string;
+}) {
+  const supplemental = supplementalModelSelection(models, selection);
+  return (
+    <>
+      {supplemental && (
+        <option value={supplemental.value} key={`selected:${supplemental.value}`}>
+          {supplemental.kind === "pinned" ? "Pinned provider route" : "Unavailable model"}
+          {" · "}{supplemental.value}
+        </option>
+      )}
+      {models.map((model) => (
+        <option value={model.id} key={model.id}>
+          {model.display_name} · {model.id}
+        </option>
+      ))}
+    </>
+  );
 }
 
 function duration(milliseconds: number): string {
@@ -323,8 +353,13 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [providers, setProviders] = useState<ProvidersResponse | null>(null);
   const [reviewSettings, setReviewSettings] = useState<CodeReviewSettings | null>(null);
-  const [models, setModels] = useState<Model[]>([]);
-  const [modeInfos, setPersonaInfos] = useState<PersonaInfo[]>([]);
+  const [modelCatalog, setModelCatalog] = useState<{
+    models: Model[];
+    loaded: boolean;
+    error: string;
+  }>({ models: [], loaded: false, error: "" });
+  const models = modelCatalog.models;
+  const [personaInfos, setPersonaInfos] = useState<PersonaInfo[]>([]);
   const [dashboardError, setDashboardError] = useState("");
   const [configurationError, setConfigurationError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -335,6 +370,8 @@ function App() {
     reloadRequested: boolean;
   }>({ promise: null, reloadRequested: false });
   const configurationLoadRef = useRef<Promise<void> | null>(null);
+  const staticModelLoadRef = useRef<Promise<void> | null>(null);
+  const modelRouteLoadRef = useRef<Promise<void> | null>(null);
 
   const loadDashboard = useCallback((quiet = false): Promise<void> => {
     const state = dashboardLoadRef.current;
@@ -371,16 +408,58 @@ function App() {
     return request;
   }, []);
 
+  const loadModelRoutes = useCallback((): Promise<void> => {
+    if (modelRouteLoadRef.current) return modelRouteLoadRef.current;
+    const request = getModelRoutes()
+      .then((models) => setModelCatalog({ models, loaded: true, error: "" }))
+      .catch((cause) => {
+        const error = cause instanceof Error ? cause.message : String(cause);
+        setModelCatalog((current) => ({ ...current, error }));
+      });
+    modelRouteLoadRef.current = request;
+    void request.finally(() => {
+      if (modelRouteLoadRef.current === request) modelRouteLoadRef.current = null;
+    });
+    return request;
+  }, []);
+
   const loadConfiguration = useCallback((): Promise<void> => {
     if (configurationLoadRef.current) return configurationLoadRef.current;
     const request = (async (): Promise<void> => {
+      // Static model discovery has its own loading/error projection. Publish
+      // it independently so a stalled model endpoint cannot hold repository,
+      // review, or persona settings behind one aggregate promise.
+      if (!staticModelLoadRef.current) {
+        const staticModels = getModels()
+          .then((models) => {
+            setModelCatalog((current) =>
+              current.loaded ? current : { ...current, models, loaded: true },
+            );
+          })
+          .catch((cause) => {
+            const error = cause instanceof Error ? cause.message : String(cause);
+            setModelCatalog((current) =>
+              current.loaded ? current : { ...current, error },
+            );
+          });
+        staticModelLoadRef.current = staticModels;
+        void staticModels.finally(() => {
+          if (staticModelLoadRef.current === staticModels) staticModelLoadRef.current = null;
+        });
+      }
       const results = await Promise.allSettled([
-        getProviders().then(setProviders),
-        getReviewSettings().then(setReviewSettings),
-        getModels().then(setModels),
-        getPersonaInfos().then(setPersonaInfos),
+        getProviders(),
+        getReviewSettings(),
+        getPersonaInfos(),
       ]);
-      const errors = results
+      const [providerResult, settingsResult, personaResult] = results;
+      if (providerResult?.status === "fulfilled") setProviders(providerResult.value);
+      if (settingsResult?.status === "fulfilled") setReviewSettings(settingsResult.value);
+      if (personaResult?.status === "fulfilled") setPersonaInfos(personaResult.value);
+      // Live provider/CLI discovery can be slow or unavailable. It enriches
+      // the already usable static picker without holding configuration open.
+      void loadModelRoutes();
+      const errors = [providerResult, settingsResult, personaResult]
         .filter((result): result is PromiseRejectedResult => result.status === "rejected")
         .map(({ reason }) => (reason instanceof Error ? reason.message : String(reason)));
       setConfigurationError(errors.join("; "));
@@ -390,7 +469,7 @@ function App() {
       if (configurationLoadRef.current === request) configurationLoadRef.current = null;
     });
     return request;
-  }, []);
+  }, [loadModelRoutes]);
 
   useEffect(() => {
     const onHash = (): void => setRoute(routeFromHash());
@@ -432,6 +511,14 @@ function App() {
   }, [configurationError, loadConfiguration, needsConfiguration]);
 
   useEffect(() => {
+    if (!needsConfiguration || !modelCatalog.error) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void loadModelRoutes();
+    }, AUTOMATIC_RETRY_MS);
+    return () => window.clearInterval(timer);
+  }, [loadModelRoutes, modelCatalog.error, needsConfiguration]);
+
+  useEffect(() => {
     if (serverEventAfter === null) return;
     let refreshTimer: number | undefined;
     const close = openServerEvents(serverEventAfter, (event) => {
@@ -464,6 +551,7 @@ function App() {
         <RepositoriesPage
           dashboard={dashboard}
           models={models}
+          modelsLoaded={modelCatalog.loaded}
           onChanged={() => void loadDashboard(true)}
         />
       )}
@@ -471,6 +559,7 @@ function App() {
         <ReviewersPage
           reviewers={dashboard.reviewers}
           models={models}
+          modelsLoaded={modelCatalog.loaded}
           defaultModel={providers?.default_model}
           onChanged={() => void loadDashboard(true)}
         />
@@ -484,7 +573,9 @@ function App() {
           providers={providers}
           reviewSettings={reviewSettings}
           models={models}
-          reviewPersonaInfo={modeInfos.find(({ persona }) => persona.id === "review")}
+          modelsLoaded={modelCatalog.loaded}
+          modelsError={modelCatalog.error}
+          reviewPersonaInfo={personaInfos.find(({ persona }) => persona.id === "review")}
           onChanged={() => {
             void loadDashboard(true);
             void loadConfiguration();
@@ -2057,10 +2148,12 @@ function OutputBlock({
 function RepositoriesPage({
   dashboard,
   models,
+  modelsLoaded,
   onChanged,
 }: {
   dashboard: Dashboard;
   models: Model[];
+  modelsLoaded: boolean;
   onChanged: () => void;
 }) {
   const [showAll, setShowAll] = useState(false);
@@ -2106,6 +2199,7 @@ function RepositoriesPage({
               repository={repository}
               reviewers={dashboard.reviewers}
               models={models}
+              modelsLoaded={modelsLoaded}
               onSaved={onChanged}
               key={repository.repository}
             />
@@ -2163,11 +2257,13 @@ function RepositoryEditor({
   repository,
   reviewers,
   models,
+  modelsLoaded,
   onSaved,
 }: {
   repository: Repository;
   reviewers: ReviewerProfile[];
   models: Model[];
+  modelsLoaded: boolean;
   onSaved: () => void;
 }) {
   const [draft, setDraft] = useState(repository);
@@ -2234,11 +2330,9 @@ function RepositoryEditor({
       return { ...current, reviewer_overrides: retained };
     });
   };
-  const effectiveCoordinatorModel = models.find((model) => model.id === draft.model);
+  const effectiveCoordinatorModel = modelForSelection(models, draft.model);
   const coordinatorThinking = thinkingOptions(effectiveCoordinatorModel);
-  const effectiveRouterModel = models.find(
-    (model) => model.id === (draft.router_model || draft.model),
-  );
+  const effectiveRouterModel = modelForSelection(models, draft.router_model || draft.model);
   const routerThinking = thinkingOptions(effectiveRouterModel);
   const compatibleThinking = (
     configured: string | undefined,
@@ -2324,14 +2418,14 @@ function RepositoryEditor({
           <label>
             Coordinator and fallback model
             <select
-              value={draft.model ?? ""}
+              value={modelSelectionValue(models, draft.model)}
+              disabled={!modelsLoaded}
               onChange={(event) => {
                 const model = event.currentTarget.value || undefined;
-                const selectedCoordinatorModel = models.find(
-                  (candidate) => candidate.id === model,
-                );
-                const selectedRouterModel = models.find(
-                  (candidate) => candidate.id === (draft.router_model || model),
+                const selectedCoordinatorModel = modelForSelection(models, model);
+                const selectedRouterModel = modelForSelection(
+                  models,
+                  draft.router_model || model,
                 );
                 setDraft({
                   ...draft,
@@ -2348,9 +2442,9 @@ function RepositoryEditor({
                     const profile = reviewers.find(
                       (reviewer) => reviewer.id === override.reviewer_id,
                     );
-                    const selectedReviewerModel = models.find(
-                      (candidate) =>
-                        candidate.id === (override.model || profile?.model || model),
+                    const selectedReviewerModel = modelForSelection(
+                      models,
+                      override.model || profile?.model || model,
                     );
                     return {
                       ...override,
@@ -2364,11 +2458,7 @@ function RepositoryEditor({
               }}
             >
               <option value="">Select a model</option>
-              {models.map((model) => (
-                <option value={model.id} key={model.id}>
-                  {model.display_name} · {model.id}
-                </option>
-              ))}
+              <ModelOptions models={models} selection={draft.model} />
             </select>
             <small>
               {models.length
@@ -2383,6 +2473,7 @@ function RepositoryEditor({
             <ThinkingSetting
               options={coordinatorThinking}
               value={draft.coordinator_thinking_level ?? ""}
+              disabled={!modelsLoaded}
               inheritLabel="Inherit review persona"
               onChange={(value) =>
                 setDraft({
@@ -2399,12 +2490,13 @@ function RepositoryEditor({
           <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
             Semantic router model
             <select
-              value={draft.router_model ?? ""}
-              disabled={!semanticRouterConfigEnabled}
+              value={modelSelectionValue(models, draft.router_model)}
+              disabled={!modelsLoaded || !semanticRouterConfigEnabled}
               onChange={(event) => {
                 const routerModel = event.currentTarget.value || undefined;
-                const selectedRouterModel = models.find(
-                  (candidate) => candidate.id === (routerModel || draft.model),
+                const selectedRouterModel = modelForSelection(
+                  models,
+                  routerModel || draft.model,
                 );
                 setDraft({
                   ...draft,
@@ -2417,11 +2509,7 @@ function RepositoryEditor({
               }}
             >
               <option value="">Inherit coordinator/fallback model</option>
-              {models.map((model) => (
-                <option value={model.id} key={model.id}>
-                  {model.display_name} · {model.id}
-                </option>
-              ))}
+              <ModelOptions models={models} selection={draft.router_model} />
             </select>
             <small>
               Runs the lightweight, read-only triage pass that may add relevant personas.
@@ -2435,8 +2523,8 @@ function RepositoryEditor({
             <ThinkingSetting
               options={routerThinking}
               value={draft.router_thinking_level ?? ""}
+              disabled={!modelsLoaded || !semanticRouterConfigEnabled}
               inheritLabel="Inherit review default"
-              disabled={!semanticRouterConfigEnabled}
               onChange={(value) =>
                 setDraft({
                   ...draft,
@@ -2543,7 +2631,7 @@ function RepositoryEditor({
               );
               const effectiveModelId = override?.model || reviewer.model || draft.model;
               const reviewerThinking = thinkingOptions(
-                models.find((model) => model.id === effectiveModelId),
+                modelForSelection(models, effectiveModelId),
               );
               return (
                 <div class="persona-execution" key={reviewer.id}>
@@ -2554,12 +2642,13 @@ function RepositoryEditor({
                   <label>
                     Model
                     <select
-                      value={override?.model ?? ""}
+                      value={modelSelectionValue(models, override?.model)}
+                      disabled={!modelsLoaded}
                       onChange={(event) => {
                         const model = event.currentTarget.value || undefined;
-                        const selectedModel = models.find(
-                          (candidate) =>
-                            candidate.id === (model || reviewer.model || draft.model),
+                        const selectedModel = modelForSelection(
+                          models,
+                          model || reviewer.model || draft.model,
                         );
                         updateReviewerOverride(reviewer.id, {
                           model,
@@ -2573,11 +2662,7 @@ function RepositoryEditor({
                       <option value="">
                         Inherit · {reviewer.model || draft.model || "no model"}
                       </option>
-                      {models.map((model) => (
-                        <option value={model.id} key={model.id}>
-                          {model.display_name} · {model.id}
-                        </option>
-                      ))}
+                      <ModelOptions models={models} selection={override?.model} />
                     </select>
                     <small>
                       Overrides the model for this persona in this repository only.
@@ -2588,6 +2673,7 @@ function RepositoryEditor({
                     <ThinkingSetting
                       options={reviewerThinking}
                       value={override?.thinking_level ?? ""}
+                      disabled={!modelsLoaded}
                       inheritLabel={
                         reviewer.default_thinking_level
                           ? `Inherit · ${thinkingLevelLabel(reviewer.default_thinking_level)}`
@@ -2643,11 +2729,13 @@ function RepositoryEditor({
 function ReviewersPage({
   reviewers,
   models,
+  modelsLoaded,
   defaultModel,
   onChanged,
 }: {
   reviewers: ReviewerProfile[];
   models: Model[];
+  modelsLoaded: boolean;
   defaultModel?: string;
   onChanged: () => void;
 }) {
@@ -2663,12 +2751,18 @@ function ReviewersPage({
           <ReviewerEditor
             reviewer={reviewer}
             models={models}
+            modelsLoaded={modelsLoaded}
             defaultModel={defaultModel}
             onChanged={onChanged}
             key={reviewer.id}
           />
         ))}
-        <ReviewerEditor models={models} defaultModel={defaultModel} onChanged={onChanged} />
+        <ReviewerEditor
+          models={models}
+          modelsLoaded={modelsLoaded}
+          defaultModel={defaultModel}
+          onChanged={onChanged}
+        />
       </div>
     </section>
   );
@@ -2677,11 +2771,13 @@ function ReviewersPage({
 function ReviewerEditor({
   reviewer,
   models,
+  modelsLoaded,
   defaultModel,
   onChanged,
 }: {
   reviewer?: ReviewerProfile;
   models: Model[];
+  modelsLoaded: boolean;
   defaultModel?: string;
   onChanged: () => void;
 }) {
@@ -2696,9 +2792,7 @@ function ReviewerEditor({
   const [message, flash] = useFlash();
   const persistedReviewer = JSON.stringify(reviewer ?? null);
   useEffect(() => setDraft(reviewer ?? empty), [persistedReviewer]);
-  const reviewerModel = models.find(
-    (model) => model.id === (draft.model || defaultModel),
-  );
+  const reviewerModel = modelForSelection(models, draft.model || defaultModel);
   const reviewerThinking = thinkingOptions(reviewerModel);
   return (
     <form
@@ -2744,7 +2838,8 @@ function ReviewerEditor({
       <label>
         Default model
         <select
-          value={draft.model ?? ""}
+          value={modelSelectionValue(models, draft.model)}
+          disabled={!modelsLoaded}
           onChange={(event) => {
             const model = event.currentTarget.value || undefined;
             setDraft({
@@ -2752,18 +2847,14 @@ function ReviewerEditor({
               model,
               default_thinking_level:
                 defaultThinkingSelection(
-                  models.find((candidate) => candidate.id === (model || defaultModel)),
+                  modelForSelection(models, model || defaultModel),
                   draft.default_thinking_level,
                 ) || undefined,
             });
           }}
         >
           <option value="">Inherit repository/system</option>
-          {models.map((model) => (
-            <option value={model.id} key={model.id}>
-              {model.display_name} · {model.id}
-            </option>
-          ))}
+          <ModelOptions models={models} selection={draft.model} />
         </select>
         <small>
           Sets this persona's reusable model. Repository-specific persona overrides take
@@ -2775,6 +2866,7 @@ function ReviewerEditor({
         <ThinkingSetting
           options={reviewerThinking}
           value={draft.default_thinking_level ?? ""}
+          disabled={!modelsLoaded}
           inheritLabel="Inherit default"
           onChange={(value) =>
             setDraft({
@@ -3086,6 +3178,8 @@ function SettingsPage({
   providers,
   reviewSettings,
   models,
+  modelsLoaded,
+  modelsError,
   reviewPersonaInfo,
   onChanged,
 }: {
@@ -3093,9 +3187,12 @@ function SettingsPage({
   providers: ProvidersResponse | null;
   reviewSettings: CodeReviewSettings | null;
   models: Model[];
+  modelsLoaded: boolean;
+  modelsError: string;
   reviewPersonaInfo?: PersonaInfo;
   onChanged: () => void;
 }) {
+  const modelCatalogStatus = modelCatalogStatusMessage(modelsLoaded, modelsError);
   return (
     <section>
       <PageHeader
@@ -3106,6 +3203,7 @@ function SettingsPage({
       <ReviewPersonaSettings
         personaInfo={reviewPersonaInfo}
         models={models}
+        modelsLoaded={modelsLoaded}
         globalModel={providers?.default_model}
         globalThinking={providers?.default_thinking_level}
         onChanged={onChanged}
@@ -3113,8 +3211,18 @@ function SettingsPage({
       <ReviewExecutionSettings settings={reviewSettings} onChanged={onChanged} />
       <div class="settings-grid">
         <GithubAppSettings app={app} onChanged={onChanged} />
-        <ProviderSettings providers={providers} models={models} onChanged={onChanged} />
+        <ProviderSettings
+          providers={providers}
+          models={models}
+          modelsLoaded={modelsLoaded}
+          onChanged={onChanged}
+        />
       </div>
+      {modelCatalogStatus && (
+        <p class="error-text" role="status">
+          {modelCatalogStatus}
+        </p>
+      )}
     </section>
   );
 }
@@ -3248,12 +3356,14 @@ function ReviewExecutionSettings({
 function ReviewPersonaSettings({
   personaInfo,
   models,
+  modelsLoaded,
   globalModel,
   globalThinking,
   onChanged,
 }: {
   personaInfo?: PersonaInfo;
   models: Model[];
+  modelsLoaded: boolean;
   globalModel?: string;
   globalThinking?: string;
   onChanged: () => void;
@@ -3269,7 +3379,7 @@ function ReviewPersonaSettings({
     [persona?.default_thinking_level],
   );
   const effectiveModel = model || globalModel || "";
-  const selectedModel = models.find((candidate) => candidate.id === effectiveModel);
+  const selectedModel = modelForSelection(models, effectiveModel);
   useEffect(() => {
     if (!personaInfo || !selectedModel) return;
     setThinking((current) => {
@@ -3312,13 +3422,12 @@ function ReviewPersonaSettings({
             <label>
               Default model
               <select
-                value={model}
+                value={modelSelectionValue(models, model)}
+                disabled={!modelsLoaded}
                 onChange={(event) => {
                   const next = event.currentTarget.value;
                   setModel(next);
-                  const nextModel = models.find(
-                    (candidate) => candidate.id === (next || globalModel),
-                  );
+                  const nextModel = modelForSelection(models, next || globalModel);
                   if (thinking && !thinkingSelectionIsValid(nextModel, thinking)) {
                     setThinking(defaultThinkingSelection(nextModel));
                   }
@@ -3327,11 +3436,7 @@ function ReviewPersonaSettings({
                 <option value="">
                   Inherit global{globalModel ? ` · ${globalModel}` : ""}
                 </option>
-                {models.map((candidate) => (
-                  <option value={candidate.id} key={candidate.id}>
-                    {candidate.display_name} · {candidate.id}
-                  </option>
-                ))}
+                <ModelOptions models={models} selection={model} />
               </select>
               <small>
                 Manual review threads inherit this model. Automated jobs continue to use
@@ -3343,6 +3448,7 @@ function ReviewPersonaSettings({
               <ThinkingSetting
                 options={options}
                 value={thinking}
+                disabled={!modelsLoaded}
                 onChange={setThinking}
                 inheritLabel={`Inherit global · ${inheritedThinking}`}
               />
@@ -3353,7 +3459,7 @@ function ReviewPersonaSettings({
             </label>
           </div>
           <div class="action-row">
-            <button type="submit" disabled={busy}>
+            <button type="submit" disabled={busy || !modelsLoaded}>
               {busy ? "Saving…" : "Save review persona"}
             </button>
             {personaInfo?.origin === "customized" && (
@@ -3479,10 +3585,12 @@ interface LoginView {
 function ProviderSettings({
   providers,
   models,
+  modelsLoaded,
   onChanged,
 }: {
   providers: ProvidersResponse | null;
   models: Model[];
+  modelsLoaded: boolean;
   onChanged: () => void;
 }) {
   const [login, setLogin] = useState<LoginView | null>(null);
@@ -3655,7 +3763,7 @@ function ProviderSettings({
   const requiredCli = selectedSubscription
     ? clis.find((cli) => cli.kinds.includes(selectedSubscription.kind))
     : undefined;
-  const selectedModel = models.find((model) => model.id === defaultModel);
+  const selectedModel = modelForSelection(models, defaultModel);
   const defaultThinkingOptions = thinkingOptions(selectedModel);
   return (
     <section class="panel settings-card">
@@ -3680,22 +3788,21 @@ function ProviderSettings({
         <label>
           Global default model
           <select
-            value={defaultModel}
+            value={modelSelectionValue(models, defaultModel)}
+            disabled={!modelsLoaded}
             onChange={(event) => {
               const next = event.currentTarget.value;
               setDefaultModel(next);
               setDefaultThinking(
                 defaultThinkingSelection(
-                  models.find((model) => model.id === next),
+                  modelForSelection(models, next),
                   defaultThinking,
                 ),
               );
             }}
             required
           >
-            {models.map((model) => (
-              <option value={model.id} key={model.id}>{model.display_name} · {model.id}</option>
-            ))}
+            <ModelOptions models={models} selection={defaultModel} />
           </select>
           <small>
             Base model for interactive threads and settings that inherit the global default.
@@ -3709,6 +3816,7 @@ function ProviderSettings({
           <ThinkingSetting
             options={defaultThinkingOptions}
             value={defaultThinking}
+            disabled={!modelsLoaded}
             onChange={setDefaultThinking}
             inheritLabel="Use the model's default"
           />
@@ -3717,7 +3825,9 @@ function ProviderSettings({
             own thinking level.
           </small>
         </label>
-        <button type="submit" disabled={!defaultModel}>Save system defaults</button>
+        <button type="submit" disabled={!modelsLoaded || !defaultModel}>
+          Save system defaults
+        </button>
       </form>
       <div class="provider-list">
         {providers?.providers.map((provider) => (

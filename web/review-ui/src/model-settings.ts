@@ -1,6 +1,10 @@
 export interface ModelWithOptions {
   id: string;
   options_schema?: unknown;
+  routes?: ReadonlyArray<{
+    provider_id: string;
+    provider_model: string;
+  }>;
 }
 
 export interface ThinkingOptions {
@@ -18,6 +22,69 @@ const THINKING_KEYS = [
   "effort",
   "reasoning",
 ] as const;
+
+/** Resolve either a routed model id or one of its provider-qualified pins. */
+export function modelForSelection<T extends ModelWithOptions>(
+  models: readonly T[],
+  selection?: string,
+): T | undefined {
+  if (!selection) return undefined;
+  const exact = models.find((model) => model.id === selection);
+  if (exact) return exact;
+  if (!selection.includes("/")) {
+    const automatic = models.find((model) => model.id === `auto/${selection}`);
+    if (automatic) return automatic;
+  }
+  return models.find((model) =>
+    model.routes?.some(
+      (route) => `${route.provider_id}/${route.provider_model}` === selection,
+    ),
+  );
+}
+
+/** Map pre-2.2 bare automatic ids to their catalog row; preserve hard pins. */
+export function modelSelectionValue(
+  models: readonly ModelWithOptions[],
+  selection?: string,
+): string {
+  if (!selection) return "";
+  if (
+    !selection.includes("/")
+    && models.some((model) => model.id === `auto/${selection}`)
+  ) {
+    return `auto/${selection}`;
+  }
+  return selection;
+}
+
+/** Extra picker row needed to display a persisted pin or unavailable id. */
+export function supplementalModelSelection(
+  models: readonly ModelWithOptions[],
+  selection?: string,
+): { value: string; kind: "pinned" | "unavailable" } | undefined {
+  if (
+    !selection
+    || models.some((model) => model.id === modelSelectionValue(models, selection))
+  ) {
+    return undefined;
+  }
+  return {
+    value: selection,
+    kind: modelForSelection(models, selection) ? "pinned" : "unavailable",
+  };
+}
+
+export function modelCatalogStatusMessage(
+  loaded: boolean,
+  error: string,
+): string | undefined {
+  if (error) {
+    return loaded ? `Model choices may be stale: ${error}` : error;
+  }
+  return loaded
+    ? undefined
+    : "Model choices are still loading. Model settings remain disabled.";
+}
 
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)

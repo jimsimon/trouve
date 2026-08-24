@@ -31,6 +31,7 @@ import type {
   ProtocolUpdateThreadRequest,
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
+import { modelForSelection } from "../services/model-catalog-controller.js";
 import type { ComposerDraft } from "../services/composer-drafts.js";
 import {
   DEFAULT_CHAT_PREFERENCES,
@@ -117,10 +118,7 @@ import {
   modelOptionControls,
   modelOptionLabel,
 } from "./model-option-controls.js";
-import {
-  modelHealthPresentation,
-  modelHealthPresentations,
-} from "./model-health.js";
+import { modelHealthPresentations } from "./model-health.js";
 import {
   retainedHistoryScrollDelta,
   type HistoryMeasurementCorrection,
@@ -1454,20 +1452,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       : this.#activeComposerCompletion(view?.commands ?? []);
     const selectedModel = thread === undefined
       ? undefined
-      : models.find((model) => model.id === thread.model);
+      : modelForSelection(models, thread.model);
     const runningTurn = this.#latestRunningTurn(view?.items ?? []);
     const activeTurnSteerable = runningTurn !== undefined
       && view?.turnSteerable.get(runningTurn) === true;
     const steerPending = this.#requestPending && this.#messageRequest === undefined;
     const modelControls = modelOptionControls(selectedModel, thread?.model_options);
     const modelHealth = modelHealthPresentations(models, this.#subscriptionHealth);
-    const selectedProviderId = thread?.model.split("/", 1)[0] ?? "";
-    const selectedSubscription = this.#subscriptionHealth.find(
-      (health) => health.provider_id === selectedProviderId,
-    );
-    const selectedModelHealth = selectedSubscription === undefined
+    const selectedModelIndex = selectedModel === undefined ? -1 : models.indexOf(selectedModel);
+    const selectedModelHealth = selectedModelIndex < 0
       ? undefined
-      : modelHealthPresentation(selectedSubscription);
+      : modelHealth[selectedModelIndex];
     const subscriptionLoading = selectedModelHealth === undefined && (
       this.#optionCatalogKey === ""
       || (this.#services.value !== undefined
@@ -2919,7 +2914,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     );
     const modelLabel = turnLabels.get(unit.turn);
     const modelId = turnModels.get(unit.turn);
-    const model = this.#availableModels().find((candidate) => candidate.id === modelId);
+    const model = modelForSelection(this.#availableModels(), modelId);
     const usage = turnState?.kind === "running" || turnState?.kind === "completed"
       ? turnState.usage
       : undefined;

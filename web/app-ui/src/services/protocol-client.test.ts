@@ -397,6 +397,13 @@ describe("ProtocolClient", () => {
       supports_tools: true,
       options_schema: {},
     };
+    const routedModel = {
+      ...model,
+      id: "auto/gpt-5.6",
+      input_price_per_mtok: null,
+      output_price_per_mtok: null,
+      routes: [{ provider_id: "openai", provider_model: "gpt-5.6" }],
+    };
     const thread = {
       id: "th_1",
       session_id: "se_1",
@@ -410,6 +417,7 @@ describe("ProtocolClient", () => {
       const request = input instanceof Request ? input : new Request(input, init);
       requests.push(request);
       if (request.url.includes("/v1/personas")) return Response.json([mode]);
+      if (request.url.endsWith("/v1/model-routes")) return Response.json([routedModel]);
       if (request.url.endsWith("/v1/models/refresh")) return Response.json([model]);
       if (request.url.endsWith("/v1/models")) return Response.json([model]);
       return Response.json(thread);
@@ -421,13 +429,14 @@ describe("ProtocolClient", () => {
 
     await expect(client.personas("ws_1")).resolves.toEqual([mode]);
     await expect(client.models()).resolves.toEqual([model]);
+    await expect(client.modelRoutes()).resolves.toEqual([routedModel]);
     await expect(client.refreshModels()).resolves.toEqual([model]);
     await expect(
       client.updateThread("th_1", { permission_mode: "allow_list" }),
     ).resolves.toEqual(thread);
 
     expect(requests[0]?.url).toContain("workspace_id=ws_1");
-    expect(requests[3]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
+    expect(requests[4]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
   });
 
   it("attaches the ephemeral desktop CSRF header only through mutation calls", async () => {
@@ -734,6 +743,7 @@ describe("ProtocolClient", () => {
     });
 
     await expect(client.providers()).resolves.toMatchObject({ providers: [provider] });
+    await expect(client.setProviderOrder({ provider_ids: [provider.id] })).resolves.toBeUndefined();
     await expect(
       client.upsertProvider("open/router", {
         kind: "openai-compat",
@@ -750,15 +760,17 @@ describe("ProtocolClient", () => {
       client.deleteMcpServer("docs/server", "workspace", "workspace / one"),
     ).resolves.toBeUndefined();
 
-    expect(requests[1]?.url).toContain("/v1/providers/open%2Frouter");
+    expect(requests[1]?.url).toContain("/v1/config/provider-order");
     expect(requests[1]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
-    expect(requests[2]?.url).toContain("workspace_id=workspace+%2F+one");
-    expect(requests[2]?.url).toContain("probe=false");
-    expect(requests[3]?.url).toContain("/v1/mcp-servers/docs%2Fserver/enabled");
-    expect(requests[3]?.method).toBe("PUT");
-    expect(requests[3]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
-    expect(requests[4]?.url).toContain("/v1/mcp-servers/docs%2Fserver?");
+    expect(requests[2]?.url).toContain("/v1/providers/open%2Frouter");
+    expect(requests[2]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
+    expect(requests[3]?.url).toContain("workspace_id=workspace+%2F+one");
+    expect(requests[3]?.url).toContain("probe=false");
+    expect(requests[4]?.url).toContain("/v1/mcp-servers/docs%2Fserver/enabled");
+    expect(requests[4]?.method).toBe("PUT");
     expect(requests[4]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
+    expect(requests[5]?.url).toContain("/v1/mcp-servers/docs%2Fserver?");
+    expect(requests[5]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
   });
 
   it("redacts malformed management payloads from diagnostics", async () => {
@@ -1057,11 +1069,11 @@ describe("ProtocolClient", () => {
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.15")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.17")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "5.4", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "8.0", "7.17.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

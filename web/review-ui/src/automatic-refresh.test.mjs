@@ -20,3 +20,34 @@ test("persona retry labels describe the actual terminal state", () => {
   );
   assert.match(source, /group\.persona \? "Retry all" : "Retry"/u);
 });
+
+test("model discovery does not block unrelated repository and persona saves", () => {
+  const repositoryEditor = source.slice(
+    source.indexOf("function RepositoryEditor"),
+    source.indexOf("function ReviewersPage"),
+  );
+  const reviewerEditor = source.slice(
+    source.indexOf("function ReviewerEditor"),
+    source.indexOf("function StatsPage"),
+  );
+  assert.match(source, /void loadModelRoutes\(\);/u);
+  const configurationLoader = source.slice(
+    source.indexOf("const loadConfiguration"),
+    source.indexOf("const needsConfiguration"),
+  );
+  assert.match(configurationLoader, /const staticModels = getModels\(\)/u);
+  assert.doesNotMatch(
+    configurationLoader,
+    /Promise\.allSettled\(\[\s*getModels\(\)/u,
+  );
+  assert.match(configurationLoader, /current\.loaded \? current : \{ \.\.\.current, error \}/u);
+  assert.match(
+    configurationLoader,
+    /current\.loaded \? current : \{ \.\.\.current, models, loaded: true \}/u,
+  );
+  assert.doesNotMatch(
+    repositoryEditor,
+    /disabled=\{busy \|\| !modelsLoaded \|\| reviewerPolicyInvalid/u,
+  );
+  assert.doesNotMatch(reviewerEditor, /disabled=\{busy \|\| !modelsLoaded\}>/u);
+});
