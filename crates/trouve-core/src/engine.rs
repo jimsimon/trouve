@@ -19611,6 +19611,10 @@ mod tests {
         live_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    struct ReasoningThenStallProvider {
+        stalled: Arc<tokio::sync::Semaphore>,
+    }
+
     fn catalog_test_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
         trouve_protocol::ModelInfo {
             id: id.into(),
@@ -19657,6 +19661,47 @@ mod tests {
             _options: &serde_json::Map<String, serde_json::Value>,
         ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
             unreachable!("model catalog tests never start a provider turn")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ReasoningThenStallProvider {
+        fn id(&self) -> &str {
+            "reasoning-stall"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "reasoning-stall/shared",
+                "Reasoning stall model",
+            )]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            let stalled = self.stalled.clone();
+            let reasoning: Result<ProviderEvent, trouve_providers::ProviderError> =
+                Ok(ProviderEvent::Reasoning(serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "preserve me",
+                    "signature": "signed",
+                })));
+            Ok(futures::stream::iter([reasoning])
+                .chain(futures::stream::once(async move {
+                    stalled.add_permits(1);
+                    std::future::pending::<Result<ProviderEvent, trouve_providers::ProviderError>>()
+                        .await
+                }))
+                .boxed())
         }
     }
 
@@ -21370,6 +21415,87 @@ mod tests {
         let model = engine.resolve_model_info("auto/live").await.unwrap();
         assert_eq!(model.id, "auto/live");
         assert_eq!(stalled_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_route_preserves_reasoning_only_transcript() {
+        let data = tempfile::tempdir().unwrap();
+        init_engine_test_repo(data.path());
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_test_thread(&store, data.path(), "cancelled_reasoning", "auto/shared");
+        let stalled = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .with_provider(
+                "reasoning-stall",
+                Arc::new(ReasoningThenStallProvider {
+                    stalled: stalled.clone(),
+                }),
+            ),
+        );
+
+        engine
+            .send_message(&thread.id, "Think until cancelled".into(), Vec::new())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), stalled.acquire())
+            .await
+            .expect("provider should stall after emitting reasoning")
+            .expect("stall semaphore remains open")
+            .forget();
+        engine.cancel_turn(&thread.id).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cancelled = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, Event::TurnCancelled { turn: 1 }));
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if cancelled && inactive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled routed turn should settle");
+
+        let expected_reasoning = serde_json::json!({
+            "type": "thinking",
+            "thinking": "preserve me",
+            "signature": "signed",
+        });
+        assert!(
+            store
+                .messages(&thread.id)
+                .unwrap()
+                .into_iter()
+                .any(|payload| {
+                    matches!(
+                        serde_json::from_value::<trouve_providers::Message>(payload),
+                        Ok(trouve_providers::Message::Assistant {
+                            content,
+                            tool_calls,
+                            reasoning,
+                        }) if content.is_empty()
+                            && tool_calls.is_empty()
+                            && reasoning == vec![expected_reasoning.clone()]
+                    )
+                })
+        );
+        assert!(store.route_health().unwrap().is_empty());
     }
 
     #[tokio::test]

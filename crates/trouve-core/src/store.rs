@@ -7486,16 +7486,17 @@ impl Store {
     pub fn set_thread_route_affinity(
         &self,
         id: &str,
+        expected_model: &str,
         provider_id: &str,
         provider_model: &str,
-    ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
             "UPDATE threads
-             SET route_provider_id = ?2, route_provider_model = ?3
-             WHERE id = ?1",
-            params![id, provider_id, provider_model],
+             SET route_provider_id = ?3, route_provider_model = ?4
+             WHERE id = ?1 AND model = ?2",
+            params![id, expected_model, provider_id, provider_model],
         )?;
-        Ok(())
+        Ok(updated == 1)
     }
 
     pub fn clear_thread_route_affinity_if_matches(
@@ -17797,9 +17798,11 @@ mod tests {
         seed_thread(&store, "th_affinity");
         assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
 
-        store
-            .set_thread_route_affinity("th_affinity", "codex", "gpt-5.6-sol")
-            .unwrap();
+        assert!(
+            store
+                .set_thread_route_affinity("th_affinity", "p/m", "codex", "gpt-5.6-sol",)
+                .unwrap()
+        );
         assert_eq!(
             store.thread_route_affinity("th_affinity").unwrap(),
             Some(("codex".into(), "gpt-5.6-sol".into()))
@@ -17834,6 +17837,12 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+        assert!(
+            !store
+                .set_thread_route_affinity("th_affinity", "p/m", "codex", "gpt-5.6-sol",)
+                .unwrap()
+        );
         assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
     }
 
@@ -17916,7 +17925,7 @@ mod tests {
         for _ in 0..2 {
             let store = Store::open(&path).unwrap();
             store
-                .set_thread_route_affinity("th_old", "codex", "shared")
+                .set_thread_route_affinity("th_old", "auto/shared", "codex", "shared")
                 .unwrap();
             assert_eq!(
                 store.thread_route_affinity("th_old").unwrap(),

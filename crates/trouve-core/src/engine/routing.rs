@@ -517,6 +517,7 @@ impl Engine {
                             if automatic_model_name(&thread.model).is_some() {
                                 self.store.set_thread_route_affinity(
                                     &thread.id,
+                                    &thread.model,
                                     &route.provider_id,
                                     &route.provider_model,
                                 )?;
@@ -844,6 +845,8 @@ impl Engine {
                             content: text.clone(),
                         },
                     )?;
+                }
+                if !text.is_empty() || !reasoning.is_empty() {
                     self.store.append_message(
                         &thread.id,
                         &serde_json::to_value(Message::Assistant {
