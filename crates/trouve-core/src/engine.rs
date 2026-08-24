@@ -909,7 +909,7 @@ impl BridgedToolOwnerRouter {
     }
 }
 
-/// Return the canonical trouve tool nested in a Codex MCP presentation item.
+/// Return the canonical trouve tool nested in a vendor MCP presentation item.
 /// User-configured MCP servers retain their vendor wrapper; only the reserved
 /// first-party `trouve` server is projected through ToolExecutor instead.
 fn trouve_bridge_wrapper_call<'a>(
@@ -10707,21 +10707,30 @@ impl Engine {
     /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
     /// the full bridge by default so mutation-capable work crosses the same
     /// ToolExecutor and per-session execution lane as native provider calls.
-    /// An explicit `tool_bridge = false` retains the vendor-native fallback.
+    /// Cursor receives a supplemental semantic-search bridge because ACP
+    /// cannot disable its native tools. An explicit `tool_bridge = false`
+    /// retains the vendor-native fallback where a full bridge is supported.
     fn mcp_bridge_for(
         &self,
         model: &str,
         thread_id: &str,
     ) -> Option<trouve_agents::McpBridgeConfig> {
         let backend_id = model.split_once('/')?.0;
-        let (kind, bridge_tools) = {
+        let (kind, configured_bridge_tools) = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
             (pc.kind.clone(), pc.tool_bridge.unwrap_or(true))
         };
-        if kind != "claude-cli" && kind != "codex-app-server" {
+        if !matches!(
+            kind.as_str(),
+            "claude-cli" | "codex-app-server" | "cursor-cli"
+        ) {
             return None;
         }
+        // Cursor cannot suppress its native ACP tools. Give it only the
+        // supplemental always-bridged search surface; Ask mode confines its
+        // native tools to read-only operations.
+        let bridge_tools = kind != "cursor-cli" && configured_bridge_tools;
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
                 "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
@@ -10729,9 +10738,9 @@ impl Engine {
             );
             return None;
         };
-        // Codex approvals are native RPCs; serving Claude's permission-gate
-        // tool would only tempt the model to call it.
-        let serve_approval = kind != "codex-app-server";
+        // Codex and Cursor approvals are native RPCs; serving Claude's
+        // permission-gate tool would only tempt those models to call it.
+        let serve_approval = kind == "claude-cli";
         let claims = BridgeTicketClaims {
             bridge_tools,
             serve_approval,
@@ -12822,7 +12831,7 @@ impl Engine {
                                 tracing::warn!(
                                     root_thread_id = %thread.id,
                                     call_id,
-                                    "Codex MCP wrapper arrived before its root vendor thread identity"
+                                    "MCP wrapper arrived before its root vendor thread identity"
                                 );
                             }
                         }
@@ -22701,7 +22710,7 @@ default_permission_mode = "ask"
     }
 
     #[test]
-    fn codex_and_claude_default_to_the_full_tool_bridge() {
+    fn vendor_backends_receive_their_supported_tool_bridge_surface() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.providers.insert(
@@ -22723,6 +22732,13 @@ default_permission_mode = "ask"
             ProviderConfig {
                 kind: "claude-cli".into(),
                 tool_bridge: Some(false),
+                ..Default::default()
+            },
+        );
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-cli".into(),
                 ..Default::default()
             },
         );
@@ -22800,6 +22816,12 @@ default_permission_mode = "ask"
             .unwrap();
         assert!(!native.bridge_tools);
         assert!(native.url.contains("tools=0"));
+
+        let cursor = engine.mcp_bridge_for("cursor/model", "th_1").unwrap();
+        assert!(!cursor.bridge_tools);
+        assert!(cursor.url.contains("tools=0"));
+        assert!(cursor.url.contains("approval=0"));
+        assert!(cursor.disallowed_tools.is_empty());
         engine.clear_cancel("th_1");
     }
 

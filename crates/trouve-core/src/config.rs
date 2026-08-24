@@ -159,6 +159,8 @@ pub struct ProviderConfig {
     /// full tool/permission fidelity. Claude's built-ins are disabled; Codex
     /// built-ins are confined to a read-only sandbox. Defaults to true for
     /// those backends; explicit false retains the vendor-native fallback.
+    /// Cursor always receives the supplemental semantic-search bridge because
+    /// ACP cannot disable its native tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_bridge: Option<bool>,
 }

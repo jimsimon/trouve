@@ -72,8 +72,9 @@ pub struct BackendTurn {
     /// rejects reported tool use; adapters also disable vendor built-ins
     /// where their protocol supports it.
     pub tool_free: bool,
-    /// When set, the vendor agent runs with its built-in tools disabled and
-    /// trouve's ToolExecutor bridged in over MCP (Claude Code only, v1).
+    /// First-party HTTP MCP bridge. A full bridge replaces or confines
+    /// vendor-native tools; a supplemental bridge adds trouve's semantic
+    /// search tools while leaving read-only vendor tools available.
     pub mcp_bridge: Option<McpBridgeConfig>,
     /// User-configured MCP servers (user/workspace/worktree scopes, already
     /// merged and env-expanded by the engine) to mount alongside the bridge.
