@@ -601,11 +601,17 @@ fn enforce_automated_review_backend_boundary(
     Ok(())
 }
 
-fn vendor_tool_uses_automated_review_budget(tools_enabled: bool, tool: &str) -> bool {
+fn vendor_tool_uses_automated_review_budget(
+    tools_enabled: bool,
+    tool: &str,
+    first_start: bool,
+) -> bool {
     // A backend that cannot remove native read/search tools is allowed to use
     // them during a logically tool-free turn under its read-only confinement.
-    // Tool-enabled review turns retain their hard per-turn cap.
-    tools_enabled && !trouve_direct_bridge_call(tool)
+    // Tool-enabled review turns retain their hard per-turn cap. ACP backends
+    // may repeat a tool_call update with the same id as its state changes, so
+    // charge the logical call only once.
+    tools_enabled && first_start && !trouve_direct_bridge_call(tool)
 }
 
 struct BackendCollaboratorProjection {
@@ -12826,11 +12832,12 @@ impl Engine {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
+                    let first_start = seen_tool_cards.insert(call_id.clone());
                     // First-party MCP calls reserve inside handle_tool_call;
                     // Claude mirrors them here under mcp__trouve__*. Native
                     // reads on a backend without a true tool-free mode are
                     // confined but intentionally outside the zero-call cap.
-                    if vendor_tool_uses_automated_review_budget(tools_enabled, &tool) {
+                    if vendor_tool_uses_automated_review_budget(tools_enabled, &tool, first_start) {
                         self.automated_review_tool_budgets.reserve(&thread.id)?;
                     }
                     tool_started_at.insert(call_id.clone(), Instant::now());
@@ -12866,9 +12873,7 @@ impl Engine {
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    if seen_tool_cards.insert(call_id.clone())
-                        && !self.tool_card_exists(&thread.id, turn, &call_id)
-                    {
+                    if first_start && !self.tool_card_exists(&thread.id, turn, &call_id) {
                         persisted.push(Event::ToolRequested {
                             turn,
                             call_id: call_id.clone(),
@@ -17965,11 +17970,23 @@ mod tests {
             enforce_automated_review_backend_boundary(true, true, false, false, "unsafe").is_err()
         );
 
-        assert!(vendor_tool_uses_automated_review_budget(true, "read_file"));
-        assert!(!vendor_tool_uses_automated_review_budget(false, "search"));
+        assert!(vendor_tool_uses_automated_review_budget(
+            true,
+            "read_file",
+            true
+        ));
         assert!(!vendor_tool_uses_automated_review_budget(
             true,
-            "mcp__trouve__read_file"
+            "read_file",
+            false
+        ));
+        assert!(!vendor_tool_uses_automated_review_budget(
+            false, "search", true
+        ));
+        assert!(!vendor_tool_uses_automated_review_budget(
+            true,
+            "mcp__trouve__read_file",
+            true
         ));
     }
 
