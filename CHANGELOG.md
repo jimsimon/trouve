@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.1] - 2026-08-23
+
+### Fixed
+
+- **Confined Cursor code reviews**: automated reviews can again use Cursor's
+  vendor-native read and search tools under ACP Ask mode's read-only
+  confinement, while external MCP servers remain withheld and backends without
+  an enforceable confinement boundary still fail closed.
+
 ## [4.1.0] - 2026-08-23
 
 This release adds faster ways to find and understand work, broadens attachment
@@ -818,6 +827,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.1.1]: https://github.com/jimsimon/trouve/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/jimsimon/trouve/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/jimsimon/trouve/compare/v3.8.0...v4.0.0
 [3.8.0]: https://github.com/jimsimon/trouve/compare/v3.7.0...v3.8.0
