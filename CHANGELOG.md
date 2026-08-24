@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] - 2026-08-24
+
+This release improves automated review throughput and restores semantic search
+to Cursor-backed reviews.
+
+### Changed
+
+- **Faster parallel reviews**: planned semantic-router and reviewer batches now
+  enter the shared scheduler together, while a separate short-lived lane bounds
+  durable setup bursts without capping active model turns. The obsolete
+  `TROUVE_CODE_REVIEW_TASK_CONCURRENCY` override has been removed; operators
+  should use the global or provider turn limits and
+  `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` when narrowing review capacity.
+
+### Fixed
+
+- **Cursor semantic search**: Cursor ACP sessions again mount trouve's
+  supplemental HTTP MCP bridge, allowing automated reviews to use semantic
+  search within their tool budgets. Sessions reload when bridge credentials or
+  MCP settings rotate, while Cursor's native tools remain read-only confined.
+
 ## [4.1.2] - 2026-08-23
 
 ### Changed
@@ -843,6 +864,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.2.0]: https://github.com/jimsimon/trouve/compare/v4.1.2...v4.2.0
 [4.1.2]: https://github.com/jimsimon/trouve/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/jimsimon/trouve/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/jimsimon/trouve/compare/v4.0.0...v4.1.0
