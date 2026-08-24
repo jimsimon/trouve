@@ -12197,6 +12197,17 @@ impl Engine {
     /// the full bridge by default so mutation-capable work crosses the same
     /// ToolExecutor and per-session execution lane as native provider calls.
     /// An explicit `tool_bridge = false` retains the vendor-native fallback.
+    fn full_tool_bridge_available_for(&self, backend_id: &str) -> bool {
+        let configured = {
+            let config = self.config.lock().unwrap();
+            config.providers.get(backend_id).is_some_and(|provider| {
+                matches!(provider.kind.as_str(), "claude-cli" | "codex-app-server")
+                    && provider.tool_bridge.unwrap_or(true)
+            })
+        };
+        configured && self.base_url.read().unwrap().is_some()
+    }
+
     fn mcp_bridge_for(
         &self,
         backend_or_model: &str,
@@ -19629,6 +19640,16 @@ mod tests {
 
     struct StartupTestBackend;
 
+    struct ReviewSafeTestProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        tools: Arc<Mutex<Vec<String>>>,
+        system: Arc<Mutex<String>>,
+    }
+
+    struct ToolFreeReviewBackend {
+        turns: Arc<Mutex<Vec<(bool, BackendPermission, String)>>>,
+    }
+
     struct StartupPersistenceFailureBackend {
         store: Store,
         cleanup_started: Arc<tokio::sync::Semaphore>,
@@ -19712,6 +19733,99 @@ mod tests {
             &self,
             _turn: BackendTurn,
         ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+            Ok(futures::stream::iter([Ok(BackendEvent::Completed {
+                usage: Usage::default(),
+            })])
+            .boxed())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ReviewSafeTestProvider {
+        fn id(&self) -> &str {
+            "review-native"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "review-native/shared",
+                "Review-safe native model",
+            )]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            messages: &[trouve_providers::Message],
+            tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.tools.lock().unwrap() = tools.iter().map(|tool| tool.name.clone()).collect();
+            *self.system.lock().unwrap() = messages
+                .iter()
+                .find_map(|message| match message {
+                    trouve_providers::Message::System(system) => Some(system.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Ok(futures::stream::iter([
+                Ok(ProviderEvent::TextDelta("reviewed".into())),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ToolFreeReviewBackend {
+        fn id(&self) -> &str {
+            "tool-free-backend"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "tool-free-backend/shared",
+                "Tool-free review backend",
+            )]
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        fn supports_tool_free_turns(&self) -> bool {
+            true
+        }
+
+        async fn start_login(
+            &self,
+        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+            unreachable!("tool-free routing test never starts login")
+        }
+
+        async fn run_turn(
+            &self,
+            turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+            self.turns.lock().unwrap().push((
+                turn.tool_free,
+                turn.permission,
+                turn.instructions.unwrap_or_default(),
+            ));
             Ok(futures::stream::iter([Ok(BackendEvent::Completed {
                 usage: Usage::default(),
             })])
@@ -19934,6 +20048,58 @@ mod tests {
         };
         store.insert_thread(&thread, &Default::default()).unwrap();
         thread
+    }
+
+    fn mark_routing_test_thread_as_review(store: &Store, thread: &Thread, suffix: &str) {
+        let job = store
+            .enqueue_code_review_job(&crate::store::NewCodeReviewJob {
+                dedupe_key: format!("acme/widgets#42:{suffix}"),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Review automatic routing".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "routing".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: Some(thread.model.clone()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: "Review it".into(),
+                reviewers: crate::reviewers::built_in_reviewers()
+                    .into_iter()
+                    .take(1)
+                    .collect(),
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let task = store
+            .create_code_review_task(&crate::store::NewCodeReviewTask {
+                job_id: job.id,
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some("correctness".into()),
+                reviewer_name: "Correctness".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some(thread.model.clone()),
+                prompt: "Review automatic routing".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(&task.id, &thread.session_id, &thread.id, &thread.model)
+            .unwrap()
+            .unwrap();
     }
 
     struct BlockingToolExecutor {
@@ -21170,6 +21336,165 @@ mod tests {
         let model = engine.resolve_model_info("auto/live").await.unwrap();
         assert_eq!(model.id, "auto/live");
         assert_eq!(stalled_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn automatic_review_routes_skip_unbridged_backends_and_enforce_security() {
+        let data = tempfile::tempdir().unwrap();
+        init_engine_test_repo(data.path());
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_test_thread(&store, data.path(), "secure_review_route", "auto/shared");
+        mark_routing_test_thread_as_review(&store, &thread, "secure-review-route");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = Arc::new(Mutex::new(Vec::new()));
+        let system = Arc::new(Mutex::new(String::new()));
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    provider_order: vec!["startup-backend".into(), "review-native".into()],
+                    ..Default::default()
+                },
+            )
+            .with_backend("startup-backend", Arc::new(StartupTestBackend))
+            .with_provider(
+                "review-native",
+                Arc::new(ReviewSafeTestProvider {
+                    calls: calls.clone(),
+                    tools: tools.clone(),
+                    system: system.clone(),
+                }),
+            ),
+        );
+        let _budget = engine
+            .begin_automated_review_tool_budget(&thread.id, 10)
+            .unwrap();
+
+        engine
+            .send_message(&thread.id, "Review safely".into(), Vec::new())
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }));
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if completed && inactive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("secure automatic review route should complete");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ModelRouteSelected { provider_id, .. } if provider_id == "review-native"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            Event::TurnCompleted {
+                checkpoint_id: None,
+                ..
+            }
+        )));
+        assert!(
+            system
+                .lock()
+                .unwrap()
+                .contains("Security boundary for unattended code review")
+        );
+        let tools = tools.lock().unwrap();
+        assert!(tools.iter().any(|tool| tool == "read_file"));
+        assert!(tools.iter().all(|tool| matches!(
+            tool.as_str(),
+            "read_file" | "list_dir" | "glob" | "grep" | "search" | "find_related" | "git_diff"
+        )));
+    }
+
+    #[tokio::test]
+    async fn automatic_tool_free_review_routes_skip_backends_that_cannot_disable_tools() {
+        let data = tempfile::tempdir().unwrap();
+        init_engine_test_repo(data.path());
+        let store = Store::open_in_memory().unwrap();
+        let thread =
+            routing_test_thread(&store, data.path(), "tool_free_review_route", "auto/shared");
+        mark_routing_test_thread_as_review(&store, &thread, "tool-free-review-route");
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    provider_order: vec!["startup-backend".into(), "tool-free-backend".into()],
+                    ..Default::default()
+                },
+            )
+            .with_backend("startup-backend", Arc::new(StartupTestBackend))
+            .with_backend(
+                "tool-free-backend",
+                Arc::new(ToolFreeReviewBackend {
+                    turns: turns.clone(),
+                }),
+            ),
+        );
+        let _budget = engine
+            .begin_automated_review_tool_budget(&thread.id, 0)
+            .unwrap();
+
+        engine
+            .send_message_without_tools(&thread.id, "Route personas".into())
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }));
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if completed && inactive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("secure tool-free review route should complete");
+
+        let turns = turns.lock().unwrap();
+        assert_eq!(turns.len(), 1);
+        let (tool_free, permission, instructions) = &turns[0];
+        assert!(*tool_free);
+        assert!(matches!(permission, BackendPermission::ReadOnly));
+        assert!(instructions.contains("Security boundary for unattended code review"));
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ModelRouteSelected { provider_id, .. } if provider_id == "tool-free-backend"
+        )));
     }
 
     #[tokio::test]

@@ -151,10 +151,14 @@ impl Engine {
             background_mutation_lease: None,
         };
 
+        let background = self.store.is_code_review_thread(&thread.id)?;
         let personas = self.resolve_personas(Some(Path::new(&workspace.path)))?;
-        let mode = personas::find_persona(&personas, &thread.mode)
+        let mut mode = personas::find_persona(&personas, &thread.mode)
             .cloned()
             .unwrap_or_else(personas::fallback_persona);
+        if background {
+            mode = personas::secure_automated_review_persona(mode);
+        }
 
         // Accept the turn durably before automatic route discovery or
         // capacity acquisition. If either setup step fails, the dispatcher
@@ -198,12 +202,25 @@ impl Engine {
             }
         };
         anyhow::ensure!(!candidates.is_empty(), "model route disappeared");
+        if background {
+            candidates.retain(|candidate| match &candidate.executor {
+                ModelExecutor::Native(_) => true,
+                ModelExecutor::Backend(_) if tools_enabled => {
+                    self.full_tool_bridge_available_for(&candidate.provider_id)
+                }
+                ModelExecutor::Backend(backend) => backend.supports_tool_free_turns(),
+            });
+            anyhow::ensure!(
+                !candidates.is_empty(),
+                "no provider route for {} can satisfy automated code review's secure tool boundary",
+                thread.model
+            );
+        }
         let selection_info = model_info_for_routed_selection(routed_model_info(
             thread.model.clone(),
             candidates.clone(),
         ));
         let total_candidates = candidates.len();
-        let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
         // Session lifecycle always precedes turn/provider capacity. Concrete
         // and automatic routes therefore share one lock order and cannot
         // deadlock while session deletion or restore waits for the write lock.
@@ -213,7 +230,6 @@ impl Engine {
             _ = cancel.cancelled() => bail!("turn cancelled"),
             guard = session_lifecycle.read() => guard,
         };
-        let background = self.store.is_code_review_thread(&thread.id)?;
         let mut first_candidate = 0;
         let first_route_capacity = loop {
             let route = candidates.get(first_candidate).with_context(|| {
@@ -348,30 +364,34 @@ impl Engine {
                 specs = self.executor.specs(&tool_ctx) => specs,
             }
             .into_iter()
-            .filter(|spec| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&spec.name))
+            .filter(|spec| personas::tool_allowed(&mode, &spec.name))
             .collect();
-            specs.push(ask_question_spec());
-            specs.push(search_transcript_spec());
-            let spawn_allowed = |name: &str| {
-                mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|tool| tool == name)
-            };
+            if personas::tool_allowed(&mode, "ask_question") {
+                specs.push(ask_question_spec());
+            }
+            if personas::tool_allowed(&mode, "search_transcript") {
+                specs.push(search_transcript_spec());
+            }
             if self.thread_can_spawn_subagents(&thread.id)? {
-                if spawn_allowed("spawn_thread") {
+                if personas::tool_allowed(&mode, "spawn_thread") {
                     specs.push(spawn_thread_spec());
                 }
-                if spawn_allowed("spawn_session") {
+                if personas::tool_allowed(&mode, "spawn_session") {
                     specs.push(spawn_session_spec());
                 }
-                if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+                if personas::tool_allowed(&mode, "spawn_output") {
                     specs.push(spawn_output_spec());
                 }
             }
         }
-        let system = context::system_prompt(
+        let mut system = context::system_prompt(
             &mode,
             self.config_dir.as_deref(),
             Path::new(&workspace.path),
         );
+        if background {
+            personas::append_automated_review_security_prompt(&mut system);
+        }
         let stored_model_options = model_options_for_schema(
             &self.store.thread_model_options(&thread.id)?,
             &selection_info,
@@ -502,7 +522,7 @@ impl Engine {
                         },
                     )?;
                     self.record_routed_usage(&session.id, &thread.id, turn, &mut accounting, true)?;
-                    let checkpoint_id = if concurrent_child {
+                    let checkpoint_id = if mode.read_only {
                         None
                     } else {
                         self.maybe_checkpoint(&session, thread, turn, &cancel)
@@ -1147,6 +1167,12 @@ impl Engine {
         let full_tool_bridge = mcp_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.bridge_tools);
+        enforce_automated_review_backend_boundary(
+            self.store.is_code_review_thread(&thread.id)?,
+            tools_enabled,
+            full_tool_bridge,
+            backend_id,
+        )?;
         if full_tool_bridge {
             if !instructions.is_empty() {
                 instructions.push_str("\n\n");
@@ -1421,6 +1447,13 @@ impl Engine {
                             );
                         }
                         continue;
+                    }
+                    // First-party MCP calls reserve inside handle_tool_call;
+                    // Claude mirrors them here under mcp__trouve__*. Count
+                    // only the backend's remaining sandbox-confined read
+                    // tools at this lifecycle boundary.
+                    if !trouve_direct_bridge_call(&tool) {
+                        self.automated_review_tool_budgets.reserve(&thread.id)?;
                     }
                     if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
@@ -1787,6 +1820,10 @@ impl Engine {
                     questions,
                     responder,
                 } => {
+                    // Vendor question extensions are another engine-served
+                    // interaction path. Reserve before publishing or waiting
+                    // so they share the same hard review-turn allowance.
+                    self.automated_review_tool_budgets.reserve(&thread.id)?;
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
