@@ -386,6 +386,12 @@ impl AgentBackend for CursorBackend {
         }
     }
 
+    fn confines_read_only_turns(&self) -> bool {
+        // Cursor's ACP Ask mode exposes search-only tools and withholds edit
+        // and command execution (see the mode selection in `run_turn`).
+        true
+    }
+
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
         spawn_login(&self.command, &["login"]).await
     }

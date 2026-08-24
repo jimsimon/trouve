@@ -590,14 +590,22 @@ fn enforce_automated_review_backend_boundary(
     automated_review: bool,
     tools_enabled: bool,
     full_tool_bridge: bool,
+    confined_read_only: bool,
     backend_id: &str,
 ) -> Result<()> {
-    if automated_review && tools_enabled && !full_tool_bridge {
+    if automated_review && tools_enabled && !full_tool_bridge && !confined_read_only {
         bail!(
-            "automated code review requires backend {backend_id} to use the full ToolExecutor bridge"
+            "automated code review requires backend {backend_id} to use the full ToolExecutor bridge or enforce read-only confinement"
         );
     }
     Ok(())
+}
+
+fn vendor_tool_uses_automated_review_budget(tools_enabled: bool, tool: &str) -> bool {
+    // A backend that cannot remove native read/search tools is allowed to use
+    // them during a logically tool-free turn under its read-only confinement.
+    // Tool-enabled review turns retain their hard per-turn cap.
+    tools_enabled && !trouve_direct_bridge_call(tool)
 }
 
 struct BackendCollaboratorProjection {
@@ -12251,10 +12259,12 @@ impl Engine {
         let full_tool_bridge = mcp_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.bridge_tools);
+        let automated_review = self.store.is_code_review_thread(&thread.id)?;
         enforce_automated_review_backend_boundary(
-            self.store.is_code_review_thread(&thread.id)?,
+            automated_review,
             tools_enabled,
             full_tool_bridge,
+            backend.confines_read_only_turns(),
             backend_id,
         )?;
         if full_tool_bridge {
@@ -12266,7 +12276,7 @@ impl Engine {
         // A full bridge already exposes user MCP servers through the local
         // ToolExecutor. Mounting them directly as well would bypass trouve's
         // permission and per-session concurrency gates.
-        let mcp_servers = if tools_enabled && !full_tool_bridge {
+        let mcp_servers = if tools_enabled && !full_tool_bridge && !automated_review {
             self.mcp_servers_for(session)?
         } else {
             Vec::new()
@@ -12812,16 +12822,16 @@ impl Engine {
                         }
                         continue;
                     }
-                    // First-party MCP calls reserve inside handle_tool_call;
-                    // Claude mirrors them here under mcp__trouve__*. Count
-                    // only the backend's remaining sandbox-confined read
-                    // tools at this lifecycle boundary.
-                    if !trouve_direct_bridge_call(&tool) {
-                        self.automated_review_tool_budgets.reserve(&thread.id)?;
-                    }
                     if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
+                    }
+                    // First-party MCP calls reserve inside handle_tool_call;
+                    // Claude mirrors them here under mcp__trouve__*. Native
+                    // reads on a backend without a true tool-free mode are
+                    // confined but intentionally outside the zero-call cap.
+                    if vendor_tool_uses_automated_review_budget(tools_enabled, &tool) {
+                        self.automated_review_tool_budgets.reserve(&thread.id)?;
                     }
                     tool_started_at.insert(call_id.clone(), Instant::now());
                     let could_create = could_request_pull_request_creation(&tool, &args);
@@ -17939,10 +17949,28 @@ mod tests {
 
     #[test]
     fn automated_review_vendor_tools_fail_closed_without_a_full_bridge() {
-        assert!(enforce_automated_review_backend_boundary(false, true, false, "cursor").is_ok());
-        assert!(enforce_automated_review_backend_boundary(true, false, false, "cursor").is_ok());
-        assert!(enforce_automated_review_backend_boundary(true, true, true, "codex").is_ok());
-        assert!(enforce_automated_review_backend_boundary(true, true, false, "cursor").is_err());
+        assert!(
+            enforce_automated_review_backend_boundary(false, true, false, false, "unsafe").is_ok()
+        );
+        assert!(
+            enforce_automated_review_backend_boundary(true, false, false, false, "unsafe").is_ok()
+        );
+        assert!(
+            enforce_automated_review_backend_boundary(true, true, true, false, "codex").is_ok()
+        );
+        assert!(
+            enforce_automated_review_backend_boundary(true, true, false, true, "cursor").is_ok()
+        );
+        assert!(
+            enforce_automated_review_backend_boundary(true, true, false, false, "unsafe").is_err()
+        );
+
+        assert!(vendor_tool_uses_automated_review_budget(true, "read_file"));
+        assert!(!vendor_tool_uses_automated_review_budget(false, "search"));
+        assert!(!vendor_tool_uses_automated_review_budget(
+            true,
+            "mcp__trouve__read_file"
+        ));
     }
 
     #[test]

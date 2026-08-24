@@ -453,6 +453,14 @@ pub trait AgentBackend: Send + Sync {
         false
     }
 
+    /// Whether [`BackendPermission::ReadOnly`] is an enforceable vendor-side
+    /// confinement boundary even without trouve's full MCP tool bridge.
+    /// Automated reviews may use such a backend's native read/search tools;
+    /// backends that return false must use the full bridge instead.
+    fn confines_read_only_turns(&self) -> bool {
+        false
+    }
+
     /// Live subscription usage (plan, metered allowance windows). Codex
     /// answers via its app-server, Claude Code via a stream-json `get_usage`
     /// control request, and Cursor via the dashboard's undocumented usage
