@@ -205,10 +205,13 @@ impl Engine {
         if background {
             candidates.retain(|candidate| match &candidate.executor {
                 ModelExecutor::Native(_) => true,
-                ModelExecutor::Backend(_) if tools_enabled => {
+                ModelExecutor::Backend(backend) if tools_enabled => {
                     self.full_tool_bridge_available_for(&candidate.provider_id)
+                        || backend.confines_read_only_turns()
                 }
-                ModelExecutor::Backend(backend) => backend.supports_tool_free_turns(),
+                ModelExecutor::Backend(backend) => {
+                    backend.supports_tool_free_turns() || backend.confines_read_only_turns()
+                }
             });
             anyhow::ensure!(
                 !candidates.is_empty(),
@@ -1167,10 +1170,12 @@ impl Engine {
         let full_tool_bridge = mcp_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.bridge_tools);
+        let automated_review = self.store.is_code_review_thread(&thread.id)?;
         enforce_automated_review_backend_boundary(
-            self.store.is_code_review_thread(&thread.id)?,
+            automated_review,
             tools_enabled,
             full_tool_bridge,
+            backend.confines_read_only_turns(),
             backend_id,
         )?;
         if full_tool_bridge {
@@ -1180,8 +1185,9 @@ impl Engine {
             instructions.push_str(crate::tools::VENDOR_TOOL_BRIDGE_GUIDANCE);
         }
         // A full bridge exposes user MCP servers through ToolExecutor. Direct
-        // mounting would bypass trouve's permission and mutation lanes.
-        let mcp_servers = if tools_enabled && !full_tool_bridge {
+        // mounting would bypass trouve's permission and mutation lanes, and
+        // unattended reviews never inherit user-configured MCP capabilities.
+        let mcp_servers = if tools_enabled && !full_tool_bridge && !automated_review {
             self.mcp_servers_for(session)?
         } else {
             Vec::new()
@@ -1448,13 +1454,6 @@ impl Engine {
                         }
                         continue;
                     }
-                    // First-party MCP calls reserve inside handle_tool_call;
-                    // Claude mirrors them here under mcp__trouve__*. Count
-                    // only the backend's remaining sandbox-confined read
-                    // tools at this lifecycle boundary.
-                    if !trouve_direct_bridge_call(&tool) {
-                        self.automated_review_tool_budgets.reserve(&thread.id)?;
-                    }
                     if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         side_effect_started = true;
@@ -1462,6 +1461,13 @@ impl Engine {
                             "backend requested tool {tool} during a tool-free turn"
                         )));
                         break;
+                    }
+                    // First-party MCP calls reserve inside handle_tool_call;
+                    // Claude mirrors them here under mcp__trouve__*. Native
+                    // reads on a backend without a true tool-free mode are
+                    // confined but intentionally outside the zero-call cap.
+                    if vendor_tool_uses_automated_review_budget(tools_enabled, &tool) {
+                        self.automated_review_tool_budgets.reserve(&thread.id)?;
                     }
                     side_effect_started = true;
                     open_tools.insert(call_id.clone());

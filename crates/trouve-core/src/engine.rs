@@ -19674,8 +19674,10 @@ mod tests {
         system: Arc<Mutex<String>>,
     }
 
-    struct ToolFreeReviewBackend {
+    struct ReviewRoutingBackend {
         turns: Arc<Mutex<Vec<(bool, BackendPermission, String)>>>,
+        strict_tool_free: bool,
+        confined_read_only: bool,
     }
 
     struct StartupPersistenceFailureBackend {
@@ -19812,7 +19814,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl AgentBackend for ToolFreeReviewBackend {
+    impl AgentBackend for ReviewRoutingBackend {
         fn id(&self) -> &str {
             "tool-free-backend"
         }
@@ -19836,7 +19838,11 @@ mod tests {
         }
 
         fn supports_tool_free_turns(&self) -> bool {
-            true
+            self.strict_tool_free
+        }
+
+        fn confines_read_only_turns(&self) -> bool {
+            self.confined_read_only
         }
 
         async fn start_login(
@@ -21476,8 +21482,10 @@ mod tests {
             .with_backend("startup-backend", Arc::new(StartupTestBackend))
             .with_backend(
                 "tool-free-backend",
-                Arc::new(ToolFreeReviewBackend {
+                Arc::new(ReviewRoutingBackend {
                     turns: turns.clone(),
+                    strict_tool_free: true,
+                    confined_read_only: false,
                 }),
             ),
         );
@@ -21514,6 +21522,78 @@ mod tests {
         assert_eq!(turns.len(), 1);
         let (tool_free, permission, instructions) = &turns[0];
         assert!(*tool_free);
+        assert!(matches!(permission, BackendPermission::ReadOnly));
+        assert!(instructions.contains("Security boundary for unattended code review"));
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ModelRouteSelected { provider_id, .. } if provider_id == "tool-free-backend"
+        )));
+    }
+
+    #[tokio::test]
+    async fn automatic_review_routes_accept_confined_read_only_backends() {
+        let data = tempfile::tempdir().unwrap();
+        init_engine_test_repo(data.path());
+        let store = Store::open_in_memory().unwrap();
+        let thread =
+            routing_test_thread(&store, data.path(), "confined_review_route", "auto/shared");
+        mark_routing_test_thread_as_review(&store, &thread, "confined-review-route");
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    provider_order: vec!["tool-free-backend".into()],
+                    ..Default::default()
+                },
+            )
+            .with_backend(
+                "tool-free-backend",
+                Arc::new(ReviewRoutingBackend {
+                    turns: turns.clone(),
+                    strict_tool_free: false,
+                    confined_read_only: true,
+                }),
+            ),
+        );
+        let _budget = engine
+            .begin_automated_review_tool_budget(&thread.id, 10)
+            .unwrap();
+
+        engine
+            .send_message(&thread.id, "Review under confinement".into(), Vec::new())
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }));
+                let inactive = !engine
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&thread.id);
+                if completed && inactive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("confined automatic review route should complete");
+
+        let turns = turns.lock().unwrap();
+        assert_eq!(turns.len(), 1);
+        let (tool_free, permission, instructions) = &turns[0];
+        assert!(!*tool_free);
         assert!(matches!(permission, BackendPermission::ReadOnly));
         assert!(instructions.contains("Security boundary for unattended code review"));
         let events = store
