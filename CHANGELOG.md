@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.2] - 2026-08-23
+
+### Changed
+
+- **Clearer review outcomes**: successful automated reviews with open findings
+  now use a warning-style “needs attention” status instead of looking like
+  failed review runs, while unavailable open-finding counts remain explicitly
+  marked as unknown.
+
+### Fixed
+
+- **Cursor review tool budgets**: repeated ACP lifecycle updates for one
+  logical Cursor tool call are charged only once, preventing valid automated
+  reviews from exhausting their hard tool-call budget prematurely.
+
 ## [4.1.1] - 2026-08-23
 
 ### Fixed
@@ -827,6 +842,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.1.2]: https://github.com/jimsimon/trouve/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/jimsimon/trouve/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/jimsimon/trouve/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/jimsimon/trouve/compare/v3.8.0...v4.0.0
