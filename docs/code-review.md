@@ -244,14 +244,14 @@ server and consumes no GitHub requests.
 
 ### Model-provider concurrency
 
-Review jobs may prepare up to 24 reviewer tasks concurrently, and two jobs may
-run at once, but the shared turn scheduler applies stricter gates before any
-model request starts. By default, at most 26 turns run globally, at most 24 of
-them may be background turns, at most 18 turns use the same provider, and at
-most 16 of those may be background turns. Consequently one provider receives
-no more than 16 concurrent review requests, background work across all
-providers is capped at 24, and two global plus two per-provider slots remain
-available for interactive work.
+Each review job admits every planned router and reviewer batch task
+concurrently, and two jobs may run at once, but the shared turn scheduler
+applies stricter gates before any model request starts. By default, at most 26
+turns run globally, at most 24 of them may be background turns, at most 18 turns
+use the same provider, and at most 16 of those may be background turns.
+Consequently one provider receives no more than 16 concurrent review requests,
+background work across all providers is capped at 24, and two global plus two
+per-provider slots remain available for interactive work.
 
 These are concurrency limits, not requests-per-minute guarantees; provider
 plans and model-specific quotas vary. Deployments that observe throttling
@@ -259,11 +259,10 @@ should lower `TROUVE_PROVIDER_TURN_CONCURRENCY` and
 `TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY`. The corresponding global
 overrides are `TROUVE_TURN_CONCURRENCY` and
 `TROUVE_BACKGROUND_TURN_CONCURRENCY`; review orchestration can be narrowed
-further with `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` and
-`TROUVE_CODE_REVIEW_TASK_CONCURRENCY`. All limits must be positive and require
-a server restart. Review-job concurrency has a hard maximum of 32; larger
-persisted, API, or `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are reduced to
-32 with a server warning.
+further with `TROUVE_CODE_REVIEW_JOB_CONCURRENCY`. All limits must be positive
+and require a server restart. Review-job concurrency has a hard maximum of 32;
+larger persisted, API, or `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are
+reduced to 32 with a server warning.
 
 ## Backup and upgrades
 
