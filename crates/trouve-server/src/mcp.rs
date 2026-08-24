@@ -1,5 +1,5 @@
 //! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude
-//! Code, Codex) back into trouve — the successor to the old spawned
+//! Code, Codex, Cursor) back into trouve — the successor to the old spawned
 //! `mcp-bridge` subprocess.
 //!
 //! The engine points vendor agents at
