@@ -94,8 +94,6 @@ const REVIEW_COLLAPSE_BATCH_LIMIT: u64 = 16;
 /// one slow group delays at most its own wave rather than the whole pass.
 const REVIEW_COLLAPSE_GROUP_CONCURRENCY: usize = 4;
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
-const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
-const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 24;
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
 // Bump when batch identity or composition changes so interrupted jobs never
@@ -4944,12 +4942,8 @@ impl Engine {
             elapsed_since_ms(preparation_started),
         )?;
         let reviewers_started = Instant::now();
-        let task_concurrency = positive_concurrency_from_env(
-            REVIEW_TASK_CONCURRENCY_ENV,
-            DEFAULT_REVIEW_TASK_CONCURRENCY,
-        );
         let reviewer_timeout = Duration::from_secs(review_settings.reviewer_timeout_seconds);
-        let executed_results = stream::iter(planned.into_iter().map(
+        let executed_results = futures::future::join_all(planned.into_iter().map(
             |(reviewer, batch_index, prompt, applies, skip_reason, existing_task)| {
                 let engine = self.clone();
                 let job = job.clone();
@@ -4959,6 +4953,7 @@ impl Engine {
                 let batch_count = batches.len();
                 async move {
                     ensure_review_current(&superseded)?;
+                    let setup = engine.acquire_planned_turn_setup(&superseded).await?;
                     let task = if let Some(task) = existing_task {
                         task
                     } else {
@@ -4981,6 +4976,7 @@ impl Engine {
                             .skip_code_review_task(&task.id, &skip_reason)?
                             .ok_or_else(|| anyhow!("review task was cancelled before routing"))?;
                         engine.emit_code_review_task(&job.id, skipped)?;
+                        drop(setup);
                         engine.refresh_code_review_progress(&job.id).await?;
                         return Ok::<_, anyhow::Error>(Vec::new());
                     }
@@ -5003,6 +4999,7 @@ impl Engine {
                             )?
                             .ok_or_else(|| anyhow!("review task was cancelled before dispatch"))?;
                         engine.emit_code_review_task(&job.id, task.clone())?;
+                        drop(setup);
                         let timeout_label =
                             format!("reviewer {} batch {}", reviewer.name, batch_index + 1);
                         let (turn, parsed) = engine
@@ -5071,8 +5068,6 @@ impl Engine {
                 }
             },
         ))
-        .buffer_unordered(task_concurrency)
-        .collect::<Vec<_>>()
         .await;
         task_results.extend(executed_results);
         self.store.set_code_review_job_phase_elapsed(
@@ -5922,10 +5917,6 @@ impl Engine {
             }
         };
         let batch_count = batches.len();
-        let task_concurrency = positive_concurrency_from_env(
-            REVIEW_TASK_CONCURRENCY_ENV,
-            DEFAULT_REVIEW_TASK_CONCURRENCY,
-        );
         let candidates = semantic_routing_candidates(job, reviewers)
             .into_iter()
             .cloned()
@@ -5948,7 +5939,7 @@ impl Engine {
         let session_id = session_id.to_owned();
         let superseded = superseded.clone();
         let active_threads = Arc::clone(active_threads);
-        let results = stream::iter(work.into_iter().map(
+        let results = futures::future::join_all(work.into_iter().map(
             move |(batch_index, candidates, prompt)| {
                 let engine = Arc::clone(&engine);
                 let job = job.clone();
@@ -5958,6 +5949,7 @@ impl Engine {
                 let active_threads = Arc::clone(&active_threads);
                 async move {
                     ensure_review_current(&superseded)?;
+                    let setup = engine.acquire_planned_turn_setup(&superseded).await?;
                     let task = engine.store.create_code_review_task(&NewCodeReviewTask {
                         job_id: job.id.clone(),
                         role: trouve_protocol::CodeReviewTaskRole::Router,
@@ -6000,6 +5992,7 @@ impl Engine {
                             anyhow!("semantic routing task was cancelled before dispatch")
                         })?;
                     engine.emit_code_review_task(&job.id, task.clone())?;
+                    drop(setup);
                     match engine
                         .run_semantic_routing_turn(
                             &job,
@@ -6036,8 +6029,6 @@ impl Engine {
                 }
             },
         ))
-        .buffer_unordered(task_concurrency)
-        .collect::<Vec<_>>()
         .await;
 
         let mut routed = HashMap::new();
@@ -21398,7 +21389,6 @@ mod tests {
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("about one minute"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("no more than 4 tool calls"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("checked-in code"));
-        assert_eq!(DEFAULT_REVIEW_TASK_CONCURRENCY, 24);
     }
 
     #[test]

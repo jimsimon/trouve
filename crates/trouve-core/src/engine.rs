@@ -529,6 +529,10 @@ const PROVIDER_TURN_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_TURN_CONCURRENCY";
 const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 18;
 const PROVIDER_BACKGROUND_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY";
 const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 16;
+/// Bounds durable task and thread setup bursts across planned review turns.
+/// Permits are released before model dispatch, so this does not cap active
+/// reviewer turns.
+const PLANNED_TURN_SETUP_CONCURRENCY: usize = 24;
 
 fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
     let id = session_id.strip_prefix("se_").unwrap_or(session_id);
@@ -1163,6 +1167,7 @@ struct ProviderBackoff {
 struct TurnScheduler {
     all: Arc<tokio::sync::Semaphore>,
     background: Arc<tokio::sync::Semaphore>,
+    planned_setups: Arc<tokio::sync::Semaphore>,
     provider_all_limit: usize,
     provider_background_limit: usize,
     providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
@@ -1193,9 +1198,23 @@ impl TurnScheduler {
         Self {
             all: Arc::new(tokio::sync::Semaphore::new(all_limit)),
             background: Arc::new(tokio::sync::Semaphore::new(background_limit)),
+            planned_setups: Arc::new(tokio::sync::Semaphore::new(PLANNED_TURN_SETUP_CONCURRENCY)),
             provider_all_limit,
             provider_background_limit,
             providers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn acquire_planned_setup(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn setup cancelled"),
+            permit = self.planned_setups.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow!("turn setup scheduler closed"))
+            }
         }
     }
 
@@ -2401,6 +2420,15 @@ fn build_all_backends(
         backends.insert(id.clone(), backend);
     }
     backends
+}
+
+impl Engine {
+    pub(crate) async fn acquire_planned_turn_setup(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.turn_scheduler.acquire_planned_setup(cancel).await
+    }
 }
 
 impl Engine {
@@ -16952,6 +16980,33 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn planned_turn_setup_lane_bounds_only_setup_admission() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::with_capacity(PLANNED_TURN_SETUP_CONCURRENCY);
+        for _ in 0..PLANNED_TURN_SETUP_CONCURRENCY {
+            permits.push(scheduler.acquire_planned_setup(&cancel).await.unwrap());
+        }
+
+        let blocked_cancel = tokio_util::sync::CancellationToken::new();
+        let blocked = scheduler.acquire_planned_setup(&blocked_cancel);
+        tokio::pin!(blocked);
+        tokio::select! {
+            biased;
+            result = &mut blocked => panic!("setup lane admitted excess work: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        blocked_cancel.cancel();
+        assert_eq!(
+            blocked.await.unwrap_err().to_string(),
+            "turn setup cancelled"
+        );
+
+        drop(permits.pop());
+        let _replacement = scheduler.acquire_planned_setup(&cancel).await.unwrap();
+    }
 
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
