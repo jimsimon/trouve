@@ -660,7 +660,7 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
       {attentionState === "open" ? (
-        <span class="status failed">needs attention</span>
+        <span class="status warning">needs attention</span>
       ) : attentionState === "unknown" ? (
         <span class="status warning">status unknown</span>
       ) : (
@@ -1428,9 +1428,13 @@ function JobDetailPane({
       </p>
       <header class="detail-header">
         <div>
-          <StatusPill status={job.status} />
-          {attentionState === "open" && <span class="status failed">needs attention</span>}
-          {attentionState === "unknown" && <span class="status warning">status unknown</span>}
+          {attentionState === "open" ? (
+            <span class="status warning">needs attention</span>
+          ) : attentionState === "unknown" ? (
+            <span class="status warning">status unknown</span>
+          ) : (
+            <StatusPill status={job.status} />
+          )}
           <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
           </h2>
