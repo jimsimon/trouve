@@ -15,9 +15,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Cursor review tool budgets**: repeated ACP lifecycle updates for one
-  logical Cursor tool call are charged only once, preventing valid automated
-  reviews from exhausting their hard tool-call budget prematurely.
+- **Automated review tool budgets**: repeated ACP lifecycle updates for one
+  logical Cursor tool call are charged only once, and the bounded reviewer
+  allowance accommodates synchronized release manifests without prematurely
+  terminating valid supply-chain reviews.
 
 ## [4.1.1] - 2026-08-23
 
