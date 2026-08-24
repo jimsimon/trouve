@@ -244,14 +244,17 @@ server and consumes no GitHub requests.
 
 ### Model-provider concurrency
 
-Each review job admits every planned router and reviewer batch task
-concurrently, and two jobs may run at once, but the shared turn scheduler
-applies stricter gates before any model request starts. By default, at most 26
-turns run globally, at most 24 of them may be background turns, at most 18 turns
-use the same provider, and at most 16 of those may be background turns.
-Consequently one provider receives no more than 16 concurrent review requests,
-background work across all providers is capped at 24, and two global plus two
-per-provider slots remain available for interactive work.
+Each review job plans every router and reviewer batch task at once. Durable task
+and thread setup uses a short-lived scheduler lane shared across review jobs;
+its permit is released before model dispatch, so setup bursts are bounded
+without capping active reviewer turns. Two jobs may run at once, but the shared
+turn scheduler applies stricter gates before any model request starts. By
+default, at most 26 turns run globally, at most 24 of them may be background
+turns, at most 18 turns use the same provider, and at most 16 of those may be
+background turns. Consequently one provider receives no more than 16
+concurrent review requests, background work across all providers is capped at
+24, and two global plus two per-provider slots remain available for interactive
+work.
 
 These are concurrency limits, not requests-per-minute guarantees; provider
 plans and model-specific quotas vary. Deployments that observe throttling

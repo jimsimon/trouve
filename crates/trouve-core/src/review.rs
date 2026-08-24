@@ -4953,6 +4953,7 @@ impl Engine {
                 let batch_count = batches.len();
                 async move {
                     ensure_review_current(&superseded)?;
+                    let setup = engine.acquire_planned_turn_setup(&superseded).await?;
                     let task = if let Some(task) = existing_task {
                         task
                     } else {
@@ -4975,6 +4976,7 @@ impl Engine {
                             .skip_code_review_task(&task.id, &skip_reason)?
                             .ok_or_else(|| anyhow!("review task was cancelled before routing"))?;
                         engine.emit_code_review_task(&job.id, skipped)?;
+                        drop(setup);
                         engine.refresh_code_review_progress(&job.id).await?;
                         return Ok::<_, anyhow::Error>(Vec::new());
                     }
@@ -4997,6 +4999,7 @@ impl Engine {
                             )?
                             .ok_or_else(|| anyhow!("review task was cancelled before dispatch"))?;
                         engine.emit_code_review_task(&job.id, task.clone())?;
+                        drop(setup);
                         let timeout_label =
                             format!("reviewer {} batch {}", reviewer.name, batch_index + 1);
                         let (turn, parsed) = engine
@@ -5946,6 +5949,7 @@ impl Engine {
                 let active_threads = Arc::clone(&active_threads);
                 async move {
                     ensure_review_current(&superseded)?;
+                    let setup = engine.acquire_planned_turn_setup(&superseded).await?;
                     let task = engine.store.create_code_review_task(&NewCodeReviewTask {
                         job_id: job.id.clone(),
                         role: trouve_protocol::CodeReviewTaskRole::Router,
@@ -5988,6 +5992,7 @@ impl Engine {
                             anyhow!("semantic routing task was cancelled before dispatch")
                         })?;
                     engine.emit_code_review_task(&job.id, task.clone())?;
+                    drop(setup);
                     match engine
                         .run_semantic_routing_turn(
                             &job,
