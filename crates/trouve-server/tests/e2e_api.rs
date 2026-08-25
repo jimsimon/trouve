@@ -1459,7 +1459,7 @@ async fn session_and_thread_updates_and_provider_config() {
     // surfaces instead.
     assert!(
         known.iter().all(|k| k["auth"] != "oauth"),
-        "no subscription presets in the shipped catalog"
+        "no shipped provider preset uses OAuth"
     );
     // Subscription agent backends use the vendor-supported authentication
     // mechanism for their transport. Cursor's SDK takes an API key while

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { constants as fsConstants } from "node:fs";
 import {
   access,
@@ -15,9 +17,14 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  assetName,
   download,
+  installSignalCleanup,
+  parseTimeoutSeconds,
   readBoundedJsonResponse,
   startBridge,
+  terminalStatusIsFinished,
+  terminateProcessTree,
 } from "./qualify_cursor_sdk_bridge.mjs";
 
 async function listen(server) {
@@ -30,6 +37,28 @@ async function listen(server) {
   assert.equal(typeof address, "object");
   return address;
 }
+
+test("timeout parsing rejects values outside Node's timer range", () => {
+  assert.equal(parseTimeoutSeconds("300"), 300);
+  assert.throws(() => parseTimeoutSeconds("2147484"), /no greater than/u);
+});
+
+test("qualification status matching accepts only explicit finished values", () => {
+  for (const value of [3, "3", "RUN_LIFECYCLE_STATUS_FINISHED"]) {
+    assert.equal(terminalStatusIsFinished(value), true);
+  }
+  for (const value of ["NOT_FINISHED", "NOT_COMPLETED", "COMPLETED"]) {
+    assert.equal(terminalStatusIsFinished(value), false);
+  }
+});
+
+test("Windows ARM64 is rejected before an asset URL is constructed", () => {
+  assert.throws(() => assetName("win32", "arm64"), /unsupported/u);
+  assert.equal(
+    assetName("win32", "x64"),
+    "cursor-sdk-bridge-standalone-win32-x64.tar.gz",
+  );
+});
 
 test("bounded JSON reading rejects an oversized streamed response", async () => {
   const response = new Response(JSON.stringify({ value: "too large" }));
@@ -117,5 +146,63 @@ setInterval(() => {}, 1000);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  },
+);
+
+test("spawn failures preserve the original Bridge error", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trouve-cursor-spawn-test-"));
+  const stateRoot = join(root, "state");
+  await mkdir(stateRoot);
+  try {
+    await assert.rejects(
+      startBridge({
+        binary: join(root, "missing-bridge"),
+        workspace: root,
+        stateRoot,
+        apiKey: "fixture-api-key",
+        callback: {
+          bearer: "fixture-callback-token",
+          url: "http://127.0.0.1:9",
+        },
+        timeoutMilliseconds: 2_000,
+      }),
+      /ENOENT/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  "signal cleanup terminates a detached process group before exit",
+  { skip: process.platform === "win32" },
+  async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    await new Promise((accept, reject) => {
+      child.once("spawn", accept);
+      child.once("error", reject);
+    });
+    const target = new EventEmitter();
+    const exits = [];
+    const errors = [];
+    const signals = installSignalCleanup(() => terminateProcessTree(child), {
+      target,
+      exit: (code) => exits.push(code),
+      report: (error) => errors.push(error),
+    });
+
+    target.emit("SIGTERM");
+    await signals.completion();
+    signals.dispose();
+
+    assert.deepEqual(errors, []);
+    assert.deepEqual(exits, [143]);
+    assert.throws(
+      () => process.kill(child.pid, 0),
+      (error) => error?.code === "ESRCH",
+    );
   },
 );

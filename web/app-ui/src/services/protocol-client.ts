@@ -1491,7 +1491,7 @@ export class ProtocolClient {
   cliInstallStatus(cliId: string): Promise<ProtocolCliInstallStatus> {
     return this.#validatedJson(
       `/v1/clis/${encodeURIComponent(cliId)}/install`,
-      "CLI install status",
+      "agent runtime install status",
       "CliInstallStatus",
       (loaded) => loaded.cliInstallStatus,
     );
