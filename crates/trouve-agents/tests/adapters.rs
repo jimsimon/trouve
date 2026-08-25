@@ -539,24 +539,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             send_count += 1
             if "STALL_FOR_CANCELLATION" in request.get("message", {}).get("text", ""):
                 run_id = "sdk-run-cancel"
-                first = frame({
-                    "sdkMessage": {
-                        "type": "system",
-                        "message": {
+                first = b"".join([
+                    frame({
+                        "sdkMessage": {
                             "type": "system",
-                            "agent_id": agent_id,
-                            "run_id": run_id
+                            "message": {
+                                "type": "system",
+                                "agent_id": agent_id,
+                                "run_id": run_id
+                            }
                         }
-                    }
-                })
+                    }),
+                    frame({
+                        "sdkMessage": {
+                            "type": "assistant",
+                            "message": {
+                                "type": "assistant",
+                                "message": {
+                                    "content": [{"type": "text", "text": "RUN_READY"}]
+                                }
+                            }
+                        }
+                    })
+                ])
+                self.protocol_version = "HTTP/1.1"
                 self.send_response(200)
                 self.send_header("Content-Type", "application/connect+json")
+                self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
-                self.wfile.write(first)
+                self.wfile.write(format(len(first), "x").encode("ascii") + b"\r\n")
+                self.wfile.write(first + b"\r\n")
                 self.wfile.flush()
-                with open(binary + ".send-started", "w", encoding="utf-8") as destination:
-                    destination.write(run_id)
                 if not cancel_received.wait(10):
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
                     return
                 cancelled = "RUN_LIFECYCLE_STATUS_CANCELLED"
                 messages = [
@@ -575,7 +591,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     {"done": {"agentId": agent_id, "runId": run_id}}
                 ]
                 body = b"".join(frame(message) for message in messages) + frame({}, 2)
-                self.wfile.write(body)
+                self.wfile.write(format(len(body), "x").encode("ascii") + b"\r\n")
+                self.wfile.write(body + b"\r\n0\r\n\r\n")
                 self.wfile.flush()
                 return
             names = active_options.get("tools", {}).get("names", [])
@@ -928,12 +945,19 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
     .await;
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !std::path::Path::new(&format!("{stub}.send-started")).exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        loop {
+            match stream.next().await {
+                Some(Ok(BackendEvent::TextDelta(text))) if text == "RUN_READY" => {
+                    break;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Cursor Send failed before cancellation: {error}"),
+                None => panic!("Cursor Send ended before publishing its run identity"),
+            }
         }
     })
     .await
-    .expect("Cursor Send fixture did not start");
+    .expect("Cursor Send did not publish an event after its run identity");
     cancel.cancel();
 
     let mut saw_cancelled = false;
