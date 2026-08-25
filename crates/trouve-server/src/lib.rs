@@ -973,6 +973,7 @@ pub async fn serve_listener(
     engine.start_session_pr_verification_worker();
     engine.warm_title_model();
     engine.start_connectivity_monitor();
+    engine.start_background_turn_listener();
     engine.start_automation_scheduler();
     engine.start_code_review_service();
     let router = build_secured_router(engine, security);

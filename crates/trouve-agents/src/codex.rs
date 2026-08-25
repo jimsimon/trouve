@@ -4409,6 +4409,7 @@ mod tests {
             instructions: None,
             permission: crate::BackendPermission::Ask,
             tool_free: false,
+            attach_background: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }

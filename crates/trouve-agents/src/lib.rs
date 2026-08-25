@@ -72,6 +72,13 @@ pub struct BackendTurn {
     /// rejects reported tool use; adapters also disable vendor built-ins
     /// where their protocol supports it.
     pub tool_free: bool,
+    /// Attach to a vendor-autonomous turn already running (or buffered) on
+    /// this thread instead of prompting a new one. The adapter must not send
+    /// `prompt` to the vendor; it streams the autonomous turn's events and
+    /// completes at that turn's boundary. Backends that never report
+    /// autonomous turns can ignore this: the engine only sets it after the
+    /// backend signalled one via `take_background_turn_signals`.
+    pub attach_background: bool,
     /// First-party HTTP MCP bridge. A full bridge replaces or confines
     /// vendor-native tools; a supplemental bridge adds trouve's semantic
     /// search tools while leaving read-only vendor tools available.
@@ -497,6 +504,16 @@ pub trait AgentBackend: Send + Sync {
 
     /// Run one agent turn in the worktree, streaming translated events.
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError>;
+
+    /// Take (at most once) the stream of thread ids on which the backend has
+    /// observed the start of a vendor-autonomous turn — model activity the
+    /// vendor harness initiated itself (e.g. a scheduled wake-up) outside
+    /// any trouve-initiated turn. The engine responds by dispatching an
+    /// attach turn (`BackendTurn::attach_background`) so the activity is
+    /// persisted and rendered live like any other turn. Default: none.
+    fn take_background_turn_signals(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+        None
+    }
 }
 
 /// Locate a binary on PATH (absolute/relative paths pass through).

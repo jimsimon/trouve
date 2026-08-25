@@ -51,6 +51,9 @@ pub struct ClaudeBackend {
     id: String,
     command: String,
     pool: Arc<Pool>,
+    /// Signals one thread id per vendor-autonomous turn the router observes.
+    background_turns: mpsc::Sender<String>,
+    background_turns_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
     /// Serialized one-shot usage process. A failed cleanup remains here so a
     /// later poll cannot spawn over an unproven prior process tree.
     usage_process: Mutex<Option<ProcessTreeChild>>,
@@ -61,10 +64,13 @@ pub struct ClaudeBackend {
 
 impl ClaudeBackend {
     pub fn new(id: impl Into<String>, command: Option<String>) -> Self {
+        let (background_turns, background_turns_rx) = mpsc::channel(64);
         Self {
             id: id.into(),
             command: command.unwrap_or_else(|| "claude".into()),
             pool: Arc::new(Pool::default()),
+            background_turns,
+            background_turns_rx: std::sync::Mutex::new(Some(background_turns_rx)),
             usage_process: Mutex::new(None),
             #[cfg(test)]
             injected_usage_cleanup_failure: std::sync::atomic::AtomicBool::new(false),
@@ -134,7 +140,7 @@ impl Pool {
         let mut procs = self.procs.lock().await;
         let mut dead = Vec::new();
         for (id, p) in procs.iter() {
-            if Arc::strong_count(p) != 1 || p.lines.try_lock().is_err() {
+            if Arc::strong_count(p) != 1 || p.router.is_busy() {
                 continue; // turn in flight
             }
             if p.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT {
@@ -168,7 +174,7 @@ impl Pool {
             let lru = procs
                 .iter()
                 .filter(|(_, p)| {
-                    p.is_reusable() && Arc::strong_count(p) == 1 && p.lines.try_lock().is_ok()
+                    p.is_reusable() && Arc::strong_count(p) == 1 && !p.router.is_busy()
                 })
                 .min_by_key(|(_, p)| *p.last_used.lock().unwrap())
                 .map(|(id, _)| id.clone());
@@ -197,11 +203,253 @@ impl Pool {
     }
 }
 
+/// Bytes of vendor-autonomous ("background") turn output buffered while no
+/// attach consumer is connected. Overflow drops the oldest lines (logged);
+/// the vendor transcript remains authoritative on disk.
+const BACKGROUND_BUFFER_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Outcome of registering a turn consumer with the stdout router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterRegistration {
+    /// The consumer will receive lines (live or drained from the buffer).
+    Streaming,
+    /// Attach-only registration found no background turn to attach to.
+    NothingPending,
+}
+
+#[derive(Default)]
+struct RouterState {
+    /// Consumer for the trouve turn currently entitled to stdout lines.
+    turn: Option<mpsc::Sender<String>>,
+    /// The registered consumer is an attach turn: it must receive exactly
+    /// one buffered/live background turn, ending at its `result` line.
+    turn_is_attach: bool,
+    /// The process is inside a vendor-autonomous turn whose `result` has not
+    /// arrived yet.
+    background_in_flight: bool,
+    /// Complete, in-order lines of vendor-autonomous turns awaiting an
+    /// attach consumer. May span multiple turns; `result` lines delimit.
+    background: std::collections::VecDeque<String>,
+    background_bytes: usize,
+    dropped_background_lines: u64,
+}
+
+/// Owns a process's stdout for its whole life and routes each line to the
+/// correct consumer. This guarantees two properties the old
+/// turn-locks-the-receiver design could not: Claude Code never blocks on an
+/// unread stdout pipe between trouve turns, and events from a
+/// vendor-autonomous turn (e.g. a Monitor wake-up inside Claude Code) can
+/// never leak into the next trouve-initiated turn — attribution only
+/// switches at `result` boundaries.
+struct StdoutRouter {
+    state: std::sync::Mutex<RouterState>,
+    /// Wakes the router loop when a consumer registers.
+    notify: tokio::sync::Notify,
+}
+
+impl StdoutRouter {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(RouterState::default()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// True while stdout lines are attributed to any in-flight turn.
+    fn is_busy(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.turn.is_some() || state.background_in_flight
+    }
+
+    /// Install the consumer for a trouve-initiated turn. A non-attach turn
+    /// starts receiving lines only after any in-flight background turn
+    /// reaches its `result`; an attach turn receives exactly one background
+    /// turn (buffered and/or live) and reports `NothingPending` when there
+    /// is none.
+    fn register(
+        &self,
+        sender: mpsc::Sender<String>,
+        attach: bool,
+    ) -> Result<RouterRegistration, BackendError> {
+        let mut state = self.state.lock().unwrap();
+        if state.turn.as_ref().is_some_and(|turn| turn.is_closed()) {
+            // A cancelled turn's consumer can linger until its next send
+            // fails; replace it eagerly so registration never deadlocks.
+            state.turn = None;
+            state.turn_is_attach = false;
+        }
+        if state.turn.is_some() {
+            return Err(BackendError::Protocol(
+                "claude: a turn is already consuming this process".into(),
+            ));
+        }
+        if attach && state.background.is_empty() && !state.background_in_flight {
+            return Ok(RouterRegistration::NothingPending);
+        }
+        if state.dropped_background_lines > 0 {
+            tracing::warn!(
+                dropped = state.dropped_background_lines,
+                "claude: background turn output was dropped before a consumer attached"
+            );
+            state.dropped_background_lines = 0;
+        }
+        state.turn = Some(sender);
+        state.turn_is_attach = attach;
+        drop(state);
+        self.notify.notify_one();
+        Ok(RouterRegistration::Streaming)
+    }
+
+    fn buffer_background(state: &mut RouterState, line: String) {
+        state.background_bytes += line.len();
+        state.background.push_back(line);
+        while state.background_bytes > BACKGROUND_BUFFER_MAX_BYTES {
+            let Some(dropped) = state.background.pop_front() else {
+                break;
+            };
+            state.background_bytes -= dropped.len();
+            state.dropped_background_lines += 1;
+        }
+    }
+
+    /// Run the routing loop until the stdout pump closes. `on_background_start`
+    /// is invoked (non-blocking) each time a vendor-autonomous turn begins.
+    async fn run(
+        self: Arc<Self>,
+        mut lines: mpsc::Receiver<String>,
+        on_background_start: impl Fn(),
+    ) {
+        loop {
+            // Drain buffered background lines to an attach consumer first;
+            // this must not require fresh stdout activity.
+            loop {
+                let (sender, line, last_of_turn) = {
+                    let mut state = self.state.lock().unwrap();
+                    let Some(sender) = state.turn.clone() else {
+                        break;
+                    };
+                    if !state.turn_is_attach {
+                        break;
+                    }
+                    let Some(line) = state.background.pop_front() else {
+                        break;
+                    };
+                    state.background_bytes -= line.len();
+                    let last = line_is_result(&line);
+                    if last {
+                        state.turn = None;
+                        state.turn_is_attach = false;
+                    }
+                    (sender, line, last)
+                };
+                if sender.send(line).await.is_err() {
+                    let mut state = self.state.lock().unwrap();
+                    if state
+                        .turn
+                        .as_ref()
+                        .is_some_and(|current| current.same_channel(&sender))
+                    {
+                        state.turn = None;
+                        state.turn_is_attach = false;
+                    }
+                    break;
+                }
+                if last_of_turn {
+                    break;
+                }
+            }
+
+            let line = tokio::select! {
+                line = lines.recv() => match line {
+                    Some(line) => line,
+                    None => break,
+                },
+                _ = self.notify.notified() => continue,
+            };
+            let is_result = line_is_result(&line);
+            // Decide the destination under the lock, send outside it.
+            let destination = {
+                let mut state = self.state.lock().unwrap();
+                let turn = state.turn.clone();
+                let is_attach = state.turn_is_attach;
+                let in_flight = state.background_in_flight;
+                match (turn, in_flight) {
+                    // An attach consumer takes the in-flight background
+                    // turn's lines directly and ends at its boundary.
+                    (Some(sender), true) if is_attach => {
+                        if is_result {
+                            state.background_in_flight = false;
+                            state.turn = None;
+                            state.turn_is_attach = false;
+                        }
+                        Some(sender)
+                    }
+                    // A background turn in flight always owns the line, even
+                    // when a non-attach turn is already registered: that
+                    // turn's prompt is queued vendor-side and its events
+                    // begin only after this boundary.
+                    (_, true) => {
+                        if is_result {
+                            state.background_in_flight = false;
+                        }
+                        Self::buffer_background(&mut state, line.clone());
+                        None
+                    }
+                    (Some(sender), false) => {
+                        if is_result {
+                            state.turn = None;
+                            state.turn_is_attach = false;
+                        }
+                        Some(sender)
+                    }
+                    (None, false) => {
+                        // First line of a new vendor-autonomous turn.
+                        state.background_in_flight = !is_result;
+                        Self::buffer_background(&mut state, line.clone());
+                        on_background_start();
+                        None
+                    }
+                }
+            };
+            if let Some(sender) = destination
+                && sender.send(line).await.is_err()
+            {
+                let mut state = self.state.lock().unwrap();
+                if state
+                    .turn
+                    .as_ref()
+                    .is_some_and(|current| current.same_channel(&sender))
+                {
+                    state.turn = None;
+                    state.turn_is_attach = false;
+                }
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        state.turn = None;
+        state.turn_is_attach = false;
+        state.background_in_flight = false;
+    }
+}
+
+fn line_is_result(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|kind| kind == "result")
+        })
+        .unwrap_or(false)
+}
+
 /// One persistent `claude` process serving one trouve thread.
 struct ClaudeProc {
     stdin: Mutex<ChildStdin>,
-    /// Stdout lines; locked by the active turn for its whole duration.
-    lines: Mutex<mpsc::Receiver<String>>,
+    /// Routes stdout lines to the active consumer; owns the receiver for
+    /// the process's whole life.
+    router: Arc<StdoutRouter>,
     child: Mutex<ProcessTreeChild>,
     /// False as soon as any path decides this transport must be recycled.
     /// The pool retains a false entry until full-tree cleanup is acknowledged.
@@ -399,9 +647,32 @@ impl AgentBackend for ClaudeBackend {
         })
     }
 
+    fn take_background_turn_signals(&self) -> Option<mpsc::Receiver<String>> {
+        self.background_turns_rx.lock().unwrap().take()
+    }
+
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         self.start_reaper();
         let cancel = turn.cancel.clone();
+        if turn.attach_background {
+            let existing = self
+                .pool
+                .procs
+                .lock()
+                .await
+                .get(&turn.thread_id)
+                .cloned()
+                .filter(|proc_| proc_.is_reusable());
+            let Some(_) = existing else {
+                // The process (and any background output) is gone; report an
+                // empty completed turn instead of spawning a fresh CLI.
+                return Ok(Box::pin(futures::stream::once(async {
+                    Ok(BackendEvent::Completed {
+                        usage: Usage::default(),
+                    })
+                })));
+            };
+        }
         // Process acquisition may have to clean a stale tree. Do not cancel
         // that future midway through its acknowledgement: it keeps the pool
         // key quarantined and checks cancellation before spawning.
@@ -426,26 +697,26 @@ impl AgentBackend for ClaudeBackend {
             }));
         }
 
+        let attach = turn.attach_background;
         let stream = async_stream(move |tx| async move {
-            // Exclusive claim on the process for this turn.
-            let mut lines = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                        let _ = tx.send(Err(error)).await;
-                    }
+            let (turn_tx, mut lines) = mpsc::channel::<String>(1024);
+            match proc_.router.register(turn_tx, attach) {
+                Ok(RouterRegistration::Streaming) => {}
+                Ok(RouterRegistration::NothingPending) => {
+                    // The background turn this attach was queued for is gone
+                    // (dropped buffer or consumed by process recycling).
+                    let _ = tx
+                        .send(Ok(BackendEvent::Completed {
+                            usage: Usage::default(),
+                        }))
+                        .await;
                     return;
                 }
-                _ = tx.closed() => {
-                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                        tracing::warn!(
-                            "claude: stream-drop cleanup was not acknowledged: {error}"
-                        );
-                    }
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
                     return;
                 }
-                lines = proc_.lines.lock() => lines,
-            };
+            }
             proc_.touch();
 
             let msg = json!({
@@ -455,34 +726,36 @@ impl AgentBackend for ClaudeBackend {
                     "content": content,
                 }
             });
-            let sent = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                        let _ = tx.send(Err(error)).await;
+            if !attach {
+                let sent = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                            let _ = tx.send(Err(error)).await;
+                        }
+                        return;
                     }
-                    return;
-                }
-                _ = tx.closed() => {
-                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                        tracing::warn!(
-                            "claude: stream-drop cleanup was not acknowledged: {error}"
-                        );
+                    _ = tx.closed() => {
+                        if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                            tracing::warn!(
+                                "claude: stream-drop cleanup was not acknowledged: {error}"
+                            );
+                        }
+                        return;
                     }
-                    return;
+                    sent = async {
+                        let mut stdin = proc_.stdin.lock().await;
+                        stdin.write_all(msg.to_string().as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await
+                    } => sent,
+                };
+                if let Err(e) = sent {
+                    // Likely the process died between turns; keep reading —
+                    // the no-result exit path below reports it (with stderr)
+                    // and drops it from the pool so the next turn respawns.
+                    tracing::debug!("claude stdin write failed: {e}");
                 }
-                sent = async {
-                    let mut stdin = proc_.stdin.lock().await;
-                    stdin.write_all(msg.to_string().as_bytes()).await?;
-                    stdin.write_all(b"\n").await?;
-                    stdin.flush().await
-                } => sent,
-            };
-            if let Err(e) = sent {
-                // Likely the process died between turns; keep reading — the
-                // no-result exit path below reports it (with stderr) and
-                // drops it from the pool so the next turn respawns.
-                tracing::debug!("claude stdin write failed: {e}");
             }
 
             let mut completed = false;
@@ -949,7 +1222,8 @@ impl ClaudeBackend {
         let stdout = child.take_stdout().expect("stdout piped");
         let stderr = child.take_stderr().expect("stderr piped");
 
-        // Stdout pump: lines flow into the channel the active turn drains.
+        // Stdout pump: lines flow into the channel the router owns for the
+        // process's whole life, so the pipe is always being read.
         let (line_tx, line_rx) = mpsc::channel::<String>(256);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -959,6 +1233,20 @@ impl ClaudeBackend {
                 }
             }
         });
+        let router = Arc::new(StdoutRouter::new());
+        {
+            let router = Arc::clone(&router);
+            let thread_id = turn.thread_id.clone();
+            let signal = self.background_turns.clone();
+            tokio::spawn(router.run(line_rx, move || {
+                if signal.try_send(thread_id.clone()).is_err() {
+                    tracing::debug!(
+                        thread_id = %thread_id,
+                        "claude: dropping background-turn signal (listener busy or absent)"
+                    );
+                }
+            }));
+        }
 
         // Stderr pump: keep a bounded tail for error reporting.
         let stderr_tail = Arc::new(std::sync::Mutex::new(String::new()));
@@ -978,7 +1266,7 @@ impl ClaudeBackend {
 
         Ok(ClaudeProc {
             stdin: Mutex::new(stdin),
-            lines: Mutex::new(line_rx),
+            router,
             child: Mutex::new(child),
             reusable: std::sync::atomic::AtomicBool::new(true),
             #[cfg(test)]
@@ -1232,6 +1520,140 @@ fn parse_reset_at(v: &Value) -> Option<i64> {
 mod tests {
     use super::*;
 
+    async fn recv_line(rx: &mut mpsc::Receiver<String>) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn wait_for(mut condition: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached in time");
+    }
+
+    const BG_LINE: &str =
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"background"}]}}"#;
+    const BG_RESULT: &str = r#"{"type":"result","subtype":"success"}"#;
+    const USER_LINE: &str =
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"user"}]}}"#;
+
+    #[tokio::test]
+    async fn router_buffers_background_turns_and_signals_once_per_turn() {
+        let router = Arc::new(StdoutRouter::new());
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx, move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        // A background turn with no consumer buffers and signals exactly once.
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+        wait_for(|| !router.is_busy()).await;
+
+        // A later non-attach turn receives only its own lines, never the
+        // buffered background output.
+        let (turn_tx, mut turn_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(turn_tx, false).unwrap(),
+            RouterRegistration::Streaming
+        );
+        line_tx.send(USER_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(USER_LINE));
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(
+            recv_line(&mut turn_rx).await.is_none(),
+            "turn stream ends at result"
+        );
+
+        // The attach turn drains exactly the buffered background turn.
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(recv_line(&mut attach_rx).await.is_none());
+
+        // Nothing left to attach to.
+        let (empty_tx, _empty_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(empty_tx, true).unwrap(),
+            RouterRegistration::NothingPending
+        );
+        assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn background_turn_in_flight_never_leaks_into_a_registered_turn() {
+        let router = Arc::new(StdoutRouter::new());
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx, || {}));
+
+        // Background turn starts; a trouve turn registers mid-flight (its
+        // prompt is queued vendor-side). This is the regression that used to
+        // swallow the user turn: the buffered background `result` terminated
+        // the user turn's stream before its own events arrived.
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        wait_for(|| router.is_busy()).await;
+        let (turn_tx, mut turn_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(turn_tx, false).unwrap(),
+            RouterRegistration::Streaming
+        );
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        line_tx.send(USER_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+
+        // The user turn sees only the lines after the background boundary.
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(USER_LINE));
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(BG_RESULT));
+
+        // The background turn's lines await an attach consumer.
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+    }
+
+    #[tokio::test]
+    async fn attach_registration_streams_a_live_background_turn_to_its_end() {
+        let router = Arc::new(StdoutRouter::new());
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx, || {}));
+
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        wait_for(|| router.is_busy()).await;
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        // Buffered prefix, then live continuation, ending at the result.
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        line_tx.send(USER_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(USER_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(recv_line(&mut attach_rx).await.is_none());
+        wait_for(|| !router.is_busy()).await;
+    }
+
     #[test]
     fn parses_authoritative_claude_auth_status() {
         assert!(auth_status_is_logged_in(br#"{"loggedIn":true}"#));
@@ -1253,6 +1675,7 @@ mod tests {
             instructions: None,
             permission: BackendPermission::ReadOnly,
             tool_free: false,
+            attach_background: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }
@@ -1298,6 +1721,7 @@ mod tests {
             instructions: None,
             permission: BackendPermission::ReadOnly,
             tool_free: true,
+            attach_background: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }

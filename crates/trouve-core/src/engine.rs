@@ -5,6 +5,11 @@
 //! serialized per session (threads share the session worktree, ADR 0003).
 
 use std::collections::{HashMap, HashSet};
+
+/// Marker prompt content for turns that attach to vendor-autonomous agent
+/// activity instead of prompting the model. It is stored and rendered as the
+/// turn's prompt, so it is written to read sensibly in a transcript.
+pub const BACKGROUND_ATTACH_PROMPT: &str = "[background agent activity]";
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -2796,6 +2801,64 @@ impl Engine {
     /// while online (going offline is rarely urgent), quickly while offline
     /// (clients unblock prompt entry off the recovery event). No-op without
     /// a probe.
+    /// Listen for vendor-autonomous turn signals from agent backends and
+    /// dispatch attach turns so that activity is persisted and rendered
+    /// live instead of buffering silently inside the adapter. Without this,
+    /// a vendor harness that wakes itself (e.g. Claude Code monitors and
+    /// scheduled tasks) produces output no one is reading: the adapter now
+    /// buffers it, and this listener turns it into an ordinary turn.
+    pub fn start_background_turn_listener(self: &Arc<Self>) {
+        let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
+            let map = self.backends.read().unwrap();
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        for (backend_id, backend) in backends {
+            let Some(mut signals) = backend.take_background_turn_signals() else {
+                continue;
+            };
+            let engine = Arc::clone(self);
+            tokio::spawn(async move {
+                while let Some(thread_id) = signals.recv().await {
+                    if let Err(error) = engine.dispatch_background_attach_turn(&thread_id) {
+                        tracing::warn!(
+                            %thread_id,
+                            backend = %backend_id,
+                            %error,
+                            "background attach-turn dispatch failed"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    /// Queue one attach turn for a vendor-autonomous turn the backend
+    /// reported on `thread_id`. The prompt is a fixed marker: the backend
+    /// recognizes it via `BackendTurn::attach_background` and consumes the
+    /// autonomous turn's events instead of prompting the model again.
+    fn dispatch_background_attach_turn(
+        self: &Arc<Self>,
+        thread_id: &str,
+    ) -> Result<(), EngineError> {
+        // Review threads run under strict budgets and their vendor sessions
+        // have no monitors; skip them defensively.
+        if self
+            .store
+            .is_code_review_thread(thread_id)
+            .map_err(EngineError::Internal)?
+        {
+            return Ok(());
+        }
+        self.send_message_with_tools(
+            thread_id,
+            BACKGROUND_ATTACH_PROMPT.to_string(),
+            Vec::new(),
+            true,
+            true,
+        )
+        .map(|_| ())
+    }
+
     pub fn start_connectivity_monitor(self: &Arc<Self>) {
         let Some(probe) = self.connectivity_probe.clone() else {
             return;
@@ -12259,6 +12322,7 @@ impl Engine {
             .map(|file| (file.attachment.clone(), file.relative_path.clone()))
             .collect::<Vec<_>>();
         let content = annotate_attachments(content, &prompt_files);
+        let attach_background = content == BACKGROUND_ATTACH_PROMPT;
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
             .map(|file| trouve_agents::TurnAttachment {
@@ -12342,6 +12406,7 @@ impl Engine {
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
             tool_free: strict_tool_free,
+            attach_background,
             mcp_bridge,
             mcp_servers,
         };
