@@ -32,7 +32,10 @@ import {
   terminalStatusIsFinished,
   terminateProcessTree,
 } from "./qualify_cursor_sdk_bridge.mjs";
-import { createCallbackAdmission } from "./qualify_cursor_sdk_bridge_full.mjs";
+import {
+  createCallbackAdmission,
+  startCallbackServer,
+} from "./qualify_cursor_sdk_bridge_full.mjs";
 
 async function listen(server) {
   await new Promise((accept, reject) => {
@@ -64,6 +67,53 @@ test("full qualification bounds total and concurrent callbacks", () => {
   assert.equal(admission.tryAcquire(), undefined);
   releaseSecond();
   assert.deepEqual(admission.snapshot(), { total: 2, active: 0 });
+});
+
+test("cancelled qualification callbacks settle and release admission", async () => {
+  let resolveStarted;
+  const started = new Promise((resolve) => {
+    resolveStarted = resolve;
+  });
+  const handlers = new Map([
+    [
+      "trouve_test_block",
+      async (_input, record) => {
+        resolveStarted(record);
+        await record.cancelled.promise;
+        return { value: "cancelled" };
+      },
+    ],
+  ]);
+  const callback = await startCallbackServer(handlers, 2_000);
+  try {
+    const controller = new AbortController();
+    const request = fetch(
+      `${callback.url}/sdk.v1.SdkCustomToolCallbackService/CallCustomTool`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${callback.bearer}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          toolName: "trouve_test_block",
+          toolCallId: "call-1",
+          agentId: "agent-1",
+          args: {},
+        }),
+        signal: controller.signal,
+      },
+    ).catch((error) => error);
+    const record = await started;
+    controller.abort();
+    await record.cancelled.promise;
+    await record.settled.promise;
+    assert.deepEqual(callback.admission.snapshot(), { total: 1, active: 0 });
+    assert.ok((await request) instanceof Error);
+  } finally {
+    callback.server.closeAllConnections?.();
+    await new Promise((resolve) => callback.server.close(resolve));
+  }
 });
 
 test("qualification status matching accepts only explicit finished values", () => {

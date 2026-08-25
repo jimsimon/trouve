@@ -17,7 +17,7 @@ use trouve_agents::{
 use trouve_core::Engine;
 use trouve_core::config::Config;
 use trouve_core::store::Store;
-use trouve_protocol::{ModelInfo, Usage};
+use trouve_protocol::{ModelInfo, Scope, Usage};
 use trouve_providers::{EventStream, Message, Provider, ProviderError, ProviderEvent, ToolSpec};
 
 const ANSWER: &str = "The two execution paths present one experience.";
@@ -197,6 +197,7 @@ async fn wait_for_completion(client: &reqwest::Client, url: &str) -> Vec<serde_j
 }
 
 async fn run_visible_turn(
+    engine: &Engine,
     client: &reqwest::Client,
     base: &str,
     session_id: &str,
@@ -226,7 +227,14 @@ async fn run_visible_turn(
         .unwrap()
         .error_for_status()
         .unwrap();
-    wait_for_completion(client, &format!("{base}/threads/{thread_id}/events")).await
+    wait_for_completion(client, &format!("{base}/threads/{thread_id}/events")).await;
+    engine
+        .store()
+        .events_after(&Scope::Thread(thread_id.to_string()), 0)
+        .unwrap()
+        .into_iter()
+        .map(|envelope| serde_json::to_value(envelope).unwrap())
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -392,6 +400,17 @@ fn visible_turn_fold_rejects_malformed_lifecycle_histories() {
             .contains("failure or cancellation")
     );
 
+    let mut post_terminal = valid.clone();
+    post_terminal.push(serde_json::json!({
+        "type":"assistant.progress",
+        "text":"late output"
+    }));
+    assert!(
+        fold_visible_turn(&post_terminal)
+            .unwrap_err()
+            .contains("final observed event")
+    );
+
     let mut out_of_order = valid;
     out_of_order.swap(2, 3);
     assert!(
@@ -435,7 +454,7 @@ async fn raw_provider_and_vendor_backend_share_the_visible_turn_contract() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let router = trouve_server::build_router(engine);
+    let router = trouve_server::build_router(engine.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let base = format!("http://{address}/v1");
     let client = reqwest::Client::new();
@@ -464,8 +483,8 @@ async fn raw_provider_and_vendor_backend_share_the_visible_turn_contract() {
         .unwrap();
     let session_id = session["id"].as_str().unwrap();
 
-    let raw = run_visible_turn(&client, &base, session_id, "raw/model").await;
-    let vendor = run_visible_turn(&client, &base, session_id, "vendor/model").await;
+    let raw = run_visible_turn(&engine, &client, &base, session_id, "raw/model").await;
+    let vendor = run_visible_turn(&engine, &client, &base, session_id, "vendor/model").await;
     assert_eq!(
         fold_visible_turn(&raw).expect("raw provider emitted a malformed visible lifecycle"),
         fold_visible_turn(&vendor).expect("vendor backend emitted a malformed visible lifecycle")

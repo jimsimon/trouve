@@ -216,13 +216,14 @@ async function readRequestBody(request, timeoutMilliseconds) {
   }
 }
 
-async function startCallbackServer(handlers, timeoutMilliseconds) {
+export async function startCallbackServer(handlers, timeoutMilliseconds) {
   const bearer = randomBytes(32).toString("base64url");
   const calls = [];
   const failures = [];
   const admission = createCallbackAdmission();
   const server = createServer(async (request, response) => {
     let releaseAdmission;
+    let record;
     try {
       const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
       if (request.method !== "POST" || path !== CALLBACK_PATH) {
@@ -260,7 +261,7 @@ async function startCallbackServer(handlers, timeoutMilliseconds) {
       if (handler === undefined) {
         throw new QualificationError(`unexpected custom tool: ${body.toolName}`);
       }
-      const record = {
+      record = {
         toolName: body.toolName,
         toolCallId: body.toolCallId,
         agentId: body.agentId,
@@ -268,6 +269,7 @@ async function startCallbackServer(handlers, timeoutMilliseconds) {
         completedAtMs: null,
         cancelledAtMs: null,
         cancelled: deferred(),
+        settled: deferred(),
         ok: false,
       };
       response.once("close", () => {
@@ -297,6 +299,7 @@ async function startCallbackServer(handlers, timeoutMilliseconds) {
       }
     } finally {
       releaseAdmission?.();
+      record?.settled.resolve();
     }
   });
   await new Promise((accept, reject) => {
@@ -310,6 +313,7 @@ async function startCallbackServer(handlers, timeoutMilliseconds) {
   }
   return {
     bearer,
+    admission,
     calls,
     failures,
     server,
@@ -695,6 +699,17 @@ async function qualifyCancellation({
       "custom-tool callback cancellation",
     ),
   ]);
+  await withTimeout(
+    callbackRecord.settled.promise,
+    Math.min(timeoutMilliseconds, 10_000),
+    "custom-tool callback handler settlement",
+  );
+  const callbackAdmission = callback.admission.snapshot();
+  if (callbackAdmission.active !== 0) {
+    throw new QualificationError(
+      `custom-tool callback admission remained active after cancellation (${callbackAdmission.active})`,
+    );
+  }
   if (outcome.error !== null) throw outcome.error;
   const frames = outcome.frames;
   const terminal = exactTerminalResult(frames, "cancelled run");
@@ -712,6 +727,8 @@ async function qualifyCancellation({
     terminal_status: String(terminal.status),
     done: true,
     callback_request_cancelled: true,
+    callback_handler_settled: true,
+    callback_admission_active: callbackAdmission.active,
     callback_count: callbacks.length,
     duration_ms: Math.round(performance.now() - startedAt),
   };
@@ -931,7 +948,10 @@ async function fullQualification(args) {
       throw new QualificationError("block callback invoked outside cancellation test");
     }
     blockControl.started.resolve(record);
-    return blockControl.release.promise;
+    return Promise.race([
+      blockControl.release.promise,
+      record.cancelled.promise.then(() => ({ value: RESULTS.blockReleased })),
+    ]);
   });
   for (let index = 0; index < SCHEMA_PROBE_COUNT; index += 1) {
     const name = `trouve_schema_probe_${String(index).padStart(3, "0")}`;
