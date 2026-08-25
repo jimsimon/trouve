@@ -270,16 +270,18 @@ async function runChild(command, args, timeoutMilliseconds) {
     child.stderr.on("data", (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-16_384);
     });
+    let timedOut = false;
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new QualificationError(`${command} timed out`));
+      timedOut = true;
+      void terminateTimedOutChild(child, command).catch(reject);
     }, timeoutMilliseconds);
     child.once("error", (error) => {
       clearTimeout(timer);
-      reject(error);
+      if (!timedOut) reject(error);
     });
     child.once("exit", (code, signal) => {
       clearTimeout(timer);
+      if (timedOut) return;
       if (code === 0) accept();
       else {
         reject(
@@ -720,6 +722,14 @@ async function waitForChildSettlement(child, milliseconds) {
     child.once("exit", onExit);
     timer = setTimeout(() => finish(false), milliseconds);
   });
+}
+
+async function terminateTimedOutChild(child, label, settlementMilliseconds = 5_000) {
+  child.kill("SIGKILL");
+  if (!(await waitForChildSettlement(child, settlementMilliseconds))) {
+    throw new QualificationError(`${label} timed out and did not terminate`);
+  }
+  throw new QualificationError(`${label} timed out`);
 }
 
 function requestTimeout(timeoutMilliseconds) {
@@ -1446,6 +1456,7 @@ export {
   serverStream,
   startBridge,
   terminalStatusIsFinished,
+  terminateTimedOutChild,
   terminateProcessTree,
   unary,
   verifyToolAllowlist,

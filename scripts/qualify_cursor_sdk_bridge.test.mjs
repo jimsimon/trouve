@@ -31,12 +31,14 @@ import {
   serverStream,
   startBridge,
   terminalStatusIsFinished,
+  terminateTimedOutChild,
   terminateProcessTree,
   validateLoopbackBridgeUrl,
   waitForChildSettlement,
 } from "./qualify_cursor_sdk_bridge.mjs";
 import {
   createCallbackAdmission,
+  inspectToolCalls,
   startCallbackServer,
 } from "./qualify_cursor_sdk_bridge_full.mjs";
 
@@ -274,6 +276,69 @@ test("child settlement waits have a bounded deadline", async () => {
 
   child.exitCode = 0;
   assert.equal(await waitForChildSettlement(child, 10), true);
+});
+
+test("timed-out child cleanup settles before surfacing the timeout", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  let killed = false;
+  let settled = false;
+  child.kill = (signal) => {
+    assert.equal(signal, "SIGKILL");
+    killed = true;
+    setTimeout(() => {
+      settled = true;
+      child.signalCode = signal;
+      child.emit("exit", null, signal);
+    }, 10);
+    return true;
+  };
+
+  await assert.rejects(
+    terminateTimedOutChild(child, "fixture child", 100),
+    /fixture child timed out$/u,
+  );
+  assert.equal(killed, true);
+  assert.equal(settled, true);
+});
+
+test("full qualification requires callback and stream ids to be one-to-one", () => {
+  const frame = (callId, status) => ({
+    sdkMessage: {
+      message: { type: "tool_call", name: "mcp", call_id: callId, status },
+    },
+  });
+  const frames = [
+    frame("call-a", "started"),
+    frame("call-a", "completed"),
+    frame("call-b", "started"),
+    frame("call-b", "completed"),
+  ];
+  const tools = ["tool-a", "tool-b"];
+  assert.throws(
+    () => inspectToolCalls(
+      frames,
+      [
+        { toolName: "tool-a", toolCallId: "call-a" },
+        { toolName: "tool-b", toolCallId: "call-a" },
+      ],
+      tools,
+      false,
+      "parallel turn",
+    ),
+    /not one-to-one/u,
+  );
+  assert.doesNotThrow(() => inspectToolCalls(
+    frames,
+    [
+      { toolName: "tool-a", toolCallId: "call-a" },
+      { toolName: "tool-b", toolCallId: "call-b" },
+    ],
+    tools,
+    false,
+    "parallel turn",
+  ));
 });
 
 test("bounded downloads remove their partial destination", async () => {
