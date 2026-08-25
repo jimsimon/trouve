@@ -1987,7 +1987,7 @@ struct BoundedLine {
 impl BoundedLine {
     fn display(&self) -> String {
         if self.truncated {
-            format!("{} [truncated]", self.text)
+            "[oversized diagnostic line omitted]".into()
         } else {
             self.text.clone()
         }
@@ -2023,7 +2023,11 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
             break;
         }
     }
-    if !truncated && bytes.last() == Some(&b'\r') {
+    if truncated {
+        // Never persist a prefix of an oversized line: a configured secret
+        // could cross the retention boundary and evade exact-value redaction.
+        bytes.clear();
+    } else if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
     Ok(Some(BoundedLine {
@@ -2916,7 +2920,10 @@ mod tests {
 
     #[tokio::test]
     async fn stderr_reader_bounds_and_drains_unterminated_diagnostics() {
-        let mut input = vec![b'x'; MAX_DIAGNOSTIC_LINE_BYTES * 2];
+        let secret = "crsr_boundary_secret";
+        let mut input = vec![b'x'; MAX_DIAGNOSTIC_LINE_BYTES - secret.len() + 1];
+        input.extend_from_slice(secret.as_bytes());
+        input.extend(std::iter::repeat_n(b'x', MAX_DIAGNOSTIC_LINE_BYTES));
         input.extend_from_slice(b"\nnext\n");
         let mut reader = BufReader::new(input.as_slice());
         let first = read_bounded_line(&mut reader, MAX_DIAGNOSTIC_LINE_BYTES)
@@ -2924,7 +2931,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(first.truncated);
-        assert_eq!(first.text.len(), MAX_DIAGNOSTIC_LINE_BYTES);
+        assert!(first.text.is_empty());
+        let diagnostic = redact(&first.display(), &[secret]);
+        assert_eq!(diagnostic, "[oversized diagnostic line omitted]");
+        assert!(!diagnostic.contains(&secret[..secret.len() - 1]));
         let second = read_bounded_line(&mut reader, MAX_DIAGNOSTIC_LINE_BYTES)
             .await
             .unwrap()
