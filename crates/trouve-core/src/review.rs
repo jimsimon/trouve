@@ -179,10 +179,14 @@ const RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION: &str = "Retry only the final 
 const FULL_REVIEW_CHECK_ACTION_DESCRIPTION: &str = "Review full branch against the PR base";
 const REVIEWER_EXECUTION_GUIDANCE: &str = "\
 Time and exploration budget: finish this review in about three minutes. Use no more than 24 \
-tool calls total. Treat the supplied diff as the primary evidence; do not inventory the \
-repository, recreate the diff, make a todo list, or run builds/tests. Batch independent reads or \
-searches when the tool supports it. If the budget is nearly exhausted, stop exploring and return \
-the best supported JSON result.";
+tool calls total; this hard limit is an emergency ceiling, not a target. Treat the supplied diff \
+as the primary evidence. Before any lookup, form a concrete defect hypothesis from changed \
+behavior and identify the unresolved question whose answer could change a finding. Use the \
+narrowest lookup that answers that question, batch independent reads or searches when the tool \
+supports it, and connect the result back to the change or discard the hypothesis. Do not inventory \
+the repository, recreate the diff, make a todo list, or run builds/tests. Stop when each material \
+hypothesis is supported or refuted. If the budget is nearly exhausted, return the best supported \
+JSON result.";
 const EXTERNAL_FACT_EVIDENCE_GUIDANCE: &str = "\
 Evidence for changing external facts: claims about current releases, version availability, known \
 vulnerabilities, action versions, registries, or provider/service support require an authoritative \
@@ -21385,6 +21389,9 @@ mod tests {
     fn review_prompts_bound_exploration_to_fit_the_latency_target() {
         assert!(REVIEWER_EXECUTION_GUIDANCE.contains("about three minutes"));
         assert!(REVIEWER_EXECUTION_GUIDANCE.contains("no more than 24 tool calls"));
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("emergency ceiling, not a target"));
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("concrete defect hypothesis"));
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("narrowest lookup"));
         assert_eq!(REVIEWER_MAX_TOOL_CALLS, 24);
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("about one minute"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("no more than 4 tool calls"));

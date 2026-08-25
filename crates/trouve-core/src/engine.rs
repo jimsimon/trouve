@@ -605,6 +605,23 @@ fn enforce_automated_review_backend_boundary(
     Ok(())
 }
 
+fn append_vendor_search_guidance(
+    instructions: &mut String,
+    has_mcp_bridge: bool,
+    automated_review: bool,
+) {
+    // Automated review has its own evidence-first instruction floor. Adding
+    // the generic search-first rule would contradict the supplied diff's
+    // priority and encourage repository inventory before any hypothesis.
+    if !has_mcp_bridge || automated_review {
+        return;
+    }
+    if !instructions.is_empty() {
+        instructions.push_str("\n\n");
+    }
+    instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
+}
+
 fn vendor_tool_uses_automated_review_budget(
     tools_enabled: bool,
     tool: &str,
@@ -10158,6 +10175,18 @@ impl Engine {
         self.automated_review_tool_budgets.arm(thread_id, limit)
     }
 
+    /// Test hook for exercising the production backend/bridge boundary from
+    /// an external shipping-path qualification. Product code uses the
+    /// crate-private entry point above through the review runner.
+    #[doc(hidden)]
+    pub fn begin_automated_review_tool_budget_for_qualification(
+        &self,
+        thread_id: &str,
+        limit: u64,
+    ) -> Result<impl Drop> {
+        self.begin_automated_review_tool_budget(thread_id, limit)
+    }
+
     /// Server-scope `session.activity` event — session lists light up (or
     /// dim) their indicator without refetching.
     fn emit_session_activity(&self, session_id: &str, active: bool) -> Result<(), EngineError> {
@@ -10373,8 +10402,8 @@ impl Engine {
         if background {
             // Context assembly intentionally layers trusted workspace
             // instructions after the persona. Repeat the immutable review
-            // guard last so no configurable layer can weaken it.
-            personas::append_automated_review_security_prompt(&mut system);
+            // guidance floor last so no configurable layer can weaken it.
+            personas::append_automated_review_guidance(&mut system);
         }
         let live_models = tokio::select! {
             biased;
@@ -12327,20 +12356,16 @@ impl Engine {
         let mcp_bridge = tools_enabled
             .then(|| self.mcp_bridge_for(&thread.model, &thread.id))
             .flatten();
+        let automated_review = self.store.is_code_review_thread(&thread.id)?;
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
-        // (MCP instructions alone are too weak a signal).
+        // (MCP instructions alone are too weak a signal). Automated review
+        // instead keeps its evidence-first instruction floor.
         let mut instructions = mode.system_prompt.trim().to_string();
-        if mcp_bridge.is_some() {
-            if !instructions.is_empty() {
-                instructions.push_str("\n\n");
-            }
-            instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
-        }
+        append_vendor_search_guidance(&mut instructions, mcp_bridge.is_some(), automated_review);
         let full_tool_bridge = mcp_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.bridge_tools);
-        let automated_review = self.store.is_code_review_thread(&thread.id)?;
         enforce_automated_review_backend_boundary(
             automated_review,
             tools_enabled,
@@ -18090,6 +18115,21 @@ mod tests {
             "mcp__trouve__read_file",
             true
         ));
+    }
+
+    #[test]
+    fn automated_review_omits_conflicting_vendor_search_first_guidance() {
+        let mut ordinary = "ordinary persona".to_string();
+        append_vendor_search_guidance(&mut ordinary, true, false);
+        assert!(ordinary.contains(crate::tools::VENDOR_SEARCH_GUIDANCE));
+
+        let mut review = "review persona".to_string();
+        append_vendor_search_guidance(&mut review, true, true);
+        assert_eq!(review, "review persona");
+
+        let mut no_bridge = "ordinary persona".to_string();
+        append_vendor_search_guidance(&mut no_bridge, false, false);
+        assert_eq!(no_bridge, "ordinary persona");
     }
 
     #[test]

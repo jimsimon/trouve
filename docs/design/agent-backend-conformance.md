@@ -175,6 +175,56 @@ rather than the durable state root. The adapter now redirects each child
 process's temporary directory to a private, auto-cleaned directory and keeps
 fail-closed path validation there; the clean reruns passed.
 
+### Evidence-driven automated-review qualification
+
+Automated review treats the immutable diff and supplied review evidence as
+primary. A reviewer forms a concrete defect hypothesis before looking outside
+that evidence, uses the narrowest lookup that can change its verdict, connects
+the result back to changed behavior, and stops once its material hypotheses
+are resolved. The 24-call limit remains an emergency backstop rather than an
+exploration target.
+
+This is a common Trouve review policy, not Cursor-specific prompt tuning. It is
+part of the secured unattended-review persona used by both API-loop providers
+and vendor backends. Vendor turns omit the ordinary semantic-search-first
+instruction for automated-review threads because it conflicts with the diff's
+priority; ordinary coding threads retain that instruction. The existing seven
+unattended tools (`read_file`, `list_dir`, `glob`, `grep`, `search`,
+`find_related`, and `git_diff`) remain available. Tool removal requires replay
+evidence that a specific capability causes waste without supporting findings.
+
+Set a public review job URL to extend the shipping-path test with two synthetic
+cases and a replay of every selected reviewer task at the job's recorded head
+and base commits:
+
+```sh
+TROUVE_E2E=1 CURSOR_API_KEY=... \
+  CURSOR_E2E_REVIEW_JOB_URL='https://review.example/#/jobs/rv_example' \
+  cargo test -p trouve-server --test cursor_sdk_live -- --ignored --nocapture
+```
+
+The UI fragment form above and a direct
+`/v1/code-review/jobs/{id}` API URL are both accepted. The recorded git objects
+must already exist in the local repository. Use
+`CURSOR_E2E_REVIEW_TASK_LIMIT` for a paid smoke subset and
+`CURSOR_E2E_REVIEW_CONCURRENCY` (default 8, maximum 16) to control parallelism.
+The test prints aggregate and per-task `tool.requested` counts grouped by tool
+name, so future restrictions can be based on evidence rather than intuition.
+
+Promotion requires all of the following:
+
+- every selected task completes with valid reviewer JSON;
+- zero hard-cap failures and no task reaching 24 calls;
+- median tool calls at most 4 and nearest-rank p90 at most 8;
+- a self-contained synthetic retry defect is detected with no tool call; and
+- a synthetic revocation defect that depends on unchanged code is detected
+  after one to four targeted lookups, without inventory or diff tools.
+
+The pre-guidance Cursor SDK replay of PR 140 established the comparison
+baseline: all 61 selected tasks completed with valid JSON, but they made 1,351
+tool calls and 36 tasks reached the 24-call ceiling. Passing transport and cap
+enforcement therefore does not by itself satisfy the exploration contract.
+
 **Decision: use the SDK Bridge adapter and retire the Cursor CLI transport.**
 Cursor steering remains disabled through the existing per-backend
 capability; Codex and capable providers keep their steering behavior. The lack
