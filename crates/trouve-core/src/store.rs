@@ -797,7 +797,15 @@ const MIGRATIONS: &[&str] = &[
            AND finding.status = 'open'
            AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
        )
-     WHERE publication_open_issue_count IS NOT NULL",
+     WHERE publication_open_issue_count IS NOT NULL
+       AND id = (
+         SELECT latest.id FROM code_review_jobs latest
+         WHERE latest.repository = code_review_jobs.repository
+           AND latest.pull_number = code_review_jobs.pull_number
+           AND latest.review_published != 0
+         ORDER BY latest.publication_order DESC, latest.created_at DESC, latest.id DESC
+         LIMIT 1
+       )",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {

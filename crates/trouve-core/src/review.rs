@@ -5239,7 +5239,11 @@ impl Engine {
         let coordinator_started = Instant::now();
         let implementation_analysis =
             if coordinator_candidates.is_empty() && previous_findings.is_empty() {
+                // Await after cancelling rather than detaching: every stage of
+                // the analysis honors its token, so this returns promptly and
+                // the task cannot outlive the review holding session state.
                 analysis_cancel.cancel();
+                let _ = analysis_handle.await;
                 None
             } else {
                 analysis_handle.await.ok().flatten()
