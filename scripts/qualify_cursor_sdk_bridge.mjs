@@ -135,28 +135,17 @@ function assetName() {
   return `cursor-sdk-bridge-standalone-${operatingSystem}-${architecture}.tar.gz`;
 }
 
-async function download(url, destination, timeoutMilliseconds) {
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(new QualificationError(`download timed out for ${url}`)),
-    timeoutMilliseconds,
-  );
-  try {
-    const response = await fetch(url, {
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    if (!response.ok || response.body === null) {
-      throw new QualificationError(`download failed (${response.status}) for ${url}`);
-    }
-    await pipeline(
-      Readable.fromWeb(response.body),
-      createWriteStream(destination),
-      { signal: controller.signal },
-    );
-  } finally {
-    clearTimeout(timer);
+async function download(url, destination, signal) {
+  const response = await fetch(url, {
+    redirect: "follow",
+    signal,
+  });
+  if (!response.ok || response.body === null) {
+    throw new QualificationError(`download failed (${response.status}) for ${url}`);
   }
+  await pipeline(Readable.fromWeb(response.body), createWriteStream(destination), {
+    signal,
+  });
 }
 
 async function sha256(path) {
@@ -209,10 +198,31 @@ async function resolveBridge(explicit, temporaryRoot, timeoutMilliseconds) {
   process.stderr.write(
     `Downloading and verifying Cursor SDK Bridge v${BRIDGE_VERSION} (${asset})...\n`,
   );
-  await Promise.all([
-    download(`${RELEASE_ROOT}/${asset}`, archive, timeoutMilliseconds),
-    download(`${RELEASE_ROOT}/SHA256SUMS.txt`, sums, timeoutMilliseconds),
-  ]);
+  const downloads = new AbortController();
+  const downloadTimer = setTimeout(
+    () => downloads.abort(new QualificationError("Cursor SDK Bridge download timed out")),
+    timeoutMilliseconds,
+  );
+  try {
+    const pending = [
+      [`${RELEASE_ROOT}/${asset}`, archive],
+      [`${RELEASE_ROOT}/SHA256SUMS.txt`, sums],
+    ].map(async ([url, destination]) => {
+      try {
+        await download(url, destination, downloads.signal);
+      } catch (error) {
+        // Abort the peer immediately, then let allSettled below acknowledge
+        // both pipelines before temporary state can be removed.
+        downloads.abort(error);
+        throw error;
+      }
+    });
+    const results = await Promise.allSettled(pending);
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed !== undefined) throw failed.reason;
+  } finally {
+    clearTimeout(downloadTimer);
+  }
   const checksumLines = (await readFile(sums, "utf8")).split(/\r?\n/u);
   let expected;
   for (const line of checksumLines) {
