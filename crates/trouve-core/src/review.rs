@@ -130,9 +130,6 @@ const COORDINATOR_REJECTION_CATEGORIES: [&str; 6] = [
 ];
 const REVIEW_PRIOR_FIX_DIFF_MAX_BYTES: usize = 64 * 1024;
 const REVIEW_EXTERNAL_COMMENTS_MAX_BYTES: usize = 64 * 1024;
-const REVIEW_CLAIM_RATIONALE_MAX_BYTES: usize = 16 * 1024;
-const REVIEW_CLAIM_REPLY_MAX_BYTES: usize = 2 * 1024;
-const REVIEW_CLAIM_REASON_MAX_BYTES: usize = 512;
 const REVIEW_EXTERNAL_COMMENT_BODY_MAX_BYTES: usize = 4 * 1024;
 const REVIEW_DIFF_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_DIFF_MAX_FILES: usize = 250;
@@ -522,10 +519,6 @@ fn refreshed_review_thread_listing(
         })
         .collect();
     (refreshed, listing_complete)
-}
-
-fn review_thread_was_reopened(previous: Option<bool>, current: bool) -> bool {
-    previous == Some(true) && !current
 }
 
 fn prepare_review_thread_verification_epoch(
@@ -1145,20 +1138,6 @@ struct PublishedReviewComment {
     body: String,
 }
 
-/// Untrusted human context attached to one pending resolution claim: who
-/// resolved the thread and what replies said.
-#[derive(Debug, Clone, Default, Serialize)]
-struct ResolutionClaimRationale {
-    resolved_by: String,
-    replies: Vec<ResolutionClaimReply>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ResolutionClaimReply {
-    author: String,
-    body: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct ExternalReviewComment {
     author: String,
@@ -1187,14 +1166,6 @@ struct ReviewOutput {
     /// Previously published finding ids that are now demonstrably fixed.
     #[serde(default)]
     resolved_finding_ids: Vec<String>,
-    /// Pending resolution claims the final editor accepted: the finding no
-    /// longer counts against the review, with the adjudicated reason.
-    #[serde(default)]
-    dismissed_findings: Vec<ReviewClaimAdjudication>,
-    /// Pending resolution claims the final editor declined: the finding stays
-    /// open, with the reason the claim did not justify dismissal.
-    #[serde(default)]
-    declined_claims: Vec<ReviewClaimAdjudication>,
     /// Root causes the final editor identified as shared by multiple retained
     /// findings, with a recommended structural direction. Reviewer outputs
     /// never populate this.
@@ -1205,15 +1176,6 @@ struct ReviewOutput {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ReviewCandidateRejection {
     candidate_id: String,
-    #[serde(default)]
-    reason: String,
-}
-
-/// The final editor's verdict on one pending resolution claim.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ReviewClaimAdjudication {
-    #[serde(default)]
-    finding_id: String,
     #[serde(default)]
     reason: String,
 }
@@ -5270,19 +5232,6 @@ impl Engine {
             REVIEW_HISTORY_MAX_THEMES,
         )?;
         let previous_themes = prioritized_theme_history(&all_previous_themes);
-        let pending_resolution_claims = if previous_findings.is_empty() {
-            Vec::new()
-        } else {
-            let open_ids = previous_findings
-                .iter()
-                .map(|finding| finding.id.as_str())
-                .collect::<HashSet<_>>();
-            self.store
-                .pending_code_review_resolution_claims(&job.repository, job.pull_number)?
-                .into_iter()
-                .filter(|claim| open_ids.contains(claim.finding_id.as_str()))
-                .collect()
-        };
         let load_external_comments = async {
             if coordinator_candidates.is_empty() && previous_findings.is_empty() {
                 Vec::new()
@@ -5290,13 +5239,10 @@ impl Engine {
                 self.external_review_comments(&job).await
             }
         };
-        let (prior_fix_context, external_comments, claim_rationales) = tokio::join!(
+        let (prior_fix_context, external_comments) = tokio::join!(
             self.prior_fix_diff_context(&session, &all_previous_findings, superseded),
             load_external_comments,
-            self.resolution_claim_rationales(&job, &pending_resolution_claims),
         );
-        let pending_claim_context =
-            pending_resolution_claim_context(&pending_resolution_claims, &claim_rationales);
         let coordinator_started = Instant::now();
         let implementation_analysis =
             if coordinator_candidates.is_empty() && previous_findings.is_empty() {
@@ -5357,8 +5303,6 @@ impl Engine {
                     })
                     .collect(),
                 resolved_finding_ids: Vec::new(),
-                dismissed_findings: Vec::new(),
-                declined_claims: Vec::new(),
                 themes: Vec::new(),
             }
         } else {
@@ -5371,7 +5315,6 @@ impl Engine {
                 &prior_candidate_rejections,
                 &previous_themes,
                 &external_comments,
-                &pending_claim_context,
                 &prior_fix_context,
                 implementation_analysis.as_ref(),
                 &diff_files,
@@ -5566,12 +5509,6 @@ impl Engine {
                 self.emit_code_review_task(&job.id, task)?;
             }
             let resolved_finding_ids = validated.resolved_finding_ids;
-            let (dismissed_findings, declined_claims) = coordinator_validated_claim_adjudications(
-                validated.dismissed_findings,
-                validated.declined_claims,
-                &resolved_finding_ids,
-                &pending_resolution_claims,
-            );
             let themes = coordinator_validated_themes(
                 validated.themes,
                 &findings,
@@ -5586,8 +5523,6 @@ impl Engine {
                 findings,
                 rejected_candidates: validated.rejected_candidates,
                 resolved_finding_ids,
-                dismissed_findings,
-                declined_claims,
                 themes,
             }
         };
@@ -5808,41 +5743,10 @@ impl Engine {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        // Dismissal claims accepted this round close their findings exactly
-        // like fixes for verdict and staging purposes; declined claims only
-        // record the adjudicated thread generation.
-        let claim_generation_by_finding = pending_resolution_claims
-            .iter()
-            .map(|claim| (claim.finding_id.as_str(), claim.thread_generation))
-            .collect::<HashMap<_, _>>();
-        let dismissed_findings = parsed
-            .dismissed_findings
-            .iter()
-            .map(|adjudication| {
-                (
-                    adjudication.finding_id.as_str(),
-                    adjudication.reason.as_str(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let declined_claims = parsed
-            .declined_claims
-            .iter()
-            .filter_map(|adjudication| {
-                claim_generation_by_finding
-                    .get(adjudication.finding_id.as_str())
-                    .map(|generation| (adjudication.finding_id.as_str(), *generation))
-            })
-            .collect::<Vec<_>>();
-        let closed_finding_ids = resolved_finding_ids
-            .iter()
-            .copied()
-            .chain(dismissed_findings.iter().map(|(finding_id, _)| *finding_id))
-            .collect::<Vec<_>>();
         let has_unresolved_findings = review_has_unresolved_publishable_findings(
             &persisted,
             &previous_findings,
-            &closed_finding_ids,
+            &resolved_finding_ids,
         );
         if !self
             .store
@@ -5851,7 +5755,7 @@ impl Engine {
             bail!("review job changed before cleanup intent was recorded");
         }
         self.store
-            .prepare_code_review_finding_resolutions(&job.id, &closed_finding_ids)?;
+            .prepare_code_review_finding_resolutions(&job.id, &resolved_finding_ids)?;
         let published_review = self
             .publish_review(&api, &job, &persisted, has_unresolved_findings)
             .await
@@ -5865,8 +5769,6 @@ impl Engine {
             &published_review.url,
             !published_review.blocking,
             &resolved_finding_ids,
-            &dismissed_findings,
-            &declined_claims,
         )?;
         // Collapsing the remote threads is cleanup detached from the round
         // entirely: it starts only after every piece of publication
@@ -5877,38 +5779,6 @@ impl Engine {
         // task (REVIEW_COLLAPSE_RETRY_INTERVAL cadence).
         let cleanup_engine = self.clone();
         let cleanup_job = job.clone();
-        let comment_id_by_finding = previous_findings
-            .iter()
-            .filter_map(|finding| {
-                finding
-                    .github_comment_id
-                    .map(|comment_id| (finding.id.clone(), comment_id))
-            })
-            .collect::<HashMap<_, _>>();
-        // Adjudication verdicts are announced on their threads so a resolve
-        // never disappears silently: accepted claims get the recorded reason,
-        // declined claims get what evidence was missing and how to re-claim.
-        let adjudication_replies = parsed
-            .dismissed_findings
-            .iter()
-            .map(|adjudication| (adjudication, true))
-            .chain(
-                parsed
-                    .declined_claims
-                    .iter()
-                    .map(|adjudication| (adjudication, false)),
-            )
-            .filter_map(|(adjudication, accepted)| {
-                comment_id_by_finding
-                    .get(&adjudication.finding_id)
-                    .map(|comment_id| {
-                        (
-                            *comment_id,
-                            claim_adjudication_reply(accepted, &adjudication.reason),
-                        )
-                    })
-            })
-            .collect::<Vec<_>>();
         let closed_findings = previous_findings
             .into_iter()
             .filter(|finding| parsed.resolved_finding_ids.contains(&finding.id))
@@ -5918,14 +5788,6 @@ impl Engine {
         // attempt does not always lose a try_lock race and defer itself.
         drop(publication_guard);
         tokio::spawn(async move {
-            cleanup_engine
-                .post_claim_adjudication_replies(
-                    &api,
-                    &cleanup_job.repository,
-                    cleanup_job.pull_number,
-                    &adjudication_replies,
-                )
-                .await;
             if let Err(error) = cleanup_engine
                 .resolve_review_threads(
                     &api,
@@ -7110,72 +6972,6 @@ impl Engine {
             }
         }
         comments
-    }
-
-    /// Best-effort rationale for pending resolution claims: who resolved each
-    /// finding's thread and any human replies. A fetch failure degrades to
-    /// claims without rationale rather than blocking the round.
-    async fn resolution_claim_rationales(
-        &self,
-        job: &trouve_protocol::CodeReviewJob,
-        claims: &[crate::store::CodeReviewResolutionClaim],
-    ) -> HashMap<String, ResolutionClaimRationale> {
-        let thread_ids = claims
-            .iter()
-            .filter_map(|claim| claim.github_thread_id.as_deref())
-            .collect::<Vec<_>>();
-        if thread_ids.is_empty() {
-            return HashMap::new();
-        }
-        let api = match self.installation_api(job.installation_id).await {
-            Ok(api) => api,
-            Err(error) => {
-                tracing::warn!(job_id = %job.id, %error, "loading resolution claim rationale failed");
-                return HashMap::new();
-            }
-        };
-        let query = r#"
-          query ResolutionClaimThreads($ids: [ID!]!) {
-            nodes(ids: $ids) {
-              ... on PullRequestReviewThread {
-                id
-                isResolved
-                resolvedBy { login }
-                comments(first: 20) {
-                  nodes { body author { login } }
-                }
-              }
-            }
-          }
-        "#;
-        let mut rationales = HashMap::new();
-        let mut used = 0_usize;
-        for ids in thread_ids.chunks(50) {
-            let payload = serde_json::json!({ "query": query, "variables": { "ids": ids } });
-            let (response, rate): (serde_json::Value, _) = match api
-                .post("/graphql", &payload)
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::warn!(job_id = %job.id, %error, "loading resolution claim rationale failed");
-                    break;
-                }
-            };
-            self.record_review_rate(rate);
-            if response["errors"].is_array() {
-                tracing::warn!(job_id = %job.id, "GitHub GraphQL rejected resolution claim thread listing");
-                break;
-            }
-            for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
-                let Some(thread_id) = thread["id"].as_str() else {
-                    continue;
-                };
-                let rationale = resolution_claim_rationale_from_thread(thread, &mut used);
-                rationales.insert(thread_id.to_owned(), rationale);
-            }
-        }
-        rationales
     }
 
     async fn prior_fix_diff_context(
@@ -9423,71 +9219,68 @@ impl Engine {
         let thread_by_comment = &authoritative_listing.0;
 
         let mut changed_jobs = HashSet::new();
-        let mut reopened = false;
         let mut state_key = Vec::new();
         let mut reconciled_finding_ids = Vec::new();
         let mut open_blocking = 0_u64;
-        let mut blocking_without_claim = 0_u64;
         for state in &findings {
             let blocking = finding_is_blocking(&state.finding.severity, &state.finding.confidence);
             let open = !matches!(state.finding.status.as_str(), "fixed" | "dismissed");
             let Some(comment_id) = state.finding.github_comment_id else {
-                // An open finding with no thread cannot carry a resolution
-                // claim; if it blocks, only a fix can settle it.
+                // An open finding with no thread cannot be dismissed by a
+                // maintainer; if it blocks, only a fix can settle it.
                 if open && blocking {
                     open_blocking += 1;
-                    blocking_without_claim += 1;
                 }
                 continue;
             };
             let Some((thread_id, is_resolved)) = thread_by_comment.get(&comment_id) else {
                 if open && blocking {
                     open_blocking += 1;
-                    blocking_without_claim += 1;
                 }
                 continue;
             };
+            // Recording the observed thread state applies maintainer
+            // judgment directly: resolving an open finding's thread
+            // dismisses it, unresolving a closed finding's thread restores
+            // it to open. No model re-adjudicates either direction.
             let (changed, generation) = self.store.record_code_review_thread_state(
                 &state.finding.id,
                 thread_id,
                 *is_resolved,
             )?;
-            // Even a closed finding whose remote thread remains resolved must
-            // reach enqueue_code_review_thread_recheck so any pending recheck
-            // marker is consumed. It stays out of the state hash/job trigger.
+            // Every reconciled finding reaches
+            // enqueue_code_review_thread_recheck so lingering recheck
+            // markers from older deployments are consumed as bookkeeping.
             reconciled_finding_ids.push(state.finding.id.clone());
             if changed {
                 changed_jobs.insert(state.finding.job_id.clone());
-                reopened |= review_thread_was_reopened(state.is_resolved, *is_resolved);
             }
-            // Closed findings remain in reconciliation solely so a remotely
-            // reopened thread can restore them to `open`. Their thread state
-            // is bookkeeping, not an adjudication claim: whether the
-            // auto-resolve worker has caught up with a verified fix must
-            // never gate scheduling, or a stalled worker silently blocks
-            // claim adjudication for the whole pull request. Reopen detection
-            // above still counts, and a pending recheck marker is still
-            // consumed.
             if !open {
-                reopened |= state.recheck_pending;
                 continue;
             }
-            reopened |= state.recheck_pending;
-            // A resolved thread at a generation the coordinator has not yet
-            // adjudicated is a pending dismissal claim; the next round rules
-            // on it. Blocking findings without such a claim can only be
-            // settled by a fix, so they hold the confirmation round back.
-            let pending_claim = *is_resolved && generation > state.claim_adjudicated_generation;
-            if blocking {
+            // A finding whose thread was just observed resolved is dismissed
+            // by the record call above and no longer holds the gate.
+            if blocking && !*is_resolved {
                 open_blocking += 1;
-                if !pending_claim {
-                    blocking_without_claim += 1;
-                }
             }
             state_key.push((state.finding.id.clone(), generation, *is_resolved));
         }
         for job_id in &changed_jobs {
             self.emit_code_review_updated(Some(job_id.clone()))?;
+        }
+        if !changed_jobs.is_empty() {
+            // Trusted dismissals and reopens change the ledger without a new
+            // round, so the newest round's count snapshot and its GitHub
+            // check/lifecycle projections are refreshed in place.
+            if let Some(projection_job_id) = self
+                .store
+                .refresh_code_review_pull_projection_counts(&repository.repository, pull.number)?
+            {
+                self.emit_code_review_updated(Some(projection_job_id.clone()))?;
+                if let Ok(Some(record)) = self.store.code_review_job(&projection_job_id) {
+                    self.sync_code_review_projection(&record.job).await;
+                }
+            }
         }
 
         state_key.sort_unstable();
@@ -9497,12 +9290,12 @@ impl Engine {
             .map(String::as_str)
             .collect::<Vec<_>>();
         let new_job = thread_recheck_review_request(repository, reviewers, config_hash, pull);
-        // The full-scope round is scheduled by state, never by a resolve-all
-        // edge: it runs when a reopened thread must resurface in a fresh
-        // published round, or when every open blocking finding carries a
-        // pending claim (the round adjudicates them), or when the ledger is
-        // already clean but no round has covered the full branch at this
-        // head (the round pays the coverage debt).
+        // The only remaining reason to schedule a round from reconciliation
+        // is coverage debt: maintainer dismissals brought the blocking
+        // ledger to zero, but no round has examined the whole branch at this
+        // head, so one full-scope round confirms before the check reports
+        // success. Reopens and dismissals themselves never schedule work —
+        // maintainer judgment is applied as-is and re-projected in place.
         let awaiting_full_coverage = open_blocking == 0
             && matches!(
                 self.store
@@ -9516,12 +9309,7 @@ impl Engine {
             &new_job,
             &state_hash,
             &finding_ids,
-            thread_reconciliation_schedules_full_round(
-                reopened,
-                open_blocking,
-                blocking_without_claim,
-                awaiting_full_coverage,
-            ),
+            thread_reconciliation_schedules_full_round(open_blocking, awaiting_full_coverage),
             MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION,
         )?;
         self.clear_review_thread_listing_progress(&review_thread_listing_key(
@@ -9536,39 +9324,6 @@ impl Engine {
             self.code_review.job_wake.notify_one();
         }
         Ok(ReviewThreadReconciliationOutcome::Completed)
-    }
-
-    /// Best-effort public verdicts on adjudicated resolution claims, posted
-    /// as replies on each claimed finding's thread. Failures are logged; the
-    /// adjudication itself is already durable.
-    async fn post_claim_adjudication_replies(
-        &self,
-        api: &GithubApi,
-        repository: &str,
-        pull_number: u64,
-        replies: &[(u64, String)],
-    ) {
-        for (comment_id, body) in replies {
-            let outcome = tokio::time::timeout(
-                REVIEW_THREAD_REQUEST_TIMEOUT,
-                api.post::<serde_json::Value>(
-                    &format!(
-                        "/repos/{repository}/pulls/{pull_number}/comments/{comment_id}/replies"
-                    ),
-                    &serde_json::json!({ "body": body }),
-                ),
-            )
-            .await;
-            match outcome {
-                Ok(Ok((_, rate))) => self.record_review_rate(rate),
-                Ok(Err(error)) => tracing::debug!(
-                    comment_id,
-                    error = format!("{error:#}"),
-                    "claim adjudication reply failed"
-                ),
-                Err(_) => tracing::debug!(comment_id, "claim adjudication reply timed out"),
-            }
-        }
     }
 
     /// Best-effort explanatory reply posted when the worker resolves a
@@ -9735,20 +9490,17 @@ impl Engine {
     }
 }
 
-/// State-based scheduling for the reconciliation-driven full round. It fires
-/// when a reopened thread must resurface in a fresh published round, when
-/// every open blocking finding carries a pending resolution claim (the round
-/// adjudicates them), or when the ledger is clean but no round has covered
-/// the full branch at this head (the round pays the coverage debt). Unlike
-/// the retired resolve-all edge, every input is re-derivable at any time, so
-/// a missed pass never wedges the pull request.
+/// State-based scheduling for the reconciliation-driven full round: it fires
+/// only when maintainer dismissals cleared the blocking ledger while no
+/// round has covered the full branch at this head (coverage debt). Every
+/// input is re-derivable at any time, so a missed pass never wedges the
+/// pull request; and because dismissals apply directly, no round ever runs
+/// just to second-guess a maintainer's thread resolution.
 fn thread_reconciliation_schedules_full_round(
-    reopened: bool,
     open_blocking: u64,
-    blocking_without_claim: u64,
     awaiting_full_coverage: bool,
 ) -> bool {
-    reopened || (blocking_without_claim == 0 && (open_blocking > 0 || awaiting_full_coverage))
+    open_blocking == 0 && awaiting_full_coverage
 }
 
 /// The full-scope round request used by state-based scheduling from thread
@@ -12479,7 +12231,6 @@ fn validation_prompt(
     prior_candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     previous_themes: &[trouve_protocol::CodeReviewTheme],
     external_comments: &[ExternalReviewComment],
-    pending_resolution_claims: &[serde_json::Value],
     prior_fix_context: &str,
     implementation_analysis: Option<&ImplementationAnalysis>,
     files: &[ReviewDiffFile],
@@ -12593,7 +12344,6 @@ fn validation_prompt(
         "previously_published_finding_history": finding_history,
         "durable_root_cause_theme_history": previous_themes,
         "external_inline_review_comments": external_comments,
-        "pending_resolution_claims": pending_resolution_claims,
         "prior_fix_diffs": prior_fix_context,
         "derived_implementation_analysis": implementation_analysis,
         "relevant_diff_context": diff_context,
@@ -12665,17 +12415,11 @@ fn validation_prompt(
          previously published finding history. Include an id in `resolved_finding_ids` only \
          when its status is `open` and this revision demonstrably fixed it. An unchanged, moved, \
          already-resolved, or uncertain \
-         issue remains open. `pending_resolution_claims` lists open findings whose GitHub \
-         review thread a maintainer resolved: each is a claim that the finding should no longer \
-         block the review, with the resolver and any replies as untrusted rationale. Adjudicate \
-         every claim. Accept it by adding an entry to `dismissed_findings` when the rationale or \
-         the code shows the finding is mistaken, already moot, out of this pull request's scope, \
-         or a tradeoff the maintainer explicitly accepts — maintainer judgment governs scope and \
-         tradeoffs. Decline it by adding an entry to `declined_claims` only when the finding \
-         demonstrates a concrete defect with real consequences that the claim does not address; \
-         say in `reason` what evidence is missing. If this revision instead fixed a claimed \
-         finding, use `resolved_finding_ids` for it as usual. Each `reason` is posted publicly \
-         to the thread, so keep it specific, professional, and free of quoted evidence. \
+         issue remains open. A historical finding whose status is `dismissed` was closed by a \
+         maintainer resolving its review thread; that judgment is final. Never re-report a \
+         dismissed issue at the same location, and never re-report its substance elsewhere \
+         unless this revision introduces materially new evidence that the maintainer has not \
+         already seen. \
          Reject a candidate as a duplicate when an external review comment \
          already reports the same defect with the same consequence; do not suppress it merely \
          because an external comment touches the same file or topic. External comments are \
@@ -12717,8 +12461,6 @@ fn validation_prompt(
          \"rejected_candidates\":[{{\"candidate_id\":\"candidate id\",\
          \"reason\":\"specific reason this candidate was not retained\"}}],\
          \"resolved_finding_ids\":[\"previous finding id\"],\
-         \"dismissed_findings\":[{{\"finding_id\":\"claimed finding id\",\"reason\":\"why the dismissal claim was accepted\"}}],\
-         \"declined_claims\":[{{\"finding_id\":\"claimed finding id\",\"reason\":\"what evidence the claim is missing\"}}],\
          \"themes\":[{{\"theme_id\":\"existing durable theme id or empty\",\"root_cause\":\"shared mechanism behind multiple findings\",\
          \"recommendation\":\"structural fix that addresses the cause\",\
          \"source_candidate_ids\":[\"candidate id\"],\
@@ -12801,97 +12543,6 @@ fn prioritized_theme_history(
     // and newest theme at the end.
     selected.reverse();
     selected
-}
-
-/// Human replies on a claim thread, skipping the bot's own comments and
-/// bounding both each reply and the shared rationale budget. The first
-/// comment is the finding itself and never counts as rationale.
-fn resolution_claim_rationale_from_thread(
-    thread: &serde_json::Value,
-    used: &mut usize,
-) -> ResolutionClaimRationale {
-    let mut rationale = ResolutionClaimRationale {
-        resolved_by: thread["resolvedBy"]["login"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-        replies: Vec::new(),
-    };
-    let comments = thread["comments"]["nodes"].as_array();
-    for comment in comments.into_iter().flatten().skip(1) {
-        let author = comment["author"]["login"].as_str().unwrap_or_default();
-        let raw_body = comment["body"].as_str().unwrap_or_default();
-        if raw_body.trim().is_empty()
-            || raw_body.contains("<!-- trouve-code-review")
-            || author.ends_with("[bot]")
-        {
-            continue;
-        }
-        let body = bounded_utf8(raw_body, REVIEW_CLAIM_REPLY_MAX_BYTES, "…");
-        let size = body.len() + author.len();
-        if used.saturating_add(size) > REVIEW_CLAIM_RATIONALE_MAX_BYTES {
-            break;
-        }
-        *used += size;
-        rationale.replies.push(ResolutionClaimReply {
-            author: author.to_owned(),
-            body,
-        });
-    }
-    rationale
-}
-
-/// Serializable evidence for the coordinator: each open finding whose thread
-/// a human resolved since the last adjudication, with untrusted rationale.
-fn pending_resolution_claim_context(
-    claims: &[crate::store::CodeReviewResolutionClaim],
-    rationales: &HashMap<String, ResolutionClaimRationale>,
-) -> Vec<serde_json::Value> {
-    claims
-        .iter()
-        .map(|claim| {
-            let rationale = claim
-                .github_thread_id
-                .as_deref()
-                .and_then(|thread_id| rationales.get(thread_id));
-            serde_json::json!({
-                "finding_id": claim.finding_id,
-                "path": claim.path,
-                "line": claim.line,
-                "title": claim.title,
-                "severity": claim.severity,
-                "confidence": claim.confidence,
-                "resolved_by": rationale.map(|r| r.resolved_by.as_str()).unwrap_or_default(),
-                "replies": rationale.map(|r| r.replies.clone()).unwrap_or_default(),
-            })
-        })
-        .collect()
-}
-
-/// Public reply announcing one claim adjudication verdict on its thread.
-fn claim_adjudication_reply(accepted: bool, reason: &str) -> String {
-    let reason = reason.trim();
-    if accepted {
-        if reason.is_empty() {
-            "Trouve accepted the dismissal of this finding; it no longer counts toward this \
-             review."
-                .to_string()
-        } else {
-            format!(
-                "Trouve accepted the dismissal of this finding: {reason} It no longer counts \
-                 toward this review."
-            )
-        }
-    } else if reason.is_empty() {
-        "Trouve kept this finding open after reviewing the thread's resolution. Reopen and \
-         re-resolve this thread to request another adjudication."
-            .to_string()
-    } else {
-        format!(
-            "Trouve kept this finding open after reviewing the thread's resolution: {reason} \
-             Reopen and re-resolve this thread to request another adjudication."
-        )
-    }
 }
 
 fn external_review_comment_from_thread(
@@ -13365,58 +13016,6 @@ fn normalize_coordinator_output(
         .resolved_finding_ids
         .retain(|id| previous_ids.contains(id.as_str()) && seen.insert(id.clone()));
     unadjudicated
-}
-
-/// Keeps only themes that genuinely span multiple findings: a non-empty root
-/// cause covering at least one retained finding via its candidate ids and at
-/// least two distinct findings overall, counting previously published finding
-/// history it names. Ids that were rejected or invented by the
-/// editor are dropped first, so a theme cannot survive on the back of
-/// discarded candidates or unknown previous findings; requiring a retained
-/// finding keeps every theme anchored to an issue the fix prompts can point
-/// at in this revision.
-/// Validates the coordinator's claim adjudications against the pending
-/// claims that were actually supplied: unknown or repeated finding ids are
-/// dropped, a fix verdict wins over a dismissal for the same finding, a
-/// dismissal wins over a decline, and reasons are bounded for public replies.
-fn coordinator_validated_claim_adjudications(
-    dismissed: Vec<ReviewClaimAdjudication>,
-    declined: Vec<ReviewClaimAdjudication>,
-    resolved_finding_ids: &[String],
-    pending_claims: &[crate::store::CodeReviewResolutionClaim],
-) -> (Vec<ReviewClaimAdjudication>, Vec<ReviewClaimAdjudication>) {
-    let claim_ids = pending_claims
-        .iter()
-        .map(|claim| claim.finding_id.as_str())
-        .collect::<HashSet<_>>();
-    let mut seen = HashSet::new();
-    let bounded = |mut adjudication: ReviewClaimAdjudication| {
-        adjudication.reason = bounded_utf8(
-            adjudication.reason.trim(),
-            REVIEW_CLAIM_REASON_MAX_BYTES,
-            "…",
-        );
-        adjudication
-    };
-    let dismissed = dismissed
-        .into_iter()
-        .filter(|adjudication| {
-            claim_ids.contains(adjudication.finding_id.as_str())
-                && !resolved_finding_ids.contains(&adjudication.finding_id)
-                && seen.insert(adjudication.finding_id.clone())
-        })
-        .map(bounded)
-        .collect::<Vec<_>>();
-    let declined = declined
-        .into_iter()
-        .filter(|adjudication| {
-            claim_ids.contains(adjudication.finding_id.as_str())
-                && !resolved_finding_ids.contains(&adjudication.finding_id)
-                && seen.insert(adjudication.finding_id.clone())
-        })
-        .map(bounded)
-        .collect::<Vec<_>>();
-    (dismissed, declined)
 }
 
 fn coordinator_validated_themes(
@@ -14746,14 +14345,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_durable_resolved_to_unresolved_transition_is_a_reopen() {
-        assert!(review_thread_was_reopened(Some(true), false));
-        assert!(!review_thread_was_reopened(None, false));
-        assert!(!review_thread_was_reopened(Some(false), false));
-        assert!(!review_thread_was_reopened(Some(true), true));
-    }
-
-    #[test]
     fn review_thread_verification_progress_expires_as_one_epoch() {
         let now = Instant::now();
         let mut progress = ReviewThreadListingProgress::new();
@@ -15011,8 +14602,6 @@ mod tests {
                 &job.head_sha,
                 "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
                 false,
-                &[],
-                &[],
                 &[],
             )
             .unwrap();
@@ -16520,37 +16109,13 @@ mod tests {
         };
 
         // A theme seen once is history, not instability.
-        let calm = validation_prompt(
-            &record,
-            &[],
-            &[],
-            &[],
-            &[theme(1)],
-            &[],
-            &[],
-            "",
-            None,
-            &[],
-            0,
-        )
-        .unwrap();
+        let calm =
+            validation_prompt(&record, &[], &[], &[], &[theme(1)], &[], "", None, &[], 0).unwrap();
         assert!(!calm.contains("Recurring instability:"));
 
         // A recurring theme triggers the design-level escalation.
-        let escalated = validation_prompt(
-            &record,
-            &[],
-            &[],
-            &[],
-            &[theme(3)],
-            &[],
-            &[],
-            "",
-            None,
-            &[],
-            0,
-        )
-        .unwrap();
+        let escalated =
+            validation_prompt(&record, &[], &[], &[], &[theme(3)], &[], "", None, &[], 0).unwrap();
         assert!(escalated.contains("Recurring instability:"));
         assert!(escalated.contains("`th_lifecycle` (recurred 3 time(s))"));
         assert!(escalated.contains("design-level fix"));
@@ -16569,13 +16134,12 @@ mod tests {
 
         // Without a description, the guidance is omitted entirely.
         let without =
-            validation_prompt(&record, &[], &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
         assert!(!without.contains("author's claimed intent"));
 
         record.pull_body =
             "Removes the per-engine caps so independent sessions are provider-limited.".into();
-        let with =
-            validation_prompt(&record, &[], &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let with = validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
         assert!(with.contains("author's claimed intent"));
         assert!(with.contains("never a reason by itself to reject a candidate"));
         assert!(with.contains("predate later revisions"));
@@ -16647,7 +16211,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
             "",
             Some(&analysis),
             &[],
@@ -16660,7 +16223,7 @@ mod tests {
         assert!(with.contains("process-wide semaphore"));
 
         let without =
-            validation_prompt(&record, &[], &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
         assert!(!without.contains("read only the full-branch diff"));
     }
 
@@ -19074,8 +18637,6 @@ mod tests {
                 &review_url.url,
                 true,
                 &[],
-                &[],
-                &[],
             )
             .unwrap();
         assert!(
@@ -19133,8 +18694,6 @@ mod tests {
                 &job.head_sha,
                 "https://github.com/acme/widgets/pull/42#pullrequestreview-11",
                 true,
-                &[],
-                &[],
                 &[],
             )
             .unwrap();
@@ -22471,8 +22030,6 @@ mod tests {
                 },
             ],
             resolved_finding_ids: vec!["invented-finding".into()],
-            dismissed_findings: Vec::new(),
-            declined_claims: Vec::new(),
             themes: Vec::new(),
         };
         let unadjudicated = normalize_coordinator_output(&mut review, &candidates, &[]);
@@ -22505,8 +22062,6 @@ mod tests {
             findings: Vec::new(),
             rejected_candidates: Vec::new(),
             resolved_finding_ids: Vec::new(),
-            dismissed_findings: Vec::new(),
-            declined_claims: Vec::new(),
             themes: Vec::new(),
         };
         let rejected_without_reason = candidate_rejections(&unaccounted, &candidates[..1]);
@@ -22537,8 +22092,6 @@ mod tests {
                 })
                 .collect(),
             resolved_finding_ids: Vec::new(),
-            dismissed_findings: Vec::new(),
-            declined_claims: Vec::new(),
             themes: Vec::new(),
         };
         let unadjudicated = normalize_coordinator_output(&mut anchor_filtered, &candidates, &[]);
@@ -22577,8 +22130,6 @@ mod tests {
                 })
                 .collect(),
             resolved_finding_ids: Vec::new(),
-            dismissed_findings: Vec::new(),
-            declined_claims: Vec::new(),
             themes: Vec::new(),
         };
         let unadjudicated = normalize_coordinator_output(
@@ -22610,8 +22161,6 @@ mod tests {
             }],
             rejected_candidates: Vec::new(),
             resolved_finding_ids: Vec::new(),
-            dismissed_findings: Vec::new(),
-            declined_claims: Vec::new(),
             themes: Vec::new(),
         };
         structurally_rejected.findings = coordinator_validated_findings(
@@ -22628,109 +22177,14 @@ mod tests {
     }
 
     #[test]
-    fn claim_adjudications_validate_against_supplied_claims() {
-        let claim = |id: &str| crate::store::CodeReviewResolutionClaim {
-            finding_id: id.into(),
-            path: "src/lib.rs".into(),
-            line: 3,
-            title: "Finding".into(),
-            severity: "medium".into(),
-            confidence: "high".into(),
-            github_thread_id: Some(format!("thread-{id}")),
-            thread_generation: 1,
-        };
-        let adjudication = |id: &str, reason: &str| ReviewClaimAdjudication {
-            finding_id: id.into(),
-            reason: reason.into(),
-        };
-        let long_reason = "x".repeat(4 * REVIEW_CLAIM_REASON_MAX_BYTES);
-        let (dismissed, declined) = coordinator_validated_claim_adjudications(
-            vec![
-                adjudication("claimed-a", "maintainer accepts the tradeoff"),
-                adjudication("claimed-a", "duplicate entry for the same claim"),
-                adjudication("fixed-finding", "already fixed this revision"),
-                adjudication("invented", "no such pending claim"),
-            ],
-            vec![
-                adjudication("claimed-a", "must lose to the dismissal verdict"),
-                adjudication("claimed-b", &long_reason),
-            ],
-            &["fixed-finding".to_string()],
-            &[
-                claim("claimed-a"),
-                claim("claimed-b"),
-                claim("fixed-finding"),
-            ],
-        );
-        assert_eq!(dismissed.len(), 1);
-        assert_eq!(dismissed[0].finding_id, "claimed-a");
-        assert_eq!(dismissed[0].reason, "maintainer accepts the tradeoff");
-        assert_eq!(declined.len(), 1);
-        assert_eq!(declined[0].finding_id, "claimed-b");
-        assert!(declined[0].reason.len() <= REVIEW_CLAIM_REASON_MAX_BYTES);
-    }
-
-    #[test]
-    fn claim_adjudication_replies_state_the_verdict_and_the_reclaim_path() {
-        assert!(claim_adjudication_reply(true, "").starts_with("Trouve accepted"));
-        let accepted = claim_adjudication_reply(true, "the cache is process-local by design.");
-        assert!(accepted.contains("the cache is process-local by design."));
-        assert!(accepted.contains("no longer counts"));
-        let declined = claim_adjudication_reply(false, "the race remains reachable from run().");
-        assert!(declined.contains("kept this finding open"));
-        assert!(declined.contains("the race remains reachable from run()."));
-        assert!(declined.contains("re-resolve"));
-    }
-
-    #[test]
-    fn claim_rationale_skips_the_finding_comment_and_bot_replies() {
-        let thread = serde_json::json!({
-            "id": "T1",
-            "isResolved": true,
-            "resolvedBy": {"login": "jim"},
-            "comments": {"nodes": [
-                {"body": "<!-- trouve-code-review -->finding body", "author": {"login": "trouve-review[bot]"}},
-                {"body": "Trouve verified this finding fixed; resolving this thread.", "author": {"login": "trouve-review[bot]"}},
-                {"body": "This is intended; the cache is process-local.", "author": {"login": "jim"}},
-                {"body": "   ", "author": {"login": "jim"}},
-            ]}
-        });
-        let mut used = 0;
-        let rationale = resolution_claim_rationale_from_thread(&thread, &mut used);
-        assert_eq!(rationale.resolved_by, "jim");
-        assert_eq!(rationale.replies.len(), 1);
-        assert_eq!(rationale.replies[0].author, "jim");
-        assert_eq!(
-            rationale.replies[0].body,
-            "This is intended; the cache is process-local."
-        );
-        assert!(used > 0);
-    }
-
-    #[test]
-    fn full_round_scheduling_is_state_based_not_edge_based() {
-        // Reopened threads always resurface in a fresh round.
-        assert!(thread_reconciliation_schedules_full_round(
-            true, 3, 3, false
-        ));
-        // Every open blocking finding carries a pending claim: adjudicate.
-        assert!(thread_reconciliation_schedules_full_round(
-            false, 2, 0, false
-        ));
+    fn full_round_scheduling_confirms_coverage_debt_only() {
         // Clean ledger but no full-coverage round at this head yet: confirm.
-        assert!(thread_reconciliation_schedules_full_round(
-            false, 0, 0, true
-        ));
-        // Unclaimed blocking findings hold the round back; only fixes or
-        // claims can move them.
-        assert!(!thread_reconciliation_schedules_full_round(
-            false, 2, 1, false
-        ));
-        // Clean ledger already confirmed by a full-coverage round: nothing to
-        // schedule.
-        assert!(!thread_reconciliation_schedules_full_round(
-            false, 0, 0, false
-        ));
+        assert!(thread_reconciliation_schedules_full_round(0, true));
+        // Open blocking findings: a fix or a maintainer dismissal moves
+        // them; no round runs just to re-litigate the ledger.
+        assert!(!thread_reconciliation_schedules_full_round(2, false));
+        // Clean ledger already confirmed by a full-coverage round: done.
+        assert!(!thread_reconciliation_schedules_full_round(0, false));
     }
 
     #[test]
@@ -22818,8 +22272,6 @@ mod tests {
                 reason: "false_positive: already settled".into(),
             }],
             resolved_finding_ids: vec!["finding-old".into()],
-            dismissed_findings: Vec::new(),
-            declined_claims: Vec::new(),
             themes: vec![theme("Original root cause")],
         };
         let repaired = ReviewOutput {
@@ -22836,8 +22288,6 @@ mod tests {
                 reason: "false_positive: reverses the prior decision".into(),
             }],
             resolved_finding_ids: vec!["different-finding".into()],
-            dismissed_findings: Vec::new(),
-            declined_claims: Vec::new(),
             themes: vec![theme("Rewritten root cause")],
         };
 
@@ -23037,7 +22487,6 @@ mod tests {
         );
         let coordinator = validation_prompt(
             &record,
-            &[],
             &[],
             &[],
             &[],
@@ -23273,7 +22722,7 @@ mod tests {
         };
         let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[], 0);
         let coordinator_prompt =
-            validation_prompt(&record, &[], &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
 
         for (name, prompt) in [
             ("reviewer", reviewer_prompt.as_str()),

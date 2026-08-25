@@ -779,7 +779,6 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs DROP COLUMN publication_churn_signal",
     "ALTER TABLE code_review_jobs ADD COLUMN review_covered_full_branch INTEGER",
     "ALTER TABLE code_review_findings ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE code_review_findings ADD COLUMN claim_adjudicated_generation INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -3889,26 +3888,6 @@ pub(crate) struct CodeReviewFindingThreadState {
     pub is_resolved: Option<bool>,
     pub generation: u64,
     pub recheck_pending: bool,
-    /// Highest thread generation whose resolution claim a coordinator has
-    /// already adjudicated (accepted claims close the finding instead, so a
-    /// generation at or below this value means "claim declined, unchanged
-    /// since").
-    pub claim_adjudicated_generation: u64,
-}
-
-/// An open finding whose GitHub review thread a human resolved after the
-/// coordinator last adjudicated it: a pending dismissal claim awaiting the
-/// next round's judgment.
-#[derive(Debug, Clone)]
-pub(crate) struct CodeReviewResolutionClaim {
-    pub finding_id: String,
-    pub path: String,
-    pub line: u64,
-    pub title: String,
-    pub severity: String,
-    pub confidence: String,
-    pub github_thread_id: Option<String>,
-    pub thread_generation: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -11504,7 +11483,7 @@ impl Store {
                         f.github_thread_resolved, f.github_thread_generation,
                         f.github_thread_recheck_pending, f.evidence, f.origin,
                         j.head_sha, f.resolved_head, f.resolved_by_job_id,
-                        f.outside_diff, f.claim_adjudicated_generation
+                        f.outside_diff
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -11546,7 +11525,6 @@ impl Store {
                     is_resolved: row.get(16)?,
                     generation: row.get::<_, i64>(17)? as u64,
                     recheck_pending: row.get(18)?,
-                    claim_adjudicated_generation: row.get::<_, i64>(25)? as u64,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -11648,9 +11626,14 @@ impl Store {
         let reopened_closed_finding = matches!(status.as_str(), "fixed" | "dismissed")
             && previous_resolved == Some(true)
             && !is_resolved;
+        // Trust the maintainer: resolving an open finding's thread dismisses
+        // the finding outright. No model re-adjudicates the decision; the
+        // symmetric gesture (unresolving the thread) restores it.
+        let dismissed_by_resolution = status == "open" && is_resolved;
         let recheck_pending = previous_resolved == Some(true) && !is_resolved;
         let changed = state_changed
             || reopened_closed_finding
+            || dismissed_by_resolution
             || previous_thread_id.as_deref() != Some(thread_id);
         let generation = generation + i64::from(state_changed || reopened_closed_finding);
         if changed {
@@ -11674,10 +11657,17 @@ impl Store {
                      END,
                      status = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 'open'
+                       WHEN ?6 THEN 'dismissed'
                        ELSE status
+                     END,
+                     dismiss_reason = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       WHEN ?6 THEN 'maintainer resolved the review thread'
+                       ELSE dismiss_reason
                      END,
                      resolved_at = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
+                       WHEN ?6 THEN ?7
                        ELSE resolved_at
                      END,
                      resolved_head = CASE
@@ -11686,6 +11676,7 @@ impl Store {
                      END,
                      resolved_by_job_id = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       WHEN ?6 THEN ''
                        ELSE resolved_by_job_id
                      END
                  WHERE id = ?1",
@@ -11694,7 +11685,9 @@ impl Store {
                     thread_id,
                     is_resolved,
                     generation,
-                    recheck_pending
+                    recheck_pending,
+                    dismissed_by_resolution,
+                    chrono::Utc::now().to_rfc3339()
                 ],
             )?;
             if reopened_closed_finding {
@@ -11709,47 +11702,64 @@ impl Store {
             }
         }
         tx.commit()?;
-        Ok((state_changed || reopened_closed_finding, generation as u64))
+        Ok((
+            state_changed || reopened_closed_finding || dismissed_by_resolution,
+            generation as u64,
+        ))
     }
 
-    /// Open findings from published rounds whose GitHub thread is resolved at
-    /// a generation the coordinator has not yet adjudicated. Every review
-    /// round adjudicates these claims; the thread state itself never closes a
-    /// finding.
-    pub(crate) fn pending_code_review_resolution_claims(
+    /// Recompute the open/advisory issue-count snapshots on the newest
+    /// published round after thread reconciliation changed finding statuses
+    /// (a trusted dismissal or a reopen), and arm the blocking-review
+    /// cleanup when the blocking ledger reached zero. Returns the job id
+    /// whose GitHub projections should be re-synced, when the snapshot
+    /// actually changed.
+    pub fn refresh_code_review_pull_projection_counts(
         &self,
         repository: &str,
         pull_number: u64,
-    ) -> Result<Vec<CodeReviewResolutionClaim>> {
+    ) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT f.id, f.path, f.line, f.title, f.severity, f.confidence,
-                    f.github_thread_id, f.github_thread_generation
-             FROM code_review_findings f
-             JOIN code_review_jobs j ON j.id = f.job_id
-             WHERE j.repository = ?1 AND j.pull_number = ?2
-               AND j.review_published = 1
-               AND f.status = 'open'
-               AND f.github_comment_id IS NOT NULL
-               AND f.github_thread_resolved = 1
-               AND f.github_thread_generation > f.claim_adjudicated_generation
-             ORDER BY f.path, f.line, f.id",
+        let tx = write_transaction(&conn)?;
+        let latest: Option<(String, Option<i64>)> = tx
+            .query_row(
+                "SELECT id, publication_open_issue_count
+                 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1
+                 ORDER BY publication_order DESC, created_at DESC, id DESC
+                 LIMIT 1",
+                params![repository, pull_number as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((job_id, previous_open)) = latest else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        record_code_review_open_issue_count(&tx, &job_id)?;
+        let refreshed_open: Option<i64> = tx.query_row(
+            "SELECT publication_open_issue_count FROM code_review_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
         )?;
-        let claims = stmt
-            .query_map(params![repository, pull_number as i64], |row| {
-                Ok(CodeReviewResolutionClaim {
-                    finding_id: row.get(0)?,
-                    path: row.get(1)?,
-                    line: row.get::<_, i64>(2)? as u64,
-                    title: row.get(3)?,
-                    severity: row.get(4)?,
-                    confidence: row.get(5)?,
-                    github_thread_id: row.get(6)?,
-                    thread_generation: row.get::<_, i64>(7)? as u64,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(claims)
+        if refreshed_open == Some(0) && previous_open != Some(0) {
+            // The gate cleared without a round (trusted dismissals): the
+            // standing REQUEST_CHANGES review must not outlive the ledger.
+            // The durable cleanup task dismisses it with retries.
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_pending = 1,
+                     blocking_review_cleanup_page = 1,
+                     blocking_review_cleanup_attempts = 0,
+                     blocking_review_cleanup_next_attempt_at = NULL,
+                     blocking_review_cleanup_claim_token = NULL,
+                     blocking_review_cleanup_claim_until = NULL
+                 WHERE id = ?1",
+                params![job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok((refreshed_open != previous_open).then_some(job_id))
     }
 
     pub fn code_review_themes_for_pull(
@@ -13170,8 +13180,9 @@ impl Store {
     }
 
     /// Whether the newest published round for this pull request covered the
-    /// full branch (full scope, or an incremental round whose review base is
-    /// the pull-request base). None when no round has published.
+    /// full branch: full scope, or the coverage flag recorded when the diff
+    /// base was resolved. Rounds that predate the flag fall back to the
+    /// review-base/base-ref comparison. None when no round has published.
     pub fn latest_published_code_review_round_covered_full_branch(
         &self,
         repository: &str,
@@ -13182,7 +13193,7 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT scope, review_base_sha, base_ref
+                "SELECT scope, review_covered_full_branch, review_base_sha, base_ref
                  FROM code_review_jobs
                  WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1
                  ORDER BY publication_order DESC, created_at DESC, id DESC
@@ -13190,9 +13201,10 @@ impl Store {
                 params![repository, pull_number as i64],
                 |row| {
                     let scope: String = row.get(0)?;
-                    let review_base_sha: String = row.get(1)?;
-                    let base_ref: String = row.get(2)?;
-                    Ok(scope == "full" || review_base_sha == base_ref)
+                    let covered: Option<bool> = row.get(1)?;
+                    let review_base_sha: String = row.get(2)?;
+                    let base_ref: String = row.get(3)?;
+                    Ok(scope == "full" || covered.unwrap_or(review_base_sha == base_ref))
                 },
             )
             .optional()?)
@@ -13370,8 +13382,6 @@ impl Store {
         review_url: &str,
         blocking_review_cleanup_pending: bool,
         resolved_finding_ids: &[&str],
-        dismissed_findings: &[(&str, &str)],
-        declined_claims: &[(&str, u64)],
     ) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
@@ -13408,51 +13418,12 @@ impl Store {
             |row| row.get::<_, String>(0),
         )?;
         if current_publication {
-            for finding_id in resolved_finding_ids
-                .iter()
-                .chain(dismissed_findings.iter().map(|(finding_id, _)| finding_id))
-            {
+            for finding_id in resolved_finding_ids {
                 tx.execute(
                     "UPDATE code_review_findings
                      SET publication_resolution_job_id = ?2
                      WHERE id = ?1 AND status = 'open'",
                     params![finding_id, id],
-                )?;
-            }
-        }
-        let mut dismissed = 0_u64;
-        if current_publication {
-            // Accepted dismissal claims close before the bulk fixed update so
-            // the shared staging marker routes each finding to exactly one
-            // terminal status. The human already resolved the thread, so no
-            // collapse work is queued; the publication path posts the
-            // explanatory reply itself.
-            for (finding_id, reason) in dismissed_findings {
-                dismissed += tx.execute(
-                    "UPDATE code_review_findings
-                     SET status = 'dismissed', dismiss_reason = ?3, resolved_at = ?2,
-                         resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?4),
-                         resolved_by_job_id = ?4,
-                         publication_resolution_job_id = NULL,
-                         claim_adjudicated_generation = github_thread_generation,
-                         collapse_pending = 0,
-                         collapse_attempts = 0,
-                         collapse_next_attempt_at = NULL
-                     WHERE id = ?1 AND publication_resolution_job_id = ?4
-                       AND status = 'open'",
-                    params![finding_id, published_at, reason, id],
-                )? as u64;
-            }
-            // Declined claims stay open; recording the adjudicated thread
-            // generation stops every later round from re-litigating the same
-            // resolve until a human toggles the thread again.
-            for (finding_id, generation) in declined_claims {
-                tx.execute(
-                    "UPDATE code_review_findings
-                     SET claim_adjudicated_generation =
-                           MAX(claim_adjudicated_generation, ?2)
-                     WHERE id = ?1 AND status = 'open'",
-                    params![finding_id, *generation as i64],
                 )?;
             }
         }
@@ -13540,7 +13511,7 @@ impl Store {
             ],
         )?;
         tx.commit()?;
-        Ok(fixed + dismissed)
+        Ok(fixed)
     }
 
     pub fn claim_code_review_blocking_review_cleanup(&self, id: &str) -> Result<Option<String>> {
@@ -18825,7 +18796,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_dismissals_close_findings_and_declined_claims_pin_the_generation() {
+    fn resolving_an_open_findings_thread_dismisses_it_and_unresolving_restores_it() {
         let store = Store::open_in_memory().unwrap();
         let finding_at = |path: &str| NewCodeReviewFinding {
             path: path.into(),
@@ -18853,7 +18824,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let (dismissable, declinable) = (findings[0].clone(), findings[1].clone());
+        let (dismissed, kept_open) = (findings[0].clone(), findings[1].clone());
         assert!(store.claim_code_review_publication(&job.id).unwrap());
         store
             .record_code_review_publication(
@@ -18865,13 +18836,11 @@ mod tests {
                 "https://example/review",
                 false,
                 &[],
-                &[],
-                &[],
             )
             .unwrap();
         store
             .update_code_review_finding_publication(
-                &dismissable.id,
+                &dismissed.id,
                 Some(9001),
                 "https://example/comment/9001",
                 None,
@@ -18879,7 +18848,7 @@ mod tests {
             .unwrap();
         store
             .update_code_review_finding_publication(
-                &declinable.id,
+                &kept_open.id,
                 Some(9002),
                 "https://example/comment/9002",
                 None,
@@ -18888,89 +18857,85 @@ mod tests {
         store
             .finish_code_review_job(&job.id, "succeeded", "", "")
             .unwrap();
+        let open_before = store
+            .code_review_open_blocking_finding_count("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(open_before, 2);
 
-        // A human resolves both threads: both become pending claims at
-        // generation 1.
-        store
-            .record_code_review_thread_state(&dismissable.id, "T1", true)
+        // A maintainer resolving the thread dismisses the finding outright:
+        // no round, no adjudication, the judgment is trusted as-is.
+        let (changed, _) = store
+            .record_code_review_thread_state(&dismissed.id, "T1", true)
             .unwrap();
-        store
-            .record_code_review_thread_state(&declinable.id, "T2", true)
-            .unwrap();
-        let claims = store
-            .pending_code_review_resolution_claims("acme/widgets", 42)
-            .unwrap();
-        assert_eq!(claims.len(), 2);
-        assert_eq!(claims[0].finding_id, dismissable.id);
-        assert_eq!(claims[0].thread_generation, 1);
-        assert_eq!(claims[0].github_thread_id.as_deref(), Some("T1"));
-
-        // The next round adjudicates: one claim accepted, one declined.
-        let mut request = backoff_test_job_request();
-        request.dedupe_key = "acme/widgets#42:adjudication".into();
-        let round = store.enqueue_code_review_job(&request).unwrap().unwrap();
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            round.id
-        );
-        store
-            .save_code_review_result(&round.id, "clean", "", 0, &[], &[])
-            .unwrap();
-        assert!(store.claim_code_review_publication(&round.id).unwrap());
-        store
-            .prepare_code_review_finding_resolutions(&round.id, &[&dismissable.id])
-            .unwrap();
-        store
-            .record_code_review_publication(
-                &round.id,
-                &round.repository,
-                round.pull_number,
-                &round.base_ref,
-                &round.head_sha,
-                "https://example/adjudicated",
-                false,
-                &[],
-                &[(dismissable.id.as_str(), "maintainer accepts the tradeoff")],
-                &[(declinable.id.as_str(), 1)],
-            )
-            .unwrap();
-
+        assert!(changed);
         let states = store
             .reconcilable_code_review_findings("acme/widgets", 42)
             .unwrap();
-        let dismissed = states
+        let state = states
             .iter()
-            .find(|state| state.finding.id == dismissable.id)
+            .find(|state| state.finding.id == dismissed.id)
             .unwrap();
-        assert_eq!(dismissed.finding.status, "dismissed");
-        assert_eq!(dismissed.finding.resolved_by_job_id, round.id);
-        let declined = states
+        assert_eq!(state.finding.status, "dismissed");
+        assert!(state.finding.resolved_by_job_id.is_empty());
+        let other = states
             .iter()
-            .find(|state| state.finding.id == declinable.id)
+            .find(|state| state.finding.id == kept_open.id)
             .unwrap();
-        assert_eq!(declined.finding.status, "open");
-        assert_eq!(declined.claim_adjudicated_generation, 1);
+        assert_eq!(other.finding.status, "open");
 
-        // Both claims are settled; nothing re-litigates until a human
-        // toggles a thread again, which raises a fresh claim.
+        // The counts snapshot on the newest published round follows the
+        // dismissal so the check can re-project without a new round; the
+        // remaining open finding keeps the cleanup unarmed.
+        let refreshed = store
+            .refresh_code_review_pull_projection_counts("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(refreshed.as_deref(), Some(job.id.as_str()));
+        assert_eq!(
+            store
+                .code_review_open_blocking_finding_count("acme/widgets", 42)
+                .unwrap(),
+            1
+        );
+
+        // Unresolving the thread restores the finding: trust is symmetric.
+        let (changed, _) = store
+            .record_code_review_thread_state(&dismissed.id, "T1", false)
+            .unwrap();
+        assert!(changed);
+        let states = store
+            .reconcilable_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        let state = states
+            .iter()
+            .find(|state| state.finding.id == dismissed.id)
+            .unwrap();
+        assert_eq!(state.finding.status, "open");
+        assert!(state.recheck_pending);
+
+        // Resolving both threads clears the blocking ledger and arms the
+        // blocking-review cleanup on the newest published round.
+        store
+            .record_code_review_thread_state(&dismissed.id, "T1", true)
+            .unwrap();
+        store
+            .record_code_review_thread_state(&kept_open.id, "T2", true)
+            .unwrap();
+        let refreshed = store
+            .refresh_code_review_pull_projection_counts("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(refreshed.as_deref(), Some(job.id.as_str()));
+        assert_eq!(
+            store
+                .code_review_open_blocking_finding_count("acme/widgets", 42)
+                .unwrap(),
+            0
+        );
         assert!(
             store
-                .pending_code_review_resolution_claims("acme/widgets", 42)
+                .claim_code_review_blocking_review_cleanup(&job.id)
                 .unwrap()
-                .is_empty()
+                .is_some()
         );
-        store
-            .record_code_review_thread_state(&declinable.id, "T2", false)
-            .unwrap();
-        store
-            .record_code_review_thread_state(&declinable.id, "T2", true)
-            .unwrap();
-        let reclaims = store
-            .pending_code_review_resolution_claims("acme/widgets", 42)
-            .unwrap();
-        assert_eq!(reclaims.len(), 1);
-        assert_eq!(reclaims[0].finding_id, declinable.id);
-        assert_eq!(reclaims[0].thread_generation, 3);
     }
 
     #[test]
@@ -19012,8 +18977,6 @@ mod tests {
                 &job.head_sha,
                 "https://example/review",
                 false,
-                &[],
-                &[],
                 &[],
             )
             .unwrap();
@@ -19559,8 +19522,6 @@ mod tests {
                 "https://example/accepted-review",
                 false,
                 &[],
-                &[],
-                &[],
             )
             .unwrap();
 
@@ -19691,8 +19652,6 @@ mod tests {
                 "https://example/stale-review",
                 true,
                 &[&finding.id],
-                &[],
-                &[],
             )
             .unwrap();
 
@@ -19837,8 +19796,6 @@ mod tests {
                 &job.head_sha,
                 "https://example/review",
                 false,
-                &[],
-                &[],
                 &[],
             )
             .unwrap();
@@ -19997,8 +19954,6 @@ mod tests {
                 "https://example/newer-review",
                 false,
                 &[],
-                &[],
-                &[],
             )
             .unwrap();
         store
@@ -20010,8 +19965,6 @@ mod tests {
                 "older-head",
                 "https://example/older-review",
                 false,
-                &[],
-                &[],
                 &[],
             )
             .unwrap();
@@ -20055,8 +20008,6 @@ mod tests {
                 &job.head_sha,
                 "https://example/review",
                 false,
-                &[],
-                &[],
                 &[],
             )
             .unwrap();
@@ -20724,8 +20675,6 @@ mod tests {
                 "https://example.test/review/transition-1",
                 false,
                 &[],
-                &[],
-                &[],
             )
             .unwrap();
         let theme_id = findings[0].theme_ids[0].clone();
@@ -20776,8 +20725,6 @@ mod tests {
                 "https://example.test/review/transition-2",
                 false,
                 &[&findings[0].id],
-                &[],
-                &[],
             )
             .unwrap();
         let second_transition = store
@@ -20857,8 +20804,6 @@ mod tests {
                 "https://example.test/review/legacy-transition-1",
                 false,
                 &[],
-                &[],
-                &[],
             )
             .unwrap();
         store
@@ -20895,8 +20840,6 @@ mod tests {
                 "https://example.test/review/legacy-transition-2",
                 false,
                 &[&finding.id],
-                &[],
-                &[],
             )
             .unwrap();
         store
@@ -23081,8 +23024,6 @@ mod tests {
                 "https://example.test/review/1",
                 false,
                 &[],
-                &[],
-                &[],
             )
             .unwrap();
         store
@@ -23139,8 +23080,6 @@ mod tests {
                 "https://example.test/review/2",
                 false,
                 &resolved_finding_ids,
-                &[],
-                &[],
             )
             .unwrap();
         store
@@ -23327,8 +23266,6 @@ mod tests {
                 "https://example.test/review",
                 false,
                 resolved_finding_ids,
-                &[],
-                &[],
             )
             .unwrap();
         store
