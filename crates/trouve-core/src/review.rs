@@ -5130,19 +5130,31 @@ impl Engine {
         ));
         // The implementation analysis reads the full-branch diff and is
         // consumed only by the coordinator, so it overlaps the reviewer
-        // phase; the join is bounded because the analysis carries its own
-        // timeout and every one of its failure paths resolves to None.
-        let (executed_results, implementation_analysis) = tokio::join!(
-            executed_results,
-            self.run_implementation_analysis(
-                &job,
-                &session.id,
-                &session.worktree_path,
-                superseded,
-                active_threads,
-                reviewer_timeout,
-            )
-        );
+        // phase as a detached task. A clean round that skips the coordinator
+        // cancels it instead of waiting: its result would be unused, and a
+        // slow analysis must not delay an otherwise finished review.
+        let analysis_cancel = superseded.child_token();
+        let analysis_handle = tokio::spawn({
+            let engine = Arc::clone(self);
+            let job = job.clone();
+            let session_id = session.id.clone();
+            let worktree_path = session.worktree_path.clone();
+            let cancel = analysis_cancel.clone();
+            let active_threads = Arc::clone(active_threads);
+            async move {
+                engine
+                    .run_implementation_analysis(
+                        &job,
+                        &session_id,
+                        &worktree_path,
+                        &cancel,
+                        &active_threads,
+                        reviewer_timeout,
+                    )
+                    .await
+            }
+        });
+        let executed_results = executed_results.await;
         task_results.extend(executed_results);
         self.store.set_code_review_job_phase_elapsed(
             &job.id,
@@ -5225,6 +5237,13 @@ impl Engine {
             load_external_comments,
         );
         let coordinator_started = Instant::now();
+        let implementation_analysis =
+            if coordinator_candidates.is_empty() && previous_findings.is_empty() {
+                analysis_cancel.cancel();
+                None
+            } else {
+                analysis_handle.await.ok().flatten()
+            };
         let parsed = if coordinator_candidates.is_empty() && previous_findings.is_empty() {
             if let Some(task) = queued_coordinator.take() {
                 let skipped = self

@@ -425,7 +425,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
               </label>
               <label>
                 Change analyst model
-                <input list="code-review-models" autocomplete="off" spellcheck="false" placeholder="Inherit coordinator model" .value=${draft.analystModel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { analystModel: (event.currentTarget as HTMLInputElement).value })} />
+                <input list="code-review-models" autocomplete="off" spellcheck="false" placeholder="Inherit review model" .value=${draft.analystModel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { analystModel: (event.currentTarget as HTMLInputElement).value })} />
                 <small>Derives what the PR builds from the full branch diff each round; the final editor uses it as whole-PR context.</small>
               </label>
               <label>

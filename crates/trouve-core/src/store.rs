@@ -776,6 +776,28 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN analyst_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_advisory_open_issue_count INTEGER",
     "ALTER TABLE code_review_jobs DROP COLUMN publication_churn_signal",
+    // Legacy snapshots counted every open finding; recompute both tiers so
+    // deployed databases adopt the blocking/advisory split at upgrade time.
+    "UPDATE code_review_jobs SET
+       publication_open_issue_count = (
+         SELECT COUNT(*) FROM code_review_findings finding
+         JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+         WHERE finding_job.repository = code_review_jobs.repository
+           AND finding_job.pull_number = code_review_jobs.pull_number
+           AND finding_job.review_published != 0
+           AND finding.status = 'open'
+           AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+       ),
+       publication_advisory_open_issue_count = (
+         SELECT COUNT(*) FROM code_review_findings finding
+         JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+         WHERE finding_job.repository = code_review_jobs.repository
+           AND finding_job.pull_number = code_review_jobs.pull_number
+           AND finding_job.review_published != 0
+           AND finding.status = 'open'
+           AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+       )
+     WHERE publication_open_issue_count IS NOT NULL",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
