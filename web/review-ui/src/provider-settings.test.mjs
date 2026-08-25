@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   cursorSdkPreset,
   providerNeedsCursorSdkMigration,
+  providerSetupGroups,
   savedProviderMessage,
 } from "./provider-settings.ts";
 
@@ -28,4 +29,14 @@ test("provider saves do not report credential-free setup as ready", () => {
     savedProviderMessage("Cursor (Agent SDK)", { has_credentials: true }),
     "Saved Cursor (Agent SDK)",
   );
+});
+
+test("provider setup keeps local presets available in review-ui", () => {
+  const cursor = { id: "cursor", kind: "cursor-sdk", category: "subscription", auth: "api-key" };
+  const hosted = { id: "openai", kind: "openai-compat", category: "api", auth: "api-key" };
+  const local = { id: "ollama", kind: "openai-compat", category: "local", auth: "none" };
+  const groups = providerSetupGroups([cursor, hosted, local]);
+
+  assert.deepEqual(groups.subscriptionProviders, [cursor]);
+  assert.deepEqual(groups.apiProviders, [hosted, local]);
 });

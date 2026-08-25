@@ -1,5 +1,23 @@
 import type { KnownProvider, Provider } from "./types";
 
+export function providerSetupGroups(
+  providers: readonly KnownProvider[],
+): { subscriptionProviders: KnownProvider[]; apiProviders: KnownProvider[] } {
+  const subscriptionProviders = providers.filter(
+    (provider) => provider.category === "subscription"
+      || provider.auth === "cli"
+      || provider.auth === "oauth",
+  );
+  const subscriptionIds = new Set(subscriptionProviders.map((provider) => provider.id));
+  return {
+    subscriptionProviders,
+    // Unlike the desktop settings screen, review-ui has no separate Local
+    // section. Keep local presets in this custom/API form so they remain
+    // selectable rather than disappearing from settings.
+    apiProviders: providers.filter((provider) => !subscriptionIds.has(provider.id)),
+  };
+}
+
 export function providerNeedsCursorSdkMigration(
   provider: Pick<Provider, "kind">,
 ): boolean {

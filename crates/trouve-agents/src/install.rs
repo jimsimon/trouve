@@ -923,12 +923,20 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
+        let request_received = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let handler_received = request_received.clone();
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
                 axum::Router::new().route(
                     "/release",
-                    axum::routing::get(|| async { std::future::pending::<&'static str>().await }),
+                    axum::routing::get(move || {
+                        let handler_received = handler_received.clone();
+                        async move {
+                            handler_received.add_permits(1);
+                            std::future::pending::<&'static str>().await
+                        }
+                    }),
                 ),
             )
             .await
@@ -942,7 +950,14 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            request_received.acquire(),
+        )
+        .await
+        .expect("release-metadata request never reached the fixture")
+        .unwrap()
+        .forget();
         progress
             .cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
