@@ -5239,20 +5239,23 @@ impl Engine {
         let coordinator_started = Instant::now();
         let implementation_analysis =
             if coordinator_candidates.is_empty() && previous_findings.is_empty() {
-                // Cancellation is cooperative: give the analysis a short
-                // grace to settle through its token, then abort the task so a
-                // stage that ignores cancellation can neither block a clean
-                // review nor keep running detached behind it.
+                // Cancel cooperatively and abort immediately, then await the
+                // handle with a bounded grace to observe termination. A task
+                // aborts at its next yield point; every analysis stage is
+                // async, so this settles promptly. A hypothetical non-yielding
+                // stage cannot be preempted by any means Tokio offers — in
+                // that irreducible case we log and proceed rather than let a
+                // finished clean review block behind unused work.
                 analysis_cancel.cancel();
+                analysis_handle.abort();
                 let mut analysis_handle = analysis_handle;
                 if tokio::time::timeout(Duration::from_secs(10), &mut analysis_handle)
                     .await
                     .is_err()
                 {
-                    analysis_handle.abort();
                     tracing::warn!(
                         job_id = %job.id,
-                        "cancelled implementation analysis did not settle promptly; aborted"
+                        "aborted implementation analysis did not terminate within grace; proceeding"
                     );
                 }
                 None
