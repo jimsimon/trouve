@@ -22,6 +22,9 @@ export interface ReviewJobSummary {
   readonly status: string;
   readonly created_at: string;
   readonly open_issue_count?: number | null;
+  readonly scope?: string;
+  readonly review_base_sha?: string;
+  readonly base_ref?: string;
 }
 
 export interface ReviewJobGroup<T extends ReviewJobSummary = ReviewJobSummary> {
@@ -232,11 +235,24 @@ export const codeReviewStatusLabel = (status: string): string => {
     : `${normalized[0]?.toUpperCase() ?? ""}${normalized.slice(1)}`;
 };
 
-export const codeReviewNeedsAttention = (
-  job: Pick<ReviewJobSummary, "status" | "open_issue_count">,
+/** Zero open blocking findings established by a partial round: the check
+ * holds at neutral until a clean full-branch round confirms. */
+export const codeReviewAwaitingFullCoverage = (
+  job: Pick<ReviewJobSummary, "status" | "open_issue_count" | "scope" | "review_base_sha" | "base_ref">,
 ): boolean =>
   job.status === "succeeded" &&
-  job.open_issue_count !== 0;
+  job.open_issue_count === 0 &&
+  job.scope !== "full" &&
+  (job.review_base_sha ?? "") !== (job.base_ref ?? "");
+
+export const codeReviewNeedsAttention = (
+  job: Pick<
+    ReviewJobSummary,
+    "status" | "open_issue_count" | "scope" | "review_base_sha" | "base_ref"
+  >,
+): boolean =>
+  job.status === "succeeded" &&
+  (job.open_issue_count !== 0 || codeReviewAwaitingFullCoverage(job));
 
 /** Only absolute, credential-free HTTPS links may cross the native boundary. */
 export const safeCodeReviewHref = (value: string | null | undefined): string | undefined => {

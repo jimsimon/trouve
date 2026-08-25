@@ -13,6 +13,7 @@ import {
   CODE_REVIEW_STATUS_FILTERS,
   codeReviewSettingsDraft,
   codeReviewSettingsRequest,
+  codeReviewAwaitingFullCoverage,
   codeReviewNeedsAttention,
   codeReviewStatusClass,
   codeReviewStatusLabel,
@@ -651,7 +652,11 @@ export class TrouveCodeReviewDashboard extends LitElement {
     const pending = this.#pendingAction?.jobId === job.id ? this.#pendingAction : undefined;
     const busy = this.#busyJobId === job.id;
     const needsAttention = codeReviewNeedsAttention(job);
-    const outcomeLabel = needsAttention ? "Needs attention" : codeReviewStatusLabel(job.status);
+    const outcomeLabel = !needsAttention
+      ? codeReviewStatusLabel(job.status)
+      : codeReviewAwaitingFullCoverage(job)
+        ? "Full review pending"
+        : "Needs attention";
     const outcomeClass = needsAttention ? "failed" : codeReviewStatusClass(job.status);
 
     return html`

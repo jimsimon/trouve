@@ -765,12 +765,17 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE session_pr_verification_intents ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
+    // The churn-signal column shipped on interim builds of this branch. Its
+    // slot must survive (migrations are positional and append-only); the
+    // column itself is retired by the trailing migration below.
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_churn_signal TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN pull_body TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_repositories ADD COLUMN analyst_model TEXT",
     "ALTER TABLE code_review_repositories ADD COLUMN analyst_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN analyst_model TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN analyst_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_advisory_open_issue_count INTEGER",
+    "ALTER TABLE code_review_jobs DROP COLUMN publication_churn_signal",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
@@ -3043,7 +3048,7 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status = 'open'
-             AND (finding.severity = 'high' OR (finding.severity = 'medium' AND finding.confidence != 'low'))
+             AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
          ),
          publication_advisory_open_issue_count = (
            SELECT COUNT(*)
@@ -3053,7 +3058,7 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status = 'open'
-             AND NOT (finding.severity = 'high' OR (finding.severity = 'medium' AND finding.confidence != 'low'))
+             AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
          )
          WHERE id = ?1",
         params![job_id],
