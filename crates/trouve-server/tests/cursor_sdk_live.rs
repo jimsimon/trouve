@@ -22,6 +22,64 @@ const FILE_CONTENT: &str = "cursor-sdk-production-e2e";
 const WRITE_MARKER: &str = "CURSOR_SDK_WRITE_OK";
 const RESUME_MARKER: &str = "CURSOR_SDK_RESUME_OK";
 
+struct LiveServerGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LiveServerGuard {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for LiveServerGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+struct ManagedCursorRuntimeGuard {
+    data_dir: PathBuf,
+    armed: bool,
+}
+
+impl ManagedCursorRuntimeGuard {
+    fn new(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ManagedCursorRuntimeGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = trouve_agents::install::uninstall(
+                &self.data_dir,
+                trouve_agents::install::CliId::CursorSdkBridge,
+            )
+        {
+            eprintln!("failed to remove managed Cursor SDK runtime during test teardown: {error}");
+        }
+    }
+}
+
 fn init_repo(dir: &Path) {
     let run = |args: &[&str]| {
         let mut command = Command::new("git");
@@ -206,6 +264,33 @@ async fn install_cursor_sdk(client: &reqwest::Client, base: &str) {
     }
 }
 
+#[tokio::test]
+async fn live_server_guard_aborts_during_unwind_cleanup() {
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let abort_handle = handle.abort_handle();
+    drop(LiveServerGuard::new(handle));
+    tokio::task::yield_now().await;
+    assert!(abort_handle.is_finished());
+}
+
+#[test]
+fn managed_cursor_runtime_guard_removes_the_managed_fixture() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_root = temporary.path().join("cli/cursor-sdk-bridge/v1");
+    let managed_bin = temporary.path().join("cli/bin/cursor-sdk-bridge");
+    std::fs::create_dir_all(&runtime_root).unwrap();
+    std::fs::create_dir_all(managed_bin.parent().unwrap()).unwrap();
+    std::fs::write(runtime_root.join("cursor-sdk-bridge"), "fixture").unwrap();
+    std::fs::write(&managed_bin, "fixture").unwrap();
+
+    drop(ManagedCursorRuntimeGuard::new(
+        temporary.path().to_path_buf(),
+    ));
+
+    assert!(!temporary.path().join("cli/cursor-sdk-bridge").exists());
+    assert!(!managed_bin.exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "downloads the Cursor runtime and makes paid API calls; run with TROUVE_E2E=1 cargo test -- --ignored"]
 async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
@@ -225,6 +310,7 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
     let temporary = tempfile::tempdir().unwrap();
     let repository = temporary.path().join("repo");
     let data_dir = temporary.path().join("data");
+    let mut runtime_guard = ManagedCursorRuntimeGuard::new(data_dir.clone());
     std::fs::create_dir(&repository).unwrap();
     init_repo(&repository);
 
@@ -258,13 +344,16 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         engine.clone(),
         trouve_server::ServerSecurity::loopback(),
     );
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let server = LiveServerGuard::new(tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap()
+    }));
     let client = reqwest::Client::builder()
         .timeout(LIVE_TIMEOUT)
         .connect_timeout(Duration::from_secs(15))
         .build()
         .expect("build bounded live-qualification HTTP client");
     let base = format!("http://{address}/v1");
+    let cursor_state_root = data_dir.join("cursor-sdk");
 
     install_cursor_sdk(&client, &base).await;
     let runtimes: serde_json::Value = client
@@ -436,7 +525,6 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         .backend_session(thread_id, "cursor")
         .unwrap()
         .expect("first turn stored the Cursor SDK agent id");
-    let cursor_state_root = data_dir.join("cursor-sdk");
     let first_runtime_dirs = bridge_runtime_dirs(&cursor_state_root);
     assert_eq!(
         first_runtime_dirs.len(),
@@ -518,7 +606,6 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
     assert!(items.iter().any(|item| {
         item["kind"] == "tool_call" && item["tool"] == "read_file" && item["status"] == "ok"
     }));
-
     let uninstall = client
         .delete(format!("{base}/clis/cursor-sdk-bridge"))
         .send()
@@ -533,9 +620,9 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         bridge_runtime_dirs(&cursor_state_root).is_empty(),
         "uninstall did not stop and remove the warm Bridge runtime"
     );
+    runtime_guard.disarm();
 
-    server.abort();
-    let _ = server.await;
+    server.shutdown().await;
     assert_eq!(
         first_file_containing(&data_dir, api_key.as_bytes()),
         None,

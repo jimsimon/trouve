@@ -1196,17 +1196,41 @@ async fn mcp_request(
     timeout: Option<Duration>,
 ) -> Result<Value, BackendError> {
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let request = http
-        .post(mcp_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .send();
-    let response = match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, request)
+    let exchange = async {
+        let response = http
+            .post(mcp_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .send()
+            .await
+            .map_err(|error| BackendError::Protocol(format!("MCP {method}: {error}")))?;
+        let label = format!("MCP {method}");
+        let (status, bytes) = read_bounded_response(response, &label, MAX_RPC_BODY_BYTES).await?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            BackendError::Protocol(format!("MCP {method} returned invalid JSON: {error}"))
+        })?;
+        if !status.is_success() {
+            return Err(BackendError::Protocol(format!(
+                "MCP {method} returned HTTP {status}: {}",
+                bounded_json(&value)
+            )));
+        }
+        if let Some(error) = value.get("error") {
+            return Err(BackendError::Protocol(format!(
+                "MCP {method} failed: {}",
+                bounded_json(error)
+            )));
+        }
+        Ok(value)
+    };
+    match timeout {
+        // One deadline covers the complete logical RPC, including a peer that
+        // sends headers and then stalls while streaming the response body.
+        Some(timeout) => tokio::time::timeout(timeout, exchange)
             .await
             .map_err(|_| BackendError::Protocol(format!("MCP {method} timed out")))?,
         // ToolExecutor owns tool-specific deadlines and cancellation. The
@@ -1214,27 +1238,8 @@ async fn mcp_request(
         // the turn or output consumer ends. A second adapter wall-clock
         // timeout would break interactive questions and valid long-running
         // shell/MCP operations.
-        None => request.await,
+        None => exchange.await,
     }
-    .map_err(|error| BackendError::Protocol(format!("MCP {method}: {error}")))?;
-    let label = format!("MCP {method}");
-    let (status, bytes) = read_bounded_response(response, &label, MAX_RPC_BODY_BYTES).await?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
-        BackendError::Protocol(format!("MCP {method} returned invalid JSON: {error}"))
-    })?;
-    if !status.is_success() {
-        return Err(BackendError::Protocol(format!(
-            "MCP {method} returned HTTP {status}: {}",
-            bounded_json(&value)
-        )));
-    }
-    if let Some(error) = value.get("error") {
-        return Err(BackendError::Protocol(format!(
-            "MCP {method} failed: {}",
-            bounded_json(error)
-        )));
-    }
-    Ok(value)
 }
 
 #[derive(Clone)]
@@ -2991,6 +2996,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeded 4 bytes"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timed_mcp_request_bounds_a_stalled_response_body() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/mcp",
+                    post(|| async {
+                        Response::builder()
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from_stream(futures::stream::pending::<
+                                Result<bytes::Bytes, std::convert::Infallible>,
+                            >(
+                            )))
+                            .unwrap()
+                    }),
+                ),
+            )
+            .await
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            mcp_request(
+                &reqwest::Client::new(),
+                &format!("http://{address}/mcp"),
+                "tools/list",
+                json!({}),
+                Some(Duration::from_millis(25)),
+            ),
+        )
+        .await
+        .expect("MCP response-body deadline was not enforced")
+        .unwrap_err();
+        assert!(error.to_string().contains("MCP tools/list timed out"));
         server.abort();
     }
 

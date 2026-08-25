@@ -57,6 +57,7 @@ import {
 import {
   cursorSdkPreset,
   providerNeedsCursorSdkMigration,
+  providerSetupGroups,
   savedProviderMessage,
 } from "./provider-settings";
 import {
@@ -3640,6 +3641,8 @@ function ProviderSettings({
   const [cliBusy, setCliBusy] = useState("");
   const [subscriptionId, setSubscriptionId] = useState("");
   const [subscriptionApiKey, setSubscriptionApiKey] = useState("");
+  const subscriptionApiKeyInput = useRef<HTMLInputElement>(null);
+  const [cursorMigrationFocusRequest, setCursorMigrationFocusRequest] = useState(0);
   const [apiPresetId, setApiPresetId] = useState("");
   const [providerId, setProviderId] = useState("");
   const [providerKind, setProviderKind] = useState("openai-compat");
@@ -3789,17 +3792,23 @@ function ProviderSettings({
       setCliBusy("");
     }
   };
-  const subscriptionProviders = knownProviders.filter(
-    (provider) => provider.category === "subscription"
-      || provider.auth === "cli"
-      || provider.auth === "oauth",
-  );
-  const apiProviders = knownProviders.filter(
-    (provider) => provider.category !== "local" && !subscriptionProviders.includes(provider),
-  );
+  const { subscriptionProviders, apiProviders } = providerSetupGroups(knownProviders);
   const selectedSubscription = subscriptionProviders.find(
     (provider) => provider.id === subscriptionId,
   );
+  useEffect(() => {
+    if (
+      cursorMigrationFocusRequest > 0
+      && selectedSubscription?.kind === "cursor-sdk"
+      && selectedSubscription.auth === "api-key"
+    ) {
+      subscriptionApiKeyInput.current?.focus();
+    }
+  }, [
+    cursorMigrationFocusRequest,
+    selectedSubscription?.auth,
+    selectedSubscription?.kind,
+  ]);
   const cursorMigration = cursorSdkPreset(subscriptionProviders);
   const requiredRuntime = selectedSubscription
     ? clis.find((cli) => cli.kinds.includes(selectedSubscription.kind))
@@ -3882,6 +3891,7 @@ function ProviderSettings({
                   class="ghost compact"
                   type="button"
                   onClick={() => {
+                    setCursorMigrationFocusRequest((request) => request + 1);
                     setSubscriptionId(cursorMigration.id);
                     setSubscriptionApiKey("");
                     setLogin(null);
@@ -3996,6 +4006,7 @@ function ProviderSettings({
             <label>
               API key
               <input
+                ref={subscriptionApiKeyInput}
                 type="password"
                 autoComplete="new-password"
                 value={subscriptionApiKey}

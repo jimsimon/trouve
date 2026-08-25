@@ -243,46 +243,162 @@ struct VisibleTurn {
     failed: bool,
 }
 
-fn fold_visible_turn(events: &[serde_json::Value]) -> VisibleTurn {
-    let text = |kind: &str, field: &str| {
-        events
-            .iter()
-            .filter(|event| event["type"] == kind)
-            .filter_map(|event| event[field].as_str())
-            .collect::<String>()
-    };
-    let completed = events
+fn exact_event_index(events: &[serde_json::Value], kind: &str) -> Result<usize, String> {
+    let indices = events
         .iter()
-        .find(|event| event["type"] == "turn.completed")
-        .expect("turn completed");
-    VisibleTurn {
-        user_message: text("user.message", "content"),
-        thinking: text("assistant.thinking", "text"),
-        thinking_completed: events
-            .iter()
-            .any(|event| event["type"] == "assistant.thinking_completed"),
-        answer: events
-            .iter()
-            .find(|event| event["type"] == "assistant.message")
-            .and_then(|event| event["content"].as_str())
-            .unwrap_or_default()
-            .to_string(),
-        input_tokens: completed["usage"]["input_tokens"].as_u64().unwrap_or(0),
-        cached_input_tokens: completed["usage"]["cached_input_tokens"]
-            .as_u64()
-            .unwrap_or(0),
-        output_tokens: completed["usage"]["output_tokens"].as_u64().unwrap_or(0),
-        context_input_tokens: completed["usage"]["context_input_tokens"]
-            .as_u64()
-            .unwrap_or(0),
-        completed: true,
-        failed: events.iter().any(|event| {
+        .enumerate()
+        .filter_map(|(index, event)| (event["type"] == kind).then_some(index))
+        .collect::<Vec<_>>();
+    if indices.len() != 1 {
+        return Err(format!(
+            "expected exactly one {kind} event, observed {}",
+            indices.len()
+        ));
+    }
+    Ok(indices[0])
+}
+
+fn required_u64(event: &serde_json::Value, pointer: &str) -> Result<u64, String> {
+    event
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("event omitted integral {pointer}"))
+}
+
+fn fold_visible_turn(events: &[serde_json::Value]) -> Result<VisibleTurn, String> {
+    let user_index = exact_event_index(events, "user.message")?;
+    let thinking_indices = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| (event["type"] == "assistant.thinking").then_some(index))
+        .collect::<Vec<_>>();
+    if thinking_indices.is_empty() {
+        return Err("expected at least one assistant.thinking event".into());
+    }
+    let thinking_completed_index = exact_event_index(events, "assistant.thinking_completed")?;
+    let answer_index = exact_event_index(events, "assistant.message")?;
+    let completed_index = exact_event_index(events, "turn.completed")?;
+    let conflicting_terminals = events
+        .iter()
+        .filter(|event| {
             matches!(
                 event["type"].as_str(),
                 Some("turn.failed" | "turn.cancelled")
             )
-        }),
+        })
+        .count();
+    if conflicting_terminals != 0 {
+        return Err(format!(
+            "completed turn also contained {conflicting_terminals} failure or cancellation event(s)"
+        ));
     }
+    if completed_index + 1 != events.len() {
+        return Err("turn.completed was not the final observed event".into());
+    }
+    if user_index >= thinking_indices[0]
+        || thinking_indices
+            .iter()
+            .any(|index| *index >= thinking_completed_index)
+        || thinking_completed_index >= answer_index
+        || answer_index >= completed_index
+    {
+        return Err("visible turn lifecycle events were out of order".into());
+    }
+
+    let user_message = events[user_index]["content"]
+        .as_str()
+        .ok_or_else(|| "user.message omitted content".to_string())?
+        .to_string();
+    let thinking = thinking_indices
+        .iter()
+        .map(|index| {
+            events[*index]["text"]
+                .as_str()
+                .ok_or_else(|| "assistant.thinking omitted text".to_string())
+        })
+        .collect::<Result<String, _>>()?;
+    let answer = events[answer_index]["content"]
+        .as_str()
+        .ok_or_else(|| "assistant.message omitted content".to_string())?
+        .to_string();
+    let completed = &events[completed_index];
+    Ok(VisibleTurn {
+        user_message,
+        thinking,
+        thinking_completed: true,
+        answer,
+        input_tokens: required_u64(completed, "/usage/input_tokens")?,
+        cached_input_tokens: required_u64(completed, "/usage/cached_input_tokens")?,
+        output_tokens: required_u64(completed, "/usage/output_tokens")?,
+        context_input_tokens: required_u64(completed, "/usage/context_input_tokens")?,
+        completed: true,
+        failed: false,
+    })
+}
+
+fn valid_visible_turn_events() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type":"user.message", "content":"verify parity"}),
+        serde_json::json!({"type":"assistant.thinking", "text":THINKING}),
+        serde_json::json!({"type":"assistant.thinking_completed"}),
+        serde_json::json!({"type":"assistant.message", "content":ANSWER}),
+        serde_json::json!({
+            "type":"turn.completed",
+            "usage":{
+                "input_tokens":12,
+                "cached_input_tokens":3,
+                "output_tokens":7,
+                "context_input_tokens":15
+            }
+        }),
+    ]
+}
+
+#[test]
+fn visible_turn_fold_rejects_malformed_lifecycle_histories() {
+    let valid = valid_visible_turn_events();
+    assert!(fold_visible_turn(&valid).is_ok());
+
+    let mut duplicate_message = valid.clone();
+    duplicate_message.insert(
+        duplicate_message.len() - 1,
+        serde_json::json!({"type":"assistant.message", "content":"duplicate"}),
+    );
+    assert!(
+        fold_visible_turn(&duplicate_message)
+            .unwrap_err()
+            .contains("exactly one assistant.message")
+    );
+
+    let missing_boundary = valid
+        .iter()
+        .filter(|event| event["type"] != "assistant.thinking_completed")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        fold_visible_turn(&missing_boundary)
+            .unwrap_err()
+            .contains("exactly one assistant.thinking_completed")
+    );
+
+    let mut contradictory_terminal = valid.clone();
+    contradictory_terminal.insert(
+        contradictory_terminal.len() - 1,
+        serde_json::json!({"type":"turn.failed"}),
+    );
+    assert!(
+        fold_visible_turn(&contradictory_terminal)
+            .unwrap_err()
+            .contains("failure or cancellation")
+    );
+
+    let mut out_of_order = valid;
+    out_of_order.swap(2, 3);
+    assert!(
+        fold_visible_turn(&out_of_order)
+            .unwrap_err()
+            .contains("out of order")
+    );
 }
 
 #[tokio::test]
@@ -350,7 +466,10 @@ async fn raw_provider_and_vendor_backend_share_the_visible_turn_contract() {
 
     let raw = run_visible_turn(&client, &base, session_id, "raw/model").await;
     let vendor = run_visible_turn(&client, &base, session_id, "vendor/model").await;
-    assert_eq!(fold_visible_turn(&raw), fold_visible_turn(&vendor));
+    assert_eq!(
+        fold_visible_turn(&raw).expect("raw provider emitted a malformed visible lifecycle"),
+        fold_visible_turn(&vendor).expect("vendor backend emitted a malformed visible lifecycle")
+    );
 
     let raw_observation = provider_observation.lock().unwrap();
     assert!(raw_observation.saw_system_instructions);
