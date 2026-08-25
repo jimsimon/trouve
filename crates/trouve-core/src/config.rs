@@ -120,6 +120,7 @@ pub struct GithubEnterpriseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Wire protocol / integration kind:
+    /// - "openai-responses" (native OpenAI Responses API)
     /// - "openai-compat" (chat completions; OpenAI, OpenRouter, Ollama, ...)
     /// - "anthropic" (Messages API)
     /// - "codex-app-server", "cursor-cli", "claude-cli" (vendor agent

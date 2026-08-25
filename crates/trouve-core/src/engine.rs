@@ -2354,7 +2354,8 @@ fn build_all_providers(
     }
     // Zero-config defaults from conventional env vars.
     if !providers.contains_key("openai")
-        && let Ok(p) = trouve_providers::openai_compat::OpenAiCompatProvider::openai_from_env()
+        && let Ok(p) =
+            trouve_providers::openai_responses::OpenAiResponsesProvider::openai_from_env()
     {
         providers.insert("openai".into(), Arc::new(p.with_catalog(catalog.clone())));
     }
@@ -3116,6 +3117,8 @@ impl Engine {
                     id: id.clone(),
                     kind: if id == "anthropic" {
                         "anthropic".into()
+                    } else if id == "openai" {
+                        "openai-responses".into()
                     } else {
                         "openai-compat".into()
                     },
@@ -3195,7 +3198,8 @@ impl Engine {
     ) -> Result<ProviderInfo, EngineError> {
         if !matches!(
             req.kind.as_str(),
-            "openai-compat"
+            "openai-responses"
+                | "openai-compat"
                 | "anthropic"
                 | "azure-openai"
                 | "amazon-bedrock"
@@ -3204,7 +3208,7 @@ impl Engine {
         ) && !is_cli_auth_kind(&req.kind)
         {
             return Err(EngineError::BadRequest(format!(
-                "unknown provider kind {:?} (expected openai-compat, anthropic, \
+                "unknown provider kind {:?} (expected openai-responses, openai-compat, anthropic, \
                  azure-openai, amazon-bedrock, google-vertex, \
                  google-vertex-anthropic, codex-app-server, \
                  cursor-cli, or claude-cli)",
@@ -10419,9 +10423,9 @@ impl Engine {
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
-            // Provider-native reasoning blocks (Anthropic signed thinking) to
-            // persist and replay verbatim — Anthropic rejects a follow-up
-            // tool-use turn whose thinking blocks aren't preserved.
+            // Provider-native reasoning blocks to persist and replay verbatim.
+            // Anthropic requires its signed thinking blocks, while OpenAI
+            // Responses requires reasoning items across tool continuations.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
             let mut thinking_streamed = false;
             let mut pending_events = Vec::new();
@@ -16883,6 +16887,20 @@ fn build_provider(
         .any(|value| value.contains("${API_KEY}"));
     let known_catalog_provider = known_preset.map(|provider| provider.id);
     match pc.kind.as_str() {
+        "openai-responses" => {
+            let mut provider =
+                trouve_providers::openai_responses::OpenAiResponsesProvider::with_token(
+                    id.to_string(),
+                    base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                    token,
+                )
+                .with_catalog(catalog.clone())
+                .with_http_options(bearer_auth, headers, query_params);
+            if let Some(catalog_provider) = known_catalog_provider {
+                provider = provider.with_catalog_provider(catalog_provider);
+            }
+            Ok(Arc::new(provider))
+        }
         "openai-compat" => {
             let mut provider = trouve_providers::openai_compat::OpenAiCompatProvider::with_token(
                 id.to_string(),

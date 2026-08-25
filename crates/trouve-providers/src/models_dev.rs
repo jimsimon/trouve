@@ -694,7 +694,15 @@ impl CatalogProvider {
 
     fn endpoint_matches(&self, catalog_id: &str, base_url: &str, kind: &str) -> bool {
         self.transport(catalog_id).is_some_and(|transport| {
-            transport.kind == kind
+            // Existing OpenAI configurations used Chat Completions before
+            // the native Responses adapter became the preset. Keep those
+            // explicit configurations catalog-backed without treating other
+            // Responses endpoints as generically Chat-compatible.
+            let kind_matches = transport.kind == kind
+                || (catalog_id == "openai"
+                    && transport.kind == "openai-responses"
+                    && kind == "openai-compat");
+            kind_matches
                 && transport.base_url.is_some_and(|endpoint| {
                     !endpoint.contains("${")
                         && normalize_endpoint(transport.kind, &endpoint)
@@ -952,7 +960,7 @@ fn merge_json(target: &mut Value, patch: &Value) {
 /// from api.json.
 fn transport_adapter(provider: &str) -> Option<TransportPreset> {
     Some(match provider {
-        "openai" => TransportPreset::http("openai-compat", "https://api.openai.com/v1"),
+        "openai" => TransportPreset::http("openai-responses", "https://api.openai.com/v1"),
         "anthropic" => TransportPreset::http("anthropic", "https://api.anthropic.com"),
         "google" => TransportPreset::http(
             "openai-compat",
@@ -1365,6 +1373,15 @@ mod tests {
             openrouter.api_key_env.as_deref(),
             Some("OPENROUTER_API_KEY")
         );
+        let openai = providers
+            .iter()
+            .find(|provider| provider.id == "openai")
+            .unwrap();
+        assert_eq!(openai.kind, "openai-responses");
+        assert_eq!(
+            openai.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
 
         // Google has no `api` field because models.dev targets its native SDK;
         // the roster/name/env remain catalog data and Trouve supplies only the
@@ -1452,6 +1469,19 @@ mod tests {
     #[test]
     fn endpoint_matching_uses_catalog_and_preserves_old_aliases() {
         let catalog = ModelsDevCatalog::embedded();
+        assert_eq!(
+            catalog.provider_for_endpoint(
+                "openai",
+                "https://api.openai.com/v1",
+                "openai-responses"
+            ),
+            Some("openai".into())
+        );
+        assert_eq!(
+            catalog.provider_for_endpoint("openai", "https://api.openai.com/v1", "openai-compat"),
+            Some("openai".into()),
+            "explicit legacy Chat Completions configs stay catalog-backed"
+        );
         assert_eq!(
             catalog.provider_for_endpoint(
                 "custom",

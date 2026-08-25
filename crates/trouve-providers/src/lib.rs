@@ -1,10 +1,11 @@
 //! LLM provider abstraction for the trouve harness.
 //!
-//! Implementations: OpenAI-compatible chat completions (also covers
-//! OpenRouter, Ollama, vLLM, and most gateways via `base_url`) and the
-//! Anthropic Messages API. Auth is pluggable ([`auth::TokenSource`]): static
-//! API keys, or OAuth tokens with refresh (device flow / PKCE subscription
-//! auth) persisted in the OS keychain ([`secrets`]).
+//! Implementations: the native OpenAI Responses API, OpenAI-compatible chat
+//! completions (OpenRouter, Ollama, vLLM, and most gateways via `base_url`),
+//! and the Anthropic Messages API. Auth is pluggable
+//! ([`auth::TokenSource`]): static API keys, or OAuth tokens with refresh
+//! (device flow / PKCE subscription auth) persisted in the OS keychain
+//! ([`secrets`]).
 
 pub mod anthropic;
 pub mod auth;
@@ -15,6 +16,7 @@ pub mod codex;
 pub mod kimi_usage;
 pub mod models_dev;
 pub mod openai_compat;
+pub mod openai_responses;
 pub mod secrets;
 pub(crate) mod sse;
 pub mod vertex;
@@ -58,11 +60,11 @@ pub enum Message {
     Assistant {
         content: String,
         tool_calls: Vec<ToolCallRequest>,
-        /// Provider-native reasoning blocks to replay verbatim on the next
-        /// request (Anthropic's signed `thinking`/`redacted_thinking`
-        /// blocks). Anthropic rejects a follow-up tool-use turn whose
-        /// thinking blocks aren't preserved, so these must survive the
-        /// round-trip. Opaque to other providers, which ignore them.
+        /// Provider-native reasoning items to replay verbatim on the next
+        /// request (for example Anthropic's signed thinking blocks or an
+        /// OpenAI Responses `reasoning` item with encrypted content). Some
+        /// providers reject follow-up tool-use turns when these are omitted,
+        /// so they must survive the round-trip. Other providers ignore them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reasoning: Vec<serde_json::Value>,
     },
@@ -82,9 +84,9 @@ pub enum ProviderEvent {
     TextDelta(String),
     /// Reasoning ("thinking") text, where the model/provider exposes it.
     ThinkingDelta(String),
-    /// A complete provider-native reasoning block to preserve for replay
-    /// (Anthropic signed `thinking`/`redacted_thinking`). Distinct from
-    /// `ThinkingDelta`, which is display-only streaming text.
+    /// A complete provider-native reasoning block/item to preserve for
+    /// replay. Distinct from `ThinkingDelta`, which is display-only streaming
+    /// text.
     Reasoning(serde_json::Value),
     ToolCall(ToolCallRequest),
     Completed {

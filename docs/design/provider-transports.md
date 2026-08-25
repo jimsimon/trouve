@@ -11,6 +11,7 @@ metadata and fallback model lists.
 
 | Transport | Catalog providers | Authentication | Model discovery |
 | --- | --- | --- | --- |
+| OpenAI Responses | OpenAI's official API | Bearer API key | `GET /models` ids intersected with models.dev |
 | OpenAI Chat Completions compatible | Catalog records using `@ai-sdk/openai-compatible`, `@ai-sdk/openai`, or OpenRouter's provider, plus documented adapters such as AIHubMix, Cerebras, Cloudflare AI Gateway, Cohere, DeepInfra, Google AI, Groq, Merge Gateway, Mistral, Perplexity, Together, v0, Venice, Vercel, and xAI | Bearer by default; template headers/query parameters can replace it | `GET /models` ids intersected with models.dev |
 | Anthropic Messages | Anthropic and catalog records explicitly using its API shape | `x-api-key`, sanctioned OAuth where configured, or template auth | `GET /v1/models` ids intersected with models.dev |
 | Azure OpenAI v1 | Azure OpenAI and Azure AI Services | `api-key` template header | `GET /openai/v1/models`; catalog fallback excludes Claude, which uses a Messages endpoint |
@@ -33,6 +34,10 @@ public model catalog.
 | Claude Code subscription | Claude CLI installation/login and command-line option mapping | Anthropic models.dev metadata |
 | Cursor subscription/API key | ACP transport, CLI auth, context/fast controls | Live ACP availability; public vendor models are canonicalized from models.dev, Cursor-only models use the ACP adapter |
 | Custom/local OpenAI-compatible endpoints | Endpoint/auth plus native Ollama or LM Studio probes where recognized | Explicit live adapter because arbitrary and user-installed ids have no catalog record |
+
+The experimental direct-tool alternative for Codex is tracked by the
+[dynamic-tool qualification](codex-dynamic-tool-qualification.md); the shipping
+transport remains the full MCP bridge.
 
 ## Intentionally not exposed
 

@@ -3879,6 +3879,7 @@ function ProviderSettings({
                 value={providerKind}
                 onChange={(event) => setProviderKind(event.currentTarget.value)}
               >
+                <option value="openai-responses">OpenAI Responses</option>
                 <option value="openai-compat">OpenAI compatible</option>
                 <option value="anthropic">Anthropic</option>
               </select>

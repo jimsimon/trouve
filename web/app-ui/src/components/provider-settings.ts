@@ -652,6 +652,7 @@ export class TrouveProviderSettings extends LitElement {
         <label>
           Transport kind
           <select name="provider_kind" required @change=${(event: Event) => { this.#customProviderKind = (event.currentTarget as HTMLSelectElement).value; }}>
+            <option value="openai-responses" ?selected=${this.#customProviderKind === "openai-responses"}>OpenAI Responses</option>
             <option value="openai-compat" ?selected=${this.#customProviderKind === "openai-compat"}>OpenAI compatible</option>
             <option value="anthropic" ?selected=${this.#customProviderKind === "anthropic"}>Anthropic</option>
             <option value="azure-openai">Azure OpenAI</option>

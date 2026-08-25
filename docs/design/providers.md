@@ -1,9 +1,11 @@
 # Provider configuration
 
 Providers are configured in `~/.config/trouve/config.toml` (override with
-`TROUVE_CONFIG`). Two kinds exist today:
+`TROUVE_CONFIG`). The two OpenAI-family transports are intentionally distinct:
 
-- `openai-compat` — OpenAI chat completions and compatible gateways
+- `openai-responses` — the native OpenAI Responses API, including typed tool
+  and encrypted reasoning items.
+- `openai-compat` — OpenAI Chat Completions-compatible gateways
   (OpenRouter, Ollama, vLLM, LiteLLM) via `base_url`.
 - `anthropic` — the Anthropic Messages API.
 
@@ -24,7 +26,7 @@ register `openai` / `anthropic` providers automatically.
 default_model = "anthropic/claude-sonnet-4-5"
 
 [providers.openai]
-kind = "openai-compat"
+kind = "openai-responses"
 api_key_env = "OPENAI_API_KEY"
 
 [providers.anthropic]
@@ -36,23 +38,13 @@ kind = "openai-compat"
 base_url = "http://localhost:11434/v1"
 api_key = "ollama"                      # ignored by ollama but required shape
 
-# Subscription (OAuth) auth. Device flow is used when
-# device_authorization_url is set; browser PKCE otherwise.
-[providers.openai-chatgpt]
-kind = "openai-compat"
-base_url = "https://chatgpt.com/backend-api/codex"
-
-[providers.openai-chatgpt.oauth]
-client_id = "<openai codex client id>"
-authorization_url = "https://auth.openai.com/oauth/authorize"
-token_url = "https://auth.openai.com/oauth/token"
-scopes = ["openid", "profile", "email", "offline_access"]
-redirect_port = 1455
+# ChatGPT subscription access stays in the vendor CLI and app-server.
+[providers.codex]
+kind = "codex-app-server"
 ```
 
-Then: `trouve auth login openai-chatgpt` opens the browser flow, stores the
-token set in the keychain, and the server uses (and refreshes) it as a bearer
-token.
+Then `trouve auth login codex` launches Codex's own login flow; Trouve never
+handles the vendor's subscription OAuth tokens.
 
 ## Model catalog
 
