@@ -54,6 +54,9 @@ const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIAGNOSTIC_LINES: usize = 40;
 const MAX_CALLBACK_RECORDS: usize = 128;
+// Historical IDs use fixed-size hashes, but still need a separate hard ceiling
+// so a defective authenticated Bridge cannot grow one turn without bound.
+const MAX_CALLBACKS_PER_TURN: usize = 4 * 1024;
 const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
 const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
@@ -1270,7 +1273,7 @@ impl CallbackCalls {
         fingerprint: CallbackKey,
         outcome: watch::Receiver<Option<CallbackOutcome>>,
     ) -> bool {
-        if self.records.len() >= MAX_CALLBACK_RECORDS {
+        if self.records.len() >= MAX_CALLBACK_RECORDS || self.seen.len() >= MAX_CALLBACKS_PER_TURN {
             return false;
         }
         self.seen.insert(call_id, fingerprint);
@@ -2837,22 +2840,46 @@ mod tests {
         assert_eq!(calls.seen.len(), MAX_CALLBACK_RECORDS + 1);
         assert_eq!(calls.seen.get(&first_call), Some(&first_fingerprint));
 
-        while calls.records.len() < MAX_CALLBACK_RECORDS {
+        while calls.seen.len() < MAX_CALLBACKS_PER_TURN {
             let index = calls.seen.len();
             let (_sender, receiver) = watch::channel(None);
             assert!(calls.admit(
-                callback_key(&format!("pending-{index}")),
-                callback_key(&format!("pending-fingerprint-{index}")),
+                callback_key(&format!("completed-{index}")),
+                callback_key(&format!("completed-fingerprint-{index}")),
+                receiver,
+            ));
+            calls.mark_completed(
+                callback_key(&format!("completed-{index}")),
+                MAX_CALLBACK_REPLAY_BYTES / 2,
+            );
+        }
+        let (_sender, receiver) = watch::channel(None);
+        assert!(!calls.admit(
+            callback_key("over-turn-capacity"),
+            callback_key("over-turn-capacity-fingerprint"),
+            receiver,
+        ));
+        assert_eq!(calls.seen.len(), MAX_CALLBACKS_PER_TURN);
+        assert!(calls.records.len() <= MAX_CALLBACK_RECORDS);
+        assert!(calls.replay_bytes <= MAX_CALLBACK_REPLAY_BYTES);
+
+        let mut active = CallbackCalls::default();
+        while active.records.len() < MAX_CALLBACK_RECORDS {
+            let index = active.records.len();
+            let (_sender, receiver) = watch::channel(None);
+            assert!(active.admit(
+                callback_key(&format!("active-{index}")),
+                callback_key(&format!("active-fingerprint-{index}")),
                 receiver,
             ));
         }
         let (_sender, receiver) = watch::channel(None);
-        assert!(!calls.admit(
-            callback_key("over-capacity"),
-            callback_key("over-capacity-fingerprint"),
+        assert!(!active.admit(
+            callback_key("over-active-capacity"),
+            callback_key("over-active-capacity-fingerprint"),
             receiver,
         ));
-        assert_eq!(calls.records.len(), MAX_CALLBACK_RECORDS);
+        assert_eq!(active.records.len(), MAX_CALLBACK_RECORDS);
     }
 
     #[tokio::test]
