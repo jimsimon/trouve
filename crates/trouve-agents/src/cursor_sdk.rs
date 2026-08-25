@@ -1805,11 +1805,9 @@ impl BridgeProcess {
                 return cleanup_error(error, cleanup.map(|_| ()));
             }
         };
-        let secrets = Arc::new(StdMutex::new(vec![
-            api_key.to_string(),
-            callback.bearer.clone(),
-            token.clone(),
-        ]));
+        let process_secrets = vec![api_key.to_string(), callback.bearer.clone(), token.clone()];
+        let process_secret_count = process_secrets.len();
+        let secrets = Arc::new(StdMutex::new(process_secrets));
         let shared_diagnostics = Arc::new(tokio::sync::Mutex::new(diagnostics));
         let drain_diagnostics = shared_diagnostics.clone();
         let drain_secrets = secrets.clone();
@@ -1835,6 +1833,7 @@ impl BridgeProcess {
                 base_url: ready.url.trim_end_matches('/').to_string(),
                 token,
                 secrets,
+                process_secret_count,
                 diagnostics: shared_diagnostics,
             },
             stderr_task,
@@ -1847,7 +1846,7 @@ impl BridgeProcess {
         callback: Option<&CallbackServer>,
     ) -> Result<(), BackendError> {
         if let Some(callback) = callback {
-            self.client.remember_secret(&callback.bearer);
+            self.client.set_turn_secret(Some(&callback.bearer));
         }
         let (url, auth_token) = callback
             .map(|callback| (callback.url.as_str(), callback.bearer.as_str()))
@@ -1860,6 +1859,9 @@ impl BridgeProcess {
                 Duration::from_secs(10),
             )
             .await?;
+        if callback.is_none() {
+            self.client.set_turn_secret(None);
+        }
         Ok(())
     }
 
@@ -2074,12 +2076,26 @@ fn redact(value: &str, secrets: &[&str]) -> String {
         })
 }
 
+fn replace_turn_secret(
+    secrets: &mut Vec<String>,
+    process_secret_count: usize,
+    secret: Option<&str>,
+) {
+    secrets.truncate(process_secret_count);
+    if let Some(secret) = secret.filter(|secret| !secret.is_empty())
+        && !secrets.iter().any(|known| known == secret)
+    {
+        secrets.push(secret.to_string());
+    }
+}
+
 #[derive(Clone)]
 struct BridgeClient {
     http: reqwest::Client,
     base_url: String,
     token: String,
     secrets: Arc<StdMutex<Vec<String>>>,
+    process_secret_count: usize,
     diagnostics: Arc<tokio::sync::Mutex<VecDeque<String>>>,
 }
 
@@ -2181,11 +2197,9 @@ impl BridgeClient {
         )
     }
 
-    fn remember_secret(&self, secret: &str) {
+    fn set_turn_secret(&self, secret: Option<&str>) {
         let mut secrets = self.secrets.lock().unwrap();
-        if !secrets.iter().any(|known| known == secret) {
-            secrets.push(secret.to_string());
-        }
+        replace_turn_secret(&mut secrets, self.process_secret_count, secret);
     }
 
     async fn diagnostic_suffix(&self) -> String {
@@ -2915,6 +2929,26 @@ fn i64_flex(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_redaction_retains_only_the_current_turn_secret() {
+        let process_secrets = vec![
+            "api-key".to_string(),
+            "startup-callback".to_string(),
+            "bridge-token".to_string(),
+        ];
+        let mut secrets = process_secrets.clone();
+
+        for index in 0..1_000 {
+            let turn_secret = format!("turn-callback-{index}");
+            replace_turn_secret(&mut secrets, process_secrets.len(), Some(&turn_secret));
+            assert_eq!(secrets.len(), process_secrets.len() + 1);
+            assert_eq!(secrets.last(), Some(&turn_secret));
+        }
+
+        replace_turn_secret(&mut secrets, process_secrets.len(), None);
+        assert_eq!(secrets, process_secrets);
+    }
 
     #[test]
     fn bridge_url_requires_a_literal_loopback_address() {

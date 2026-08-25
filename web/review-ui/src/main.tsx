@@ -4009,11 +4009,12 @@ function ProviderSettings({
                 ref={subscriptionApiKeyInput}
                 type="password"
                 autoComplete="new-password"
+                aria-describedby="subscription-api-key-guidance"
                 value={subscriptionApiKey}
                 onInput={(event) => setSubscriptionApiKey(event.currentTarget.value)}
                 placeholder="Stored in trouve's secret store; leave empty to keep"
               />
-              <small>
+              <small id="subscription-api-key-guidance">
                 {selectedSubscription.api_key_env
                   ? `Or set ${selectedSubscription.api_key_env} on the server.`
                   : "A supported vendor API key is required for this subscription."}
@@ -4100,11 +4101,12 @@ function ProviderSettings({
             <input
               type="password"
               autoComplete="new-password"
+              aria-describedby="provider-api-key-guidance"
               value={providerApiKey}
               onInput={(event) => setProviderApiKey(event.currentTarget.value)}
               disabled={apiProviders.find((provider) => provider.id === apiPresetId)?.auth === "none"}
             />
-            <small>
+            <small id="provider-api-key-guidance">
               {apiProviders.find((provider) => provider.id === apiPresetId)?.api_key_env
                 ? `Or set ${apiProviders.find((provider) => provider.id === apiPresetId)?.api_key_env} on the server.`
                 : "Stored in trouve's secret store."}
