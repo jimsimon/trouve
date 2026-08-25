@@ -30,6 +30,8 @@ import {
   BRIDGE_VERSION,
   QualificationError,
   assistantText,
+  assertUniqueToolLifecycle,
+  exactTerminalResult,
   installSignalCleanup,
   parseTimeoutSeconds,
   readBoundedJsonResponse,
@@ -402,6 +404,7 @@ function arraysEqual(left, right) {
 function inspectToolCalls(frames, callbacks, expectedTools, allowToolError, label) {
   const messages = sdkMessages(frames);
   const toolMessages = messages.filter((message) => message.type === "tool_call");
+  assertUniqueToolLifecycle(toolMessages, label);
   const actualTools = sorted(callbacks.map((call) => call.toolName));
   const expected = sorted(expectedTools);
   if (!arraysEqual(actualTools, expected)) {
@@ -516,14 +519,11 @@ async function runTurn({
     allowToolError,
     label,
   );
-  const terminal = terminalFrame(frames);
-  if (terminal === undefined || !terminalStatusIsFinished(terminal.status)) {
+  const terminal = exactTerminalResult(frames, label);
+  if (!terminalStatusIsFinished(terminal.status)) {
     throw new QualificationError(
       `${label} ended with non-finished status ${terminal?.status}`,
     );
-  }
-  if (!frames.some((frame) => frame.done !== undefined)) {
-    throw new QualificationError(`${label} omitted done`);
   }
   const messages = sdkMessages(frames);
   const finalText = String(terminal.result?.result ?? assistantText(messages));
@@ -560,12 +560,9 @@ async function observeCompletedRun(bridge, runId, timeoutMilliseconds) {
     { runId },
     timeoutMilliseconds,
   );
-  const terminal = terminalFrame(replay);
-  if (terminal === undefined || !terminalStatusIsFinished(terminal.status)) {
+  const terminal = exactTerminalResult(replay, "ObserveRun replay");
+  if (!terminalStatusIsFinished(terminal.status)) {
     throw new QualificationError("ObserveRun did not replay a finished result");
-  }
-  if (!replay.some((frame) => frame.done !== undefined)) {
-    throw new QualificationError("ObserveRun replay omitted done");
   }
   const offsets = replay
     .map((frame) => frame.offset)
@@ -594,8 +591,8 @@ async function observeCompletedRun(bridge, runId, timeoutMilliseconds) {
       "ObserveRun afterOffset did not return the exact replay suffix",
     );
   }
-  if (!resumed.some((frame) => frame.done !== undefined)) {
-    throw new QualificationError("resumed ObserveRun omitted done");
+  if (resumed.filter((frame) => frame.done !== undefined).length !== 1) {
+    throw new QualificationError("resumed ObserveRun replay did not contain exactly one done");
   }
   return {
     full_replay: true,
@@ -657,17 +654,14 @@ async function qualifyCancellation({
   ]);
   if (outcome.error !== null) throw outcome.error;
   const frames = outcome.frames;
-  const terminal = terminalFrame(frames);
-  if (terminal === undefined || !statusIsCancelled(terminal.status)) {
+  const terminal = exactTerminalResult(frames, "cancelled run");
+  if (!statusIsCancelled(terminal.status)) {
     throw new QualificationError(
       `cancelled run ended with status ${terminal?.status}`,
     );
   }
-  if (!frames.some((frame) => frame.done !== undefined)) {
-    throw new QualificationError("cancelled run omitted done");
-  }
   const callbacks = callback.calls.slice(callbackStart);
-  inspectToolCalls(frames, callbacks, [TOOLS.block], true);
+  inspectToolCalls(frames, callbacks, [TOOLS.block], true, "cancelled run");
   blockControl.release.resolve({ value: RESULTS.blockReleased });
   return {
     run_id: runId,

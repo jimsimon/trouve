@@ -55,6 +55,11 @@ import {
   thinkingSelectionIsValid,
 } from "./model-settings";
 import {
+  cursorSdkPreset,
+  providerNeedsCursorSdkMigration,
+  savedProviderMessage,
+} from "./provider-settings";
+import {
   LIVE_OUTPUT_BATCH_MS,
   appendBoundedReviewOutput,
   boundReviewOutput,
@@ -3795,6 +3800,7 @@ function ProviderSettings({
   const selectedSubscription = subscriptionProviders.find(
     (provider) => provider.id === subscriptionId,
   );
+  const cursorMigration = cursorSdkPreset(subscriptionProviders);
   const requiredRuntime = selectedSubscription
     ? clis.find((cli) => cli.kinds.includes(selectedSubscription.kind))
     : undefined;
@@ -3870,7 +3876,24 @@ function ProviderSettings({
               <small>{provider.kind} · {provider.category}</small>
             </span>
             <StatusPill status={provider.has_credentials ? "ready" : "credentials required"} />
-            {(provider.auth === "oauth" || provider.auth === "cli") && (
+            {providerNeedsCursorSdkMigration(provider) ? (
+              cursorMigration ? (
+                <button
+                  class="ghost compact"
+                  type="button"
+                  onClick={() => {
+                    setSubscriptionId(cursorMigration.id);
+                    setSubscriptionApiKey("");
+                    setLogin(null);
+                    flash("Cursor Agent SDK selected; save an API key below to finish migration");
+                  }}
+                >
+                  Migrate to Agent SDK
+                </button>
+              ) : (
+                <small>Cursor Agent SDK setup is unavailable</small>
+              )
+            ) : (provider.auth === "oauth" || provider.auth === "cli") && (
               <button class="ghost compact" type="button" onClick={() => void begin(provider)}>
                 {provider.has_credentials ? "Sign in again" : "Sign in"}
               </button>
@@ -3940,7 +3963,7 @@ function ProviderSettings({
               onChanged();
               if (selectedSubscription.auth === "api-key") {
                 setSubscriptionApiKey("");
-                flash(`Saved ${selectedSubscription.display_name}`);
+                flash(savedProviderMessage(selectedSubscription.display_name, configured));
               } else {
                 await begin(configured);
               }
