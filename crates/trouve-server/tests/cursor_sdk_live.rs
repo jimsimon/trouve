@@ -15,6 +15,7 @@ use futures::StreamExt as _;
 use trouve_core::Engine;
 use trouve_core::config::{Config, ProviderConfig};
 use trouve_core::store::Store;
+use trouve_protocol::Scope;
 
 const LIVE_TIMEOUT: Duration = Duration::from_secs(300);
 const FILE_NAME: &str = "cursor-sdk-e2e.txt";
@@ -150,11 +151,28 @@ fn terminal_event(event: &serde_json::Value, turn: u64) -> bool {
         )
 }
 
+fn persisted_thread_events(engine: &Engine, thread_id: &str) -> Vec<serde_json::Value> {
+    engine
+        .store()
+        .events_after(&Scope::Thread(thread_id.to_string()), 0)
+        .expect("read complete persisted thread history")
+        .into_iter()
+        .map(|envelope| serde_json::to_value(envelope).expect("encode persisted thread event"))
+        .collect()
+}
+
 fn assert_turn_completed(events: &[serde_json::Value], turn: u64) {
-    let terminal = events
+    let terminals = events
         .iter()
-        .find(|event| terminal_event(event, turn))
-        .expect("turn emitted a terminal event");
+        .enumerate()
+        .filter(|(_, event)| terminal_event(event, turn))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "Cursor SDK turn {turn} did not emit exactly one terminal event: {terminals:?}"
+    );
+    let (terminal_index, terminal) = terminals[0];
     assert_eq!(
         terminal["type"], "turn.completed",
         "Cursor SDK turn {turn} did not complete: {terminal}"
@@ -166,6 +184,13 @@ fn assert_turn_completed(events: &[serde_json::Value], turn: u64) {
     assert!(
         terminal["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0,
         "Cursor SDK turn {turn} omitted output usage: {terminal}"
+    );
+    assert!(
+        events[terminal_index + 1..]
+            .iter()
+            .all(|event| event["turn"] != turn),
+        "Cursor SDK turn {turn} emitted durable events after its terminal event: {:?}",
+        &events[terminal_index + 1..]
     );
 }
 
@@ -489,7 +514,8 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         .unwrap();
     assert_eq!(approval_response.status(), reqwest::StatusCode::NO_CONTENT);
 
-    let first_events = wait_for_event(&client, &events_url, |event| terminal_event(event, 1)).await;
+    wait_for_event(&client, &events_url, |event| terminal_event(event, 1)).await;
+    let first_events = persisted_thread_events(&engine, thread_id);
     assert_turn_completed(&first_events, 1);
     assert!(
         assistant_text(&first_events, 1).contains(WRITE_MARKER),
@@ -546,8 +572,8 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         .unwrap();
     assert!(second_send.status().is_success(), "{second_send:?}");
 
-    let second_events =
-        wait_for_event(&client, &events_url, |event| terminal_event(event, 2)).await;
+    wait_for_event(&client, &events_url, |event| terminal_event(event, 2)).await;
+    let second_events = persisted_thread_events(&engine, thread_id);
     assert_turn_completed(&second_events, 2);
     assert!(
         assistant_text(&second_events, 2).contains(RESUME_MARKER),

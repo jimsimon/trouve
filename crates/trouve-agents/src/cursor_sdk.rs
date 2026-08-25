@@ -2384,14 +2384,10 @@ async fn stream_turn(
             }
             Err(error) => return Err(error),
         };
-        if stop.is_some() {
-            continue;
-        }
-        if events.is_closed() {
+        if stop.is_none() && events.is_closed() {
             callback_cancel.cancel();
             stop = Some(StreamStop::ConsumerClosed);
             stop_deadline = Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
-            continue;
         }
         buffered.extend_from_slice(&chunk);
         while buffered.len() >= 5 {
@@ -2399,6 +2395,9 @@ async fn stream_turn(
             let length =
                 u32::from_be_bytes([buffered[1], buffered[2], buffered[3], buffered[4]]) as usize;
             if length > MAX_CONNECT_FRAME_BYTES {
+                if stop.is_some() {
+                    break 'stream;
+                }
                 return Err(BackendError::Protocol(format!(
                     "Cursor Connect frame exceeded {MAX_CONNECT_FRAME_BYTES} bytes"
                 )));
@@ -2408,6 +2407,9 @@ async fn stream_turn(
             }
             let frame = buffered.split_to(5 + length);
             if flags & 0x01 != 0 {
+                if stop.is_some() {
+                    continue;
+                }
                 return Err(BackendError::Protocol(
                     "compressed Cursor Connect frames are not supported".into(),
                 ));
@@ -2415,27 +2417,35 @@ async fn stream_turn(
             let value = if length == 0 {
                 json!({})
             } else {
-                serde_json::from_slice::<Value>(&frame[5..]).map_err(|error| {
-                    BackendError::Protocol(format!(
-                        "Cursor Send emitted invalid Connect JSON: {error}"
-                    ))
-                })?
+                match serde_json::from_slice::<Value>(&frame[5..]) {
+                    Ok(value) => value,
+                    Err(_) if stop.is_some() => continue,
+                    Err(error) => {
+                        return Err(BackendError::Protocol(format!(
+                            "Cursor Send emitted invalid Connect JSON: {error}"
+                        )));
+                    }
+                }
             };
             if flags & 0x02 != 0 {
                 saw_connect_end = true;
-                if let Some(error) = value.get("error") {
+                if stop.is_none()
+                    && let Some(error) = value.get("error")
+                {
                     return Err(BackendError::Protocol(format!(
                         "Cursor Send failed: {}",
                         client.redact(&bounded_json(error))
                     )));
                 }
+            } else if stop.is_some() {
+                projection.capture_frame_run_id(&value);
             } else {
-                if !projection.process(value, events).await? {
-                    callback_cancel.cancel();
-                    stop = Some(StreamStop::ConsumerClosed);
+                if let Err(reason) = projection.process(value, events, &turn.cancel).await {
+                    if reason == StreamStop::ConsumerClosed {
+                        callback_cancel.cancel();
+                    }
+                    stop = Some(reason);
                     stop_deadline = Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
-                    buffered.clear();
-                    continue 'stream;
                 }
             }
         }
@@ -2457,13 +2467,26 @@ async fn stream_turn(
             "Cursor Send omitted the Connect end-stream frame".into(),
         ));
     }
-    projection.finish(events).await
+    projection.finish(events, &turn.cancel).await
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamStop {
     Cancelled,
     ConsumerClosed,
+}
+
+async fn send_projected_event(
+    events: &BackendEventSender,
+    cancel: &CancellationToken,
+    event: BackendEvent,
+) -> Result<(), StreamStop> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(StreamStop::Cancelled),
+        _ = events.closed() => Err(StreamStop::ConsumerClosed),
+        result = events.send(Ok(event)) => result.map_err(|()| StreamStop::ConsumerClosed),
+    }
 }
 
 #[derive(Default)]
@@ -2483,13 +2506,11 @@ impl RunProjection {
         &mut self,
         frame: Value,
         events: &BackendEventSender,
-    ) -> Result<bool, BackendError> {
-        if events.is_closed() {
-            return Ok(false);
-        }
+        cancel: &CancellationToken,
+    ) -> Result<(), StreamStop> {
+        self.capture_frame_run_id(&frame);
         if let Some(sdk) = frame.get("sdkMessage") {
             let payload = sdk.get("message").unwrap_or(&Value::Null);
-            self.capture_run_id(payload);
             let kind = payload
                 .get("type")
                 .or_else(|| sdk.get("type"))
@@ -2500,40 +2521,27 @@ impl RunProjection {
                     for text in message_text_blocks(payload) {
                         if !text.is_empty() {
                             self.emitted_assistant_text = true;
-                            if events
-                                .send(Ok(BackendEvent::TextDelta(text)))
-                                .await
-                                .is_err()
-                            {
-                                return Ok(false);
-                            }
+                            send_projected_event(events, cancel, BackendEvent::TextDelta(text))
+                                .await?;
                         }
                     }
                 }
                 "thinking" => {
                     if let Some(text) = message_text(payload)
                         && !text.is_empty()
-                        && (events
-                            .send(Ok(BackendEvent::ThinkingDelta(text)))
-                            .await
-                            .is_err()
-                            || events
-                                .send(Ok(BackendEvent::ThinkingCompleted))
-                                .await
-                                .is_err())
                     {
-                        return Ok(false);
+                        send_projected_event(events, cancel, BackendEvent::ThinkingDelta(text))
+                            .await?;
+                        send_projected_event(events, cancel, BackendEvent::ThinkingCompleted)
+                            .await?;
                     }
                 }
                 "task" => {
                     if let Some(text) = message_text(payload)
                         && !text.is_empty()
-                        && events
-                            .send(Ok(BackendEvent::ProgressDelta(text)))
-                            .await
-                            .is_err()
                     {
-                        return Ok(false);
+                        send_projected_event(events, cancel, BackendEvent::ProgressDelta(text))
+                            .await?;
                     }
                 }
                 "status" => {
@@ -2545,13 +2553,8 @@ impl RunProjection {
                 "usage" => {
                     if let Some(usage) = payload.get("usage").map(parse_usage) {
                         self.usage = usage.clone();
-                        if events
-                            .send(Ok(BackendEvent::UsageUpdated { usage }))
-                            .await
-                            .is_err()
-                        {
-                            return Ok(false);
-                        }
+                        send_projected_event(events, cancel, BackendEvent::UsageUpdated { usage })
+                            .await?;
                     }
                 }
                 // Concrete tool lifecycle events are emitted by the
@@ -2563,7 +2566,6 @@ impl RunProjection {
             }
         }
         if let Some(result) = frame.get("result") {
-            self.capture_run_id(result);
             self.terminal_status = result.get("status").cloned();
             self.terminal_error_code = result
                 .get("errorCode")
@@ -2581,11 +2583,22 @@ impl RunProjection {
                 }
             }
         }
-        if let Some(done) = frame.get("done") {
-            self.capture_run_id(done);
+        if frame.get("done").is_some() {
             self.saw_done = true;
         }
-        Ok(!events.is_closed())
+        Ok(())
+    }
+
+    fn capture_frame_run_id(&mut self, frame: &Value) {
+        if let Some(message) = frame.pointer("/sdkMessage/message") {
+            self.capture_run_id(message);
+        }
+        if let Some(result) = frame.get("result") {
+            self.capture_run_id(result);
+        }
+        if let Some(done) = frame.get("done") {
+            self.capture_run_id(done);
+        }
     }
 
     fn capture_run_id(&mut self, value: &Value) {
@@ -2599,7 +2612,14 @@ impl RunProjection {
         }
     }
 
-    async fn finish(self, events: &BackendEventSender) -> Result<TurnTerminal, BackendError> {
+    async fn finish(
+        self,
+        events: &BackendEventSender,
+        cancel: &CancellationToken,
+    ) -> Result<TurnTerminal, BackendError> {
+        if cancel.is_cancelled() {
+            return Ok(TurnTerminal::Cancelled);
+        }
         if events.is_closed() {
             return Ok(TurnTerminal::ConsumerClosed);
         }
@@ -2615,12 +2635,13 @@ impl RunProjection {
             if !self.emitted_assistant_text
                 && let Some(text) = self.final_text
                 && !text.is_empty()
-                && events
-                    .send(Ok(BackendEvent::TextDelta(text)))
-                    .await
-                    .is_err()
+                && let Err(stop) =
+                    send_projected_event(events, cancel, BackendEvent::TextDelta(text)).await
             {
-                return Ok(TurnTerminal::ConsumerClosed);
+                return Ok(match stop {
+                    StreamStop::Cancelled => TurnTerminal::Cancelled,
+                    StreamStop::ConsumerClosed => TurnTerminal::ConsumerClosed,
+                });
             }
             return Ok(TurnTerminal::Finished(self.usage));
         }
@@ -2960,7 +2981,8 @@ mod tests {
         assert!(events.is_closed());
 
         let mut projection = RunProjection::default();
-        let keep_processing = projection
+        let cancel = CancellationToken::new();
+        let result = projection
             .process(
                 json!({
                     "sdkMessage": {
@@ -2968,10 +2990,62 @@ mod tests {
                     }
                 }),
                 &events,
+                &cancel,
             )
-            .await
-            .unwrap();
-        assert!(!keep_processing);
+            .await;
+        assert_eq!(result, Err(StreamStop::ConsumerClosed));
+    }
+
+    #[tokio::test]
+    async fn projection_backpressure_remains_cancellable() {
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+
+        let mut accepted = 0usize;
+        loop {
+            let event = BackendEvent::SessionStarted {
+                session_id: format!("fill-{accepted}"),
+            };
+            match tokio::time::timeout(Duration::from_millis(100), events.send(Ok(event))).await {
+                Ok(Ok(())) => accepted += 1,
+                Ok(Err(())) => panic!("event stream closed while filling its buffer"),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            accepted >= crate::BACKEND_STREAM_CAPACITY,
+            "fixture did not reach real event-stream backpressure"
+        );
+
+        let cancel = CancellationToken::new();
+        let mut projection = RunProjection::default();
+        let publish = projection.process(
+            json!({
+                "sdkMessage": {
+                    "message": { "type": "assistant", "text": "blocked output" }
+                }
+            }),
+            &events,
+            &cancel,
+        );
+        tokio::pin!(publish);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), publish.as_mut())
+                .await
+                .is_err(),
+            "projection unexpectedly published through a full event buffer"
+        );
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), publish)
+                .await
+                .expect("cancellation did not release projection backpressure"),
+            Err(StreamStop::Cancelled)
+        );
     }
 
     #[tokio::test]

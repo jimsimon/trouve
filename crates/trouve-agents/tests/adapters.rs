@@ -489,6 +489,7 @@ import socketserver
 import struct
 import sys
 import threading
+import time
 
 binary = os.path.abspath(sys.argv[0])
 count_path = binary + ".spawns"
@@ -539,29 +540,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             send_count += 1
             if "STALL_FOR_CANCELLATION" in request.get("message", {}).get("text", ""):
                 run_id = "sdk-run-cancel"
-                first = b"".join([
-                    frame({
-                        "sdkMessage": {
-                            "type": "system",
-                            "message": {
-                                "type": "system",
-                                "agent_id": agent_id,
-                                "run_id": run_id
-                            }
-                        }
-                    }),
-                    frame({
-                        "sdkMessage": {
+                first = frame({
+                    "sdkMessage": {
+                        "type": "assistant",
+                        "message": {
                             "type": "assistant",
                             "message": {
-                                "type": "assistant",
-                                "message": {
-                                    "content": [{"type": "text", "text": "RUN_READY"}]
-                                }
+                                "content": [{"type": "text", "text": "RUN_READY"}]
                             }
                         }
-                    })
-                ])
+                    }
+                })
                 self.protocol_version = "HTTP/1.1"
                 self.send_response(200)
                 self.send_header("Content-Type", "application/connect+json")
@@ -569,6 +558,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(format(len(first), "x").encode("ascii") + b"\r\n")
                 self.wfile.write(first + b"\r\n")
+                self.wfile.flush()
+                deadline = time.monotonic() + 10
+                while not os.path.exists(binary + ".release-run-id"):
+                    if time.monotonic() >= deadline:
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                        return
+                    time.sleep(0.01)
+                identity = frame({
+                    "sdkMessage": {
+                        "type": "system",
+                        "message": {
+                            "type": "system",
+                            "agent_id": agent_id,
+                            "run_id": run_id
+                        }
+                    }
+                })
+                self.wfile.write(format(len(identity), "x").encode("ascii") + b"\r\n")
+                self.wfile.write(identity + b"\r\n")
                 self.wfile.flush()
                 if not cancel_received.wait(10):
                     self.wfile.write(b"0\r\n\r\n")
@@ -952,13 +961,14 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
                 }
                 Some(Ok(_)) => {}
                 Some(Err(error)) => panic!("Cursor Send failed before cancellation: {error}"),
-                None => panic!("Cursor Send ended before publishing its run identity"),
+                None => panic!("Cursor Send ended before publishing cancellation readiness"),
             }
         }
     })
     .await
-    .expect("Cursor Send did not publish an event after its run identity");
+    .expect("Cursor Send did not publish cancellation readiness");
     cancel.cancel();
+    std::fs::write(format!("{stub}.release-run-id"), "").unwrap();
 
     let mut saw_cancelled = false;
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
