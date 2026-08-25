@@ -448,7 +448,7 @@ function arraysEqual(left, right) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function inspectToolCalls(frames, callbacks, expectedTools, allowToolError, label) {
+export function inspectToolCalls(frames, callbacks, expectedTools, allowToolError, label) {
   const messages = sdkMessages(frames);
   const toolMessages = messages.filter((message) => message.type === "tool_call");
   assertUniqueToolLifecycle(toolMessages, label);
@@ -478,17 +478,25 @@ function inspectToolCalls(frames, callbacks, expectedTools, allowToolError, labe
       `expected ${expectedTools.length} stream call ids, observed ${streamIds.size}`,
     );
   }
+  const callbackIds = [];
   for (const callback of callbacks) {
     if (typeof callback.toolCallId !== "string" || callback.toolCallId.length === 0) {
       throw new QualificationError(
         `callback ${callback.toolName} omitted its tool-call id`,
       );
     }
-    if (!streamIds.has(callback.toolCallId)) {
-      throw new QualificationError(
-        `callback ${callback.toolName} did not correlate with stream id ${callback.toolCallId}`,
-      );
-    }
+    callbackIds.push(callback.toolCallId);
+  }
+  const uniqueCallbackIds = new Set(callbackIds);
+  if (
+    uniqueCallbackIds.size !== callbacks.length ||
+    !arraysEqual(sorted(uniqueCallbackIds), sorted(streamIds))
+  ) {
+    throw new QualificationError(
+      `${label}: callback and stream call ids were not one-to-one ` +
+        `(callbacks=${callbackIds.join(",") || "none"}, ` +
+        `stream=${[...streamIds].join(",") || "none"})`,
+    );
   }
   if (!allowToolError && toolMessages.some((message) => message.status === "error")) {
     throw new QualificationError("a custom tool unexpectedly completed with error status");
