@@ -41,7 +41,7 @@
 //! when it goes stale the user runs any `cursor-agent` command, which
 //! refreshes `auth.json` through the sanctioned path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -386,6 +386,12 @@ impl AgentBackend for CursorBackend {
         }
     }
 
+    fn confines_read_only_turns(&self) -> bool {
+        // Cursor's ACP Ask mode exposes search-only tools and withholds edit
+        // and command execution (see the mode selection in `run_turn`).
+        true
+    }
+
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
         spawn_login(&self.command, &["login"]).await
     }
@@ -423,18 +429,29 @@ impl AgentBackend for CursorBackend {
         // Resume the ACP session for this thread, or start a fresh one. A
         // failed load (e.g. server restarted and lost it) degrades to fresh.
         let mut fresh_session = false;
+        let desired_mcp_fingerprint = acp_mcp_fingerprint(&acp_mcp_servers(
+            &turn.mcp_servers,
+            turn.mcp_bridge.as_ref(),
+            server.mcp_http.load(Ordering::Relaxed),
+        )?)?;
         let known_session = match &turn.session {
             Some(sid) => tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-                known = server.knows_session(sid) => known,
+                known = server.session_settings_match(sid, desired_mcp_fingerprint) => known,
             },
             None => false,
         };
         let session_id = match &turn.session {
             Some(sid) if known_session => sid.clone(),
             Some(sid) => match server
-                .load_session(sid, &turn.worktree, &turn.mcp_servers, &cancel)
+                .load_session(
+                    sid,
+                    &turn.worktree,
+                    &turn.mcp_servers,
+                    turn.mcp_bridge.as_ref(),
+                    &cancel,
+                )
                 .await
             {
                 Ok(()) => sid.clone(),
@@ -443,14 +460,24 @@ impl AgentBackend for CursorBackend {
                     tracing::warn!("cursor session/load failed ({e}); starting fresh");
                     fresh_session = true;
                     server
-                        .new_session(&turn.worktree, &turn.mcp_servers, &cancel)
+                        .new_session(
+                            &turn.worktree,
+                            &turn.mcp_servers,
+                            turn.mcp_bridge.as_ref(),
+                            &cancel,
+                        )
                         .await?
                 }
             },
             None => {
                 fresh_session = true;
                 server
-                    .new_session(&turn.worktree, &turn.mcp_servers, &cancel)
+                    .new_session(
+                        &turn.worktree,
+                        &turn.mcp_servers,
+                        turn.mcp_bridge.as_ref(),
+                        &cancel,
+                    )
                     .await?
             }
         };
@@ -1467,14 +1494,24 @@ async fn write_reply(stdin: &Mutex<ChildStdin>, reply: Value) {
     let _ = stdin.flush().await;
 }
 
+fn acp_mcp_fingerprint(servers: &Value) -> Result<[u8; 32], BackendError> {
+    use sha2::{Digest as _, Sha256};
+
+    let encoded = serde_json::to_vec(servers).map_err(|error| {
+        BackendError::Protocol(format!("serializing Cursor MCP config: {error}"))
+    })?;
+    Ok(Sha256::digest(encoded).into())
+}
+
 struct AcpServer {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicI64,
     pending: Pending,
     routes: Routes,
-    /// Sessions this process has created or loaded (session/prompt on an
-    /// unknown session fails, so resumes go through session/load first).
-    sessions: Mutex<HashSet<String>>,
+    /// Effective MCP configuration for sessions this process created or
+    /// loaded. Rotating bridge tickets and edited MCP servers must trigger a
+    /// session/load before the next prompt.
+    sessions: Mutex<HashMap<String, [u8; 32]>>,
     /// Serializes model/mode config + prompt start: cursor applies model
     /// selection process-wide, so concurrent turns must not interleave.
     config_lock: Mutex<()>,
@@ -1487,6 +1524,8 @@ struct AcpServer {
     /// `cursor/ask_question` find their route here, and permission requests
     /// recover rawInput when cursor omits it.
     calls: Arc<Mutex<HashMap<String, (String, Value)>>>,
+    /// Whether Cursor advertised the ACP HTTP MCP transport.
+    mcp_http: AtomicBool,
     /// Held so the complete process tree lives as long as the server handle;
     /// mutable ownership also lets a blocked transport be terminated and
     /// reaped. The reader holds only a `Weak`, so it cannot keep the child
@@ -1623,10 +1662,11 @@ impl AcpServer {
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             routes: Arc::new(Mutex::new(HashMap::new())),
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
             config_lock: Mutex::new(()),
             plans: Arc::new(Mutex::new(HashMap::new())),
             calls: Arc::new(Mutex::new(HashMap::new())),
+            mcp_http: AtomicBool::new(false),
             child: Arc::new(Mutex::new(child)),
             closed: Arc::new(AtomicBool::new(false)),
             transport_cleanup_started: AtomicBool::new(false),
@@ -1826,7 +1866,12 @@ impl AcpServer {
                 }),
             )
             .await?;
-        let _ = result;
+        self.mcp_http.store(
+            result["agentCapabilities"]["mcpCapabilities"]["http"]
+                .as_bool()
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -1834,12 +1879,16 @@ impl AcpServer {
         &self,
         worktree: &std::path::Path,
         mcp_servers: &[crate::McpServerLaunch],
+        bridge: Option<&crate::McpBridgeConfig>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<String, BackendError> {
+        let mcp_servers =
+            acp_mcp_servers(mcp_servers, bridge, self.mcp_http.load(Ordering::Relaxed))?;
+        let mcp_fingerprint = acp_mcp_fingerprint(&mcp_servers)?;
         let result = self
             .request_cancellable(
                 "session/new",
-                json!({ "cwd": worktree, "mcpServers": acp_mcp_servers(mcp_servers) }),
+                json!({ "cwd": worktree, "mcpServers": mcp_servers }),
                 cancel,
             )
             .await
@@ -1858,7 +1907,10 @@ impl AcpServer {
                 ));
             }
         };
-        self.sessions.lock().await.insert(id.clone());
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), mcp_fingerprint);
         Ok(id)
     }
 
@@ -1867,25 +1919,36 @@ impl AcpServer {
         session_id: &str,
         worktree: &std::path::Path,
         mcp_servers: &[crate::McpServerLaunch],
+        bridge: Option<&crate::McpBridgeConfig>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), BackendError> {
+        let mcp_servers =
+            acp_mcp_servers(mcp_servers, bridge, self.mcp_http.load(Ordering::Relaxed))?;
+        let mcp_fingerprint = acp_mcp_fingerprint(&mcp_servers)?;
         self.request_cancellable(
             "session/load",
             json!({
                 "sessionId": session_id,
                 "cwd": worktree,
-                "mcpServers": acp_mcp_servers(mcp_servers),
+                "mcpServers": mcp_servers,
             }),
             cancel,
         )
         .await
         .map_err(auth_hint)?;
-        self.sessions.lock().await.insert(session_id.to_string());
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.to_string(), mcp_fingerprint);
         Ok(())
     }
 
-    async fn knows_session(&self, session_id: &str) -> bool {
-        self.sessions.lock().await.contains(session_id)
+    async fn session_settings_match(
+        &self,
+        session_id: &str,
+        desired_mcp_fingerprint: [u8; 32],
+    ) -> bool {
+        self.sessions.lock().await.get(session_id) == Some(&desired_mcp_fingerprint)
     }
 
     async fn set_config_option(
@@ -2086,25 +2149,48 @@ fn auth_hint(e: BackendError) -> BackendError {
     }
 }
 
-/// User MCP servers in ACP `mcpServers` shape: stdio transport with env as
-/// an array of name/value pairs.
-fn acp_mcp_servers(servers: &[crate::McpServerLaunch]) -> Value {
-    Value::Array(
-        servers
-            .iter()
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "command": s.command,
-                    "args": s.args,
-                    "env": s.env
-                        .iter()
-                        .map(|(name, value)| json!({ "name": name, "value": value }))
-                        .collect::<Vec<_>>(),
-                })
+/// User MCP servers plus trouve's supplemental HTTP bridge in ACP
+/// `mcpServers` shape.
+fn acp_mcp_servers(
+    servers: &[crate::McpServerLaunch],
+    bridge: Option<&crate::McpBridgeConfig>,
+    supports_http: bool,
+) -> Result<Value, BackendError> {
+    let mut values: Vec<Value> = servers
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "command": s.command,
+                "args": s.args,
+                "env": s.env
+                    .iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value }))
+                    .collect::<Vec<_>>(),
             })
-            .collect(),
-    )
+        })
+        .collect();
+    if let Some(bridge) = bridge {
+        if bridge.bridge_tools {
+            return Err(BackendError::Protocol(
+                "Cursor cannot use trouve's authoritative tool bridge because ACP cannot disable its native tools"
+                    .into(),
+            ));
+        }
+        if !supports_http {
+            return Err(BackendError::Protocol(
+                "cursor-agent did not advertise ACP HTTP MCP support; refusing to drop trouve's supplemental search bridge"
+                    .into(),
+            ));
+        }
+        values.push(json!({
+            "type": "http",
+            "name": "trouve",
+            "url": bridge.url,
+            "headers": [],
+        }));
+    }
+    Ok(Value::Array(values))
 }
 
 #[cfg(test)]
@@ -2236,7 +2322,7 @@ mod tests {
             args: vec!["--stdio".into()],
             env: vec![("TOKEN".into(), "sekrit".into())],
         }];
-        let value = acp_mcp_servers(&servers);
+        let value = acp_mcp_servers(&servers, None, false).unwrap();
         assert_eq!(
             value,
             json!([{
@@ -2246,7 +2332,23 @@ mod tests {
                 "env": [{ "name": "TOKEN", "value": "sekrit" }],
             }])
         );
-        assert_eq!(acp_mcp_servers(&[]), json!([]));
+        assert_eq!(acp_mcp_servers(&[], None, false).unwrap(), json!([]));
+
+        let bridge = crate::McpBridgeConfig {
+            url: "http://127.0.0.1:7433/internal/threads/th_1/mcp?tools=0".into(),
+            bridge_tools: false,
+            disallowed_tools: Vec::new(),
+        };
+        assert_eq!(
+            acp_mcp_servers(&[], Some(&bridge), true).unwrap(),
+            json!([{
+                "type": "http",
+                "name": "trouve",
+                "url": bridge.url,
+                "headers": [],
+            }])
+        );
+        assert!(acp_mcp_servers(&[], Some(&bridge), false).is_err());
     }
 
     #[test]
@@ -2570,12 +2672,12 @@ for line in sys.stdin:
                 async move {
                     match method {
                         "session/new" => server
-                            .new_session(&worktree, &[], &cancel)
+                            .new_session(&worktree, &[], None, &cancel)
                             .await
                             .map(|_| ()),
                         "session/load" => {
                             server
-                                .load_session("session-1", &worktree, &[], &cancel)
+                                .load_session("session-1", &worktree, &[], None, &cancel)
                                 .await
                         }
                         "session/set_config_option" => server
@@ -2973,6 +3075,7 @@ for line in sys.stdin:
                     .new_session(
                         directory.path(),
                         &[],
+                        None,
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await,

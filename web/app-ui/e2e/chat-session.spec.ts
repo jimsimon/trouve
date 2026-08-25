@@ -3441,7 +3441,7 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   await expect(group.getByText("Ran 4 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
   await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
-  await expect(transientActivity).toContainText("Waiting for model…");
+  await expect(transientActivity).toContainText("Agent is working…");
 });
 
 test("context compaction is an animated durable boundary between tool groups", async ({

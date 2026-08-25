@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/search-darwin-arm64",
-  "version": "4.0.0",
+  "version": "4.2.0",
   "description": "trouve-search native binary for aarch64-apple-darwin",
   "license": "MIT",
   "repository": {

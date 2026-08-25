@@ -72,8 +72,9 @@ pub struct BackendTurn {
     /// rejects reported tool use; adapters also disable vendor built-ins
     /// where their protocol supports it.
     pub tool_free: bool,
-    /// When set, the vendor agent runs with its built-in tools disabled and
-    /// trouve's ToolExecutor bridged in over MCP (Claude Code only, v1).
+    /// First-party HTTP MCP bridge. A full bridge replaces or confines
+    /// vendor-native tools; a supplemental bridge adds trouve's semantic
+    /// search tools while leaving read-only vendor tools available.
     pub mcp_bridge: Option<McpBridgeConfig>,
     /// User-configured MCP servers (user/workspace/worktree scopes, already
     /// merged and env-expanded by the engine) to mount alongside the bridge.
@@ -450,6 +451,14 @@ pub trait AgentBackend: Send + Sync {
     /// such turns without mounted MCP tools and under read-only permissions,
     /// but the engine must tolerate vendor-native read/search activity.
     fn supports_tool_free_turns(&self) -> bool {
+        false
+    }
+
+    /// Whether [`BackendPermission::ReadOnly`] is an enforceable vendor-side
+    /// confinement boundary even without trouve's full MCP tool bridge.
+    /// Automated reviews may use such a backend's native read/search tools;
+    /// backends that return false must use the full bridge instead.
+    fn confines_read_only_turns(&self) -> bool {
         false
     }
 

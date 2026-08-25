@@ -529,6 +529,10 @@ const PROVIDER_TURN_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_TURN_CONCURRENCY";
 const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 18;
 const PROVIDER_BACKGROUND_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY";
 const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 16;
+/// Bounds durable task and thread setup bursts across planned review turns.
+/// Permits are released before model dispatch, so this does not cap active
+/// reviewer turns.
+const PLANNED_TURN_SETUP_CONCURRENCY: usize = 24;
 
 fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
     let id = session_id.strip_prefix("se_").unwrap_or(session_id);
@@ -590,14 +594,28 @@ fn enforce_automated_review_backend_boundary(
     automated_review: bool,
     tools_enabled: bool,
     full_tool_bridge: bool,
+    confined_read_only: bool,
     backend_id: &str,
 ) -> Result<()> {
-    if automated_review && tools_enabled && !full_tool_bridge {
+    if automated_review && tools_enabled && !full_tool_bridge && !confined_read_only {
         bail!(
-            "automated code review requires backend {backend_id} to use the full ToolExecutor bridge"
+            "automated code review requires backend {backend_id} to use the full ToolExecutor bridge or enforce read-only confinement"
         );
     }
     Ok(())
+}
+
+fn vendor_tool_uses_automated_review_budget(
+    tools_enabled: bool,
+    tool: &str,
+    first_start: bool,
+) -> bool {
+    // A backend that cannot remove native read/search tools is allowed to use
+    // them during a logically tool-free turn under its read-only confinement.
+    // Tool-enabled review turns retain their hard per-turn cap. ACP backends
+    // may repeat a tool_call update with the same id as its state changes, so
+    // charge the logical call only once.
+    tools_enabled && first_start && !trouve_direct_bridge_call(tool)
 }
 
 struct BackendCollaboratorProjection {
@@ -895,7 +913,7 @@ impl BridgedToolOwnerRouter {
     }
 }
 
-/// Return the canonical trouve tool nested in a Codex MCP presentation item.
+/// Return the canonical trouve tool nested in a vendor MCP presentation item.
 /// User-configured MCP servers retain their vendor wrapper; only the reserved
 /// first-party `trouve` server is projected through ToolExecutor instead.
 fn trouve_bridge_wrapper_call<'a>(
@@ -1149,6 +1167,7 @@ struct ProviderBackoff {
 struct TurnScheduler {
     all: Arc<tokio::sync::Semaphore>,
     background: Arc<tokio::sync::Semaphore>,
+    planned_setups: Arc<tokio::sync::Semaphore>,
     provider_all_limit: usize,
     provider_background_limit: usize,
     providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
@@ -1179,9 +1198,23 @@ impl TurnScheduler {
         Self {
             all: Arc::new(tokio::sync::Semaphore::new(all_limit)),
             background: Arc::new(tokio::sync::Semaphore::new(background_limit)),
+            planned_setups: Arc::new(tokio::sync::Semaphore::new(PLANNED_TURN_SETUP_CONCURRENCY)),
             provider_all_limit,
             provider_background_limit,
             providers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn acquire_planned_setup(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn setup cancelled"),
+            permit = self.planned_setups.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow!("turn setup scheduler closed"))
+            }
         }
     }
 
@@ -2387,6 +2420,15 @@ fn build_all_backends(
         backends.insert(id.clone(), backend);
     }
     backends
+}
+
+impl Engine {
+    pub(crate) async fn acquire_planned_turn_setup(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.turn_scheduler.acquire_planned_setup(cancel).await
+    }
 }
 
 impl Engine {
@@ -10693,21 +10735,30 @@ impl Engine {
     /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
     /// the full bridge by default so mutation-capable work crosses the same
     /// ToolExecutor and per-session execution lane as native provider calls.
-    /// An explicit `tool_bridge = false` retains the vendor-native fallback.
+    /// Cursor receives a supplemental semantic-search bridge because ACP
+    /// cannot disable its native tools. An explicit `tool_bridge = false`
+    /// retains the vendor-native fallback where a full bridge is supported.
     fn mcp_bridge_for(
         &self,
         model: &str,
         thread_id: &str,
     ) -> Option<trouve_agents::McpBridgeConfig> {
         let backend_id = model.split_once('/')?.0;
-        let (kind, bridge_tools) = {
+        let (kind, configured_bridge_tools) = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
             (pc.kind.clone(), pc.tool_bridge.unwrap_or(true))
         };
-        if kind != "claude-cli" && kind != "codex-app-server" {
+        if !matches!(
+            kind.as_str(),
+            "claude-cli" | "codex-app-server" | "cursor-cli"
+        ) {
             return None;
         }
+        // Cursor cannot suppress its native ACP tools. Give it only the
+        // supplemental always-bridged search surface; Ask mode confines its
+        // native tools to read-only operations.
+        let bridge_tools = kind != "cursor-cli" && configured_bridge_tools;
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
                 "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
@@ -10715,9 +10766,9 @@ impl Engine {
             );
             return None;
         };
-        // Codex approvals are native RPCs; serving Claude's permission-gate
-        // tool would only tempt the model to call it.
-        let serve_approval = kind != "codex-app-server";
+        // Codex and Cursor approvals are native RPCs; serving Claude's
+        // permission-gate tool would only tempt those models to call it.
+        let serve_approval = kind == "claude-cli";
         let claims = BridgeTicketClaims {
             bridge_tools,
             serve_approval,
@@ -12251,10 +12302,12 @@ impl Engine {
         let full_tool_bridge = mcp_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.bridge_tools);
+        let automated_review = self.store.is_code_review_thread(&thread.id)?;
         enforce_automated_review_backend_boundary(
-            self.store.is_code_review_thread(&thread.id)?,
+            automated_review,
             tools_enabled,
             full_tool_bridge,
+            backend.confines_read_only_turns(),
             backend_id,
         )?;
         if full_tool_bridge {
@@ -12266,7 +12319,7 @@ impl Engine {
         // A full bridge already exposes user MCP servers through the local
         // ToolExecutor. Mounting them directly as well would bypass trouve's
         // permission and per-session concurrency gates.
-        let mcp_servers = if tools_enabled && !full_tool_bridge {
+        let mcp_servers = if tools_enabled && !full_tool_bridge && !automated_review {
             self.mcp_servers_for(session)?
         } else {
             Vec::new()
@@ -12806,22 +12859,23 @@ impl Engine {
                                 tracing::warn!(
                                     root_thread_id = %thread.id,
                                     call_id,
-                                    "Codex MCP wrapper arrived before its root vendor thread identity"
+                                    "MCP wrapper arrived before its root vendor thread identity"
                                 );
                             }
                         }
                         continue;
                     }
-                    // First-party MCP calls reserve inside handle_tool_call;
-                    // Claude mirrors them here under mcp__trouve__*. Count
-                    // only the backend's remaining sandbox-confined read
-                    // tools at this lifecycle boundary.
-                    if !trouve_direct_bridge_call(&tool) {
-                        self.automated_review_tool_budgets.reserve(&thread.id)?;
-                    }
                     if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
+                    }
+                    let first_start = seen_tool_cards.insert(call_id.clone());
+                    // First-party MCP calls reserve inside handle_tool_call;
+                    // Claude mirrors them here under mcp__trouve__*. Native
+                    // reads on a backend without a true tool-free mode are
+                    // confined but intentionally outside the zero-call cap.
+                    if vendor_tool_uses_automated_review_budget(tools_enabled, &tool, first_start) {
+                        self.automated_review_tool_budgets.reserve(&thread.id)?;
                     }
                     tool_started_at.insert(call_id.clone(), Instant::now());
                     let could_create = could_request_pull_request_creation(&tool, &args);
@@ -12856,9 +12910,7 @@ impl Engine {
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    if seen_tool_cards.insert(call_id.clone())
-                        && !self.tool_card_exists(&thread.id, turn, &call_id)
-                    {
+                    if first_start && !self.tool_card_exists(&thread.id, turn, &call_id) {
                         persisted.push(Event::ToolRequested {
                             turn,
                             call_id: call_id.clone(),
@@ -16938,6 +16990,33 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn planned_turn_setup_lane_bounds_only_setup_admission() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::with_capacity(PLANNED_TURN_SETUP_CONCURRENCY);
+        for _ in 0..PLANNED_TURN_SETUP_CONCURRENCY {
+            permits.push(scheduler.acquire_planned_setup(&cancel).await.unwrap());
+        }
+
+        let blocked_cancel = tokio_util::sync::CancellationToken::new();
+        let blocked = scheduler.acquire_planned_setup(&blocked_cancel);
+        tokio::pin!(blocked);
+        tokio::select! {
+            biased;
+            result = &mut blocked => panic!("setup lane admitted excess work: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        blocked_cancel.cancel();
+        assert_eq!(
+            blocked.await.unwrap_err().to_string(),
+            "turn setup cancelled"
+        );
+
+        drop(permits.pop());
+        let _replacement = scheduler.acquire_planned_setup(&cancel).await.unwrap();
+    }
+
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
             display_name: display_name.into(),
@@ -17943,10 +18022,40 @@ mod tests {
 
     #[test]
     fn automated_review_vendor_tools_fail_closed_without_a_full_bridge() {
-        assert!(enforce_automated_review_backend_boundary(false, true, false, "cursor").is_ok());
-        assert!(enforce_automated_review_backend_boundary(true, false, false, "cursor").is_ok());
-        assert!(enforce_automated_review_backend_boundary(true, true, true, "codex").is_ok());
-        assert!(enforce_automated_review_backend_boundary(true, true, false, "cursor").is_err());
+        assert!(
+            enforce_automated_review_backend_boundary(false, true, false, false, "unsafe").is_ok()
+        );
+        assert!(
+            enforce_automated_review_backend_boundary(true, false, false, false, "unsafe").is_ok()
+        );
+        assert!(
+            enforce_automated_review_backend_boundary(true, true, true, false, "codex").is_ok()
+        );
+        assert!(
+            enforce_automated_review_backend_boundary(true, true, false, true, "cursor").is_ok()
+        );
+        assert!(
+            enforce_automated_review_backend_boundary(true, true, false, false, "unsafe").is_err()
+        );
+
+        assert!(vendor_tool_uses_automated_review_budget(
+            true,
+            "read_file",
+            true
+        ));
+        assert!(!vendor_tool_uses_automated_review_budget(
+            true,
+            "read_file",
+            false
+        ));
+        assert!(!vendor_tool_uses_automated_review_budget(
+            false, "search", true
+        ));
+        assert!(!vendor_tool_uses_automated_review_budget(
+            true,
+            "mcp__trouve__read_file",
+            true
+        ));
     }
 
     #[test]
@@ -22660,7 +22769,7 @@ default_permission_mode = "ask"
     }
 
     #[test]
-    fn codex_and_claude_default_to_the_full_tool_bridge() {
+    fn vendor_backends_receive_their_supported_tool_bridge_surface() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.providers.insert(
@@ -22682,6 +22791,13 @@ default_permission_mode = "ask"
             ProviderConfig {
                 kind: "claude-cli".into(),
                 tool_bridge: Some(false),
+                ..Default::default()
+            },
+        );
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-cli".into(),
                 ..Default::default()
             },
         );
@@ -22759,6 +22875,12 @@ default_permission_mode = "ask"
             .unwrap();
         assert!(!native.bridge_tools);
         assert!(native.url.contains("tools=0"));
+
+        let cursor = engine.mcp_bridge_for("cursor/model", "th_1").unwrap();
+        assert!(!cursor.bridge_tools);
+        assert!(cursor.url.contains("tools=0"));
+        assert!(cursor.url.contains("approval=0"));
+        assert!(cursor.disallowed_tools.is_empty());
         engine.clear_cancel("th_1");
     }
 
