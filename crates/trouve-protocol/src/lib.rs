@@ -329,7 +329,9 @@ pub use requests::*;
 // the review (additive).
 // 7.23: workspace list entries expose additive repository identity so clients
 // can distinguish repository grouping from workspace grouping.
-pub const PROTOCOL_VERSION: &str = "7.23";
+// 7.24: the legacy /v1/clis lifecycle also manages non-CLI agent runtimes;
+// Cursor's managed artifact is its standalone Agent SDK Bridge.
+pub const PROTOCOL_VERSION: &str = "7.24";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -424,7 +424,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.23";
+export const SUPPORTED_PROTOCOL_VERSION = "7.24";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -1482,7 +1482,7 @@ export class ProtocolClient {
   clis(): Promise<ProtocolCliList> {
     return this.#validatedJson(
       "/v1/clis",
-      "CLI list",
+      "agent runtime list",
       "CliList",
       (loaded) => loaded.cliList,
     );
@@ -1500,7 +1500,7 @@ export class ProtocolClient {
   async startCliInstall(cliId: string): Promise<void> {
     await this.#mutation(
       `/v1/clis/${encodeURIComponent(cliId)}/install`,
-      "start CLI install",
+      "start agent runtime install",
       "POST",
     );
   }
@@ -1508,7 +1508,7 @@ export class ProtocolClient {
   async cancelCliInstall(cliId: string): Promise<void> {
     await this.#mutation(
       `/v1/clis/${encodeURIComponent(cliId)}/install`,
-      "cancel CLI install",
+      "cancel agent runtime install",
       "DELETE",
     );
   }
@@ -1516,7 +1516,7 @@ export class ProtocolClient {
   async uninstallCli(cliId: string): Promise<void> {
     await this.#mutation(
       `/v1/clis/${encodeURIComponent(cliId)}`,
-      "uninstall CLI",
+      "uninstall agent runtime",
       "DELETE",
     );
   }

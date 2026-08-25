@@ -233,7 +233,7 @@ export const saveProvider = (
     body: JSON.stringify({
       kind,
       base_url: baseUrl || null,
-      api_key: apiKey || null,
+      ...(apiKey === undefined ? {} : { api_key: apiKey || null }),
     }),
   });
 export const getClis = async (): Promise<CliInfo[]> =>

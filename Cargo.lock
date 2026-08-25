@@ -7402,7 +7402,9 @@ name = "trouve-agents"
 version = "4.5.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "dirs",
  "flate2",
@@ -7422,6 +7424,7 @@ dependencies = [
  "trouve-process",
  "trouve-protocol",
  "trouve-providers",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 

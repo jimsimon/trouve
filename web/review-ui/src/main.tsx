@@ -3634,6 +3634,7 @@ function ProviderSettings({
   const [cliStatuses, setCliStatuses] = useState<Record<string, CliInstallStatus>>({});
   const [cliBusy, setCliBusy] = useState("");
   const [subscriptionId, setSubscriptionId] = useState("");
+  const [subscriptionApiKey, setSubscriptionApiKey] = useState("");
   const [apiPresetId, setApiPresetId] = useState("");
   const [providerId, setProviderId] = useState("");
   const [providerKind, setProviderKind] = useState("openai-compat");
@@ -3758,6 +3759,7 @@ function ProviderSettings({
     id: string,
     action: "install" | "cancel" | "uninstall",
   ): Promise<void> => {
+    const label = clis.find((runtime) => runtime.id === id)?.display_name ?? id;
     setCliBusy(id);
     try {
       if (action === "install") {
@@ -3766,14 +3768,14 @@ function ProviderSettings({
           ...current,
           [id]: { status: "pending", received_bytes: 0, total_bytes: 0 },
         }));
-        flash(`Installing ${id}…`);
+        flash(`Installing ${label}…`);
       } else if (action === "cancel") {
         await cancelCliInstall(id);
-        flash(`Cancelling ${id} install…`);
+        flash(`Cancelling ${label} install…`);
       } else {
-        if (!window.confirm(`Remove trouve's managed ${id}?`)) return;
+        if (!window.confirm(`Remove trouve's managed ${label}?`)) return;
         await uninstallCli(id);
-        flash(`Removed managed ${id}`);
+        flash(`Removed managed ${label}`);
         await loadCliData();
       }
     } catch (cause) {
@@ -3783,15 +3785,17 @@ function ProviderSettings({
     }
   };
   const subscriptionProviders = knownProviders.filter(
-    (provider) => provider.auth === "cli" || provider.auth === "oauth",
+    (provider) => provider.category === "subscription"
+      || provider.auth === "cli"
+      || provider.auth === "oauth",
   );
   const apiProviders = knownProviders.filter(
-    (provider) => provider.auth !== "cli" && provider.auth !== "oauth",
+    (provider) => provider.category !== "local" && !subscriptionProviders.includes(provider),
   );
   const selectedSubscription = subscriptionProviders.find(
     (provider) => provider.id === subscriptionId,
   );
-  const requiredCli = selectedSubscription
+  const requiredRuntime = selectedSubscription
     ? clis.find((cli) => cli.kinds.includes(selectedSubscription.kind))
     : undefined;
   const selectedModel = models.find((model) => model.id === defaultModel);
@@ -3920,8 +3924,8 @@ function ProviderSettings({
           onSubmit={async (event) => {
             event.preventDefault();
             if (!selectedSubscription) return;
-            if (requiredCli && !cliIsInstalled(requiredCli)) {
-              await runCliAction(requiredCli.id, "install");
+            if (requiredRuntime && !cliIsInstalled(requiredRuntime)) {
+              await runCliAction(requiredRuntime.id, "install");
               return;
             }
             try {
@@ -3929,21 +3933,32 @@ function ProviderSettings({
                 selectedSubscription.id,
                 selectedSubscription.kind,
                 selectedSubscription.base_url,
+                selectedSubscription.auth === "api-key"
+                  ? subscriptionApiKey || undefined
+                  : undefined,
               );
               onChanged();
-              await begin(configured);
+              if (selectedSubscription.auth === "api-key") {
+                setSubscriptionApiKey("");
+                flash(`Saved ${selectedSubscription.display_name}`);
+              } else {
+                await begin(configured);
+              }
             } catch (cause) {
               flash(cause instanceof Error ? cause.message : String(cause));
             }
           }}
         >
           <h3>Subscription provider</h3>
-          <p class="muted">Configure a vendor subscription and open its sign-in flow.</p>
+          <p class="muted">Configure a membership-backed provider with its supported sign-in or API-key flow.</p>
           <label>
             Provider
             <select
               value={subscriptionId}
-              onChange={(event) => setSubscriptionId(event.currentTarget.value)}
+              onChange={(event) => {
+                setSubscriptionId(event.currentTarget.value);
+                setSubscriptionApiKey("");
+              }}
               required
             >
               <option value="">Choose a provider…</option>
@@ -3954,10 +3969,29 @@ function ProviderSettings({
               ))}
             </select>
           </label>
+          {selectedSubscription?.auth === "api-key" && (
+            <label>
+              API key
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={subscriptionApiKey}
+                onInput={(event) => setSubscriptionApiKey(event.currentTarget.value)}
+                placeholder="Stored in trouve's secret store; leave empty to keep"
+              />
+              <small>
+                {selectedSubscription.api_key_env
+                  ? `Or set ${selectedSubscription.api_key_env} on the server.`
+                  : "A supported vendor API key is required for this subscription."}
+              </small>
+            </label>
+          )}
           <button type="submit" disabled={!selectedSubscription || cliBusy !== ""}>
-            {requiredCli && !cliIsInstalled(requiredCli)
-              ? `Install ${requiredCli.display_name}`
-              : "Configure and sign in"}
+            {requiredRuntime && !cliIsInstalled(requiredRuntime)
+              ? `Install ${requiredRuntime.display_name}`
+              : selectedSubscription?.auth === "api-key"
+                ? "Save provider"
+                : "Configure and sign in"}
           </button>
         </form>
         <form
@@ -4048,8 +4082,8 @@ function ProviderSettings({
       <section class="cli-manager">
         <header>
           <div>
-            <h3>Subscription CLI binaries</h3>
-            <p class="muted">Managed versions take precedence over system copies on PATH. Status updates automatically.</p>
+            <h3>Subscription agent runtimes</h3>
+            <p class="muted">Cursor's Agent SDK Bridge and managed vendor CLIs take precedence over system copies on PATH. Status updates automatically.</p>
           </div>
         </header>
         <div class="cli-list">

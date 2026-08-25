@@ -10,10 +10,11 @@ use trouve_protocol::KnownProvider;
 /// render these as one-click setup options; ids are suggestions, not
 /// constraints.
 ///
-/// Subscription access goes through the vendors' own binaries (`auth:
-/// "cli"` presets below) — never by hijacking their OAuth client
-/// registrations. The generic OAuth machinery remains available for
-/// providers that sanction third-party clients.
+/// Subscription access goes through vendor-supported credentials: their own
+/// binaries where required, or product/SDK API keys for Kimi Code and Cursor.
+/// It never hijacks vendor OAuth client registrations. The generic OAuth
+/// machinery remains available for providers that sanction third-party
+/// clients.
 pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<KnownProvider> {
     fn p(
         id: &str,
@@ -50,7 +51,7 @@ pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<
             Some("KIMI_CODE_API_KEY"),
             "api-key",
         ),
-        // Local runtimes and vendor CLI agent backends are Trouve
+        // Local runtimes and vendor agent backends are Trouve
         // integrations, not model API providers, so models.dev does not list
         // them.
         p(
@@ -71,16 +72,8 @@ pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<
         ),
         p(
             "cursor",
-            "Cursor (Subscription)",
-            "cursor-cli",
-            None,
-            None,
-            "cli",
-        ),
-        p(
-            "cursor-api",
-            "Cursor (API Key)",
-            "cursor-cli",
+            "Cursor (Agent SDK)",
+            "cursor-sdk",
             None,
             Some("CURSOR_API_KEY"),
             "api-key",
@@ -114,7 +107,7 @@ fn merge_provider_presets(
 /// Classify a configured provider for settings presentation. Authentication
 /// and transport are deliberately independent from billing/presentation.
 pub fn provider_category(id: &str, auth: &str, base_url: Option<&str>) -> String {
-    if id == "kimi-code" || auth == "cli" || auth == "oauth" {
+    if matches!(id, "kimi-code" | "cursor" | "cursor-api") || auth == "cli" || auth == "oauth" {
         "subscription".into()
     } else if base_url.is_some_and(is_loopback_url) {
         "local".into()
@@ -237,7 +230,10 @@ mod tests {
             provider_category("kimi-code", "api-key", None),
             "subscription"
         );
-        assert_eq!(provider_category("cursor-api", "api-key", None), "api");
+        assert_eq!(
+            provider_category("cursor-api", "api-key", None),
+            "subscription"
+        );
         assert_eq!(
             provider_category("ollama", "none", Some("http://localhost:11434/v1")),
             "local"
