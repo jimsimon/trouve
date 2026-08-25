@@ -8271,7 +8271,7 @@ impl Engine {
             let has_cached_thread =
                 finding.github_comment_id.is_some() && finding.github_thread_id.is_some();
             let outcome = if has_cached_thread {
-                self.collapse_cached_thread(api, finding)
+                self.collapse_cached_thread(api, repository, pull_number, finding)
                     .await
                     .map(|()| CollapseOutcome::Completed)
             } else {
@@ -8324,8 +8324,15 @@ impl Engine {
                 }
                 let (thread_by_comment, listing_complete) =
                     listing.as_ref().expect("listing was just loaded");
-                self.collapse_finding_thread(api, thread_by_comment, *listing_complete, finding)
-                    .await
+                self.collapse_finding_thread(
+                    api,
+                    repository,
+                    pull_number,
+                    thread_by_comment,
+                    *listing_complete,
+                    finding,
+                )
+                .await
             };
             match outcome {
                 Ok(CollapseOutcome::Completed) => {}
@@ -8359,6 +8366,8 @@ impl Engine {
     async fn collapse_cached_thread(
         &self,
         api: &GithubApi,
+        repository: &str,
+        pull_number: u64,
         finding: &trouve_protocol::CodeReviewFinding,
     ) -> Result<()> {
         let (Some(comment_id), Some(thread_id)) = (
@@ -8387,6 +8396,8 @@ impl Engine {
             }
             return Err(error);
         }
+        self.explain_thread_resolution(api, repository, pull_number, finding)
+            .await;
         self.store.clear_code_review_thread_collapse(
             &finding.id,
             Some(comment_id),
@@ -8429,6 +8440,8 @@ impl Engine {
     async fn collapse_finding_thread(
         &self,
         api: &GithubApi,
+        repository: &str,
+        pull_number: u64,
         thread_by_comment: &HashMap<u64, (String, bool)>,
         listing_complete: bool,
         finding: &trouve_protocol::CodeReviewFinding,
@@ -8455,6 +8468,8 @@ impl Engine {
                     )
                     .await
                     .context("collapsing a review thread timed out")??;
+                    self.explain_thread_resolution(api, repository, pull_number, finding)
+                        .await;
                 }
                 resolved_thread_id = Some(thread_id);
             }
@@ -9195,9 +9210,15 @@ impl Engine {
                 reopened |= review_thread_was_reopened(state.is_resolved, *is_resolved);
             }
             // Closed findings remain in reconciliation solely so a remotely
-            // reopened thread can restore them to `open`. A thread that is
-            // still resolved must not start another review round.
-            if matches!(state.finding.status.as_str(), "fixed" | "dismissed") && *is_resolved {
+            // reopened thread can restore them to `open`. Their thread state
+            // is bookkeeping, not an adjudication claim: whether the
+            // auto-resolve worker has caught up with a verified fix must
+            // never gate the resolve-all recheck, or a stalled worker
+            // silently blocks dismissal adjudication for the whole pull
+            // request. Reopen detection above still counts, and a pending
+            // recheck marker is still consumed.
+            if matches!(state.finding.status.as_str(), "fixed" | "dismissed") {
+                reopened |= state.recheck_pending;
                 continue;
             }
             reopened |= state.recheck_pending;
@@ -9265,6 +9286,59 @@ impl Engine {
             self.code_review.job_wake.notify_one();
         }
         Ok(ReviewThreadReconciliationOutcome::Completed)
+    }
+
+    /// Best-effort explanatory reply posted when the worker resolves a
+    /// fixed or dismissed finding's thread, so the closure is
+    /// self-documenting in the conversation history. Failures are logged and
+    /// never block or fail the resolution itself.
+    async fn explain_thread_resolution(
+        &self,
+        api: &GithubApi,
+        repository: &str,
+        pull_number: u64,
+        finding: &trouve_protocol::CodeReviewFinding,
+    ) {
+        let Some(comment_id) = finding.github_comment_id else {
+            return;
+        };
+        let head = finding
+            .resolved_head
+            .get(..8)
+            .unwrap_or(finding.resolved_head.as_str());
+        let body = match finding.status.as_str() {
+            "dismissed" => {
+                "Trouve dismissed this finding after adjudication; resolving this thread."
+                    .to_string()
+            }
+            _ if finding.resolved_by_job_id.is_empty() => {
+                "Trouve verified this finding fixed; resolving this thread.".to_string()
+            }
+            _ => format!(
+                "Trouve verified this finding fixed at `{head}` (review `{}`); resolving this thread.",
+                finding.resolved_by_job_id
+            ),
+        };
+        let outcome = tokio::time::timeout(
+            REVIEW_THREAD_REQUEST_TIMEOUT,
+            api.post::<serde_json::Value>(
+                &format!("/repos/{repository}/pulls/{pull_number}/comments/{comment_id}/replies"),
+                &serde_json::json!({ "body": body }),
+            ),
+        )
+        .await;
+        match outcome {
+            Ok(Ok((_, rate))) => self.record_review_rate(rate),
+            Ok(Err(error)) => tracing::debug!(
+                finding_id = finding.id,
+                error = format!("{error:#}"),
+                "explanatory resolution reply failed"
+            ),
+            Err(_) => tracing::debug!(
+                finding_id = finding.id,
+                "explanatory resolution reply timed out"
+            ),
+        }
     }
 
     async fn collapse_review_thread(&self, api: &GithubApi, thread_id: &str) -> Result<()> {

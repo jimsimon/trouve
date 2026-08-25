@@ -310,7 +310,10 @@ pub use requests::*;
 // success only when the newest published round also covered the full branch;
 // jobs and repositories carry the implementation-analyst model/thinking
 // configuration and tasks gain the `analyst` role.
-pub const PROTOCOL_VERSION: &str = "7.16";
+// 7.17 is reserved by an in-flight branch.
+// 7.18: review stats expose the finding-thread auto-resolve backlog
+// (additive).
+pub const PROTOCOL_VERSION: &str = "7.18";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

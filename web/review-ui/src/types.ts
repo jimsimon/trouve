@@ -416,6 +416,10 @@ export interface ReviewStats {
   coordinator_duration: DurationStats;
   publication_duration: DurationStats;
   issue_count: number;
+  thread_collapse_backlog?: {
+    pending: number;
+    oldest_pending_minutes?: number | null;
+  } | null;
   churn?: {
     recurrence_issue_count: number;
     fix_regression_issue_count: number;

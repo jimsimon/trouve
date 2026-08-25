@@ -2556,6 +2556,17 @@ pub struct CodeReviewChurnStats {
     pub max_rounds_to_clean: u64,
 }
 
+/// Auto-resolve worker backlog for finding threads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewCollapseBacklog {
+    /// Findings marked for thread resolution that the worker has not
+    /// completed yet.
+    pub pending: u64,
+    /// Age of the oldest pending entry, from when its finding was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_minutes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewStats {
     pub range: CodeReviewStatsRange,
@@ -2580,6 +2591,11 @@ pub struct CodeReviewStats {
     pub issue_count: u64,
     #[serde(default)]
     pub churn: CodeReviewChurnStats,
+    /// Fixed or dismissed findings whose GitHub threads still await the
+    /// auto-resolve worker. A growing or aging backlog means resolved
+    /// findings look unresolved on GitHub and thread-driven flows lag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_collapse_backlog: Option<CodeReviewCollapseBacklog>,
     #[serde(default)]
     pub buckets: Vec<CodeReviewStatsBucket>,
     #[serde(default)]

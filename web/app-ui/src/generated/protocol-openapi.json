@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.16"
+    "version": "7.18"
   },
   "paths": {
     "/v1/approvals": {
@@ -5538,6 +5538,30 @@
           }
         }
       },
+      "CodeReviewCollapseBacklog": {
+        "type": "object",
+        "description": "Auto-resolve worker backlog for finding threads.",
+        "required": [
+          "pending"
+        ],
+        "properties": {
+          "oldest_pending_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Age of the oldest pending entry, from when its finding was resolved.",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Findings marked for thread resolution that the worker has not\ncompleted yet.",
+            "minimum": 0
+          }
+        }
+      },
       "CodeReviewDashboard": {
         "type": "object",
         "required": [
@@ -5814,29 +5838,6 @@
           "created_at"
         ],
         "properties": {
-          "advisory_open_issue_count": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Advisory findings (low severity, or medium severity with low\nconfidence) still open across the pull request: durable engineering\ndebt recorded in trouve, never posted to GitHub and never\nmerge-blocking.",
-            "minimum": 0
-          },
-          "analyst_model": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Model snapshotted for the per-round implementation analyst. Absent\ninherits `model`."
-          },
-          "analyst_thinking_level": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Thinking level snapshotted for the implementation analyst."
-          },
           "base_ref": {
             "type": "string"
           },
@@ -5946,7 +5947,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Blocking confirmed findings (high severity, or medium severity with\nat least medium confidence) that remained open across the pull\nrequest after this review was published. Only these gate the check\nrun. Absent while publication is pending and for legacy jobs that\npredate this snapshot. Consumers must treat absence on a succeeded\njob as unknown, never as a clean review.",
+            "description": "Total confirmed findings that remained open across the pull request\nafter this review was published. Absent while publication is pending\nand for legacy jobs that predate this snapshot. Consumers must treat\nabsence on a succeeded job as unknown, never as a clean review.",
             "minimum": 0
           },
           "pending_elapsed_ms": {
@@ -6397,20 +6398,6 @@
           "repository"
         ],
         "properties": {
-          "analyst_model": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Provider-qualified model used by the per-round implementation\nanalyst. Absent inherits `model`."
-          },
-          "analyst_thinking_level": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Preferred thinking level or fixed token budget for the implementation\nanalyst. Absent inherits the review mode's default."
-          },
           "coordinator_thinking_level": {
             "type": [
               "string",
@@ -6705,6 +6692,17 @@
           "status": {
             "$ref": "#/components/schemas/CodeReviewStatusCounts",
             "description": "Current active work plus terminal outcomes in the selected range."
+          },
+          "thread_collapse_backlog": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CodeReviewCollapseBacklog",
+                "description": "Fixed or dismissed findings whose GitHub threads still await the\nauto-resolve worker. A growing or aging backlog means resolved\nfindings look unresolved on GitHub and thread-driven flows lag."
+              }
+            ]
           }
         }
       },
@@ -7038,7 +7036,6 @@
         "type": "string",
         "enum": [
           "router",
-          "analyst",
           "reviewer",
           "coordinator"
         ]
@@ -13483,18 +13480,6 @@
           "mode"
         ],
         "properties": {
-          "analyst_model": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "analyst_thinking_level": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "coordinator_thinking_level": {
             "type": [
               "string",

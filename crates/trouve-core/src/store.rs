@@ -12271,6 +12271,27 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?
         };
+        let thread_collapse_backlog = {
+            let conn = self.conn.lock().unwrap();
+            let (pending, oldest): (i64, Option<String>) = conn.query_row(
+                "SELECT COUNT(*), MIN(COALESCE(resolved_at, created_at))
+                 FROM code_review_findings WHERE collapse_pending = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            trouve_protocol::CodeReviewCollapseBacklog {
+                pending: pending.max(0) as u64,
+                oldest_pending_minutes: oldest
+                    .and_then(|value| value.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                    .filter(|_| pending > 0)
+                    .map(|oldest| {
+                        chrono::Utc::now()
+                            .signed_duration_since(oldest)
+                            .num_minutes()
+                            .max(0) as u64
+                    }),
+            }
+        };
         let mut persona_stats: BTreeMap<(String, String), PersonaAccumulator> = BTreeMap::new();
         for (_, reviewer_id, model, execution) in executions {
             let persona = persona_stats.entry((reviewer_id, model)).or_default();
@@ -12465,6 +12486,7 @@ impl Store {
             publication_duration: code_review_duration_stats(overall_publication),
             issue_count: overall_issues,
             churn,
+            thread_collapse_backlog: Some(thread_collapse_backlog),
             buckets,
             personas,
             repositories,
@@ -22503,6 +22525,63 @@ mod tests {
         assert_eq!(stats.churn.pull_request_count, 0);
         assert_eq!(stats.churn.recurrence_issue_count, 0);
         assert_eq!(stats.churn.external_duplicate_count, 0);
+        assert_eq!(
+            stats.thread_collapse_backlog.as_ref().map(|b| b.pending),
+            Some(0),
+            "an idle worker reports an empty backlog"
+        );
+    }
+
+    #[test]
+    fn review_stats_report_the_thread_collapse_backlog() {
+        let store = Store::open_in_memory().unwrap();
+        let mut request = backoff_test_job_request();
+        request.dedupe_key = "acme/widgets#42:collapse-backlog".into();
+        let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One finding.",
+                "",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Backlogged".into(),
+                    body: "Awaiting thread resolution.".into(),
+                    prompt_for_agents: String::new(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_findings
+                 SET collapse_pending = 1, github_comment_id = 7,
+                     resolved_at = '2026-08-25T00:00:00Z'
+                 WHERE id = ?1",
+                params![findings[0].id],
+            )
+            .unwrap();
+        let stats = store
+            .code_review_stats(trouve_protocol::CodeReviewStatsRange::All, None)
+            .unwrap();
+        let backlog = stats.thread_collapse_backlog.unwrap();
+        assert_eq!(backlog.pending, 1);
+        assert!(
+            backlog
+                .oldest_pending_minutes
+                .is_some_and(|minutes| minutes > 0),
+            "age is measured from the finding's resolution time"
+        );
     }
 
     #[test]
