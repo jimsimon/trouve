@@ -563,12 +563,12 @@ impl ProtocolClient {
         self.get_json(&format!("/clis/{id}/install")).await
     }
 
-    /// Cancel an in-flight CLI install.
+    /// Cancel an in-flight managed agent-runtime install.
     pub async fn cancel_cli_install(&self, id: &str) -> Result<()> {
         self.delete(&format!("/clis/{id}/install")).await
     }
 
-    /// Remove the managed install of a CLI (PATH installs are untouched).
+    /// Remove a managed agent runtime (PATH installs are untouched).
     pub async fn uninstall_cli(&self, id: &str) -> Result<()> {
         self.delete(&format!("/clis/{id}")).await
     }

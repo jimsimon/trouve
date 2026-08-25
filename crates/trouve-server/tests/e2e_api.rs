@@ -1451,17 +1451,16 @@ async fn session_and_thread_updates_and_provider_config() {
     assert_eq!(kimi_code["base_url"], "https://api.kimi.com/coding/v1");
     // Policy invariant: we never ship OAuth presets that piggyback on
     // vendors' own CLI client registrations (account-ban risk). OAuth is
-    // manual-config only; subscriptions go through vendor CLIs instead.
+    // manual-config only; subscriptions use vendor-supported CLI or API-key
+    // surfaces instead.
     assert!(
         known.iter().all(|k| k["auth"] != "oauth"),
         "no subscription presets in the shipped catalog"
     );
-    // Subscription agent backends: auth lives in the vendor CLI.
-    for (id, kind) in [
-        ("codex", "codex-app-server"),
-        ("cursor", "cursor-cli"),
-        ("claude-code", "claude-cli"),
-    ] {
+    // Subscription agent backends use the vendor-supported authentication
+    // mechanism for their transport. Cursor's SDK takes an API key while
+    // Codex and Claude retain their CLI login flows.
+    for (id, kind) in [("codex", "codex-app-server"), ("claude-code", "claude-cli")] {
         let preset = known
             .iter()
             .find(|k| k["id"] == id)
@@ -1471,16 +1470,15 @@ async fn session_and_thread_updates_and_provider_config() {
         assert_eq!(preset["category"], "subscription");
         assert!(!preset["experimental"].as_bool().unwrap_or(false));
     }
-    // Cursor also ships a key-authenticated preset (usage-based billing)
-    // alongside the subscription one; same cursor-cli backend.
-    let cursor_api = known
+    let cursor = known
         .iter()
-        .find(|k| k["id"] == "cursor-api")
-        .expect("cursor-api preset");
-    assert_eq!(cursor_api["kind"], "cursor-cli");
-    assert_eq!(cursor_api["auth"], "api-key");
-    assert_eq!(cursor_api["category"], "api");
-    assert_eq!(cursor_api["api_key_env"], "CURSOR_API_KEY");
+        .find(|k| k["id"] == "cursor")
+        .expect("cursor preset");
+    assert_eq!(cursor["kind"], "cursor-sdk");
+    assert_eq!(cursor["auth"], "api-key");
+    assert_eq!(cursor["category"], "subscription");
+    assert_eq!(cursor["api_key_env"], "CURSOR_API_KEY");
+    assert!(known.iter().all(|k| k["id"] != "cursor-api"));
     assert!(known.iter().all(|k| k["id"] != "codex-api"));
 
     // Login endpoints exist but reject providers without manual OAuth config.

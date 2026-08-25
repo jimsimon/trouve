@@ -1,9 +1,8 @@
-//! Managed vendor CLI installs.
+//! Managed vendor agent-runtime installs.
 //!
-//! Downloads the official vendor CLI builds (the same artifacts their
-//! install scripts fetch) into trouve's data directory, so users don't
-//! depend on system packages that may lag behind — e.g. the ACP mode of
-//! `cursor-agent` needs a newer build than most distro packages ship.
+//! Downloads official vendor builds into trouve's data directory, so users
+//! don't depend on system packages that may lag behind. The legacy `/v1/clis`
+//! API name covers both CLIs and Cursor's standalone Agent SDK Bridge.
 //!
 //! Layout under `<data_dir>/cli/`:
 //! - `<id>/<version>/…`       — one directory per installed version
@@ -11,8 +10,8 @@
 //! - `bin/<id>`               — stable symlink backends resolve at spawn
 //!
 //! Sources (no custom mirrors, no version pinning by us):
-//! - cursor-agent: `downloads.cursor.com/lab/<ver>/<os>/<arch>/agent-cli-package.tar.gz`
-//!   (version discovered from the official install script)
+//! - cursor-sdk-bridge: GitHub `cursor/sdk-bridge` release tarball plus the
+//!   release's `SHA256SUMS.txt`
 //! - claude: `downloads.claude.ai/claude-code-releases` (`latest` + manifest
 //!   with sha256 checksums; single static binary)
 //! - codex: GitHub `openai/codex` latest release tarball (musl build on Linux)
@@ -23,11 +22,11 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-/// A vendor CLI trouve knows how to install. `id` doubles as the binary
-/// name and the API path segment.
+/// A vendor agent runtime trouve knows how to install. `id` doubles as the
+/// binary name and the legacy API path segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliId {
-    CursorAgent,
+    CursorSdkBridge,
     Claude,
     Codex,
     /// llama.cpp's `llama-server` — the local-inference runtime behind the
@@ -37,12 +36,12 @@ pub enum CliId {
     LlamaServer,
 }
 
-pub const ALL_CLIS: [CliId; 3] = [CliId::CursorAgent, CliId::Claude, CliId::Codex];
+pub const ALL_CLIS: [CliId; 3] = [CliId::CursorSdkBridge, CliId::Claude, CliId::Codex];
 
 impl CliId {
     pub fn parse(id: &str) -> Option<Self> {
         match id {
-            "cursor-agent" => Some(Self::CursorAgent),
+            "cursor-sdk-bridge" => Some(Self::CursorSdkBridge),
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "llama-server" => Some(Self::LlamaServer),
@@ -52,7 +51,7 @@ impl CliId {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::CursorAgent => "cursor-agent",
+            Self::CursorSdkBridge => "cursor-sdk-bridge",
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::LlamaServer => "llama-server",
@@ -61,17 +60,17 @@ impl CliId {
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            Self::CursorAgent => "Cursor CLI",
+            Self::CursorSdkBridge => "Cursor Agent SDK",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
             Self::LlamaServer => "llama.cpp",
         }
     }
 
-    /// Provider kinds this CLI serves (for surfacing next to providers).
+    /// Provider kinds this runtime serves (for surfacing next to providers).
     pub fn provider_kinds(&self) -> &'static [&'static str] {
         match self {
-            Self::CursorAgent => &["cursor-cli"],
+            Self::CursorSdkBridge => &["cursor-sdk"],
             Self::Claude => &["claude-cli"],
             Self::Codex => &["codex-app-server"],
             Self::LlamaServer => &["local"],
@@ -110,7 +109,7 @@ impl Progress {
     }
 }
 
-/// The active managed install of one CLI, persisted as `installed.json`.
+/// The active managed install of one runtime, persisted as `installed.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledCli {
     pub version: String,
@@ -157,7 +156,7 @@ async fn get_text(url: &str) -> Result<String, InstallError> {
         .map_err(|e| InstallError::Download(format!("{url}: {e}")))
 }
 
-/// Download `url` fully into memory (CLI artifacts are tens of MB),
+/// Download `url` fully into memory (runtime artifacts are tens of MB),
 /// streaming chunks so `progress` stays live and cancellation can land
 /// mid-transfer.
 async fn get_bytes(url: &str, progress: &Progress) -> Result<Vec<u8>, InstallError> {
@@ -196,12 +195,10 @@ async fn get_bytes(url: &str, progress: &Progress) -> Result<Vec<u8>, InstallErr
 /// The newest version the vendor currently serves.
 pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
     match id {
-        CliId::CursorAgent => {
-            let script = get_text("https://cursor.com/install").await?;
-            parse_cursor_install_version(&script).ok_or_else(|| {
-                InstallError::Download("cursor install script had no version".into())
-            })
-        }
+        CliId::CursorSdkBridge => Ok(github_latest_tag("cursor/sdk-bridge")
+            .await?
+            .trim_start_matches('v')
+            .to_string()),
         CliId::Claude => {
             let v = get_text("https://downloads.claude.ai/claude-code-releases/latest").await?;
             let v = v.trim().to_string();
@@ -234,21 +231,27 @@ async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
         .ok_or_else(|| InstallError::Download("github release had no tag_name".into()))
 }
 
-/// Pull the pinned version out of the official cursor install script
-/// (`…downloads.cursor.com/lab/<version>/<os>/<arch>/…`).
-fn parse_cursor_install_version(script: &str) -> Option<String> {
-    let idx = script.find("downloads.cursor.com/lab/")?;
-    let rest = &script[idx + "downloads.cursor.com/lab/".len()..];
-    let version: String = rest.chars().take_while(|c| *c != '/').collect();
-    (!version.is_empty()).then_some(version)
-}
-
 // --- platform mapping --------------------------------------------------------
 
 fn cursor_platform() -> Result<(&'static str, &'static str), InstallError> {
     let os = match std::env::consts::OS {
         "linux" => "linux",
         "macos" => "darwin",
+        other => return Err(InstallError::Unsupported(other.into())),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => return Err(InstallError::Unsupported(other.into())),
+    };
+    Ok((os, arch))
+}
+
+fn cursor_sdk_bridge_platform() -> Result<(&'static str, &'static str), InstallError> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "win32",
         other => return Err(InstallError::Unsupported(other.into())),
     };
     let arch = match std::env::consts::ARCH {
@@ -390,6 +393,12 @@ pub async fn install(
 
     // Keep at most one older version around for rollback; drop the rest.
     prune_old_versions(&root, version);
+    if id == CliId::CursorSdkBridge {
+        // The SDK is the Cursor transport now. Remove Trouve's obsolete
+        // managed ACP binary once the replacement is active; system installs
+        // remain outside our ownership and are never touched.
+        remove_legacy_cursor_agent(data_dir)?;
+    }
     Ok(info)
 }
 
@@ -405,10 +414,25 @@ pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
     }
+    if id == CliId::CursorSdkBridge {
+        remove_legacy_cursor_agent(data_dir)?;
+    }
     Ok(())
 }
 
-/// Fetch and unpack one CLI into `dir`; returns the executable's path
+fn remove_legacy_cursor_agent(data_dir: &Path) -> std::io::Result<()> {
+    let legacy_link = data_dir.join("cli").join("bin").join("cursor-agent");
+    if legacy_link.symlink_metadata().is_ok() {
+        std::fs::remove_file(legacy_link)?;
+    }
+    let legacy_root = data_dir.join("cli").join("cursor-agent");
+    if legacy_root.exists() {
+        std::fs::remove_dir_all(legacy_root)?;
+    }
+    Ok(())
+}
+
+/// Fetch and unpack one runtime into `dir`; returns the executable's path
 /// relative to `dir`.
 async fn install_into(
     dir: &Path,
@@ -417,14 +441,39 @@ async fn install_into(
     progress: &Progress,
 ) -> Result<PathBuf, InstallError> {
     match id {
-        CliId::CursorAgent => {
-            let (os, arch) = cursor_platform()?;
-            let url = format!(
-                "https://downloads.cursor.com/lab/{version}/{os}/{arch}/agent-cli-package.tar.gz"
-            );
+        CliId::CursorSdkBridge => {
+            let (os, arch) = cursor_sdk_bridge_platform()?;
+            let asset = format!("cursor-sdk-bridge-standalone-{os}-{arch}.tar.gz");
+            let base = format!("https://github.com/cursor/sdk-bridge/releases/download/v{version}");
+            let sums = get_text(&format!("{base}/SHA256SUMS.txt")).await?;
+            let url = format!("{base}/{asset}");
             let bytes = get_bytes(&url, progress).await?;
+            let expected = checksum_for_asset(&sums, &asset).ok_or_else(|| {
+                InstallError::Download(format!("SHA256SUMS.txt had no entry for {asset}"))
+            })?;
+            let actual = sha2::Sha256::digest(&bytes).iter().fold(
+                String::with_capacity(64),
+                |mut output, byte| {
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                },
+            );
+            if actual != expected {
+                return Err(InstallError::Checksum(asset));
+            }
             untar_gz(bytes, dir).await?;
-            let rel = PathBuf::from("dist-package").join("cursor-agent");
+            let executable = if cfg!(windows) {
+                "cursor-sdk-bridge.exe"
+            } else {
+                "cursor-sdk-bridge"
+            };
+            let rel = PathBuf::from("bin").join(executable);
+            if !dir.join(&rel).exists() {
+                return Err(InstallError::Download(format!(
+                    "{asset} had no {}",
+                    rel.display()
+                )));
+            }
             make_executable(&dir.join(&rel))?;
             Ok(rel)
         }
@@ -485,6 +534,20 @@ async fn install_into(
             Ok(rel)
         }
     }
+}
+
+fn checksum_for_asset(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let checksum = fields.next()?;
+        let name = fields.next()?.trim_start_matches('*');
+        (name.rsplit('/').next() == Some(asset)
+            && checksum.len() == 64
+            && checksum
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+        .then(|| checksum.to_ascii_lowercase())
+    })
 }
 
 /// A version string safe to use as a path component and in a download URL.
@@ -622,7 +685,7 @@ pub fn find_on_path(command: &str) -> Option<PathBuf> {
 }
 
 /// Best-effort `<bin> --version` (first line, trimmed), for reporting the
-/// version of CLIs found on PATH.
+/// version of runtimes found on PATH.
 pub async fn binary_version(command: &str) -> Option<String> {
     let mut command = crate::process_env::tokio_command(command);
     command
@@ -650,15 +713,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_cursor_version_from_install_script() {
-        let script = r#"
-DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/agent-cli-package.tar.gz"
+    fn parses_cursor_sdk_release_checksum() {
+        let sums = r#"
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  cursor-sdk-bridge-standalone-linux-x64.tar.gz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bridge-standalone-darwin-arm64.tar.gz
 "#;
         assert_eq!(
-            parse_cursor_install_version(script).as_deref(),
-            Some("2026.07.01-41b2de7")
+            checksum_for_asset(sums, "cursor-sdk-bridge-standalone-linux-x64.tar.gz").as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
-        assert_eq!(parse_cursor_install_version("nothing here"), None);
+        assert_eq!(checksum_for_asset(sums, "missing.tar.gz"), None);
     }
 
     #[test]
@@ -683,7 +747,7 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
 
     #[test]
     fn tar_entry_containment_checks() {
-        assert!(path_is_contained(Path::new("dist-package/cursor-agent")));
+        assert!(path_is_contained(Path::new("bin/cursor-sdk-bridge")));
         assert!(path_is_contained(Path::new("libllama.so.1")));
         assert!(!path_is_contained(Path::new("../escape")));
         assert!(!path_is_contained(Path::new("/etc/passwd")));
@@ -784,6 +848,47 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
 
         // Uninstalling again is a no-op, not an error.
         uninstall(tmp.path(), CliId::Codex).unwrap();
+    }
+
+    #[test]
+    fn cursor_sdk_uninstall_removes_only_trouve_managed_cursor_runtimes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
+        let sdk_bin = sdk_root
+            .join("1.0.28")
+            .join("bin")
+            .join("cursor-sdk-bridge");
+        std::fs::create_dir_all(sdk_bin.parent().unwrap()).unwrap();
+        std::fs::write(&sdk_bin, "bridge").unwrap();
+        std::fs::write(
+            sdk_root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "1.0.28".into(),
+                bin: sdk_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let sdk_link = managed_bin(tmp.path(), CliId::CursorSdkBridge);
+        std::fs::create_dir_all(sdk_link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sdk_bin, &sdk_link).unwrap();
+
+        let legacy_root = tmp.path().join("cli").join("cursor-agent");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        std::fs::write(legacy_root.join("installed.json"), "legacy").unwrap();
+        let legacy_link = tmp.path().join("cli").join("bin").join("cursor-agent");
+        std::fs::write(&legacy_link, "legacy").unwrap();
+        let external = tmp.path().join("system-cursor-agent");
+        std::fs::write(&external, "outside trouve's managed layout").unwrap();
+
+        uninstall(tmp.path(), CliId::CursorSdkBridge).unwrap();
+
+        assert!(!sdk_root.exists());
+        assert!(sdk_link.symlink_metadata().is_err());
+        assert!(!legacy_root.exists());
+        assert!(legacy_link.symlink_metadata().is_err());
+        assert!(external.exists());
     }
 
     #[test]

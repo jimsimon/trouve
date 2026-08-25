@@ -2030,8 +2030,8 @@ pub struct Engine {
     /// Providers registered programmatically (`with_provider`); preserved
     /// across config-driven registry reloads.
     injected_providers: Mutex<HashMap<String, Arc<dyn Provider>>>,
-    /// External agent backends (Codex app-server, cursor-agent, Claude Code
-    /// CLI), keyed by provider id like `providers`.
+    /// External agent backends (Codex app-server, Cursor Agent SDK Bridge,
+    /// Claude Code CLI), keyed by provider id like `providers`.
     backends: RwLock<HashMap<String, Arc<dyn AgentBackend>>>,
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
@@ -2181,6 +2181,19 @@ pub struct Engine {
     connectivity_probe: Option<crate::connectivity::Probe>,
 }
 
+/// Content returned to a vendor harness after a bridged ToolExecutor call.
+/// Images stay out of the durable tool-result event but can be projected as
+/// native MCP image blocks for harnesses that support them.
+pub struct BridgedToolResult {
+    pub content: String,
+    pub images: Vec<BridgedToolImage>,
+}
+
+pub struct BridgedToolImage {
+    pub mime: String,
+    pub data: String,
+}
+
 /// Keeps an idempotent session-create reservation alive with the detached
 /// worktree attempt. Field order is intentional: if the request awaiting the
 /// task is cancelled, the worktree receipt rolls back before the key guard is
@@ -2248,20 +2261,24 @@ fn cli_version_matches(reported: &str, version: &str) -> bool {
             .any(|tok| tok == version || tok.strip_prefix('v') == Some(version))
 }
 
-/// The managed CLI serving a backend provider kind, if any.
+/// The managed agent runtime serving a backend provider kind, if any.
 fn cli_for_kind(kind: &str) -> Option<trouve_agents::install::CliId> {
     use trouve_agents::install::CliId;
     match kind {
-        "cursor-cli" => Some(CliId::CursorAgent),
+        "cursor-sdk" | "cursor-cli" => Some(CliId::CursorSdkBridge),
         "claude-cli" => Some(CliId::Claude),
         "codex-app-server" => Some(CliId::Codex),
         _ => None,
     }
 }
 
-/// Resolve the executable for a CLI-backed provider. An explicit command
+/// Resolve the executable for a managed agent runtime. An explicit command
 /// wins; otherwise a trouve-managed binary takes precedence over PATH.
-fn resolved_cli_command(kind: &str, command: Option<String>, data_dir: &Path) -> Option<String> {
+fn resolved_runtime_command(
+    kind: &str,
+    command: Option<String>,
+    data_dir: &Path,
+) -> Option<String> {
     command.or_else(|| {
         cli_for_kind(kind)
             .map(|cli| trouve_agents::install::managed_bin(data_dir, cli))
@@ -2270,14 +2287,29 @@ fn resolved_cli_command(kind: &str, command: Option<String>, data_dir: &Path) ->
     })
 }
 
+/// The old `cursor-cli` kind is accepted only as a transport-name migration.
+/// Its command referred to `cursor-agent`, which must never be launched by the
+/// SDK adapter; runtime resolution therefore starts fresh at the managed
+/// Bridge/PATH layers.
+fn configured_runtime_command(pc: &ProviderConfig) -> Option<String> {
+    if pc.kind == "cursor-cli" {
+        None
+    } else {
+        pc.command.clone()
+    }
+}
+
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
 fn is_backend_kind(kind: &str) -> bool {
-    matches!(kind, "codex-app-server" | "cursor-cli" | "claude-cli")
+    matches!(
+        kind,
+        "codex-app-server" | "cursor-sdk" | "cursor-cli" | "claude-cli"
+    )
 }
 
 /// Config kinds whose auth lives in a vendor CLI.
 fn is_cli_auth_kind(kind: &str) -> bool {
-    is_backend_kind(kind)
+    matches!(kind, "codex-app-server" | "claude-cli")
 }
 
 /// Credential style for a configured provider: "cli" for vendor-CLI-backed
@@ -2292,13 +2324,11 @@ fn provider_auth_kind(pc: &ProviderConfig) -> String {
     ) {
         "gcp".into()
     } else if is_cli_auth_kind(&pc.kind) {
-        // cursor-cli works both ways: subscription login ("cursor" preset)
-        // or an API key ("cursor-api" preset, usage-based billing).
-        if pc.kind == "cursor-cli" && (pc.api_key.is_some() || pc.api_key_env.is_some()) {
-            "api-key".into()
-        } else {
-            "cli".into()
-        }
+        "cli".into()
+    } else if matches!(pc.kind.as_str(), "cursor-sdk" | "cursor-cli") {
+        // cursor-cli is retained as a configuration compatibility alias, but
+        // both spellings run through the API-key-authenticated Agent SDK.
+        "api-key".into()
     } else if pc.oauth.is_some() && pc.api_key.is_none() {
         "oauth".into()
     } else if pc.api_key.is_none()
@@ -2387,15 +2417,14 @@ fn build_all_backends(
     for (id, pc) in &config.providers {
         // Explicit command wins; otherwise a trouve-managed install beats
         // whatever is on PATH (distro packages lag behind vendor releases).
-        let command = resolved_cli_command(&pc.kind, pc.command.clone(), data_dir);
+        let command = resolved_runtime_command(&pc.kind, configured_runtime_command(pc), data_dir);
         let backend: Arc<dyn AgentBackend> = match pc.kind.as_str() {
             "codex-app-server" => Arc::new(
                 trouve_agents::codex::CodexBackend::new(id, command).with_catalog(catalog.clone()),
             ),
-            "cursor-cli" => {
+            "cursor-sdk" | "cursor-cli" => {
                 // Same precedence as native providers: inline key > env var >
-                // key saved through settings (secret store). Subscription
-                // login via the CLI still works when all are absent.
+                // key saved through settings (secret store).
                 let api_key = pc
                     .api_key
                     .clone()
@@ -2408,6 +2437,7 @@ fn build_all_backends(
                     });
                 Arc::new(
                     trouve_agents::cursor::CursorBackend::new(id, command, api_key)
+                        .with_state_root(data_dir.join("cursor-sdk"))
                         .with_catalog(catalog.clone()),
                 )
             }
@@ -3166,7 +3196,7 @@ impl Engine {
                 .ok()
                 .flatten()
                 .is_some(),
-            // Key-authenticated agent backend (cursor-api): not in the
+            // Key-authenticated agent backend (such as Cursor): not in the
             // provider registry, so check the key channels directly.
             _ if is_backend_kind(&pc.kind) => {
                 pc.api_key.is_some()
@@ -3201,13 +3231,13 @@ impl Engine {
                 | "amazon-bedrock"
                 | "google-vertex"
                 | "google-vertex-anthropic"
-        ) && !is_cli_auth_kind(&req.kind)
+        ) && !is_backend_kind(&req.kind)
         {
             return Err(EngineError::BadRequest(format!(
                 "unknown provider kind {:?} (expected openai-compat, anthropic, \
                  azure-openai, amazon-bedrock, google-vertex, \
                  google-vertex-anthropic, codex-app-server, \
-                 cursor-cli, or claude-cli)",
+                 cursor-sdk (cursor-cli is a legacy alias), or claude-cli)",
                 req.kind
             )));
         }
@@ -3539,9 +3569,9 @@ impl Engine {
         Ok(started)
     }
 
-    // --- managed vendor CLIs ---------------------------------------------------
+    // --- managed agent runtimes ------------------------------------------------
 
-    /// Install state of every vendor CLI trouve can manage: the binary that
+    /// Install state of every vendor agent runtime trouve can manage: the binary that
     /// would run (managed install beats PATH), its version, and whether the
     /// vendor serves something newer (best-effort network check, cached).
     pub async fn list_clis(&self) -> trouve_protocol::CliList {
@@ -3557,7 +3587,7 @@ impl Engine {
                     .providers
                     .values()
                     .filter(|pc| cli_for_kind(&pc.kind) == Some(id))
-                    .find_map(|pc| pc.command.clone())
+                    .find_map(configured_runtime_command)
             };
             let managed = cli::installed(&self.data_dir, id);
             let (source, path, installed_version) = if let Some(cmd) = explicit {
@@ -3593,7 +3623,7 @@ impl Engine {
         trouve_protocol::CliList { clis }
     }
 
-    /// Latest vendor version for one CLI, cached for an hour; None when the
+    /// Latest vendor version for one managed runtime, cached for an hour; None when the
     /// lookup fails (offline is fine — the UI just can't offer updates).
     async fn cli_latest_version(&self, id: trouve_agents::install::CliId) -> Option<String> {
         const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -3625,7 +3655,7 @@ impl Engine {
         latest
     }
 
-    /// Start downloading the newest build of a vendor CLI into trouve's
+    /// Start downloading the newest build of a vendor agent runtime into trouve's
     /// managed directory. Progress is reported by `cli_install_status`; on
     /// success the backend registry reloads so new turns use the new binary.
     pub fn start_cli_install(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
@@ -6814,10 +6844,10 @@ impl Engine {
 
     /// Subscription usage for every configured subscription provider.
     /// Codex answers via its app-server, Claude Code via its CLI's
-    /// stream-json usage query, and Cursor via the dashboard's undocumented
-    /// usage RPC (read with the CLI's stored login). Kimi Code uses the key
-    /// stored for its provider preset against the same `/usages` endpoint as
-    /// Kimi's open-source CLI.
+    /// stream-json usage query, and Cursor by exchanging its configured API
+    /// key for an ephemeral token before calling the dashboard's undocumented
+    /// usage RPC. Kimi Code uses the key stored for its provider preset
+    /// against the same `/usages` endpoint as Kimi's open-source CLI.
     pub async fn subscription_health(&self) -> Vec<trouve_protocol::SubscriptionHealth> {
         let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
             let map = self.backends.read().unwrap();
@@ -10118,6 +10148,8 @@ impl Engine {
         }
     }
 
+    /// Arm the hard tool-call boundary before an automated-review turn is
+    /// dispatched.
     pub(crate) fn begin_automated_review_tool_budget(
         &self,
         thread_id: &str,
@@ -10419,9 +10451,9 @@ impl Engine {
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
-            // Provider-native reasoning blocks (Anthropic signed thinking) to
-            // persist and replay verbatim — Anthropic rejects a follow-up
-            // tool-use turn whose thinking blocks aren't preserved.
+            // Provider-native reasoning blocks (for example Anthropic signed
+            // thinking and OpenAI encrypted reasoning items) to persist and
+            // replay verbatim across stateless tool-use turns.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
             let mut thinking_streamed = false;
             let mut pending_events = Vec::new();
@@ -10735,9 +10767,10 @@ impl Engine {
     /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
     /// the full bridge by default so mutation-capable work crosses the same
     /// ToolExecutor and per-session execution lane as native provider calls.
-    /// Cursor receives a supplemental semantic-search bridge because ACP
-    /// cannot disable its native tools. An explicit `tool_bridge = false`
-    /// retains the vendor-native fallback where a full bridge is supported.
+    /// Cursor's Agent SDK always uses the full bridge: its explicit `mcp`
+    /// allowlist replaces every vendor-native tool with host-owned callbacks.
+    /// An explicit `tool_bridge = false` retains the vendor-native fallback
+    /// only where the backend architecture supports one.
     fn mcp_bridge_for(
         &self,
         model: &str,
@@ -10751,14 +10784,12 @@ impl Engine {
         };
         if !matches!(
             kind.as_str(),
-            "claude-cli" | "codex-app-server" | "cursor-cli"
+            "claude-cli" | "codex-app-server" | "cursor-sdk" | "cursor-cli"
         ) {
             return None;
         }
-        // Cursor cannot suppress its native ACP tools. Give it only the
-        // supplemental always-bridged search surface; Ask mode confines its
-        // native tools to read-only operations.
-        let bridge_tools = kind != "cursor-cli" && configured_bridge_tools;
+        let cursor_sdk = matches!(kind.as_str(), "cursor-sdk" | "cursor-cli");
+        let bridge_tools = cursor_sdk || configured_bridge_tools;
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
                 "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
@@ -10766,8 +10797,8 @@ impl Engine {
             );
             return None;
         };
-        // Codex and Cursor approvals are native RPCs; serving Claude's
-        // permission-gate tool would only tempt those models to call it.
+        // Codex approval RPCs and Cursor's host-owned tool callbacks do not
+        // need Claude's permission-gate MCP tool.
         let serve_approval = kind == "claude-cli";
         let claims = BridgeTicketClaims {
             bridge_tools,
@@ -10872,7 +10903,7 @@ impl Engine {
         thread_id: &str,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let cancel = self.active_bridge_cancel(thread_id)?;
         self.bridged_tool_call_for(thread_id, name, arguments, cancel)
             .await
@@ -11003,8 +11034,10 @@ impl Engine {
         if root_cancel.is_cancelled() {
             return Err(EngineError::Conflict("tool call cancelled".into()));
         }
-        self.bridged_tool_call_for(&owner_thread_id, name, arguments, root_cancel)
-            .await
+        Ok(self
+            .bridged_tool_call_for(&owner_thread_id, name, arguments, root_cancel)
+            .await?
+            .content)
     }
 
     async fn bridged_tool_call_for(
@@ -11013,7 +11046,7 @@ impl Engine {
         name: &str,
         arguments: &serde_json::Value,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let (session, thread, mode, ctx) =
             self.bridged_context_with_cancel(thread_id, cancel.clone())?;
         let turn = self.store.last_turn(thread_id)?;
@@ -11022,15 +11055,20 @@ impl Engine {
             name: name.to_string(),
             arguments: arguments.clone(),
         };
-        // Bridged responses are text-only (MCP content blocks could carry
-        // images, but no bridged vendor consumes them yet); the summary the
-        // engine leaves in place of "_images" still tells the model the
-        // image was read.
-        let (content, _images) = self
+        let (content, images) = self
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
-        Ok(content)
+        Ok(BridgedToolResult {
+            content,
+            images: images
+                .into_iter()
+                .map(|image| BridgedToolImage {
+                    mime: image.mime,
+                    data: image.data,
+                })
+                .collect(),
+        })
     }
 
     fn announce_trouve_bridge_wrapper(
@@ -22118,7 +22156,7 @@ default_permission_mode = "ask"
     }
 
     #[test]
-    fn cli_command_prefers_explicit_then_managed_binary() {
+    fn runtime_command_prefers_explicit_then_managed_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let managed =
             trouve_agents::install::managed_bin(tmp.path(), trouve_agents::install::CliId::Codex);
@@ -22126,11 +22164,11 @@ default_permission_mode = "ask"
         std::fs::write(&managed, b"stub").unwrap();
 
         assert_eq!(
-            resolved_cli_command("codex-app-server", None, tmp.path()),
+            resolved_runtime_command("codex-app-server", None, tmp.path()),
             Some(managed.to_string_lossy().into_owned())
         );
         assert_eq!(
-            resolved_cli_command(
+            resolved_runtime_command(
                 "codex-app-server",
                 Some("/opt/custom/codex".into()),
                 tmp.path()
@@ -22139,8 +22177,24 @@ default_permission_mode = "ask"
             Some("/opt/custom/codex")
         );
         assert_eq!(
-            resolved_cli_command("openai-compat", None, tmp.path()),
+            resolved_runtime_command("openai-compat", None, tmp.path()),
             None
+        );
+
+        let legacy_cursor = ProviderConfig {
+            kind: "cursor-cli".into(),
+            command: Some("/opt/custom/cursor-agent".into()),
+            ..Default::default()
+        };
+        assert_eq!(configured_runtime_command(&legacy_cursor), None);
+        let cursor_sdk = ProviderConfig {
+            kind: "cursor-sdk".into(),
+            command: Some("/opt/custom/cursor-sdk-bridge".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_runtime_command(&cursor_sdk).as_deref(),
+            Some("/opt/custom/cursor-sdk-bridge")
         );
     }
 
@@ -22793,7 +22847,10 @@ default_permission_mode = "ask"
         config.providers.insert(
             "cursor".into(),
             ProviderConfig {
-                kind: "cursor-cli".into(),
+                kind: "cursor-sdk".into(),
+                // Cursor's SDK adapter always uses the full Trouve bridge;
+                // a stale opt-out must not re-enable vendor-native tools.
+                tool_bridge: Some(false),
                 ..Default::default()
             },
         );
@@ -22873,8 +22930,8 @@ default_permission_mode = "ask"
         assert!(native.url.contains("tools=0"));
 
         let cursor = engine.mcp_bridge_for("cursor/model", "th_1").unwrap();
-        assert!(!cursor.bridge_tools);
-        assert!(cursor.url.contains("tools=0"));
+        assert!(cursor.bridge_tools);
+        assert!(cursor.url.contains("tools=1"));
         assert!(cursor.url.contains("approval=0"));
         assert!(cursor.disallowed_tools.is_empty());
         engine.clear_cancel("th_1");
