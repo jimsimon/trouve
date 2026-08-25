@@ -358,6 +358,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   issue_count INTEGER NOT NULL DEFAULT 0,
   fixed_issue_count INTEGER NOT NULL DEFAULT 0,
   publication_open_issue_count INTEGER,
+  publication_advisory_open_issue_count INTEGER,
   publication_churn_signal TEXT,
   summary TEXT NOT NULL DEFAULT '',
   prompt_for_agents TEXT NOT NULL DEFAULT '',
@@ -771,6 +772,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_repositories ADD COLUMN analyst_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN analyst_model TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN analyst_thinking_level TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_advisory_open_issue_count INTEGER",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
@@ -3030,6 +3032,8 @@ fn finalize_code_review_theme_publication(
     Ok(())
 }
 
+/// Blocking findings gate the check; advisory findings (low severity, or
+/// medium with low confidence) are tracked separately as durable debt.
 fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &str) -> Result<()> {
     tx.execute(
         "UPDATE code_review_jobs
@@ -3041,6 +3045,17 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status = 'open'
+             AND (finding.severity = 'high' OR (finding.severity = 'medium' AND finding.confidence != 'low'))
+         ),
+         publication_advisory_open_issue_count = (
+           SELECT COUNT(*)
+           FROM code_review_findings finding
+           JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+           WHERE finding_job.repository = code_review_jobs.repository
+             AND finding_job.pull_number = code_review_jobs.pull_number
+             AND finding_job.review_published != 0
+             AND finding.status = 'open'
+             AND NOT (finding.severity = 'high' OR (finding.severity = 'medium' AND finding.confidence != 'low'))
          )
          WHERE id = ?1",
         params![job_id],
@@ -3181,7 +3196,11 @@ fn load_code_review_churn_rounds(
     pull_number: u64,
 ) -> Result<Vec<CodeReviewChurnRound>> {
     let mut rounds_statement = conn.prepare(
-        "SELECT id, created_at, issue_count, review_scope
+        "SELECT id, created_at,
+                (SELECT COUNT(*) FROM code_review_findings finding
+                  WHERE finding.job_id = code_review_jobs.id
+                    AND (finding.severity = 'high' OR (finding.severity = 'medium' AND finding.confidence != 'low'))) AS blocking_count,
+                review_scope
          FROM code_review_jobs
          WHERE repository = ?1 AND pull_number = ?2 AND review_published != 0
          ORDER BY publication_order DESC, created_at DESC, id DESC
@@ -3204,8 +3223,10 @@ fn load_code_review_churn_rounds(
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut paths_statement =
-        conn.prepare("SELECT DISTINCT path FROM code_review_findings WHERE job_id = ?1")?;
+    let mut paths_statement = conn.prepare(
+        "SELECT DISTINCT path FROM code_review_findings finding
+          WHERE finding.job_id = ?1 AND (finding.severity = 'high' OR (finding.severity = 'medium' AND finding.confidence != 'low'))",
+    )?;
     rows.into_iter()
         .map(|(job_id, created_at, issue_count, scope)| {
             let issue_count = issue_count.max(0) as u64;
@@ -3525,6 +3546,9 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             open_issue_count: r
                 .get::<_, Option<i64>>(56)?
                 .map(|value| value.max(0) as u64),
+            advisory_open_issue_count: r
+                .get::<_, Option<i64>>(61)?
+                .map(|value| value.max(0) as u64),
             churn: r
                 .get::<_, Option<String>>(57)?
                 .and_then(|value| serde_json::from_str(&value).ok()),
@@ -3539,7 +3563,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
-        can_retry_final_editor: r.get(61)?,
+        can_retry_final_editor: r.get(62)?,
         prompt: r.get(12)?,
         pull_body: r.get(58)?,
         reviewers,
@@ -3564,7 +3588,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
      review_published, blocking_review_cleanup_pending, publication_dispatched, \
      publication_open_issue_count, publication_churn_signal, pull_body, \
-     analyst_model, analyst_thinking_level, \
+     analyst_model, analyst_thinking_level, publication_advisory_open_issue_count, \
      CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
             AND code_review_jobs.session_id IS NULL \
             AND EXISTS ( \
@@ -22979,6 +23003,31 @@ mod tests {
         trouve_protocol::CodeReviewJob,
         Vec<trouve_protocol::CodeReviewFinding>,
     ) {
+        let findings = finding_paths
+            .iter()
+            .map(|path| (*path, "high", "high"))
+            .collect::<Vec<_>>();
+        publish_leveled_test_round(
+            store,
+            dedupe_key,
+            head_sha,
+            scope,
+            &findings,
+            resolved_finding_ids,
+        )
+    }
+
+    fn publish_leveled_test_round(
+        store: &Store,
+        dedupe_key: &str,
+        head_sha: &str,
+        scope: trouve_protocol::CodeReviewJobScope,
+        findings: &[(&str, &str, &str)],
+        resolved_finding_ids: &[&str],
+    ) -> (
+        trouve_protocol::CodeReviewJob,
+        Vec<trouve_protocol::CodeReviewFinding>,
+    ) {
         let job = store
             .enqueue_code_review_job(&NewCodeReviewJob {
                 dedupe_key: dedupe_key.into(),
@@ -23015,14 +23064,14 @@ mod tests {
             store.claim_code_review_job().unwrap().unwrap().job.id,
             job.id
         );
-        let findings = finding_paths
+        let findings = findings
             .iter()
-            .map(|path| NewCodeReviewFinding {
+            .map(|(path, severity, confidence)| NewCodeReviewFinding {
                 path: (*path).into(),
                 line: 12,
                 side: "RIGHT".into(),
-                severity: "high".into(),
-                confidence: "high".into(),
+                severity: (*severity).into(),
+                confidence: (*confidence).into(),
                 title: "Relocated defect".into(),
                 body: "The lifecycle invariant is violated.".into(),
                 prompt_for_agents: "Restore the invariant.".into(),
@@ -23034,7 +23083,7 @@ mod tests {
                 &job.id,
                 "Round result.",
                 "",
-                finding_paths.len() as u64,
+                findings.len() as u64,
                 &findings,
                 &[],
             )
@@ -23187,6 +23236,56 @@ mod tests {
             None,
             "a settled pull request stops carrying the signal"
         );
+    }
+
+    #[test]
+    fn advisory_findings_neither_gate_the_check_nor_feed_the_churn_streak() {
+        let store = Store::open_in_memory().unwrap();
+        let incremental = trouve_protocol::CodeReviewJobScope::Incremental;
+
+        // A mixed round: one blocking finding, two advisory (low severity,
+        // and medium with weak evidence).
+        let (round1, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:tier-round-1",
+            "2222222222222222222222222222222222222222",
+            incremental,
+            &[
+                ("crates/core/src/engine.rs", "high", "high"),
+                ("scripts/qualify.mjs", "low", "high"),
+                ("scripts/qualify.mjs", "medium", "low"),
+            ],
+            &[],
+        );
+        let job = store.code_review_job(&round1.id).unwrap().unwrap().job;
+        assert_eq!(
+            job.open_issue_count,
+            Some(1),
+            "only the blocking finding gates"
+        );
+        assert_eq!(
+            job.advisory_open_issue_count,
+            Some(2),
+            "advisory debt is tracked"
+        );
+
+        // Three consecutive advisory-only rounds recurring in one path must
+        // not read as fix churn: debt accumulation is not defect relocation.
+        for (index, head) in ["3333", "4444", "5555"].iter().enumerate() {
+            let (round, _) = publish_leveled_test_round(
+                &store,
+                &format!("acme/widgets#42:tier-advisory-{index}"),
+                &head.repeat(10),
+                incremental,
+                &[("scripts/qualify.mjs", "low", "high")],
+                &[],
+            );
+            assert_eq!(
+                store.code_review_job(&round.id).unwrap().unwrap().job.churn,
+                None,
+                "advisory-only rounds are clean for the churn streak"
+            );
+        }
     }
 
     #[test]

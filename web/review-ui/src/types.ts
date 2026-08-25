@@ -125,6 +125,7 @@ export interface ReviewJob {
   issue_count: number;
   fixed_issue_count: number;
   open_issue_count?: number | null;
+  advisory_open_issue_count?: number | null;
   churn?: ReviewChurnSignal | null;
   error: string;
   created_at: string;

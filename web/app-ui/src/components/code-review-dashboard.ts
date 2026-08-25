@@ -665,7 +665,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
         </header>
 
         <dl class="job-meta">
-          <div><dt>Findings</dt><dd>${job.issue_count ?? 0} new${job.open_issue_count == null ? " · open status unknown" : ` · ${job.open_issue_count} open`}</dd></div>
+          <div><dt>Findings</dt><dd>${job.issue_count ?? 0} new${job.open_issue_count == null ? " · open status unknown" : ` · ${job.open_issue_count} blocking`}${(job.advisory_open_issue_count ?? 0) > 0 ? ` · ${job.advisory_open_issue_count} advisory` : ""}</dd></div>
           ${job.churn
             ? html`<div><dt>Fix churn</dt><dd>${job.churn.finding_round_streak} round${job.churn.finding_round_streak === 1 ? "" : "s"} with new issues · ${job.churn.clean_rounds}/${job.churn.required_clean_rounds} full-branch clean since</dd></div>`
             : nothing}

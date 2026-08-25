@@ -2110,6 +2110,14 @@ export interface components {
         /** @description A durable execution of one model review against one immutable PR head. */
         CodeReviewJob: {
             /**
+             * Format: int64
+             * @description Advisory findings (low severity, or medium severity with low
+             *     confidence) still open across the pull request: durable engineering
+             *     debt recorded in trouve, never posted to GitHub and never
+             *     merge-blocking.
+             */
+            advisory_open_issue_count?: number | null;
+            /**
              * @description Model snapshotted for the per-round implementation analyst. Absent
              *     inherits `model`.
              */
@@ -2149,10 +2157,12 @@ export interface components {
             model?: string | null;
             /**
              * Format: int64
-             * @description Total confirmed findings that remained open across the pull request
-             *     after this review was published. Absent while publication is pending
-             *     and for legacy jobs that predate this snapshot. Consumers must treat
-             *     absence on a succeeded job as unknown, never as a clean review.
+             * @description Blocking confirmed findings (high severity, or medium severity with
+             *     at least medium confidence) that remained open across the pull
+             *     request after this review was published. Only these gate the check
+             *     run. Absent while publication is pending and for legacy jobs that
+             *     predate this snapshot. Consumers must treat absence on a succeeded
+             *     job as unknown, never as a clean review.
              */
             open_issue_count?: number | null;
             /** Format: int64 */

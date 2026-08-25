@@ -2377,12 +2377,20 @@ pub struct CodeReviewJob {
     pub issue_count: u64,
     #[serde(default)]
     pub fixed_issue_count: u64,
-    /// Total confirmed findings that remained open across the pull request
-    /// after this review was published. Absent while publication is pending
-    /// and for legacy jobs that predate this snapshot. Consumers must treat
-    /// absence on a succeeded job as unknown, never as a clean review.
+    /// Blocking confirmed findings (high severity, or medium severity with
+    /// at least medium confidence) that remained open across the pull
+    /// request after this review was published. Only these gate the check
+    /// run. Absent while publication is pending and for legacy jobs that
+    /// predate this snapshot. Consumers must treat absence on a succeeded
+    /// job as unknown, never as a clean review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_issue_count: Option<u64>,
+    /// Advisory findings (low severity, or medium severity with low
+    /// confidence) still open across the pull request: durable engineering
+    /// debt recorded in trouve, never posted to GitHub and never
+    /// merge-blocking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_open_issue_count: Option<u64>,
     /// Server-derived fix-churn signal for this pull request, snapshotted
     /// when the review was published. Present while recent published rounds
     /// match the churn heuristics (consecutive rounds each confirming new

@@ -5859,6 +5859,15 @@
           "created_at"
         ],
         "properties": {
+          "advisory_open_issue_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Advisory findings (low severity, or medium severity with low\nconfidence) still open across the pull request: durable engineering\ndebt recorded in trouve, never posted to GitHub and never\nmerge-blocking.",
+            "minimum": 0
+          },
           "analyst_model": {
             "type": [
               "string",
@@ -5986,7 +5995,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Total confirmed findings that remained open across the pull request\nafter this review was published. Absent while publication is pending\nand for legacy jobs that predate this snapshot. Consumers must treat\nabsence on a succeeded job as unknown, never as a clean review.",
+            "description": "Blocking confirmed findings (high severity, or medium severity with\nat least medium confidence) that remained open across the pull\nrequest after this review was published. Only these gate the check\nrun. Absent while publication is pending and for legacy jobs that\npredate this snapshot. Consumers must treat absence on a succeeded\njob as unknown, never as a clean review.",
             "minimum": 0
           },
           "pending_elapsed_ms": {

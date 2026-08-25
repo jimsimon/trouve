@@ -685,7 +685,7 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
         <b>
           {openIssueCount == null
             ? `Open status unknown · ${job.issue_count} new`
-            : `${openIssueCount} open · ${job.issue_count} new`}
+            : `${openIssueCount} blocking · ${job.issue_count} new`}
         </b>
         <small>{job.status === "queued" ? duration(job.pending_elapsed_ms) : duration(elapsed)}</small>
       </span>
@@ -1576,7 +1576,7 @@ function JobDetailPane({
       {hasOpenIssues && (
         <div class="banner warning stacked" role="alert">
           <strong>
-            {openIssueCount} confirmed issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
+            {openIssueCount} blocking issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
           </strong>
           <p>
             This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean incremental result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
@@ -1672,7 +1672,9 @@ function JobDetailPane({
             <h2>{job.status === "running" || job.status === "queued" ? "Review overview" : "Completed overview"}</h2>
             <p>
               {job.issue_count} new confirmed findings
-              {openIssueCount != null && ` · ${openIssueCount} open across pull request`}
+              {openIssueCount != null && ` · ${openIssueCount} blocking open across pull request`}
+              {(job.advisory_open_issue_count ?? 0) > 0 &&
+                ` · ${job.advisory_open_issue_count} advisory`}
               {` · ${acceptedCandidateIds.size} selected candidates`}
               {" · "}
               {candidateRejections.length} rejected · {unadjudicatedCandidates.length} unresolved · {job.fixed_issue_count} fixed
