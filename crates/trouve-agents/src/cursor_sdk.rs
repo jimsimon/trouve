@@ -28,6 +28,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
@@ -48,6 +49,9 @@ const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIAGNOSTIC_LINES: usize = 40;
+const MAX_CALLBACK_RECORDS: usize = 128;
+const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
+const MAX_CALLBACK_CONCURRENCY: usize = 8;
 const READY_PREFIX: &str = "cursor-sdk-bridge ready ";
 const CALLBACK_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 /// Most warm Cursor Bridge processes retained by one configured backend.
@@ -780,7 +784,7 @@ async fn run_sdk_turn(
         ));
     }
 
-    let mut callback = CallbackServer::start(local_http, mcp_url).await?;
+    let mut callback = CallbackServer::start(local_http, mcp_url, &turn.cancel).await?;
     if events.is_closed() {
         callback.stop().await;
         return Ok(TurnTerminal::ConsumerClosed);
@@ -885,8 +889,8 @@ async fn run_sdk_turn(
     let outcome = stream_turn(&bridge.client, &agent_id, &turn, events).await;
     let release = bridge.release_turn(&agent_id).await;
     let keep_warm = matches!(&outcome, Ok(TurnTerminal::Finished(_))) && release.is_ok();
-    drop(bridge);
     callback.stop().await;
+    drop(bridge);
 
     if keep_warm {
         process.touch();
@@ -1178,7 +1182,7 @@ struct CallbackState {
     expected_agent_id: Arc<RwLock<Option<String>>>,
     mcp_url: Option<Arc<str>>,
     http: reqwest::Client,
-    calls: Arc<tokio::sync::Mutex<HashMap<String, CallbackRecord>>>,
+    supervisor: Arc<CallbackSupervisor>,
 }
 
 #[derive(Clone)]
@@ -1186,6 +1190,109 @@ struct CallbackRecord {
     tool_name: String,
     args: Value,
     outcome: watch::Receiver<Option<CallbackOutcome>>,
+}
+
+#[derive(Default)]
+struct CallbackCalls {
+    records: HashMap<String, CallbackRecord>,
+    completed: VecDeque<String>,
+}
+
+impl CallbackCalls {
+    fn make_room(&mut self) -> bool {
+        while self.records.len() >= MAX_CALLBACK_RECORDS {
+            let Some(call_id) = self.completed.pop_front() else {
+                return false;
+            };
+            self.records.remove(&call_id);
+        }
+        true
+    }
+
+    fn mark_completed(&mut self, call_id: String) {
+        self.completed.push_back(call_id);
+        while self.completed.len() > MAX_CALLBACK_REPLAY_RECORDS {
+            if let Some(expired) = self.completed.pop_front() {
+                self.records.remove(&expired);
+            }
+        }
+    }
+}
+
+struct CallbackSupervisor {
+    calls: Mutex<CallbackCalls>,
+    slots: Arc<Semaphore>,
+    cancel: CancellationToken,
+    tasks: Mutex<JoinSet<()>>,
+}
+
+impl CallbackSupervisor {
+    fn new(cancel: CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(CallbackCalls::default()),
+            slots: Arc::new(Semaphore::new(MAX_CALLBACK_CONCURRENCY)),
+            cancel,
+            tasks: Mutex::new(JoinSet::new()),
+        })
+    }
+
+    async fn spawn(
+        self: &Arc<Self>,
+        call_id: String,
+        http: reqwest::Client,
+        mcp_url: Arc<str>,
+        request: CustomToolRequest,
+        sender: watch::Sender<Option<CallbackOutcome>>,
+    ) -> bool {
+        let mut tasks = self.tasks.lock().await;
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                tracing::warn!("Cursor callback task failed: {error}");
+            }
+        }
+        if self.cancel.is_cancelled() {
+            return false;
+        }
+        let cancel = self.cancel.clone();
+        let slots = self.slots.clone();
+        let supervisor = Arc::downgrade(self);
+        tasks.spawn(async move {
+            let permit = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                permit = slots.acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+            };
+            let outcome = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                outcome = execute_custom_tool(http, mcp_url, request) => outcome,
+            };
+            drop(permit);
+            let _ = sender.send(Some(outcome));
+            if let Some(supervisor) = supervisor.upgrade() {
+                supervisor.calls.lock().await.mark_completed(call_id);
+            }
+        });
+        true
+    }
+
+    async fn stop(&self) {
+        self.cancel.cancel();
+        let mut tasks = self.tasks.lock().await;
+        tasks.abort_all();
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                tracing::warn!("Cursor callback task failed during shutdown: {error}");
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1208,24 +1315,30 @@ struct CallbackServer {
     url: String,
     bearer: String,
     expected_agent_id: Arc<RwLock<Option<String>>>,
+    supervisor: Arc<CallbackSupervisor>,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 impl CallbackServer {
-    async fn start(http: reqwest::Client, mcp_url: Option<String>) -> Result<Self, BackendError> {
+    async fn start(
+        http: reqwest::Client,
+        mcp_url: Option<String>,
+        turn_cancel: &CancellationToken,
+    ) -> Result<Self, BackendError> {
         let bearer = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
         let expected_agent_id = Arc::new(RwLock::new(None));
+        let supervisor = CallbackSupervisor::new(turn_cancel.child_token());
         let state = CallbackState {
             bearer: Arc::from(bearer.as_str()),
             expected_agent_id: expected_agent_id.clone(),
             mcp_url: mcp_url.map(Arc::from),
             http,
-            calls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            supervisor: supervisor.clone(),
         };
         let router = Router::new()
             .route(CALLBACK_PATH, post(custom_tool_callback))
@@ -1246,19 +1359,23 @@ impl CallbackServer {
             url: format!("http://127.0.0.1:{}", address.port()),
             bearer,
             expected_agent_id,
+            supervisor,
             shutdown,
             task,
         })
     }
 
     async fn stop(&mut self) {
+        self.supervisor.cancel.cancel();
         self.shutdown.cancel();
         if tokio::time::timeout(CALLBACK_SHUTDOWN_TIMEOUT, &mut self.task)
             .await
             .is_err()
         {
             self.task.abort();
+            let _ = (&mut self.task).await;
         }
+        self.supervisor.stop().await;
     }
 }
 
@@ -1310,8 +1427,8 @@ async fn custom_tool_callback(
         );
     };
     let (mut outcome, execute) = {
-        let mut calls = state.calls.lock().await;
-        if let Some(existing) = calls.get(&call_id) {
+        let mut calls = state.supervisor.calls.lock().await;
+        if let Some(existing) = calls.records.get(&call_id) {
             if existing.tool_name != request.tool_name || existing.args != request.args {
                 return callback_error(
                     StatusCode::CONFLICT,
@@ -1321,9 +1438,16 @@ async fn custom_tool_callback(
             }
             (existing.outcome.clone(), None)
         } else {
+            if !calls.make_room() {
+                return callback_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "resource_exhausted",
+                    "too many custom-tool callbacks are active",
+                );
+            }
             let (sender, receiver) = watch::channel(None);
-            calls.insert(
-                call_id,
+            calls.records.insert(
+                call_id.clone(),
                 CallbackRecord {
                     tool_name: request.tool_name.clone(),
                     args: request.args.clone(),
@@ -1336,10 +1460,18 @@ async fn custom_tool_callback(
     if let Some(sender) = execute {
         let http = state.http.clone();
         let mcp_url = Arc::<str>::from(mcp_url);
-        tokio::spawn(async move {
-            let outcome = execute_custom_tool(http, mcp_url, request).await;
-            let _ = sender.send(Some(outcome));
-        });
+        if !state
+            .supervisor
+            .spawn(call_id.clone(), http, mcp_url, request, sender)
+            .await
+        {
+            state.supervisor.calls.lock().await.records.remove(&call_id);
+            return callback_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cancelled",
+                "the custom-tool callback turn is shutting down",
+            );
+        }
     }
     loop {
         if let Some(outcome) = outcome.borrow().clone() {
@@ -1511,26 +1643,30 @@ impl BridgeProcess {
         let ready = match ready_result {
             Ok(ready) => ready,
             Err(error) => {
+                let error = startup_error_with_diagnostics(error, &diagnostics);
                 let cleanup = child.terminate_and_reap().await;
                 return cleanup_error(error, cleanup.map(|_| ()));
             }
         };
         if ready.schema_version != 1 || ready.transport != "tcp" || ready.protocol != "connect" {
-            let cleanup = child.terminate_and_reap().await;
-            return cleanup_error(
+            let error = startup_error_with_diagnostics(
                 BackendError::Protocol(
                     "Cursor SDK Bridge returned an unsupported discovery payload".into(),
                 ),
-                cleanup.map(|_| ()),
+                &diagnostics,
             );
+            let cleanup = child.terminate_and_reap().await;
+            return cleanup_error(error, cleanup.map(|_| ()));
         }
         if let Err(error) = validate_loopback_bridge_url(&ready.url) {
+            let error = startup_error_with_diagnostics(error, &diagnostics);
             let cleanup = child.terminate_and_reap().await;
             return cleanup_error(error, cleanup.map(|_| ()));
         }
         let token = match bridge_token(&ready, runtime_dir.path()) {
             Ok(token) => token,
             Err(error) => {
+                let error = startup_error_with_diagnostics(error, &diagnostics);
                 let cleanup = child.terminate_and_reap().await;
                 return cleanup_error(error, cleanup.map(|_| ()));
             }
@@ -1711,7 +1847,21 @@ fn push_diagnostic(lines: &mut VecDeque<String>, line: String) {
     if lines.len() == MAX_DIAGNOSTIC_LINES {
         lines.pop_front();
     }
-    lines.push_back(line);
+    lines.push_back(bounded_text(&line));
+}
+
+fn startup_error_with_diagnostics(
+    error: BackendError,
+    diagnostics: &VecDeque<String>,
+) -> BackendError {
+    if matches!(error, BackendError::Cancelled) || diagnostics.is_empty() {
+        error
+    } else {
+        BackendError::Protocol(format!(
+            "{error}; Bridge diagnostics: {}",
+            diagnostics.iter().cloned().collect::<Vec<_>>().join(" | ")
+        ))
+    }
 }
 
 fn redact(value: &str, secrets: &[&str]) -> String {
@@ -1869,8 +2019,18 @@ async fn stream_turn(
             })?,
     };
     if !response.status().is_success() {
-        let (status, detail) =
-            read_bounded_response(response, "Cursor Send", MAX_RPC_BODY_BYTES).await?;
+        let (status, detail) = tokio::select! {
+            biased;
+            _ = turn.cancel.cancelled() => return Ok(TurnTerminal::Cancelled),
+            _ = events.closed() => return Ok(TurnTerminal::ConsumerClosed),
+            detail = tokio::time::timeout(
+                RPC_TIMEOUT,
+                read_bounded_response(response, "Cursor Send", MAX_RPC_BODY_BYTES),
+            ) => detail
+                .map_err(|_| BackendError::Protocol(
+                    "Cursor Send error response timed out".into()
+                ))??,
+        };
         let detail = String::from_utf8_lossy(&detail);
         return Err(BackendError::Protocol(format!(
             "Cursor Send failed (HTTP {status}): {}",
@@ -2434,6 +2594,66 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("exceeded 4 bytes"));
         server.abort();
+    }
+
+    #[test]
+    fn callback_replay_state_and_admission_are_bounded() {
+        let mut calls = CallbackCalls::default();
+        for index in 0..=MAX_CALLBACK_REPLAY_RECORDS {
+            let call_id = format!("call-{index}");
+            let (_sender, receiver) = watch::channel(None);
+            calls.records.insert(
+                call_id.clone(),
+                CallbackRecord {
+                    tool_name: "read_file".into(),
+                    args: json!({ "path": "README.md" }),
+                    outcome: receiver,
+                },
+            );
+            calls.mark_completed(call_id);
+        }
+        assert_eq!(calls.records.len(), MAX_CALLBACK_REPLAY_RECORDS);
+        assert_eq!(calls.completed.len(), MAX_CALLBACK_REPLAY_RECORDS);
+
+        calls.completed.clear();
+        while calls.records.len() < MAX_CALLBACK_RECORDS {
+            let index = calls.records.len();
+            let (_sender, receiver) = watch::channel(None);
+            calls.records.insert(
+                format!("pending-{index}"),
+                CallbackRecord {
+                    tool_name: "read_file".into(),
+                    args: json!({ "path": "README.md" }),
+                    outcome: receiver,
+                },
+            );
+        }
+        assert!(!calls.make_room());
+        assert_eq!(calls.records.len(), MAX_CALLBACK_RECORDS);
+    }
+
+    #[tokio::test]
+    async fn callback_supervisor_joins_cancelled_tasks() {
+        let supervisor = CallbackSupervisor::new(CancellationToken::new());
+        supervisor
+            .tasks
+            .lock()
+            .await
+            .spawn(std::future::pending::<()>());
+        supervisor.stop().await;
+        assert!(supervisor.tasks.lock().await.is_empty());
+    }
+
+    #[test]
+    fn startup_errors_include_redacted_diagnostics() {
+        let diagnostics = VecDeque::from(["configuration rejected [REDACTED]".to_string()]);
+        let error = startup_error_with_diagnostics(
+            BackendError::Protocol("startup failed".into()),
+            &diagnostics,
+        );
+        let message = error.to_string();
+        assert!(message.contains("startup failed"));
+        assert!(message.contains("configuration rejected [REDACTED]"));
     }
 
     #[tokio::test]

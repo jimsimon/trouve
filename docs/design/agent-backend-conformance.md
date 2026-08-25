@@ -137,7 +137,10 @@ without exposing the explicitly requested native shell capability.
 
 Seven paid turns proved host allow and deny/error results, input images,
 text/structured/image tool results, two genuinely concurrent read callbacks,
-plan mode, cancellation followed by recovery, and a cold Bridge-process resume.
+cancellation followed by recovery, and a cold Bridge-process resume. The
+Bridge accepted a per-send plan-mode request and returned a tool-free plan, but
+SDK v1 does not echo the effective mode in run or stream results; qualification
+records that limitation instead of treating model behavior as proof of mode.
 Every callback id correlated with the generic `mcp` stream event, all seven
 turns reported token usage, and the final run had complete terminal tool
 events. Durable `ObserveRun` replay returned opaque offsets and resumed

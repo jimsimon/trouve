@@ -433,31 +433,6 @@ async fn cursor_health_requires_a_configured_api_key() {
     assert!(!health.note.contains("cursor-agent"), "{}", health.note);
 }
 
-#[tokio::test]
-async fn cursor_live_subscription_health_uses_only_the_configured_api_key() {
-    if std::env::var("TROUVE_E2E").ok().as_deref() != Some("1") {
-        eprintln!("skipping: set TROUVE_E2E=1 to run network tests");
-        return;
-    }
-    let api_key = std::env::var("CURSOR_API_KEY").expect("CURSOR_API_KEY is required");
-    let backend = CursorBackend::new(
-        "cursor",
-        Some("cursor-agent-must-not-run".into()),
-        Some(api_key),
-    );
-    let health = backend.subscription_health().await.unwrap();
-    assert_eq!(health.status, "ok", "{}", health.note);
-    assert!(
-        !health.windows.is_empty(),
-        "Cursor returned no usage windows"
-    );
-    assert!(!health.plan.is_empty(), "Cursor returned no plan name");
-    eprintln!(
-        "Cursor health passed without CLI credentials (windows={}, plan_reported=true)",
-        health.windows.len()
-    );
-}
-
 #[derive(Clone)]
 struct CursorSdkMcpState {
     calls: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,

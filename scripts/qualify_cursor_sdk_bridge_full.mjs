@@ -30,6 +30,7 @@ import {
   BRIDGE_VERSION,
   QualificationError,
   assistantText,
+  readBoundedJsonResponse,
   redact,
   resolveBridge,
   safeUnary,
@@ -223,8 +224,16 @@ async function startCallbackServer(handlers, timeoutMilliseconds) {
         agentId: body.agentId,
         startedAtMs: performance.now(),
         completedAtMs: null,
+        cancelledAtMs: null,
+        cancelled: deferred(),
         ok: false,
       };
+      response.once("close", () => {
+        if (!response.writableEnded) {
+          record.cancelledAtMs = performance.now();
+          record.cancelled.resolve();
+        }
+      });
       calls.push(record);
       const result = await handler(body.args, record);
       record.completedAtMs = performance.now();
@@ -530,6 +539,7 @@ async function runTurn({
         .length,
       conversation_steps: frames.filter((frame) => frame.step !== undefined).length,
       assistant_used_result: expectedText === undefined || finalText.includes(expectedText),
+      requested_mode: mode ?? null,
       ...tools,
     },
   };
@@ -617,9 +627,9 @@ async function qualifyCancellation({
     (error) => ({ frames: null, error }),
   );
 
-  const [runId] = await withTimeout(
+  const [runId, callbackRecord] = await withTimeout(
     Promise.all([runIdReady.promise, blockControl.started.promise]).then(
-      ([resolvedRunId]) => [resolvedRunId],
+      ([resolvedRunId, record]) => [resolvedRunId, record],
     ),
     Math.min(timeoutMilliseconds, 60_000),
     "cancellation probe startup",
@@ -631,9 +641,14 @@ async function qualifyCancellation({
     { runId, agentId },
     timeoutMilliseconds,
   );
-  await delay(300);
-  blockControl.release.resolve({ value: RESULTS.blockReleased });
-  const outcome = await observedSend;
+  const [outcome] = await Promise.all([
+    observedSend,
+    withTimeout(
+      callbackRecord.cancelled.promise,
+      Math.min(timeoutMilliseconds, 10_000),
+      "custom-tool callback cancellation",
+    ),
+  ]);
   if (outcome.error !== null) throw outcome.error;
   const frames = outcome.frames;
   const terminal = terminalFrame(frames);
@@ -647,11 +662,13 @@ async function qualifyCancellation({
   }
   const callbacks = callback.calls.slice(callbackStart);
   inspectToolCalls(frames, callbacks, [TOOLS.block], true);
+  blockControl.release.resolve({ value: RESULTS.blockReleased });
   return {
     run_id: runId,
     cancellation_acknowledged: true,
     terminal_status: String(terminal.status),
     done: true,
+    callback_request_cancelled: true,
     callback_count: callbacks.length,
     duration_ms: Math.round(performance.now() - startedAt),
   };
@@ -744,7 +761,10 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
     body: "{}",
     signal,
   });
-  const exchangeBody = await exchange.json().catch(() => ({}));
+  const exchangeBody = await readBoundedJsonResponse(
+    exchange,
+    "Cursor API-key exchange",
+  );
   const accessToken =
     exchange.ok && typeof exchangeBody.accessToken === "string"
       ? exchangeBody.accessToken
@@ -769,7 +789,7 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
         signal,
       },
     );
-    const body = await response.json().catch(() => ({}));
+    const body = await readBoundedJsonResponse(response, `Cursor ${method}`);
     if (!response.ok) {
       throw new QualificationError(
         `Cursor ${method} failed after API-key exchange (HTTP ${response.status})`,
@@ -863,11 +883,11 @@ async function fullQualification(args) {
   };
   handlers.set(TOOLS.parallelA, delayedRead(RESULTS.parallelA));
   handlers.set(TOOLS.parallelB, delayedRead(RESULTS.parallelB));
-  handlers.set(TOOLS.block, async () => {
+  handlers.set(TOOLS.block, async (_input, record) => {
     if (blockControl === null) {
       throw new QualificationError("block callback invoked outside cancellation test");
     }
-    blockControl.started.resolve();
+    blockControl.started.resolve(record);
     return blockControl.release.promise;
   });
   for (let index = 0; index < SCHEMA_PROBE_COUNT; index += 1) {
@@ -1285,7 +1305,10 @@ async function fullQualification(args) {
         durable_observe_replay: replay,
         cancellation,
         post_cancellation_recovery: true,
-        plan_mode: true,
+        plan_mode: {
+          requested: planTurn.summary.requested_mode === "AGENT_MODE_OPTION_PLAN",
+          effective_mode_reported_by_sdk: false,
+        },
         get_run: true,
         list_runs: true,
         get_run_conversation: true,
