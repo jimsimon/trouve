@@ -510,6 +510,23 @@ send_count = 0
 callback_updates = 0
 cancel_received = threading.Event()
 
+expected_custom_tool = {
+    "description": "Return the test sentinel.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"token": {"type": "string"}},
+        "required": ["token"],
+        "additionalProperties": False
+    }
+}
+
+def valid_tool_registration(options):
+    names = options.get("tools", {}).get("names", [])
+    tools = options.get("local", {}).get("customTools", {})
+    if names == ["mcp"]:
+        return tools == {"trouve_test_echo": expected_custom_tool}
+    return names == [] and tools == {}
+
 def write_json(path, value):
     with open(path, "w", encoding="utf-8") as destination:
         json.dump(value, destination)
@@ -607,8 +624,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             names = active_options.get("tools", {}).get("names", [])
             if names == ["mcp"]:
                 import concurrent.futures
-                tools = active_options.get("local", {}).get("customTools", {})
-                tool_name = next(iter(tools))
+                tool_name = "trouve_test_echo"
                 callback = {
                     "toolName": tool_name,
                     "toolCallId": "sdk-call-1",
@@ -696,14 +712,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         request = json.loads(raw.decode("utf-8") or "{}")
+        status = 200
         if self.path.endswith("/CreateAgent"):
             write_json(binary + ".create.json", request)
-            active_options = request["options"]
-            response = {"agentId": agent_id}
+            active_options = request.get("options", {})
+            if valid_tool_registration(active_options):
+                response = {"agentId": agent_id}
+            else:
+                status = 400
+                response = {"code": "invalid_argument", "message": "invalid custom tool registration"}
         elif self.path.endswith("/ResumeAgent"):
             write_json(binary + ".resume.json", request)
-            active_options = request["options"]
-            response = {"agentId": agent_id}
+            active_options = request.get("options", {})
+            if valid_tool_registration(active_options):
+                response = {"agentId": agent_id}
+            else:
+                status = 400
+                response = {"code": "invalid_argument", "message": "invalid custom tool registration"}
         elif self.path.endswith("/SetToolCallback"):
             callback_url = request.get("url", "")
             callback_token = request.get("authToken", "")
@@ -726,7 +751,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             response = {}
         body = json.dumps(response, separators=(",", ":")).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -800,10 +825,15 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
     })
     .await;
 
-    let mut events = Vec::new();
-    while let Some(event) = stream.next().await {
-        events.push(event.unwrap());
-    }
+    let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.unwrap());
+        }
+        events
+    })
+    .await
+    .expect("initial Cursor SDK stream did not close within five seconds");
     assert!(events.iter().any(
         |event| matches!(event, BackendEvent::SessionStarted { session_id } if session_id == "sdk-agent-1")
     ), "{events:?}");
@@ -845,7 +875,18 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
         create["options"]["local"]["sandboxOptions"]["enabled"],
         false
     );
-    assert!(create["options"]["local"]["customTools"]["trouve_test_echo"].is_object());
+    assert_eq!(
+        create["options"]["local"]["customTools"]["trouve_test_echo"],
+        serde_json::json!({
+            "description": "Return the test sentinel.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "token": { "type": "string" } },
+                "required": ["token"],
+                "additionalProperties": false
+            }
+        })
+    );
     let send: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{stub}.send.json")).unwrap())
             .unwrap();
@@ -880,9 +921,13 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
         next
     })
     .await;
-    while let Some(event) = resumed.next().await {
-        event.unwrap();
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = resumed.next().await {
+            event.unwrap();
+        }
+    })
+    .await
+    .expect("resumed Cursor SDK stream did not close within five seconds");
     let resume: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{stub}.resume.json")).unwrap())
             .unwrap();

@@ -32,6 +32,7 @@ import {
   startBridge,
   terminalStatusIsFinished,
   terminateProcessTree,
+  validateLoopbackBridgeUrl,
   waitForChildSettlement,
 } from "./qualify_cursor_sdk_bridge.mjs";
 import {
@@ -62,6 +63,21 @@ function connectTestFrame(flags, value) {
 test("timeout parsing rejects values outside Node's timer range", () => {
   assert.equal(parseTimeoutSeconds("300"), 300);
   assert.throws(() => parseTimeoutSeconds("2147484"), /no greater than/u);
+});
+
+test("Bridge discovery requires an uncredentialed literal loopback HTTP URL", () => {
+  for (const url of ["http://127.0.0.1:43123", "http://127.1.2.3:43123/sdk", "http://[::1]:43123"]) {
+    assert.doesNotThrow(() => validateLoopbackBridgeUrl(url), url);
+  }
+  for (const url of [
+    "http://localhost:43123",
+    "http://192.168.1.2:43123",
+    "https://127.0.0.1:43123",
+    "http://user@127.0.0.1:43123",
+    "http://127.0.0.1:43123?target=elsewhere",
+  ]) {
+    assert.throws(() => validateLoopbackBridgeUrl(url), /literal loopback HTTP URL/u, url);
+  }
 });
 
 test("full qualification bounds total and concurrent callbacks", () => {
