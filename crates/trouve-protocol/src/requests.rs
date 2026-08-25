@@ -1887,11 +1887,13 @@ pub struct CodeReviewChurnSignal {
     /// the streak is too short to measure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub median_round_interval_seconds: Option<u64>,
-    /// Consecutive clean published rounds since the streak ended, including
-    /// the round carrying this signal when it was clean. Zero while churn is
-    /// active.
+    /// Qualifying clean rounds since the streak ended. Only clean
+    /// full-branch rounds qualify: a clean incremental round examined just
+    /// the latest fix diff, earns no credit, and does not end the streak.
+    /// Zero while churn is active.
     pub clean_rounds: u64,
-    /// Clean rounds required before the check run may report success again.
+    /// Qualifying clean full-branch rounds required before the check run may
+    /// report success again.
     pub required_clean_rounds: u64,
 }
 

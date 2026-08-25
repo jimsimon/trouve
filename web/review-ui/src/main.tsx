@@ -1609,8 +1609,8 @@ function JobDetailPane({
             )}
             . Consider a design-level pass over the affected area instead of another point fix.{" "}
             {reviewChurnSoakPending(job)
-              ? `The check run stays neutral until ${job.churn.required_clean_rounds} consecutive review rounds are clean (${job.churn.clean_rounds}/${job.churn.required_clean_rounds} so far).`
-              : `The clean-round soak is complete (${job.churn.clean_rounds}/${job.churn.required_clean_rounds}).`}
+              ? `The check run stays neutral until ${job.churn.required_clean_rounds} clean full-branch review round${job.churn.required_clean_rounds === 1 ? "" : "s"} confirm${job.churn.required_clean_rounds === 1 ? "s" : ""} stability (${job.churn.clean_rounds}/${job.churn.required_clean_rounds} so far); clean incremental rounds do not count.`
+              : `The clean full-branch soak is complete (${job.churn.clean_rounds}/${job.churn.required_clean_rounds}).`}
           </p>
         </div>
       )}

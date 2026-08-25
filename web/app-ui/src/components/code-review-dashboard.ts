@@ -667,7 +667,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
         <dl class="job-meta">
           <div><dt>Findings</dt><dd>${job.issue_count ?? 0} new${job.open_issue_count == null ? " · open status unknown" : ` · ${job.open_issue_count} open`}</dd></div>
           ${job.churn
-            ? html`<div><dt>Fix churn</dt><dd>${job.churn.finding_round_streak} round${job.churn.finding_round_streak === 1 ? "" : "s"} with new issues · ${job.churn.clean_rounds}/${job.churn.required_clean_rounds} clean since</dd></div>`
+            ? html`<div><dt>Fix churn</dt><dd>${job.churn.finding_round_streak} round${job.churn.finding_round_streak === 1 ? "" : "s"} with new issues · ${job.churn.clean_rounds}/${job.churn.required_clean_rounds} full-branch clean since</dd></div>`
             : nothing}
           <div><dt>${job.status === "queued" ? "Waiting" : "Elapsed"}</dt><dd>${formatDuration(job.status === "queued" ? job.pending_elapsed_ms : job.running_elapsed_ms)}</dd></div>
           <div><dt>Started</dt><dd title=${formatDate(job.started_at ?? job.created_at)}>${formatDate(job.started_at ?? job.created_at)}</dd></div>

@@ -36,10 +36,10 @@ describe("code-review dashboard model", () => {
     const soaking = {
       finding_round_streak: 4,
       recurring_paths: ["crates/core/src/engine.rs"],
-      clean_rounds: 1,
-      required_clean_rounds: 2,
+      clean_rounds: 0,
+      required_clean_rounds: 1,
     };
-    const settled = { ...soaking, clean_rounds: 2 };
+    const settled = { ...soaking, clean_rounds: 1 };
     expect(codeReviewChurnSoakPending({ churn: soaking })).toBe(true);
     expect(codeReviewChurnSoakPending({ churn: settled })).toBe(false);
     expect(codeReviewChurnSoakPending({})).toBe(false);

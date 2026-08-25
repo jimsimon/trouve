@@ -3061,34 +3061,54 @@ const CODE_REVIEW_CHURN_PERSISTENT_STREAK: u64 = 5;
 const CODE_REVIEW_CHURN_RECURRING_ROUNDS: usize = 3;
 /// Reported recurring paths are capped to keep persisted payloads bounded.
 const CODE_REVIEW_CHURN_MAX_RECURRING_PATHS: usize = 5;
-/// Clean rounds required before a churning pull request's check run may
-/// report success again.
-const CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS: u64 = 2;
+/// Clean full-scope rounds required before a churning pull request's check
+/// run may report success again. Clean incremental rounds earn no credit: a
+/// round that examined only the latest fix diff proves nothing about the
+/// rest of a churning branch — on the observed loops, clean incremental
+/// rounds were immediately followed by double-digit full-scope findings.
+const CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS: u64 = 1;
 
 /// One published review round of a pull request.
 #[derive(Debug, Clone)]
 struct CodeReviewChurnRound {
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     issue_count: u64,
+    full_scope: bool,
     finding_paths: Vec<String>,
 }
 
 /// Derive the fix-churn signal from a pull request's published rounds,
-/// ordered newest first. Returns `None` when the recent history does not
-/// match the churn heuristics, or once the clean soak has completed on an
-/// earlier round (`clean_rounds` strictly greater than the requirement), so
-/// the signal disappears instead of trailing the pull request forever.
+/// ordered newest first.
+///
+/// Rounds are weighed by what they actually examined: finding rounds extend
+/// the streak regardless of scope, a clean full-branch round ends it (and is
+/// the only round that earns soak credit), and a clean incremental round is
+/// neutral — it neither extends nor breaks the streak, because it looked at
+/// a sliver of the branch. This keeps alternating fix-verify/full-recheck
+/// loops visible instead of letting each narrow clean round reset the
+/// streak.
+///
+/// Returns `None` when the recent history does not match the churn
+/// heuristics, or once the soak has completed on an earlier round, so the
+/// signal disappears instead of trailing the pull request forever.
 fn compute_code_review_churn_signal(
     rounds: &[CodeReviewChurnRound],
 ) -> Option<trouve_protocol::CodeReviewChurnSignal> {
-    let clean_rounds = rounds
-        .iter()
-        .take_while(|round| round.issue_count == 0)
-        .count();
-    let streak_rounds = rounds[clean_rounds.min(rounds.len())..]
-        .iter()
-        .take_while(|round| round.issue_count > 0)
-        .collect::<Vec<_>>();
+    let mut clean_rounds = 0_u64;
+    let mut streak_rounds = Vec::new();
+    for round in rounds {
+        if round.issue_count > 0 {
+            streak_rounds.push(round);
+        } else if round.full_scope {
+            if streak_rounds.is_empty() {
+                clean_rounds += 1;
+            } else {
+                // A clean full-branch round older than the newest streak
+                // bounds it: findings after it belong to a new episode.
+                break;
+            }
+        }
+    }
     let finding_round_streak = streak_rounds.len() as u64;
     let mut rounds_per_path = BTreeMap::<&str, usize>::new();
     for round in &streak_rounds {
@@ -3116,8 +3136,21 @@ fn compute_code_review_churn_signal(
     let churning = (finding_round_streak >= CODE_REVIEW_CHURN_MIN_STREAK
         && !recurring_paths.is_empty())
         || finding_round_streak >= CODE_REVIEW_CHURN_PERSISTENT_STREAK;
-    if !churning || clean_rounds as u64 > CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS {
+    if !churning {
         return None;
+    }
+    // Once the soak completes, the completing clean full-branch round still
+    // reports the signal (so its "resolved" state is visible), and every
+    // later round drops it. Clean incremental rounds never advance the count,
+    // so the newest-round check is what retires the signal.
+    if clean_rounds >= CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS {
+        let newest_is_completing_round = rounds
+            .first()
+            .is_some_and(|round| round.issue_count == 0 && round.full_scope)
+            && clean_rounds == CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS;
+        if !newest_is_completing_round {
+            return None;
+        }
     }
     let mut intervals = streak_rounds
         .windows(2)
@@ -3134,7 +3167,7 @@ fn compute_code_review_churn_signal(
         finding_round_streak,
         recurring_paths,
         median_round_interval_seconds,
-        clean_rounds: clean_rounds as u64,
+        clean_rounds,
         required_clean_rounds: CODE_REVIEW_CHURN_REQUIRED_CLEAN_ROUNDS,
     })
 }
@@ -3148,7 +3181,7 @@ fn load_code_review_churn_rounds(
     pull_number: u64,
 ) -> Result<Vec<CodeReviewChurnRound>> {
     let mut rounds_statement = conn.prepare(
-        "SELECT id, created_at, issue_count
+        "SELECT id, created_at, issue_count, review_scope
          FROM code_review_jobs
          WHERE repository = ?1 AND pull_number = ?2 AND review_published != 0
          ORDER BY publication_order DESC, created_at DESC, id DESC
@@ -3166,6 +3199,7 @@ fn load_code_review_churn_rounds(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )?
@@ -3173,7 +3207,7 @@ fn load_code_review_churn_rounds(
     let mut paths_statement =
         conn.prepare("SELECT DISTINCT path FROM code_review_findings WHERE job_id = ?1")?;
     rows.into_iter()
-        .map(|(job_id, created_at, issue_count)| {
+        .map(|(job_id, created_at, issue_count, scope)| {
             let issue_count = issue_count.max(0) as u64;
             let finding_paths = if issue_count == 0 {
                 Vec::new()
@@ -3185,6 +3219,8 @@ fn load_code_review_churn_rounds(
             Ok(CodeReviewChurnRound {
                 created_at: parse_optional_datetime(Some(created_at)),
                 issue_count,
+                full_scope: code_review_scope_from(&scope)
+                    == trouve_protocol::CodeReviewJobScope::Full,
                 finding_paths,
             })
         })
@@ -22936,6 +22972,7 @@ mod tests {
         store: &Store,
         dedupe_key: &str,
         head_sha: &str,
+        scope: trouve_protocol::CodeReviewJobScope,
         finding_paths: &[&str],
         resolved_finding_ids: &[&str],
     ) -> (
@@ -22955,7 +22992,7 @@ mod tests {
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
                 base_ref: "main".into(),
                 head_ref: "ship".into(),
-                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                scope,
                 trigger: "automatic".into(),
                 retry_of: None,
                 model: Some("provider/default".into()),
@@ -23026,11 +23063,15 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let churn = |job_id: &str| store.code_review_job(job_id).unwrap().unwrap().job.churn;
 
+        let incremental = trouve_protocol::CodeReviewJobScope::Incremental;
+        let full = trouve_protocol::CodeReviewJobScope::Full;
+
         let mut open_finding_ids = Vec::new();
         let (round1, findings) = publish_churn_test_round(
             &store,
             "acme/widgets#42:signal-round-1",
             "2222222222222222222222222222222222222222",
+            incremental,
             &["crates/core/src/engine.rs"],
             &[],
         );
@@ -23041,28 +23082,44 @@ mod tests {
             &store,
             "acme/widgets#42:signal-round-2",
             "3333333333333333333333333333333333333333",
+            incremental,
             &["crates/core/src/engine.rs", "crates/core/src/store.rs"],
             &[],
         );
         open_finding_ids.extend(findings.into_iter().map(|finding| finding.id));
         assert_eq!(churn(&round2.id), None, "two rounds are not yet a streak");
 
+        // A clean incremental round between finding rounds is neutral: it
+        // reviewed only the latest fix diff, so it must not reset the streak.
+        // This is the alternating loop shape observed on live churn.
+        let (neutral, _) = publish_churn_test_round(
+            &store,
+            "acme/widgets#42:signal-neutral",
+            "8888888888888888888888888888888888888888",
+            incremental,
+            &[],
+            &[],
+        );
+        assert_eq!(churn(&neutral.id), None, "streak is still below threshold");
+
         let (round3, findings) = publish_churn_test_round(
             &store,
             "acme/widgets#42:signal-round-3",
             "4444444444444444444444444444444444444444",
+            incremental,
             &["crates/core/src/engine.rs"],
             &[],
         );
         open_finding_ids.extend(findings.into_iter().map(|finding| finding.id));
-        let signal = churn(&round3.id).expect("three recurring rounds trip the signal");
+        let signal = churn(&round3.id)
+            .expect("three recurring finding rounds trip the signal across a neutral clean round");
         assert_eq!(signal.finding_round_streak, 3);
         assert_eq!(
             signal.recurring_paths,
             vec!["crates/core/src/engine.rs".to_string()]
         );
         assert_eq!(signal.clean_rounds, 0);
-        assert_eq!(signal.required_clean_rounds, 2);
+        assert_eq!(signal.required_clean_rounds, 1);
 
         // The prior-round view a still-running job would consult reports the
         // same streak.
@@ -23075,6 +23132,9 @@ mod tests {
             3
         );
 
+        // A clean incremental round that resolves everything still earns no
+        // soak credit: zero open findings plus a sliver-scoped clean round is
+        // exactly the state that preceded double-digit full-scope findings.
         let resolved = open_finding_ids
             .iter()
             .map(String::as_str)
@@ -23083,12 +23143,13 @@ mod tests {
             &store,
             "acme/widgets#42:signal-round-4",
             "5555555555555555555555555555555555555555",
+            incremental,
             &[],
             &resolved,
         );
-        let signal = churn(&round4.id).expect("the soak keeps the signal visible");
+        let signal = churn(&round4.id).expect("the pending soak keeps the signal visible");
         assert_eq!(signal.finding_round_streak, 3);
-        assert_eq!(signal.clean_rounds, 1);
+        assert_eq!(signal.clean_rounds, 0);
         assert_eq!(
             store
                 .code_review_job(&round4.id)
@@ -23100,20 +23161,24 @@ mod tests {
             "the soak is what keeps this round from reading as settled"
         );
 
+        // Only a clean full-branch round completes the soak.
         let (round5, _) = publish_churn_test_round(
             &store,
             "acme/widgets#42:signal-round-5",
             "6666666666666666666666666666666666666666",
+            full,
             &[],
             &[],
         );
         let signal = churn(&round5.id).expect("the completing soak round still reports the signal");
-        assert_eq!(signal.clean_rounds, 2);
+        assert_eq!(signal.clean_rounds, 1);
+        assert_eq!(signal.required_clean_rounds, 1);
 
         let (round6, _) = publish_churn_test_round(
             &store,
             "acme/widgets#42:signal-round-6",
             "7777777777777777777777777777777777777777",
+            incremental,
             &[],
             &[],
         );
@@ -23125,8 +23190,8 @@ mod tests {
     }
 
     #[test]
-    fn review_fix_churn_signal_heuristics_cover_shifting_paths_and_intervals() {
-        let round = |minutes_ago: i64, paths: &[&str]| CodeReviewChurnRound {
+    fn review_fix_churn_signal_heuristics_cover_shifting_paths_and_scopes() {
+        let scoped = |minutes_ago: i64, full_scope: bool, paths: &[&str]| CodeReviewChurnRound {
             created_at: Some(
                 "2026-08-23T12:00:00Z"
                     .parse::<chrono::DateTime<chrono::Utc>>()
@@ -23134,8 +23199,10 @@ mod tests {
                     - chrono::Duration::minutes(minutes_ago),
             ),
             issue_count: paths.len() as u64,
+            full_scope,
             finding_paths: paths.iter().map(|path| (*path).to_string()).collect(),
         };
+        let round = |minutes_ago: i64, paths: &[&str]| scoped(minutes_ago, false, paths);
 
         // Four rounds whose findings never share a path stay below the
         // persistent-streak threshold.
@@ -23147,8 +23214,8 @@ mod tests {
         ];
         assert_eq!(compute_code_review_churn_signal(&shifting), None);
 
-        // A fifth consecutive finding round trips the signal even without a
-        // recurring path.
+        // A fifth finding round trips the signal even without a recurring
+        // path.
         let persistent = [
             round(0, &["a.rs"]),
             round(10, &["b.rs"]),
@@ -23163,15 +23230,57 @@ mod tests {
         assert_eq!(signal.median_round_interval_seconds, Some(20 * 60));
         assert_eq!(signal.clean_rounds, 0);
 
-        // An interrupted streak resets: clean rounds older than the streak do
-        // not belong to the soak.
-        let interrupted = [
+        // Clean incremental rounds are neutral: alternating fix-verify and
+        // finding rounds still accumulate one streak. This is the live loop
+        // shape where narrow clean rounds interleave with full-scope finding
+        // rounds.
+        let alternating = [
+            scoped(0, true, &["a.rs"]),
+            round(10, &[]),
+            scoped(20, true, &["a.rs"]),
+            round(30, &[]),
+            round(40, &["a.rs"]),
+        ];
+        let signal = compute_code_review_churn_signal(&alternating)
+            .expect("neutral clean incremental rounds must not reset the streak");
+        assert_eq!(signal.finding_round_streak, 3);
+        assert_eq!(signal.recurring_paths, vec!["a.rs".to_string()]);
+        assert_eq!(signal.clean_rounds, 0);
+
+        // A clean full-branch round bounds the streak: findings after it are
+        // a fresh episode.
+        let bounded = [
             round(0, &["a.rs"]),
+            scoped(10, true, &[]),
+            round(20, &["a.rs"]),
+            round(30, &["a.rs"]),
+            round(40, &["a.rs"]),
+        ];
+        assert_eq!(compute_code_review_churn_signal(&bounded), None);
+
+        // Once churn is detected, a newest clean full-branch round completes
+        // the soak and still carries the signal; any later round retires it.
+        let completing = [
+            scoped(0, true, &[]),
             round(10, &["a.rs"]),
-            round(20, &[]),
+            round(20, &["a.rs"]),
             round(30, &["a.rs"]),
         ];
-        assert_eq!(compute_code_review_churn_signal(&interrupted), None);
+        let signal = compute_code_review_churn_signal(&completing)
+            .expect("the completing full-branch round reports the finished soak");
+        assert_eq!(signal.clean_rounds, 1);
+        let retired = [
+            round(0, &[]),
+            scoped(10, true, &[]),
+            round(20, &["a.rs"]),
+            round(30, &["a.rs"]),
+            round(40, &["a.rs"]),
+        ];
+        assert_eq!(
+            compute_code_review_churn_signal(&retired),
+            None,
+            "rounds after the completed soak stop carrying the signal"
+        );
     }
 
     #[test]

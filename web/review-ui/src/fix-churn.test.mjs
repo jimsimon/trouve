@@ -25,8 +25,9 @@ test("a clean round inside the churn soak is badged, not settled", () => {
 test("the job detail explains recurring instability and the clean soak", () => {
   assert.match(source, /Recurring instability: \{job\.churn\.finding_round_streak\}/u);
   assert.match(source, /relocating the defect rather than resolving it/u);
-  assert.match(source, /consecutive review rounds are clean/u);
-  assert.match(source, /The clean-round soak is complete/u);
+  assert.match(source, /clean full-branch review round/u);
+  assert.match(source, /clean incremental rounds do not count/u);
+  assert.match(source, /The clean full-branch soak is complete/u);
   assert.match(
     source,
     /job\.status === "succeeded" && job\.churn && \(\s*<div class="banner warning stacked"/u,

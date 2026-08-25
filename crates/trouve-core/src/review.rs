@@ -9315,7 +9315,7 @@ fn review_churn_soak_pending(job: &trouve_protocol::CodeReviewJob) -> bool {
 fn review_churn_check_sentence(churn: &trouve_protocol::CodeReviewChurnSignal) -> String {
     if churn.clean_rounds < churn.required_clean_rounds {
         format!(
-            "Fix churn detected: {} consecutive earlier round(s) each confirmed new issues, so success requires {} consecutive clean round(s) ({}/{} so far).",
+            "Fix churn detected: {} earlier round(s) each confirmed new issues, so success requires {} clean full-branch review round(s) ({}/{} so far); clean incremental rounds do not count.",
             churn.finding_round_streak,
             churn.required_clean_rounds,
             churn.clean_rounds,
@@ -9323,7 +9323,7 @@ fn review_churn_check_sentence(churn: &trouve_protocol::CodeReviewChurnSignal) -
         )
     } else {
         format!(
-            "Fix churn resolved: {} consecutive clean round(s) followed the {}-round churn streak.",
+            "Fix churn resolved: {} clean full-branch round(s) followed the {}-round churn streak.",
             churn.clean_rounds, churn.finding_round_streak
         )
     }
@@ -9332,7 +9332,7 @@ fn review_churn_check_sentence(churn: &trouve_protocol::CodeReviewChurnSignal) -
 fn render_churn_section(churn: &trouve_protocol::CodeReviewChurnSignal) -> String {
     let mut section = format!(
         "### 🔁 Recurring instability\n\n\
-         The last {} consecutive published review round(s) each confirmed new issues",
+         The last {} published review round(s) with findings each confirmed new issues",
         churn.finding_round_streak
     );
     if !churn.recurring_paths.is_empty() {
@@ -9356,12 +9356,12 @@ fn render_churn_section(churn: &trouve_protocol::CodeReviewChurnSignal) -> Strin
     );
     if churn.clean_rounds < churn.required_clean_rounds {
         section.push_str(&format!(
-            "The check run will not report success until {} consecutive review rounds are clean ({}/{} so far).\n\n",
+            "The check run will not report success until {} clean full-branch review round(s) confirm stability ({}/{} so far); a clean incremental round examines only the latest fix diff and does not count.\n\n",
             churn.required_clean_rounds, churn.clean_rounds, churn.required_clean_rounds
         ));
     } else {
         section.push_str(&format!(
-            "The clean-round soak is complete ({}/{}).\n\n",
+            "The clean full-branch soak is complete ({}/{}).\n\n",
             churn.clean_rounds, churn.required_clean_rounds
         ));
     }
@@ -15778,12 +15778,13 @@ mod tests {
             finding_round_streak: 5,
             recurring_paths: vec!["crates/core/src/engine.rs".into()],
             median_round_interval_seconds: Some(420),
-            clean_rounds: 1,
-            required_clean_rounds: 2,
+            clean_rounds: 0,
+            required_clean_rounds: 1,
         });
 
         // A clean round mid-churn must not read as settled: neutral check,
-        // needs-attention lifecycle, and an explicit soak counter.
+        // needs-attention lifecycle, and an explicit full-branch soak
+        // requirement.
         assert!(review_churn_soak_pending(&detail.job));
         assert_eq!(
             review_check_conclusion(&detail.job.status, Some(0), false, true),
@@ -15792,13 +15793,15 @@ mod tests {
         let body = render_lifecycle_comment(&detail);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
         assert!(body.contains("### 🔁 Recurring instability"));
-        assert!(body.contains("5 consecutive published review round(s)"));
+        assert!(body.contains("5 published review round(s) with findings"));
         assert!(body.contains("`crates/core/src/engine.rs`"));
-        assert!(body.contains("(1/2 so far)"));
+        assert!(body.contains("clean full-branch review round(s) confirm stability (0/1 so far)"));
+        assert!(body.contains("does not count"));
 
-        // The soak-completing round may report success again and says so.
+        // The soak-completing clean full-branch round may report success
+        // again and says so.
         if let Some(churn) = detail.job.churn.as_mut() {
-            churn.clean_rounds = 2;
+            churn.clean_rounds = 1;
         }
         assert!(!review_churn_soak_pending(&detail.job));
         assert_eq!(
@@ -15807,7 +15810,7 @@ mod tests {
         );
         let body = render_lifecycle_comment(&detail);
         assert!(body.starts_with("## ✅ Trouve Code Review — Succeeded"));
-        assert!(body.contains("The clean-round soak is complete (2/2)."));
+        assert!(body.contains("The clean full-branch soak is complete (1/1)."));
 
         // Open findings still dominate the churn presentation.
         detail.job.open_issue_count = Some(3);
@@ -15825,7 +15828,7 @@ mod tests {
             recurring_paths: vec!["crates/core/src/engine.rs".into()],
             median_round_interval_seconds: Some(360),
             clean_rounds: 0,
-            required_clean_rounds: 2,
+            required_clean_rounds: 1,
         };
 
         let with_signal = validation_prompt(

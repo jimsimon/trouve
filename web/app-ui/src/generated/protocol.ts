@@ -1959,9 +1959,10 @@ export interface components {
         CodeReviewChurnSignal: {
             /**
              * Format: int64
-             * @description Consecutive clean published rounds since the streak ended, including
-             *     the round carrying this signal when it was clean. Zero while churn is
-             *     active.
+             * @description Qualifying clean rounds since the streak ended. Only clean
+             *     full-branch rounds qualify: a clean incremental round examined just
+             *     the latest fix diff, earns no credit, and does not end the streak.
+             *     Zero while churn is active.
              */
             clean_rounds: number;
             /**
@@ -1983,7 +1984,8 @@ export interface components {
             recurring_paths?: string[];
             /**
              * Format: int64
-             * @description Clean rounds required before the check run may report success again.
+             * @description Qualifying clean full-branch rounds required before the check run may
+             *     report success again.
              */
             required_clean_rounds: number;
         };
