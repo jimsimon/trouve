@@ -506,14 +506,13 @@ fn cursor_sdk_bridge_stub(dir: &Path) -> String {
         dir,
         "cursor-sdk-bridge",
         r##"#!/usr/bin/env python3
-import concurrent.futures
+import http.client
 import http.server
 import json
 import os
 import struct
 import sys
 import threading
-import urllib.request
 
 binary = os.path.abspath(sys.argv[0])
 count_path = binary + ".spawns"
@@ -564,6 +563,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             send_count += 1
             names = active_options.get("tools", {}).get("names", [])
             if names == ["mcp"]:
+                import concurrent.futures
                 tools = active_options.get("local", {}).get("customTools", {})
                 tool_name = next(iter(tools))
                 callback = {
@@ -573,17 +573,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "args": {"token": "from-sdk"}
                 }
                 def call_tool(_attempt):
-                    callback_request = urllib.request.Request(
-                        callback_url + "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
-                        data=json.dumps(callback).encode("utf-8"),
-                        headers={
+                    # The callback is always adapter-owned loopback traffic.
+                    # Bypass urllib's macOS system-proxy discovery so bridge
+                    # startup never depends on platform proxy initialization.
+                    callback_port = int(callback_url.rsplit(":", 1)[1].rstrip("/"))
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", callback_port, timeout=10
+                    )
+                    try:
+                        connection.request(
+                            "POST",
+                            "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+                            body=json.dumps(callback).encode("utf-8"),
+                            headers={
                             "Authorization": "Bearer " + callback_token,
                             "Content-Type": "application/json"
-                        },
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(callback_request, timeout=10) as response:
+                            }
+                        )
+                        response = connection.getresponse()
+                        if response.status != 200:
+                            raise RuntimeError("callback returned " + str(response.status))
                         return json.loads(response.read().decode("utf-8"))
+                    finally:
+                        connection.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                     callback_responses = list(executor.map(call_tool, range(2)))
                 write_json(binary + ".callback.json", callback_responses[0])
