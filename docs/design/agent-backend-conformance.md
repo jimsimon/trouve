@@ -77,7 +77,9 @@ uninstall, and credential-persistence checks—with:
 
 ```sh
 TROUVE_E2E=1 CURSOR_API_KEY=... \
-  cargo test -p trouve-server --test cursor_sdk_live -- --nocapture
+  cargo test -p trouve-server --test cursor_sdk_live \
+    cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up -- \
+    --ignored --exact --nocapture
 ```
 
 Run the broader promotion probe only when several paid turns are acceptable:

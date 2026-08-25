@@ -2380,6 +2380,10 @@ fn cli_for_kind(kind: &str) -> Option<trouve_agents::install::CliId> {
     }
 }
 
+fn canonical_cli_runtime_id(id: &str) -> &str {
+    trouve_agents::install::CliId::parse(id).map_or(id, |runtime| runtime.as_str())
+}
+
 /// Resolve the executable for a managed agent runtime. An explicit command
 /// wins; otherwise a trouve-managed binary takes precedence over PATH.
 fn resolved_runtime_command(
@@ -3952,16 +3956,20 @@ impl Engine {
     pub fn start_cli_install(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
+        let state_id = cli.as_str();
         let progress = Arc::new(trouve_agents::install::Progress::default());
         {
             let mut installs = self.cli_installs.lock().unwrap();
-            if matches!(installs.get(id), Some(CliInstallState::Pending { .. })) {
+            if matches!(
+                installs.get(state_id),
+                Some(CliInstallState::Pending { .. })
+            ) {
                 return Err(EngineError::Conflict(format!(
                     "an install for {id} is already in progress"
                 )));
             }
             installs.insert(
-                id.to_string(),
+                state_id.to_string(),
                 CliInstallState::Pending {
                     version: None,
                     progress: progress.clone(),
@@ -3969,7 +3977,7 @@ impl Engine {
             );
         }
         let engine = self.clone();
-        let id_owned = id.to_string();
+        let id_owned = state_id.to_string();
         tokio::spawn(async move {
             let result = async {
                 let version = trouve_agents::install::latest_version(cli)
@@ -4015,7 +4023,8 @@ impl Engine {
     /// Ask an in-flight install started with `start_cli_install` to stop.
     /// The task notices at its next chunk and clears the install state.
     pub fn cancel_cli_install(&self, id: &str) -> Result<(), EngineError> {
-        match self.cli_installs.lock().unwrap().get(id) {
+        let state_id = canonical_cli_runtime_id(id);
+        match self.cli_installs.lock().unwrap().get(state_id) {
             Some(CliInstallState::Pending { progress, .. }) => {
                 progress
                     .cancel
@@ -4033,9 +4042,13 @@ impl Engine {
     pub async fn uninstall_cli(&self, id: &str) -> Result<(), EngineError> {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
+        let state_id = cli.as_str();
         {
             let installs = self.cli_installs.lock().unwrap();
-            if matches!(installs.get(id), Some(CliInstallState::Pending { .. })) {
+            if matches!(
+                installs.get(state_id),
+                Some(CliInstallState::Pending { .. })
+            ) {
                 return Err(EngineError::Conflict(format!(
                     "an install for {id} is in progress — cancel it first"
                 )));
@@ -4049,14 +4062,15 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.into()))?;
         // Drop any stale success/failed state so status reads "none", and
         // rebuild backends so they fall back to PATH resolution (or none).
-        self.cli_installs.lock().unwrap().remove(id);
+        self.cli_installs.lock().unwrap().remove(state_id);
         self.reload_providers();
         Ok(())
     }
 
     /// Report the state of an install started with `start_cli_install`.
     pub fn cli_install_status(&self, id: &str) -> trouve_protocol::CliInstallStatus {
-        match self.cli_installs.lock().unwrap().get(id) {
+        let state_id = canonical_cli_runtime_id(id);
+        match self.cli_installs.lock().unwrap().get(state_id) {
             None => trouve_protocol::CliInstallStatus {
                 status: "none".into(),
                 version: None,
@@ -24349,6 +24363,19 @@ default_permission_mode = "ask"
             configured_runtime_command(&cursor_sdk).as_deref(),
             Some("/opt/custom/cursor-sdk-bridge")
         );
+    }
+
+    #[test]
+    fn legacy_cursor_runtime_id_maps_to_the_sdk_bridge() {
+        assert_eq!(
+            canonical_cli_runtime_id("cursor-agent"),
+            "cursor-sdk-bridge"
+        );
+        assert_eq!(
+            canonical_cli_runtime_id("cursor-sdk-bridge"),
+            "cursor-sdk-bridge"
+        );
+        assert_eq!(canonical_cli_runtime_id("unknown"), "unknown");
     }
 
     #[tokio::test]

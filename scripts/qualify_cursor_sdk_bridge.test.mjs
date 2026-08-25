@@ -17,12 +17,15 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  ConnectRpcError,
   assetName,
   assertUniqueToolLifecycle,
   capPendingDiagnostic,
   download,
   exactTerminalResult,
+  expectedBridgeChecksum,
   installSignalCleanup,
+  isUnsupportedRpcMethodError,
   parseTimeoutSeconds,
   readBoundedJsonResponse,
   startBridge,
@@ -99,6 +102,34 @@ test("Windows ARM64 is rejected before an asset URL is constructed", () => {
     assetName("win32", "x64"),
     "cursor-sdk-bridge-standalone-win32-x64.tar.gz",
   );
+});
+
+test("qualification release assets have independently reviewed checksums", () => {
+  assert.equal(
+    expectedBridgeChecksum(assetName("linux", "x64")),
+    "5357a42d3faa668a3ef25c6669fe576544b032dd17fabbbfa515355cd8d33c19",
+  );
+  assert.throws(
+    () => expectedBridgeChecksum("cursor-sdk-bridge-standalone-plan9-x64.tar.gz"),
+    /no reviewed checksum/u,
+  );
+});
+
+test("only an explicit unimplemented RPC is classified as unsupported", () => {
+  assert.equal(
+    isUnsupportedRpcMethodError(
+      new ConnectRpcError("GetUsage", 501, { code: "unimplemented", message: "missing" }),
+      "GetUsage",
+    ),
+    true,
+  );
+  for (const error of [
+    new ConnectRpcError("GetUsage", 401, { code: "unauthenticated", message: "bad key" }),
+    new ConnectRpcError("GetUsage", 500, { code: "internal", message: "outage" }),
+    new Error("Cursor SDK Bridge RPC timed out"),
+  ]) {
+    assert.equal(isUnsupportedRpcMethodError(error, "GetUsage"), false);
+  }
 });
 
 test("bounded JSON reading rejects an oversized streamed response", async () => {

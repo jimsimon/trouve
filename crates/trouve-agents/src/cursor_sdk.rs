@@ -200,8 +200,9 @@ impl CursorBackend {
             .send()
             .await
             .map_err(|e| BackendError::Protocol(format!("API-key exchange: {e}")))?;
-        let status = response.status();
-        let body: Value = response.json().await.unwrap_or(Value::Null);
+        let (status, bytes) =
+            read_bounded_response(response, "Cursor API-key exchange", MAX_RPC_BODY_BYTES).await?;
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         if matches!(
             status,
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
@@ -249,8 +250,8 @@ impl CursorBackend {
             .send()
             .await
             .map_err(|e| BackendError::Protocol(format!("{method}: {e}")))?;
-        let status = response.status();
-        let body: Value = response.json().await.unwrap_or(Value::Null);
+        let (status, bytes) = read_bounded_response(response, method, MAX_RPC_BODY_BYTES).await?;
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         if matches!(
             status,
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
@@ -1931,12 +1932,10 @@ fn validate_loopback_bridge_url(url: &str) -> Result<(), BackendError> {
         || parsed.query().is_some()
         || parsed.fragment().is_some()
         || !parsed.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
         })
     {
         return Err(BackendError::Protocol(
@@ -2747,6 +2746,20 @@ fn i64_flex(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_url_requires_a_literal_loopback_address() {
+        for url in ["http://127.0.0.1:43123", "http://[::1]:43123"] {
+            assert!(validate_loopback_bridge_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://localhost:43123",
+            "http://192.168.1.2:43123",
+            "https://127.0.0.1:43123",
+        ] {
+            assert!(validate_loopback_bridge_url(url).is_err(), "{url}");
+        }
+    }
 
     #[tokio::test]
     async fn bounded_response_stops_at_the_configured_limit() {

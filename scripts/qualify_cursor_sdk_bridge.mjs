@@ -38,6 +38,20 @@ import { fileURLToPath } from "node:url";
 const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const BRIDGE_VERSION = "1.0.28";
 const RELEASE_ROOT = `https://github.com/cursor/sdk-bridge/releases/download/v${BRIDGE_VERSION}`;
+// Reviewed independently of the mutable release assets. The fetched manifest
+// remains a useful consistency check, but it is not the execution trust root.
+const BRIDGE_SHA256 = Object.freeze({
+  "cursor-sdk-bridge-standalone-darwin-arm64.tar.gz":
+    "52ebfdab4e7806270122bea6c8f972646516297343c483e6700b37d444515af5",
+  "cursor-sdk-bridge-standalone-darwin-x64.tar.gz":
+    "ba59c6eaad62338118e59ceb6d24006e06f7c75b28e32dbc13950c4027511c3c",
+  "cursor-sdk-bridge-standalone-linux-arm64.tar.gz":
+    "0222f5c60c88b82063a0547bd938945c777c2a470def69de6464c04470ae0560",
+  "cursor-sdk-bridge-standalone-linux-x64.tar.gz":
+    "5357a42d3faa668a3ef25c6669fe576544b032dd17fabbbfa515355cd8d33c19",
+  "cursor-sdk-bridge-standalone-win32-x64.tar.gz":
+    "8af767f8b60f48ccf9147ce89085cd1956a5a1b8c66d26ff078cc1bd193f2ebb",
+});
 const TOOL_NAME = "trouve_qualification_echo";
 const TOOL_ARGUMENT = "cursor-sdk-bridge-tool-ok";
 const TOOL_RESULT = "TROUVE_CURSOR_SDK_BRIDGE_OK";
@@ -67,6 +81,23 @@ const FORBIDDEN_BUILT_INS = new Set([
 ]);
 
 class QualificationError extends Error {}
+
+class ConnectRpcError extends QualificationError {
+  constructor(method, status, payload) {
+    super(`${method} failed (${status}): ${JSON.stringify(payload)}`);
+    this.method = method;
+    this.httpStatus = status;
+    this.code = payload?.code;
+  }
+}
+
+function isUnsupportedRpcMethodError(error, method) {
+  return (
+    error instanceof ConnectRpcError &&
+    error.method === method &&
+    ["unimplemented", 12, "12"].includes(error.code)
+  );
+}
 
 const help = `Usage: node scripts/qualify_cursor_sdk_bridge.mjs [options]
 
@@ -152,6 +183,14 @@ function assetName(platform = process.platform, cpu = process.arch) {
     );
   }
   return `cursor-sdk-bridge-standalone-${operatingSystem}-${architecture}.tar.gz`;
+}
+
+function expectedBridgeChecksum(asset) {
+  const checksum = BRIDGE_SHA256[asset];
+  if (checksum === undefined) {
+    throw new QualificationError(`no reviewed checksum is pinned for ${asset}`);
+  }
+  return checksum;
 }
 
 async function download(url, destination, signal, limit) {
@@ -301,10 +340,16 @@ async function resolveBridge(explicit, temporaryRoot, timeoutMilliseconds) {
   if (expected === undefined) {
     throw new QualificationError(`SHA256SUMS.txt did not contain ${asset}`);
   }
-  const actual = await sha256(archive);
-  if (actual !== expected) {
+  const reviewed = expectedBridgeChecksum(asset);
+  if (expected !== reviewed) {
     throw new QualificationError(
-      `checksum mismatch for ${asset}: expected ${expected}, got ${actual}`,
+      `release checksum for ${asset} differs from the reviewed checksum`,
+    );
+  }
+  const actual = await sha256(archive);
+  if (actual !== reviewed) {
+    throw new QualificationError(
+      `checksum mismatch for ${asset}: expected ${reviewed}, got ${actual}`,
     );
   }
 
@@ -673,9 +718,7 @@ async function unary(client, service, method, body, timeoutMilliseconds) {
       throw new QualificationError(`${method} returned invalid JSON: ${error}`);
     }
     if (!response.ok || (value.code !== undefined && value.message !== undefined)) {
-      throw new QualificationError(
-        `${method} failed (${response.status}): ${JSON.stringify(value)}`,
-      );
+      throw new ConnectRpcError(method, response.status, value);
     }
     return value;
   } finally {
@@ -1328,6 +1371,7 @@ async function main() {
 
 export {
   BRIDGE_VERSION,
+  ConnectRpcError,
   QualificationError,
   assetName,
   assistantText,
@@ -1336,7 +1380,9 @@ export {
   connectFrame,
   download,
   exactTerminalResult,
+  expectedBridgeChecksum,
   installSignalCleanup,
+  isUnsupportedRpcMethodError,
   parseTimeoutSeconds,
   redact,
   readBoundedJsonResponse,

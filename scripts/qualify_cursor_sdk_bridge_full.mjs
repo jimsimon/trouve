@@ -33,6 +33,7 @@ import {
   assertUniqueToolLifecycle,
   exactTerminalResult,
   installSignalCleanup,
+  isUnsupportedRpcMethodError,
   parseTimeoutSeconds,
   readBoundedJsonResponse,
   redact,
@@ -736,6 +737,7 @@ async function getLocalUsage(bridge, agentId, timeoutMilliseconds) {
       run_entries: Array.isArray(result.usage?.runs) ? result.usage.runs.length : 0,
     };
   } catch (error) {
+    if (!isUnsupportedRpcMethodError(error, "GetUsage")) throw error;
     return {
       supported: false,
       reason: error instanceof Error ? error.message : String(error),

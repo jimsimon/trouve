@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 const MAX_TEXT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RUNTIME_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// A vendor agent runtime trouve knows how to install. `id` doubles as the
@@ -44,7 +45,9 @@ pub const ALL_CLIS: [CliId; 3] = [CliId::CursorSdkBridge, CliId::Claude, CliId::
 impl CliId {
     pub fn parse(id: &str) -> Option<Self> {
         match id {
-            "cursor-sdk-bridge" => Some(Self::CursorSdkBridge),
+            // Keep the pre-SDK route as an input alias so older clients can
+            // manage the replacement runtime through the compatibility API.
+            "cursor-agent" | "cursor-sdk-bridge" => Some(Self::CursorSdkBridge),
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "llama-server" => Some(Self::LlamaServer),
@@ -218,12 +221,17 @@ async fn get_text_controlled(
 /// Download `url` fully into memory (runtime artifacts are tens of MB),
 /// streaming chunks so `progress` stays live and cancellation can land
 /// mid-transfer.
-async fn get_bytes(url: &str, progress: &Progress) -> Result<Vec<u8>, InstallError> {
+async fn get_bytes(url: &str, progress: &Progress, limit: usize) -> Result<Vec<u8>, InstallError> {
     use futures::TryStreamExt as _;
     use std::sync::atomic::Ordering::Relaxed;
 
     let resp = get_response(url, Some(progress)).await?;
     if let Some(len) = resp.content_length() {
+        if len > limit as u64 {
+            return Err(InstallError::Download(format!(
+                "{url}: response exceeded {limit} bytes"
+            )));
+        }
         progress.total.store(len, Relaxed);
     }
     let mut out = Vec::new();
@@ -238,6 +246,11 @@ async fn get_bytes(url: &str, progress: &Progress) -> Result<Vec<u8>, InstallErr
         let Some(chunk) = next else {
             break;
         };
+        if out.len().saturating_add(chunk.len()) > limit {
+            return Err(InstallError::Download(format!(
+                "{url}: response exceeded {limit} bytes"
+            )));
+        }
         out.extend_from_slice(&chunk);
         progress.received.fetch_add(chunk.len() as u64, Relaxed);
     }
@@ -460,6 +473,7 @@ pub async fn install(
     // or compromised endpoint returning `1/../../../etc` would otherwise let
     // `remove_dir_all`/`rename` touch an arbitrary directory. Constrain it to
     // a strict, path-safe allowlist before it reaches the filesystem.
+    let version = normalized_version(id, version);
     validate_version(version)?;
     let root = cli_root(data_dir, id);
     let version_dir = root.join(version);
@@ -574,7 +588,7 @@ async fn install_into(
             let base = format!("https://github.com/cursor/sdk-bridge/releases/download/v{version}");
             let sums = get_text_with_progress(&format!("{base}/SHA256SUMS.txt"), progress).await?;
             let url = format!("{base}/{asset}");
-            let bytes = get_bytes(&url, progress).await?;
+            let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
             let expected = checksum_for_asset(&sums, &asset).ok_or_else(|| {
                 InstallError::Download(format!("SHA256SUMS.txt had no entry for {asset}"))
             })?;
@@ -616,7 +630,12 @@ async fn install_into(
                 .as_str()
                 .ok_or_else(|| InstallError::Unsupported(platform.clone()))?
                 .to_string();
-            let bytes = get_bytes(&format!("{base}/{version}/{platform}/claude"), progress).await?;
+            let bytes = get_bytes(
+                &format!("{base}/{version}/{platform}/claude"),
+                progress,
+                MAX_RUNTIME_DOWNLOAD_BYTES,
+            )
+            .await?;
             let actual = sha2::Sha256::digest(&bytes).iter().fold(
                 String::with_capacity(64),
                 |mut output, byte| {
@@ -637,7 +656,7 @@ async fn install_into(
             let url = format!(
                 "https://github.com/openai/codex/releases/download/rust-v{version}/codex-{triple}.tar.gz"
             );
-            let bytes = get_bytes(&url, progress).await?;
+            let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
             untar_gz(bytes, dir).await?;
             let rel = PathBuf::from("codex");
             std::fs::rename(dir.join(format!("codex-{triple}")), dir.join(&rel))?;
@@ -649,7 +668,7 @@ async fn install_into(
             let url = format!(
                 "https://github.com/ggml-org/llama.cpp/releases/download/{version}/llama-{version}-bin-{platform}.tar.gz"
             );
-            let bytes = get_bytes(&url, progress).await?;
+            let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
             untar_gz(bytes, dir).await?;
             // The tarball unpacks to `llama-<version>/` with llama-server and
             // its shared libraries side by side (rpath $ORIGIN).
@@ -677,6 +696,14 @@ fn checksum_for_asset(sums: &str, asset: &str) -> Option<String> {
                 .all(|character| character.is_ascii_hexdigit()))
         .then(|| checksum.to_ascii_lowercase())
     })
+}
+
+fn normalized_version(id: CliId, version: &str) -> &str {
+    if id == CliId::CursorSdkBridge {
+        version.strip_prefix('v').unwrap_or(version)
+    } else {
+        version
+    }
 }
 
 /// A version string safe to use as a path component and in a download URL.
@@ -887,6 +914,35 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         server.abort();
     }
 
+    #[tokio::test]
+    async fn runtime_download_enforces_the_streaming_byte_budget() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/runtime",
+                    axum::routing::get(|| async {
+                        axum::body::Body::from_stream(futures::stream::iter([
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"123")),
+                            Ok(bytes::Bytes::from_static(b"45")),
+                        ]))
+                    }),
+                ),
+            )
+            .await
+        });
+        let progress = Progress::default();
+        let error = get_bytes(&format!("http://{address}/runtime"), &progress, 4)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded 4 bytes"));
+        server.abort();
+    }
+
     #[test]
     fn selects_llama_build_release_instead_of_latest_marker() {
         let releases = serde_json::json!([
@@ -973,6 +1029,18 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
+    fn cursor_sdk_versions_accept_one_release_tag_prefix() {
+        assert_eq!(
+            normalized_version(CliId::CursorSdkBridge, "v1.0.28"),
+            "1.0.28"
+        );
+        assert_eq!(
+            normalized_version(CliId::Codex, "rust-v0.5.0"),
+            "rust-v0.5.0"
+        );
+    }
+
+    #[test]
     fn tar_entry_containment_checks() {
         assert!(path_is_contained(Path::new("bin/cursor-sdk-bridge")));
         assert!(path_is_contained(Path::new("libllama.so.1")));
@@ -1020,6 +1088,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             Some(CliId::LlamaServer)
         );
         assert_eq!(CliId::parse("unknown"), None);
+        assert_eq!(CliId::parse("cursor-agent"), Some(CliId::CursorSdkBridge));
     }
 
     #[test]
