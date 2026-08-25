@@ -187,6 +187,13 @@ jobs:
       # fix, unlike a silently skipped test.
       - name: Ignored tests are intentionally gated
         run: |
+          cursor_live_test='crates/trouve-server/tests/cursor_sdk_live.rs'
+          cursor_ignore_count=$(grep -cE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' "$cursor_live_test" || true)
+          cursor_ignore_target=$(grep -A1 -E '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' "$cursor_live_test" | tail -n 1 || true)
+          if [ "$cursor_ignore_count" -ne 1 ] || [ "$cursor_ignore_target" != 'async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {' ]; then
+            echo "Cursor live qualification must contain exactly its one explicitly gated shipping-path test" >&2
+            exit 1
+          fi
           if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -vE '^crates/(trouve-search|trouve-client-core|trouve-core)/|^crates/trouve-server/tests/cursor_sdk_live\.rs$'; then
             echo "Found an #[ignore]d test outside the gated crates or explicit paid Cursor qualification" >&2
             exit 1
