@@ -5239,24 +5239,32 @@ impl Engine {
         let coordinator_started = Instant::now();
         let implementation_analysis =
             if coordinator_candidates.is_empty() && previous_findings.is_empty() {
-                // Cancel cooperatively and abort immediately, then await the
-                // handle with a bounded grace to observe termination. A task
-                // aborts at its next yield point; every analysis stage is
-                // async, so this settles promptly. A hypothetical non-yielding
-                // stage cannot be preempted by any means Tokio offers — in
-                // that irreducible case we log and proceed rather than let a
-                // finished clean review block behind unused work.
+                // Full shutdown ladder for the unused analysis. First a
+                // cooperative grace: signalling the token and polling the
+                // future lets its cancellation branch finalize the durable
+                // analyst task (marking it cancelled) and release the vendor
+                // turn cleanly. Only then abort — the non-cooperative last
+                // resort for a stage ignoring its token — and reap the abort
+                // with a short second grace. A non-yielding stage cannot be
+                // preempted by any means Tokio offers; in that irreducible
+                // case we log and proceed rather than let a finished clean
+                // review block behind unused work.
                 analysis_cancel.cancel();
-                analysis_handle.abort();
                 let mut analysis_handle = analysis_handle;
                 if tokio::time::timeout(Duration::from_secs(10), &mut analysis_handle)
                     .await
                     .is_err()
                 {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        "aborted implementation analysis did not terminate within grace; proceeding"
-                    );
+                    analysis_handle.abort();
+                    if tokio::time::timeout(Duration::from_secs(2), &mut analysis_handle)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            "aborted implementation analysis did not terminate; proceeding"
+                        );
+                    }
                 }
                 None
             } else {
