@@ -621,15 +621,17 @@ async function terminateProcessTree(child) {
       return exited();
     };
     if (!exited()) {
-      await new Promise((accept) => {
-        const taskkill = spawn(
-          "taskkill",
-          ["/PID", String(child.pid), "/T", "/F"],
-          { windowsHide: true, stdio: "ignore" },
-        );
-        taskkill.once("error", accept);
-        taskkill.once("exit", accept);
-      });
+      const taskkill = spawn(
+        "taskkill",
+        ["/PID", String(child.pid), "/T", "/F"],
+        { windowsHide: true, stdio: "ignore" },
+      );
+      if (!(await waitForChildSettlement(taskkill, 5_000))) {
+        taskkill.kill("SIGKILL");
+        if (!(await waitForChildSettlement(taskkill, 1_000))) {
+          throw new QualificationError("taskkill process did not terminate");
+        }
+      }
       if (!(await waitForExit(5_000))) {
         child.kill("SIGKILL");
         if (!(await waitForExit(5_000))) {
@@ -672,6 +674,24 @@ async function terminateProcessTree(child) {
   if (!(await waitForGroupExit(5_000))) {
     throw new QualificationError("Cursor SDK Bridge process group did not terminate");
   }
+}
+
+async function waitForChildSettlement(child, milliseconds) {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise((accept) => {
+    let timer;
+    const finish = (settled) => {
+      clearTimeout(timer);
+      child.off("error", onError);
+      child.off("exit", onExit);
+      accept(settled);
+    };
+    const onError = () => finish(true);
+    const onExit = () => finish(true);
+    child.once("error", onError);
+    child.once("exit", onExit);
+    timer = setTimeout(() => finish(false), milliseconds);
+  });
 }
 
 function requestTimeout(timeoutMilliseconds) {
@@ -837,6 +857,11 @@ async function serverStream(
     let sawEnd = false;
     for await (const raw of Readable.fromWeb(response.body)) {
       for (const { flags, payload } of decoder.push(raw)) {
+        if (sawEnd) {
+          throw new QualificationError(
+            `${method} emitted a frame after the Connect end-stream frame`,
+          );
+        }
         if ((flags & 0x01) !== 0) {
           throw new QualificationError("compressed Connect frames are not supported by this probe");
         }
@@ -1396,6 +1421,7 @@ export {
   terminateProcessTree,
   unary,
   verifyToolAllowlist,
+  waitForChildSettlement,
 };
 
 if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {

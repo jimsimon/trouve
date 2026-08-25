@@ -28,9 +28,11 @@ import {
   isUnsupportedRpcMethodError,
   parseTimeoutSeconds,
   readBoundedJsonResponse,
+  serverStream,
   startBridge,
   terminalStatusIsFinished,
   terminateProcessTree,
+  waitForChildSettlement,
 } from "./qualify_cursor_sdk_bridge.mjs";
 import {
   createCallbackAdmission,
@@ -46,6 +48,15 @@ async function listen(server) {
   assert.notEqual(address, null);
   assert.equal(typeof address, "object");
   return address;
+}
+
+function connectTestFrame(flags, value) {
+  const payload = Buffer.from(JSON.stringify(value));
+  const frame = Buffer.alloc(5 + payload.length);
+  frame[0] = flags;
+  frame.writeUInt32BE(payload.length, 1);
+  payload.copy(frame, 5);
+  return frame;
 }
 
 test("timeout parsing rejects values outside Node's timer range", () => {
@@ -205,6 +216,48 @@ test("bounded JSON reading rejects an oversized streamed response", async () => 
     readBoundedJsonResponse(response, "fixture", 4),
     /response exceeded 4 bytes/u,
   );
+});
+
+test("stream qualification rejects frames after Connect end-stream", async () => {
+  const server = createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { "content-type": "application/connect+json" });
+    response.end(
+      Buffer.concat([
+        connectTestFrame(0, { message: "accepted" }),
+        connectTestFrame(0x02, {}),
+        connectTestFrame(0, { message: "late" }),
+      ]),
+    );
+  });
+  try {
+    const address = await listen(server);
+    await assert.rejects(
+      serverStream(
+        { url: `http://127.0.0.1:${address.port}`, token: "fixture-token" },
+        "FixtureService",
+        "FixtureStream",
+        {},
+        2_000,
+      ),
+      /frame after the Connect end-stream frame/u,
+    );
+  } finally {
+    await new Promise((accept) => server.close(accept));
+  }
+});
+
+test("child settlement waits have a bounded deadline", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+
+  assert.equal(await waitForChildSettlement(child, 10), false);
+  assert.equal(child.listenerCount("error"), 0);
+  assert.equal(child.listenerCount("exit"), 0);
+
+  child.exitCode = 0;
+  assert.equal(await waitForChildSettlement(child, 10), true);
 });
 
 test("bounded downloads remove their partial destination", async () => {

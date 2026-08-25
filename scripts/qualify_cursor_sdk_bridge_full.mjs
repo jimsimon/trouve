@@ -920,8 +920,8 @@ async function fullQualification(args) {
     structuredContent: { permission: "denied", owner: "trouve" },
   }));
   handlers.set(TOOLS.image, async (input) => {
-    if (input.token !== "image-result") {
-      throw new QualificationError("image callback token differed");
+    if (input.token !== "red") {
+      throw new QualificationError("image callback did not identify the attached image");
     }
     return {
       content: [
@@ -1154,11 +1154,12 @@ async function fullQualification(args) {
       bridge,
       callback,
       agentId,
-      label: "input-and-tool-result-images",
+      label: "image-input-observation-and-tool-result-images",
       prompt:
-        `Accept the attached inline image, then call ${TOOLS.image} exactly once with ` +
-        `{"token":"image-result"}. Accept its text, structured, and image content, ` +
-        `then reply only ${RESULTS.image}.`,
+        `Inspect the attached image, then call ${TOOLS.image} exactly once with ` +
+        `{"token":"<color>"}, replacing <color> with the single lowercase English ` +
+        `name of its dominant pixel color. Do not call the tool if the image is unavailable. ` +
+        `Accept its text, structured, and image content, then reply only ${RESULTS.image}.`,
       images: [
         {
           data: { data: RED_PIXEL_PNG, mimeType: "image/png" },

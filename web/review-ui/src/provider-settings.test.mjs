@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -7,6 +8,8 @@ import {
   providerSetupGroups,
   savedProviderMessage,
 } from "./provider-settings.ts";
+
+const providerSetupSource = readFileSync(new URL("./main.tsx", import.meta.url), "utf8");
 
 test("legacy Cursor providers select the SDK migration path", () => {
   assert.equal(providerNeedsCursorSdkMigration({ kind: "cursor-cli" }), true);
@@ -39,4 +42,11 @@ test("provider setup keeps local presets available in review-ui", () => {
 
   assert.deepEqual(groups.subscriptionProviders, [cursor]);
   assert.deepEqual(groups.apiProviders, [hosted, local]);
+});
+
+test("API key inputs expose their guidance to assistive technology", () => {
+  for (const id of ["subscription-api-key-guidance", "provider-api-key-guidance"]) {
+    assert.match(providerSetupSource, new RegExp(`aria-describedby="${id}"`, "u"));
+    assert.match(providerSetupSource, new RegExp(`<small id="${id}">`, "u"));
+  }
 });
