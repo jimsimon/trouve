@@ -26,6 +26,7 @@ export interface ReviewJobSummary {
   readonly scope?: string;
   readonly review_base_sha?: string;
   readonly base_ref?: string;
+  readonly covered_full_branch?: boolean | null;
 }
 
 export interface ReviewJobGroup<T extends ReviewJobSummary = ReviewJobSummary> {
@@ -236,21 +237,28 @@ export const codeReviewStatusLabel = (status: string): string => {
     : `${normalized[0]?.toUpperCase() ?? ""}${normalized.slice(1)}`;
 };
 
+type ReviewCoverageFields =
+  | "status"
+  | "open_issue_count"
+  | "scope"
+  | "review_base_sha"
+  | "base_ref"
+  | "covered_full_branch";
+
 /** Zero open blocking findings established by a partial round: the check
- * holds at neutral until a clean full-branch round confirms. */
+ * holds at neutral until a clean full-branch round confirms. The server
+ * records whether the round's diff spanned the whole branch; legacy rounds
+ * without the flag fall back to the sha comparison. */
 export const codeReviewAwaitingFullCoverage = (
-  job: Pick<ReviewJobSummary, "status" | "open_issue_count" | "scope" | "review_base_sha" | "base_ref">,
+  job: Pick<ReviewJobSummary, ReviewCoverageFields>,
 ): boolean =>
   job.status === "succeeded" &&
   job.open_issue_count === 0 &&
   job.scope !== "full" &&
-  (job.review_base_sha ?? "") !== (job.base_ref ?? "");
+  !(job.covered_full_branch ?? (job.review_base_sha ?? "") === (job.base_ref ?? ""));
 
 export const codeReviewNeedsAttention = (
-  job: Pick<
-    ReviewJobSummary,
-    "status" | "open_issue_count" | "scope" | "review_base_sha" | "base_ref"
-  >,
+  job: Pick<ReviewJobSummary, ReviewCoverageFields>,
 ): boolean =>
   job.status === "succeeded" &&
   (job.open_issue_count !== 0 || codeReviewAwaitingFullCoverage(job));

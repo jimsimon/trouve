@@ -645,19 +645,27 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
-function reviewAwaitingFullCoverage(
-  job: Pick<ReviewJob, "status" | "open_issue_count" | "scope" | "review_base_sha" | "base_ref">,
-): boolean {
+type ReviewCoverageFields =
+  | "status"
+  | "open_issue_count"
+  | "scope"
+  | "review_base_sha"
+  | "base_ref"
+  | "covered_full_branch";
+
+function reviewAwaitingFullCoverage(job: Pick<ReviewJob, ReviewCoverageFields>): boolean {
   return (
     job.status === "succeeded" &&
     job.open_issue_count === 0 &&
     job.scope !== "full" &&
-    (job.review_base_sha ?? "") !== job.base_ref
+    // The server records whether the round's diff spanned the whole branch;
+    // legacy rounds without the flag fall back to the sha comparison.
+    !(job.covered_full_branch ?? (job.review_base_sha ?? "") === job.base_ref)
   );
 }
 
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, "status" | "open_issue_count" | "scope" | "review_base_sha" | "base_ref">,
+  job: Pick<ReviewJob, ReviewCoverageFields>,
 ): "open" | "awaiting-full" | "unknown" | null {
   if (job.status !== "succeeded") return null;
   if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
@@ -1604,7 +1612,7 @@ function JobDetailPane({
         </div>
       )}
       {reviewAwaitingFullCoverage(job) && (
-        <div class="banner warning stacked" role="alert">
+        <div class="banner warning stacked">
           <strong>Full-branch confirmation pending</strong>
           <p>
             No blocking issues remain open, but this round reviewed only the changes since the

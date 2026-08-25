@@ -2096,6 +2096,15 @@ export interface components {
             coordinator_elapsed_ms?: number;
             /** @description Thinking level snapshotted for the final coordinator/editor. */
             coordinator_thinking_level?: string | null;
+            /**
+             * @description Whether this round's diff spanned the entire branch, recorded at the
+             *     moment the diff base was resolved. `review_base_sha` can be refined to
+             *     the pull-request merge base during execution, so comparing it against
+             *     `base_ref` misclassifies full first reviews whenever the base branch
+             *     advanced past the branch point; this flag is authoritative. None on
+             *     rounds that predate it (clients fall back to the sha comparison).
+             */
+            covered_full_branch?: boolean | null;
             /** Format: date-time */
             created_at: string;
             error?: string;

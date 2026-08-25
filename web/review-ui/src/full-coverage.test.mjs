@@ -9,10 +9,21 @@ test("success is gated on the newest round covering the full branch", () => {
   // A clean partial round is pending, not settled: badge plus banner.
   assert.match(source, /reviewAwaitingFullCoverage/u);
   assert.match(source, /job\.scope !== "full"/u);
-  assert.match(source, /\(job\.review_base_sha \?\? ""\) !== job\.base_ref/u);
+  // The server-recorded coverage flag is authoritative; the sha comparison
+  // is only the legacy fallback (it misreads merge-base-refined rounds).
+  assert.match(
+    source,
+    /!\(job\.covered_full_branch \?\? \(job\.review_base_sha \?\? ""\) === job\.base_ref\)/u,
+  );
+  assert.match(types, /covered_full_branch\?: boolean \| null;/u);
   assert.match(source, /full review pending/u);
   assert.match(source, /Full-branch confirmation pending/u);
   assert.match(source, /reviewed only the changes since the\s+last review/u);
+  // Persistent guidance is not an assertive screen-reader alert.
+  assert.doesNotMatch(
+    source,
+    /banner warning stacked" role="alert">\s*<strong>Full-branch confirmation pending/u,
+  );
   // Open blocking findings outrank the pending state.
   assert.match(
     source,

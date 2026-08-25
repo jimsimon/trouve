@@ -359,6 +359,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   fixed_issue_count INTEGER NOT NULL DEFAULT 0,
   publication_open_issue_count INTEGER,
   publication_advisory_open_issue_count INTEGER,
+  review_covered_full_branch INTEGER,
   summary TEXT NOT NULL DEFAULT '',
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   publication_claimed INTEGER NOT NULL DEFAULT 0,
@@ -776,37 +777,51 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN analyst_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_advisory_open_issue_count INTEGER",
     "ALTER TABLE code_review_jobs DROP COLUMN publication_churn_signal",
-    // Legacy snapshots counted every open finding; recompute both tiers so
-    // deployed databases adopt the blocking/advisory split at upgrade time.
-    "UPDATE code_review_jobs SET
-       publication_open_issue_count = (
-         SELECT COUNT(*) FROM code_review_findings finding
-         JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
-         WHERE finding_job.repository = code_review_jobs.repository
-           AND finding_job.pull_number = code_review_jobs.pull_number
-           AND finding_job.review_published != 0
-           AND finding.status = 'open'
-           AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
-       ),
-       publication_advisory_open_issue_count = (
-         SELECT COUNT(*) FROM code_review_findings finding
-         JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
-         WHERE finding_job.repository = code_review_jobs.repository
-           AND finding_job.pull_number = code_review_jobs.pull_number
-           AND finding_job.review_published != 0
-           AND finding.status = 'open'
-           AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
-       )
-     WHERE publication_open_issue_count IS NOT NULL
-       AND id = (
-         SELECT latest.id FROM code_review_jobs latest
-         WHERE latest.repository = code_review_jobs.repository
-           AND latest.pull_number = code_review_jobs.pull_number
-           AND latest.review_published != 0
-         ORDER BY latest.publication_order DESC, latest.created_at DESC, latest.id DESC
-         LIMIT 1
-       )",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_covered_full_branch INTEGER",
 ];
+
+/// Legacy snapshots counted every open finding; recompute both tiers on the
+/// newest published round of each pull so deployed databases adopt the
+/// blocking/advisory split at upgrade time. This runs after
+/// `repair_legacy_code_review_publications` so the counts never derive from
+/// stale `review_published` flags, and the `publication_advisory_open_issue_count
+/// IS NULL` guard makes it a one-time backfill per row instead of a
+/// full-table recount on every startup.
+fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE code_review_jobs SET
+           publication_open_issue_count = (
+             SELECT COUNT(*) FROM code_review_findings finding
+             JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+             WHERE finding_job.repository = code_review_jobs.repository
+               AND finding_job.pull_number = code_review_jobs.pull_number
+               AND finding_job.review_published != 0
+               AND finding.status = 'open'
+               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+           ),
+           publication_advisory_open_issue_count = (
+             SELECT COUNT(*) FROM code_review_findings finding
+             JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+             WHERE finding_job.repository = code_review_jobs.repository
+               AND finding_job.pull_number = code_review_jobs.pull_number
+               AND finding_job.review_published != 0
+               AND finding.status = 'open'
+               AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+           )
+         WHERE publication_open_issue_count IS NOT NULL
+           AND publication_advisory_open_issue_count IS NULL
+           AND id = (
+             SELECT latest.id FROM code_review_jobs latest
+             WHERE latest.repository = code_review_jobs.repository
+               AND latest.pull_number = code_review_jobs.pull_number
+               AND latest.review_published != 0
+             ORDER BY latest.publication_order DESC, latest.created_at DESC, latest.id DESC
+             LIMIT 1
+           )",
+        [],
+    )?;
+    Ok(())
+}
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
     let had_theme_observation_publication_authority = conn.query_row(
@@ -828,6 +843,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
+    backfill_code_review_two_tier_issue_counts(conn)?;
     migrate_code_review_theme_observation_publication_authority(
         conn,
         had_theme_observation_publication_authority,
@@ -3335,6 +3351,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             } else {
                 review_watermark_sha
             },
+            covered_full_branch: r.get(62)?,
             base_ref,
             head_ref: r.get(8)?,
             scope: code_review_scope_from(&r.get::<_, String>(23)?),
@@ -3446,7 +3463,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
                     AND newer_reviewer.rowid > reviewer.rowid \
                 ) \
             ) \
-          THEN 1 ELSE 0 END AS can_retry_final_editor";
+          THEN 1 ELSE 0 END AS can_retry_final_editor, \
+     review_covered_full_branch";
 
 /// Shared ownership predicate for accepting review results and claiming their
 /// publication. Keeping both transitions on one predicate prevents stale
@@ -9226,11 +9244,17 @@ impl Store {
         Ok(updated > 0)
     }
 
-    pub fn set_code_review_job_review_base(&self, id: &str, review_base_sha: &str) -> Result<bool> {
+    pub fn set_code_review_job_review_base(
+        &self,
+        id: &str,
+        review_base_sha: &str,
+        covered_full_branch: bool,
+    ) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET review_base_sha = ?2
+            "UPDATE code_review_jobs
+             SET review_base_sha = ?2, review_covered_full_branch = ?3
              WHERE id = ?1 AND status = 'running'",
-            params![id, review_base_sha],
+            params![id, review_base_sha, covered_full_branch],
         )? > 0)
     }
 
@@ -18190,12 +18214,13 @@ mod tests {
         let effective_base = "3333333333333333333333333333333333333333";
         assert!(
             store
-                .set_code_review_job_review_base(&queued.id, effective_base)
+                .set_code_review_job_review_base(&queued.id, effective_base, true)
                 .unwrap()
         );
         let rebased = store.code_review_job(&queued.id).unwrap().unwrap().job;
         assert_eq!(rebased.review_base_sha, effective_base);
         assert_eq!(rebased.review_watermark_sha, queued.review_base_sha);
+        assert_eq!(rebased.covered_full_branch, Some(true));
         assert!(
             !store
                 .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
@@ -22893,6 +22918,61 @@ mod tests {
             .finish_code_review_job(&job.id, "succeeded", "https://example.test/review", "")
             .unwrap();
         (job, stored)
+    }
+
+    #[test]
+    fn two_tier_backfill_recomputes_legacy_snapshots_once() {
+        let store = Store::open_in_memory().unwrap();
+        let (round, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:tier-backfill",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[
+                ("crates/core/src/engine.rs", "high", "high"),
+                ("scripts/qualify.mjs", "low", "high"),
+            ],
+            &[],
+        );
+        // Simulate a pre-split snapshot: an all-open total with no advisory
+        // column value, as deployed databases have at upgrade time.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET publication_open_issue_count = 2,
+                     publication_advisory_open_issue_count = NULL
+                 WHERE id = ?1",
+                params![round.id],
+            )
+            .unwrap();
+            backfill_code_review_two_tier_issue_counts(&conn).unwrap();
+        }
+        let migrated = store.code_review_job(&round.id).unwrap().unwrap().job;
+        assert_eq!(migrated.open_issue_count, Some(1));
+        assert_eq!(migrated.advisory_open_issue_count, Some(1));
+
+        // Migrated rows are skipped on later startups: deliberate drift
+        // survives a second pass, proving the backfill is one-time per row
+        // rather than a full recount on every boot.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs SET publication_open_issue_count = 7 WHERE id = ?1",
+                params![round.id],
+            )
+            .unwrap();
+            backfill_code_review_two_tier_issue_counts(&conn).unwrap();
+        }
+        assert_eq!(
+            store
+                .code_review_job(&round.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .open_issue_count,
+            Some(7)
+        );
     }
 
     #[test]

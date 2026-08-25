@@ -85,6 +85,7 @@ export interface ReviewJob {
   head_sha: string;
   review_base_sha?: string;
   review_watermark_sha?: string;
+  covered_full_branch?: boolean | null;
   base_ref: string;
   head_ref: string;
   scope: ReviewScope;

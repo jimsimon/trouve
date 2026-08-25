@@ -49,6 +49,20 @@ describe("code-review dashboard model", () => {
     expect(codeReviewNeedsAttention({ ...partialClean, review_base_sha: "bbbb" })).toBe(false);
     expect(codeReviewAwaitingFullCoverage({ ...partialClean, scope: "full" })).toBe(false);
     expect(codeReviewAwaitingFullCoverage({ ...partialClean, open_issue_count: 2 })).toBe(false);
+    // The server-recorded coverage flag is authoritative over the sha
+    // comparison: merge-base-refined first reviews stay full coverage even
+    // when the base branch advanced (review base != base tip), and a slice
+    // stays partial even when the shas line up.
+    expect(
+      codeReviewAwaitingFullCoverage({ ...partialClean, covered_full_branch: true }),
+    ).toBe(false);
+    expect(
+      codeReviewAwaitingFullCoverage({
+        ...partialClean,
+        review_base_sha: "bbbb",
+        covered_full_branch: false,
+      }),
+    ).toBe(true);
   });
 
   it("groups by repository with active and newest jobs first", () => {

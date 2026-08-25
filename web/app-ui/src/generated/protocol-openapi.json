@@ -5881,6 +5881,13 @@
             ],
             "description": "Thinking level snapshotted for the final coordinator/editor."
           },
+          "covered_full_branch": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this round's diff spanned the entire branch, recorded at the\nmoment the diff base was resolved. `review_base_sha` can be refined to\nthe pull-request merge base during execution, so comparing it against\n`base_ref` misclassifies full first reviews whenever the base branch\nadvanced past the branch point; this flag is authoritative. None on\nrounds that predate it (clients fall back to the sha comparison)."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"

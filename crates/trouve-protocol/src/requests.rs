@@ -2276,6 +2276,14 @@ pub struct CodeReviewJob {
     /// effective `review_base_sha` fall back to the pull request merge base.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub review_watermark_sha: String,
+    /// Whether this round's diff spanned the entire branch, recorded at the
+    /// moment the diff base was resolved. `review_base_sha` can be refined to
+    /// the pull-request merge base during execution, so comparing it against
+    /// `base_ref` misclassifies full first reviews whenever the base branch
+    /// advanced past the branch point; this flag is authoritative. None on
+    /// rounds that predate it (clients fall back to the sha comparison).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_full_branch: Option<bool>,
     pub base_ref: String,
     pub head_ref: String,
     #[serde(default)]

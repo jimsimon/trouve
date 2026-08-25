@@ -4599,12 +4599,21 @@ impl Engine {
             watermark_merge_base.as_deref(),
         );
         let rewritten_history = incremental_history == IncrementalHistory::Rewritten;
+        // Whether the chosen diff base spans the entire branch is decided
+        // right here and recorded explicitly: the watermark path reviews the
+        // delta since the last published head, while the merge-base path
+        // reviews everything the branch changed. Inferring this later from
+        // `review_base_sha == base_ref` is wrong whenever the base branch
+        // advanced past the branch point, because the merge base then differs
+        // from the base tip even though the diff covers the full branch.
+        let covered_full_branch;
         if incremental_diff_can_use_watermark(
             incremental_history,
             &previous_pull_state.last_reviewed_base_sha,
             &job.base_ref,
         ) {
             job.review_base_sha = review_watermark_sha;
+            covered_full_branch = false;
         } else {
             job.review_base_sha = self
                 .executor
@@ -4619,11 +4628,14 @@ impl Engine {
                 .map_err(|error| anyhow!(error))
                 .context("resolving the pull request merge base locally")?;
             validate_sha(&job.review_base_sha)?;
+            covered_full_branch = true;
         }
-        if !self
-            .store
-            .set_code_review_job_review_base(&job.id, &job.review_base_sha)?
-        {
+        job.covered_full_branch = Some(covered_full_branch);
+        if !self.store.set_code_review_job_review_base(
+            &job.id,
+            &job.review_base_sha,
+            covered_full_branch,
+        )? {
             bail!("stale: review was superseded while selecting its diff base");
         }
         let workspace = self.register_workspace(
@@ -9392,7 +9404,14 @@ fn review_open_issue_count(job: &trouve_protocol::CodeReviewJob) -> Option<u64> 
 /// incremental rounds were repeatedly followed by double-digit full-scope
 /// findings on the same head.
 fn review_round_covered_full_branch(job: &trouve_protocol::CodeReviewJob) -> bool {
-    job.scope == trouve_protocol::CodeReviewJobScope::Full || job.review_base_sha == job.base_ref
+    job.scope == trouve_protocol::CodeReviewJobScope::Full
+        || job
+            .covered_full_branch
+            // Rounds that predate the explicit flag fall back to the sha
+            // comparison, which understates coverage when the base branch
+            // advanced past the branch point (the merge base then differs
+            // from the base tip). New rounds always record the flag.
+            .unwrap_or(job.review_base_sha == job.base_ref)
 }
 
 /// Zero open blocking findings, but the round that established that state
@@ -15889,6 +15908,21 @@ mod tests {
         detail.job.review_base_sha = "9999999999999999999999999999999999999999".into();
         detail.job.scope = trouve_protocol::CodeReviewJobScope::Full;
         assert!(!review_awaiting_full_coverage(&detail.job, Some(0)));
+
+        // The recorded flag is authoritative over the sha comparison: a
+        // first review resolved to the merge base covers the whole branch
+        // even when the base branch advanced past the branch point (base tip
+        // != merge base), and a slice stays partial even if its shas happen
+        // to line up.
+        detail.job.scope = trouve_protocol::CodeReviewJobScope::Incremental;
+        assert_ne!(detail.job.review_base_sha, detail.job.base_ref);
+        detail.job.covered_full_branch = Some(true);
+        assert!(!review_awaiting_full_coverage(&detail.job, Some(0)));
+        detail.job.review_base_sha = detail.job.base_ref.clone();
+        detail.job.covered_full_branch = Some(false);
+        assert!(review_awaiting_full_coverage(&detail.job, Some(0)));
+        detail.job.covered_full_branch = None;
+        detail.job.review_base_sha = "9999999999999999999999999999999999999999".into();
 
         // Open blocking findings dominate the presentation either way.
         detail.job.open_issue_count = Some(3);
