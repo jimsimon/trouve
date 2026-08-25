@@ -52,6 +52,8 @@ import {
 const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const CALLBACK_PATH = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 const MAX_CALLBACK_BODY_BYTES = 4 * 1024 * 1024;
+const MAX_QUALIFICATION_CALLBACKS = 256;
+const MAX_QUALIFICATION_CALLBACK_CONCURRENCY = 16;
 const SCHEMA_PROBE_COUNT = 128;
 const RED_PIXEL_PNG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zt9sAAAAASUVORK5CYII=";
@@ -168,6 +170,30 @@ function bearerMatches(header, token) {
   return presented.length === expected.length && timingSafeEqual(presented, expected);
 }
 
+export function createCallbackAdmission(
+  maximumTotal = MAX_QUALIFICATION_CALLBACKS,
+  maximumConcurrent = MAX_QUALIFICATION_CALLBACK_CONCURRENCY,
+) {
+  let total = 0;
+  let active = 0;
+  return {
+    tryAcquire() {
+      if (total >= maximumTotal || active >= maximumConcurrent) return undefined;
+      total += 1;
+      active += 1;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        active -= 1;
+      };
+    },
+    snapshot() {
+      return { total, active };
+    },
+  };
+}
+
 async function readRequestBody(request, timeoutMilliseconds) {
   const chunks = [];
   let length = 0;
@@ -194,7 +220,9 @@ async function startCallbackServer(handlers, timeoutMilliseconds) {
   const bearer = randomBytes(32).toString("base64url");
   const calls = [];
   const failures = [];
+  const admission = createCallbackAdmission();
   const server = createServer(async (request, response) => {
+    let releaseAdmission;
     try {
       const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
       if (request.method !== "POST" || path !== CALLBACK_PATH) {
@@ -204,6 +232,18 @@ async function startCallbackServer(handlers, timeoutMilliseconds) {
       if (!bearerMatches(request.headers.authorization, bearer)) {
         response.writeHead(401, { "content-type": "application/json" });
         response.end(JSON.stringify({ code: "unauthenticated", message: "Unauthorized" }));
+        return;
+      }
+      releaseAdmission = admission.tryAcquire();
+      if (releaseAdmission === undefined) {
+        request.resume();
+        response.writeHead(429, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            code: "resource_exhausted",
+            message: "qualification callback capacity exhausted",
+          }),
+        );
         return;
       }
       const body = JSON.parse(await readRequestBody(request, timeoutMilliseconds));
@@ -255,6 +295,8 @@ async function startCallbackServer(handlers, timeoutMilliseconds) {
           }),
         );
       }
+    } finally {
+      releaseAdmission?.();
     }
   });
   await new Promise((accept, reject) => {
