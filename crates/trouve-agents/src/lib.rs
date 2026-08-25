@@ -1,16 +1,17 @@
 //! External agent backends: vendor coding agents (Codex, Cursor, Claude
-//! Code) driven through their sanctioned CLI/JSON interfaces, running inside
+//! Code) driven through their sanctioned runtime interfaces, running inside
 //! trouve's session worktrees.
 //!
 //! Unlike a `trouve_providers::Provider` (raw model inference inside
 //! trouve's own agent loop), an [`AgentBackend`] owns the whole turn: the
 //! vendor harness plans, calls its own tools, and edits files. Trouve
 //! translates its event stream into the trouve protocol and bridges its
-//! approval requests through the engine's permission layer. Subscription
-//! auth stays inside the vendor binary — we never touch vendor OAuth tokens.
+//! approval requests through the engine's permission layer. Credentials are
+//! passed only through each vendor's supported authentication surface.
 
 pub mod claude;
 pub mod codex;
+#[path = "cursor_sdk.rs"]
 pub mod cursor;
 pub mod install;
 mod login;
@@ -471,9 +472,9 @@ pub trait AgentBackend: Send + Sync {
 
     /// Live subscription usage (plan, metered allowance windows). Codex
     /// answers via its app-server, Claude Code via a stream-json `get_usage`
-    /// control request, and Cursor via the dashboard's undocumented usage
-    /// RPC (using the CLI's stored login). `None` means the vendor shares
-    /// nothing at all.
+    /// control request, and Cursor by exchanging its configured API key for
+    /// an ephemeral token and calling the dashboard's undocumented usage RPC.
+    /// `None` means the vendor shares nothing at all.
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         None
     }
@@ -1096,11 +1097,6 @@ where
     })
 }
 
-/// Simple options-schema for backend models: vendors own the knobs.
-pub(crate) fn empty_schema() -> serde_json::Value {
-    serde_json::json!({"type": "object", "properties": {}})
-}
-
 /// "resets in 2h 10m" from a unix timestamp (seconds; tolerates millis).
 pub(crate) fn format_reset(at: i64) -> String {
     let at = if at > 100_000_000_000 { at / 1000 } else { at };
@@ -1118,20 +1114,6 @@ pub(crate) fn format_reset(at: i64) -> String {
         format!("resets in {hours}h {mins}m")
     } else {
         format!("resets in {}m", mins.max(1))
-    }
-}
-
-/// Build a ModelInfo for a backend model.
-pub(crate) fn model(backend_id: &str, name: &str, display: &str, context_window: u64) -> ModelInfo {
-    ModelInfo {
-        id: format!("{backend_id}/{name}"),
-        display_name: display.into(),
-        context_window,
-        supports_tools: true,
-        // Subscription-billed: no per-token prices.
-        input_price_per_mtok: None,
-        output_price_per_mtok: None,
-        options_schema: empty_schema(),
     }
 }
 

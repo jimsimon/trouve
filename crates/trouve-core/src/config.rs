@@ -120,10 +120,10 @@ pub struct GithubEnterpriseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Wire protocol / integration kind:
-    /// - "openai-compat" (chat completions; OpenAI, OpenRouter, Ollama, ...)
+    /// - "openai-compat" (chat completions; OpenRouter, Ollama, ...)
     /// - "anthropic" (Messages API)
-    /// - "codex-app-server", "cursor-cli", "claude-cli" (vendor agent
-    ///   backends driven through their CLIs; auth lives in the vendor CLI)
+    /// - "codex-app-server", "cursor-sdk", "claude-cli" (vendor agent
+    ///   backends; `cursor-cli` remains a legacy alias for `cursor-sdk`)
     #[serde(default = "default_kind")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,17 +150,17 @@ pub struct ProviderConfig {
     /// tokens (refreshed automatically).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<trouve_providers::auth::OAuthConfig>,
-    /// Path/name of the vendor binary for CLI-backed kinds (defaults:
-    /// "codex", "cursor-agent", "claude"). Also how tests point adapters at
-    /// stub binaries.
+    /// Path/name of the vendor runtime binary (defaults: "codex",
+    /// "cursor-sdk-bridge", "claude"). Also how tests point adapters at stub
+    /// binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Claude Code and Codex: bridge trouve's ToolExecutor in over MCP for
-    /// full tool/permission fidelity. Claude's built-ins are disabled; Codex
-    /// built-ins are confined to a read-only sandbox. Defaults to true for
-    /// those backends; explicit false retains the vendor-native fallback.
-    /// On tool-enabled turns, Cursor always receives the supplemental
-    /// semantic-search bridge because ACP cannot disable its native tools.
+    /// Bridge trouve's ToolExecutor in over MCP for full tool/permission
+    /// fidelity. Claude's built-ins are disabled; Codex built-ins are
+    /// confined to a read-only sandbox. Defaults to true for those backends;
+    /// explicit false retains their vendor-native fallback. Cursor's Agent
+    /// SDK always uses the full bridge and ignores false because its explicit
+    /// tool allowlist makes the bridge the complete capability boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_bridge: Option<bool>,
 }
