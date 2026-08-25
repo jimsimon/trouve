@@ -40,6 +40,7 @@ import {
   terminalStatusIsFinished,
   terminateProcessTree,
   unary,
+  verifyToolAllowlist,
 } from "./qualify_cursor_sdk_bridge.mjs";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
@@ -164,20 +165,29 @@ function bearerMatches(header, token) {
   return presented.length === expected.length && timingSafeEqual(presented, expected);
 }
 
-async function readRequestBody(request) {
+async function readRequestBody(request, timeoutMilliseconds) {
   const chunks = [];
   let length = 0;
-  for await (const chunk of request) {
-    length += chunk.length;
-    if (length > MAX_CALLBACK_BODY_BYTES) {
-      throw new QualificationError("callback request exceeded the qualification limit");
+  const timer = setTimeout(
+    () => request.destroy(new QualificationError("callback request body timed out")),
+    Math.min(timeoutMilliseconds, 30_000),
+  );
+  try {
+    for await (const chunk of request) {
+      length += chunk.length;
+      if (length > MAX_CALLBACK_BODY_BYTES) {
+        request.destroy();
+        throw new QualificationError("callback request exceeded the qualification limit");
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+    return Buffer.concat(chunks).toString("utf8");
+  } finally {
+    clearTimeout(timer);
   }
-  return Buffer.concat(chunks).toString("utf8");
 }
 
-async function startCallbackServer(handlers) {
+async function startCallbackServer(handlers, timeoutMilliseconds) {
   const bearer = randomBytes(32).toString("base64url");
   const calls = [];
   const failures = [];
@@ -193,7 +203,7 @@ async function startCallbackServer(handlers) {
         response.end(JSON.stringify({ code: "unauthenticated", message: "Unauthorized" }));
         return;
       }
-      const body = JSON.parse(await readRequestBody(request));
+      const body = JSON.parse(await readRequestBody(request, timeoutMilliseconds));
       if (
         typeof body.toolName !== "string" ||
         typeof body.agentId !== "string" ||
@@ -546,6 +556,8 @@ async function observeCompletedRun(bridge, runId, timeoutMilliseconds) {
   let exclusiveResume = null;
   if (offsets.length > 0) {
     const afterOffset = offsets[0];
+    const offsetIndex = replay.findIndex((frame) => frame.offset === afterOffset);
+    const expectedSuffix = replay.slice(offsetIndex + 1);
     const resumed = await serverStream(
       bridge,
       "SdkAgentService",
@@ -558,6 +570,11 @@ async function observeCompletedRun(bridge, runId, timeoutMilliseconds) {
       .filter((offset) => typeof offset === "string" && offset.length > 0);
     if (resumedOffsets.includes(afterOffset)) {
       throw new QualificationError("ObserveRun afterOffset was not exclusive");
+    }
+    if (JSON.stringify(resumed) !== JSON.stringify(expectedSuffix)) {
+      throw new QualificationError(
+        "ObserveRun afterOffset did not return the exact replay suffix",
+      );
     }
     if (!resumed.some((frame) => frame.done !== undefined)) {
       throw new QualificationError("resumed ObserveRun omitted done");
@@ -640,7 +657,7 @@ async function qualifyCancellation({
   };
 }
 
-async function bridgeBearerFailsClosed(bridge) {
+async function bridgeBearerFailsClosed(bridge, timeoutMilliseconds) {
   const response = await fetch(`${bridge.url}/sdk.v1.SdkBridgeControlService/Ping`, {
     method: "POST",
     headers: {
@@ -648,11 +665,14 @@ async function bridgeBearerFailsClosed(bridge) {
       "content-type": "application/json",
     },
     body: "{}",
+    signal: AbortSignal.timeout(Math.min(timeoutMilliseconds, 10_000)),
   });
-  return response.status === 401;
+  const rejected = response.status === 401;
+  await response.body?.cancel();
+  return rejected;
 }
 
-async function callbackBearerFailsClosed(callback) {
+async function callbackBearerFailsClosed(callback, timeoutMilliseconds) {
   const response = await fetch(`${callback.url}${CALLBACK_PATH}`, {
     method: "POST",
     headers: {
@@ -664,8 +684,11 @@ async function callbackBearerFailsClosed(callback) {
       args: { token: "unauthorized" },
       agentId: "unauthorized",
     }),
+    signal: AbortSignal.timeout(Math.min(timeoutMilliseconds, 10_000)),
   });
-  return response.status === 401;
+  const rejected = response.status === 401;
+  await response.body?.cancel();
+  return rejected;
 }
 
 async function processRssBytes(pid) {
@@ -861,8 +884,11 @@ async function fullQualification(args) {
     resolvedBridge = await resolveBridge(args.bridge, temporaryRoot, timeoutMilliseconds);
     const binaryStat = await stat(resolvedBridge.binary);
     operational.bridge_binary_bytes = binaryStat.size;
-    callback = await startCallbackServer(handlers);
-    const callbackAuthClosed = await callbackBearerFailsClosed(callback);
+    callback = await startCallbackServer(handlers, timeoutMilliseconds);
+    const callbackAuthClosed = await callbackBearerFailsClosed(
+      callback,
+      timeoutMilliseconds,
+    );
     if (!callbackAuthClosed) {
       throw new QualificationError("callback bearer authentication did not fail closed");
     }
@@ -879,7 +905,7 @@ async function fullQualification(args) {
     operational.bridge_startup_ms = Math.round(performance.now() - bridgeStartedAt);
     operational.bridge_ready_rss_bytes = await processRssBytes(bridge.child.pid);
 
-    if (!(await bridgeBearerFailsClosed(bridge))) {
+    if (!(await bridgeBearerFailsClosed(bridge, timeoutMilliseconds))) {
       throw new QualificationError("Bridge bearer authentication did not fail closed");
     }
     const ping = await unary(
@@ -932,6 +958,11 @@ async function fullQualification(args) {
 
     const customTools = buildCustomTools();
     const options = fullAgentOptions(apiKey, model, args.workspace, customTools);
+    const toolPolicy = await verifyToolAllowlist(
+      bridge,
+      options,
+      timeoutMilliseconds,
+    );
     process.stderr.write(
       `Running full Cursor SDK Bridge qualification with model ${model}...\n`,
     );
@@ -952,11 +983,10 @@ async function fullQualification(args) {
       bridge,
       callback,
       agentId,
-      label: "allow-read-and-native-tool-negative",
+      label: "allow-read-under-validated-tool-policy",
       prompt:
-        `Call ${TOOLS.read} exactly once with {"token":"full-read"}. Then try to ` +
-        'call Cursor\'s native shell with "printf forbidden-native-shell". If shell is ' +
-        `unavailable, do not substitute another tool. Reply only ${RESULTS.read}.`,
+        `Call ${TOOLS.read} exactly once with {"token":"full-read"}, then reply ` +
+        `only ${RESULTS.read}.`,
       expectedTools: [TOOLS.read],
       expectedText: RESULTS.read,
       timeoutMilliseconds,
@@ -1056,6 +1086,10 @@ async function fullQualification(args) {
       mode: "AGENT_MODE_OPTION_PLAN",
     });
     turns.push(planTurn.summary);
+    const preRestartRunId = readTurn.summary.run_id;
+    if (typeof preRestartRunId !== "string" || preRestartRunId.length === 0) {
+      throw new QualificationError("pre-restart turn omitted its run id");
+    }
 
     const localUsageBeforeRestart = await getLocalUsage(
       bridge,
@@ -1125,6 +1159,16 @@ async function fullQualification(args) {
     if (!terminalStatusIsFinished(getRun.run?.status)) {
       throw new QualificationError("GetRun did not return the cold resumed run");
     }
+    const historicalRun = await unary(
+      bridge,
+      "SdkAgentService",
+      "GetRun",
+      { runId: preRestartRunId, options: { agentId } },
+      timeoutMilliseconds,
+    );
+    if (!terminalStatusIsFinished(historicalRun.run?.status)) {
+      throw new QualificationError("cold restart lost the pre-restart run");
+    }
     const listedRuns = await unary(
       bridge,
       "SdkAgentService",
@@ -1134,9 +1178,10 @@ async function fullQualification(args) {
     );
     if (
       !Array.isArray(listedRuns.items) ||
-      !listedRuns.items.some((run) => run.runId === coldTurn.summary.run_id)
+      !listedRuns.items.some((run) => run.runId === coldTurn.summary.run_id) ||
+      !listedRuns.items.some((run) => run.runId === preRestartRunId)
     ) {
-      throw new QualificationError("ListRuns omitted the cold resumed run");
+      throw new QualificationError("ListRuns omitted cold or pre-restart history");
     }
     const conversation = await unary(
       bridge,
@@ -1149,6 +1194,19 @@ async function fullQualification(args) {
       throw new QualificationError("GetRunConversation omitted conversation JSON");
     }
     JSON.parse(conversation.conversationJson);
+    const historicalConversation = await unary(
+      bridge,
+      "SdkAgentService",
+      "GetRunConversation",
+      { runId: preRestartRunId },
+      timeoutMilliseconds,
+    );
+    if (typeof historicalConversation.conversationJson !== "string") {
+      throw new QualificationError(
+        "cold restart lost the pre-restart conversation",
+      );
+    }
+    JSON.parse(historicalConversation.conversationJson);
     const agentMessages = await unary(
       bridge,
       "SdkAgentService",
@@ -1208,9 +1266,9 @@ async function fullQualification(args) {
       tools_and_permissions: {
         registered_custom_tools: Object.keys(customTools).length,
         synthetic_schema_probes: SCHEMA_PROBE_COUNT,
-        confinement: "explicit-mcp-only-allow-list",
+        confinement: "sdk-tool-allowlist-contract",
+        tool_policy_validation: toolPolicy,
         cursor_native_sandbox: false,
-        native_shell_negative_probe: true,
         host_allow_result: "passed",
         host_denied_is_error_result: "passed",
         host_denied_terminal_stream_event:
@@ -1223,6 +1281,7 @@ async function fullQualification(args) {
       lifecycle: {
         close_resume: true,
         cold_bridge_process_resume: true,
+        pre_restart_history_after_cold_resume: true,
         durable_observe_replay: replay,
         cancellation,
         post_cancellation_recovery: true,

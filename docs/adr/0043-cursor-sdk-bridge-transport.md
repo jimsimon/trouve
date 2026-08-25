@@ -9,9 +9,10 @@ separate CLI login, could not suppress every vendor-native tool, and exposed
 no same-run steering. Cursor's supported Agent SDK now ships a standalone
 Bridge with a versioned `sdk.v1` Connect contract, API-key authentication,
 durable local agents, streaming, cancellation, model options, and host-owned
-custom-tool callbacks. Local qualification proved those capabilities and
-showed that a strict `mcp` allow-list removes native filesystem and shell
-tools even where Cursor's native sandbox is unavailable.
+custom-tool callbacks. Cursor's published protocol defines `tools` as an
+allow-list of the built-ins offered to the model; local qualification validates
+that the pinned Bridge rejects unknown tool names and emits no calls outside a
+strict `mcp` selection, even where Cursor's native sandbox is unavailable.
 
 Maintaining ACP beside the SDK would preserve two authentication paths, two
 session models, and two tool-confinement contracts for one provider. It would
@@ -36,10 +37,11 @@ credentials, tools, and worktrees from unrelated turns.
   registration before keeping the Bridge warm. Cancellation, consumer loss,
   protocol failure, child exit, or ambiguous cleanup quarantines the process;
   it is terminated and reaped instead of reused.
-- Each configured backend retains at most three idle Bridges, reaps processes
-  idle for five minutes, and checks once per minute. The cap remains soft while
-  all retained processes are actively borrowed so unrelated threads preserve
-  concurrency. Backend reload, runtime update, and uninstall discard the pool.
+- Each configured backend owns at most three Bridge processes, including busy
+  processes and concurrent startups. A fourth thread waits with cancellation
+  support until an idle least-recently-used process can be reaped or capacity
+  becomes available. Idle processes are reaped after five minutes, checked once
+  per minute. Backend reload, runtime update, and uninstall discard the pool.
 - Cursor receives only the SDK's `mcp` capability. Trouve projects the
   thread-scoped internal MCP tool catalog into SDK custom-tool definitions and
   proxies callbacks back through that MCP endpoint. Cursor-native filesystem,
@@ -55,9 +57,10 @@ credentials, tools, and worktrees from unrelated turns.
 - The managed `cursor-sdk-bridge` release replaces `cursor-agent` in the
   existing managed-binary lifecycle. The legacy `/v1/clis` routes remain a
   compatibility surface but are presented as managed agent runtimes. New
-  Cursor configs use `cursor-sdk`; `cursor-cli` is accepted only as a runtime
-  compatibility alias and also selects the SDK adapter. Its obsolete explicit
-  `cursor-agent` command is ignored.
+  Cursor configs use `cursor-sdk`. A persisted `cursor-cli` config is retained
+  only as an explicit migration state: its obsolete `cursor-agent` command is
+  ignored and turns report how to select Cursor (Agent SDK) and save the API
+  key that replaces the incompatible CLI-login credential.
 - Cursor steering remains disabled until the SDK exposes a supported same-run
   injection operation. Cancellation and later resume are not represented as
   steering.

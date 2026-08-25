@@ -123,7 +123,7 @@ pub struct ProviderConfig {
     /// - "openai-compat" (chat completions; OpenRouter, Ollama, ...)
     /// - "anthropic" (Messages API)
     /// - "codex-app-server", "cursor-sdk", "claude-cli" (vendor agent
-    ///   backends; `cursor-cli` remains a legacy alias for `cursor-sdk`)
+    ///   backends; `cursor-cli` remains a legacy migration/recovery state)
     #[serde(default = "default_kind")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

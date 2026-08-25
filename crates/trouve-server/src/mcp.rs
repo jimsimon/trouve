@@ -238,10 +238,6 @@ async fn tools_call(
                 &arguments,
             )
             .await
-            .map(|content| trouve_core::BridgedToolResult {
-                content,
-                images: Vec::new(),
-            })
     } else {
         engine.bridged_tool_call(thread_id, name, &arguments).await
     };

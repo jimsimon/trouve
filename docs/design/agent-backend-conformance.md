@@ -77,7 +77,7 @@ uninstall, and credential-persistence checks—with:
 
 ```sh
 TROUVE_E2E=1 CURSOR_API_KEY=... \
-  cargo test -p trouve-server --test cursor_sdk_live -- --ignored --nocapture
+  cargo test -p trouve-server --test cursor_sdk_live -- --nocapture
 ```
 
 Run the broader promotion probe only when several paid turns are acceptable:
@@ -103,15 +103,16 @@ Both fail before downloading anything when `CURSOR_API_KEY` is absent. The SDK
 deliberately uses API-key authentication rather than a separate CLI login.
 Cursor's native sandbox is disabled in this baseline because the standalone
 runtime does not support it on every host. Confinement instead comes from the
-SDK's explicit `tools: ["mcp"]` allow-list: the effective stream tool list must
-contain no filesystem, shell, task, or other native capability when the runtime
-reports it, and the sole custom callback remains host-owned. Because
-`SDKSystemMessage.tools` is optional, every baseline turn also explicitly asks
-for a harmless native shell call and fails if the stream exposes or executes
-anything except the custom callback. Cursor may label that custom callback as
-the generic `mcp` capability in its tool stream; the probe correlates its call
-id with the named `CallCustomTool` callback and rejects any additional call id
-or native-tool name.
+SDK's explicit `tools: ["mcp"]` allow-list. Before any paid turn, each probe
+deterministically submits an unknown built-in name and requires CreateAgent to
+reject it, proving that the pinned runtime is validating the allow-list control
+rather than silently ignoring it. Stream tool telemetry is corroborating
+evidence only: when present it must contain no filesystem, shell, task, or
+other native capability. Cursor may label a custom callback as either the
+generic `mcp` capability or its exact custom-tool name; the probe accepts only
+those exact spellings, correlates the call id with `CallCustomTool`, and rejects
+every additional call id or tool name. Model compliance with a prompt is never
+treated as confinement evidence.
 
 Qualification is gated in this order:
 
