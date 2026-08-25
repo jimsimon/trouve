@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.15"
+    "version": "7.16"
   },
   "paths": {
     "/v1/approvals": {
@@ -13807,7 +13807,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "Transport family, such as \"openai-compat\", \"anthropic\",\n\"azure-openai\", \"amazon-bedrock\", \"google-vertex\", or\n\"google-vertex-anthropic\"."
+            "description": "Transport family, such as \"openai-responses\", \"openai-compat\",\n\"anthropic\", \"azure-openai\", \"amazon-bedrock\", \"google-vertex\", or\n\"google-vertex-anthropic\"."
           },
           "query_params": {
             "type": "object",

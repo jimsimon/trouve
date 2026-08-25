@@ -1427,6 +1427,11 @@ async fn session_and_thread_updates_and_provider_config() {
         .unwrap();
     let known = known.as_array().unwrap();
     assert!(known.len() >= 145);
+    let openai = known
+        .iter()
+        .find(|provider| provider["id"] == "openai")
+        .expect("openai preset");
+    assert_eq!(openai["kind"], "openai-responses");
     let openrouter = known
         .iter()
         .find(|k| k["id"] == "openrouter")

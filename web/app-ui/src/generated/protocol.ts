@@ -4878,8 +4878,8 @@ export interface components {
                 [key: string]: string;
             };
             /**
-             * @description Transport family, such as "openai-compat", "anthropic",
-             *     "azure-openai", "amazon-bedrock", "google-vertex", or
+             * @description Transport family, such as "openai-responses", "openai-compat",
+             *     "anthropic", "azure-openai", "amazon-bedrock", "google-vertex", or
              *     "google-vertex-anthropic".
              */
             kind: string;

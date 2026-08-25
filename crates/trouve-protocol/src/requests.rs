@@ -2676,8 +2676,8 @@ pub struct ProvidersResponse {
 /// store, never to the config file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpsertProviderRequest {
-    /// Transport family, such as "openai-compat", "anthropic",
-    /// "azure-openai", "amazon-bedrock", "google-vertex", or
+    /// Transport family, such as "openai-responses", "openai-compat",
+    /// "anthropic", "azure-openai", "amazon-bedrock", "google-vertex", or
     /// "google-vertex-anthropic".
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
