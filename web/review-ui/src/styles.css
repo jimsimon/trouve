@@ -121,7 +121,7 @@ button.compact { padding: 6px 9px; font-size: 12px; }
 .status.succeeded, .status.ready, .status.success, .status.open { color: #9cf0c6; border-color: #2d7558; background: #183d31; }
 .status.failed, .status.failure, .status.credentials.required { color: #ffabb7; border-color: #883b49; background: #46212a; }
 .status.warning { color: #ffd78c; border-color: #705728; background: #3a2d17; }
-.status.cancelled, .status.stale, .status.disabled, .status.fixed { color: #afb6c4; }
+.status.cancelled, .status.stale, .status.disabled, .status.fixed, .status.dismissed { color: #afb6c4; }
 .progress { position: relative; height: 18px; margin-top: 8px; border-radius: 4px; overflow: hidden; background: #0c111b; }
 .progress > span { display: block; width: 100%; height: 100%; transform-origin: left center; background: linear-gradient(90deg, #397bc5, #65b2ff); transition: transform .25s; }
 .progress small { position: absolute; inset: 2px 6px; color: white; font-size: 10px; text-shadow: 0 1px 2px #000; }
