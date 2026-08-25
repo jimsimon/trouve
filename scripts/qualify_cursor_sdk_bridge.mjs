@@ -29,6 +29,7 @@ import {
   rm,
 } from "node:fs/promises";
 import { createServer } from "node:http";
+import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
@@ -471,6 +472,32 @@ function capPendingDiagnostic(value) {
   };
 }
 
+function validateLoopbackBridgeUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (error) {
+    throw new QualificationError(`Cursor SDK Bridge returned an invalid URL: ${error}`);
+  }
+  const hostname = parsed.hostname.replace(/^\[|\]$/gu, "");
+  const ipVersion = isIP(hostname);
+  const loopback =
+    (ipVersion === 4 && hostname.split(".")[0] === "127") ||
+    (ipVersion === 6 && hostname === "::1");
+  if (
+    parsed.protocol !== "http:" ||
+    !loopback ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  ) {
+    throw new QualificationError(
+      "Cursor SDK Bridge must advertise an uncredentialed literal loopback HTTP URL",
+    );
+  }
+}
+
 async function startBridge({
   binary,
   workspace,
@@ -586,6 +613,7 @@ async function startBridge({
     ) {
       throw new QualificationError("Cursor SDK Bridge returned an unsupported discovery payload");
     }
+    validateLoopbackBridgeUrl(ready.url);
     const token =
       typeof ready.authToken === "string"
         ? ready.authToken.trim()
@@ -1421,6 +1449,7 @@ export {
   terminateProcessTree,
   unary,
   verifyToolAllowlist,
+  validateLoopbackBridgeUrl,
   waitForChildSettlement,
 };
 
