@@ -2991,7 +2991,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   ) {
     this.#ensureMarkdown();
     const steered = item.kind === "steered";
-    const label = steered ? "Steered" : "Prompt";
+    const background = item.kind === "user" && item.background;
+    const label = steered ? "Steered" : background ? "Background activity" : "Prompt";
     return html`
       <section
         class=${`turn-rail-node turn-${steered ? "steered" : "prompt"}-node user-message`}
@@ -2999,11 +3000,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         aria-label=${label}
       >
         <span class=${`turn-rail-marker ${steered ? "steered" : "prompt"}`} aria-hidden="true">
-          ${fontAwesomeIcon(steered ? "route" : "user")}
+          ${fontAwesomeIcon(steered ? "route" : background ? "gear" : "user")}
         </span>
         <header class="turn-node-header"><strong>${label}</strong></header>
         <div class="turn-node-body user-body-stream">
-          ${item.content === ""
+          ${item.content === "" || background
             ? nothing
             : html`<trouve-markdown-view
                 .content=${item.content}

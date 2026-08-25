@@ -2797,6 +2797,13 @@ export interface components {
              *     `GET /v1/attachments/{id}`).
              */
             attachments?: components["schemas"]["Attachment"][];
+            /**
+             * @description The turn was dispatched by the server to attach to
+             *     vendor-autonomous agent activity; `content` is a fixed marker,
+             *     not user input. Clients should render the turn as background
+             *     agent activity.
+             */
+            background?: boolean;
             content: string;
             /** Format: int64 */
             turn: number;
@@ -4070,6 +4077,11 @@ export interface components {
         QueuedPrompt: {
             /** @description Attachments uploaded with the prompt (already stored server-side). */
             attachments?: components["schemas"]["Attachment"][];
+            /**
+             * @description Server-dispatched attach prompt for vendor-autonomous agent
+             *     activity. Trusted dispatch metadata: never inferred from `content`.
+             */
+            background?: boolean;
             content: string;
             created_at: string;
             id: string;
@@ -4572,6 +4584,11 @@ export interface components {
          */
         ThreadViewItem: {
             attachments: components["schemas"]["Attachment"][];
+            /**
+             * @description Server-dispatched attach turn for vendor-autonomous agent
+             *     activity; render as background activity, not as user input.
+             */
+            background?: boolean;
             content: string;
             /** @enum {string} */
             kind: "user";

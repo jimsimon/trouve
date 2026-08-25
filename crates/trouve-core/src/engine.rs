@@ -2849,10 +2849,11 @@ impl Engine {
         {
             return Ok(());
         }
-        self.send_message_with_tools(
+        self.send_message_inner(
             thread_id,
             BACKGROUND_ATTACH_PROMPT.to_string(),
             Vec::new(),
+            true,
             true,
             true,
         )
@@ -9069,6 +9070,7 @@ impl Engine {
                 turn,
                 content: prompt.content.clone(),
                 attachments: prompt.attachments.clone(),
+                background: prompt.background,
             },
         ])
     }
@@ -9185,6 +9187,29 @@ impl Engine {
         tools_enabled: bool,
         allow_spawned: bool,
     ) -> Result<TurnAccepted, EngineError> {
+        self.send_message_inner(
+            thread_id,
+            content,
+            uploads,
+            tools_enabled,
+            allow_spawned,
+            false,
+        )
+    }
+
+    /// Full prompt-submission path. `background` marks a server-dispatched
+    /// attach turn for vendor-autonomous activity; it is trusted dispatch
+    /// metadata carried on the queued prompt, never inferred from content.
+    #[allow(clippy::too_many_arguments)]
+    fn send_message_inner(
+        self: &Arc<Self>,
+        thread_id: &str,
+        content: String,
+        uploads: Vec<trouve_protocol::AttachmentUpload>,
+        tools_enabled: bool,
+        allow_spawned: bool,
+        background: bool,
+    ) -> Result<TurnAccepted, EngineError> {
         let thread = self.get_thread(thread_id)?; // 404 for unknown threads
         if !allow_spawned && self.subagent_is_read_only(&thread)? {
             return Err(EngineError::Conflict(
@@ -9221,6 +9246,7 @@ impl Engine {
             thread_id: thread_id.to_string(),
             position,
             content,
+            background,
             attachments,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -9992,6 +10018,7 @@ impl Engine {
                             turn,
                             content: prompt.content.clone(),
                             attachments: prompt.attachments.clone(),
+                            background: prompt.background,
                         },
                     ]);
                 }
@@ -10317,6 +10344,7 @@ impl Engine {
                     cancel,
                     &prompt.id,
                     tools_enabled,
+                    prompt.background,
                 )
                 .await;
         }
@@ -11528,6 +11556,7 @@ impl Engine {
                 turn: collaborator.turn,
                 content: content.clone(),
                 attachments: Vec::new(),
+                background: false,
             }
         };
         collaborator.persisted.push(event);
@@ -12020,6 +12049,7 @@ impl Engine {
                     turn: collaborator.turn,
                     content: content.clone(),
                     attachments: Vec::new(),
+                    background: false,
                 });
                 collaborator.last_user_message = Some(content);
                 flush_backend_event_batch(
@@ -12248,6 +12278,7 @@ impl Engine {
         cancel: tokio_util::sync::CancellationToken,
         queued_prompt_id: &str,
         tools_enabled: bool,
+        attach_background: bool,
     ) -> Result<()> {
         let startup_started = Instant::now();
         let scope = Scope::Thread(thread.id.clone());
@@ -12322,7 +12353,6 @@ impl Engine {
             .map(|file| (file.attachment.clone(), file.relative_path.clone()))
             .collect::<Vec<_>>();
         let content = annotate_attachments(content, &prompt_files);
-        let attach_background = content == BACKGROUND_ATTACH_PROMPT;
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
             .map(|file| trouve_agents::TurnAttachment {
@@ -21288,6 +21318,7 @@ default_permission_mode = "ask"
                 turn: 2,
                 content: "Please compare with repos/o/r/pulls/73".into(),
                 attachments: vec![],
+                background: false,
             },
         ];
         let evidence = pr_evidence_from_events(events, "github.com", "o", "r");

@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS queued_prompts (
   attachments TEXT NOT NULL DEFAULT '[]',  -- JSON [trouve_protocol::Attachment]
   claimed INTEGER NOT NULL DEFAULT 0,
   tools_enabled INTEGER NOT NULL DEFAULT 1,
+  background INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queued_prompts_thread ON queued_prompts (thread_id, position);
@@ -781,6 +782,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN review_covered_full_branch INTEGER",
     "ALTER TABLE code_review_findings ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_checkbox_edited_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE queued_prompts ADD COLUMN background INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -5172,8 +5174,8 @@ fn apply_store_mutation(
             }
             conn.execute(
                 "INSERT INTO queued_prompts
-                   (id, thread_id, position, content, attachments, tools_enabled, claimed, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                   (id, thread_id, position, content, attachments, tools_enabled, background, claimed, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
                 params![
                     prompt.id,
                     prompt.thread_id,
@@ -5181,6 +5183,7 @@ fn apply_store_mutation(
                     prompt.content,
                     serde_json::to_string(&prompt.attachments)?,
                     tools_enabled,
+                    prompt.background,
                     prompt.created_at,
                 ],
             )?;
@@ -7475,10 +7478,10 @@ impl Store {
         let attachments_json = serde_json::to_string(attachments)?;
         conn.execute(
             "INSERT INTO queued_prompts
-               (id, thread_id, position, content, attachments, tools_enabled, created_at)
+               (id, thread_id, position, content, attachments, tools_enabled, background, created_at)
              VALUES (?1, ?2,
                (SELECT COALESCE(MAX(position), 0) + 1 FROM queued_prompts WHERE thread_id = ?2),
-               ?3, ?4, ?5, ?6)",
+               ?3, ?4, ?5, 0, ?6)",
             params![
                 id,
                 thread_id,
@@ -7497,6 +7500,7 @@ impl Store {
             id,
             thread_id: thread_id.to_string(),
             position: position as u64,
+            background: false,
             content: content.to_string(),
             attachments: attachments.to_vec(),
             created_at,
@@ -7525,7 +7529,7 @@ impl Store {
     pub fn queued_prompts(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, position, content, attachments, created_at FROM queued_prompts
+            "SELECT id, position, content, attachments, created_at, background FROM queued_prompts
              WHERE thread_id = ?1 AND claimed = 0 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
@@ -7536,6 +7540,7 @@ impl Store {
                 content: r.get(2)?,
                 attachments: parse_attachments(&r.get::<_, String>(3)?),
                 created_at: r.get(4)?,
+                background: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -7760,7 +7765,7 @@ impl Store {
         let tx = write_transaction(&conn)?;
         let Some(mut prompt) = tx
             .query_row(
-                "SELECT thread_id, content, attachments, created_at
+                "SELECT thread_id, content, attachments, created_at, background
                  FROM queued_prompts WHERE id = ?1 AND claimed = 0",
                 params![id],
                 |row| {
@@ -7768,6 +7773,7 @@ impl Store {
                         id: id.to_string(),
                         thread_id: row.get(0)?,
                         position: 0,
+                        background: row.get(4)?,
                         content: row.get(1)?,
                         attachments: parse_attachments(&row.get::<_, String>(2)?),
                         created_at: row.get(3)?,
@@ -7817,7 +7823,7 @@ impl Store {
         let tx = write_transaction(&conn)?;
         let front = tx
             .query_row(
-                "SELECT id, position, content, attachments, created_at FROM queued_prompts
+                "SELECT id, position, content, attachments, created_at, background FROM queued_prompts
                  WHERE thread_id = ?1 AND claimed = 0 ORDER BY position LIMIT 1",
                 params![thread_id],
                 |r| {
@@ -7825,6 +7831,7 @@ impl Store {
                         id: r.get(0)?,
                         thread_id: thread_id.to_string(),
                         position: r.get::<_, i64>(1)? as u64,
+                        background: r.get(5)?,
                         content: r.get(2)?,
                         attachments: parse_attachments(&r.get::<_, String>(3)?),
                         created_at: r.get(4)?,
@@ -15119,6 +15126,7 @@ mod tests {
                 turn: 1,
                 content: "hello".into(),
                 attachments: Vec::new(),
+                background: false,
             },
             Event::AssistantDelta {
                 turn: 1,
@@ -15242,6 +15250,7 @@ mod tests {
                     turn,
                     content: format!("historical prompt {turn}"),
                     attachments: Vec::new(),
+                    background: false,
                 },
                 Event::AssistantMessage {
                     turn,
@@ -15293,6 +15302,7 @@ mod tests {
                     turn,
                     content: format!("cancelled prompt {turn}"),
                     attachments: Vec::new(),
+                    background: false,
                 },
                 Event::AssistantMessage {
                     turn,
@@ -15351,6 +15361,7 @@ mod tests {
                 turn: 1,
                 content: "inspect the repository".into(),
                 attachments: Vec::new(),
+                background: false,
             },
             Event::ToolRequested {
                 turn: 1,
@@ -17692,6 +17703,65 @@ mod tests {
     }
 
     #[test]
+    fn background_attach_prompts_round_trip_as_trusted_metadata() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_bg");
+        // A user typing the literal marker text gets an ordinary prompt: the
+        // flag is dispatch metadata, never inferred from content.
+        let user_prompt = trouve_protocol::QueuedPrompt {
+            id: "qp_user_marker".into(),
+            thread_id: "th_bg".into(),
+            position: 1,
+            content: "[background agent activity]".into(),
+            background: false,
+            attachments: Vec::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let attach_prompt = trouve_protocol::QueuedPrompt {
+            id: "qp_attach".into(),
+            thread_id: "th_bg".into(),
+            position: 2,
+            content: "[background agent activity]".into(),
+            background: true,
+            attachments: Vec::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        for prompt in [&user_prompt, &attach_prompt] {
+            store
+                .accept_prompt_with_events(
+                    PromptAcceptance {
+                        prompt: (*prompt).clone(),
+                        tools_enabled: true,
+                        attachments: Vec::new(),
+                        claim_prompt_id: None,
+                        expected_previous_turn: None,
+                        staging_cleanup_claim: None,
+                    },
+                    vec![(
+                        Scope::Thread("th_bg".into()),
+                        Event::QueueUpdated {
+                            prompts: Vec::new(),
+                        },
+                    )],
+                )
+                .unwrap();
+        }
+        let queued = store.queued_prompts("th_bg").unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|prompt| (prompt.id.as_str(), prompt.background))
+                .collect::<Vec<_>>(),
+            vec![("qp_user_marker", false), ("qp_attach", true)]
+        );
+        let first = store.claim_queued_prompt("th_bg").unwrap().unwrap();
+        assert!(!first.background, "identical content stays a user prompt");
+        assert!(store.finish_queued_prompt(&first.id).unwrap());
+        let second = store.claim_queued_prompt("th_bg").unwrap().unwrap();
+        assert!(second.background, "dispatch metadata survives the claim");
+    }
+
+    #[test]
     fn prompt_acceptance_commits_queue_turn_attachments_and_events_atomically() {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_accept");
@@ -17706,6 +17776,7 @@ mod tests {
             thread_id: "th_accept".into(),
             position: 1,
             content: "Ship the prompt quickly".into(),
+            background: false,
             attachments: vec![attachment.clone()],
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -17732,6 +17803,7 @@ mod tests {
                     turn: 1,
                     content: prompt.content.clone(),
                     attachments: prompt.attachments.clone(),
+                    background: false,
                 },
             ),
         ];
@@ -17788,6 +17860,7 @@ mod tests {
             thread_id: "th_accept_rollback".into(),
             position: 1,
             content: "This transaction must roll back".into(),
+            background: false,
             attachments: vec![attachment.clone()],
             created_at: chrono::Utc::now().to_rfc3339(),
         };

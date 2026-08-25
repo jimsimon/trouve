@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.18"
+    "version": "7.19"
   },
   "paths": {
     "/v1/approvals": {
@@ -7660,6 +7660,10 @@
                 },
                 "description": "Files the user attached to the prompt (bytes at\n`GET /v1/attachments/{id}`)."
               },
+              "background": {
+                "type": "boolean",
+                "description": "The turn was dispatched by the server to attach to\nvendor-autonomous agent activity; `content` is a fixed marker,\nnot user input. Clients should render the turn as background\nagent activity."
+              },
               "content": {
                 "type": "string"
               },
@@ -11619,6 +11623,10 @@
             },
             "description": "Attachments uploaded with the prompt (already stored server-side)."
           },
+          "background": {
+            "type": "boolean",
+            "description": "Server-dispatched attach prompt for vendor-autonomous agent\nactivity. Trusted dispatch metadata: never inferred from `content`."
+          },
           "content": {
             "type": "string"
           },
@@ -12828,6 +12836,10 @@
                 "items": {
                   "$ref": "#/components/schemas/Attachment"
                 }
+              },
+              "background": {
+                "type": "boolean",
+                "description": "Server-dispatched attach turn for vendor-autonomous agent\nactivity; render as background activity, not as user input."
               },
               "content": {
                 "type": "string"

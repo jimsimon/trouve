@@ -193,11 +193,13 @@ impl ThreadProjection {
                 turn,
                 content,
                 attachments,
+                background,
             } => {
                 self.push(ThreadViewItem::User {
                     turn: *turn,
                     content: content.clone(),
                     attachments: attachments.clone(),
+                    background: *background,
                 });
             }
             Event::TurnSteered {
@@ -1422,6 +1424,7 @@ mod tests {
                 turn: 7,
                 content: "Start here.".into(),
                 attachments: Vec::new(),
+                background: false,
             },
             Event::AssistantThinking {
                 turn: 7,
@@ -1521,6 +1524,7 @@ mod tests {
                 turn: 1,
                 content: "keep this prompt".into(),
                 attachments: Vec::new(),
+                background: false,
             },
             Event::AssistantMessage {
                 turn: 1,
@@ -1562,6 +1566,7 @@ mod tests {
                 turn: 1,
                 content: "first".into(),
                 attachments: Vec::new(),
+                background: false,
             },
             Event::TurnCompleted {
                 turn: 1,

@@ -378,6 +378,10 @@ pub enum ThreadViewItem {
         turn: u64,
         content: String,
         attachments: Vec<Attachment>,
+        /// Server-dispatched attach turn for vendor-autonomous agent
+        /// activity; render as background activity, not as user input.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        background: bool,
     },
     Steered {
         turn: u64,
@@ -683,6 +687,10 @@ pub struct QueuedPrompt {
     pub thread_id: ThreadId,
     pub position: u64,
     pub content: String,
+    /// Server-dispatched attach prompt for vendor-autonomous agent
+    /// activity. Trusted dispatch metadata: never inferred from `content`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
     /// Attachments uploaded with the prompt (already stored server-side).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,

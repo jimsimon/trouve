@@ -224,6 +224,9 @@ struct RouterState {
     /// The registered consumer is an attach turn: it must receive exactly
     /// one buffered/live background turn, ending at its `result` line.
     turn_is_attach: bool,
+    /// A non-attach consumer registered but its prompt has not been written
+    /// to the vendor yet, so no arriving line can belong to it.
+    prompt_pending: bool,
     /// The process is inside a vendor-autonomous turn whose `result` has not
     /// arrived yet.
     background_in_flight: bool,
@@ -245,13 +248,20 @@ struct StdoutRouter {
     state: std::sync::Mutex<RouterState>,
     /// Wakes the router loop when a consumer registers.
     notify: tokio::sync::Notify,
+    /// Announces a pending vendor-autonomous turn to the engine. Invoked
+    /// whenever a turn begins with no consumer, and re-invoked whenever a
+    /// buffered turn loses or outlives its attach consumer, so every
+    /// buffered turn is eventually announced even if an earlier signal or
+    /// attach was lost.
+    signal: Box<dyn Fn() + Send + Sync>,
 }
 
 impl StdoutRouter {
-    fn new() -> Self {
+    fn new(signal: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             state: std::sync::Mutex::new(RouterState::default()),
             notify: tokio::sync::Notify::new(),
+            signal: Box::new(signal),
         }
     }
 
@@ -261,11 +271,17 @@ impl StdoutRouter {
         state.turn.is_some() || state.background_in_flight
     }
 
+    /// The registered non-attach turn's prompt reached the vendor; lines
+    /// arriving from now on may belong to it.
+    fn prompt_delivered(&self) {
+        self.state.lock().unwrap().prompt_pending = false;
+    }
+
     /// Install the consumer for a trouve-initiated turn. A non-attach turn
-    /// starts receiving lines only after any in-flight background turn
-    /// reaches its `result`; an attach turn receives exactly one background
-    /// turn (buffered and/or live) and reports `NothingPending` when there
-    /// is none.
+    /// starts receiving lines only after its prompt is delivered and any
+    /// in-flight background turn reaches its `result`; an attach turn
+    /// receives exactly one background turn (buffered and/or live) and
+    /// reports `NothingPending` when there is none.
     fn register(
         &self,
         sender: mpsc::Sender<String>,
@@ -274,9 +290,14 @@ impl StdoutRouter {
         let mut state = self.state.lock().unwrap();
         if state.turn.as_ref().is_some_and(|turn| turn.is_closed()) {
             // A cancelled turn's consumer can linger until its next send
-            // fails; replace it eagerly so registration never deadlocks.
+            // fails; replace it eagerly so registration never deadlocks. A
+            // dead attach consumer may leave its turn buffered: re-announce.
+            let was_attach = state.turn_is_attach;
             state.turn = None;
             state.turn_is_attach = false;
+            if was_attach && (!state.background.is_empty() || state.background_in_flight) {
+                (self.signal)();
+            }
         }
         if state.turn.is_some() {
             return Err(BackendError::Protocol(
@@ -295,6 +316,7 @@ impl StdoutRouter {
         }
         state.turn = Some(sender);
         state.turn_is_attach = attach;
+        state.prompt_pending = !attach;
         drop(state);
         self.notify.notify_one();
         Ok(RouterRegistration::Streaming)
@@ -312,13 +334,33 @@ impl StdoutRouter {
         }
     }
 
-    /// Run the routing loop until the stdout pump closes. `on_background_start`
-    /// is invoked (non-blocking) each time a vendor-autonomous turn begins.
-    async fn run(
-        self: Arc<Self>,
-        mut lines: mpsc::Receiver<String>,
-        on_background_start: impl Fn(),
-    ) {
+    /// Uninstall a failed consumer; when it was an attach consumer, put the
+    /// undelivered line back and re-announce the still-pending turn.
+    fn consumer_lost(&self, sender: &mpsc::Sender<String>, undelivered: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        let current = state
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.same_channel(sender));
+        if !current {
+            return;
+        }
+        let was_attach = state.turn_is_attach;
+        state.turn = None;
+        state.turn_is_attach = false;
+        if was_attach {
+            if let Some(line) = undelivered {
+                state.background_bytes += line.len();
+                state.background.push_front(line);
+            }
+            if !state.background.is_empty() || state.background_in_flight {
+                (self.signal)();
+            }
+        }
+    }
+
+    /// Run the routing loop until the stdout pump closes.
+    async fn run(self: Arc<Self>, mut lines: mpsc::Receiver<String>) {
         loop {
             // Drain buffered background lines to an attach consumer first;
             // this must not require fresh stdout activity.
@@ -339,19 +381,22 @@ impl StdoutRouter {
                     if last {
                         state.turn = None;
                         state.turn_is_attach = false;
+                        if !state.background.is_empty() {
+                            // Another complete buffered turn awaits its own
+                            // attach consumer; its original signal may have
+                            // been consumed by this one.
+                            (self.signal)();
+                        }
                     }
                     (sender, line, last)
                 };
-                if sender.send(line).await.is_err() {
-                    let mut state = self.state.lock().unwrap();
-                    if state
-                        .turn
-                        .as_ref()
-                        .is_some_and(|current| current.same_channel(&sender))
-                    {
-                        state.turn = None;
-                        state.turn_is_attach = false;
+                if sender.send(line.clone()).await.is_err() {
+                    if last_of_turn {
+                        // Consumer death and turn completion coincided; the
+                        // turn is consumed either way.
+                        break;
                     }
+                    self.consumer_lost(&sender, Some(line));
                     break;
                 }
                 if last_of_turn {
@@ -368,10 +413,11 @@ impl StdoutRouter {
             };
             let is_result = line_is_result(&line);
             // Decide the destination under the lock, send outside it.
-            let destination = {
+            let (destination, attach_completed) = {
                 let mut state = self.state.lock().unwrap();
                 let turn = state.turn.clone();
                 let is_attach = state.turn_is_attach;
+                let prompt_pending = state.prompt_pending;
                 let in_flight = state.background_in_flight;
                 match (turn, in_flight) {
                     // An attach consumer takes the in-flight background
@@ -382,7 +428,7 @@ impl StdoutRouter {
                             state.turn = None;
                             state.turn_is_attach = false;
                         }
-                        Some(sender)
+                        (Some(sender), is_result)
                     }
                     // A background turn in flight always owns the line, even
                     // when a non-attach turn is already registered: that
@@ -393,35 +439,41 @@ impl StdoutRouter {
                             state.background_in_flight = false;
                         }
                         Self::buffer_background(&mut state, line.clone());
-                        None
+                        (None, false)
                     }
-                    (Some(sender), false) => {
+                    (Some(sender), false) if is_attach => {
+                        // Live continuation of a partially buffered turn.
                         if is_result {
                             state.turn = None;
                             state.turn_is_attach = false;
                         }
-                        Some(sender)
+                        (Some(sender), is_result)
                     }
-                    (None, false) => {
-                        // First line of a new vendor-autonomous turn.
+                    (Some(sender), false) if !prompt_pending => {
+                        if is_result {
+                            state.turn = None;
+                        }
+                        (Some(sender), false)
+                    }
+                    // Either no consumer, or a non-attach consumer whose
+                    // prompt has not reached the vendor: this line starts a
+                    // new vendor-autonomous turn.
+                    (_, false) => {
                         state.background_in_flight = !is_result;
                         Self::buffer_background(&mut state, line.clone());
-                        on_background_start();
-                        None
+                        (self.signal)();
+                        (None, false)
                     }
                 }
             };
-            if let Some(sender) = destination
-                && sender.send(line).await.is_err()
-            {
-                let mut state = self.state.lock().unwrap();
-                if state
-                    .turn
-                    .as_ref()
-                    .is_some_and(|current| current.same_channel(&sender))
-                {
-                    state.turn = None;
-                    state.turn_is_attach = false;
+            if let Some(sender) = destination {
+                if sender.send(line.clone()).await.is_err() {
+                    self.consumer_lost(&sender, Some(line));
+                } else if attach_completed {
+                    let state = self.state.lock().unwrap();
+                    if !state.background.is_empty() {
+                        (self.signal)();
+                    }
                 }
             }
         }
@@ -756,6 +808,7 @@ impl AgentBackend for ClaudeBackend {
                     // and drops it from the pool so the next turn respawns.
                     tracing::debug!("claude stdin write failed: {e}");
                 }
+                proc_.router.prompt_delivered();
             }
 
             let mut completed = false;
@@ -1233,20 +1286,17 @@ impl ClaudeBackend {
                 }
             }
         });
-        let router = Arc::new(StdoutRouter::new());
-        {
-            let router = Arc::clone(&router);
-            let thread_id = turn.thread_id.clone();
-            let signal = self.background_turns.clone();
-            tokio::spawn(router.run(line_rx, move || {
-                if signal.try_send(thread_id.clone()).is_err() {
-                    tracing::debug!(
-                        thread_id = %thread_id,
-                        "claude: dropping background-turn signal (listener busy or absent)"
-                    );
-                }
-            }));
-        }
+        let thread_id = turn.thread_id.clone();
+        let signal = self.background_turns.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            if signal.try_send(thread_id.clone()).is_err() {
+                tracing::debug!(
+                    thread_id = %thread_id,
+                    "claude: dropping background-turn signal (retried on attach boundaries)"
+                );
+            }
+        }));
+        tokio::spawn(Arc::clone(&router).run(line_rx));
 
         // Stderr pump: keep a bounded tail for error reporting.
         let stderr_tail = Arc::new(std::sync::Mutex::new(String::new()));
@@ -1545,13 +1595,13 @@ mod tests {
 
     #[tokio::test]
     async fn router_buffers_background_turns_and_signals_once_per_turn() {
-        let router = Arc::new(StdoutRouter::new());
-        let (line_tx, line_rx) = mpsc::channel(16);
         let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let observed = signals.clone();
-        let _task = tokio::spawn(Arc::clone(&router).run(line_rx, move || {
+        let router = Arc::new(StdoutRouter::new(move || {
             observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
 
         // A background turn with no consumer buffers and signals exactly once.
         line_tx.send(BG_LINE.to_string()).await.unwrap();
@@ -1566,6 +1616,7 @@ mod tests {
             router.register(turn_tx, false).unwrap(),
             RouterRegistration::Streaming
         );
+        router.prompt_delivered();
         line_tx.send(USER_LINE.to_string()).await.unwrap();
         line_tx.send(BG_RESULT.to_string()).await.unwrap();
         assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(USER_LINE));
@@ -1596,9 +1647,9 @@ mod tests {
 
     #[tokio::test]
     async fn background_turn_in_flight_never_leaks_into_a_registered_turn() {
-        let router = Arc::new(StdoutRouter::new());
+        let router = Arc::new(StdoutRouter::new(|| {}));
         let (line_tx, line_rx) = mpsc::channel(16);
-        let _task = tokio::spawn(Arc::clone(&router).run(line_rx, || {}));
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
 
         // Background turn starts; a trouve turn registers mid-flight (its
         // prompt is queued vendor-side). This is the regression that used to
@@ -1611,6 +1662,7 @@ mod tests {
             router.register(turn_tx, false).unwrap(),
             RouterRegistration::Streaming
         );
+        router.prompt_delivered();
         line_tx.send(BG_LINE.to_string()).await.unwrap();
         line_tx.send(BG_RESULT.to_string()).await.unwrap();
         line_tx.send(USER_LINE.to_string()).await.unwrap();
@@ -1633,9 +1685,9 @@ mod tests {
 
     #[tokio::test]
     async fn attach_registration_streams_a_live_background_turn_to_its_end() {
-        let router = Arc::new(StdoutRouter::new());
+        let router = Arc::new(StdoutRouter::new(|| {}));
         let (line_tx, line_rx) = mpsc::channel(16);
-        let _task = tokio::spawn(Arc::clone(&router).run(line_rx, || {}));
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
 
         line_tx.send(BG_LINE.to_string()).await.unwrap();
         wait_for(|| router.is_busy()).await;
@@ -1652,6 +1704,113 @@ mod tests {
         assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
         assert!(recv_line(&mut attach_rx).await.is_none());
         wait_for(|| !router.is_busy()).await;
+    }
+
+    #[tokio::test]
+    async fn lines_before_prompt_delivery_are_background_not_turn_output() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        // An autonomous turn starting between registration and the prompt
+        // write must not be mistaken for the registered turn's response.
+        let (turn_tx, mut turn_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(turn_tx, false).unwrap(),
+            RouterRegistration::Streaming
+        );
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+
+        router.prompt_delivered();
+        line_tx.send(USER_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(USER_LINE));
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(BG_RESULT));
+
+        // The pre-delivery autonomous turn is intact for an attach consumer.
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+    }
+
+    #[tokio::test]
+    async fn dead_attach_consumer_reinserts_its_line_and_reannounces() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+
+        // The attach consumer dies before draining anything.
+        let (attach_tx, attach_rx) = mpsc::channel::<String>(16);
+        drop(attach_rx);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        // The failed drain reinserts the line and re-announces the turn.
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 2).await;
+        let (retry_tx, mut retry_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(retry_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_RESULT));
+    }
+
+    #[tokio::test]
+    async fn buffered_backlog_reannounces_after_each_attach_turn() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        // Two complete autonomous turns buffer while no listener attaches;
+        // even if one of their signals had been lost, draining the first
+        // turn must re-announce the second.
+        for _ in 0..2 {
+            line_tx.send(BG_LINE.to_string()).await.unwrap();
+            line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        }
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 2).await;
+
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(recv_line(&mut attach_rx).await.is_none());
+        // Draining turn one re-announced turn two.
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 3).await;
+        let (second_tx, mut second_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(second_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut second_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut second_rx).await.as_deref(), Some(BG_RESULT));
     }
 
     #[test]
