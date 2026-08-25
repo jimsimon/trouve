@@ -357,13 +357,23 @@ fn cursor_platform() -> Result<(&'static str, &'static str), InstallError> {
 }
 
 fn cursor_sdk_bridge_platform() -> Result<(&'static str, &'static str), InstallError> {
-    let os = match std::env::consts::OS {
+    cursor_sdk_bridge_platform_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn cursor_sdk_bridge_platform_for(
+    operating_system: &str,
+    architecture: &str,
+) -> Result<(&'static str, &'static str), InstallError> {
+    if operating_system == "windows" && architecture == "aarch64" {
+        return Err(InstallError::Unsupported("windows/aarch64".into()));
+    }
+    let os = match operating_system {
         "linux" => "linux",
         "macos" => "darwin",
         "windows" => "win32",
         other => return Err(InstallError::Unsupported(other.into())),
     };
-    let arch = match std::env::consts::ARCH {
+    let arch = match architecture {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         other => return Err(InstallError::Unsupported(other.into())),
@@ -506,7 +516,7 @@ pub async fn install(
         // The SDK is the Cursor transport now. Remove Trouve's obsolete
         // managed ACP binary once the replacement is active; system installs
         // remain outside our ownership and are never touched.
-        remove_legacy_cursor_agent(data_dir)?;
+        remove_legacy_cursor_agent_best_effort(data_dir);
     }
     Ok(info)
 }
@@ -524,7 +534,7 @@ pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
         std::fs::remove_dir_all(&root)?;
     }
     if id == CliId::CursorSdkBridge {
-        remove_legacy_cursor_agent(data_dir)?;
+        remove_legacy_cursor_agent_best_effort(data_dir);
     }
     Ok(())
 }
@@ -539,6 +549,14 @@ fn remove_legacy_cursor_agent(data_dir: &Path) -> std::io::Result<()> {
         std::fs::remove_dir_all(legacy_root)?;
     }
     Ok(())
+}
+
+fn remove_legacy_cursor_agent_best_effort(data_dir: &Path) {
+    if let Err(error) = remove_legacy_cursor_agent(data_dir) {
+        tracing::warn!(
+            "Cursor Agent SDK operation completed, but obsolete managed cursor-agent cleanup failed: {error}"
+        );
+    }
 }
 
 /// Fetch and unpack one runtime into `dir`; returns the executable's path
@@ -1005,6 +1023,18 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
+    fn cursor_sdk_rejects_windows_arm64_without_constructing_an_asset() {
+        assert!(matches!(
+            cursor_sdk_bridge_platform_for("windows", "aarch64"),
+            Err(InstallError::Unsupported(platform)) if platform == "windows/aarch64"
+        ));
+        assert_eq!(
+            cursor_sdk_bridge_platform_for("windows", "x86_64").unwrap(),
+            ("win32", "x64")
+        );
+    }
+
+    #[test]
     fn installed_reads_pointer_when_binary_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
@@ -1098,6 +1128,20 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         assert!(!legacy_root.exists());
         assert!(legacy_link.symlink_metadata().is_err());
         assert!(external.exists());
+    }
+
+    #[test]
+    fn cursor_sdk_uninstall_succeeds_when_legacy_cleanup_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
+        std::fs::create_dir_all(&sdk_root).unwrap();
+        let legacy_root = tmp.path().join("cli").join("cursor-agent");
+        std::fs::write(&legacy_root, "not a directory").unwrap();
+
+        uninstall(tmp.path(), CliId::CursorSdkBridge).unwrap();
+
+        assert!(!sdk_root.exists());
+        assert!(legacy_root.is_file());
     }
 
     #[test]

@@ -499,7 +499,6 @@ except Exception:
     count = 1
 with open(count_path, "w", encoding="utf-8") as destination:
     destination.write(str(count))
-
 agent_id = "sdk-agent-1"
 bridge_token = "test-bridge-token"
 callback_url = os.environ["CURSOR_SDK_TOOL_CALLBACK_URL"]
@@ -508,6 +507,7 @@ callback_history = []
 active_options = {}
 send_count = 0
 callback_updates = 0
+cancel_received = threading.Event()
 
 def write_json(path, value):
     with open(path, "w", encoding="utf-8") as destination:
@@ -537,6 +537,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
             request = json.loads(raw[5:].decode("utf-8"))
             write_json(binary + ".send.json", request)
             send_count += 1
+            if "STALL_FOR_CANCELLATION" in request.get("message", {}).get("text", ""):
+                run_id = "sdk-run-cancel"
+                first = frame({
+                    "sdkMessage": {
+                        "type": "system",
+                        "message": {
+                            "type": "system",
+                            "agent_id": agent_id,
+                            "run_id": run_id
+                        }
+                    }
+                })
+                self.send_response(200)
+                self.send_header("Content-Type", "application/connect+json")
+                self.end_headers()
+                self.wfile.write(first)
+                self.wfile.flush()
+                with open(binary + ".send-started", "w", encoding="utf-8") as destination:
+                    destination.write(run_id)
+                if not cancel_received.wait(10):
+                    return
+                cancelled = "RUN_LIFECYCLE_STATUS_CANCELLED"
+                messages = [
+                    {
+                        "result": {
+                            "agentId": agent_id,
+                            "runId": run_id,
+                            "status": cancelled,
+                            "result": {
+                                "agentId": agent_id,
+                                "runId": run_id,
+                                "status": cancelled
+                            }
+                        }
+                    },
+                    {"done": {"agentId": agent_id, "runId": run_id}}
+                ]
+                body = b"".join(frame(message) for message in messages) + frame({}, 2)
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             names = active_options.get("tools", {}).get("names", [])
             if names == ["mcp"]:
                 import concurrent.futures
@@ -649,6 +690,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.endswith("/CloseAgent"):
             response = {}
         elif self.path.endswith("/CancelRun"):
+            with open(binary + ".cancel-run", "w", encoding="utf-8") as destination:
+                destination.write(request.get("runId", ""))
+            cancel_received.set()
             response = {}
         elif self.path.endswith("/Shutdown"):
             response = {}
@@ -673,6 +717,8 @@ class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
 server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
+with open(binary + ".port", "w", encoding="utf-8") as destination:
+    destination.write(str(server.server_address[1]))
 ready = {
     "schemaVersion": 1,
     "transport": "tcp",
@@ -860,6 +906,66 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
     assert_eq!(calls.lock().await.len(), 1);
     mcp_task.abort();
 }
+
+#[tokio::test]
+async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = cursor_sdk_bridge_stub(tmp.path());
+    let backend = CursorBackend::new(
+        "cursor",
+        Some(stub.clone()),
+        Some("test-cursor-api-key".into()),
+    )
+    .with_state_root(tmp.path().join("sdk-state"));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut stream = start_turn(&backend, || {
+        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        next.prompt = "STALL_FOR_CANCELLATION".into();
+        next.tool_free = true;
+        next.cancel = cancel.clone();
+        next
+    })
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !std::path::Path::new(&format!("{stub}.send-started")).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Cursor Send fixture did not start");
+    cancel.cancel();
+
+    let mut saw_cancelled = false;
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event, Err(trouve_agents::BackendError::Cancelled)) {
+                saw_cancelled = true;
+            }
+        }
+    })
+    .await
+    .expect("cancelled Cursor turn did not finish bounded cleanup");
+    assert!(saw_cancelled);
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.cancel-run"))
+            .unwrap()
+            .trim(),
+        "sdk-run-cancel"
+    );
+    let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "cancelled Cursor Bridge was still accepting connections"
+    );
+}
+
 #[tokio::test]
 async fn codex_adapter_speaks_json_rpc_and_bridges_approvals() {
     let tmp = tempfile::tempdir().unwrap();

@@ -30,6 +30,8 @@ import {
   BRIDGE_VERSION,
   QualificationError,
   assistantText,
+  installSignalCleanup,
+  parseTimeoutSeconds,
   readBoundedJsonResponse,
   redact,
   resolveBridge,
@@ -120,10 +122,7 @@ function parseArgs(argv) {
     parsed[key] = argv[index + 1];
     index += 1;
   }
-  parsed.timeoutSeconds = Number(parsed.timeoutSeconds);
-  if (!Number.isFinite(parsed.timeoutSeconds) || parsed.timeoutSeconds <= 0) {
-    throw new QualificationError("--timeout must be a positive number");
-  }
+  parsed.timeoutSeconds = parseTimeoutSeconds(parsed.timeoutSeconds);
   parsed.workspace = resolve(parsed.workspace);
   if (parsed.bridge !== undefined) parsed.bridge = resolve(parsed.bridge);
   return parsed;
@@ -357,7 +356,11 @@ function terminalFrame(frames) {
 }
 
 function statusIsCancelled(status) {
-  return status === 5 || /CANCELLED$/u.test(String(status));
+  return (
+    status === 5 ||
+    status === "5" ||
+    status === "RUN_LIFECYCLE_STATUS_CANCELLED"
+  );
 }
 
 function numberValue(value) {
@@ -426,7 +429,12 @@ function inspectToolCalls(frames, callbacks, expectedTools, allowToolError, labe
     );
   }
   for (const callback of callbacks) {
-    if (callback.toolCallId !== undefined && !streamIds.has(callback.toolCallId)) {
+    if (typeof callback.toolCallId !== "string" || callback.toolCallId.length === 0) {
+      throw new QualificationError(
+        `callback ${callback.toolName} omitted its tool-call id`,
+      );
+    }
+    if (!streamIds.has(callback.toolCallId)) {
       throw new QualificationError(
         `callback ${callback.toolName} did not correlate with stream id ${callback.toolCallId}`,
       );
@@ -456,8 +464,7 @@ function inspectToolCalls(frames, callbacks, expectedTools, allowToolError, labe
     callback_tools: actualTools,
     stream_names: streamNames,
     call_ids_correlated: callbacks.every(
-      (callback) =>
-        callback.toolCallId === undefined || streamIds.has(callback.toolCallId),
+      (callback) => streamIds.has(callback.toolCallId),
     ),
     terminal_stream_events_complete: terminalEventsComplete,
     native_tools_present: false,
@@ -563,38 +570,37 @@ async function observeCompletedRun(bridge, runId, timeoutMilliseconds) {
   const offsets = replay
     .map((frame) => frame.offset)
     .filter((offset) => typeof offset === "string" && offset.length > 0);
-  let exclusiveResume = null;
-  if (offsets.length > 0) {
-    const afterOffset = offsets[0];
-    const offsetIndex = replay.findIndex((frame) => frame.offset === afterOffset);
-    const expectedSuffix = replay.slice(offsetIndex + 1);
-    const resumed = await serverStream(
-      bridge,
-      "SdkAgentService",
-      "ObserveRun",
-      { runId, afterOffset },
-      timeoutMilliseconds,
+  if (offsets.length === 0) {
+    throw new QualificationError("ObserveRun replay omitted durable offsets");
+  }
+  const afterOffset = offsets[0];
+  const offsetIndex = replay.findIndex((frame) => frame.offset === afterOffset);
+  const expectedSuffix = replay.slice(offsetIndex + 1);
+  const resumed = await serverStream(
+    bridge,
+    "SdkAgentService",
+    "ObserveRun",
+    { runId, afterOffset },
+    timeoutMilliseconds,
+  );
+  const resumedOffsets = resumed
+    .map((frame) => frame.offset)
+    .filter((offset) => typeof offset === "string" && offset.length > 0);
+  if (resumedOffsets.includes(afterOffset)) {
+    throw new QualificationError("ObserveRun afterOffset was not exclusive");
+  }
+  if (JSON.stringify(resumed) !== JSON.stringify(expectedSuffix)) {
+    throw new QualificationError(
+      "ObserveRun afterOffset did not return the exact replay suffix",
     );
-    const resumedOffsets = resumed
-      .map((frame) => frame.offset)
-      .filter((offset) => typeof offset === "string" && offset.length > 0);
-    if (resumedOffsets.includes(afterOffset)) {
-      throw new QualificationError("ObserveRun afterOffset was not exclusive");
-    }
-    if (JSON.stringify(resumed) !== JSON.stringify(expectedSuffix)) {
-      throw new QualificationError(
-        "ObserveRun afterOffset did not return the exact replay suffix",
-      );
-    }
-    if (!resumed.some((frame) => frame.done !== undefined)) {
-      throw new QualificationError("resumed ObserveRun omitted done");
-    }
-    exclusiveResume = true;
+  }
+  if (!resumed.some((frame) => frame.done !== undefined)) {
+    throw new QualificationError("resumed ObserveRun omitted done");
   }
   return {
     full_replay: true,
     durable_offsets: offsets.length,
-    exclusive_offset_resume: exclusiveResume,
+    exclusive_offset_resume: true,
   };
 }
 
@@ -751,7 +757,6 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
   }
   const origin = (process.env.CURSOR_BACKEND_URL ?? "https://api2.cursor.sh")
     .replace(/\/+$/u, "");
-  const signal = AbortSignal.timeout(Math.min(timeoutMilliseconds, 30_000));
   const exchange = await fetch(`${origin}/auth/exchange_user_api_key`, {
     method: "POST",
     headers: {
@@ -759,7 +764,7 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
       "content-type": "application/json",
     },
     body: "{}",
-    signal,
+    signal: AbortSignal.timeout(Math.min(timeoutMilliseconds, 30_000)),
   });
   const exchangeBody = await readBoundedJsonResponse(
     exchange,
@@ -786,7 +791,7 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
           "content-type": "application/json",
         },
         body: "{}",
-        signal,
+        signal: AbortSignal.timeout(Math.min(timeoutMilliseconds, 30_000)),
       },
     );
     const body = await readBoundedJsonResponse(response, `Cursor ${method}`);
@@ -899,7 +904,59 @@ async function fullQualification(args) {
   let bridge;
   let agentId;
   let resolvedBridge;
+  const bridgeChildren = new Set();
   const operational = {};
+  let cleanupPromise;
+  const cleanup = (signal) => {
+    if (cleanupPromise !== undefined) return cleanupPromise;
+    cleanupPromise = (async () => {
+      if (blockControl !== null) {
+        blockControl.release.resolve({ value: RESULTS.blockReleased });
+      }
+      const activeBridge = bridge;
+      const activeAgentId = agentId;
+      bridge = undefined;
+      agentId = undefined;
+      if (signal === undefined && activeBridge !== undefined && activeAgentId !== undefined) {
+        await safeUnary(
+          activeBridge,
+          "SdkAgentService",
+          "CloseAgent",
+          { agentId: activeAgentId },
+          Math.min(timeoutMilliseconds, 10_000),
+        );
+      }
+      if (signal === undefined && activeBridge !== undefined) {
+        await safeUnary(
+          activeBridge,
+          "SdkBridgeControlService",
+          "Shutdown",
+          { graceSeconds: 1 },
+          Math.min(timeoutMilliseconds, 10_000),
+        );
+      }
+      for (const child of bridgeChildren) {
+        await terminateProcessTree(child);
+      }
+      bridgeChildren.clear();
+      if (callback !== undefined) {
+        callback.server.closeAllConnections?.();
+        await new Promise((accept) => callback.server.close(accept));
+        callback = undefined;
+      }
+      if (signal !== undefined || !args.keepState) {
+        await rm(temporaryRoot, { recursive: true, force: true });
+      } else {
+        process.stderr.write(`Kept qualification state at ${temporaryRoot}\n`);
+      }
+    })();
+    return cleanupPromise;
+  };
+  const signalCleanup = installSignalCleanup(cleanup, {
+    report: (error) => process.stderr.write(
+      `Cursor signal cleanup failed: ${redact(error, [apiKey])}\n`,
+    ),
+  });
   try {
     resolvedBridge = await resolveBridge(args.bridge, temporaryRoot, timeoutMilliseconds);
     const binaryStat = await stat(resolvedBridge.binary);
@@ -921,6 +978,7 @@ async function fullQualification(args) {
       apiKey,
       callback,
       timeoutMilliseconds,
+      onSpawn: (child) => bridgeChildren.add(child),
     });
     operational.bridge_startup_ms = Math.round(performance.now() - bridgeStartedAt);
     operational.bridge_ready_rss_bytes = await processRssBytes(bridge.child.pid);
@@ -1133,6 +1191,7 @@ async function fullQualification(args) {
       Math.min(timeoutMilliseconds, 10_000),
     );
     await terminateProcessTree(bridge.child);
+    bridgeChildren.delete(bridge.child);
     bridge = undefined;
 
     const restartStartedAt = performance.now();
@@ -1143,6 +1202,7 @@ async function fullQualification(args) {
       apiKey,
       callback,
       timeoutMilliseconds,
+      onSpawn: (child) => bridgeChildren.add(child),
     });
     operational.bridge_cold_restart_ms = Math.round(performance.now() - restartStartedAt);
     const resumed = await unary(
@@ -1155,6 +1215,11 @@ async function fullQualification(args) {
     if (resumed.agentId !== agentId) {
       throw new QualificationError("cold ResumeAgent returned a different agent id");
     }
+    const coldReplay = await observeCompletedRun(
+      bridge,
+      preRestartRunId,
+      timeoutMilliseconds,
+    );
     const coldTurn = await runTurn({
       bridge,
       callback,
@@ -1293,8 +1358,9 @@ async function fullQualification(args) {
         host_denied_is_error_result: "passed",
         host_denied_terminal_stream_event:
           deniedTurn.summary.terminal_stream_events_complete,
-        input_image: "passed",
-        tool_result_text_structured_image: "passed",
+        input_image_request_completed: true,
+        tool_result_text_structured_image_callback_completed: true,
+        image_payload_consumption_claimed: false,
         parallel_read_callbacks: maxActiveReads >= 2,
         max_parallel_read_callbacks: maxActiveReads,
       },
@@ -1303,6 +1369,7 @@ async function fullQualification(args) {
         cold_bridge_process_resume: true,
         pre_restart_history_after_cold_resume: true,
         durable_observe_replay: replay,
+        durable_observe_replay_after_cold_restart: coldReplay,
         cancellation,
         post_cancellation_recovery: true,
         plan_mode: {
@@ -1334,36 +1401,8 @@ async function fullQualification(args) {
       blockers,
     };
   } finally {
-    if (blockControl !== null) {
-      blockControl.release.resolve({ value: RESULTS.blockReleased });
-    }
-    if (bridge !== undefined && agentId !== undefined) {
-      await safeUnary(
-        bridge,
-        "SdkAgentService",
-        "CloseAgent",
-        { agentId },
-        Math.min(timeoutMilliseconds, 10_000),
-      );
-    }
-    if (bridge !== undefined) {
-      await safeUnary(
-        bridge,
-        "SdkBridgeControlService",
-        "Shutdown",
-        { graceSeconds: 1 },
-        Math.min(timeoutMilliseconds, 10_000),
-      );
-      await terminateProcessTree(bridge.child);
-    }
-    if (callback !== undefined) {
-      await new Promise((accept) => callback.server.close(accept));
-    }
-    if (!args.keepState) {
-      await rm(temporaryRoot, { recursive: true, force: true });
-    } else {
-      process.stderr.write(`Kept qualification state at ${temporaryRoot}\n`);
-    }
+    await cleanup();
+    signalCleanup.dispose();
   }
 }
 

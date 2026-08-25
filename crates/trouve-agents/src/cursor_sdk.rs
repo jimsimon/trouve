@@ -44,7 +44,8 @@ const DASHBOARD_BASE: &str = "https://api2.cursor.sh";
 const USAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const INTERRUPTED_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -573,6 +574,22 @@ impl BridgePool {
         Ok(())
     }
 
+    async fn terminate_and_remove_now_until(
+        &self,
+        thread_id: &str,
+        process: &BridgeLease,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), BackendError> {
+        process.quarantine();
+        self.remove_if_same(thread_id, process.pooled()).await;
+        if let Err(error) = process.terminate_now_until(deadline).await {
+            self.restore_if_vacant(thread_id, process.pooled().clone())
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn reap_idle(&self) {
         while let Some((thread_id, process, guard)) = self.take_evictable(Some(IDLE_TIMEOUT)).await
         {
@@ -754,6 +771,19 @@ impl PooledBridge {
             .await
             .map_err(BackendError::Io)
     }
+
+    async fn terminate_now_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), BackendError> {
+        self.quarantine();
+        self.bridge
+            .lock()
+            .await
+            .shutdown_now_until(deadline)
+            .await
+            .map_err(BackendError::Io)
+    }
 }
 
 async fn run_sdk_turn(
@@ -886,10 +916,35 @@ async fn run_sdk_turn(
         return Ok(TurnTerminal::ConsumerClosed);
     }
 
-    let outcome = stream_turn(&bridge.client, &agent_id, &turn, events).await;
+    let outcome = stream_turn(
+        &bridge.client,
+        &agent_id,
+        &turn,
+        events,
+        &callback.supervisor.cancel,
+    )
+    .await;
+    if matches!(
+        &outcome,
+        Ok(TurnTerminal::Cancelled | TurnTerminal::ConsumerClosed)
+    ) {
+        // CancelRun observation and local cleanup share a five-second budget.
+        // Stop host-owned tool work before releasing the Bridge mutex, then
+        // force-reap instead of waiting on normal CloseAgent cleanup RPCs.
+        let deadline = tokio::time::Instant::now() + INTERRUPTED_CLEANUP_TIMEOUT;
+        callback.stop_until(deadline).await;
+        drop(bridge);
+        let process_cleanup = pool
+            .terminate_and_remove_now_until(&turn.thread_id, &process, deadline)
+            .await;
+        return finish_recycled_turn(outcome, Ok(()), process_cleanup);
+    }
+
+    // No callback may start after the terminal Send frame. The Bridge mutex
+    // stays held until callback tasks are joined and its registration clears.
+    callback.stop().await;
     let release = bridge.release_turn(&agent_id).await;
     let keep_warm = matches!(&outcome, Ok(TurnTerminal::Finished(_))) && release.is_ok();
-    callback.stop().await;
     drop(bridge);
 
     if keep_warm {
@@ -1366,9 +1421,14 @@ impl CallbackServer {
     }
 
     async fn stop(&mut self) {
+        self.stop_until(tokio::time::Instant::now() + CALLBACK_SHUTDOWN_TIMEOUT)
+            .await;
+    }
+
+    async fn stop_until(&mut self, deadline: tokio::time::Instant) {
         self.supervisor.cancel.cancel();
         self.shutdown.cancel();
-        if tokio::time::timeout(CALLBACK_SHUTDOWN_TIMEOUT, &mut self.task)
+        if tokio::time::timeout_at(deadline, &mut self.task)
             .await
             .is_err()
         {
@@ -1737,9 +1797,9 @@ impl BridgeProcess {
                 Duration::from_secs(10),
             )
             .await;
-        // Registration is process-wide. Clear it before stopping the
-        // turn-scoped server so a late vendor callback cannot acquire the next
-        // turn's credentials or tool ticket.
+        // Registration is process-wide. The turn-scoped callback server is
+        // already stopped while the Bridge mutex is still held; clear the
+        // stale URL before this process can serve another turn.
         let clear = self.set_tool_callback(None).await;
         match (close, clear) {
             (Ok(_), Ok(())) => Ok(()),
@@ -1765,6 +1825,16 @@ impl BridgeProcess {
             tracing::debug!("Cursor SDK Bridge shutdown RPC failed: {error}");
         }
         let cleanup = self.child.terminate_and_reap().await.map(|_| ());
+        self.stderr_task.abort();
+        cleanup
+    }
+
+    async fn shutdown_now_until(&mut self, deadline: tokio::time::Instant) -> std::io::Result<()> {
+        let cleanup = self
+            .child
+            .terminate_and_reap_until(deadline)
+            .await
+            .map(|_| ());
         self.stderr_task.abort();
         cleanup
     }
@@ -1960,6 +2030,7 @@ async fn stream_turn(
     agent_id: &str,
     turn: &BackendTurn,
     events: &BackendEventSender,
+    callback_cancel: &CancellationToken,
 ) -> Result<TurnTerminal, BackendError> {
     let text = match turn.instructions.as_deref() {
         Some(instructions) => format!(
@@ -2007,22 +2078,33 @@ async fn stream_turn(
     let response = tokio::select! {
         biased;
         _ = turn.cancel.cancelled() => return Ok(TurnTerminal::Cancelled),
-        _ = events.closed() => return Ok(TurnTerminal::ConsumerClosed),
-        response = client.http
-            .post(url)
-            .bearer_auth(&client.token)
-            .header("Connect-Protocol-Version", "1")
-            .header("Content-Type", "application/connect+json")
-            .body(body)
-            .send() => response.map_err(|error| {
-                BackendError::Protocol(format!("Cursor Send: {error}"))
-            })?,
+        _ = events.closed() => {
+            callback_cancel.cancel();
+            return Ok(TurnTerminal::ConsumerClosed);
+        }
+        response = tokio::time::timeout(
+            RPC_TIMEOUT,
+            client.http
+                .post(url)
+                .bearer_auth(&client.token)
+                .header("Connect-Protocol-Version", "1")
+                .header("Content-Type", "application/connect+json")
+                .body(body)
+                .send(),
+        ) => response
+            .map_err(|_| BackendError::Protocol(
+                "Cursor Send timed out waiting for response headers".into()
+            ))?
+            .map_err(|error| BackendError::Protocol(format!("Cursor Send: {error}")))?,
     };
     if !response.status().is_success() {
         let (status, detail) = tokio::select! {
             biased;
             _ = turn.cancel.cancelled() => return Ok(TurnTerminal::Cancelled),
-            _ = events.closed() => return Ok(TurnTerminal::ConsumerClosed),
+            _ = events.closed() => {
+                callback_cancel.cancel();
+                return Ok(TurnTerminal::ConsumerClosed);
+            }
             detail = tokio::time::timeout(
                 RPC_TIMEOUT,
                 read_bounded_response(response, "Cursor Send", MAX_RPC_BODY_BYTES),
@@ -2081,6 +2163,7 @@ async fn stream_turn(
                     continue;
                 }
                 _ = events.closed() => {
+                    callback_cancel.cancel();
                     stop = Some(StreamStop::ConsumerClosed);
                     stop_deadline = Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
                     continue;
@@ -2391,17 +2474,11 @@ fn u64_flex(value: &Value) -> Option<u64> {
 }
 
 fn status_is_finished(status: &Value) -> bool {
-    status.as_u64() == Some(3)
-        || status
-            .as_str()
-            .is_some_and(|status| status.ends_with("FINISHED") || status.ends_with("COMPLETED"))
+    u64_flex(status) == Some(3) || status.as_str() == Some("RUN_LIFECYCLE_STATUS_FINISHED")
 }
 
 fn status_is_cancelled(status: &Value) -> bool {
-    status.as_u64() == Some(5)
-        || status
-            .as_str()
-            .is_some_and(|status| status.ends_with("CANCELLED"))
+    u64_flex(status) == Some(5) || status.as_str() == Some("RUN_LIFECYCLE_STATUS_CANCELLED")
 }
 
 fn image_dimensions(bytes: &[u8]) -> (u32, u32) {
@@ -2642,6 +2719,28 @@ mod tests {
             .spawn(std::future::pending::<()>());
         supervisor.stop().await;
         assert!(supervisor.tasks.lock().await.is_empty());
+    }
+
+    #[test]
+    fn cursor_terminal_statuses_require_exact_sdk_values() {
+        for status in [json!(3), json!("3"), json!("RUN_LIFECYCLE_STATUS_FINISHED")] {
+            assert!(status_is_finished(&status));
+        }
+        for status in [
+            json!("NOT_FINISHED"),
+            json!("NOT_COMPLETED"),
+            json!("COMPLETED"),
+        ] {
+            assert!(!status_is_finished(&status));
+        }
+        for status in [
+            json!(5),
+            json!("5"),
+            json!("RUN_LIFECYCLE_STATUS_CANCELLED"),
+        ] {
+            assert!(status_is_cancelled(&status));
+        }
+        assert!(!status_is_cancelled(&json!("NOT_CANCELLED")));
     }
 
     #[test]

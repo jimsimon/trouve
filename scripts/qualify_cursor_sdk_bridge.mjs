@@ -47,6 +47,7 @@ const MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
 const MAX_CONNECT_STREAM_BYTES = 64 * 1024 * 1024;
 const MAX_CONNECT_STREAM_FRAMES = 100_000;
+const MAX_TIMER_DELAY_MILLISECONDS = 2_147_483_647;
 const READY_PREFIX = "cursor-sdk-bridge ready ";
 const INVALID_TOOL_NAME = "trouve_qualification_invalid_builtin";
 const FORBIDDEN_BUILT_INS = new Set([
@@ -80,6 +81,20 @@ Options:
   --help            Show this help
 `;
 
+function parseTimeoutSeconds(value) {
+  const seconds = Number(value);
+  if (
+    !Number.isFinite(seconds) ||
+    seconds <= 0 ||
+    seconds * 1_000 > MAX_TIMER_DELAY_MILLISECONDS
+  ) {
+    throw new QualificationError(
+      `--timeout must be a positive number no greater than ${MAX_TIMER_DELAY_MILLISECONDS / 1_000}`,
+    );
+  }
+  return seconds;
+}
+
 function parseArgs(argv) {
   const parsed = {
     bridge: process.env.CURSOR_SDK_BRIDGE_BIN,
@@ -110,28 +125,29 @@ function parseArgs(argv) {
     parsed[key] = argv[index + 1];
     index += 1;
   }
-  parsed.timeoutSeconds = Number(parsed.timeoutSeconds);
-  if (!Number.isFinite(parsed.timeoutSeconds) || parsed.timeoutSeconds <= 0) {
-    throw new QualificationError("--timeout must be a positive number");
-  }
+  parsed.timeoutSeconds = parseTimeoutSeconds(parsed.timeoutSeconds);
   parsed.workspace = resolve(parsed.workspace);
   if (parsed.bridge !== undefined) parsed.bridge = resolve(parsed.bridge);
   return parsed;
 }
 
-function assetName() {
+function assetName(platform = process.platform, cpu = process.arch) {
   const operatingSystem = {
     linux: "linux",
     darwin: "darwin",
     win32: "win32",
-  }[process.platform];
+  }[platform];
   const architecture = {
     x64: "x64",
     arm64: "arm64",
-  }[process.arch];
-  if (operatingSystem === undefined || architecture === undefined) {
+  }[cpu];
+  if (
+    operatingSystem === undefined ||
+    architecture === undefined ||
+    (platform === "win32" && cpu === "arm64")
+  ) {
     throw new QualificationError(
-      `unsupported Cursor SDK Bridge platform: ${process.platform}/${process.arch}`,
+      `unsupported Cursor SDK Bridge platform: ${platform}/${cpu}`,
     );
   }
   return `cursor-sdk-bridge-standalone-${operatingSystem}-${architecture}.tar.gz`;
@@ -406,6 +422,7 @@ async function startBridge({
   apiKey,
   callback,
   timeoutMilliseconds,
+  onSpawn,
 }) {
   const diagnostics = [];
   const secrets = [apiKey, callback.bearer];
@@ -427,6 +444,7 @@ async function startBridge({
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
+  onSpawn?.(child);
   child.stderr.setEncoding("utf8");
 
   let buffered = "";
@@ -526,6 +544,7 @@ async function startBridge({
 }
 
 async function terminateProcessTree(child) {
+  if (!Number.isInteger(child?.pid)) return;
   if (process.platform === "win32") {
     const exited = () => child.exitCode !== null || child.signalCode !== null;
     const waitForExit = async (milliseconds) => {
@@ -536,7 +555,15 @@ async function terminateProcessTree(child) {
       return exited();
     };
     if (!exited()) {
-      child.kill("SIGTERM");
+      await new Promise((accept) => {
+        const taskkill = spawn(
+          "taskkill",
+          ["/PID", String(child.pid), "/T", "/F"],
+          { windowsHide: true, stdio: "ignore" },
+        );
+        taskkill.once("error", accept);
+        taskkill.once("exit", accept);
+      });
       if (!(await waitForExit(5_000))) {
         child.kill("SIGKILL");
         if (!(await waitForExit(5_000))) {
@@ -790,7 +817,11 @@ async function send(client, request, timeoutMilliseconds, onMessage) {
 }
 
 function terminalStatusIsFinished(status) {
-  return status === 3 || /(?:FINISHED|COMPLETED)$/u.test(String(status));
+  return (
+    status === 3 ||
+    status === "3" ||
+    status === "RUN_LIFECYCLE_STATUS_FINISHED"
+  );
 }
 
 function toolIsForbidden(name) {
@@ -877,7 +908,10 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
   }
   const streamedCallId = [...callIds][0];
   const callbackCallId = callbackCall.toolCallId;
-  if (callbackCallId !== undefined && callbackCallId !== streamedCallId) {
+  if (typeof callbackCallId !== "string" || callbackCallId.length === 0) {
+    throw new QualificationError(`turn ${ordinal}: callback omitted its tool-call id`);
+  }
+  if (callbackCallId !== streamedCallId) {
     throw new QualificationError(
       `turn ${ordinal}: MCP stream call ${streamedCallId} did not correlate with ` +
         `callback call ${callbackCallId}`,
@@ -910,8 +944,7 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
     effective_tools_reported: reportedTools !== null,
     streamed_tool_names: toolNames,
     callback_tool_name: callbackCall.toolName,
-    stream_callback_id_correlated:
-      callbackCallId === undefined ? null : callbackCallId === streamedCallId,
+    stream_callback_id_correlated: true,
     assistant_used_result: true,
     built_in_tools_present: false,
   };
@@ -1003,6 +1036,40 @@ async function safeUnary(client, service, method, body, timeoutMilliseconds) {
   }
 }
 
+function installSignalCleanup(
+  cleanup,
+  {
+    target = process,
+    exit = (code) => process.exit(code),
+    report = (error) => process.stderr.write(`signal cleanup failed: ${error}\n`),
+  } = {},
+) {
+  let completion;
+  const handlers = new Map();
+  for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+    const handler = () => {
+      if (completion !== undefined) return;
+      let result;
+      try {
+        result = cleanup(signal);
+      } catch (error) {
+        result = Promise.reject(error);
+      }
+      completion = Promise.resolve(result)
+        .catch(report)
+        .finally(() => exit(code));
+    };
+    handlers.set(signal, handler);
+    target.once(signal, handler);
+  }
+  return {
+    dispose() {
+      for (const [signal, handler] of handlers) target.off(signal, handler);
+    },
+    completion: () => completion ?? Promise.resolve(),
+  };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const apiKey = process.env.CURSOR_API_KEY;
@@ -1020,6 +1087,53 @@ async function main() {
   let bridge;
   let callback;
   let agentId;
+  const bridgeChildren = new Set();
+  let cleanupPromise;
+  const cleanup = (signal) => {
+    if (cleanupPromise !== undefined) return cleanupPromise;
+    cleanupPromise = (async () => {
+      const activeBridge = bridge;
+      const activeAgentId = agentId;
+      bridge = undefined;
+      agentId = undefined;
+      if (signal === undefined && activeBridge !== undefined && activeAgentId !== undefined) {
+        await safeUnary(
+          activeBridge,
+          "SdkAgentService",
+          "CloseAgent",
+          { agentId: activeAgentId },
+          Math.min(timeoutMilliseconds, 10_000),
+        );
+      }
+      if (signal === undefined && activeBridge !== undefined) {
+        await safeUnary(
+          activeBridge,
+          "SdkBridgeControlService",
+          "Shutdown",
+          { graceSeconds: 1 },
+          Math.min(timeoutMilliseconds, 10_000),
+        );
+      }
+      for (const child of bridgeChildren) {
+        await terminateProcessTree(child);
+      }
+      bridgeChildren.clear();
+      if (callback !== undefined) {
+        callback.server.closeAllConnections?.();
+        await new Promise((accept) => callback.server.close(accept));
+        callback = undefined;
+      }
+      await rm(stateRoot, { recursive: true, force: true });
+      if (!args.keepDownload) await rm(temporaryRoot, { recursive: true, force: true });
+      else process.stderr.write(`Kept verified download files at ${temporaryRoot}\n`);
+    })();
+    return cleanupPromise;
+  };
+  const signalCleanup = installSignalCleanup(cleanup, {
+    report: (error) => process.stderr.write(
+      `Cursor SDK Bridge signal cleanup failed: ${redact(error, [apiKey])}\n`,
+    ),
+  });
   try {
     const resolvedBridge = await resolveBridge(
       args.bridge,
@@ -1034,6 +1148,7 @@ async function main() {
       apiKey,
       callback,
       timeoutMilliseconds,
+      onSpawn: (child) => bridgeChildren.add(child),
     });
 
     const ping = await unary(
@@ -1152,40 +1267,20 @@ async function main() {
       )}\n`,
     );
   } finally {
-    if (bridge !== undefined && agentId !== undefined) {
-      await safeUnary(
-        bridge,
-        "SdkAgentService",
-        "CloseAgent",
-        { agentId },
-        Math.min(timeoutMilliseconds, 10_000),
-      );
-    }
-    if (bridge !== undefined) {
-      await safeUnary(
-        bridge,
-        "SdkBridgeControlService",
-        "Shutdown",
-        { graceSeconds: 1 },
-        Math.min(timeoutMilliseconds, 10_000),
-      );
-      await terminateProcessTree(bridge.child);
-    }
-    if (callback !== undefined) {
-      await new Promise((accept) => callback.server.close(accept));
-    }
-    await rm(stateRoot, { recursive: true, force: true });
-    if (!args.keepDownload) await rm(temporaryRoot, { recursive: true, force: true });
-    else process.stderr.write(`Kept verified download files at ${temporaryRoot}\n`);
+    await cleanup();
+    signalCleanup.dispose();
   }
 }
 
 export {
   BRIDGE_VERSION,
   QualificationError,
+  assetName,
   assistantText,
   connectFrame,
   download,
+  installSignalCleanup,
+  parseTimeoutSeconds,
   redact,
   readBoundedJsonResponse,
   resolveBridge,
