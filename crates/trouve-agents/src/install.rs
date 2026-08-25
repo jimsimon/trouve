@@ -22,6 +22,9 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
+const MAX_TEXT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// A vendor agent runtime trouve knows how to install. `id` doubles as the
 /// binary name and the legacy API path segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,17 +146,73 @@ fn http() -> Result<reqwest::Client, InstallError> {
 }
 
 async fn get_text(url: &str) -> Result<String, InstallError> {
-    let resp = http()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| InstallError::Download(format!("{url}: {e}")))?;
+    get_text_controlled(url, None).await
+}
+
+async fn get_text_with_progress(url: &str, progress: &Progress) -> Result<String, InstallError> {
+    get_text_controlled(url, Some(progress)).await
+}
+
+async fn wait_for_install_cancel(progress: Option<&Progress>) {
+    let Some(progress) = progress else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if progress.cancelled() {
+            return;
+        }
+        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
+}
+
+async fn get_response(
+    url: &str,
+    progress: Option<&Progress>,
+) -> Result<reqwest::Response, InstallError> {
+    if progress.is_some_and(Progress::cancelled) {
+        return Err(InstallError::Cancelled);
+    }
+    let request = http()?.get(url).send();
+    let resp = tokio::select! {
+        biased;
+        _ = wait_for_install_cancel(progress) => return Err(InstallError::Cancelled),
+        resp = request => resp.map_err(|e| InstallError::Download(format!("{url}: {e}")))?,
+    };
     if !resp.status().is_success() {
         return Err(InstallError::Download(format!("{url}: {}", resp.status())));
     }
-    resp.text()
-        .await
-        .map_err(|e| InstallError::Download(format!("{url}: {e}")))
+    Ok(resp)
+}
+
+async fn get_text_controlled(
+    url: &str,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
+    use futures::TryStreamExt as _;
+
+    let resp = get_response(url, progress).await?;
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = wait_for_install_cancel(progress) => return Err(InstallError::Cancelled),
+            next = stream.try_next() => next
+                .map_err(|e| InstallError::Download(format!("{url}: {e}")))?,
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        if out.len().saturating_add(chunk.len()) > MAX_TEXT_RESPONSE_BYTES {
+            return Err(InstallError::Download(format!(
+                "{url}: response exceeded {MAX_TEXT_RESPONSE_BYTES} bytes"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    String::from_utf8(out)
+        .map_err(|e| InstallError::Download(format!("{url}: response was not UTF-8: {e}")))
 }
 
 /// Download `url` fully into memory (runtime artifacts are tens of MB),
@@ -163,27 +222,22 @@ async fn get_bytes(url: &str, progress: &Progress) -> Result<Vec<u8>, InstallErr
     use futures::TryStreamExt as _;
     use std::sync::atomic::Ordering::Relaxed;
 
-    let resp = http()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| InstallError::Download(format!("{url}: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(InstallError::Download(format!("{url}: {}", resp.status())));
-    }
+    let resp = get_response(url, Some(progress)).await?;
     if let Some(len) = resp.content_length() {
         progress.total.store(len, Relaxed);
     }
     let mut out = Vec::new();
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream
-        .try_next()
-        .await
-        .map_err(|e| InstallError::Download(format!("{url}: {e}")))?
-    {
-        if progress.cancelled() {
-            return Err(InstallError::Cancelled);
-        }
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = wait_for_install_cancel(Some(progress)) => return Err(InstallError::Cancelled),
+            next = stream.try_next() => next
+                .map_err(|e| InstallError::Download(format!("{url}: {e}")))?,
+        };
+        let Some(chunk) = next else {
+            break;
+        };
         out.extend_from_slice(&chunk);
         progress.received.fetch_add(chunk.len() as u64, Relaxed);
     }
@@ -500,7 +554,7 @@ async fn install_into(
             let (os, arch) = cursor_sdk_bridge_platform()?;
             let asset = format!("cursor-sdk-bridge-standalone-{os}-{arch}.tar.gz");
             let base = format!("https://github.com/cursor/sdk-bridge/releases/download/v{version}");
-            let sums = get_text(&format!("{base}/SHA256SUMS.txt")).await?;
+            let sums = get_text_with_progress(&format!("{base}/SHA256SUMS.txt"), progress).await?;
             let url = format!("{base}/{asset}");
             let bytes = get_bytes(&url, progress).await?;
             let expected = checksum_for_asset(&sums, &asset).ok_or_else(|| {
@@ -535,7 +589,9 @@ async fn install_into(
         CliId::Claude => {
             let platform = claude_platform()?;
             let base = "https://downloads.claude.ai/claude-code-releases";
-            let manifest = get_text(&format!("{base}/{version}/manifest.json")).await?;
+            let manifest =
+                get_text_with_progress(&format!("{base}/{version}/manifest.json"), progress)
+                    .await?;
             let manifest: serde_json::Value = serde_json::from_str(&manifest)
                 .map_err(|e| InstallError::Download(format!("claude manifest: {e}")))?;
             let expected = manifest["platforms"][&platform]["checksum"]
@@ -778,6 +834,39 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         assert_eq!(checksum_for_asset(sums, "missing.tar.gz"), None);
+    }
+
+    #[tokio::test]
+    async fn manifest_fetch_observes_install_cancellation_before_headers() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/manifest",
+                    axum::routing::get(|| async { std::future::pending::<&'static str>().await }),
+                ),
+            )
+            .await
+        });
+        let progress = std::sync::Arc::new(Progress::default());
+        let request_progress = progress.clone();
+        let request = tokio::spawn(async move {
+            get_text_with_progress(&format!("http://{address}/manifest"), &request_progress).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        progress
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("cancelled manifest request stayed pending")
+            .unwrap();
+        assert!(matches!(result, Err(InstallError::Cancelled)));
+        server.abort();
     }
 
     #[test]

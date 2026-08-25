@@ -31,7 +31,7 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
@@ -42,6 +42,8 @@ const TOOL_NAME = "trouve_qualification_echo";
 const TOOL_ARGUMENT = "cursor-sdk-bridge-tool-ok";
 const TOOL_RESULT = "TROUVE_CURSOR_SDK_BRIDGE_OK";
 const MAX_HTTP_BODY_BYTES = 4 * 1024 * 1024;
+const MAX_BRIDGE_ARCHIVE_BYTES = 512 * 1024 * 1024;
+const MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
 const MAX_CONNECT_STREAM_BYTES = 64 * 1024 * 1024;
 const MAX_CONNECT_STREAM_FRAMES = 100_000;
@@ -74,7 +76,7 @@ Options:
   --workspace PATH  Workspace shown to the sandboxed agent (default: repo root)
   --model ID        Cursor model id (default: composer-2 when available)
   --timeout SECONDS Timeout for startup and each RPC/turn (default: 300)
-  --keep-download   Keep the temporary verified bridge download for inspection
+  --keep-download   Keep verified download files; runtime state is still removed
   --help            Show this help
 `;
 
@@ -135,7 +137,7 @@ function assetName() {
   return `cursor-sdk-bridge-standalone-${operatingSystem}-${architecture}.tar.gz`;
 }
 
-async function download(url, destination, signal) {
+async function download(url, destination, signal, limit) {
   const response = await fetch(url, {
     redirect: "follow",
     signal,
@@ -143,9 +145,56 @@ async function download(url, destination, signal) {
   if (!response.ok || response.body === null) {
     throw new QualificationError(`download failed (${response.status}) for ${url}`);
   }
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(destination), {
-    signal,
+  let received = 0;
+  const limiter = new Transform({
+    transform(chunk, _encoding, callback) {
+      received += chunk.length;
+      if (received > limit) {
+        callback(new QualificationError(`download exceeded ${limit} bytes for ${url}`));
+      } else {
+        callback(null, chunk);
+      }
+    },
   });
+  try {
+    const contentLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > limit) {
+      throw new QualificationError(`download exceeded ${limit} bytes for ${url}`);
+    }
+    await pipeline(
+      Readable.fromWeb(response.body),
+      limiter,
+      createWriteStream(destination),
+      { signal },
+    );
+  } catch (error) {
+    try {
+      await response.body.cancel();
+    } catch {
+      // The pipeline may already own or close the response stream.
+    }
+    await rm(destination, { force: true });
+    throw error;
+  }
+}
+
+async function readBoundedJsonResponse(response, label, limit = MAX_HTTP_BODY_BYTES) {
+  if (response.body === null) return {};
+  const chunks = [];
+  let received = 0;
+  for await (const chunk of Readable.fromWeb(response.body)) {
+    received += chunk.length;
+    if (received > limit) {
+      throw new QualificationError(`${label} response exceeded ${limit} bytes`);
+    }
+    chunks.push(chunk);
+  }
+  if (received === 0) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch (error) {
+    throw new QualificationError(`${label} returned invalid JSON: ${error}`);
+  }
 }
 
 async function sha256(path) {
@@ -205,11 +254,11 @@ async function resolveBridge(explicit, temporaryRoot, timeoutMilliseconds) {
   );
   try {
     const pending = [
-      [`${RELEASE_ROOT}/${asset}`, archive],
-      [`${RELEASE_ROOT}/SHA256SUMS.txt`, sums],
-    ].map(async ([url, destination]) => {
+      [`${RELEASE_ROOT}/${asset}`, archive, MAX_BRIDGE_ARCHIVE_BYTES],
+      [`${RELEASE_ROOT}/SHA256SUMS.txt`, sums, MAX_CHECKSUM_MANIFEST_BYTES],
+    ].map(async ([url, destination, limit]) => {
       try {
-        await download(url, destination, downloads.signal);
+        await download(url, destination, downloads.signal, limit);
       } catch (error) {
         // Abort the peer immediately, then let allSettled below acknowledge
         // both pipelines before temporary state can be removed.
@@ -360,6 +409,8 @@ async function startBridge({
 }) {
   const diagnostics = [];
   const secrets = [apiKey, callback.bearer];
+  const runtimeRoot = join(stateRoot, "runtime");
+  await mkdir(runtimeRoot, { recursive: true, mode: 0o700 });
   const child = spawn(binary, [], {
     detached: process.platform !== "win32",
     env: {
@@ -370,6 +421,9 @@ async function startBridge({
       CURSOR_SDK_CLIENT_LANGUAGE: "node",
       CURSOR_SDK_TOOL_CALLBACK_AUTH_TOKEN: callback.bearer,
       CURSOR_SDK_TOOL_CALLBACK_URL: callback.url,
+      TMPDIR: runtimeRoot,
+      TEMP: runtimeRoot,
+      TMP: runtimeRoot,
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -404,7 +458,7 @@ async function startBridge({
       }
       return;
     }
-    if (line.trim()) diagnostics.push(redact(line, secrets));
+    if (line.trim()) diagnostics.push(redact(line, secrets).slice(-16_384));
     if (diagnostics.length > 40) diagnostics.shift();
   };
   child.stderr.on("data", (chunk) => {
@@ -439,31 +493,36 @@ async function startBridge({
   } finally {
     clearTimeout(timer);
   }
-  if (
-    ready.schemaVersion !== 1 ||
-    ready.transport !== "tcp" ||
-    ready.protocol !== "connect" ||
-    typeof ready.url !== "string"
-  ) {
+  try {
+    if (
+      ready.schemaVersion !== 1 ||
+      ready.transport !== "tcp" ||
+      ready.protocol !== "connect" ||
+      typeof ready.url !== "string"
+    ) {
+      throw new QualificationError("Cursor SDK Bridge returned an unsupported discovery payload");
+    }
+    const token =
+      typeof ready.authToken === "string"
+        ? ready.authToken.trim()
+        : typeof ready.authTokenFile === "string"
+          ? (await readFile(ready.authTokenFile, "utf8")).trim()
+          : "";
+    if (!token) {
+      throw new QualificationError("Cursor SDK Bridge returned an empty bearer token");
+    }
+    secrets.push(token);
+    return {
+      child,
+      diagnostics,
+      secrets,
+      token,
+      url: ready.url,
+    };
+  } catch (error) {
     await terminateProcessTree(child);
-    throw new QualificationError("Cursor SDK Bridge returned an unsupported discovery payload");
+    throw error;
   }
-  const token =
-    typeof ready.authToken === "string"
-      ? ready.authToken
-      : (await readFile(ready.authTokenFile, "utf8")).trim();
-  if (!token) {
-    await terminateProcessTree(child);
-    throw new QualificationError("Cursor SDK Bridge returned an empty bearer token");
-  }
-  secrets.push(token);
-  return {
-    child,
-    diagnostics,
-    secrets,
-    token,
-    url: ready.url,
-  };
 }
 
 async function terminateProcessTree(child) {
@@ -1084,7 +1143,8 @@ async function main() {
           cursor_native_sandbox: false,
           exactly_once: true,
           resume: true,
-          isolated_state_removed: !args.keepDownload,
+          isolated_state_removed: true,
+          verified_download_files_retained: args.keepDownload,
           turns,
         },
         null,
@@ -1114,8 +1174,9 @@ async function main() {
     if (callback !== undefined) {
       await new Promise((accept) => callback.server.close(accept));
     }
+    await rm(stateRoot, { recursive: true, force: true });
     if (!args.keepDownload) await rm(temporaryRoot, { recursive: true, force: true });
-    else process.stderr.write(`Kept qualification files at ${temporaryRoot}\n`);
+    else process.stderr.write(`Kept verified download files at ${temporaryRoot}\n`);
   }
 }
 
@@ -1124,7 +1185,9 @@ export {
   QualificationError,
   assistantText,
   connectFrame,
+  download,
   redact,
+  readBoundedJsonResponse,
   resolveBridge,
   safeUnary,
   sdkMessages,
