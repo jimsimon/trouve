@@ -434,7 +434,6 @@ async fn cursor_health_requires_a_configured_api_key() {
 }
 
 #[tokio::test]
-#[ignore = "calls Cursor's live API; run with TROUVE_E2E=1 and CURSOR_API_KEY"]
 async fn cursor_live_subscription_health_uses_only_the_configured_api_key() {
     if std::env::var("TROUVE_E2E").ok().as_deref() != Some("1") {
         eprintln!("skipping: set TROUVE_E2E=1 to run network tests");
@@ -484,6 +483,7 @@ async fn cursor_sdk_mcp(
         }),
         "tools/call" => {
             state.calls.lock().await.push(request["params"].clone());
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             serde_json::json!({
                 "content": [{ "type": "text", "text": "tool-ok" }],
                 "structuredContent": { "value": "tool-ok" },
@@ -506,6 +506,7 @@ fn cursor_sdk_bridge_stub(dir: &Path) -> String {
         dir,
         "cursor-sdk-bridge",
         r##"#!/usr/bin/env python3
+import concurrent.futures
 import http.server
 import json
 import os
@@ -571,8 +572,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "agentId": agent_id,
                     "args": {"token": "from-sdk"}
                 }
-                callback_responses = []
-                for _attempt in range(2):
+                def call_tool(_attempt):
                     callback_request = urllib.request.Request(
                         callback_url + "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
                         data=json.dumps(callback).encode("utf-8"),
@@ -583,7 +583,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         method="POST"
                     )
                     with urllib.request.urlopen(callback_request, timeout=10) as response:
-                        callback_responses.append(json.loads(response.read().decode("utf-8")))
+                        return json.loads(response.read().decode("utf-8"))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    callback_responses = list(executor.map(call_tool, range(2)))
                 write_json(binary + ".callback.json", callback_responses[0])
                 write_json(binary + ".callback-replay.json", callback_responses[1])
             run_id = "sdk-run-" + str(send_count)

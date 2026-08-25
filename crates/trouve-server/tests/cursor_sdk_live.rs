@@ -207,7 +207,6 @@ async fn install_cursor_sdk(client: &reqwest::Client, base: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "paid live test; run with TROUVE_E2E=1 and CURSOR_API_KEY"]
 async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
     if std::env::var("TROUVE_E2E").ok().as_deref() != Some("1") {
         eprintln!("skipping: set TROUVE_E2E=1 to run live Cursor SDK qualification");

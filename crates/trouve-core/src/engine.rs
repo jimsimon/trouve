@@ -2395,10 +2395,10 @@ fn resolved_runtime_command(
     })
 }
 
-/// The old `cursor-cli` kind is accepted only as a transport-name migration.
+/// The old `cursor-cli` kind is retained only as an explicit migration state.
 /// Its command referred to `cursor-agent`, which must never be launched by the
 /// SDK adapter; runtime resolution therefore starts fresh at the managed
-/// Bridge/PATH layers.
+/// Bridge/PATH layers while the backend asks the user for an SDK API key.
 fn configured_runtime_command(pc: &ProviderConfig) -> Option<String> {
     if pc.kind == "cursor-cli" {
         None
@@ -2434,8 +2434,8 @@ fn provider_auth_kind(pc: &ProviderConfig) -> String {
     } else if is_cli_auth_kind(&pc.kind) {
         "cli".into()
     } else if matches!(pc.kind.as_str(), "cursor-sdk" | "cursor-cli") {
-        // cursor-cli is retained as a configuration compatibility alias, but
-        // both spellings run through the API-key-authenticated Agent SDK.
+        // The legacy recovery state needs the API-key editor that completes
+        // migration to the Agent SDK; CLI login credentials are incompatible.
         "api-key".into()
     } else if pc.oauth.is_some() && pc.api_key.is_none() {
         "oauth".into()
@@ -2543,11 +2543,14 @@ fn build_all_backends(
                             .ok()
                             .flatten()
                     });
-                Arc::new(
-                    trouve_agents::cursor::CursorBackend::new(id, command, api_key)
-                        .with_state_root(data_dir.join("cursor-sdk"))
-                        .with_catalog(catalog.clone()),
-                )
+                let backend = trouve_agents::cursor::CursorBackend::new(id, command, api_key)
+                    .with_state_root(data_dir.join("cursor-sdk"))
+                    .with_catalog(catalog.clone());
+                Arc::new(if pc.kind == "cursor-cli" {
+                    backend.requiring_legacy_cli_migration()
+                } else {
+                    backend
+                })
             }
             "claude-cli" => Arc::new(
                 trouve_agents::claude::ClaudeBackend::new(id, command)
@@ -3480,6 +3483,10 @@ impl Engine {
                 .ok()
                 .flatten()
                 .is_some(),
+            // A saved key does not silently opt a legacy CLI config into a
+            // different transport. Saving the Cursor SDK preset completes the
+            // migration and changes the kind deliberately.
+            _ if pc.kind == "cursor-cli" => false,
             // Key-authenticated agent backend (such as Cursor): not in the
             // provider registry, so check the key channels directly.
             _ if is_backend_kind(&pc.kind) => {
@@ -3521,7 +3528,7 @@ impl Engine {
                 "unknown provider kind {:?} (expected openai-compat, anthropic, \
                  azure-openai, amazon-bedrock, google-vertex, \
                  google-vertex-anthropic, codex-app-server, \
-                 cursor-sdk (cursor-cli is a legacy alias), or claude-cli)",
+                 cursor-sdk (cursor-cli is a legacy migration state), or claude-cli)",
                 req.kind
             )));
         }
@@ -11863,7 +11870,7 @@ impl Engine {
         vendor_call_id: Option<&str>,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let vendor_thread_id = vendor_thread_id
             .filter(|thread_id| !thread_id.is_empty())
             .ok_or_else(|| {
@@ -11978,10 +11985,8 @@ impl Engine {
         if root_cancel.is_cancelled() {
             return Err(EngineError::Conflict("tool call cancelled".into()));
         }
-        Ok(self
-            .bridged_tool_call_for(&owner_thread_id, name, arguments, root_cancel)
-            .await?
-            .content)
+        self.bridged_tool_call_for(&owner_thread_id, name, arguments, root_cancel)
+            .await
     }
 
     async fn bridged_tool_call_for(
@@ -20902,12 +20907,15 @@ default_permission_mode = "ask"
             .bridged_tool_owners
             .bind_vendor_thread(&parent.id, "vendor-audit", &audit_child.id)
             .unwrap();
-        let missing_owner = engine
+        let missing_owner = match engine
             .bridged_codex_tool_call(&parent.id, None, None, "read_file", &bridge_arguments)
             .await
-            .unwrap_err();
+        {
+            Ok(_) => panic!("missing owner metadata should be rejected"),
+            Err(error) => error,
+        };
         assert!(missing_owner.to_string().contains("_meta.threadId"));
-        let unknown_owner = engine
+        let unknown_owner = match engine
             .bridged_codex_tool_call(
                 &parent.id,
                 Some("vendor-external"),
@@ -20916,7 +20924,10 @@ default_permission_mode = "ask"
                 &bridge_arguments,
             )
             .await
-            .unwrap_err();
+        {
+            Ok(_) => panic!("unknown owner metadata should be rejected"),
+            Err(error) => error,
+        };
         assert!(unknown_owner.to_string().contains("unknown, external"));
         let thread_only_output = engine
             .bridged_codex_tool_call(
@@ -20928,7 +20939,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(thread_only_output.contains("owned by the child"));
+        assert!(thread_only_output.content.contains("owned by the child"));
         {
             let projection = collaborators.get_mut("vendor-child").unwrap();
             assert!(engine.suppress_collaborator_bridge_wrapper(
@@ -20952,7 +20963,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(bridge_output.contains("owned by the child"));
+        assert!(bridge_output.content.contains("owned by the child"));
         {
             let projection = collaborators.get_mut("vendor-child").unwrap();
             assert!(engine.suppress_collaborator_bridge_wrapper(
@@ -21080,7 +21091,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(review_result.contains("not permitted in this mode"));
+        assert!(review_result.content.contains("not permitted in this mode"));
         assert_eq!(
             std::fs::read_to_string(data.path().join("metadata-owner.txt")).unwrap(),
             "written by interactive child"

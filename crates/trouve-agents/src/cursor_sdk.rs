@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
@@ -65,6 +65,7 @@ pub struct CursorBackend {
     catalog: Arc<ModelsDevCatalog>,
     /// Cursor API and Dashboard Connect-RPC origin (overridable for tests).
     dashboard_base: String,
+    legacy_cli_migration_required: bool,
 }
 
 impl CursorBackend {
@@ -81,7 +82,16 @@ impl CursorBackend {
             pool: Arc::new(BridgePool::default()),
             catalog: Arc::new(ModelsDevCatalog::embedded()),
             dashboard_base: DASHBOARD_BASE.into(),
+            legacy_cli_migration_required: false,
         }
+    }
+
+    /// Preserve old `cursor-cli` configurations as an explicit recovery
+    /// state. CLI login credentials cannot authenticate the Agent SDK, so the
+    /// user must deliberately save an SDK API key before this backend runs.
+    pub fn requiring_legacy_cli_migration(mut self) -> Self {
+        self.legacy_cli_migration_required = true;
+        self
     }
 
     /// Put durable SDK state under trouve's application data directory.
@@ -267,7 +277,8 @@ impl AgentBackend for CursorBackend {
     fn status(&self) -> BackendStatus {
         BackendStatus {
             installed: binary_on_path(&self.command),
-            has_credentials: self.effective_api_key().is_some(),
+            has_credentials: !self.legacy_cli_migration_required
+                && self.effective_api_key().is_some(),
         }
     }
 
@@ -280,6 +291,16 @@ impl AgentBackend for CursorBackend {
     }
 
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        if self.legacy_cli_migration_required {
+            return Some(trouve_protocol::SubscriptionHealth {
+                provider_id: self.id.clone(),
+                status: "unavailable".into(),
+                plan: String::new(),
+                windows: Vec::new(),
+                credits: String::new(),
+                note: legacy_cursor_migration_message().into(),
+            });
+        }
         Some(match self.query_dashboard_usage().await {
             Ok((usage, plan_info)) => parse_dashboard_usage(&self.id, &usage, plan_info.as_ref()),
             Err(e) => trouve_protocol::SubscriptionHealth {
@@ -298,12 +319,18 @@ impl AgentBackend for CursorBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
+        if self.legacy_cli_migration_required {
+            return Err(BackendError::Auth(legacy_cursor_migration_message().into()));
+        }
         Err(BackendError::Auth(
             "Cursor Agent SDK authentication uses an API key; save it in Provider settings".into(),
         ))
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        if self.legacy_cli_migration_required {
+            return Err(BackendError::Auth(legacy_cursor_migration_message().into()));
+        }
         self.start_reaper();
         if !binary_on_path(&self.command) {
             return Err(BackendError::NotInstalled(self.command.clone()));
@@ -359,16 +386,47 @@ impl AgentBackend for CursorBackend {
     }
 }
 
+fn legacy_cursor_migration_message() -> &'static str {
+    "this provider still uses the retired cursor-cli transport; open Provider settings, select Cursor (Agent SDK), and save a Cursor user or service API key"
+}
+
 enum TurnTerminal {
     Finished(Usage),
     Cancelled,
     ConsumerClosed,
 }
 
-#[derive(Default)]
 struct BridgePool {
     processes: Mutex<HashMap<String, Arc<PooledBridge>>>,
+    thread_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    capacity: Arc<Semaphore>,
+    available: Notify,
     reaper_started: AtomicBool,
+}
+
+impl Default for BridgePool {
+    fn default() -> Self {
+        Self {
+            processes: Mutex::new(HashMap::new()),
+            thread_gates: Mutex::new(HashMap::new()),
+            capacity: Arc::new(Semaphore::new(POOL_CAP)),
+            available: Notify::new(),
+            reaper_started: AtomicBool::new(false),
+        }
+    }
+}
+
+struct BridgeLease {
+    process: Arc<PooledBridge>,
+    _thread_guard: OwnedMutexGuard<()>,
+}
+
+impl std::ops::Deref for BridgeLease {
+    type Target = PooledBridge;
+
+    fn deref(&self) -> &Self::Target {
+        &self.process
+    }
 }
 
 struct BridgeProcessRequest<'a> {
@@ -386,17 +444,29 @@ impl BridgePool {
         &self,
         thread_id: &str,
         request: BridgeProcessRequest<'_>,
-    ) -> Result<Arc<PooledBridge>, BackendError> {
+    ) -> Result<BridgeLease, BackendError> {
         if request.cancel.is_cancelled() || request.events.is_closed() {
             return Err(BackendError::Cancelled);
         }
-        let mut processes = self.processes.lock().await;
-        if let Some(process) = processes.get(thread_id).cloned() {
+        let gate = self.thread_gate(thread_id).await;
+        let thread_guard = tokio::select! {
+            biased;
+            _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
+            _ = request.events.closed() => return Err(BackendError::Cancelled),
+            guard = gate.lock_owned() => guard,
+        };
+        let existing = self.processes.lock().await.get(thread_id).cloned();
+        if let Some(process) = existing {
             let alive = if process.is_reusable()
                 && process.worktree == request.worktree
                 && process.state_dir == request.state_dir
             {
-                let mut bridge = process.bridge.lock().await;
+                let mut bridge = tokio::select! {
+                    biased;
+                    _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
+                    _ = request.events.closed() => return Err(BackendError::Cancelled),
+                    bridge = process.bridge.lock() => bridge,
+                };
                 match bridge.child.try_wait_leader() {
                     Ok(status) => status.is_none(),
                     Err(error) => {
@@ -412,22 +482,24 @@ impl BridgePool {
             };
             if alive {
                 process.touch();
-                return Ok(process);
+                return Ok(BridgeLease {
+                    process,
+                    _thread_guard: thread_guard,
+                });
             }
             process.quarantine();
-            process.terminate().await?;
-            if processes
-                .get(thread_id)
-                .is_some_and(|entry| Arc::ptr_eq(entry, &process))
-            {
-                processes.remove(thread_id);
+            self.remove_if_same(thread_id, &process).await;
+            if let Err(error) = process.terminate().await {
+                self.restore_if_vacant(thread_id, process).await;
+                return Err(error);
             }
+            drop(process);
             if request.cancel.is_cancelled() || request.events.is_closed() {
                 return Err(BackendError::Cancelled);
             }
         }
 
-        Self::enforce_cap(&mut processes).await;
+        let permit = self.acquire_capacity(&request).await?;
         if request.cancel.is_cancelled() || request.events.is_closed() {
             return Err(BackendError::Cancelled);
         }
@@ -447,100 +519,172 @@ impl BridgePool {
             worktree: request.worktree.to_path_buf(),
             state_dir: request.state_dir.to_path_buf(),
             last_used: StdMutex::new(Instant::now()),
+            _permit: permit,
         });
-        processes.insert(thread_id.to_string(), process.clone());
-        Ok(process)
+        self.processes
+            .lock()
+            .await
+            .insert(thread_id.to_string(), process.clone());
+        Ok(BridgeLease {
+            process,
+            _thread_guard: thread_guard,
+        })
     }
 
     async fn terminate_and_remove(
         &self,
         thread_id: &str,
-        process: &Arc<PooledBridge>,
+        process: &BridgeLease,
     ) -> Result<(), BackendError> {
-        let mut processes = self.processes.lock().await;
         process.quarantine();
-        process.terminate().await?;
+        self.remove_if_same(thread_id, &process.process).await;
+        if let Err(error) = process.terminate().await {
+            self.restore_if_vacant(thread_id, process.process.clone())
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn reap_idle(&self) {
+        while let Some((thread_id, process, _guard)) = self.take_evictable(Some(IDLE_TIMEOUT)).await
+        {
+            match process.terminate().await {
+                Ok(()) => {}
+                Err(error) => {
+                    self.restore_if_vacant(&thread_id, process).await;
+                    tracing::warn!(
+                        %thread_id,
+                        "cursor: retaining idle Bridge after unacknowledged cleanup: {error}"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn thread_gate(&self, thread_id: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.thread_gates.lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(thread_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(thread_id.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn remove_if_same(&self, thread_id: &str, process: &Arc<PooledBridge>) {
+        let mut processes = self.processes.lock().await;
         if processes
             .get(thread_id)
             .is_some_and(|entry| Arc::ptr_eq(entry, process))
         {
             processes.remove(thread_id);
         }
-        Ok(())
     }
 
-    async fn reap_idle(&self) {
-        let mut processes = self.processes.lock().await;
-        let idle = processes
-            .iter()
-            .filter(|(_, process)| {
-                process.is_reusable()
-                    && Arc::strong_count(process) == 1
-                    && process.bridge.try_lock().is_ok()
-                    && process.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT
-            })
-            .map(|(thread_id, _)| thread_id.clone())
-            .collect::<Vec<_>>();
-        for thread_id in idle {
-            let Some(process) = processes.get(&thread_id).cloned() else {
+    async fn restore_if_vacant(&self, thread_id: &str, process: Arc<PooledBridge>) {
+        self.processes
+            .lock()
+            .await
+            .entry(thread_id.to_string())
+            .or_insert(process);
+    }
+
+    async fn acquire_capacity(
+        &self,
+        request: &BridgeProcessRequest<'_>,
+    ) -> Result<OwnedSemaphorePermit, BackendError> {
+        loop {
+            if let Ok(permit) = self.capacity.clone().try_acquire_owned() {
+                return Ok(permit);
+            }
+            if self.evict_one().await? {
                 continue;
-            };
-            process.quarantine();
-            match process.terminate().await {
-                Ok(()) => {
-                    if processes
-                        .get(&thread_id)
-                        .is_some_and(|entry| Arc::ptr_eq(entry, &process))
-                    {
-                        processes.remove(&thread_id);
-                    }
+            }
+            tokio::select! {
+                biased;
+                _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
+                _ = request.events.closed() => return Err(BackendError::Cancelled),
+                permit = self.capacity.clone().acquire_owned() => {
+                    return permit.map_err(|_| BackendError::Protocol(
+                        "Cursor SDK Bridge pool capacity closed unexpectedly".into()
+                    ));
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        %thread_id,
-                        "cursor: retaining idle Bridge after unacknowledged cleanup: {error}"
-                    );
-                }
+                _ = self.available.notified() => {}
             }
         }
     }
 
-    async fn enforce_cap(processes: &mut HashMap<String, Arc<PooledBridge>>) {
-        while processes.len() >= POOL_CAP {
-            let lru = processes
+    async fn evict_one(&self) -> Result<bool, BackendError> {
+        let Some((thread_id, process, _guard)) = self.take_evictable(None).await else {
+            return Ok(false);
+        };
+        if let Err(error) = process.terminate().await {
+            self.restore_if_vacant(&thread_id, process).await;
+            return Err(error);
+        }
+        self.available.notify_one();
+        Ok(true)
+    }
+
+    async fn take_evictable(
+        &self,
+        idle_for: Option<Duration>,
+    ) -> Option<(String, Arc<PooledBridge>, OwnedMutexGuard<()>)> {
+        let mut candidates = {
+            let processes = self.processes.lock().await;
+            processes
                 .iter()
                 .filter(|(_, process)| {
                     process.is_reusable()
                         && Arc::strong_count(process) == 1
                         && process.bridge.try_lock().is_ok()
+                        && idle_for.is_none_or(|idle_for| {
+                            process.last_used.lock().unwrap().elapsed() > idle_for
+                        })
                 })
-                .min_by_key(|(_, process)| *process.last_used.lock().unwrap())
-                .map(|(thread_id, _)| thread_id.clone());
-            let Some(thread_id) = lru else {
-                break;
-            };
-            let Some(process) = processes.get(&thread_id).cloned() else {
+                .map(|(thread_id, process)| (thread_id.clone(), *process.last_used.lock().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        candidates.sort_by_key(|(_, last_used)| *last_used);
+        for (thread_id, _) in candidates {
+            let gate = self.thread_gate(&thread_id).await;
+            let Ok(guard) = gate.try_lock_owned() else {
                 continue;
             };
-            process.quarantine();
-            match process.terminate().await {
-                Ok(()) => {
-                    if processes
-                        .get(&thread_id)
-                        .is_some_and(|entry| Arc::ptr_eq(entry, &process))
-                    {
-                        processes.remove(&thread_id);
-                    }
+            let process = {
+                let mut processes = self.processes.lock().await;
+                let evictable = processes.get(&thread_id).is_some_and(|process| {
+                    process.is_reusable()
+                        && Arc::strong_count(process) == 1
+                        && process.bridge.try_lock().is_ok()
+                        && idle_for.is_none_or(|idle_for| {
+                            process.last_used.lock().unwrap().elapsed() > idle_for
+                        })
+                });
+                if !evictable {
+                    None
+                } else {
+                    let process = processes.remove(&thread_id).expect("entry checked above");
+                    process.quarantine();
+                    Some(process)
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        %thread_id,
-                        "cursor: retaining LRU Bridge after unacknowledged cleanup: {error}"
-                    );
-                    break;
-                }
+            };
+            if let Some(process) = process {
+                return Some((thread_id, process, guard));
             }
         }
+        None
+    }
+
+    fn notify_idle(&self) {
+        self.available.notify_waiters();
+        // `notify_waiters` is intentionally broad but does not retain a
+        // permit. Store one notification as well so a completion racing just
+        // before a waiter registers cannot strand admission at a full pool.
+        self.available.notify_one();
     }
 }
 
@@ -550,6 +694,7 @@ struct PooledBridge {
     worktree: PathBuf,
     state_dir: PathBuf,
     last_used: StdMutex<Instant>,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl PooledBridge {
@@ -714,6 +859,7 @@ async fn run_sdk_turn(
 
     if keep_warm {
         process.touch();
+        pool.notify_idle();
         return outcome;
     }
     let process_cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
@@ -926,6 +1072,29 @@ async fn load_custom_tools(
     Ok(definitions)
 }
 
+async fn read_bounded_response(
+    response: reqwest::Response,
+    label: &str,
+    limit: usize,
+) -> Result<(reqwest::StatusCode, bytes::Bytes), BackendError> {
+    let status = response.status();
+    let mut stream = response.bytes_stream();
+    let mut bytes = BytesMut::with_capacity(limit.min(64 * 1024));
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|error| BackendError::Protocol(format!("{label}: {error}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(BackendError::Protocol(format!(
+                "{label} response exceeded {limit} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((status, bytes.freeze()))
+}
+
 async fn mcp_request(
     http: &reqwest::Client,
     mcp_url: &str,
@@ -953,16 +1122,8 @@ async fn mcp_request(
         None => request.await,
     }
     .map_err(|error| BackendError::Protocol(format!("MCP {method}: {error}")))?;
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| BackendError::Protocol(format!("MCP {method}: {error}")))?;
-    if bytes.len() > MAX_RPC_BODY_BYTES {
-        return Err(BackendError::Protocol(format!(
-            "MCP {method} response exceeded {MAX_RPC_BODY_BYTES} bytes"
-        )));
-    }
+    let label = format!("MCP {method}");
+    let (status, bytes) = read_bounded_response(response, &label, MAX_RPC_BODY_BYTES).await?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
         BackendError::Protocol(format!("MCP {method} returned invalid JSON: {error}"))
     })?;
@@ -994,7 +1155,7 @@ struct CallbackState {
 struct CallbackRecord {
     tool_name: String,
     args: Value,
-    outcome: Option<CallbackOutcome>,
+    outcome: watch::Receiver<Option<CallbackOutcome>>,
 }
 
 #[derive(Clone)]
@@ -1106,14 +1267,19 @@ async fn custom_tool_callback(
             "tool calls are disabled for this turn",
         );
     };
-    let Some(call_id) = request.tool_call_id.filter(|id| !id.is_empty()) else {
+    let Some(call_id) = request
+        .tool_call_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+    else {
         return callback_error(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
             "custom-tool callback omitted its tool-call id",
         );
     };
-    {
+    let (mut outcome, execute) = {
         let mut calls = state.calls.lock().await;
         if let Some(existing) = calls.get(&call_id) {
             if existing.tool_name != request.tool_name || existing.args != request.args {
@@ -1123,32 +1289,53 @@ async fn custom_tool_callback(
                     "tool-call id was reused with different arguments",
                 );
             }
-            return existing.outcome.as_ref().map_or_else(
-                || {
-                    callback_error(
-                        StatusCode::CONFLICT,
-                        "already_exists",
-                        "tool call is already executing",
-                    )
+            (existing.outcome.clone(), None)
+        } else {
+            let (sender, receiver) = watch::channel(None);
+            calls.insert(
+                call_id,
+                CallbackRecord {
+                    tool_name: request.tool_name.clone(),
+                    args: request.args.clone(),
+                    outcome: receiver.clone(),
                 },
-                callback_outcome_response,
+            );
+            (receiver, Some(sender))
+        }
+    };
+    if let Some(sender) = execute {
+        let http = state.http.clone();
+        let mcp_url = Arc::<str>::from(mcp_url);
+        tokio::spawn(async move {
+            let outcome = execute_custom_tool(http, mcp_url, request).await;
+            let _ = sender.send(Some(outcome));
+        });
+    }
+    loop {
+        if let Some(outcome) = outcome.borrow().clone() {
+            return callback_outcome_response(&outcome);
+        }
+        if outcome.changed().await.is_err() {
+            return callback_error(
+                StatusCode::BAD_GATEWAY,
+                "internal",
+                "trouve could not execute the requested tool",
             );
         }
-        calls.insert(
-            call_id.clone(),
-            CallbackRecord {
-                tool_name: request.tool_name.clone(),
-                args: request.args.clone(),
-                outcome: None,
-            },
-        );
     }
+}
+
+async fn execute_custom_tool(
+    http: reqwest::Client,
+    mcp_url: Arc<str>,
+    request: CustomToolRequest,
+) -> CallbackOutcome {
     // The internal MCP endpoint persists the canonical requested/approval/
     // started/completed lifecycle around ToolExecutor. Do not mirror a
     // second BackendEvent tool card from the SDK callback.
     let result = mcp_request(
-        &state.http,
-        mcp_url,
+        &http,
+        &mcp_url,
         "tools/call",
         json!({
             "name": request.tool_name,
@@ -1167,7 +1354,7 @@ async fn custom_tool_callback(
             })
     });
 
-    let outcome = match result {
+    match result {
         Ok(result) => CallbackOutcome {
             status: StatusCode::OK,
             body: json!({ "result": result }),
@@ -1182,11 +1369,7 @@ async fn custom_tool_callback(
                 }),
             }
         }
-    };
-    if let Some(record) = state.calls.lock().await.get_mut(&call_id) {
-        record.outcome = Some(outcome.clone());
     }
-    callback_outcome_response(&outcome)
 }
 
 fn callback_outcome_response(outcome: &CallbackOutcome) -> Response {
@@ -1545,16 +1728,12 @@ impl BridgeClient {
         .await
         .map_err(|_| BackendError::Protocol(format!("{method} timed out")))?
         .map_err(|error| BackendError::Protocol(format!("{method}: {error}")))?;
-        let status = response.status();
-        let bytes = tokio::time::timeout(timeout, response.bytes())
-            .await
-            .map_err(|_| BackendError::Protocol(format!("{method} response timed out")))?
-            .map_err(|error| BackendError::Protocol(format!("{method}: {error}")))?;
-        if bytes.len() > MAX_RPC_BODY_BYTES {
-            return Err(BackendError::Protocol(format!(
-                "{method} response exceeded {MAX_RPC_BODY_BYTES} bytes"
-            )));
-        }
+        let (status, bytes) = tokio::time::timeout(
+            timeout,
+            read_bounded_response(response, method, MAX_RPC_BODY_BYTES),
+        )
+        .await
+        .map_err(|_| BackendError::Protocol(format!("{method} response timed out")))??;
         let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
             BackendError::Protocol(format!("{method} returned invalid JSON: {error}"))
         })?;
@@ -1660,8 +1839,9 @@ async fn stream_turn(
             })?,
     };
     if !response.status().is_success() {
-        let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
+        let (status, detail) =
+            read_bounded_response(response, "Cursor Send", MAX_RPC_BODY_BYTES).await?;
+        let detail = String::from_utf8_lossy(&detail);
         return Err(BackendError::Protocol(format!(
             "Cursor Send failed (HTTP {status}): {}",
             client.redact(&bounded_text(&detail))
@@ -2200,6 +2380,50 @@ fn i64_flex(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_response_stops_at_the_configured_limit() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/oversized", axum::routing::get(|| async { "12345" })),
+            )
+            .await
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/oversized"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_bounded_response(response, "test", 4)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded 4 bytes"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_cursor_cli_requires_explicit_sdk_migration() {
+        let backend = CursorBackend::new(
+            "cursor",
+            Some("cursor-sdk-bridge".into()),
+            Some("configured-key".into()),
+        )
+        .requiring_legacy_cli_migration();
+        assert!(!backend.status().has_credentials);
+        let health = backend.subscription_health().await.unwrap();
+        assert_eq!(health.status, "unavailable");
+        assert!(health.note.contains("retired cursor-cli"));
+        let error = match backend.start_login().await {
+            Ok(_) => panic!("legacy Cursor config unexpectedly started a login flow"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("select Cursor (Agent SDK)"));
+    }
 
     #[test]
     fn derives_common_image_dimensions() {

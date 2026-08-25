@@ -43,7 +43,10 @@ const TOOL_ARGUMENT = "cursor-sdk-bridge-tool-ok";
 const TOOL_RESULT = "TROUVE_CURSOR_SDK_BRIDGE_OK";
 const MAX_HTTP_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
+const MAX_CONNECT_STREAM_BYTES = 64 * 1024 * 1024;
+const MAX_CONNECT_STREAM_FRAMES = 100_000;
 const READY_PREFIX = "cursor-sdk-bridge ready ";
+const INVALID_TOOL_NAME = "trouve_qualification_invalid_builtin";
 const FORBIDDEN_BUILT_INS = new Set([
   "browser",
   "delete",
@@ -132,12 +135,28 @@ function assetName() {
   return `cursor-sdk-bridge-standalone-${operatingSystem}-${architecture}.tar.gz`;
 }
 
-async function download(url, destination) {
-  const response = await fetch(url, { redirect: "follow" });
-  if (!response.ok || response.body === null) {
-    throw new QualificationError(`download failed (${response.status}) for ${url}`);
+async function download(url, destination, timeoutMilliseconds) {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new QualificationError(`download timed out for ${url}`)),
+    timeoutMilliseconds,
+  );
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!response.ok || response.body === null) {
+      throw new QualificationError(`download failed (${response.status}) for ${url}`);
+    }
+    await pipeline(
+      Readable.fromWeb(response.body),
+      createWriteStream(destination),
+      { signal: controller.signal },
+    );
+  } finally {
+    clearTimeout(timer);
   }
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(destination));
 }
 
 async function sha256(path) {
@@ -191,8 +210,8 @@ async function resolveBridge(explicit, temporaryRoot, timeoutMilliseconds) {
     `Downloading and verifying Cursor SDK Bridge v${BRIDGE_VERSION} (${asset})...\n`,
   );
   await Promise.all([
-    download(`${RELEASE_ROOT}/${asset}`, archive),
-    download(`${RELEASE_ROOT}/SHA256SUMS.txt`, sums),
+    download(`${RELEASE_ROOT}/${asset}`, archive, timeoutMilliseconds),
+    download(`${RELEASE_ROOT}/SHA256SUMS.txt`, sums, timeoutMilliseconds),
   ]);
   const checksumLines = (await readFile(sums, "utf8")).split(/\r?\n/u);
   let expected;
@@ -228,20 +247,29 @@ function secureBearerMatches(header, token) {
   return presented.length === expected.length && timingSafeEqual(presented, expected);
 }
 
-async function readHttpBody(request) {
+async function readHttpBody(request, timeoutMilliseconds) {
   const chunks = [];
   let length = 0;
-  for await (const chunk of request) {
-    length += chunk.length;
-    if (length > MAX_HTTP_BODY_BYTES) {
-      throw new QualificationError("custom-tool callback body exceeded the probe limit");
+  const timer = setTimeout(
+    () => request.destroy(new QualificationError("custom-tool callback body timed out")),
+    Math.min(timeoutMilliseconds, 30_000),
+  );
+  try {
+    for await (const chunk of request) {
+      length += chunk.length;
+      if (length > MAX_HTTP_BODY_BYTES) {
+        request.destroy();
+        throw new QualificationError("custom-tool callback body exceeded the probe limit");
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+    return Buffer.concat(chunks).toString("utf8");
+  } finally {
+    clearTimeout(timer);
   }
-  return Buffer.concat(chunks).toString("utf8");
 }
 
-async function startToolCallbackServer() {
+async function startToolCallbackServer(timeoutMilliseconds) {
   const bearer = randomBytes(32).toString("base64url");
   const calls = [];
   const errors = [];
@@ -258,7 +286,7 @@ async function startToolCallbackServer() {
         response.end(JSON.stringify({ code: "unauthenticated", message: "Unauthorized" }));
         return;
       }
-      const body = JSON.parse(await readHttpBody(request));
+      const body = JSON.parse(await readHttpBody(request, timeoutMilliseconds));
       if (body.toolName !== TOOL_NAME) {
         throw new QualificationError(`unexpected callback tool: ${body.toolName}`);
       }
@@ -275,13 +303,15 @@ async function startToolCallbackServer() {
       response.end(JSON.stringify({ result: { value: TOOL_RESULT } }));
     } catch (error) {
       errors.push(error);
-      response.writeHead(400, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          code: "invalid_argument",
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      if (!response.destroyed) {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            code: "invalid_argument",
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
     }
   });
   await new Promise((accept, reject) => {
@@ -427,29 +457,50 @@ async function startBridge({
 }
 
 async function terminateProcessTree(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise((accept) => child.once("exit", accept));
-  try {
-    if (process.platform === "win32") child.kill("SIGTERM");
-    else process.kill(-child.pid, "SIGTERM");
-  } catch (error) {
-    if (error?.code !== "ESRCH") throw error;
+  if (process.platform === "win32") {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+      await Promise.race([
+        new Promise((accept) => child.once("exit", accept)),
+        new Promise((accept) => setTimeout(accept, 5_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+    return;
   }
-  const graceful = await Promise.race([
-    exited.then(() => true),
-    new Promise((accept) => setTimeout(() => accept(false), 5_000)),
-  ]);
-  if (graceful) return;
-  try {
-    if (process.platform === "win32") child.kill("SIGKILL");
-    else process.kill(-child.pid, "SIGKILL");
-  } catch (error) {
-    if (error?.code !== "ESRCH") throw error;
+
+  const groupAlive = () => {
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") return false;
+      throw error;
+    }
+  };
+  const signalGroup = (signal) => {
+    try {
+      process.kill(-child.pid, signal);
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
+  };
+  const waitForGroupExit = async (milliseconds) => {
+    const deadline = Date.now() + milliseconds;
+    while (groupAlive() && Date.now() < deadline) {
+      await new Promise((accept) => setTimeout(accept, 50));
+    }
+    return !groupAlive();
+  };
+
+  // The process-group id remains valid while descendants survive even if the
+  // bridge leader has already exited. Always signal and verify the group.
+  signalGroup("SIGTERM");
+  if (await waitForGroupExit(5_000)) return;
+  signalGroup("SIGKILL");
+  if (!(await waitForGroupExit(5_000))) {
+    throw new QualificationError("Cursor SDK Bridge process group did not terminate");
   }
-  await Promise.race([
-    exited,
-    new Promise((accept) => setTimeout(accept, 5_000)),
-  ]);
 }
 
 function requestTimeout(timeoutMilliseconds) {
@@ -459,6 +510,21 @@ function requestTimeout(timeoutMilliseconds) {
     timeoutMilliseconds,
   );
   return { controller, timer };
+}
+
+async function readResponseText(response, limit, label) {
+  if (response.body === null) return "";
+  const chunks = [];
+  let length = 0;
+  for await (const raw of Readable.fromWeb(response.body)) {
+    const chunk = Buffer.from(raw);
+    length += chunk.length;
+    if (length > limit) {
+      throw new QualificationError(`${label} response exceeded ${limit} bytes`);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, length).toString("utf8");
 }
 
 async function unary(client, service, method, body, timeoutMilliseconds) {
@@ -473,7 +539,7 @@ async function unary(client, service, method, body, timeoutMilliseconds) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    const text = await response.text();
+    const text = await readResponseText(response, MAX_HTTP_BODY_BYTES, method);
     let value;
     try {
       value = text ? JSON.parse(text) : {};
@@ -499,6 +565,78 @@ function connectFrame(value) {
   return Buffer.concat([header, payload]);
 }
 
+class ConnectFrameDecoder {
+  constructor() {
+    this.header = Buffer.alloc(5);
+    this.headerLength = 0;
+    this.flags = 0;
+    this.payloadLength = 0;
+    this.payloadRemaining = 0;
+    this.payloadParts = [];
+    this.totalPayloadBytes = 0;
+    this.frameCount = 0;
+  }
+
+  push(raw) {
+    const chunk = Buffer.from(raw);
+    const frames = [];
+    let offset = 0;
+    while (offset < chunk.length) {
+      if (this.headerLength < 5) {
+        const copied = Math.min(5 - this.headerLength, chunk.length - offset);
+        chunk.copy(this.header, this.headerLength, offset, offset + copied);
+        this.headerLength += copied;
+        offset += copied;
+        if (this.headerLength < 5) break;
+        this.flags = this.header.readUInt8(0);
+        this.payloadLength = this.header.readUInt32BE(1);
+        if (this.payloadLength > MAX_CONNECT_FRAME_BYTES) {
+          throw new QualificationError(
+            `Connect frame exceeded ${MAX_CONNECT_FRAME_BYTES} bytes`,
+          );
+        }
+        this.totalPayloadBytes += this.payloadLength;
+        if (this.totalPayloadBytes > MAX_CONNECT_STREAM_BYTES) {
+          throw new QualificationError(
+            `Connect stream exceeded ${MAX_CONNECT_STREAM_BYTES} retained bytes`,
+          );
+        }
+        this.payloadRemaining = this.payloadLength;
+      }
+
+      const copied = Math.min(this.payloadRemaining, chunk.length - offset);
+      if (copied > 0) {
+        this.payloadParts.push(chunk.subarray(offset, offset + copied));
+        this.payloadRemaining -= copied;
+        offset += copied;
+      }
+      if (this.payloadRemaining !== 0) break;
+
+      this.frameCount += 1;
+      if (this.frameCount > MAX_CONNECT_STREAM_FRAMES) {
+        throw new QualificationError(
+          `Connect stream exceeded ${MAX_CONNECT_STREAM_FRAMES} frames`,
+        );
+      }
+      frames.push({
+        flags: this.flags,
+        payload: Buffer.concat(this.payloadParts, this.payloadLength),
+      });
+      this.headerLength = 0;
+      this.payloadLength = 0;
+      this.payloadRemaining = 0;
+      this.payloadParts = [];
+    }
+    return frames;
+  }
+
+  finish() {
+    if (this.headerLength !== 0 || this.payloadRemaining !== 0) {
+      throw new QualificationError("Send ended with a partial Connect frame");
+    }
+  }
+}
+
 async function serverStream(
   client,
   service,
@@ -520,25 +658,16 @@ async function serverStream(
       signal: controller.signal,
     });
     if (!response.ok || response.body === null) {
-      const detail = await response.text();
+      const detail = await readResponseText(response, MAX_HTTP_BODY_BYTES, method);
       throw new QualificationError(
         `${method} failed (${response.status}): ${detail.slice(0, 4_096)}`,
       );
     }
     const messages = [];
-    let buffered = Buffer.alloc(0);
+    const decoder = new ConnectFrameDecoder();
     let sawEnd = false;
     for await (const raw of Readable.fromWeb(response.body)) {
-      buffered = Buffer.concat([buffered, Buffer.from(raw)]);
-      while (buffered.length >= 5) {
-        const flags = buffered.readUInt8(0);
-        const length = buffered.readUInt32BE(1);
-        if (length > MAX_CONNECT_FRAME_BYTES) {
-          throw new QualificationError(`Connect frame exceeded ${MAX_CONNECT_FRAME_BYTES} bytes`);
-        }
-        if (buffered.length < 5 + length) break;
-        const payload = buffered.subarray(5, 5 + length);
-        buffered = buffered.subarray(5 + length);
+      for (const { flags, payload } of decoder.push(raw)) {
         if ((flags & 0x01) !== 0) {
           throw new QualificationError("compressed Connect frames are not supported by this probe");
         }
@@ -561,9 +690,7 @@ async function serverStream(
         }
       }
     }
-    if (buffered.length !== 0) {
-      throw new QualificationError("Send ended with a partial Connect frame");
-    }
+    decoder.finish();
     if (!sawEnd) {
       throw new QualificationError(`${method} omitted the Connect end-stream frame`);
     }
@@ -624,10 +751,8 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
       message: {
         text:
           `Call the custom tool ${TOOL_NAME} exactly once with ` +
-          `{"token":"${TOOL_ARGUMENT}"}. Then attempt to call Cursor's native shell ` +
-          `tool with the harmless command "printf cursor-native-shell-probe". If the ` +
-          `native shell tool is unavailable, do not substitute another tool. The custom ` +
-          `tool result is an object with a value field; reply with only that value.`,
+          `{"token":"${TOOL_ARGUMENT}"}. The custom tool result is an object ` +
+          `with a value field; reply with only that value.`,
       },
       options: { enableDeltas: true, enableSteps: true },
     },
@@ -647,9 +772,8 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
   const messages = sdkMessages(frames);
   const system = messages.find((message) => message.type === "system");
   // SDKSystemMessage.tools is optional and some Bridge/runtime combinations
-  // omit it. Use it as corroborating telemetry when present; the authoritative
-  // negative check is the explicit native-shell request above plus the
-  // streamed tool events and the exactly-once host callback.
+  // omit it. This is corroborating telemetry only; the deterministic policy
+  // check rejects an unknown built-in through CreateAgent before paid turns.
   const reportedTools = Array.isArray(system?.tools) ? system.tools : null;
   const forbidden = reportedTools?.filter(toolIsForbidden) ?? [];
   if (forbidden.length > 0) {
@@ -661,7 +785,7 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
   const callIds = new Set(toolMessages.map((message) => message.call_id).filter(Boolean));
   const toolNames = [...new Set(toolMessages.map((message) => message.name).filter(Boolean))];
   const unexpectedToolNames = toolNames.filter(
-    (name) => name !== "mcp" && !String(name).includes(TOOL_NAME),
+    (name) => name !== "mcp" && name !== TOOL_NAME,
   );
   if (
     callIds.size !== 1 ||
@@ -712,7 +836,6 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
       callbackCallId === undefined ? null : callbackCallId === streamedCallId,
     assistant_used_result: true,
     built_in_tools_present: false,
-    native_shell_negative_probe: true,
   };
 }
 
@@ -751,6 +874,48 @@ function agentOptions(apiKey, model, workspace) {
   };
 }
 
+async function verifyToolAllowlist(client, options, timeoutMilliseconds) {
+  const invalidOptions = structuredClone(options);
+  invalidOptions.tools = { names: ["mcp", INVALID_TOOL_NAME] };
+  let created;
+  try {
+    created = await unary(
+      client,
+      "SdkAgentService",
+      "CreateAgent",
+      { options: invalidOptions },
+      timeoutMilliseconds,
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (
+      !detail.includes(INVALID_TOOL_NAME) &&
+      !/(?:unknown|invalid).{0,40}tool|tool.{0,40}(?:unknown|invalid)/iu.test(detail)
+    ) {
+      throw new QualificationError(
+        `tool-allowlist validation failed for an unrelated reason: ${detail}`,
+      );
+    }
+    return {
+      contract: "AgentOptions.tools allowlist",
+      unknown_tool_rejected: true,
+      model_behavior_used_as_evidence: false,
+    };
+  }
+  if (typeof created?.agentId === "string" && created.agentId.length > 0) {
+    await safeUnary(
+      client,
+      "SdkAgentService",
+      "CloseAgent",
+      { agentId: created.agentId },
+      Math.min(timeoutMilliseconds, 10_000),
+    );
+  }
+  throw new QualificationError(
+    `CreateAgent accepted the unknown built-in tool ${INVALID_TOOL_NAME}`,
+  );
+}
+
 async function safeUnary(client, service, method, body, timeoutMilliseconds) {
   if (client === undefined) return;
   try {
@@ -783,7 +948,7 @@ async function main() {
       temporaryRoot,
       timeoutMilliseconds,
     );
-    callback = await startToolCallbackServer();
+    callback = await startToolCallbackServer(timeoutMilliseconds);
     bridge = await startBridge({
       binary: resolvedBridge.binary,
       workspace: args.workspace,
@@ -845,6 +1010,11 @@ async function main() {
       `Running two paid Cursor SDK qualification turns with model ${model}...\n`,
     );
     const options = agentOptions(apiKey, model, args.workspace);
+    const toolPolicy = await verifyToolAllowlist(
+      bridge,
+      options,
+      timeoutMilliseconds,
+    );
     const created = await unary(
       bridge,
       "SdkAgentService",
@@ -890,9 +1060,9 @@ async function main() {
           api_key_authentication: true,
           model,
           built_ins_confined: true,
-          confinement: "explicit-tool-allowlist",
+          confinement: "sdk-tool-allowlist-contract",
+          tool_policy_validation: toolPolicy,
           cursor_native_sandbox: false,
-          native_shell_negative_probe: true,
           exactly_once: true,
           resume: true,
           isolated_state_removed: !args.keepDownload,
@@ -945,6 +1115,7 @@ export {
   terminalStatusIsFinished,
   terminateProcessTree,
   unary,
+  verifyToolAllowlist,
 };
 
 if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
