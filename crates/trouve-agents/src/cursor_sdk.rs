@@ -45,7 +45,8 @@ const USAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
-const INTERRUPTED_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+const INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const INTERRUPTED_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -928,14 +929,16 @@ async fn run_sdk_turn(
         &outcome,
         Ok(TurnTerminal::Cancelled | TurnTerminal::ConsumerClosed)
     ) {
-        // CancelRun observation and local cleanup share a five-second budget.
-        // Stop host-owned tool work before releasing the Bridge mutex, then
-        // force-reap instead of waiting on normal CloseAgent cleanup RPCs.
-        let deadline = tokio::time::Instant::now() + INTERRUPTED_CLEANUP_TIMEOUT;
-        callback.stop_until(deadline).await;
+        // CancelRun observation, callback shutdown, and process reaping share
+        // a five-second budget. Give child reaping its own final interval so a
+        // callback server that consumes its allowance cannot strand the warm
+        // Bridge or its pool permit.
+        let callback_deadline = tokio::time::Instant::now() + INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT;
+        callback.stop_until(callback_deadline).await;
         drop(bridge);
+        let reap_deadline = tokio::time::Instant::now() + INTERRUPTED_REAP_TIMEOUT;
         let process_cleanup = pool
-            .terminate_and_remove_now_until(&turn.thread_id, &process, deadline)
+            .terminate_and_remove_now_until(&turn.thread_id, &process, reap_deadline)
             .await;
         return finish_recycled_turn(outcome, Ok(()), process_cleanup);
     }
@@ -2125,7 +2128,7 @@ async fn stream_turn(
     let mut projection = RunProjection::default();
     let mut saw_connect_end = false;
     let mut stop = None;
-    let mut stop_deadline = None;
+    let mut stop_deadline: Option<tokio::time::Instant> = None;
     let mut cancel_sent = false;
 
     loop {
@@ -2133,12 +2136,19 @@ async fn stream_turn(
             && !cancel_sent
             && let Some(run_id) = projection.run_id.as_deref()
         {
-            if let Err(error) = client
+            let cancel_timeout = stop_deadline
+                .expect("a stopped Cursor stream owns its cancellation deadline")
+                .saturating_duration_since(tokio::time::Instant::now());
+            if cancel_timeout.is_zero() {
+                tracing::debug!(
+                    "Cursor run identity arrived after the CancelRun deadline; process cleanup will stop the turn"
+                );
+            } else if let Err(error) = client
                 .unary_with_timeout(
                     "SdkAgentService",
                     "CancelRun",
                     json!({ "runId": run_id, "agentId": agent_id }),
-                    CANCEL_ACK_TIMEOUT,
+                    cancel_timeout,
                 )
                 .await
             {
