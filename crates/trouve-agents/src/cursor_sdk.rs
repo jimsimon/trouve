@@ -1270,7 +1270,7 @@ impl CallbackCalls {
         fingerprint: CallbackKey,
         outcome: watch::Receiver<Option<CallbackOutcome>>,
     ) -> bool {
-        if self.seen.len() >= MAX_CALLBACK_RECORDS {
+        if self.records.len() >= MAX_CALLBACK_RECORDS {
             return false;
         }
         self.seen.insert(call_id, fingerprint);
@@ -2797,7 +2797,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_replay_state_is_byte_bounded_without_forgetting_ids() {
+    fn callback_replay_state_is_bounded_without_exhausting_completed_calls() {
         let mut calls = CallbackCalls::default();
         let mut first = None;
         for index in 0..=MAX_CALLBACK_REPLAY_RECORDS {
@@ -2815,7 +2815,29 @@ mod tests {
         assert!(calls.replay_bytes <= MAX_CALLBACK_REPLAY_BYTES);
         assert!(calls.completed.len() <= MAX_CALLBACK_REPLAY_RECORDS);
 
-        while calls.seen.len() < MAX_CALLBACK_RECORDS {
+        for index in (MAX_CALLBACK_REPLAY_RECORDS + 1)..MAX_CALLBACK_RECORDS {
+            let call_id = callback_key(&format!("completed-{index}"));
+            let fingerprint = callback_key(&format!("completed-fingerprint-{index}"));
+            let (_sender, receiver) = watch::channel(None);
+            assert!(calls.admit(call_id, fingerprint, receiver));
+            calls.mark_completed(call_id, MAX_CALLBACK_REPLAY_BYTES / 2);
+        }
+        assert_eq!(calls.seen.len(), MAX_CALLBACK_RECORDS);
+
+        let (_sender, receiver) = watch::channel(None);
+        assert!(calls.admit(
+            callback_key("after-completed-cap"),
+            callback_key("after-completed-cap-fingerprint"),
+            receiver,
+        ));
+        calls.mark_completed(
+            callback_key("after-completed-cap"),
+            MAX_CALLBACK_REPLAY_BYTES / 2,
+        );
+        assert_eq!(calls.seen.len(), MAX_CALLBACK_RECORDS + 1);
+        assert_eq!(calls.seen.get(&first_call), Some(&first_fingerprint));
+
+        while calls.records.len() < MAX_CALLBACK_RECORDS {
             let index = calls.seen.len();
             let (_sender, receiver) = watch::channel(None);
             assert!(calls.admit(
@@ -2830,7 +2852,7 @@ mod tests {
             callback_key("over-capacity-fingerprint"),
             receiver,
         ));
-        assert_eq!(calls.seen.len(), MAX_CALLBACK_RECORDS);
+        assert_eq!(calls.records.len(), MAX_CALLBACK_RECORDS);
     }
 
     #[tokio::test]
