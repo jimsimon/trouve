@@ -6146,10 +6146,28 @@ impl Engine {
         .await;
         match outcome {
             Ok(Ok((turn, parsed))) => {
-                if let Ok(Some(task)) =
-                    self.store
-                        .finish_code_review_task(&task.id, "succeeded", &turn.output, 0, "")
+                // The analysis stays usable either way, but a finalization
+                // failure must not pass silently: the durable task would
+                // linger non-terminal in the activity view.
+                let mut finalized = None;
+                match self
+                    .store
+                    .finish_code_review_task(&task.id, "succeeded", &turn.output, 0, "")
                 {
+                    Err(error) => tracing::warn!(
+                        job_id = %job.id,
+                        task_id = %task.id,
+                        %error,
+                        "analysis task finalization failed; accepting the parsed analysis"
+                    ),
+                    Ok(None) => tracing::debug!(
+                        job_id = %job.id,
+                        task_id = %task.id,
+                        "analysis task was superseded before finalization"
+                    ),
+                    Ok(Some(task)) => finalized = Some(task),
+                }
+                if let Some(task) = finalized.take() {
                     let _ = self.emit_code_review_task(&job.id, task);
                 }
                 Some(parsed)

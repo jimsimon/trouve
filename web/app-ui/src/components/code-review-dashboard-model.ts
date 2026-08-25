@@ -22,6 +22,7 @@ export interface ReviewJobSummary {
   readonly status: string;
   readonly created_at: string;
   readonly open_issue_count?: number | null;
+  readonly advisory_open_issue_count?: number | null;
   readonly scope?: string;
   readonly review_base_sha?: string;
   readonly base_ref?: string;
