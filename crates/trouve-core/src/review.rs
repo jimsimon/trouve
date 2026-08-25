@@ -5239,11 +5239,22 @@ impl Engine {
         let coordinator_started = Instant::now();
         let implementation_analysis =
             if coordinator_candidates.is_empty() && previous_findings.is_empty() {
-                // Await after cancelling rather than detaching: every stage of
-                // the analysis honors its token, so this returns promptly and
-                // the task cannot outlive the review holding session state.
+                // Cancellation is cooperative: give the analysis a short
+                // grace to settle through its token, then abort the task so a
+                // stage that ignores cancellation can neither block a clean
+                // review nor keep running detached behind it.
                 analysis_cancel.cancel();
-                let _ = analysis_handle.await;
+                let mut analysis_handle = analysis_handle;
+                if tokio::time::timeout(Duration::from_secs(10), &mut analysis_handle)
+                    .await
+                    .is_err()
+                {
+                    analysis_handle.abort();
+                    tracing::warn!(
+                        job_id = %job.id,
+                        "cancelled implementation analysis did not settle promptly; aborted"
+                    );
+                }
                 None
             } else {
                 analysis_handle.await.ok().flatten()
