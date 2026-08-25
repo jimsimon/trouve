@@ -206,3 +206,77 @@ test(
     );
   },
 );
+
+test("repeated signals wait for the same asynchronous cleanup", async () => {
+  const target = new EventEmitter();
+  let releaseCleanup;
+  const cleanupGate = new Promise((accept) => {
+    releaseCleanup = accept;
+  });
+  let cleanupCalls = 0;
+  const exits = [];
+  const signals = installSignalCleanup(
+    async () => {
+      cleanupCalls += 1;
+      await cleanupGate;
+    },
+    {
+      target,
+      exit: (code) => exits.push(code),
+      report: assert.fail,
+    },
+  );
+
+  target.emit("SIGTERM");
+  target.emit("SIGTERM");
+  await Promise.resolve();
+  assert.equal(cleanupCalls, 1);
+  assert.deepEqual(exits, []);
+  assert.throws(() => signals.throwIfSignalled(), /interrupted by signal/u);
+
+  releaseCleanup();
+  await signals.completion();
+  assert.deepEqual(exits, [143]);
+  signals.dispose();
+});
+
+test("a signal received during startup prevents a later Bridge spawn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trouve-cursor-signal-startup-"));
+  const stateRoot = join(root, "state");
+  await mkdir(stateRoot);
+  const target = new EventEmitter();
+  const exits = [];
+  const signals = installSignalCleanup(async () => {}, {
+    target,
+    exit: (code) => exits.push(code),
+    report: assert.fail,
+  });
+  target.emit("SIGINT");
+  let spawned = false;
+  try {
+    await assert.rejects(
+      startBridge({
+        binary: process.execPath,
+        workspace: root,
+        stateRoot,
+        apiKey: "fixture-api-key",
+        callback: {
+          bearer: "fixture-callback-token",
+          url: "http://127.0.0.1:9",
+        },
+        timeoutMilliseconds: 2_000,
+        beforeSpawn: signals.throwIfSignalled,
+        onSpawn: () => {
+          spawned = true;
+        },
+      }),
+      /interrupted by signal/u,
+    );
+    await signals.completion();
+    assert.equal(spawned, false);
+    assert.deepEqual(exits, [130]);
+  } finally {
+    signals.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});

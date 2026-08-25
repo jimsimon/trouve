@@ -978,6 +978,7 @@ async function fullQualification(args) {
       apiKey,
       callback,
       timeoutMilliseconds,
+      beforeSpawn: signalCleanup.throwIfSignalled,
       onSpawn: (child) => bridgeChildren.add(child),
     });
     operational.bridge_startup_ms = Math.round(performance.now() - bridgeStartedAt);
@@ -1202,6 +1203,7 @@ async function fullQualification(args) {
       apiKey,
       callback,
       timeoutMilliseconds,
+      beforeSpawn: signalCleanup.throwIfSignalled,
       onSpawn: (child) => bridgeChildren.add(child),
     });
     operational.bridge_cold_restart_ms = Math.round(performance.now() - restartStartedAt);

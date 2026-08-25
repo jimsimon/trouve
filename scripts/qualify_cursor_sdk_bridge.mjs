@@ -422,12 +422,14 @@ async function startBridge({
   apiKey,
   callback,
   timeoutMilliseconds,
+  beforeSpawn,
   onSpawn,
 }) {
   const diagnostics = [];
   const secrets = [apiKey, callback.bearer];
   const runtimeRoot = join(stateRoot, "runtime");
   await mkdir(runtimeRoot, { recursive: true, mode: 0o700 });
+  beforeSpawn?.();
   const child = spawn(binary, [], {
     detached: process.platform !== "win32",
     env: {
@@ -1060,13 +1062,18 @@ function installSignalCleanup(
         .finally(() => exit(code));
     };
     handlers.set(signal, handler);
-    target.once(signal, handler);
+    target.on(signal, handler);
   }
   return {
     dispose() {
       for (const [signal, handler] of handlers) target.off(signal, handler);
     },
     completion: () => completion ?? Promise.resolve(),
+    throwIfSignalled() {
+      if (completion !== undefined) {
+        throw new QualificationError("qualification interrupted by signal");
+      }
+    },
   };
 }
 
@@ -1148,6 +1155,7 @@ async function main() {
       apiKey,
       callback,
       timeoutMilliseconds,
+      beforeSpawn: signalCleanup.throwIfSignalled,
       onSpawn: (child) => bridgeChildren.add(child),
     });
 
