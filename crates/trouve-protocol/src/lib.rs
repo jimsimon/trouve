@@ -304,13 +304,12 @@ pub use requests::*;
 // final-editor repair so clients can represent incomplete reviews (additive).
 // 7.15: code-review jobs expose the PR-wide open-finding count captured after
 // publication so a clean incremental round cannot hide older findings.
-// 7.16: code-review jobs expose the server-derived per-PR fix-churn signal so
-// clients and the check run can distinguish a settled clean state from a
-// single clean round inside a fix-churn loop; jobs and repositories carry the
-// implementation-analyst model/thinking configuration and tasks gain the
-// `analyst` role; findings gate in two tiers — `open_issue_count` counts only
-// blocking findings while `advisory_open_issue_count` tracks recorded debt
-// that no longer posts to GitHub or blocks the check.
+// 7.16: findings gate in two tiers — `open_issue_count` counts only blocking
+// findings while `advisory_open_issue_count` tracks recorded advisory debt
+// that no longer posts to GitHub or blocks the check; the check run reports
+// success only when the newest published round also covered the full branch;
+// jobs and repositories carry the implementation-analyst model/thinking
+// configuration and tasks gain the `analyst` role.
 pub const PROTOCOL_VERSION: &str = "7.16";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";

@@ -198,6 +198,10 @@ Treat checked-in code and the supplied revision as authoritative. Do not inspect
 service's runtime, deployment, model/provider configuration, context window, queues, environment, \
 or hardware; those are unrelated to whether the change is correct. When a candidate concerns a \
 configured limit, inspect the checked-in definition and call sites, not the local running service.";
+/// A durable theme observed again this many times (beyond its first
+/// appearance) triggers the coordinator's design-level escalation.
+const RECURRING_THEME_ESCALATION_COUNT: u64 = 2;
+
 const FINDING_LEVEL_GUIDANCE: &str = "\
 Finding level rubric (apply these same thresholds in every review domain):
 - Severity measures the realistic consequence and blast radius if a reachable issue manifests, \
@@ -5203,11 +5207,6 @@ impl Engine {
             REVIEW_HISTORY_MAX_THEMES,
         )?;
         let previous_themes = prioritized_theme_history(&all_previous_themes);
-        // Derived from prior published rounds only; the running round joins
-        // the streak when its own result is published.
-        let churn_signal = self
-            .store
-            .code_review_pull_churn_signal(&job.repository, job.pull_number)?;
         let load_external_comments = async {
             if coordinator_candidates.is_empty() && previous_findings.is_empty() {
                 Vec::new()
@@ -5259,7 +5258,6 @@ impl Engine {
                 &previous_themes,
                 &external_comments,
                 &prior_fix_context,
-                churn_signal.as_ref(),
                 implementation_analysis.as_ref(),
                 &diff_files,
                 reused_hunk_count,
@@ -7813,9 +7811,10 @@ impl Engine {
         let needs_adjudication =
             job.status == "failed" && !detail.unadjudicated_candidates.is_empty();
         let open_issue_count = review_open_issue_count(job);
-        let churn_soak_pending = review_churn_soak_pending(job);
+        let awaiting_full_coverage = review_awaiting_full_coverage(job, open_issue_count);
         let needs_attention = needs_adjudication
-            || (job.status == "succeeded" && (open_issue_count != Some(0) || churn_soak_pending));
+            || (job.status == "succeeded"
+                && (open_issue_count != Some(0) || awaiting_full_coverage));
         let status = match job.status.as_str() {
             "queued" => "queued",
             "running" => "in_progress",
@@ -7825,7 +7824,7 @@ impl Engine {
             &job.status,
             open_issue_count,
             needs_adjudication,
-            churn_soak_pending,
+            awaiting_full_coverage,
         );
         let check_summary = match job.status.as_str() {
             "queued" => "Waiting for a review worker.".to_string(),
@@ -7853,9 +7852,13 @@ impl Engine {
                         job.issue_count
                     ),
                 };
-                if let Some(churn) = &job.churn {
-                    summary.push(' ');
-                    summary.push_str(&review_churn_check_sentence(churn));
+                if awaiting_full_coverage {
+                    summary.push_str(
+                        " Success awaits a clean full-branch review: this round examined only \
+                         changes since the last review, and the whole branch as it now stands \
+                         has not been reviewed clean. Resolving all review threads or \
+                         requesting a full-branch review runs the confirming round.",
+                    );
                 }
                 summary
             }
@@ -9315,79 +9318,38 @@ fn review_open_issue_count(job: &trouve_protocol::CodeReviewJob) -> Option<u64> 
     job.open_issue_count
 }
 
-/// A published churn signal whose clean soak has not completed yet. While
-/// pending, one clean round is weak evidence of stability, so the check run
-/// must not report success even with zero open findings.
-fn review_churn_soak_pending(job: &trouve_protocol::CodeReviewJob) -> bool {
-    job.churn
-        .as_ref()
-        .is_some_and(|churn| churn.clean_rounds < churn.required_clean_rounds)
+/// Whether this round's diff covered the entire branch. A pull request's
+/// first review is incremental *from the pull-request base*, so it counts;
+/// later incremental rounds cover only the delta since the last published
+/// head. Success requires the newest published round to be both clean of
+/// blocking findings and full-coverage: a clean look at a sliver of a branch
+/// is not evidence the branch is clean — on observed loops, clean
+/// incremental rounds were repeatedly followed by double-digit full-scope
+/// findings on the same head.
+fn review_round_covered_full_branch(job: &trouve_protocol::CodeReviewJob) -> bool {
+    job.scope == trouve_protocol::CodeReviewJobScope::Full || job.review_base_sha == job.base_ref
 }
 
-fn review_churn_check_sentence(churn: &trouve_protocol::CodeReviewChurnSignal) -> String {
-    if churn.clean_rounds < churn.required_clean_rounds {
-        format!(
-            "Fix churn detected: {} earlier round(s) each confirmed new issues, so success requires {} clean full-branch review round(s) ({}/{} so far); clean incremental rounds do not count.",
-            churn.finding_round_streak,
-            churn.required_clean_rounds,
-            churn.clean_rounds,
-            churn.required_clean_rounds
-        )
-    } else {
-        format!(
-            "Fix churn resolved: {} clean full-branch round(s) followed the {}-round churn streak.",
-            churn.clean_rounds, churn.finding_round_streak
-        )
-    }
-}
-
-fn render_churn_section(churn: &trouve_protocol::CodeReviewChurnSignal) -> String {
-    let mut section = format!(
-        "### 🔁 Recurring instability\n\n\
-         The last {} published review round(s) with findings each confirmed new issues",
-        churn.finding_round_streak
-    );
-    if !churn.recurring_paths.is_empty() {
-        let paths = churn
-            .recurring_paths
-            .iter()
-            .map(|path| format!("`{}`", markdown_table_cell(path)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        section.push_str(&format!(", recurring in {paths}"));
-    }
-    if let Some(interval) = churn.median_round_interval_seconds {
-        section.push_str(&format!(
-            " (median {} between rounds)",
-            compact_elapsed(interval.saturating_mul(1000))
-        ));
-    }
-    section.push_str(
-        ". Incremental fixes appear to be relocating the defect rather than resolving it; \
-         consider a design-level pass over the affected area instead of another point fix. ",
-    );
-    if churn.clean_rounds < churn.required_clean_rounds {
-        section.push_str(&format!(
-            "The check run will not report success until {} clean full-branch review round(s) confirm stability ({}/{} so far); a clean incremental round examines only the latest fix diff and does not count.\n\n",
-            churn.required_clean_rounds, churn.clean_rounds, churn.required_clean_rounds
-        ));
-    } else {
-        section.push_str(&format!(
-            "The clean full-branch soak is complete ({}/{}).\n\n",
-            churn.clean_rounds, churn.required_clean_rounds
-        ));
-    }
-    section
+/// Zero open blocking findings, but the round that established that state
+/// examined only part of the branch: hold the check at neutral until a clean
+/// full-coverage round confirms.
+fn review_awaiting_full_coverage(
+    job: &trouve_protocol::CodeReviewJob,
+    open_issue_count: Option<u64>,
+) -> bool {
+    job.status == "succeeded"
+        && open_issue_count == Some(0)
+        && !review_round_covered_full_branch(job)
 }
 
 fn review_check_conclusion(
     status: &str,
     open_issue_count: Option<u64>,
     needs_adjudication: bool,
-    churn_soak_pending: bool,
+    awaiting_full_coverage: bool,
 ) -> Option<&'static str> {
     match status {
-        "succeeded" if open_issue_count == Some(0) && !churn_soak_pending => Some("success"),
+        "succeeded" if open_issue_count == Some(0) && !awaiting_full_coverage => Some("success"),
         "succeeded" => Some("neutral"),
         "failed" if needs_adjudication => Some("action_required"),
         "failed" => Some("failure"),
@@ -9861,9 +9823,9 @@ fn finish_lifecycle_comment(mut body: String, job_id: &str) -> String {
 fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
     let job = &detail.job;
     let open_issue_count = review_open_issue_count(job);
-    let churn_soak_pending = review_churn_soak_pending(job);
+    let awaiting_full_coverage = review_awaiting_full_coverage(job, open_issue_count);
     let succeeded_needing_attention =
-        job.status == "succeeded" && (open_issue_count != Some(0) || churn_soak_pending);
+        job.status == "succeeded" && (open_issue_count != Some(0) || awaiting_full_coverage);
     // Only terminal review outcomes expose coordinator-authored results. A
     // queued or running job may hold a staged result while its live revision
     // is revalidated; cancelled and stale jobs never accepted that result.
@@ -9887,7 +9849,7 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
     let icon = match job.status.as_str() {
         "queued" => "⏳",
         "running" => "🔎",
-        "succeeded" if open_issue_count == Some(0) && !churn_soak_pending => "✅",
+        "succeeded" if open_issue_count == Some(0) && !awaiting_full_coverage => "✅",
         "succeeded" => "🟡",
         "failed" if !detail.unadjudicated_candidates.is_empty() => "⚠️",
         "cancelled" | "stale" => "⏹️",
@@ -9942,10 +9904,13 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         pending = compact_elapsed(job.pending_elapsed_ms),
         running = compact_elapsed(job.running_elapsed_ms),
     ));
-    if job.status == "succeeded"
-        && let Some(churn) = &job.churn
-    {
-        body.push_str(&render_churn_section(churn));
+    if review_awaiting_full_coverage(job, open_issue_count) {
+        body.push_str(
+            "### ⏳ Full-branch confirmation pending\n\nNo blocking issues remain open, but \
+             this round reviewed only the changes since the last review. The check reports \
+             success once a clean review covers the whole branch as it now stands — resolving \
+             all review threads (or requesting a full-branch review) runs that round.\n\n",
+        );
     }
     if !detail.personas.is_empty() {
         body.push_str("### Reviewer coverage\n\n");
@@ -12016,7 +11981,6 @@ fn validation_prompt(
     previous_themes: &[trouve_protocol::CodeReviewTheme],
     external_comments: &[ExternalReviewComment],
     prior_fix_context: &str,
-    churn_signal: Option<&trouve_protocol::CodeReviewChurnSignal>,
     implementation_analysis: Option<&ImplementationAnalysis>,
     files: &[ReviewDiffFile],
     reused_hunk_count: usize,
@@ -12063,6 +12027,36 @@ fn validation_prompt(
     let finding_history = compact_finding_history(finding_history)?;
     let prior_candidate_rejections =
         compact_candidate_rejection_history(prior_candidate_rejections)?;
+    // Escalate on semantic recurrence: a durable theme that has recurred
+    // despite fixes is the root-cause form of fix churn, and it needs a
+    // design-level recommendation rather than another point fix.
+    let recurring_themes = previous_themes
+        .iter()
+        .filter(|theme| theme.recurrence_count >= RECURRING_THEME_ESCALATION_COUNT)
+        .collect::<Vec<_>>();
+    let recurrence_guidance = if recurring_themes.is_empty() {
+        String::new()
+    } else {
+        let causes = recurring_themes
+            .iter()
+            .map(|theme| {
+                format!(
+                    "{} (recurred {} time(s))",
+                    theme.root_cause, theme.recurrence_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "Durable root-cause themes have recurred across review rounds despite intervening \
+             fixes: {causes}. Recurrence of a theme means incremental fixes are relocating its \
+             root cause rather than resolving it. Begin your `summary` with a short `Recurring \
+             instability:` assessment that recommends a design-level fix for each recurring \
+             theme instead of another incremental patch, grounded only in the durable history \
+             and diff evidence, and classify related candidates' origin as `recurrence` or \
+             `fix_regression` where that history supports it."
+        )
+    };
     let previous_themes = compact_theme_history(previous_themes)?;
     let external_comments = compact_external_review_comments(external_comments)?;
     let reuse_note = if reused_hunk_count == 0 {
@@ -12094,7 +12088,6 @@ fn validation_prompt(
         "durable_root_cause_theme_history": previous_themes,
         "external_inline_review_comments": external_comments,
         "prior_fix_diffs": prior_fix_context,
-        "server_derived_fix_churn_signal": churn_signal,
         "derived_implementation_analysis": implementation_analysis,
         "relevant_diff_context": diff_context,
     }))?;
@@ -12121,31 +12114,6 @@ fn validation_prompt(
          behavior contradicts the claimed intent, report that mismatch as a finding anchored to \
          the contradicting change, with code-based evidence."
             .to_string()
-    };
-    let churn_guidance = match churn_signal {
-        Some(churn) => {
-            let recurring = if churn.recurring_paths.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", with findings recurring in {}",
-                    churn.recurring_paths.join(", ")
-                )
-            };
-            format!(
-                "The server derived a fix-churn signal for this pull request: the last {streak} \
-                 published review round(s) each confirmed new issues{recurring}. This pattern \
-                 indicates incremental fixes are relocating a defect rather than resolving it. \
-                 Scrutinize candidates touching the recurring paths for relocated variants of \
-                 previously fixed issues and classify their origin as `fix_regression` when the \
-                 durable history supports it. Begin your `summary` with a short `Recurring \
-                 instability:` assessment that recommends a design-level pass over the affected \
-                 area instead of another incremental patch, grounded only in the server-derived \
-                 signal, the durable history, and diff evidence.",
-                streak = churn.finding_round_streak,
-            )
-        }
-        None => String::new(),
     };
     Ok(format!(
         "Act as the final code-review editor for pull request #{number} at \
@@ -12211,7 +12179,7 @@ fn validation_prompt(
          sufficient evidence of a shared root cause. Only \
          report a root cause you can state concretely from the \
          code; leave `themes` empty when the findings are unrelated.\
-         \n\n{description_guidance}\n\n{analysis_guidance}\n\n{churn_guidance}\n\n{external_fact_guidance}\n\n{level_guidance}\n\n{execution_guidance}\n\n{extra}{evidence_guidance}\n\n\
+         \n\n{description_guidance}\n\n{analysis_guidance}\n\n{recurrence_guidance}\n\n{external_fact_guidance}\n\n{level_guidance}\n\n{execution_guidance}\n\n{extra}{evidence_guidance}\n\n\
          Untrusted review evidence:\n{evidence}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
          {{\"summary\":\"concise final assessment that mentions validated coverage\",\
@@ -12238,7 +12206,7 @@ fn validation_prompt(
         evidence_guidance = UNTRUSTED_REVIEW_EVIDENCE_GUIDANCE,
         evidence = evidence,
         reuse_note = reuse_note,
-        churn_guidance = churn_guidance,
+        recurrence_guidance = recurrence_guidance,
         description_guidance = description_guidance,
         analysis_guidance = analysis_guidance,
     ))
@@ -15780,6 +15748,13 @@ mod tests {
             review_check_conclusion(&detail.job.status, Some(0), false, false),
             Some("success")
         );
+        // Zero open blocking findings established by a partial round is
+        // pending, not settled; a full-coverage clean round renders settled.
+        assert!(
+            render_lifecycle_comment(&detail)
+                .starts_with("## 🟡 Trouve Code Review — Needs Attention")
+        );
+        detail.job.review_base_sha = detail.job.base_ref.clone();
         assert!(
             render_lifecycle_comment(&detail).starts_with("## ✅ Trouve Code Review — Succeeded")
         );
@@ -15796,9 +15771,9 @@ mod tests {
     }
 
     #[test]
-    fn churn_soak_keeps_clean_rounds_neutral_until_complete() {
+    fn success_requires_the_newest_round_to_cover_the_full_branch() {
         let store = crate::store::Store::open_in_memory().unwrap();
-        let queued = enqueue_test_review_job(&store, "acme/widgets#42:churn-soak-lifecycle");
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:coverage-lifecycle");
         store.claim_code_review_job().unwrap().unwrap();
         store
             .save_code_review_result(&queued.id, "No new issues.", "", 0, &[], &[])
@@ -15808,88 +15783,76 @@ mod tests {
             .unwrap();
         let mut detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         detail.job.open_issue_count = Some(0);
-        detail.job.churn = Some(trouve_protocol::CodeReviewChurnSignal {
-            finding_round_streak: 5,
-            recurring_paths: vec!["crates/core/src/engine.rs".into()],
-            median_round_interval_seconds: Some(420),
-            clean_rounds: 0,
-            required_clean_rounds: 1,
-        });
-
-        // A clean round mid-churn must not read as settled: neutral check,
-        // needs-attention lifecycle, and an explicit full-branch soak
-        // requirement.
-        assert!(review_churn_soak_pending(&detail.job));
+        // The helper enqueues an incremental job whose review base differs
+        // from the pull-request base: a partial round.
+        assert_ne!(detail.job.review_base_sha, detail.job.base_ref);
+        assert!(review_awaiting_full_coverage(&detail.job, Some(0)));
         assert_eq!(
             review_check_conclusion(&detail.job.status, Some(0), false, true),
             Some("neutral")
         );
         let body = render_lifecycle_comment(&detail);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
-        assert!(body.contains("### 🔁 Recurring instability"));
-        assert!(body.contains("5 published review round(s) with findings"));
-        assert!(body.contains("`crates/core/src/engine.rs`"));
-        assert!(body.contains("clean full-branch review round(s) confirm stability (0/1 so far)"));
-        assert!(body.contains("does not count"));
+        assert!(body.contains("### ⏳ Full-branch confirmation pending"));
+        assert!(body.contains("reviewed only the changes since the last review"));
 
-        // The soak-completing clean full-branch round may report success
-        // again and says so.
-        if let Some(churn) = detail.job.churn.as_mut() {
-            churn.clean_rounds = 1;
-        }
-        assert!(!review_churn_soak_pending(&detail.job));
+        // A first-round review is incremental from the pull-request base and
+        // therefore covers the whole branch: it may go green directly.
+        detail.job.review_base_sha = detail.job.base_ref.clone();
+        assert!(!review_awaiting_full_coverage(&detail.job, Some(0)));
         assert_eq!(
             review_check_conclusion(&detail.job.status, Some(0), false, false),
             Some("success")
         );
         let body = render_lifecycle_comment(&detail);
         assert!(body.starts_with("## ✅ Trouve Code Review — Succeeded"));
-        assert!(body.contains("The clean full-branch soak is complete (1/1)."));
+        assert!(!body.contains("Full-branch confirmation pending"));
 
-        // Open findings still dominate the churn presentation.
+        // Full-scope rounds qualify regardless of their review base.
+        detail.job.review_base_sha = "9999999999999999999999999999999999999999".into();
+        detail.job.scope = trouve_protocol::CodeReviewJobScope::Full;
+        assert!(!review_awaiting_full_coverage(&detail.job, Some(0)));
+
+        // Open blocking findings dominate the presentation either way.
         detail.job.open_issue_count = Some(3);
+        assert!(!review_awaiting_full_coverage(&detail.job, Some(3)));
         let body = render_lifecycle_comment(&detail);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
     }
 
     #[test]
-    fn coordinator_prompt_escalates_recurring_instability() {
+    fn coordinator_prompt_escalates_recurring_theme_instability() {
         let store = crate::store::Store::open_in_memory().unwrap();
-        let job = enqueue_test_review_job(&store, "acme/widgets#42:churn-guidance");
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:theme-escalation");
         let record = store.code_review_job(&job.id).unwrap().unwrap();
-        let signal = trouve_protocol::CodeReviewChurnSignal {
-            finding_round_streak: 4,
-            recurring_paths: vec!["crates/core/src/engine.rs".into()],
-            median_round_interval_seconds: Some(360),
-            clean_rounds: 0,
-            required_clean_rounds: 1,
+        let theme = |recurrence_count: u64| trouve_protocol::CodeReviewTheme {
+            id: "th_lifecycle".into(),
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            root_cause: "Response limits are applied after full materialization".into(),
+            recommendation: "Route every read through one bounded helper".into(),
+            status: "open".into(),
+            first_seen_head: "1111111111111111111111111111111111111111".into(),
+            last_seen_head: "2222222222222222222222222222222222222222".into(),
+            resolved_head: String::new(),
+            recurrence_count,
+            affected_paths: vec!["crates/core/src/engine.rs".into()],
+            finding_ids: Vec::new(),
+            observations: Vec::new(),
         };
 
-        let with_signal = validation_prompt(
-            &record,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            "",
-            Some(&signal),
-            None,
-            &[],
-            0,
-        )
-        .unwrap();
-        assert!(with_signal.contains("fix-churn signal"));
-        assert!(with_signal.contains("last 4 published review round(s)"));
-        assert!(with_signal.contains("crates/core/src/engine.rs"));
-        assert!(with_signal.contains("Recurring instability:"));
-        assert!(with_signal.contains("fix_regression"));
-        assert!(with_signal.contains("server_derived_fix_churn_signal"));
+        // A theme seen once is history, not instability.
+        let calm =
+            validation_prompt(&record, &[], &[], &[], &[theme(1)], &[], "", None, &[], 0).unwrap();
+        assert!(!calm.contains("Recurring instability:"));
 
-        let without_signal =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, None, &[], 0).unwrap();
-        assert!(!without_signal.contains("fix-churn signal"));
-        assert!(!without_signal.contains("Recurring instability:"));
+        // A recurring theme triggers the design-level escalation.
+        let escalated =
+            validation_prompt(&record, &[], &[], &[], &[theme(3)], &[], "", None, &[], 0).unwrap();
+        assert!(escalated.contains("Recurring instability:"));
+        assert!(escalated.contains("recurred 3 time(s)"));
+        assert!(escalated.contains("design-level fix"));
+        assert!(escalated.contains("Response limits are applied after full materialization"));
     }
 
     #[test]
@@ -15900,13 +15863,12 @@ mod tests {
 
         // Without a description, the guidance is omitted entirely.
         let without =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, None, &[], 0).unwrap();
+            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
         assert!(!without.contains("author's claimed intent"));
 
         record.pull_body =
             "Removes the per-engine caps so independent sessions are provider-limited.".into();
-        let with =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, None, &[], 0).unwrap();
+        let with = validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
         assert!(with.contains("author's claimed intent"));
         assert!(with.contains("never a reason by itself to reject a candidate"));
         assert!(with.contains("contradicts the claimed intent"));
@@ -15977,7 +15939,6 @@ mod tests {
             &[],
             &[],
             "",
-            None,
             Some(&analysis),
             &[],
             0,
@@ -15989,7 +15950,7 @@ mod tests {
         assert!(with.contains("process-wide semaphore"));
 
         let without =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, None, &[], 0).unwrap();
+            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
         assert!(!without.contains("read only the full-branch diff"));
     }
 
@@ -22248,7 +22209,6 @@ mod tests {
             &[],
             &[],
             "",
-            None,
             Some(&ImplementationAnalysis {
                 purpose: format!("Implements a widget pipeline.\n{attack}"),
                 mechanisms: Vec::new(),
@@ -22478,7 +22438,7 @@ mod tests {
         };
         let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[], 0);
         let coordinator_prompt =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, None, &[], 0).unwrap();
+            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
 
         for (name, prompt) in [
             ("reviewer", reviewer_prompt.as_str()),

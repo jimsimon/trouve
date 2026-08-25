@@ -645,16 +645,23 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
-function reviewChurnSoakPending(job: Pick<ReviewJob, "churn">): boolean {
-  return job.churn != null && job.churn.clean_rounds < job.churn.required_clean_rounds;
+function reviewAwaitingFullCoverage(
+  job: Pick<ReviewJob, "status" | "open_issue_count" | "scope" | "review_base_sha" | "base_ref">,
+): boolean {
+  return (
+    job.status === "succeeded" &&
+    job.open_issue_count === 0 &&
+    job.scope !== "full" &&
+    (job.review_base_sha ?? "") !== job.base_ref
+  );
 }
 
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, "status" | "open_issue_count" | "churn">,
-): "open" | "churn" | "unknown" | null {
+  job: Pick<ReviewJob, "status" | "open_issue_count" | "scope" | "review_base_sha" | "base_ref">,
+): "open" | "awaiting-full" | "unknown" | null {
   if (job.status !== "succeeded") return null;
   if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
-  if (reviewChurnSoakPending(job)) return "churn";
+  if (reviewAwaitingFullCoverage(job)) return "awaiting-full";
   if (job.open_issue_count == null) return "unknown";
   return null;
 }
@@ -667,8 +674,8 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
       {attentionState === "open" ? (
         <span class="status failed">needs attention</span>
-      ) : attentionState === "churn" ? (
-        <span class="status warning">fix churn</span>
+      ) : attentionState === "awaiting-full" ? (
+        <span class="status warning">full review pending</span>
       ) : attentionState === "unknown" ? (
         <span class="status warning">status unknown</span>
       ) : (
@@ -1451,7 +1458,9 @@ function JobDetailPane({
         <div>
           <StatusPill status={job.status} />
           {attentionState === "open" && <span class="status failed">needs attention</span>}
-          {attentionState === "churn" && <span class="status warning">fix churn</span>}
+          {attentionState === "awaiting-full" && (
+            <span class="status warning">full review pending</span>
+          )}
           {attentionState === "unknown" && <span class="status warning">status unknown</span>}
           <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
@@ -1591,26 +1600,14 @@ function JobDetailPane({
           </p>
         </div>
       )}
-      {job.status === "succeeded" && job.churn && (
+      {reviewAwaitingFullCoverage(job) && (
         <div class="banner warning stacked" role="alert">
-          <strong>
-            Recurring instability: {job.churn.finding_round_streak} consecutive round
-            {job.churn.finding_round_streak === 1 ? "" : "s"} confirmed new issues
-          </strong>
+          <strong>Full-branch confirmation pending</strong>
           <p>
-            Incremental fixes appear to be relocating the defect rather than resolving it
-            {(job.churn.recurring_paths ?? []).length > 0 && (
-              <> — recurring in {(job.churn.recurring_paths ?? []).map((path, index) => (
-                <span key={path}>
-                  {index > 0 && ", "}
-                  <code>{path}</code>
-                </span>
-              ))}</>
-            )}
-            . Consider a design-level pass over the affected area instead of another point fix.{" "}
-            {reviewChurnSoakPending(job)
-              ? `The check run stays neutral until ${job.churn.required_clean_rounds} clean full-branch review round${job.churn.required_clean_rounds === 1 ? "" : "s"} confirm${job.churn.required_clean_rounds === 1 ? "s" : ""} stability (${job.churn.clean_rounds}/${job.churn.required_clean_rounds} so far); clean incremental rounds do not count.`
-              : `The clean full-branch soak is complete (${job.churn.clean_rounds}/${job.churn.required_clean_rounds}).`}
+            No blocking issues remain open, but this round reviewed only the changes since the
+            last review. The check reports success once a clean review covers the whole branch
+            as it now stands — resolve all review threads or request a full branch review to
+            run that round.
           </p>
         </div>
       )}
