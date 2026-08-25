@@ -3980,9 +3980,15 @@ impl Engine {
         let id_owned = state_id.to_string();
         tokio::spawn(async move {
             let result = async {
-                let version = trouve_agents::install::latest_version(cli)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let version = match trouve_agents::install::latest_version_for_install(
+                    cli, &progress,
+                )
+                .await
+                {
+                    Ok(version) => version,
+                    Err(trouve_agents::install::InstallError::Cancelled) => return Ok(None),
+                    Err(error) => return Err(error.to_string()),
+                };
                 engine.cli_installs.lock().unwrap().insert(
                     id_owned.clone(),
                     CliInstallState::Pending {

@@ -259,7 +259,11 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         trouve_server::ServerSecurity::loopback(),
     );
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(LIVE_TIMEOUT)
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .expect("build bounded live-qualification HTTP client");
     let base = format!("http://{address}/v1");
 
     install_cursor_sdk(&client, &base).await;

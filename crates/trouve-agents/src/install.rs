@@ -148,10 +148,6 @@ fn http() -> Result<reqwest::Client, InstallError> {
         .map_err(|e| InstallError::Download(e.to_string()))
 }
 
-async fn get_text(url: &str) -> Result<String, InstallError> {
-    get_text_controlled(url, None).await
-}
-
 async fn get_text_with_progress(url: &str, progress: &Progress) -> Result<String, InstallError> {
     get_text_controlled(url, Some(progress)).await
 }
@@ -261,13 +257,34 @@ async fn get_bytes(url: &str, progress: &Progress, limit: usize) -> Result<Vec<u
 
 /// The newest version the vendor currently serves.
 pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
+    latest_version_controlled(id, None).await
+}
+
+/// The newest version for an interactive managed-runtime install. Unlike the
+/// background update check, release metadata lookup observes the same cancel
+/// flag as the subsequent artifact download.
+pub async fn latest_version_for_install(
+    id: CliId,
+    progress: &Progress,
+) -> Result<String, InstallError> {
+    latest_version_controlled(id, Some(progress)).await
+}
+
+async fn latest_version_controlled(
+    id: CliId,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
     match id {
-        CliId::CursorSdkBridge => Ok(github_latest_tag("cursor/sdk-bridge")
+        CliId::CursorSdkBridge => Ok(github_latest_tag("cursor/sdk-bridge", progress)
             .await?
             .trim_start_matches('v')
             .to_string()),
         CliId::Claude => {
-            let v = get_text("https://downloads.claude.ai/claude-code-releases/latest").await?;
+            let v = get_text_controlled(
+                "https://downloads.claude.ai/claude-code-releases/latest",
+                progress,
+            )
+            .await?;
             let v = v.trim().to_string();
             if v.chars().next().is_none_or(|c| !c.is_ascii_digit()) {
                 return Err(InstallError::Download(format!(
@@ -277,21 +294,34 @@ pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
             Ok(v)
         }
         CliId::Codex => {
-            let tag = github_latest_tag("openai/codex").await?;
+            let tag = github_latest_tag("openai/codex", progress).await?;
             Ok(tag.trim_start_matches("rust-v").to_string())
         }
         // llama.cpp publishes binary builds as prereleases ("b9957"). Its
         // `/releases/latest` entry is now a metadata-only nightly marker, so
         // resolve the newest release that actually carries build artifacts.
-        CliId::LlamaServer => latest_llama_release_tag(fetch_llama_release_page).await,
+        CliId::LlamaServer => {
+            latest_llama_release_tag(|page| fetch_llama_release_page(page, progress)).await
+        }
     }
 }
 
-async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
-    let body = get_text(&format!(
-        "https://api.github.com/repos/{repo}/releases/latest"
-    ))
-    .await?;
+async fn github_latest_tag(
+    repo: &str,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
+    github_latest_tag_url(
+        &format!("https://api.github.com/repos/{repo}/releases/latest"),
+        progress,
+    )
+    .await
+}
+
+async fn github_latest_tag_url(
+    url: &str,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
+    let body = get_text_controlled(url, progress).await?;
     let json: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| InstallError::Download(format!("github release json: {e}")))?;
     json["tag_name"]
@@ -302,10 +332,16 @@ async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
 
 const LLAMA_RELEASE_PAGE_LIMIT: usize = 5;
 
-async fn fetch_llama_release_page(page: usize) -> Result<String, InstallError> {
-    get_text(&format!(
-        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100&page={page}"
-    ))
+async fn fetch_llama_release_page(
+    page: usize,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
+    get_text_controlled(
+        &format!(
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100&page={page}"
+        ),
+        progress,
+    )
     .await
 }
 
@@ -882,7 +918,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[tokio::test]
-    async fn manifest_fetch_observes_install_cancellation_before_headers() {
+    async fn release_metadata_fetch_observes_install_cancellation_before_headers() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -891,7 +927,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             axum::serve(
                 listener,
                 axum::Router::new().route(
-                    "/manifest",
+                    "/release",
                     axum::routing::get(|| async { std::future::pending::<&'static str>().await }),
                 ),
             )
@@ -900,7 +936,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         let progress = std::sync::Arc::new(Progress::default());
         let request_progress = progress.clone();
         let request = tokio::spawn(async move {
-            get_text_with_progress(&format!("http://{address}/manifest"), &request_progress).await
+            github_latest_tag_url(
+                &format!("http://{address}/release"),
+                Some(&request_progress),
+            )
+            .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         progress
@@ -908,7 +948,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), request)
             .await
-            .expect("cancelled manifest request stayed pending")
+            .expect("cancelled release-metadata request stayed pending")
             .unwrap();
         assert!(matches!(result, Err(InstallError::Cancelled)));
         server.abort();

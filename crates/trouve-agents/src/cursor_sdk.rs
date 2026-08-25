@@ -27,7 +27,7 @@ use futures::{StreamExt as _, TryStreamExt as _};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncBufReadExt as _, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufReader};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -53,6 +53,7 @@ const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIAGNOSTIC_LINES: usize = 40;
+const MAX_DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
 const MAX_CALLBACK_RECORDS: usize = 128;
 // Historical IDs use fixed-size hashes, but still need a separate hard ceiling
 // so a defective authenticated Bridge cannot grow one turn without bound.
@@ -1084,7 +1085,7 @@ async fn create_or_resume_agent(
 ) -> Result<(String, bool), BackendError> {
     if let Some(agent_id) = session {
         match client
-            .unary(
+            .unary_detailed(
                 "SdkAgentService",
                 "ResumeAgent",
                 json!({ "agentId": agent_id, "options": options }),
@@ -1100,12 +1101,12 @@ async fn create_or_resume_agent(
                 }
                 return Ok((resumed, false));
             }
-            Err(error) if missing_agent_error(&error) => {
+            Err(error) if error.is_not_found() => {
                 tracing::warn!(
                     "Cursor SDK could not resume agent {agent_id}; creating a replacement"
                 );
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.error),
         }
     }
 
@@ -1125,14 +1126,6 @@ fn required_string(value: &Value, key: &str, method: &str) -> Result<String, Bac
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| BackendError::Protocol(format!("{method} omitted {key}")))
-}
-
-fn missing_agent_error(error: &BackendError) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("not_found")
-        || message.contains("not found")
-        || message.contains("unknown agent")
-        || message.contains("no agent")
 }
 
 async fn load_custom_tools(
@@ -1216,9 +1209,11 @@ async fn mcp_request(
         Some(timeout) => tokio::time::timeout(timeout, request)
             .await
             .map_err(|_| BackendError::Protocol(format!("MCP {method} timed out")))?,
-        // ToolExecutor owns tool-specific deadlines and cancellation. A
-        // local adapter timeout here would break interactive questions and
-        // valid long-running shell/MCP operations.
+        // ToolExecutor owns tool-specific deadlines and cancellation. The
+        // turn-scoped CallbackSupervisor cancels and joins this request when
+        // the turn or output consumer ends. A second adapter wall-clock
+        // timeout would break interactive questions and valid long-running
+        // shell/MCP operations.
         None => request.await,
     }
     .map_err(|error| BackendError::Protocol(format!("MCP {method}: {error}")))?;
@@ -1742,7 +1737,7 @@ impl BridgeProcess {
         let stderr = child.take_stderr().ok_or_else(|| {
             BackendError::Protocol("Cursor SDK Bridge stderr was not piped".into())
         })?;
-        let mut lines = BufReader::new(stderr).lines();
+        let mut stderr = BufReader::new(stderr);
         let mut diagnostics = VecDeque::new();
         let ready_result = tokio::select! {
             biased;
@@ -1750,13 +1745,15 @@ impl BridgeProcess {
             _ = events.closed() => Err(BackendError::Cancelled),
             result = tokio::time::timeout(STARTUP_TIMEOUT, async {
                 loop {
-                    let line = lines.next_line().await.map_err(BackendError::Io)?;
+                    let line = read_bounded_line(&mut stderr, MAX_DIAGNOSTIC_LINE_BYTES)
+                        .await
+                        .map_err(BackendError::Io)?;
                     let Some(line) = line else {
                         return Err(BackendError::Protocol(
                             "Cursor SDK Bridge exited before reporting readiness".into(),
                         ));
                     };
-                    if let Some(payload) = line.strip_prefix(READY_PREFIX) {
+                    if !line.truncated && let Some(payload) = line.text.strip_prefix(READY_PREFIX) {
                         return serde_json::from_str::<ReadyPayload>(payload).map_err(|error| {
                             BackendError::Protocol(format!(
                                 "Cursor SDK Bridge emitted an invalid readiness payload: {error}"
@@ -1765,7 +1762,7 @@ impl BridgeProcess {
                     }
                     push_diagnostic(
                         &mut diagnostics,
-                        redact(&line, &[api_key, &callback.bearer]),
+                        redact(&line.display(), &[api_key, &callback.bearer]),
                     );
                 }
             }) => result.map_err(|_| {
@@ -1812,11 +1809,13 @@ impl BridgeProcess {
         let drain_diagnostics = shared_diagnostics.clone();
         let drain_secrets = secrets.clone();
         let stderr_task = tokio::spawn(async move {
-            while let Ok(Some(line)) = lines.next_line().await {
+            while let Ok(Some(line)) =
+                read_bounded_line(&mut stderr, MAX_DIAGNOSTIC_LINE_BYTES).await
+            {
                 let line = {
                     let secrets = drain_secrets.lock().unwrap();
                     redact(
-                        &line,
+                        &line.display(),
                         &secrets.iter().map(String::as_str).collect::<Vec<_>>(),
                     )
                 };
@@ -1980,6 +1979,59 @@ fn bridge_token(ready: &ReadyPayload, state_dir: &Path) -> Result<String, Backen
     Ok(token.to_string())
 }
 
+struct BoundedLine {
+    text: String,
+    truncated: bool,
+}
+
+impl BoundedLine {
+    fn display(&self) -> String {
+        if self.truncated {
+            format!("{} [truncated]", self.text)
+        } else {
+            self.text.clone()
+        }
+    }
+}
+
+/// Read and drain one newline-delimited record while retaining at most
+/// `limit` bytes. `AsyncBufReadExt::lines` retains an entire unterminated
+/// line internally, which would let a defective child bypass the diagnostics
+/// cap.
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<BoundedLine>> {
+    let mut bytes = Vec::with_capacity(limit.min(4096));
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() && !truncated {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let retained = content_len.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&available[..retained]);
+        truncated |= retained < content_len;
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if !truncated && bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    Ok(Some(BoundedLine {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated,
+    }))
+}
+
 fn push_diagnostic(lines: &mut VecDeque<String>, line: String) {
     if line.trim().is_empty() {
         return;
@@ -2022,9 +2074,36 @@ struct BridgeClient {
     diagnostics: Arc<tokio::sync::Mutex<VecDeque<String>>>,
 }
 
+struct BridgeRpcFailure {
+    code: Option<String>,
+    error: BackendError,
+}
+
+impl BridgeRpcFailure {
+    fn is_not_found(&self) -> bool {
+        self.code.as_deref() == Some("not_found")
+    }
+}
+
+impl From<BackendError> for BridgeRpcFailure {
+    fn from(error: BackendError) -> Self {
+        Self { code: None, error }
+    }
+}
+
 impl BridgeClient {
     async fn unary(&self, service: &str, method: &str, body: Value) -> Result<Value, BackendError> {
         self.unary_with_timeout(service, method, body, RPC_TIMEOUT)
+            .await
+    }
+
+    async fn unary_detailed(
+        &self,
+        service: &str,
+        method: &str,
+        body: Value,
+    ) -> Result<Value, BridgeRpcFailure> {
+        self.unary_detailed_with_timeout(service, method, body, RPC_TIMEOUT)
             .await
     }
 
@@ -2035,6 +2114,18 @@ impl BridgeClient {
         body: Value,
         timeout: Duration,
     ) -> Result<Value, BackendError> {
+        self.unary_detailed_with_timeout(service, method, body, timeout)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn unary_detailed_with_timeout(
+        &self,
+        service: &str,
+        method: &str,
+        body: Value,
+        timeout: Duration,
+    ) -> Result<Value, BridgeRpcFailure> {
         let url = format!("{}/sdk.v1.{service}/{method}", self.base_url);
         let response = tokio::time::timeout(
             timeout,
@@ -2060,9 +2151,15 @@ impl BridgeClient {
         if !status.is_success() || (value.get("code").is_some() && value.get("message").is_some()) {
             let detail = self.redact(&bounded_json(&value));
             let diagnostics = self.diagnostic_suffix().await;
-            return Err(BackendError::Protocol(format!(
-                "{method} failed (HTTP {status}): {detail}{diagnostics}"
-            )));
+            return Err(BridgeRpcFailure {
+                code: value
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                error: BackendError::Protocol(format!(
+                    "{method} failed (HTTP {status}): {detail}{diagnostics}"
+                )),
+            });
         }
         Ok(value)
     }
@@ -2217,7 +2314,7 @@ async fn stream_turn(
     let mut stop_deadline: Option<tokio::time::Instant> = None;
     let mut cancel_sent = false;
 
-    loop {
+    'stream: loop {
         if stop.is_some()
             && !cancel_sent
             && let Some(run_id) = projection.run_id.as_deref()
@@ -2278,6 +2375,15 @@ async fn stream_turn(
             }
             Err(error) => return Err(error),
         };
+        if stop.is_some() {
+            continue;
+        }
+        if events.is_closed() {
+            callback_cancel.cancel();
+            stop = Some(StreamStop::ConsumerClosed);
+            stop_deadline = Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
+            continue;
+        }
         buffered.extend_from_slice(&chunk);
         while buffered.len() >= 5 {
             let flags = buffered[0];
@@ -2315,7 +2421,13 @@ async fn stream_turn(
                     )));
                 }
             } else {
-                projection.process(value, events).await?;
+                if !projection.process(value, events).await? {
+                    callback_cancel.cancel();
+                    stop = Some(StreamStop::ConsumerClosed);
+                    stop_deadline = Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
+                    buffered.clear();
+                    continue 'stream;
+                }
             }
         }
     }
@@ -2362,7 +2474,10 @@ impl RunProjection {
         &mut self,
         frame: Value,
         events: &BackendEventSender,
-    ) -> Result<(), BackendError> {
+    ) -> Result<bool, BackendError> {
+        if events.is_closed() {
+            return Ok(false);
+        }
         if let Some(sdk) = frame.get("sdkMessage") {
             let payload = sdk.get("message").unwrap_or(&Value::Null);
             self.capture_run_id(payload);
@@ -2381,7 +2496,7 @@ impl RunProjection {
                                 .await
                                 .is_err()
                             {
-                                return Ok(());
+                                return Ok(false);
                             }
                         }
                     }
@@ -2389,16 +2504,27 @@ impl RunProjection {
                 "thinking" => {
                     if let Some(text) = message_text(payload)
                         && !text.is_empty()
+                        && (events
+                            .send(Ok(BackendEvent::ThinkingDelta(text)))
+                            .await
+                            .is_err()
+                            || events
+                                .send(Ok(BackendEvent::ThinkingCompleted))
+                                .await
+                                .is_err())
                     {
-                        let _ = events.send(Ok(BackendEvent::ThinkingDelta(text))).await;
-                        let _ = events.send(Ok(BackendEvent::ThinkingCompleted)).await;
+                        return Ok(false);
                     }
                 }
                 "task" => {
                     if let Some(text) = message_text(payload)
                         && !text.is_empty()
+                        && events
+                            .send(Ok(BackendEvent::ProgressDelta(text)))
+                            .await
+                            .is_err()
                     {
-                        let _ = events.send(Ok(BackendEvent::ProgressDelta(text))).await;
+                        return Ok(false);
                     }
                 }
                 "status" => {
@@ -2410,7 +2536,13 @@ impl RunProjection {
                 "usage" => {
                     if let Some(usage) = payload.get("usage").map(parse_usage) {
                         self.usage = usage.clone();
-                        let _ = events.send(Ok(BackendEvent::UsageUpdated { usage })).await;
+                        if events
+                            .send(Ok(BackendEvent::UsageUpdated { usage }))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(false);
+                        }
                     }
                 }
                 // Concrete tool lifecycle events are emitted by the
@@ -2444,7 +2576,7 @@ impl RunProjection {
             self.capture_run_id(done);
             self.saw_done = true;
         }
-        Ok(())
+        Ok(!events.is_closed())
     }
 
     fn capture_run_id(&mut self, value: &Value) {
@@ -2459,6 +2591,9 @@ impl RunProjection {
     }
 
     async fn finish(self, events: &BackendEventSender) -> Result<TurnTerminal, BackendError> {
+        if events.is_closed() {
+            return Ok(TurnTerminal::ConsumerClosed);
+        }
         if !self.saw_done {
             return Err(BackendError::Protocol(
                 "Cursor Send omitted its done envelope".into(),
@@ -2471,8 +2606,12 @@ impl RunProjection {
             if !self.emitted_assistant_text
                 && let Some(text) = self.final_text
                 && !text.is_empty()
+                && events
+                    .send(Ok(BackendEvent::TextDelta(text)))
+                    .await
+                    .is_err()
             {
-                let _ = events.send(Ok(BackendEvent::TextDelta(text))).await;
+                return Ok(TurnTerminal::ConsumerClosed);
             }
             return Ok(TurnTerminal::Finished(self.usage));
         }
@@ -2759,6 +2898,65 @@ mod tests {
         ] {
             assert!(validate_loopback_bridge_url(url).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn resume_replacement_requires_a_structured_not_found_code() {
+        let prose = BridgeRpcFailure {
+            code: None,
+            error: BackendError::Protocol("agent was not found in a diagnostic".into()),
+        };
+        assert!(!prose.is_not_found());
+        let structured = BridgeRpcFailure {
+            code: Some("not_found".into()),
+            error: BackendError::Protocol("opaque failure".into()),
+        };
+        assert!(structured.is_not_found());
+    }
+
+    #[tokio::test]
+    async fn stderr_reader_bounds_and_drains_unterminated_diagnostics() {
+        let mut input = vec![b'x'; MAX_DIAGNOSTIC_LINE_BYTES * 2];
+        input.extend_from_slice(b"\nnext\n");
+        let mut reader = BufReader::new(input.as_slice());
+        let first = read_bounded_line(&mut reader, MAX_DIAGNOSTIC_LINE_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.truncated);
+        assert_eq!(first.text.len(), MAX_DIAGNOSTIC_LINE_BYTES);
+        let second = read_bounded_line(&mut reader, MAX_DIAGNOSTIC_LINE_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!second.truncated);
+        assert_eq!(second.text, "next");
+    }
+
+    #[tokio::test]
+    async fn projection_stops_after_the_event_consumer_closes() {
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        drop(stream);
+        assert!(events.is_closed());
+
+        let mut projection = RunProjection::default();
+        let keep_processing = projection
+            .process(
+                json!({
+                    "sdkMessage": {
+                        "message": { "type": "assistant", "text": "late output" }
+                    }
+                }),
+                &events,
+            )
+            .await
+            .unwrap();
+        assert!(!keep_processing);
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ import {
   terminalStatusIsFinished,
   terminateProcessTree,
 } from "./qualify_cursor_sdk_bridge.mjs";
+import { createCallbackAdmission } from "./qualify_cursor_sdk_bridge_full.mjs";
 
 async function listen(server) {
   await new Promise((accept, reject) => {
@@ -47,6 +48,22 @@ async function listen(server) {
 test("timeout parsing rejects values outside Node's timer range", () => {
   assert.equal(parseTimeoutSeconds("300"), 300);
   assert.throws(() => parseTimeoutSeconds("2147484"), /no greater than/u);
+});
+
+test("full qualification bounds total and concurrent callbacks", () => {
+  const admission = createCallbackAdmission(2, 1);
+  const releaseFirst = admission.tryAcquire();
+  assert.equal(typeof releaseFirst, "function");
+  assert.equal(admission.tryAcquire(), undefined);
+  assert.deepEqual(admission.snapshot(), { total: 1, active: 1 });
+
+  releaseFirst();
+  releaseFirst();
+  const releaseSecond = admission.tryAcquire();
+  assert.equal(typeof releaseSecond, "function");
+  assert.equal(admission.tryAcquire(), undefined);
+  releaseSecond();
+  assert.deepEqual(admission.snapshot(), { total: 2, active: 0 });
 });
 
 test("qualification status matching accepts only explicit finished values", () => {
