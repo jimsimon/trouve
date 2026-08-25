@@ -18,7 +18,10 @@ import test from "node:test";
 
 import {
   assetName,
+  assertUniqueToolLifecycle,
+  capPendingDiagnostic,
   download,
+  exactTerminalResult,
   installSignalCleanup,
   parseTimeoutSeconds,
   readBoundedJsonResponse,
@@ -50,6 +53,44 @@ test("qualification status matching accepts only explicit finished values", () =
   for (const value of ["NOT_FINISHED", "NOT_COMPLETED", "COMPLETED"]) {
     assert.equal(terminalStatusIsFinished(value), false);
   }
+});
+
+test("qualification rejects duplicate tool and terminal lifecycle events", () => {
+  assert.doesNotThrow(() =>
+    assertUniqueToolLifecycle(
+      [
+        { call_id: "call-1", status: "started" },
+        { call_id: "call-1", status: "completed" },
+      ],
+      "fixture",
+    ),
+  );
+  assert.throws(
+    () =>
+      assertUniqueToolLifecycle(
+        [
+          { call_id: "call-1", status: "completed" },
+          { call_id: "call-1", status: "completed" },
+        ],
+        "fixture",
+      ),
+    /duplicate completed lifecycle event/u,
+  );
+  assert.throws(
+    () =>
+      exactTerminalResult(
+        [{ result: { status: 3 } }, { result: { status: 3 } }, { done: {} }],
+        "fixture",
+      ),
+    /exactly one result and done/u,
+  );
+});
+
+test("unterminated Bridge diagnostics retain only a marked bounded suffix", () => {
+  const pending = capPendingDiagnostic("x".repeat(32_768));
+  assert.equal(pending.truncated, true);
+  assert.equal(pending.text.length, 16_384);
+  assert.equal(pending.text, "x".repeat(16_384));
 });
 
 test("Windows ARM64 is rejected before an asset URL is constructed", () => {

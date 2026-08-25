@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -45,6 +46,7 @@ const USAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const INTERRUPTED_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,7 +55,9 @@ const MAX_CONNECT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIAGNOSTIC_LINES: usize = 40;
 const MAX_CALLBACK_RECORDS: usize = 128;
 const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
+const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
+const MAX_CALLBACK_HTTP_CONCURRENCY: usize = 16;
 const READY_PREFIX: &str = "cursor-sdk-bridge ready ";
 const CALLBACK_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 /// Most warm Cursor Bridge processes retained by one configured backend.
@@ -1241,39 +1245,56 @@ struct CallbackState {
     mcp_url: Option<Arc<str>>,
     http: reqwest::Client,
     supervisor: Arc<CallbackSupervisor>,
+    request_slots: Arc<Semaphore>,
 }
+
+type CallbackKey = [u8; 32];
 
 #[derive(Clone)]
 struct CallbackRecord {
-    tool_name: String,
-    args: Value,
     outcome: watch::Receiver<Option<CallbackOutcome>>,
 }
 
 #[derive(Default)]
 struct CallbackCalls {
-    records: HashMap<String, CallbackRecord>,
-    completed: VecDeque<String>,
+    records: HashMap<CallbackKey, CallbackRecord>,
+    seen: HashMap<CallbackKey, CallbackKey>,
+    completed: VecDeque<(CallbackKey, usize)>,
+    replay_bytes: usize,
 }
 
 impl CallbackCalls {
-    fn make_room(&mut self) -> bool {
-        while self.records.len() >= MAX_CALLBACK_RECORDS {
-            let Some(call_id) = self.completed.pop_front() else {
-                return false;
-            };
-            self.records.remove(&call_id);
+    fn admit(
+        &mut self,
+        call_id: CallbackKey,
+        fingerprint: CallbackKey,
+        outcome: watch::Receiver<Option<CallbackOutcome>>,
+    ) -> bool {
+        if self.seen.len() >= MAX_CALLBACK_RECORDS {
+            return false;
         }
+        self.seen.insert(call_id, fingerprint);
+        self.records.insert(call_id, CallbackRecord { outcome });
         true
     }
 
-    fn mark_completed(&mut self, call_id: String) {
-        self.completed.push_back(call_id);
-        while self.completed.len() > MAX_CALLBACK_REPLAY_RECORDS {
-            if let Some(expired) = self.completed.pop_front() {
-                self.records.remove(&expired);
-            }
+    fn mark_completed(&mut self, call_id: CallbackKey, replay_bytes: usize) {
+        self.completed.push_back((call_id, replay_bytes));
+        self.replay_bytes = self.replay_bytes.saturating_add(replay_bytes);
+        while self.completed.len() > MAX_CALLBACK_REPLAY_RECORDS
+            || self.replay_bytes > MAX_CALLBACK_REPLAY_BYTES
+        {
+            let Some((expired, bytes)) = self.completed.pop_front() else {
+                break;
+            };
+            self.replay_bytes = self.replay_bytes.saturating_sub(bytes);
+            self.records.remove(&expired);
         }
+    }
+
+    fn forget(&mut self, call_id: &CallbackKey) {
+        self.records.remove(call_id);
+        self.seen.remove(call_id);
     }
 }
 
@@ -1296,7 +1317,7 @@ impl CallbackSupervisor {
 
     async fn spawn(
         self: &Arc<Self>,
-        call_id: String,
+        call_id: CallbackKey,
         http: reqwest::Client,
         mcp_url: Arc<str>,
         request: CustomToolRequest,
@@ -1331,9 +1352,14 @@ impl CallbackSupervisor {
                 outcome = execute_custom_tool(http, mcp_url, request) => outcome,
             };
             drop(permit);
+            let replay_bytes = outcome.replay_bytes();
             let _ = sender.send(Some(outcome));
             if let Some(supervisor) = supervisor.upgrade() {
-                supervisor.calls.lock().await.mark_completed(call_id);
+                supervisor
+                    .calls
+                    .lock()
+                    .await
+                    .mark_completed(call_id, replay_bytes);
             }
         });
         true
@@ -1357,6 +1383,14 @@ impl CallbackSupervisor {
 struct CallbackOutcome {
     status: StatusCode,
     body: Value,
+}
+
+impl CallbackOutcome {
+    fn replay_bytes(&self) -> usize {
+        serde_json::to_vec(&self.body)
+            .map(|body| body.len())
+            .unwrap_or(MAX_RPC_BODY_BYTES)
+    }
 }
 
 #[derive(Deserialize)]
@@ -1397,9 +1431,14 @@ impl CallbackServer {
             mcp_url: mcp_url.map(Arc::from),
             http,
             supervisor: supervisor.clone(),
+            request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_HTTP_CONCURRENCY)),
         };
         let router = Router::new()
             .route(CALLBACK_PATH, post(custom_tool_callback))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                authenticate_callback,
+            ))
             .layer(DefaultBodyLimit::max(MAX_RPC_BODY_BYTES))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1442,12 +1481,20 @@ impl CallbackServer {
     }
 }
 
-async fn custom_tool_callback(
+async fn authenticate_callback(
     State(state): State<CallbackState>,
-    headers: HeaderMap,
-    Json(request): Json<CustomToolRequest>,
+    request: Request,
+    next: Next,
 ) -> Response {
-    let presented = headers
+    let Ok(_permit) = state.request_slots.clone().try_acquire_owned() else {
+        return callback_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "resource_exhausted",
+            "too many custom-tool callback requests are active",
+        );
+    };
+    let presented = request
+        .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
@@ -1455,6 +1502,13 @@ async fn custom_tool_callback(
     if !secure_text_eq(presented, &expected) {
         return callback_error(StatusCode::UNAUTHORIZED, "unauthenticated", "Unauthorized");
     }
+    next.run(request).await
+}
+
+async fn custom_tool_callback(
+    State(state): State<CallbackState>,
+    Json(request): Json<CustomToolRequest>,
+) -> Response {
     let expected_agent = state.expected_agent_id.read().await.clone();
     if expected_agent.as_deref() != Some(request.agent_id.as_str()) {
         return callback_error(
@@ -1477,46 +1531,42 @@ async fn custom_tool_callback(
             "tool calls are disabled for this turn",
         );
     };
-    let Some(call_id) = request
-        .tool_call_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-    else {
+    let Some(call_id) = request.tool_call_id.as_deref().filter(|id| !id.is_empty()) else {
         return callback_error(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
             "custom-tool callback omitted its tool-call id",
         );
     };
+    let call_key = callback_key(call_id);
+    let fingerprint = callback_fingerprint(&request);
     let (mut outcome, execute) = {
         let mut calls = state.supervisor.calls.lock().await;
-        if let Some(existing) = calls.records.get(&call_id) {
-            if existing.tool_name != request.tool_name || existing.args != request.args {
+        if let Some(expected) = calls.seen.get(&call_key) {
+            if expected != &fingerprint {
                 return callback_error(
                     StatusCode::CONFLICT,
                     "already_exists",
                     "tool-call id was reused with different arguments",
                 );
             }
+            let Some(existing) = calls.records.get(&call_key) else {
+                return callback_error(
+                    StatusCode::CONFLICT,
+                    "already_exists",
+                    "tool-call result expired; refusing duplicate execution",
+                );
+            };
             (existing.outcome.clone(), None)
         } else {
-            if !calls.make_room() {
+            let (sender, receiver) = watch::channel(None);
+            if !calls.admit(call_key, fingerprint, receiver.clone()) {
                 return callback_error(
                     StatusCode::TOO_MANY_REQUESTS,
                     "resource_exhausted",
-                    "too many custom-tool callbacks are active",
+                    "too many custom-tool callbacks were admitted for this turn",
                 );
             }
-            let (sender, receiver) = watch::channel(None);
-            calls.records.insert(
-                call_id.clone(),
-                CallbackRecord {
-                    tool_name: request.tool_name.clone(),
-                    args: request.args.clone(),
-                    outcome: receiver.clone(),
-                },
-            );
             (receiver, Some(sender))
         }
     };
@@ -1525,10 +1575,10 @@ async fn custom_tool_callback(
         let mcp_url = Arc::<str>::from(mcp_url);
         if !state
             .supervisor
-            .spawn(call_id.clone(), http, mcp_url, request, sender)
+            .spawn(call_key, http, mcp_url, request, sender)
             .await
         {
-            state.supervisor.calls.lock().await.records.remove(&call_id);
+            state.supervisor.calls.lock().await.forget(&call_key);
             return callback_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "cancelled",
@@ -1603,6 +1653,21 @@ fn callback_outcome_response(outcome: &CallbackOutcome) -> Response {
 
 fn callback_error(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(json!({ "code": code, "message": message }))).into_response()
+}
+
+fn callback_key(call_id: &str) -> CallbackKey {
+    Sha256::digest(call_id.as_bytes()).into()
+}
+
+fn callback_fingerprint(request: &CustomToolRequest) -> CallbackKey {
+    let mut digest = Sha256::new();
+    digest.update((request.tool_name.len() as u64).to_le_bytes());
+    digest.update(request.tool_name.as_bytes());
+    let args = serde_json::to_vec(&request.args)
+        .expect("a deserialized Cursor callback argument remains serializable");
+    digest.update((args.len() as u64).to_le_bytes());
+    digest.update(args);
+    digest.finalize().into()
 }
 
 fn secure_text_eq(left: &str, right: &str) -> bool {
@@ -2028,6 +2093,25 @@ impl BridgeClient {
     }
 }
 
+async fn next_send_chunk<S>(
+    stream: &mut S,
+    idle_timeout: Duration,
+) -> Result<Option<S::Ok>, BackendError>
+where
+    S: futures::TryStream + Unpin,
+    S::Error: std::fmt::Display,
+{
+    tokio::time::timeout(idle_timeout, stream.try_next())
+        .await
+        .map_err(|_| {
+            BackendError::Protocol(format!(
+                "Cursor Send stream made no progress for {} seconds",
+                idle_timeout.as_secs()
+            ))
+        })?
+        .map_err(|error| BackendError::Protocol(format!("Cursor Send stream failed: {error}")))
+}
+
 async fn stream_turn(
     client: &BridgeClient,
     agent_id: &str,
@@ -2123,7 +2207,7 @@ async fn stream_turn(
         )));
     }
 
-    let mut stream = response.bytes_stream();
+    let mut stream = Box::pin(response.bytes_stream());
     let mut buffered = BytesMut::new();
     let mut projection = RunProjection::default();
     let mut saw_connect_end = false;
@@ -2161,7 +2245,9 @@ async fn stream_turn(
 
         let next = if let Some(deadline) = stop_deadline {
             match tokio::time::timeout_at(deadline, stream.try_next()).await {
-                Ok(next) => next,
+                Ok(next) => next.map_err(|error| {
+                    BackendError::Protocol(format!("Cursor Send stream failed: {error}"))
+                }),
                 Err(_) => break,
             }
         } else {
@@ -2178,7 +2264,7 @@ async fn stream_turn(
                     stop_deadline = Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
                     continue;
                 }
-                next = stream.try_next() => next,
+                next = next_send_chunk(&mut stream, SEND_IDLE_TIMEOUT) => next,
             }
         };
         let chunk = match next {
@@ -2188,11 +2274,7 @@ async fn stream_turn(
                 tracing::debug!("Cursor Send ended while cancellation was pending: {error}");
                 break;
             }
-            Err(error) => {
-                return Err(BackendError::Protocol(format!(
-                    "Cursor Send stream failed: {error}"
-                )));
-            }
+            Err(error) => return Err(error),
         };
         buffered.extend_from_slice(&chunk);
         while buffered.len() >= 5 {
@@ -2484,11 +2566,16 @@ fn u64_flex(value: &Value) -> Option<u64> {
 }
 
 fn status_is_finished(status: &Value) -> bool {
-    u64_flex(status) == Some(3) || status.as_str() == Some("RUN_LIFECYCLE_STATUS_FINISHED")
+    status.as_u64() == Some(3)
+        || matches!(status.as_str(), Some("3" | "RUN_LIFECYCLE_STATUS_FINISHED"))
 }
 
 fn status_is_cancelled(status: &Value) -> bool {
-    u64_flex(status) == Some(5) || status.as_str() == Some("RUN_LIFECYCLE_STATUS_CANCELLED")
+    status.as_u64() == Some(5)
+        || matches!(
+            status.as_str(),
+            Some("5" | "RUN_LIFECYCLE_STATUS_CANCELLED")
+        )
 }
 
 fn image_dimensions(bytes: &[u8]) -> (u32, u32) {
@@ -2683,40 +2770,67 @@ mod tests {
         server.abort();
     }
 
-    #[test]
-    fn callback_replay_state_and_admission_are_bounded() {
-        let mut calls = CallbackCalls::default();
-        for index in 0..=MAX_CALLBACK_REPLAY_RECORDS {
-            let call_id = format!("call-{index}");
-            let (_sender, receiver) = watch::channel(None);
-            calls.records.insert(
-                call_id.clone(),
-                CallbackRecord {
-                    tool_name: "read_file".into(),
-                    args: json!({ "path": "README.md" }),
-                    outcome: receiver,
-                },
-            );
-            calls.mark_completed(call_id);
-        }
-        assert_eq!(calls.records.len(), MAX_CALLBACK_REPLAY_RECORDS);
-        assert_eq!(calls.completed.len(), MAX_CALLBACK_REPLAY_RECORDS);
+    #[tokio::test]
+    async fn callback_authentication_precedes_json_deserialization() {
+        let cancel = CancellationToken::new();
+        let mut callback = CallbackServer::start(reqwest::Client::new(), None, &cancel)
+            .await
+            .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}{}", callback.url, CALLBACK_PATH))
+            .header("Content-Type", "application/json")
+            .body("{")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        callback.stop().await;
+    }
 
-        calls.completed.clear();
-        while calls.records.len() < MAX_CALLBACK_RECORDS {
-            let index = calls.records.len();
+    #[tokio::test]
+    async fn stalled_send_chunks_have_an_inactivity_deadline() {
+        let mut stream = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let error = next_send_chunk(&mut stream, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("made no progress"));
+    }
+
+    #[test]
+    fn callback_replay_state_is_byte_bounded_without_forgetting_ids() {
+        let mut calls = CallbackCalls::default();
+        let mut first = None;
+        for index in 0..=MAX_CALLBACK_REPLAY_RECORDS {
+            let call_id = callback_key(&format!("call-{index}"));
+            let fingerprint = callback_key(&format!("fingerprint-{index}"));
             let (_sender, receiver) = watch::channel(None);
-            calls.records.insert(
-                format!("pending-{index}"),
-                CallbackRecord {
-                    tool_name: "read_file".into(),
-                    args: json!({ "path": "README.md" }),
-                    outcome: receiver,
-                },
-            );
+            assert!(calls.admit(call_id, fingerprint, receiver));
+            calls.mark_completed(call_id, MAX_CALLBACK_REPLAY_BYTES / 2);
+            first.get_or_insert((call_id, fingerprint));
         }
-        assert!(!calls.make_room());
-        assert_eq!(calls.records.len(), MAX_CALLBACK_RECORDS);
+        let (first_call, first_fingerprint) = first.unwrap();
+        assert_eq!(calls.seen.len(), MAX_CALLBACK_REPLAY_RECORDS + 1);
+        assert_eq!(calls.seen.get(&first_call), Some(&first_fingerprint));
+        assert!(!calls.records.contains_key(&first_call));
+        assert!(calls.replay_bytes <= MAX_CALLBACK_REPLAY_BYTES);
+        assert!(calls.completed.len() <= MAX_CALLBACK_REPLAY_RECORDS);
+
+        while calls.seen.len() < MAX_CALLBACK_RECORDS {
+            let index = calls.seen.len();
+            let (_sender, receiver) = watch::channel(None);
+            assert!(calls.admit(
+                callback_key(&format!("pending-{index}")),
+                callback_key(&format!("pending-fingerprint-{index}")),
+                receiver,
+            ));
+        }
+        let (_sender, receiver) = watch::channel(None);
+        assert!(!calls.admit(
+            callback_key("over-capacity"),
+            callback_key("over-capacity-fingerprint"),
+            receiver,
+        ));
+        assert_eq!(calls.seen.len(), MAX_CALLBACK_RECORDS);
     }
 
     #[tokio::test]
@@ -2740,6 +2854,7 @@ mod tests {
             json!("NOT_FINISHED"),
             json!("NOT_COMPLETED"),
             json!("COMPLETED"),
+            json!(3.5),
         ] {
             assert!(!status_is_finished(&status));
         }
@@ -2750,7 +2865,9 @@ mod tests {
         ] {
             assert!(status_is_cancelled(&status));
         }
-        assert!(!status_is_cancelled(&json!("NOT_CANCELLED")));
+        for status in [json!("NOT_CANCELLED"), json!(5.5)] {
+            assert!(!status_is_cancelled(&status));
+        }
     }
 
     #[test]

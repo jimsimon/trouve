@@ -47,6 +47,7 @@ const MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
 const MAX_CONNECT_STREAM_BYTES = 64 * 1024 * 1024;
 const MAX_CONNECT_STREAM_FRAMES = 100_000;
+const MAX_PENDING_DIAGNOSTIC_CHARS = 16_384;
 const MAX_TIMER_DELAY_MILLISECONDS = 2_147_483_647;
 const READY_PREFIX = "cursor-sdk-bridge ready ";
 const INVALID_TOOL_NAME = "trouve_qualification_invalid_builtin";
@@ -415,6 +416,16 @@ function redact(value, secrets) {
   return result;
 }
 
+function capPendingDiagnostic(value) {
+  if (value.length <= MAX_PENDING_DIAGNOSTIC_CHARS) {
+    return { text: value, truncated: false };
+  }
+  return {
+    text: value.slice(-MAX_PENDING_DIAGNOSTIC_CHARS),
+    truncated: true,
+  };
+}
+
 async function startBridge({
   binary,
   workspace,
@@ -450,6 +461,7 @@ async function startBridge({
   child.stderr.setEncoding("utf8");
 
   let buffered = "";
+  let bufferedWasTruncated = false;
   let settleReady;
   let rejectReady;
   const readyPromise = new Promise((accept, reject) => {
@@ -485,13 +497,20 @@ async function startBridge({
     buffered += chunk;
     let newline;
     while ((newline = buffered.indexOf("\n")) >= 0) {
-      inspectLine(buffered.slice(0, newline).replace(/\r$/u, ""));
+      const line = buffered.slice(0, newline).replace(/\r$/u, "");
+      inspectLine(`${bufferedWasTruncated ? "[truncated prefix] " : ""}${line}`);
       buffered = buffered.slice(newline + 1);
+      bufferedWasTruncated = false;
     }
+    const pending = capPendingDiagnostic(buffered);
+    buffered = pending.text;
+    bufferedWasTruncated ||= pending.truncated;
   });
   child.once("error", failReady);
   child.once("exit", (code, signal) => {
-    if (buffered) inspectLine(buffered);
+    if (buffered) {
+      inspectLine(`${bufferedWasTruncated ? "[truncated prefix] " : ""}${buffered}`);
+    }
     failReady(
       new QualificationError(
         `Cursor SDK Bridge exited before ready (status ${code}, signal ${signal})${
@@ -826,6 +845,35 @@ function terminalStatusIsFinished(status) {
   );
 }
 
+function assertUniqueToolLifecycle(toolMessages, label) {
+  const seen = new Set();
+  for (const message of toolMessages) {
+    if (typeof message.call_id !== "string" || message.call_id.length === 0) {
+      throw new QualificationError(`${label}: tool lifecycle event omitted its call id`);
+    }
+    const key = JSON.stringify([message.call_id, message.status ?? null]);
+    if (seen.has(key)) {
+      throw new QualificationError(
+        `${label}: duplicate ${message.status ?? "unspecified"} lifecycle event for ` +
+          message.call_id,
+      );
+    }
+    seen.add(key);
+  }
+}
+
+function exactTerminalResult(frames, label) {
+  const results = frames.filter((frame) => frame.result !== undefined);
+  const done = frames.filter((frame) => frame.done !== undefined);
+  if (results.length !== 1 || done.length !== 1) {
+    throw new QualificationError(
+      `${label}: expected exactly one result and done frame ` +
+        `(results=${results.length}, done=${done.length})`,
+    );
+  }
+  return results[0].result;
+}
+
 function toolIsForbidden(name) {
   const normalized = String(name).toLowerCase().replace(/[^a-z0-9]+/gu, "_");
   if (normalized.includes("mcp") || normalized.includes(TOOL_NAME)) return false;
@@ -893,7 +941,8 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
     );
   }
   const toolMessages = messages.filter((message) => message.type === "tool_call");
-  const callIds = new Set(toolMessages.map((message) => message.call_id).filter(Boolean));
+  assertUniqueToolLifecycle(toolMessages, `turn ${ordinal}`);
+  const callIds = new Set(toolMessages.map((message) => message.call_id));
   const toolNames = [...new Set(toolMessages.map((message) => message.name).filter(Boolean))];
   const unexpectedToolNames = toolNames.filter(
     (name) => name !== "mcp" && name !== TOOL_NAME,
@@ -921,18 +970,15 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
   }
   if (
     toolMessages.some((message) => message.status === "error") ||
-    !toolMessages.some((message) => message.status === "completed")
+    toolMessages.filter((message) => message.status === "completed").length !== 1
   ) {
     throw new QualificationError(`turn ${ordinal}: custom MCP call did not complete cleanly`);
   }
-  const resultFrame = frames.find((frame) => frame.result !== undefined)?.result;
-  if (resultFrame === undefined || !terminalStatusIsFinished(resultFrame.status)) {
+  const resultFrame = exactTerminalResult(frames, `turn ${ordinal}`);
+  if (!terminalStatusIsFinished(resultFrame.status)) {
     throw new QualificationError(
       `turn ${ordinal}: run did not finish successfully (${resultFrame?.status})`,
     );
-  }
-  if (!frames.some((frame) => frame.done !== undefined)) {
-    throw new QualificationError(`turn ${ordinal}: stream omitted done`);
   }
   const finalText = resultFrame.result?.result ?? assistantText(messages);
   if (!String(finalText).includes(TOOL_RESULT)) {
@@ -1285,8 +1331,11 @@ export {
   QualificationError,
   assetName,
   assistantText,
+  assertUniqueToolLifecycle,
+  capPendingDiagnostic,
   connectFrame,
   download,
+  exactTerminalResult,
   installSignalCleanup,
   parseTimeoutSeconds,
   redact,
