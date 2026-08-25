@@ -510,6 +510,7 @@ import http.client
 import http.server
 import json
 import os
+import socketserver
 import struct
 import sys
 import threading
@@ -686,7 +687,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves its bind address through getfqdn() while setting
+        # display metadata. GitHub's macOS runner can stall in that unrelated
+        # resolver path, so preserve TCPServer binding and use the literal
+        # loopback address as the never-displayed server name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+
+server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
 ready = {
     "schemaVersion": 1,
     "transport": "tcp",

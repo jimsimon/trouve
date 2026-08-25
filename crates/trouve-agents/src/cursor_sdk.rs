@@ -400,7 +400,7 @@ struct BridgePool {
     processes: Mutex<HashMap<String, Arc<PooledBridge>>>,
     thread_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     capacity: Arc<Semaphore>,
-    available: Notify,
+    available: Arc<Notify>,
     reaper_started: AtomicBool,
 }
 
@@ -410,22 +410,41 @@ impl Default for BridgePool {
             processes: Mutex::new(HashMap::new()),
             thread_gates: Mutex::new(HashMap::new()),
             capacity: Arc::new(Semaphore::new(POOL_CAP)),
-            available: Notify::new(),
+            available: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
         }
     }
 }
 
 struct BridgeLease {
-    process: Arc<PooledBridge>,
-    _thread_guard: OwnedMutexGuard<()>,
+    process: Option<Arc<PooledBridge>>,
+    thread_guard: Option<OwnedMutexGuard<()>>,
+    available: Arc<Notify>,
+}
+
+impl BridgeLease {
+    fn pooled(&self) -> &Arc<PooledBridge> {
+        self.process
+            .as_ref()
+            .expect("a live Cursor Bridge lease owns its process")
+    }
 }
 
 impl std::ops::Deref for BridgeLease {
     type Target = PooledBridge;
 
     fn deref(&self) -> &Self::Target {
-        &self.process
+        self.pooled()
+    }
+}
+
+impl Drop for BridgeLease {
+    fn drop(&mut self) {
+        // A capacity waiter may only retry eviction after the lease no longer
+        // contributes a process reference and no longer owns the thread gate.
+        self.thread_guard.take();
+        self.process.take();
+        notify_available(&self.available);
     }
 }
 
@@ -483,14 +502,17 @@ impl BridgePool {
             if alive {
                 process.touch();
                 return Ok(BridgeLease {
-                    process,
-                    _thread_guard: thread_guard,
+                    process: Some(process),
+                    thread_guard: Some(thread_guard),
+                    available: self.available.clone(),
                 });
             }
             process.quarantine();
             self.remove_if_same(thread_id, &process).await;
             if let Err(error) = process.terminate().await {
                 self.restore_if_vacant(thread_id, process).await;
+                drop(thread_guard);
+                notify_available(&self.available);
                 return Err(error);
             }
             drop(process);
@@ -526,8 +548,9 @@ impl BridgePool {
             .await
             .insert(thread_id.to_string(), process.clone());
         Ok(BridgeLease {
-            process,
-            _thread_guard: thread_guard,
+            process: Some(process),
+            thread_guard: Some(thread_guard),
+            available: self.available.clone(),
         })
     }
 
@@ -537,9 +560,9 @@ impl BridgePool {
         process: &BridgeLease,
     ) -> Result<(), BackendError> {
         process.quarantine();
-        self.remove_if_same(thread_id, &process.process).await;
+        self.remove_if_same(thread_id, process.pooled()).await;
         if let Err(error) = process.terminate().await {
-            self.restore_if_vacant(thread_id, process.process.clone())
+            self.restore_if_vacant(thread_id, process.pooled().clone())
                 .await;
             return Err(error);
         }
@@ -547,12 +570,14 @@ impl BridgePool {
     }
 
     async fn reap_idle(&self) {
-        while let Some((thread_id, process, _guard)) = self.take_evictable(Some(IDLE_TIMEOUT)).await
+        while let Some((thread_id, process, guard)) = self.take_evictable(Some(IDLE_TIMEOUT)).await
         {
             match process.terminate().await {
                 Ok(()) => {}
                 Err(error) => {
                     self.restore_if_vacant(&thread_id, process).await;
+                    drop(guard);
+                    notify_available(&self.available);
                     tracing::warn!(
                         %thread_id,
                         "cursor: retaining idle Bridge after unacknowledged cleanup: {error}"
@@ -618,14 +643,15 @@ impl BridgePool {
     }
 
     async fn evict_one(&self) -> Result<bool, BackendError> {
-        let Some((thread_id, process, _guard)) = self.take_evictable(None).await else {
+        let Some((thread_id, process, guard)) = self.take_evictable(None).await else {
             return Ok(false);
         };
         if let Err(error) = process.terminate().await {
             self.restore_if_vacant(&thread_id, process).await;
+            drop(guard);
+            notify_available(&self.available);
             return Err(error);
         }
-        self.available.notify_one();
         Ok(true)
     }
 
@@ -637,14 +663,7 @@ impl BridgePool {
             let processes = self.processes.lock().await;
             processes
                 .iter()
-                .filter(|(_, process)| {
-                    process.is_reusable()
-                        && Arc::strong_count(process) == 1
-                        && process.bridge.try_lock().is_ok()
-                        && idle_for.is_none_or(|idle_for| {
-                            process.last_used.lock().unwrap().elapsed() > idle_for
-                        })
-                })
+                .filter(|(_, process)| bridge_is_evictable(process, idle_for))
                 .map(|(thread_id, process)| (thread_id.clone(), *process.last_used.lock().unwrap()))
                 .collect::<Vec<_>>()
         };
@@ -656,14 +675,9 @@ impl BridgePool {
             };
             let process = {
                 let mut processes = self.processes.lock().await;
-                let evictable = processes.get(&thread_id).is_some_and(|process| {
-                    process.is_reusable()
-                        && Arc::strong_count(process) == 1
-                        && process.bridge.try_lock().is_ok()
-                        && idle_for.is_none_or(|idle_for| {
-                            process.last_used.lock().unwrap().elapsed() > idle_for
-                        })
-                });
+                let evictable = processes
+                    .get(&thread_id)
+                    .is_some_and(|process| bridge_is_evictable(process, idle_for));
                 if !evictable {
                     None
                 } else {
@@ -678,14 +692,31 @@ impl BridgePool {
         }
         None
     }
+}
 
-    fn notify_idle(&self) {
-        self.available.notify_waiters();
-        // `notify_waiters` is intentionally broad but does not retain a
-        // permit. Store one notification as well so a completion racing just
-        // before a waiter registers cannot strand admission at a full pool.
-        self.available.notify_one();
-    }
+fn bridge_is_evictable(process: &Arc<PooledBridge>, idle_for: Option<Duration>) -> bool {
+    Arc::strong_count(process) == 1
+        && process.bridge.try_lock().is_ok()
+        && bridge_cleanup_is_due(
+            process.is_reusable(),
+            *process.last_used.lock().unwrap(),
+            idle_for,
+        )
+}
+
+fn bridge_cleanup_is_due(reusable: bool, last_used: Instant, idle_for: Option<Duration>) -> bool {
+    // A quarantined process needs cleanup retried immediately: applying the
+    // ordinary idle threshold would let a failed cleanup retain a pool permit
+    // without any path to capacity recovery.
+    !reusable || idle_for.is_none_or(|idle_for| last_used.elapsed() > idle_for)
+}
+
+fn notify_available(available: &Notify) {
+    available.notify_waiters();
+    // `notify_waiters` is intentionally broad but does not retain a permit.
+    // Store one notification as well so a release racing just before a waiter
+    // registers cannot strand admission at a full pool.
+    available.notify_one();
 }
 
 struct PooledBridge {
@@ -859,7 +890,6 @@ async fn run_sdk_turn(
 
     if keep_warm {
         process.touch();
-        pool.notify_idle();
         return outcome;
     }
     let process_cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
@@ -2423,6 +2453,13 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("select Cursor (Agent SDK)"));
+    }
+
+    #[test]
+    fn quarantined_bridge_cleanup_bypasses_the_idle_threshold() {
+        let just_used = Instant::now();
+        assert!(!bridge_cleanup_is_due(true, just_used, Some(IDLE_TIMEOUT)));
+        assert!(bridge_cleanup_is_due(false, just_used, Some(IDLE_TIMEOUT)));
     }
 
     #[test]

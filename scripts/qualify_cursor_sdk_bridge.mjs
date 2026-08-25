@@ -468,13 +468,22 @@ async function startBridge({
 
 async function terminateProcessTree(child) {
   if (process.platform === "win32") {
-    if (child.exitCode === null && child.signalCode === null) {
+    const exited = () => child.exitCode !== null || child.signalCode !== null;
+    const waitForExit = async (milliseconds) => {
+      const deadline = Date.now() + milliseconds;
+      while (!exited() && Date.now() < deadline) {
+        await new Promise((accept) => setTimeout(accept, 50));
+      }
+      return exited();
+    };
+    if (!exited()) {
       child.kill("SIGTERM");
-      await Promise.race([
-        new Promise((accept) => child.once("exit", accept)),
-        new Promise((accept) => setTimeout(accept, 5_000)),
-      ]);
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      if (!(await waitForExit(5_000))) {
+        child.kill("SIGKILL");
+        if (!(await waitForExit(5_000))) {
+          throw new QualificationError("Cursor SDK Bridge process did not terminate");
+        }
+      }
     }
     return;
   }
