@@ -1190,6 +1190,38 @@ async function safeUnary(client, service, method, body, timeoutMilliseconds) {
   }
 }
 
+async function runCleanupSteps(steps) {
+  const errors = [];
+  for (const [label, cleanup] of steps) {
+    try {
+      await cleanup();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      errors.push(new Error(`${label}: ${detail}`, { cause: error }));
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(
+      errors,
+      `Cursor SDK Bridge cleanup failed: ${errors.map((error) => error.message).join("; ")}`,
+    );
+  }
+}
+
+function combineQualificationAndCleanupErrors(qualificationError, cleanupError) {
+  if (qualificationError === undefined) return cleanupError;
+  const qualificationDetail = qualificationError instanceof Error
+    ? qualificationError.message
+    : String(qualificationError);
+  const cleanupDetail = cleanupError instanceof Error
+    ? cleanupError.message
+    : String(cleanupError);
+  return new AggregateError(
+    [qualificationError, cleanupError],
+    `qualification failed: ${qualificationDetail}; cleanup also failed: ${cleanupDetail}`,
+  );
+}
+
 function installSignalCleanup(
   cleanup,
   {
@@ -1253,38 +1285,52 @@ async function main() {
     cleanupPromise = (async () => {
       const activeBridge = bridge;
       const activeAgentId = agentId;
+      const activeCallback = callback;
       bridge = undefined;
       agentId = undefined;
+      callback = undefined;
+      const cleanupSteps = [];
       if (signal === undefined && activeBridge !== undefined && activeAgentId !== undefined) {
-        await safeUnary(
+        cleanupSteps.push(["close SDK agent", () => safeUnary(
           activeBridge,
           "SdkAgentService",
           "CloseAgent",
           { agentId: activeAgentId },
           Math.min(timeoutMilliseconds, 10_000),
-        );
+        )]);
       }
       if (signal === undefined && activeBridge !== undefined) {
-        await safeUnary(
+        cleanupSteps.push(["shut down SDK Bridge", () => safeUnary(
           activeBridge,
           "SdkBridgeControlService",
           "Shutdown",
           { graceSeconds: 1 },
           Math.min(timeoutMilliseconds, 10_000),
-        );
+        )]);
       }
       for (const child of bridgeChildren) {
-        await terminateProcessTree(child);
+        cleanupSteps.push(["terminate SDK Bridge process tree", () => terminateProcessTree(child)]);
       }
       bridgeChildren.clear();
-      if (callback !== undefined) {
-        callback.server.closeAllConnections?.();
-        await new Promise((accept) => callback.server.close(accept));
-        callback = undefined;
+      if (activeCallback !== undefined) {
+        cleanupSteps.push(["close custom-tool callback server", async () => {
+          activeCallback.server.closeAllConnections?.();
+          await new Promise((accept) => activeCallback.server.close(accept));
+        }]);
       }
-      await rm(stateRoot, { recursive: true, force: true });
-      if (!args.keepDownload) await rm(temporaryRoot, { recursive: true, force: true });
-      else process.stderr.write(`Kept verified download files at ${temporaryRoot}\n`);
+      cleanupSteps.push([
+        "remove SDK Bridge state",
+        () => rm(stateRoot, { recursive: true, force: true }),
+      ]);
+      if (!args.keepDownload) {
+        cleanupSteps.push([
+          "remove verified SDK Bridge download",
+          () => rm(temporaryRoot, { recursive: true, force: true }),
+        ]);
+      } else {
+        process.stderr.write(`Kept verified download files at ${temporaryRoot}\n`);
+      }
+      await runCleanupSteps(cleanupSteps);
     })();
     return cleanupPromise;
   };
@@ -1293,6 +1339,7 @@ async function main() {
       `Cursor SDK Bridge signal cleanup failed: ${redact(error, [apiKey])}\n`,
     ),
   });
+  let qualificationError;
   try {
     const resolvedBridge = await resolveBridge(
       args.bridge,
@@ -1426,9 +1473,17 @@ async function main() {
         2,
       )}\n`,
     );
+  } catch (error) {
+    qualificationError = error;
+    throw error;
   } finally {
-    await cleanup();
-    signalCleanup.dispose();
+    try {
+      await cleanup();
+    } catch (cleanupError) {
+      throw combineQualificationAndCleanupErrors(qualificationError, cleanupError);
+    } finally {
+      signalCleanup.dispose();
+    }
   }
 }
 
@@ -1440,6 +1495,7 @@ export {
   assistantText,
   assertUniqueToolLifecycle,
   capPendingDiagnostic,
+  combineQualificationAndCleanupErrors,
   connectFrame,
   download,
   exactTerminalResult,
@@ -1450,6 +1506,7 @@ export {
   redact,
   readBoundedJsonResponse,
   resolveBridge,
+  runCleanupSteps,
   safeUnary,
   sdkMessages,
   send,

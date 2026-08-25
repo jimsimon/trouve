@@ -21,6 +21,7 @@ import {
   assetName,
   assertUniqueToolLifecycle,
   capPendingDiagnostic,
+  combineQualificationAndCleanupErrors,
   download,
   exactTerminalResult,
   expectedBridgeChecksum,
@@ -28,6 +29,7 @@ import {
   isUnsupportedRpcMethodError,
   parseTimeoutSeconds,
   readBoundedJsonResponse,
+  runCleanupSteps,
   serverStream,
   startBridge,
   terminalStatusIsFinished,
@@ -39,6 +41,7 @@ import {
 import {
   createCallbackAdmission,
   inspectToolCalls,
+  qualificationExitCode,
   startCallbackServer,
 } from "./qualify_cursor_sdk_bridge_full.mjs";
 
@@ -65,6 +68,59 @@ function connectTestFrame(flags, value) {
 test("timeout parsing rejects values outside Node's timer range", () => {
   assert.equal(parseTimeoutSeconds("300"), 300);
   assert.throws(() => parseTimeoutSeconds("2147484"), /no greater than/u);
+});
+
+test("cleanup attempts every registered resource before aggregating failures", async () => {
+  const attempted = [];
+  await assert.rejects(
+    runCleanupSteps([
+      ["first child", async () => {
+        attempted.push("first child");
+        throw new Error("first failed");
+      }],
+      ["second child", async () => {
+        attempted.push("second child");
+      }],
+      ["callback server", async () => {
+        attempted.push("callback server");
+        throw new Error("callback failed");
+      }],
+      ["temporary state", async () => {
+        attempted.push("temporary state");
+      }],
+    ]),
+    (error) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(error.message, /first child: first failed/u);
+      assert.match(error.message, /callback server: callback failed/u);
+      return true;
+    },
+  );
+  assert.deepEqual(attempted, [
+    "first child",
+    "second child",
+    "callback server",
+    "temporary state",
+  ]);
+});
+
+test("cleanup failures preserve an earlier qualification failure", () => {
+  const qualificationError = new Error("qualification failed first");
+  const cleanupError = new Error("cleanup failed second");
+  const combined = combineQualificationAndCleanupErrors(
+    qualificationError,
+    cleanupError,
+  );
+  assert.equal(combined instanceof AggregateError, true);
+  assert.deepEqual(combined.errors, [qualificationError, cleanupError]);
+  assert.match(combined.message, /qualification failed first/u);
+  assert.match(combined.message, /cleanup failed second/u);
+});
+
+test("a blocked full qualification returns a failing process status", () => {
+  assert.equal(qualificationExitCode({ decision: "proceed-with-sdk-bridge-adapter" }), 0);
+  assert.equal(qualificationExitCode({ decision: "hold-sdk-bridge-promotion" }), 1);
+  assert.equal(qualificationExitCode({ result: "passed" }), 0);
 });
 
 test("Bridge discovery requires an uncredentialed literal loopback HTTP URL", () => {

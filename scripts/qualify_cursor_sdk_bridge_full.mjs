@@ -31,6 +31,7 @@ import {
   QualificationError,
   assistantText,
   assertUniqueToolLifecycle,
+  combineQualificationAndCleanupErrors,
   exactTerminalResult,
   installSignalCleanup,
   isUnsupportedRpcMethodError,
@@ -38,6 +39,7 @@ import {
   readBoundedJsonResponse,
   redact,
   resolveBridge,
+  runCleanupSteps,
   safeUnary,
   sdkMessages,
   send,
@@ -981,40 +983,48 @@ async function fullQualification(args) {
       }
       const activeBridge = bridge;
       const activeAgentId = agentId;
+      const activeCallback = callback;
       bridge = undefined;
       agentId = undefined;
+      callback = undefined;
+      const cleanupSteps = [];
       if (signal === undefined && activeBridge !== undefined && activeAgentId !== undefined) {
-        await safeUnary(
+        cleanupSteps.push(["close SDK agent", () => safeUnary(
           activeBridge,
           "SdkAgentService",
           "CloseAgent",
           { agentId: activeAgentId },
           Math.min(timeoutMilliseconds, 10_000),
-        );
+        )]);
       }
       if (signal === undefined && activeBridge !== undefined) {
-        await safeUnary(
+        cleanupSteps.push(["shut down SDK Bridge", () => safeUnary(
           activeBridge,
           "SdkBridgeControlService",
           "Shutdown",
           { graceSeconds: 1 },
           Math.min(timeoutMilliseconds, 10_000),
-        );
+        )]);
       }
       for (const child of bridgeChildren) {
-        await terminateProcessTree(child);
+        cleanupSteps.push(["terminate SDK Bridge process tree", () => terminateProcessTree(child)]);
       }
       bridgeChildren.clear();
-      if (callback !== undefined) {
-        callback.server.closeAllConnections?.();
-        await new Promise((accept) => callback.server.close(accept));
-        callback = undefined;
+      if (activeCallback !== undefined) {
+        cleanupSteps.push(["close custom-tool callback server", async () => {
+          activeCallback.server.closeAllConnections?.();
+          await new Promise((accept) => activeCallback.server.close(accept));
+        }]);
       }
       if (signal !== undefined || !args.keepState) {
-        await rm(temporaryRoot, { recursive: true, force: true });
+        cleanupSteps.push([
+          "remove qualification state",
+          () => rm(temporaryRoot, { recursive: true, force: true }),
+        ]);
       } else {
         process.stderr.write(`Kept qualification state at ${temporaryRoot}\n`);
       }
+      await runCleanupSteps(cleanupSteps);
     })();
     return cleanupPromise;
   };
@@ -1023,6 +1033,7 @@ async function fullQualification(args) {
       `Cursor signal cleanup failed: ${redact(error, [apiKey])}\n`,
     ),
   });
+  let qualificationError;
   try {
     resolvedBridge = await resolveBridge(args.bridge, temporaryRoot, timeoutMilliseconds);
     const binaryStat = await stat(resolvedBridge.binary);
@@ -1469,10 +1480,22 @@ async function fullQualification(args) {
       },
       blockers,
     };
+  } catch (error) {
+    qualificationError = error;
+    throw error;
   } finally {
-    await cleanup();
-    signalCleanup.dispose();
+    try {
+      await cleanup();
+    } catch (cleanupError) {
+      throw combineQualificationAndCleanupErrors(qualificationError, cleanupError);
+    } finally {
+      signalCleanup.dispose();
+    }
   }
+}
+
+export function qualificationExitCode(result) {
+  return result?.decision === "hold-sdk-bridge-promotion" ? 1 : 0;
 }
 
 if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
@@ -1488,6 +1511,7 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
         }
       : await fullQualification(args);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    process.exitCode = qualificationExitCode(result);
   } catch (error) {
     const message = redact(
       error instanceof Error ? error.message : error,
