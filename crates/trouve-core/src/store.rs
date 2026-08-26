@@ -11966,7 +11966,7 @@ impl Store {
                     params![finding_id, now, repository, pull_number as i64],
                 )?
             } else {
-                tx.execute(
+                let restored = tx.execute(
                     "UPDATE code_review_findings
                      SET status = 'open', dismiss_reason = '', resolved_at = NULL,
                          resolved_head = '', resolved_by_job_id = ''
@@ -11978,7 +11978,22 @@ impl Store {
                            AND job.review_published = 1
                        )",
                     params![finding_id, repository, pull_number as i64],
-                )?
+                )?;
+                if restored > 0 {
+                    // Mirror the thread-based reopen path: a theme resolved
+                    // while this finding was dismissed is open again now
+                    // that its manifestation is.
+                    tx.execute(
+                        "UPDATE code_review_themes
+                         SET status = 'open', resolved_head = '', updated_at = ?2
+                         WHERE id IN (
+                           SELECT theme_id FROM code_review_finding_themes
+                           WHERE finding_id = ?1
+                         )",
+                        params![finding_id, now],
+                    )?;
+                }
+                restored
             };
             changed |= applied > 0;
         }
@@ -19156,6 +19171,27 @@ mod tests {
             )
             .unwrap();
         assert!(!changed);
+        // A theme resolved while its only manifestation was dismissed
+        // reopens when the checkbox restore reopens the finding, mirroring
+        // the thread-based reopen path.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_review_themes
+                        (id, repository, pull_number, root_cause, recommendation, status,
+                         first_seen_head, last_seen_head, resolved_head, created_at, updated_at)
+                 VALUES ('thm-1', 'acme/widgets', 42, 'cause', 'fix', 'resolved',
+                         'abc', 'abc', 'abc', '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO code_review_finding_themes (finding_id, theme_id, linked_by_job_id)
+                 VALUES (?1, 'thm-1', '')",
+                params![threadless.id],
+            )
+            .unwrap();
+        }
         // Unchecking restores; re-applying the identical states is a no-op.
         let (changed, projection) = store
             .apply_lifecycle_dismissal_states(
@@ -19167,6 +19203,20 @@ mod tests {
             .unwrap();
         assert!(changed);
         assert_eq!(projection.as_deref(), Some(job.id.as_str()));
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM code_review_themes WHERE id = 'thm-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "open",
+            "the linked theme reopened with its restored manifestation"
+        );
         let (changed, projection) = store
             .apply_lifecycle_dismissal_states(
                 "acme/widgets",

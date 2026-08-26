@@ -8064,17 +8064,60 @@ impl Engine {
             .code_review
             .projection_lock(format!("lifecycle:{}#{}", job.repository, job.pull_number));
         let _guard = lock.lock().await;
+        let (repository, pull_number) = (job.repository.clone(), job.pull_number);
+        let state = self
+            .store
+            .code_review_pull_state(&repository, pull_number)?;
+        // Apply-then-render: converge the ledger to the comment's current
+        // body before overwriting it. GitHub's stored body always reflects
+        // the chronologically last edit regardless of webhook delivery
+        // order, so this closes the window where a re-render could erase a
+        // toggle whose delivery had not been applied yet — and makes
+        // same-second delivery ties self-correct on the next render cycle
+        // instead of persisting an obsolete state. Best-effort: a fetch
+        // failure degrades to rendering the ledger as-is.
+        if let Some(comment_id) = state.lifecycle_comment_id {
+            let fetched: Result<(serde_json::Value, _)> = tokio::time::timeout(
+                REVIEW_THREAD_REQUEST_TIMEOUT,
+                api.get(&format!("/repos/{repository}/issues/comments/{comment_id}")),
+            )
+            .await
+            .map_err(|_| anyhow!("fetching the lifecycle comment timed out"))
+            .and_then(|outcome| outcome);
+            match fetched {
+                Ok((comment, rate)) => {
+                    self.record_review_rate(rate);
+                    if let Some(states) = comment["body"]
+                        .as_str()
+                        .and_then(parse_lifecycle_dismissal_markers)
+                    {
+                        let edited_at = comment["updated_at"].as_str().unwrap_or_default();
+                        // Store-level apply only: re-projection is exactly
+                        // what this pass is already doing.
+                        self.store.apply_lifecycle_dismissal_states(
+                            &repository,
+                            pull_number,
+                            edited_at,
+                            &states,
+                        )?;
+                    }
+                }
+                Err(error) => tracing::debug!(
+                    repository,
+                    pull_number,
+                    error = format!("{error:#}"),
+                    "lifecycle comment pre-render fetch failed"
+                ),
+            }
+        }
         let detail = self
             .store
             .code_review_job_detail(&job.id)?
             .ok_or_else(|| anyhow!("review job no longer exists"))?;
         let job = &detail.job;
-        let state = self
-            .store
-            .code_review_pull_state(&job.repository, job.pull_number)?;
         let (threadless_findings, threadless_truncated) = self
             .store
-            .threadless_code_review_findings(&job.repository, job.pull_number)?;
+            .threadless_code_review_findings(&repository, pull_number)?;
         let lifecycle_body =
             render_lifecycle_comment(&detail, &threadless_findings, threadless_truncated);
         let terminal = matches!(
@@ -15899,6 +15942,12 @@ mod tests {
                     "post /repos/acme/widgets/issues/42/comments http/1.1\r\n",
                     r#"{"id":10,"html_url":"https://github.com/acme/widgets/pull/42#issuecomment-10"}"#,
                 ),
+                // The second projection knows the comment id, so it runs the
+                // apply-then-render fetch before its PATCH.
+                (
+                    "get /repos/acme/widgets/issues/comments/10 http/1.1\r\n",
+                    r#"{"id":10,"body":"no markers here","updated_at":"2026-08-26T00:00:00Z"}"#,
+                ),
                 (
                     "patch /repos/acme/widgets/issues/comments/10 http/1.1\r\n",
                     r#"{"id":10,"html_url":"https://github.com/acme/widgets/pull/42#issuecomment-10"}"#,
@@ -19465,6 +19514,14 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for (expected, status, body) in [
+                // The preset comment id triggers the apply-then-render fetch
+                // before anything else in the projection.
+                (
+                    "get /repos/acme/widgets/issues/comments/11 http/1.1\r\n",
+                    "200 OK",
+                    r#"{"id":11,"body":"no markers here","updated_at":"2026-08-26T00:00:00Z"}"#
+                        .into(),
+                ),
                 (
                     "get /repos/acme/widgets/issues/42/comments?per_page=100&page=1 http/1.1\r\n",
                     "200 OK",
