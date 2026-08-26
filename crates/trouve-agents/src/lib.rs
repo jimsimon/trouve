@@ -514,6 +514,12 @@ pub trait AgentBackend: Send + Sync {
     fn take_background_turn_signals(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
         None
     }
+
+    /// Discard any buffered autonomous-turn output held for `thread_id`.
+    /// Called when the thread no longer exists, so the buffered turns can
+    /// never be attached: without this, a backend that pins resources on
+    /// pending background output would hold them forever. Default: no-op.
+    async fn abandon_background_turns(&self, _thread_id: &str) {}
 }
 
 /// Locate a binary on PATH (absolute/relative paths pass through).

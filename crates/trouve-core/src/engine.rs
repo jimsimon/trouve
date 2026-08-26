@@ -2871,8 +2871,16 @@ impl Engine {
         for attempt in 0..2_u8 {
             match self.dispatch_background_attach_turn(thread_id, backend_id) {
                 Ok(()) => return,
-                // The thread is gone; there is nothing to attach to.
-                Err(EngineError::NotFound(_)) => return,
+                // The thread is gone; the buffered turns can never attach.
+                // Tell the backend to abandon them so they stop pinning the
+                // process in its pool.
+                Err(EngineError::NotFound(_)) => {
+                    let backend = self.backends.read().unwrap().get(backend_id).cloned();
+                    if let Some(backend) = backend {
+                        backend.abandon_background_turns(thread_id).await;
+                    }
+                    return;
+                }
                 Err(error) if attempt == 0 => {
                     tracing::debug!(
                         %thread_id,

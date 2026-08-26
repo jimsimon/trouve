@@ -283,6 +283,19 @@ impl StdoutRouter {
         !self.state.lock().unwrap().background.is_empty()
     }
 
+    /// Drop buffered autonomous turns that can never be attached (their
+    /// thread is gone), releasing the pending-background pin on the process.
+    fn abandon_background(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.background.is_empty() {
+            tracing::debug!(
+                lines = state.background.len(),
+                "claude: abandoning unattachable background turns"
+            );
+        }
+        state.background.clear();
+    }
+
     /// The registered non-attach turn's prompt reached the vendor; lines
     /// arriving from now on may belong to it.
     fn prompt_delivered(&self) {
@@ -713,6 +726,16 @@ impl AgentBackend for ClaudeBackend {
 
     fn take_background_turn_signals(&self) -> Option<mpsc::Receiver<String>> {
         self.background_turns_rx.lock().unwrap().take()
+    }
+
+    async fn abandon_background_turns(&self, thread_id: &str) {
+        let proc_ = self.pool.procs.lock().await.get(thread_id).cloned();
+        if let Some(proc_) = proc_ {
+            // Unpin the process: with the buffer abandoned,
+            // has_pending_background() no longer holds it out of reaping and
+            // cap eviction.
+            proc_.router.abandon_background();
+        }
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
