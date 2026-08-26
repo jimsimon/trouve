@@ -4152,15 +4152,18 @@ impl Engine {
             .then(|| manual_review_comment(&payload))
             .flatten();
         // A maintainer toggling a dismissal checkbox edits the lifecycle
-        // comment; GitHub delivers that as an issue_comment `edited` event
-        // carrying the new body. Parse our own markers from the payload so
-        // the applied state is exactly what the maintainer saw and toggled,
-        // immune to later re-renders.
+        // comment; GitHub delivers that as an issue_comment `edited` event.
+        // The payload only gates on our marker being present — the handler
+        // refetches the comment's current body before applying, so a
+        // reordered or replayed delivery converges on the latest state
+        // instead of applying its own possibly-stale snapshot.
         let lifecycle_checkbox_edit = (event == "issue_comment" && action == "edited")
             .then(|| {
                 let comment_id = payload["comment"]["id"].as_u64()?;
-                let body = payload["comment"]["body"].as_str()?;
-                parse_lifecycle_dismissal_markers(body).map(|states| (comment_id, states))
+                payload["comment"]["body"]
+                    .as_str()
+                    .filter(|body| body.contains("<!-- trouve-dismiss:"))
+                    .map(|_| comment_id)
             })
             .flatten();
         if !pull_request_event && manual_comment.is_none() && lifecycle_checkbox_edit.is_none() {
@@ -4215,14 +4218,22 @@ impl Engine {
             let engine = self.clone();
             tokio::spawn(async move {
                 let _guard = engine.code_review.reconcile_lock.lock().await;
-                if let Some((comment_id, states)) = lifecycle_checkbox_edit
-                    && let Err(error) = engine
-                        .apply_lifecycle_dismissal_edit(&repository, comment_id, &states)
-                        .await
-                {
-                    engine.record_review_error(format!(
-                        "applying lifecycle dismissal checkboxes failed: {error:#}"
-                    ));
+                if let Some(comment_id) = lifecycle_checkbox_edit {
+                    match engine.installation_api(repository.installation_id).await {
+                        Ok(api) => {
+                            if let Err(error) = engine
+                                .apply_lifecycle_dismissal_edit(&api, &repository, comment_id)
+                                .await
+                            {
+                                engine.record_review_error(format!(
+                                    "applying lifecycle dismissal checkboxes failed: {error:#}"
+                                ));
+                            }
+                        }
+                        Err(error) => engine.record_review_error(format!(
+                            "authenticating lifecycle checkbox webhook failed: {error:#}"
+                        )),
+                    }
                 }
                 if let Some(pull_number) = converted_to_draft_pull {
                     match engine.installation_api(repository.installation_id).await {
@@ -9098,6 +9109,22 @@ impl Engine {
         {
             return Ok(ReviewThreadReconciliationOutcome::Skipped);
         }
+        // Converge checkbox dismissals from the lifecycle comment's current
+        // body on every pass. This is the durable backstop for the webhook
+        // fast path: an edit whose delivery was lost to a crash or restart
+        // is picked up here, so the ledger and the rendered checkboxes can
+        // never stay divergent past one reconciliation.
+        if let Err(error) = self
+            .sync_lifecycle_dismissal_checkboxes(api, repository, pull.number)
+            .await
+        {
+            tracing::warn!(
+                repository = repository.repository,
+                pull_number = pull.number,
+                error = format!("{error:#}"),
+                "syncing lifecycle dismissal checkboxes failed"
+            );
+        }
         let initial_findings = self
             .store
             .reconcilable_code_review_findings(&repository.repository, pull.number)?;
@@ -9378,9 +9405,9 @@ impl Engine {
     /// exactly as for a thread resolution.
     async fn apply_lifecycle_dismissal_edit(
         &self,
+        api: &GithubApi,
         repository: &CodeReviewRepository,
         comment_id: u64,
-        states: &[(String, bool)],
     ) -> Result<()> {
         let Some(pull_number) = self
             .store
@@ -9388,39 +9415,67 @@ impl Engine {
         else {
             return Ok(());
         };
-        let threadless = self
+        self.sync_lifecycle_dismissal_checkboxes(api, repository, pull_number)
+            .await
+    }
+
+    /// Reads the lifecycle comment's *current* body from GitHub and applies
+    /// its checkbox states to the threadless finding ledger. Fetching fresh
+    /// state instead of trusting a delivered snapshot makes the operation a
+    /// convergence, not an event: reordered webhook deliveries cannot apply
+    /// an obsolete snapshot over a newer maintainer decision, and because
+    /// thread reconciliation also runs this sync, a webhook lost to a crash
+    /// or restart heals on the next pass without any durable retry queue.
+    async fn sync_lifecycle_dismissal_checkboxes(
+        &self,
+        api: &GithubApi,
+        repository: &CodeReviewRepository,
+        pull_number: u64,
+    ) -> Result<()> {
+        let state = self
             .store
-            .threadless_code_review_findings(&repository.repository, pull_number)?;
-        let by_id = threadless
-            .iter()
-            .map(|finding| (finding.id.as_str(), finding))
-            .collect::<HashMap<_, _>>();
-        let mut changed = false;
-        for (finding_id, checked) in states {
-            let Some(finding) = by_id.get(finding_id.as_str()) else {
-                continue;
-            };
-            changed |= match (finding.status.as_str(), checked) {
-                ("open", true) => self
-                    .store
-                    .dismiss_threadless_code_review_finding(finding_id)?,
-                ("dismissed", false) => self
-                    .store
-                    .restore_threadless_code_review_finding(finding_id)?,
-                _ => false,
-            };
-        }
+            .code_review_pull_state(&repository.repository, pull_number)?;
+        let Some(comment_id) = state.lifecycle_comment_id else {
+            return Ok(());
+        };
+        let (comment, rate): (serde_json::Value, _) = tokio::time::timeout(
+            REVIEW_THREAD_REQUEST_TIMEOUT,
+            api.get(&format!(
+                "/repos/{}/issues/comments/{comment_id}",
+                repository.repository
+            )),
+        )
+        .await
+        .context("fetching the lifecycle comment timed out")?
+        .context("fetching the lifecycle comment")?;
+        self.record_review_rate(rate);
+        let Some(states) = comment["body"]
+            .as_str()
+            .and_then(parse_lifecycle_dismissal_markers)
+        else {
+            return Ok(());
+        };
+        // All toggles and the count refresh commit in one transaction; the
+        // store guards restrict every update to threadless findings of this
+        // pull's published rounds, so unknown or fabricated marker ids are
+        // inert.
+        let (changed, projection_job) = self.store.apply_lifecycle_dismissal_states(
+            &repository.repository,
+            pull_number,
+            &states,
+        )?;
         if !changed {
             return Ok(());
         }
-        self.store
-            .refresh_code_review_pull_projection_counts(&repository.repository, pull_number)?;
-        // Re-project unconditionally: even a count-neutral toggle must
-        // normalize the rendered checkbox states back to the ledger.
-        if let Some(job_id) = self
-            .store
-            .latest_published_code_review_job_id(&repository.repository, pull_number)?
-        {
+        // Re-project even when both count tiers were neutral: the rendered
+        // checkbox states must normalize back to the ledger.
+        let projection_job = match projection_job {
+            Some(job_id) => Some(job_id),
+            None => self
+                .store
+                .latest_published_code_review_job_id(&repository.repository, pull_number)?,
+        };
+        if let Some(job_id) = projection_job {
             self.emit_code_review_updated(Some(job_id.clone()))?;
             if let Ok(Some(record)) = self.store.code_review_job(&job_id) {
                 self.sync_code_review_projection(&record.job).await;
@@ -10226,6 +10281,11 @@ fn parse_lifecycle_dismissal_markers(body: &str) -> Option<Vec<(String, bool)>> 
 
 const LIFECYCLE_DISMISSABLE_MAX_BYTES: usize = 16 * 1024;
 
+/// Bytes reserved past this section for the trailing identity marker and a
+/// possible truncation suffix, so the global cap in finish_lifecycle_comment
+/// never slices a checkbox row or its dismissal marker mid-entry.
+const LIFECYCLE_DISMISSABLE_TAIL_RESERVE: usize = 512;
+
 fn append_lifecycle_dismissal_section(
     body: &mut String,
     threadless: &[trouve_protocol::CodeReviewFinding],
@@ -10233,17 +10293,28 @@ fn append_lifecycle_dismissal_section(
     if threadless.is_empty() {
         return;
     }
+    // The section budget is the smaller of its own cap and what actually
+    // remains of the global comment budget after the earlier sections.
+    let remaining_global = LIFECYCLE_COMMENT_MAX_BYTES
+        .saturating_sub(body.len())
+        .saturating_sub(LIFECYCLE_DISMISSABLE_TAIL_RESERVE);
+    let budget = LIFECYCLE_DISMISSABLE_MAX_BYTES.min(remaining_global);
+    let omitted_marker = "- _additional findings omitted; see the trouve dashboard._\n";
+    let heading = "### Findings without inline threads\n\nThese findings anchor outside the \
+         pull-request diff, so they have no review thread to resolve. A maintainer can check a \
+         box to dismiss one; unchecking restores it. Edits apply directly, without a new review \
+         round.\n\n";
+    if heading.len() + omitted_marker.len() + 1 > budget {
+        // Not even the heading plus an honest omission notice fits; render
+        // nothing rather than a sliced section.
+        return;
+    }
     let start = body.len();
-    body.push_str(
-        "### Findings without inline threads\n\nThese findings anchor outside the pull-request \
-         diff, so they have no review thread to resolve. A maintainer can check a box to \
-         dismiss one; unchecking restores it. Edits apply directly, without a new review \
-         round.\n\n",
-    );
+    body.push_str(heading);
     for finding in threadless {
         let entry = lifecycle_dismissal_entry(finding);
-        if body.len() - start + entry.len() > LIFECYCLE_DISMISSABLE_MAX_BYTES {
-            body.push_str("- _additional findings omitted; see the trouve dashboard._\n");
+        if body.len() - start + entry.len() + omitted_marker.len() + 1 > budget {
+            body.push_str(omitted_marker);
             break;
         }
         body.push_str(&entry);
@@ -24157,6 +24228,61 @@ mod tests {
         assert!(parse_lifecycle_dismissal_markers("just a comment").is_none());
         let junk = "- [x] <!-- trouve-dismiss:../etc/passwd -->\n- [x] no marker here\n<!-- trouve-dismiss:orphan -->";
         assert_eq!(parse_lifecycle_dismissal_markers(junk).unwrap(), []);
+    }
+
+    #[test]
+    fn dismissal_section_respects_the_remaining_global_budget() {
+        let finding = |id: usize| trouve_protocol::CodeReviewFinding {
+            id: format!("fnd-{id}"),
+            job_id: String::new(),
+            path: "crates/core/src/engine.rs".into(),
+            line: id as u64,
+            side: "RIGHT".into(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            title: "T".repeat(200),
+            body: "details".into(),
+            prompt_for_agents: String::new(),
+            status: "open".into(),
+            sources: Vec::new(),
+            github_comment_id: None,
+            github_comment_url: String::new(),
+            github_publication_status: Default::default(),
+            github_thread_id: None,
+            resolved_at: None,
+            evidence: Default::default(),
+            origin: Default::default(),
+            theme_ids: Vec::new(),
+            observed_head: String::new(),
+            resolved_head: String::new(),
+            resolved_by_job_id: String::new(),
+            outside_diff: true,
+        };
+        let findings = (0..40).map(finding).collect::<Vec<_>>();
+
+        // A body already near the global cap: the section must emit only
+        // complete rows plus a complete omission notice, never content the
+        // final truncation would slice mid-marker.
+        let mut near_limit = "x".repeat(LIFECYCLE_COMMENT_MAX_BYTES - 900);
+        append_lifecycle_dismissal_section(&mut near_limit, &findings);
+        let finished = finish_lifecycle_comment(near_limit.clone(), "rv_test");
+        assert!(finished.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
+        assert!(!finished.contains(LIFECYCLE_COMMENT_TRUNCATION_MARKER));
+        for (index, _) in near_limit.match_indices("<!-- trouve-dismiss:") {
+            assert!(
+                near_limit[index..].contains(" -->"),
+                "every emitted marker is complete"
+            );
+        }
+        if near_limit.contains("### Findings without inline threads") {
+            assert!(near_limit.contains("additional findings omitted"));
+        }
+
+        // A body so close to the cap that not even the heading fits renders
+        // no section at all rather than a sliced one.
+        let mut over_limit = "x".repeat(LIFECYCLE_COMMENT_MAX_BYTES - 600);
+        append_lifecycle_dismissal_section(&mut over_limit, &findings);
+        assert!(!over_limit.contains("### Findings without inline threads"));
     }
 
     #[test]
