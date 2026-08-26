@@ -10425,14 +10425,18 @@ fn append_lifecycle_dismissal_section(
     threadless: &[trouve_protocol::CodeReviewFinding],
     truncated: bool,
     round_ids: &HashSet<&str>,
+    reserved_after: usize,
 ) {
     if threadless.is_empty() {
         return;
     }
     // The section budget is the smaller of its own cap and what actually
-    // remains of the global comment budget after the earlier sections.
+    // remains of the global comment budget after the earlier sections,
+    // minus the space the caller has promised to later sections (the agent
+    // prompt and the comment tail).
     let remaining_global = LIFECYCLE_COMMENT_MAX_BYTES
         .saturating_sub(body.len())
+        .saturating_sub(reserved_after)
         .saturating_sub(LIFECYCLE_DISMISSABLE_TAIL_RESERVE);
     let budget = LIFECYCLE_DISMISSABLE_MAX_BYTES.min(remaining_global);
     let omitted_marker = "- _additional findings omitted; see the trouve dashboard._\n";
@@ -10713,11 +10717,38 @@ fn render_lifecycle_comment(
         }
         body.push_str("\n\n");
     }
+    // Section maxima are local, but the comment cap is global: budgets are
+    // allocated in render order, with every earlier section reserving the
+    // space required by the sections after it so finish_lifecycle_comment
+    // never slices dismissal rows or the trailing remediation prompt.
+    let prompt_reserve = if lifecycle_prompt.is_empty() {
+        0
+    } else {
+        // Fenced prompt (bounded plus its truncation marker) and wrapper.
+        LIFECYCLE_PROMPT_MAX_BYTES + 256
+    };
+    let tail_reserve = if job.error.is_empty() {
+        128
+    } else {
+        LIFECYCLE_ERROR_MAX_BYTES + 192
+    };
+    let dismissal_reserve = if threadless_findings.is_empty() {
+        0
+    } else {
+        // Heading plus the honest omission notice, so the checkbox section
+        // is never squeezed out entirely by earlier sections.
+        1_024
+    };
+    let failed_budget = LIFECYCLE_FINDINGS_MAX_BYTES.min(
+        LIFECYCLE_COMMENT_MAX_BYTES
+            .saturating_sub(body.len())
+            .saturating_sub(dismissal_reserve + prompt_reserve + tail_reserve),
+    );
     append_lifecycle_finding_section(
         &mut body,
         "### Inline comments that failed to post",
         &failed_findings,
-        LIFECYCLE_FINDINGS_MAX_BYTES,
+        failed_budget,
         false,
     );
     append_lifecycle_dismissal_section(
@@ -10725,11 +10756,16 @@ fn render_lifecycle_comment(
         threadless_findings,
         threadless_truncated,
         &round_ids,
+        prompt_reserve + tail_reserve,
     );
     if !lifecycle_prompt.is_empty() {
+        let remaining_for_prompt = LIFECYCLE_COMMENT_MAX_BYTES
+            .saturating_sub(body.len())
+            .saturating_sub(tail_reserve + 256);
+        let prompt_max = LIFECYCLE_PROMPT_MAX_BYTES.min(remaining_for_prompt);
         let prompt = safe_public_prompt_fence(
             &lifecycle_prompt,
-            LIFECYCLE_PROMPT_MAX_BYTES,
+            prompt_max,
             "\n[Prompt truncated; open the trouve dashboard for the complete prompt.]",
         );
         body.push_str(&format!(
@@ -17215,6 +17251,43 @@ mod tests {
         // notice instead of letting the fence slice entries mid-way.
         assert!(body.contains("more new finding(s) omitted"));
         assert!(!body.contains("Prompt truncated"));
+
+        // Section maxima are local, but the cap is global: with the failed
+        // section, the threadless checkbox list, and a large carried ledger
+        // all competing, the render-order reservations keep every trailing
+        // section intact instead of letting the final cap slice them.
+        let threadless: Vec<_> = (0..40)
+            .map(|i| {
+                let mut finding = detail.findings[0].clone();
+                finding.id = format!("threadless-{i}");
+                finding.github_comment_id = None;
+                finding.status = "open".into();
+                finding.title = "Threadless ledger entry".into();
+                finding
+            })
+            .collect();
+        let carried: Vec<_> = (0..80)
+            .map(|i| {
+                let mut finding = detail.findings[0].clone();
+                finding.id = format!("carried-{i}");
+                finding.title = "Carried ledger entry".into();
+                finding
+            })
+            .collect();
+        let body = render_lifecycle_comment(&detail, &threadless, false, &carried);
+        assert!(body.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
+        assert!(body.ends_with(&lifecycle_comment_marker(&queued.id)));
+        // The global cap never fired: every section already fit its
+        // render-order allocation.
+        assert!(!body.contains(LIFECYCLE_COMMENT_TRUNCATION_MARKER));
+        // The checkbox section survives with at least one row and an honest
+        // omission notice.
+        assert!(body.contains("### Findings without inline threads"));
+        assert!(body.contains("<!-- trouve-dismiss:threadless-0 -->"));
+        assert!(body.contains("additional findings omitted"));
+        // The prompt block trails the comment and its fence is closed.
+        let prompt_open = body.rfind("```text").unwrap();
+        assert!(body[prompt_open..].contains("\n```\n\n</details>"));
     }
 
     #[test]
@@ -24850,7 +24923,7 @@ mod tests {
         // complete rows plus a complete omission notice, never content the
         // final truncation would slice mid-marker.
         let mut near_limit = "x".repeat(LIFECYCLE_COMMENT_MAX_BYTES - 900);
-        append_lifecycle_dismissal_section(&mut near_limit, &findings, false, &HashSet::new());
+        append_lifecycle_dismissal_section(&mut near_limit, &findings, false, &HashSet::new(), 0);
         let finished = finish_lifecycle_comment(near_limit.clone(), "rv_test");
         assert!(finished.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
         assert!(!finished.contains(LIFECYCLE_COMMENT_TRUNCATION_MARKER));
@@ -24867,7 +24940,7 @@ mod tests {
         // A body so close to the cap that not even the heading fits renders
         // no section at all rather than a sliced one.
         let mut over_limit = "x".repeat(LIFECYCLE_COMMENT_MAX_BYTES - 600);
-        append_lifecycle_dismissal_section(&mut over_limit, &findings, false, &HashSet::new());
+        append_lifecycle_dismissal_section(&mut over_limit, &findings, false, &HashSet::new(), 0);
         assert!(!over_limit.contains("### Findings without inline threads"));
     }
 
