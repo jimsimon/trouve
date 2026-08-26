@@ -2041,6 +2041,13 @@ pub struct Engine {
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
+    /// Background-turn signal receivers awaiting a forwarder task. Provider
+    /// reloads rebuild the backend registry, so receivers are handed off
+    /// through this level-triggered intake instead of being wired once at
+    /// startup; the pump spawned by `start_background_turn_listener` drains
+    /// it whenever `background_turn_intake_notify` fires.
+    background_turn_intake: Mutex<Vec<(String, tokio::sync::mpsc::Receiver<String>)>>,
+    background_turn_intake_notify: tokio::sync::Notify,
     pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
@@ -2487,6 +2494,8 @@ impl Engine {
             injected_providers: Mutex::new(injected_providers),
             backends: RwLock::new(backends),
             injected_backends: Mutex::new(HashMap::new()),
+            background_turn_intake: Mutex::new(Vec::new()),
+            background_turn_intake_notify: tokio::sync::Notify::new(),
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
@@ -2808,28 +2817,59 @@ impl Engine {
     /// scheduled tasks) produces output no one is reading: the adapter now
     /// buffers it, and this listener turns it into an ordinary turn.
     pub fn start_background_turn_listener(self: &Arc<Self>) {
+        self.intake_background_turn_signals();
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let pending: Vec<(String, tokio::sync::mpsc::Receiver<String>)> = {
+                    let mut intake = engine.background_turn_intake.lock().unwrap();
+                    intake.drain(..).collect()
+                };
+                for (backend_id, mut signals) in pending {
+                    let engine = Arc::clone(&engine);
+                    tokio::spawn(async move {
+                        // The forwarder ends when its backend (the sender) is
+                        // dropped by a registry reload; the replacement
+                        // backend's receiver arrives through the intake.
+                        while let Some(thread_id) = signals.recv().await {
+                            if let Err(error) =
+                                engine.dispatch_background_attach_turn(&thread_id, &backend_id)
+                            {
+                                tracing::warn!(
+                                    %thread_id,
+                                    backend = %backend_id,
+                                    %error,
+                                    "background attach-turn dispatch failed"
+                                );
+                            }
+                        }
+                    });
+                }
+                engine.background_turn_intake_notify.notified().await;
+            }
+        });
+    }
+
+    /// Collect every registered backend's background-turn signal receiver
+    /// into the intake. `take_background_turn_signals` yields a receiver at
+    /// most once per backend instance, so calling this after a registry
+    /// reload arms exactly the new instances.
+    fn intake_background_turn_signals(&self) {
         let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
             let map = self.backends.read().unwrap();
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
+        let mut taken = Vec::new();
         for (backend_id, backend) in backends {
-            let Some(mut signals) = backend.take_background_turn_signals() else {
-                continue;
-            };
-            let engine = Arc::clone(self);
-            tokio::spawn(async move {
-                while let Some(thread_id) = signals.recv().await {
-                    if let Err(error) = engine.dispatch_background_attach_turn(&thread_id) {
-                        tracing::warn!(
-                            %thread_id,
-                            backend = %backend_id,
-                            %error,
-                            "background attach-turn dispatch failed"
-                        );
-                    }
-                }
-            });
+            if let Some(signals) = backend.take_background_turn_signals() {
+                taken.push((backend_id, signals));
+            }
         }
+        if taken.is_empty() {
+            return;
+        }
+        self.background_turn_intake.lock().unwrap().extend(taken);
+        self.background_turn_intake_notify.notify_one();
     }
 
     /// Queue one attach turn for a vendor-autonomous turn the backend
@@ -2839,6 +2879,7 @@ impl Engine {
     fn dispatch_background_attach_turn(
         self: &Arc<Self>,
         thread_id: &str,
+        signaling_backend_id: &str,
     ) -> Result<(), EngineError> {
         // Review threads run under strict budgets and their vendor sessions
         // have no monitors; skip them defensively.
@@ -2848,6 +2889,24 @@ impl Engine {
             .map_err(EngineError::Internal)?
         {
             return Ok(());
+        }
+        // The thread may have switched models between the signal and this
+        // dispatch. Attaching would then queue the marker prompt for a
+        // backend with no pending autonomous turn — worst case a backend
+        // that treats it as a literal prompt — so confirm the thread still
+        // resolves to the signaling backend.
+        let thread = self.get_thread(thread_id)?;
+        match self.backend_for(&thread.model) {
+            Some((backend_id, _, _)) if backend_id == signaling_backend_id => {}
+            resolved => {
+                tracing::debug!(
+                    %thread_id,
+                    signaling_backend = %signaling_backend_id,
+                    resolved_backend = resolved.map(|(id, _, _)| id).unwrap_or_default(),
+                    "skipping background attach: thread no longer resolves to the signaling backend"
+                );
+                return Ok(());
+            }
         }
         self.send_message_inner(
             thread_id,
@@ -4939,6 +4998,11 @@ impl Engine {
             backends.insert(id.clone(), b.clone());
         }
         *self.backends.write().unwrap() = backends;
+        // Rebuilt backends carry fresh background-turn signal channels; hand
+        // their receivers to the listener pump so autonomous-turn attachment
+        // survives the reload (the old instances' forwarders end when their
+        // senders drop).
+        self.intake_background_turn_signals();
     }
 
     pub fn thread_usage(

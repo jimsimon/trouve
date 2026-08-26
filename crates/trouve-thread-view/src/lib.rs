@@ -847,6 +847,29 @@ mod tests {
     }
 
     #[test]
+    fn background_user_messages_stay_marked_in_the_projection() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::UserMessage {
+                turn: 3,
+                content: "[background agent activity]".into(),
+                attachments: Vec::new(),
+                background: true,
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::User {
+                turn: 3,
+                background: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn capacity_before_start_replays_as_running() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(

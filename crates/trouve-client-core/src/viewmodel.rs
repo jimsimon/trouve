@@ -1343,6 +1343,25 @@ mod tests {
     }
 
     #[test]
+    fn background_user_messages_stay_marked_in_the_view_model() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::UserMessage {
+            turn: 3,
+            content: "[background agent activity]".into(),
+            attachments: Vec::new(),
+            background: true,
+        }));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::User {
+                turn: 3,
+                background: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn turn_phase_updates_activity_without_adding_a_chat_item() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnStarted {

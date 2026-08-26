@@ -806,6 +806,12 @@ impl AgentBackend for ClaudeBackend {
                     // Likely the process died between turns; keep reading —
                     // the no-result exit path below reports it (with stderr)
                     // and drops it from the pool so the next turn respawns.
+                    // Delivery is still marked: a write error cannot
+                    // distinguish "the vendor never saw the prompt" from
+                    // "the vendor consumed the prompt and closed stdin
+                    // before our flush" (EPIPE after full consumption), and
+                    // withholding delivery in the second case strands the
+                    // legitimate response as background output.
                     tracing::debug!("claude stdin write failed: {e}");
                 }
                 proc_.router.prompt_delivered();
