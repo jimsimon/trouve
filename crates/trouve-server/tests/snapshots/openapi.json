@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.16"
+    "version": "7.18"
   },
   "paths": {
     "/v1/approvals": {
@@ -5538,6 +5538,30 @@
           }
         }
       },
+      "CodeReviewCollapseBacklog": {
+        "type": "object",
+        "description": "Auto-resolve worker backlog for finding threads.",
+        "required": [
+          "pending"
+        ],
+        "properties": {
+          "oldest_pending_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Age of the oldest pending entry, from when its finding was resolved.",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Findings marked for thread resolution that the worker has not\ncompleted yet.",
+            "minimum": 0
+          }
+        }
+      },
       "CodeReviewDashboard": {
         "type": "object",
         "required": [
@@ -6705,6 +6729,17 @@
           "status": {
             "$ref": "#/components/schemas/CodeReviewStatusCounts",
             "description": "Current active work plus terminal outcomes in the selected range."
+          },
+          "thread_collapse_backlog": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CodeReviewCollapseBacklog",
+                "description": "Fixed or dismissed findings whose GitHub threads still await the\nauto-resolve worker. A growing or aging backlog means resolved\nfindings look unresolved on GitHub and thread-driven flows lag."
+              }
+            ]
           }
         }
       },

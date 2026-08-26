@@ -3024,6 +3024,17 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
               <Metric label="External duplicates" value={churn.external_duplicate_count} color="green" />
               <Metric label="Weak evidence rejected" value={churn.insufficient_evidence_rejection_count} color="green" />
               <Metric label="Avg rounds to clean" value={Math.round(churn.average_rounds_to_clean * 10) / 10} color="blue" />
+              {(stats?.thread_collapse_backlog?.pending ?? 0) > 0 && (
+                <Metric
+                  label={`Thread resolve backlog${
+                    stats?.thread_collapse_backlog?.oldest_pending_minutes != null
+                      ? ` (oldest ${stats.thread_collapse_backlog.oldest_pending_minutes}m)`
+                      : ""
+                  }`}
+                  value={stats?.thread_collapse_backlog?.pending ?? 0}
+                  color="amber"
+                />
+              )}
               <Metric label="Max rounds to clean" value={churn.max_rounds_to_clean} color="amber" />
             </div>
           </section>

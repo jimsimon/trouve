@@ -1970,6 +1970,20 @@ export interface components {
             /** Format: int64 */
             recurrence_issue_count?: number;
         };
+        /** @description Auto-resolve worker backlog for finding threads. */
+        CodeReviewCollapseBacklog: {
+            /**
+             * Format: int64
+             * @description Age of the oldest pending entry, from when its finding was resolved.
+             */
+            oldest_pending_minutes?: number | null;
+            /**
+             * Format: int64
+             * @description Findings marked for thread resolution that the worker has not
+             *     completed yet.
+             */
+            pending: number;
+        };
         CodeReviewDashboard: {
             app: components["schemas"]["GithubAppStatus"];
             /**
@@ -2444,6 +2458,7 @@ export interface components {
             running_duration?: components["schemas"]["CodeReviewDurationStats"];
             /** @description Current active work plus terminal outcomes in the selected range. */
             status?: components["schemas"]["CodeReviewStatusCounts"];
+            thread_collapse_backlog?: null | components["schemas"]["CodeReviewCollapseBacklog"];
         };
         CodeReviewStatsBucket: {
             /** Format: date-time */

@@ -778,6 +778,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN publication_advisory_open_issue_count INTEGER",
     "ALTER TABLE code_review_jobs DROP COLUMN publication_churn_signal",
     "ALTER TABLE code_review_jobs ADD COLUMN review_covered_full_branch INTEGER",
+    "ALTER TABLE code_review_findings ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''",
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -11625,9 +11626,14 @@ impl Store {
         let reopened_closed_finding = matches!(status.as_str(), "fixed" | "dismissed")
             && previous_resolved == Some(true)
             && !is_resolved;
+        // Trust the maintainer: resolving an open finding's thread dismisses
+        // the finding outright. No model re-adjudicates the decision; the
+        // symmetric gesture (unresolving the thread) restores it.
+        let dismissed_by_resolution = status == "open" && is_resolved;
         let recheck_pending = previous_resolved == Some(true) && !is_resolved;
         let changed = state_changed
             || reopened_closed_finding
+            || dismissed_by_resolution
             || previous_thread_id.as_deref() != Some(thread_id);
         let generation = generation + i64::from(state_changed || reopened_closed_finding);
         if changed {
@@ -11651,10 +11657,17 @@ impl Store {
                      END,
                      status = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 'open'
+                       WHEN ?6 THEN 'dismissed'
                        ELSE status
+                     END,
+                     dismiss_reason = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       WHEN ?6 THEN 'maintainer resolved the review thread'
+                       ELSE dismiss_reason
                      END,
                      resolved_at = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
+                       WHEN ?6 THEN ?7
                        ELSE resolved_at
                      END,
                      resolved_head = CASE
@@ -11663,6 +11676,7 @@ impl Store {
                      END,
                      resolved_by_job_id = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       WHEN ?6 THEN ''
                        ELSE resolved_by_job_id
                      END
                  WHERE id = ?1",
@@ -11671,7 +11685,9 @@ impl Store {
                     thread_id,
                     is_resolved,
                     generation,
-                    recheck_pending
+                    recheck_pending,
+                    dismissed_by_resolution,
+                    chrono::Utc::now().to_rfc3339()
                 ],
             )?;
             if reopened_closed_finding {
@@ -11686,7 +11702,85 @@ impl Store {
             }
         }
         tx.commit()?;
-        Ok((state_changed || reopened_closed_finding, generation as u64))
+        Ok((
+            state_changed || reopened_closed_finding || dismissed_by_resolution,
+            generation as u64,
+        ))
+    }
+
+    /// Recompute the open/advisory issue-count snapshots on the newest
+    /// published round after thread reconciliation changed finding statuses
+    /// (a trusted dismissal or a reopen), and arm the blocking-review
+    /// cleanup when the blocking ledger reached zero. Returns the job id
+    /// whose GitHub projections should be re-synced, when the snapshot
+    /// actually changed.
+    pub fn refresh_code_review_pull_projection_counts(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let latest: Option<(String, Option<i64>, Option<i64>)> = tx
+            .query_row(
+                "SELECT id, publication_open_issue_count,
+                        publication_advisory_open_issue_count
+                 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1
+                 ORDER BY publication_order DESC, created_at DESC, id DESC
+                 LIMIT 1",
+                params![repository, pull_number as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((job_id, previous_open, previous_advisory)) = latest else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        record_code_review_open_issue_count(&tx, &job_id)?;
+        let (refreshed_open, refreshed_advisory): (Option<i64>, Option<i64>) = tx.query_row(
+            "SELECT publication_open_issue_count, publication_advisory_open_issue_count
+             FROM code_review_jobs WHERE id = ?1",
+            params![job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if refreshed_open == Some(0) && previous_open != Some(0) {
+            // The gate cleared without a round (trusted dismissals): the
+            // standing REQUEST_CHANGES review must not outlive the ledger.
+            // The durable cleanup task dismisses it with retries.
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_pending = 1,
+                     blocking_review_cleanup_page = 1,
+                     blocking_review_cleanup_attempts = 0,
+                     blocking_review_cleanup_next_attempt_at = NULL,
+                     blocking_review_cleanup_claim_token = NULL,
+                     blocking_review_cleanup_claim_until = NULL
+                 WHERE id = ?1",
+                params![job_id],
+            )?;
+        } else if refreshed_open.is_some_and(|open| open > 0) {
+            // The ledger has open blocking findings again (a reopen): any
+            // cleanup armed while it was clear must not proceed to dismiss
+            // the standing REQUEST_CHANGES review out from under them.
+            // Clearing the claim fields also invalidates an in-flight claim.
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET blocking_review_cleanup_pending = 0,
+                     blocking_review_cleanup_claim_token = NULL,
+                     blocking_review_cleanup_claim_until = NULL
+                 WHERE id = ?1 AND blocking_review_cleanup_pending != 0",
+                params![job_id],
+            )?;
+        }
+        tx.commit()?;
+        // Either tier changing requires a fresh GitHub projection: advisory
+        // counts surface in the check summary and lifecycle comment even
+        // though only the blocking tier gates.
+        Ok(
+            (refreshed_open != previous_open || refreshed_advisory != previous_advisory)
+                .then_some(job_id),
+        )
     }
 
     pub fn code_review_themes_for_pull(
@@ -12271,6 +12365,34 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?
         };
+        let thread_collapse_backlog = {
+            let conn = self.conn.lock().unwrap();
+            // Scoped to the requested repository like every other metric.
+            // The time range intentionally does not apply: the backlog is a
+            // point-in-time gauge of work still owed, not activity within
+            // the window.
+            let (pending, oldest): (i64, Option<String>) = conn.query_row(
+                "SELECT COUNT(*), MIN(COALESCE(finding.resolved_at, finding.created_at))
+                 FROM code_review_findings finding
+                 JOIN code_review_jobs job ON job.id = finding.job_id
+                 WHERE finding.collapse_pending = 1
+                   AND (?1 IS NULL OR job.repository = ?1)",
+                params![repository],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            trouve_protocol::CodeReviewCollapseBacklog {
+                pending: pending.max(0) as u64,
+                oldest_pending_minutes: oldest
+                    .and_then(|value| value.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                    .filter(|_| pending > 0)
+                    .map(|oldest| {
+                        chrono::Utc::now()
+                            .signed_duration_since(oldest)
+                            .num_minutes()
+                            .max(0) as u64
+                    }),
+            }
+        };
         let mut persona_stats: BTreeMap<(String, String), PersonaAccumulator> = BTreeMap::new();
         for (_, reviewer_id, model, execution) in executions {
             let persona = persona_stats.entry((reviewer_id, model)).or_default();
@@ -12465,6 +12587,7 @@ impl Store {
             publication_duration: code_review_duration_stats(overall_publication),
             issue_count: overall_issues,
             churn,
+            thread_collapse_backlog: Some(thread_collapse_backlog),
             buckets,
             personas,
             repositories,
@@ -13082,6 +13205,63 @@ impl Store {
                              OR (review_url = lifecycle_comment_url AND review_url != ?2))))",
             params![id, url],
         )? > 0)
+    }
+
+    /// Whether the newest published round for this pull request at exactly
+    /// this head covered the full branch: full scope, or the coverage flag
+    /// recorded when the diff base was resolved. Rounds that predate the
+    /// flag fall back to the review-base/base-ref comparison. Pinning to the
+    /// head keeps a full round from an older revision from settling the
+    /// current revision's coverage debt. None when no round has published
+    /// for this head.
+    pub fn latest_published_code_review_round_covered_full_branch(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        head_sha: &str,
+    ) -> Result<Option<bool>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT review_scope, review_covered_full_branch, review_base_sha, base_ref
+                 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND review_published = 1
+                 ORDER BY publication_order DESC, created_at DESC, id DESC
+                 LIMIT 1",
+                params![repository, pull_number as i64, head_sha],
+                |row| {
+                    let scope: String = row.get(0)?;
+                    let covered: Option<bool> = row.get(1)?;
+                    let review_base_sha: String = row.get(2)?;
+                    let base_ref: String = row.get(3)?;
+                    Ok(scope == "full" || covered.unwrap_or(review_base_sha == base_ref))
+                },
+            )
+            .optional()?)
+    }
+
+    /// Count of open blocking findings across all published rounds of a pull
+    /// request, using the same severity/confidence tier cutoff as the
+    /// publication snapshot.
+    pub fn code_review_open_blocking_finding_count(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<u64> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*)
+             FROM code_review_findings finding
+             JOIN code_review_jobs job ON job.id = finding.job_id
+             WHERE job.repository = ?1 AND job.pull_number = ?2
+               AND job.review_published != 0
+               AND finding.status = 'open'
+               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))",
+            params![repository, pull_number as i64],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
     }
 
     pub fn code_review_pull_state(
@@ -18649,6 +18829,285 @@ mod tests {
     }
 
     #[test]
+    fn resolving_an_open_findings_thread_dismisses_it_and_unresolving_restores_it() {
+        let store = Store::open_in_memory().unwrap();
+        let finding_at = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 3,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "medium".into(),
+            title: "Finding".into(),
+            body: "finding".into(),
+            prompt_for_agents: "fix".into(),
+            sources: Vec::new(),
+        };
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                2,
+                &[finding_at("src/a.rs"), finding_at("src/b.rs")],
+                &[],
+            )
+            .unwrap();
+        let (dismissed, kept_open) = (findings[0].clone(), findings[1].clone());
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .update_code_review_finding_publication(
+                &dismissed.id,
+                Some(9001),
+                "https://example/comment/9001",
+                None,
+            )
+            .unwrap();
+        store
+            .update_code_review_finding_publication(
+                &kept_open.id,
+                Some(9002),
+                "https://example/comment/9002",
+                None,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+        let open_before = store
+            .code_review_open_blocking_finding_count("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(open_before, 2);
+
+        // A maintainer resolving the thread dismisses the finding outright:
+        // no round, no adjudication, the judgment is trusted as-is.
+        let (changed, _) = store
+            .record_code_review_thread_state(&dismissed.id, "T1", true)
+            .unwrap();
+        assert!(changed);
+        let states = store
+            .reconcilable_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        let state = states
+            .iter()
+            .find(|state| state.finding.id == dismissed.id)
+            .unwrap();
+        assert_eq!(state.finding.status, "dismissed");
+        assert!(state.finding.resolved_by_job_id.is_empty());
+        let other = states
+            .iter()
+            .find(|state| state.finding.id == kept_open.id)
+            .unwrap();
+        assert_eq!(other.finding.status, "open");
+
+        // The counts snapshot on the newest published round follows the
+        // dismissal so the check can re-project without a new round; the
+        // remaining open finding keeps the cleanup unarmed.
+        let refreshed = store
+            .refresh_code_review_pull_projection_counts("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(refreshed.as_deref(), Some(job.id.as_str()));
+        assert_eq!(
+            store
+                .code_review_open_blocking_finding_count("acme/widgets", 42)
+                .unwrap(),
+            1
+        );
+
+        // Unresolving the thread restores the finding: trust is symmetric.
+        let (changed, _) = store
+            .record_code_review_thread_state(&dismissed.id, "T1", false)
+            .unwrap();
+        assert!(changed);
+        let states = store
+            .reconcilable_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        let state = states
+            .iter()
+            .find(|state| state.finding.id == dismissed.id)
+            .unwrap();
+        assert_eq!(state.finding.status, "open");
+        assert!(state.recheck_pending);
+
+        // Resolving both threads clears the blocking ledger and arms the
+        // blocking-review cleanup on the newest published round.
+        store
+            .record_code_review_thread_state(&dismissed.id, "T1", true)
+            .unwrap();
+        store
+            .record_code_review_thread_state(&kept_open.id, "T2", true)
+            .unwrap();
+        let refreshed = store
+            .refresh_code_review_pull_projection_counts("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(refreshed.as_deref(), Some(job.id.as_str()));
+        assert_eq!(
+            store
+                .code_review_open_blocking_finding_count("acme/widgets", 42)
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .claim_code_review_blocking_review_cleanup(&job.id)
+                .unwrap()
+                .is_some()
+        );
+
+        // A reopen while cleanup is armed (even claimed) disarms it: the
+        // standing REQUEST_CHANGES review must not be dismissed out from
+        // under a restored blocking finding.
+        store
+            .record_code_review_thread_state(&dismissed.id, "T1", false)
+            .unwrap();
+        let refreshed = store
+            .refresh_code_review_pull_projection_counts("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(refreshed.as_deref(), Some(job.id.as_str()));
+        assert!(
+            store
+                .claim_code_review_blocking_review_cleanup(&job.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn advisory_only_ledger_changes_still_reproject() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "scripts/qualify.mjs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "low".into(),
+                    confidence: "high".into(),
+                    title: "Advisory".into(),
+                    body: "advisory".into(),
+                    prompt_for_agents: "".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .update_code_review_finding_publication(
+                &finding.id,
+                Some(9001),
+                "https://example/comment/9001",
+                None,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+        // Dismissing the advisory finding leaves the blocking count at zero
+        // both before and after, but the projection must still refresh so
+        // the advisory note in the check summary and lifecycle comment
+        // follows the ledger.
+        store
+            .record_code_review_thread_state(&finding.id, "T1", true)
+            .unwrap();
+        let refreshed = store
+            .refresh_code_review_pull_projection_counts("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(refreshed.as_deref(), Some(job.id.as_str()));
+    }
+
+    #[test]
+    fn coverage_debt_is_pinned_to_the_reconciled_head() {
+        let store = Store::open_in_memory().unwrap();
+        let mut request = backoff_test_job_request();
+        request.scope = trouve_protocol::CodeReviewJobScope::Full;
+        let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        store
+            .save_code_review_result(&job.id, "clean", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+        // The full round settles coverage only for the head it reviewed; a
+        // newer head has no published round and therefore no verdict.
+        assert_eq!(
+            store
+                .latest_published_code_review_round_covered_full_branch(
+                    "acme/widgets",
+                    42,
+                    &job.head_sha,
+                )
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .latest_published_code_review_round_covered_full_branch(
+                    "acme/widgets",
+                    42,
+                    "9999999999999999999999999999999999999999",
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn fixed_findings_are_monitored_without_reopening_resolved_threads() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
@@ -22503,6 +22962,78 @@ mod tests {
         assert_eq!(stats.churn.pull_request_count, 0);
         assert_eq!(stats.churn.recurrence_issue_count, 0);
         assert_eq!(stats.churn.external_duplicate_count, 0);
+        assert_eq!(
+            stats.thread_collapse_backlog.as_ref().map(|b| b.pending),
+            Some(0),
+            "an idle worker reports an empty backlog"
+        );
+    }
+
+    #[test]
+    fn review_stats_report_the_thread_collapse_backlog() {
+        let store = Store::open_in_memory().unwrap();
+        let mut request = backoff_test_job_request();
+        request.dedupe_key = "acme/widgets#42:collapse-backlog".into();
+        let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One finding.",
+                "",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Backlogged".into(),
+                    body: "Awaiting thread resolution.".into(),
+                    prompt_for_agents: String::new(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_findings
+                 SET collapse_pending = 1, github_comment_id = 7,
+                     resolved_at = '2026-08-25T00:00:00Z'
+                 WHERE id = ?1",
+                params![findings[0].id],
+            )
+            .unwrap();
+        let stats = store
+            .code_review_stats(trouve_protocol::CodeReviewStatsRange::All, None)
+            .unwrap();
+        let backlog = stats.thread_collapse_backlog.unwrap();
+        assert_eq!(backlog.pending, 1);
+        assert!(
+            backlog
+                .oldest_pending_minutes
+                .is_some_and(|minutes| minutes > 0),
+            "age is measured from the finding's resolution time"
+        );
+        // The backlog respects the repository scope like every other metric.
+        let scoped = store
+            .code_review_stats(
+                trouve_protocol::CodeReviewStatsRange::All,
+                Some("acme/widgets"),
+            )
+            .unwrap();
+        assert_eq!(scoped.thread_collapse_backlog.unwrap().pending, 1);
+        let other = store
+            .code_review_stats(
+                trouve_protocol::CodeReviewStatsRange::All,
+                Some("acme/other"),
+            )
+            .unwrap();
+        assert_eq!(other.thread_collapse_backlog.unwrap().pending, 0);
     }
 
     #[test]
