@@ -286,6 +286,8 @@ CREATE TABLE IF NOT EXISTS code_review_repositories (
   coordinator_thinking_level TEXT,
   router_model TEXT,
   router_thinking_level TEXT,
+  analyst_model TEXT,
+  analyst_thinking_level TEXT,
   prompt TEXT NOT NULL DEFAULT '',
   identity_ids TEXT NOT NULL DEFAULT '["correctness","security","concurrency","api-compatibility","testing"]',
   routing_mode TEXT NOT NULL DEFAULT 'additive',
@@ -312,6 +314,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   repository TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
   pull_title TEXT NOT NULL,
+  pull_body TEXT NOT NULL DEFAULT '',
   pull_url TEXT NOT NULL,
   head_sha TEXT NOT NULL,
   base_ref TEXT NOT NULL,
@@ -322,6 +325,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   coordinator_thinking_level TEXT,
   router_model TEXT,
   router_thinking_level TEXT,
+  analyst_model TEXT,
+  analyst_thinking_level TEXT,
   prompt TEXT NOT NULL DEFAULT '',
   identities TEXT NOT NULL DEFAULT '[]',
   config_hash TEXT NOT NULL DEFAULT '',
@@ -353,6 +358,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   issue_count INTEGER NOT NULL DEFAULT 0,
   fixed_issue_count INTEGER NOT NULL DEFAULT 0,
   publication_open_issue_count INTEGER,
+  publication_advisory_open_issue_count INTEGER,
+  review_covered_full_branch INTEGER,
   summary TEXT NOT NULL DEFAULT '',
   prompt_for_agents TEXT NOT NULL DEFAULT '',
   publication_claimed INTEGER NOT NULL DEFAULT 0,
@@ -759,7 +766,65 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE session_pr_verification_intents ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
        ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
+    // The churn-signal column shipped on interim builds of this branch. Its
+    // slot must survive (migrations are positional and append-only); the
+    // column itself is retired by the trailing migration below.
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_churn_signal TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN pull_body TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_repositories ADD COLUMN analyst_model TEXT",
+    "ALTER TABLE code_review_repositories ADD COLUMN analyst_thinking_level TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN analyst_model TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN analyst_thinking_level TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_advisory_open_issue_count INTEGER",
+    "ALTER TABLE code_review_jobs DROP COLUMN publication_churn_signal",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_covered_full_branch INTEGER",
 ];
+
+/// Legacy snapshots counted every open finding; recompute both tiers on the
+/// newest published round of each pull so deployed databases adopt the
+/// blocking/advisory split at upgrade time. This runs after
+/// `repair_legacy_code_review_publications` (so the counts never derive from
+/// stale `review_published` flags) and after
+/// `normalize_code_review_publication_orders` (so the newest-round selection
+/// never falls back to `created_at` while legacy rows still hold order 0).
+/// The `publication_advisory_open_issue_count IS NULL` guard makes it a
+/// one-time backfill per row instead of a full-table recount on every
+/// startup.
+fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE code_review_jobs SET
+           publication_open_issue_count = (
+             SELECT COUNT(*) FROM code_review_findings finding
+             JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+             WHERE finding_job.repository = code_review_jobs.repository
+               AND finding_job.pull_number = code_review_jobs.pull_number
+               AND finding_job.review_published != 0
+               AND finding.status = 'open'
+               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+           ),
+           publication_advisory_open_issue_count = (
+             SELECT COUNT(*) FROM code_review_findings finding
+             JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+             WHERE finding_job.repository = code_review_jobs.repository
+               AND finding_job.pull_number = code_review_jobs.pull_number
+               AND finding_job.review_published != 0
+               AND finding.status = 'open'
+               AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+           )
+         WHERE publication_open_issue_count IS NOT NULL
+           AND publication_advisory_open_issue_count IS NULL
+           AND id = (
+             SELECT latest.id FROM code_review_jobs latest
+             WHERE latest.repository = code_review_jobs.repository
+               AND latest.pull_number = code_review_jobs.pull_number
+               AND latest.review_published != 0
+             ORDER BY latest.publication_order DESC, latest.created_at DESC, latest.id DESC
+             LIMIT 1
+           )",
+        [],
+    )?;
+    Ok(())
+}
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
     let had_theme_observation_publication_authority = conn.query_row(
@@ -787,6 +852,11 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     )?;
     backfill_code_review_published_at(conn)?;
     normalize_code_review_publication_orders(conn)?;
+    // After publication repair AND order normalization: the backfill selects
+    // each pull's newest published round by publication_order, and its
+    // one-time guard makes whatever row it picks permanent, so it must never
+    // run while legacy rows still hold order 0.
+    backfill_code_review_two_tier_issue_counts(conn)?;
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS code_review_theme_transition_repair_targets (
            theme_id TEXT PRIMARY KEY
@@ -3018,6 +3088,8 @@ fn finalize_code_review_theme_publication(
     Ok(())
 }
 
+/// Blocking findings gate the check; advisory findings (low severity, or
+/// medium with low confidence) are tracked separately as durable debt.
 fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &str) -> Result<()> {
     tx.execute(
         "UPDATE code_review_jobs
@@ -3029,6 +3101,17 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status = 'open'
+             AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+         ),
+         publication_advisory_open_issue_count = (
+           SELECT COUNT(*)
+           FROM code_review_findings finding
+           JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+           WHERE finding_job.repository = code_review_jobs.repository
+             AND finding_job.pull_number = code_review_jobs.pull_number
+             AND finding_job.review_published != 0
+             AND finding.status = 'open'
+             AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
          )
          WHERE id = ?1",
         params![job_id],
@@ -3125,6 +3208,8 @@ fn row_to_code_review_repository(
         router_model: r.get(12)?,
         router_thinking_level: r.get(13)?,
         coordinator_thinking_level: r.get(14)?,
+        analyst_model: r.get(15)?,
+        analyst_thinking_level: r.get(16)?,
     })
 }
 
@@ -3135,6 +3220,10 @@ pub struct NewCodeReviewJob {
     pub repository: String,
     pub pull_number: u64,
     pub pull_title: String,
+    /// Author-written pull-request description, already bounded by the
+    /// enqueue path. Untrusted claimed intent for review prompts only; it is
+    /// never exposed through the protocol.
+    pub pull_body: String,
     pub pull_url: String,
     pub head_sha: String,
     pub review_base_sha: String,
@@ -3147,6 +3236,8 @@ pub struct NewCodeReviewJob {
     pub coordinator_thinking_level: Option<String>,
     pub router_model: Option<String>,
     pub router_thinking_level: Option<String>,
+    pub analyst_model: Option<String>,
+    pub analyst_thinking_level: Option<String>,
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub routing_mode: trouve_protocol::CodeReviewRoutingMode,
@@ -3167,6 +3258,10 @@ pub struct CodeReviewJobRecord {
     pub job: trouve_protocol::CodeReviewJob,
     pub can_retry_final_editor: bool,
     pub prompt: String,
+    /// Author-written pull-request description snapshotted at enqueue.
+    /// Untrusted claimed intent for review prompts; never serialized to the
+    /// protocol.
+    pub pull_body: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub summary: String,
     pub prompt_for_agents: String,
@@ -3263,6 +3358,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             } else {
                 review_watermark_sha
             },
+            covered_full_branch: r.get(62)?,
             base_ref,
             head_ref: r.get(8)?,
             scope: code_review_scope_from(&r.get::<_, String>(23)?),
@@ -3274,6 +3370,8 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_thinking_level: r.get(49)?,
             router_model: r.get(47)?,
             router_thinking_level: r.get(48)?,
+            analyst_model: r.get(58)?,
+            analyst_thinking_level: r.get(59)?,
             reviewer_ids: reviewers
                 .iter()
                 .map(|reviewer| reviewer.id.clone())
@@ -3303,6 +3401,9 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             open_issue_count: r
                 .get::<_, Option<i64>>(56)?
                 .map(|value| value.max(0) as u64),
+            advisory_open_issue_count: r
+                .get::<_, Option<i64>>(60)?
+                .map(|value| value.max(0) as u64),
             error: r.get(18)?,
             created_at,
             started_at,
@@ -3314,8 +3415,9 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
-        can_retry_final_editor: r.get(57)?,
+        can_retry_final_editor: r.get(61)?,
         prompt: r.get(12)?,
+        pull_body: r.get(57)?,
         reviewers,
         summary: r.get(36)?,
         prompt_for_agents: r.get(37)?,
@@ -3337,7 +3439,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
      coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
      review_published, blocking_review_cleanup_pending, publication_dispatched, \
-     publication_open_issue_count, \
+     publication_open_issue_count, pull_body, \
+     analyst_model, analyst_thinking_level, publication_advisory_open_issue_count, \
      CASE WHEN code_review_jobs.status IN ('failed', 'cancelled') \
             AND code_review_jobs.session_id IS NULL \
             AND EXISTS ( \
@@ -3367,7 +3470,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
                     AND newer_reviewer.rowid > reviewer.rowid \
                 ) \
             ) \
-          THEN 1 ELSE 0 END AS can_retry_final_editor";
+          THEN 1 ELSE 0 END AS can_retry_final_editor, \
+     review_covered_full_branch";
 
 /// Shared ownership predicate for accepting review results and claiming their
 /// publication. Keeping both transitions on one predicate prevents stale
@@ -3435,6 +3539,7 @@ pub enum CodeReviewJobPhase {
 fn code_review_task_role_str(role: trouve_protocol::CodeReviewTaskRole) -> &'static str {
     match role {
         trouve_protocol::CodeReviewTaskRole::Router => "router",
+        trouve_protocol::CodeReviewTaskRole::Analyst => "analyst",
         trouve_protocol::CodeReviewTaskRole::Reviewer => "reviewer",
         trouve_protocol::CodeReviewTaskRole::Coordinator => "coordinator",
     }
@@ -3443,6 +3548,7 @@ fn code_review_task_role_str(role: trouve_protocol::CodeReviewTaskRole) -> &'sta
 fn code_review_task_role_from(value: &str) -> trouve_protocol::CodeReviewTaskRole {
     match value {
         "router" => trouve_protocol::CodeReviewTaskRole::Router,
+        "analyst" => trouve_protocol::CodeReviewTaskRole::Analyst,
         "coordinator" => trouve_protocol::CodeReviewTaskRole::Coordinator,
         _ => trouve_protocol::CodeReviewTaskRole::Reviewer,
     }
@@ -8138,7 +8244,8 @@ impl Store {
             "SELECT repository, installation_id, private, mode, model, prompt,
                     identity_ids, routing_mode, semantic_routing,
                     included_reviewer_ids, excluded_reviewer_ids, reviewer_overrides,
-                    router_model, router_thinking_level, coordinator_thinking_level
+                    router_model, router_thinking_level, coordinator_thinking_level,
+                    analyst_model, analyst_thinking_level
              FROM code_review_repositories ORDER BY repository",
         )?;
         let rows = stmt.query_map([], row_to_code_review_repository)?;
@@ -8179,11 +8286,12 @@ impl Store {
                      identity_ids, routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids,
                      reviewer_overrides, router_model, router_thinking_level,
-                     coordinator_thinking_level, updated_at)
+                     coordinator_thinking_level, analyst_model,
+                     analyst_thinking_level, updated_at)
              VALUES (?1, ?2, 0, ?3, ?4, ?5,
                      COALESCE(?6, ?16), COALESCE(?7, 'additive'),
                      COALESCE(?8, 1), COALESCE(?9, '[]'),
-                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14, ?15)
+                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14, ?17, ?18, ?15)
              ON CONFLICT(repository) DO UPDATE SET
                installation_id = excluded.installation_id,
                mode = excluded.mode,
@@ -8201,6 +8309,8 @@ impl Store {
                router_model = excluded.router_model,
                router_thinking_level = excluded.router_thinking_level,
                coordinator_thinking_level = excluded.coordinator_thinking_level,
+               analyst_model = excluded.analyst_model,
+               analyst_thinking_level = excluded.analyst_thinking_level,
                updated_at = excluded.updated_at",
             params![
                 request.repository,
@@ -8219,6 +8329,8 @@ impl Store {
                 request.coordinator_thinking_level,
                 chrono::Utc::now().to_rfc3339(),
                 default_reviewer_ids,
+                request.analyst_model,
+                request.analyst_thinking_level,
             ],
         )?;
         Ok(())
@@ -8500,13 +8612,14 @@ impl Store {
                      routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
                      router_thinking_level, coordinator_thinking_level,
-                     review_watermark_sha)
+                     review_watermark_sha, pull_body, analyst_model,
+                     analyst_thinking_level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                      (SELECT COALESCE(MAX(publication_generation), 0) + 1
                       FROM code_review_jobs
                       WHERE repository = ?4 AND pull_number = ?5 AND head_sha = ?8),
-                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17, ?28, ?29, ?30)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -8535,6 +8648,9 @@ impl Store {
                 new_job.router_model,
                 new_job.router_thinking_level,
                 new_job.coordinator_thinking_level,
+                new_job.pull_body,
+                new_job.analyst_model,
+                new_job.analyst_thinking_level,
             ],
         )?;
         if inserted == 0 {
@@ -9135,11 +9251,17 @@ impl Store {
         Ok(updated > 0)
     }
 
-    pub fn set_code_review_job_review_base(&self, id: &str, review_base_sha: &str) -> Result<bool> {
+    pub fn set_code_review_job_review_base(
+        &self,
+        id: &str,
+        review_base_sha: &str,
+        covered_full_branch: bool,
+    ) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET review_base_sha = ?2
+            "UPDATE code_review_jobs
+             SET review_base_sha = ?2, review_covered_full_branch = ?3
              WHERE id = ?1 AND status = 'running'",
-            params![id, review_base_sha],
+            params![id, review_base_sha, covered_full_branch],
         )? > 0)
     }
 
@@ -12536,7 +12658,8 @@ impl Store {
                      publication_generation,
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
-                     coordinator_thinking_level, review_watermark_sha)
+                     coordinator_thinking_level, review_watermark_sha, pull_body,
+                     analyst_model, analyst_thinking_level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'retry',
                     'queued', ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
                     (SELECT COALESCE(MAX(generation.publication_generation), 0) + 1
@@ -12544,7 +12667,7 @@ impl Store {
                      WHERE generation.repository = ?4
                        AND generation.pull_number = ?5
                        AND generation.head_sha = ?8),
-                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?16)",
+                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?16, ?27, ?28, ?29)",
             params![
                 new_id,
                 new_job.dedupe_key,
@@ -12572,6 +12695,9 @@ impl Store {
                 new_job.router_model,
                 new_job.router_thinking_level,
                 new_job.coordinator_thinking_level,
+                new_job.pull_body,
+                new_job.analyst_model,
+                new_job.analyst_thinking_level,
             ],
         )?;
         let linked = tx.execute(
@@ -14074,6 +14200,7 @@ mod tests {
             repository: job.repository,
             pull_number: job.pull_number,
             pull_title: job.pull_title,
+            pull_body: record.pull_body,
             pull_url: job.pull_url,
             head_sha: job.head_sha,
             review_base_sha: job.review_base_sha,
@@ -14086,6 +14213,8 @@ mod tests {
             coordinator_thinking_level: job.coordinator_thinking_level,
             router_model: job.router_model,
             router_thinking_level: job.router_thinking_level,
+            analyst_model: job.analyst_model,
+            analyst_thinking_level: job.analyst_thinking_level,
             prompt: record.prompt,
             reviewers: record.reviewers,
             routing_mode: job.routing_mode,
@@ -17859,6 +17988,8 @@ mod tests {
             coordinator_thinking_level: None,
             router_model: None,
             router_thinking_level: None,
+            analyst_model: None,
+            analyst_thinking_level: None,
             prompt: "keep this".into(),
             reviewer_ids: Some(vec!["custom".into()]),
             routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
@@ -17883,6 +18014,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "preserve empty selection".into(),
                 reviewer_ids: Some(Vec::new()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -17901,6 +18034,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec!["reliability".into()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -17984,6 +18119,8 @@ mod tests {
                 coordinator_thinking_level: Some("high".into()),
                 router_model: Some("anthropic/router".into()),
                 router_thinking_level: Some("low".into()),
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "focus on concurrency".into(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -18047,6 +18184,7 @@ mod tests {
             repository: "acme/widgets".into(),
             pull_number: 42,
             pull_title: "Ship widgets".into(),
+            pull_body: String::new(),
             pull_url: "https://github.com/acme/widgets/pull/42".into(),
             head_sha: "1111111111111111111111111111111111111111".into(),
             review_base_sha: "0000000000000000000000000000000000000000".into(),
@@ -18059,6 +18197,8 @@ mod tests {
             coordinator_thinking_level: configured.coordinator_thinking_level,
             router_model: configured.router_model,
             router_thinking_level: configured.router_thinking_level,
+            analyst_model: None,
+            analyst_thinking_level: None,
             prompt: configured.prompt,
             reviewers,
             routing_mode: configured.routing_mode,
@@ -18081,12 +18221,13 @@ mod tests {
         let effective_base = "3333333333333333333333333333333333333333";
         assert!(
             store
-                .set_code_review_job_review_base(&queued.id, effective_base)
+                .set_code_review_job_review_base(&queued.id, effective_base, true)
                 .unwrap()
         );
         let rebased = store.code_review_job(&queued.id).unwrap().unwrap().job;
         assert_eq!(rebased.review_base_sha, effective_base);
         assert_eq!(rebased.review_watermark_sha, queued.review_base_sha);
+        assert_eq!(rebased.covered_full_branch, Some(true));
         assert!(
             !store
                 .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
@@ -21163,6 +21304,7 @@ mod tests {
             repository: "acme/widgets".into(),
             pull_number: 42,
             pull_title: "Ship widgets".into(),
+            pull_body: String::new(),
             pull_url: "https://github.com/acme/widgets/pull/42".into(),
             head_sha: "2222222222222222222222222222222222222222".into(),
             review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -21175,6 +21317,8 @@ mod tests {
             coordinator_thinking_level: None,
             router_model: None,
             router_thinking_level: None,
+            analyst_model: None,
+            analyst_thinking_level: None,
             prompt: "Review it".into(),
             reviewers: crate::reviewers::built_in_reviewers()
                 .into_iter()
@@ -21673,6 +21817,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: "1111111111111111111111111111111111111111".into(),
                     review_base_sha: "0000000000000000000000000000000000000000".into(),
@@ -21685,6 +21830,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -21758,6 +21905,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec![reviewer.id.clone()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -21782,6 +21931,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -21842,6 +21993,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: "2222222222222222222222222222222222222222".into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -21854,6 +22006,8 @@ mod tests {
                 coordinator_thinking_level: Some("medium".into()),
                 router_model: Some("provider/router".into()),
                 router_thinking_level: Some("low".into()),
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers,
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -22362,6 +22516,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: head_sha.into(),
                     review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -22374,6 +22529,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: "Review it".into(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -22680,6 +22837,209 @@ mod tests {
         assert_eq!(limited[0].task_id, "second-task");
     }
 
+    fn publish_leveled_test_round(
+        store: &Store,
+        dedupe_key: &str,
+        head_sha: &str,
+        scope: trouve_protocol::CodeReviewJobScope,
+        findings: &[(&str, &str, &str)],
+        resolved_finding_ids: &[&str],
+    ) -> (
+        trouve_protocol::CodeReviewJob,
+        Vec<trouve_protocol::CodeReviewFinding>,
+    ) {
+        let job = store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: dedupe_key.into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: head_sha.into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: Some("provider/default".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
+                prompt: "Review it".into(),
+                reviewers: Vec::new(),
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = findings
+            .iter()
+            .map(|(path, severity, confidence)| NewCodeReviewFinding {
+                path: (*path).into(),
+                line: 12,
+                side: "RIGHT".into(),
+                severity: (*severity).into(),
+                confidence: (*confidence).into(),
+                title: "Relocated defect".into(),
+                body: "The lifecycle invariant is violated.".into(),
+                prompt_for_agents: "Restore the invariant.".into(),
+                sources: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let stored = store
+            .save_code_review_result(
+                &job.id,
+                "Round result.",
+                "",
+                findings.len() as u64,
+                &findings,
+                &[],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example.test/review",
+                false,
+                resolved_finding_ids,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "https://example.test/review", "")
+            .unwrap();
+        (job, stored)
+    }
+
+    #[test]
+    fn two_tier_backfill_recomputes_legacy_snapshots_once() {
+        let store = Store::open_in_memory().unwrap();
+        let (round, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:tier-backfill",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[
+                ("crates/core/src/engine.rs", "high", "high"),
+                ("scripts/qualify.mjs", "low", "high"),
+            ],
+            &[],
+        );
+        // Simulate a pre-split snapshot: an all-open total with no advisory
+        // column value, as deployed databases have at upgrade time.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs
+                 SET publication_open_issue_count = 2,
+                     publication_advisory_open_issue_count = NULL
+                 WHERE id = ?1",
+                params![round.id],
+            )
+            .unwrap();
+            backfill_code_review_two_tier_issue_counts(&conn).unwrap();
+        }
+        let migrated = store.code_review_job(&round.id).unwrap().unwrap().job;
+        assert_eq!(migrated.open_issue_count, Some(1));
+        assert_eq!(migrated.advisory_open_issue_count, Some(1));
+
+        // Migrated rows are skipped on later startups: deliberate drift
+        // survives a second pass, proving the backfill is one-time per row
+        // rather than a full recount on every boot.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_jobs SET publication_open_issue_count = 7 WHERE id = ?1",
+                params![round.id],
+            )
+            .unwrap();
+            backfill_code_review_two_tier_issue_counts(&conn).unwrap();
+        }
+        assert_eq!(
+            store
+                .code_review_job(&round.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .open_issue_count,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn advisory_findings_accrue_as_debt_without_gating() {
+        let store = Store::open_in_memory().unwrap();
+        let incremental = trouve_protocol::CodeReviewJobScope::Incremental;
+
+        // A mixed round: one blocking finding, two advisory (low severity,
+        // and medium with weak evidence).
+        let (round1, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:tier-round-1",
+            "2222222222222222222222222222222222222222",
+            incremental,
+            &[
+                ("crates/core/src/engine.rs", "high", "high"),
+                ("scripts/qualify.mjs", "low", "high"),
+                ("scripts/qualify.mjs", "medium", "low"),
+            ],
+            &[],
+        );
+        let job = store.code_review_job(&round1.id).unwrap().unwrap().job;
+        assert_eq!(
+            job.open_issue_count,
+            Some(1),
+            "only the blocking finding gates"
+        );
+        assert_eq!(
+            job.advisory_open_issue_count,
+            Some(2),
+            "advisory debt is tracked"
+        );
+
+        // Advisory-only rounds accumulate debt without ever touching the
+        // blocking gate.
+        let mut last = None;
+        for (index, head) in ["3333", "4444", "5555"].iter().enumerate() {
+            let (round, _) = publish_leveled_test_round(
+                &store,
+                &format!("acme/widgets#42:tier-advisory-{index}"),
+                &head.repeat(10),
+                incremental,
+                &[("scripts/qualify.mjs", "low", "high")],
+                &[],
+            );
+            last = Some(round.id);
+        }
+        let job = store.code_review_job(&last.unwrap()).unwrap().unwrap().job;
+        assert_eq!(
+            job.open_issue_count,
+            Some(1),
+            "the blocking gate is unmoved"
+        );
+        assert_eq!(
+            job.advisory_open_issue_count,
+            Some(5),
+            "debt keeps accruing"
+        );
+    }
+
     #[test]
     fn scoped_review_retries_preserve_successful_reviewer_batches() {
         let store = Store::open_in_memory().unwrap();
@@ -22691,6 +23051,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: "2222222222222222222222222222222222222222".into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -22703,6 +23064,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -23251,6 +23614,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: "2222222222222222222222222222222222222222".into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -23263,6 +23627,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -23577,6 +23943,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 pull_number: 42,
                 pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
                 pull_url: "https://github.com/acme/widgets/pull/42".into(),
                 head_sha: "2222222222222222222222222222222222222222".into(),
                 review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -23589,6 +23956,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -23703,6 +24072,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: format!("https://github.com/acme/widgets/pull/{pull_number}"),
                     head_sha: "2222222222222222222222222222222222222222".into(),
                     review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -23715,6 +24085,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -23861,6 +24233,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: "head-2".into(),
                     review_base_sha: "base-2".into(),
@@ -23873,6 +24246,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -23999,6 +24374,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: head_sha.into(),
                     review_base_sha: base_ref.into(),
@@ -24011,6 +24387,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -24169,6 +24547,7 @@ mod tests {
                     repository: "acme/widgets".into(),
                     pull_number: 42,
                     pull_title: "Ship widgets".into(),
+                    pull_body: String::new(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: "head".into(),
                     review_base_sha: "base".into(),
@@ -24181,6 +24560,8 @@ mod tests {
                     coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
+                    analyst_model: None,
+                    analyst_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,

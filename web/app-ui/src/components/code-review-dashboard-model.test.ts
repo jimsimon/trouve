@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   codeReviewSettingsDraft,
   codeReviewSettingsRequest,
+  codeReviewAwaitingFullCoverage,
   codeReviewNeedsAttention,
   codeReviewStatusClass,
   groupCodeReviewJobs,
@@ -29,6 +30,39 @@ describe("code-review dashboard model", () => {
     expect(codeReviewNeedsAttention({ status: "succeeded", open_issue_count: null })).toBe(true);
     expect(codeReviewNeedsAttention({ status: "succeeded" })).toBe(true);
     expect(codeReviewNeedsAttention({ status: "running", open_issue_count: 2 })).toBe(false);
+  });
+
+  it("holds attention on clean partial rounds until full coverage confirms", () => {
+    const partialClean = {
+      status: "succeeded",
+      open_issue_count: 0,
+      scope: "incremental",
+      review_base_sha: "aaaa",
+      base_ref: "bbbb",
+    };
+    expect(codeReviewAwaitingFullCoverage(partialClean)).toBe(true);
+    expect(codeReviewNeedsAttention(partialClean)).toBe(true);
+    // A first review is incremental from the PR base: full coverage.
+    expect(
+      codeReviewAwaitingFullCoverage({ ...partialClean, review_base_sha: "bbbb" }),
+    ).toBe(false);
+    expect(codeReviewNeedsAttention({ ...partialClean, review_base_sha: "bbbb" })).toBe(false);
+    expect(codeReviewAwaitingFullCoverage({ ...partialClean, scope: "full" })).toBe(false);
+    expect(codeReviewAwaitingFullCoverage({ ...partialClean, open_issue_count: 2 })).toBe(false);
+    // The server-recorded coverage flag is authoritative over the sha
+    // comparison: merge-base-refined first reviews stay full coverage even
+    // when the base branch advanced (review base != base tip), and a slice
+    // stays partial even when the shas line up.
+    expect(
+      codeReviewAwaitingFullCoverage({ ...partialClean, covered_full_branch: true }),
+    ).toBe(false);
+    expect(
+      codeReviewAwaitingFullCoverage({
+        ...partialClean,
+        review_base_sha: "bbbb",
+        covered_full_branch: false,
+      }),
+    ).toBe(true);
   });
 
   it("groups by repository with active and newest jobs first", () => {

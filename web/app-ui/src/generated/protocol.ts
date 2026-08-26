@@ -2067,6 +2067,21 @@ export interface components {
         };
         /** @description A durable execution of one model review against one immutable PR head. */
         CodeReviewJob: {
+            /**
+             * Format: int64
+             * @description Advisory findings (low severity, or medium severity with low
+             *     confidence) still open across the pull request: durable engineering
+             *     debt recorded in trouve, never posted to GitHub and never
+             *     merge-blocking.
+             */
+            advisory_open_issue_count?: number | null;
+            /**
+             * @description Model snapshotted for the per-round implementation analyst. Absent
+             *     inherits `model`.
+             */
+            analyst_model?: string | null;
+            /** @description Thinking level snapshotted for the implementation analyst. */
+            analyst_thinking_level?: string | null;
             base_ref: string;
             cancel_requested?: boolean;
             /** Format: int64 */
@@ -2081,6 +2096,15 @@ export interface components {
             coordinator_elapsed_ms?: number;
             /** @description Thinking level snapshotted for the final coordinator/editor. */
             coordinator_thinking_level?: string | null;
+            /**
+             * @description Whether this round's diff spanned the entire branch, recorded at the
+             *     moment the diff base was resolved. `review_base_sha` can be refined to
+             *     the pull-request merge base during execution, so comparing it against
+             *     `base_ref` misclassifies full first reviews whenever the base branch
+             *     advanced past the branch point; this flag is authoritative. None on
+             *     rounds that predate it (clients fall back to the sha comparison).
+             */
+            covered_full_branch?: boolean | null;
             /** Format: date-time */
             created_at: string;
             error?: string;
@@ -2099,10 +2123,12 @@ export interface components {
             model?: string | null;
             /**
              * Format: int64
-             * @description Total confirmed findings that remained open across the pull request
-             *     after this review was published. Absent while publication is pending
-             *     and for legacy jobs that predate this snapshot. Consumers must treat
-             *     absence on a succeeded job as unknown, never as a clean review.
+             * @description Blocking confirmed findings (high severity, or medium severity with
+             *     at least medium confidence) that remained open across the pull
+             *     request after this review was published. Only these gate the check
+             *     run. Absent while publication is pending and for legacy jobs that
+             *     predate this snapshot. Consumers must treat absence on a succeeded
+             *     job as unknown, never as a clean review.
              */
             open_issue_count?: number | null;
             /** Format: int64 */
@@ -2283,6 +2309,16 @@ export interface components {
          *     review policy for it.
          */
         CodeReviewRepository: {
+            /**
+             * @description Provider-qualified model used by the per-round implementation
+             *     analyst. Absent inherits `model`.
+             */
+            analyst_model?: string | null;
+            /**
+             * @description Preferred thinking level or fixed token budget for the implementation
+             *     analyst. Absent inherits the review mode's default.
+             */
+            analyst_thinking_level?: string | null;
             /**
              * @description Preferred thinking level or fixed token budget for the final
              *     coordinator/editor. Absent inherits the review mode's default.
@@ -2537,7 +2573,7 @@ export interface components {
             tool_call_count: number;
         };
         /** @enum {string} */
-        CodeReviewTaskRole: "router" | "reviewer" | "coordinator";
+        CodeReviewTaskRole: "router" | "analyst" | "reviewer" | "coordinator";
         /** @description A root cause tracked across all review rounds for one pull request. */
         CodeReviewTheme: {
             affected_paths?: string[];
@@ -4750,6 +4786,8 @@ export interface components {
          */
         TurnPhase: "processing" | "connecting_tools";
         UpdateCodeReviewRepositoryRequest: {
+            analyst_model?: string | null;
+            analyst_thinking_level?: string | null;
             coordinator_thinking_level?: string | null;
             /** @description Omitted by older clients to preserve existing forced exclusions. */
             excluded_reviewer_ids?: string[] | null;

@@ -211,7 +211,7 @@ function taskAttemptLabel(tasks: ReviewTask[], task: ReviewTask): string {
       candidate.role === task.role && candidate.batch_index === task.batch_index,
   );
   const base =
-    task.role === "coordinator"
+    task.role === "coordinator" || task.role === "analyst"
       ? "Attempt"
       : task.role === "router"
         ? `Routing ${task.batch_index + 1}`
@@ -645,12 +645,33 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+type ReviewCoverageFields =
+  | "status"
+  | "open_issue_count"
+  | "scope"
+  | "review_base_sha"
+  | "base_ref"
+  | "covered_full_branch";
+
+function reviewAwaitingFullCoverage(job: Pick<ReviewJob, ReviewCoverageFields>): boolean {
+  return (
+    job.status === "succeeded" &&
+    job.open_issue_count === 0 &&
+    job.scope !== "full" &&
+    // The server records whether the round's diff spanned the whole branch;
+    // legacy rounds without the flag fall back to the sha comparison.
+    !(job.covered_full_branch ?? (job.review_base_sha ?? "") === job.base_ref)
+  );
+}
+
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, "status" | "open_issue_count">,
-): "open" | "unknown" | null {
+  job: Pick<ReviewJob, ReviewCoverageFields>,
+): "open" | "awaiting-full" | "unknown" | null {
   if (job.status !== "succeeded") return null;
+  if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
+  if (reviewAwaitingFullCoverage(job)) return "awaiting-full";
   if (job.open_issue_count == null) return "unknown";
-  return job.open_issue_count > 0 ? "open" : null;
+  return null;
 }
 
 function JobRow({ job, now }: { job: ReviewJob; now: number }) {
@@ -661,6 +682,8 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
       {attentionState === "open" ? (
         <span class="status warning">needs attention</span>
+      ) : attentionState === "awaiting-full" ? (
+        <span class="status warning">full review pending</span>
       ) : attentionState === "unknown" ? (
         <span class="status warning">status unknown</span>
       ) : (
@@ -677,7 +700,7 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
         <b>
           {openIssueCount == null
             ? `Open status unknown · ${job.issue_count} new`
-            : `${openIssueCount} open · ${job.issue_count} new`}
+            : `${openIssueCount} blocking · ${job.issue_count} new`}
         </b>
         <small>{job.status === "queued" ? duration(job.pending_elapsed_ms) : duration(elapsed)}</small>
       </span>
@@ -1319,6 +1342,19 @@ function JobDetailPane({
       tasks: routerTasks,
     });
   }
+  const analystTasks = detail.tasks.filter((task) => task.role === "analyst");
+  if (analystTasks.length) {
+    const analystTask = analystTasks[analystTasks.length - 1];
+    activityGroups.push({
+      id: "analyst",
+      name: "Change analyst",
+      status: analystTask.status,
+      subtitle: `Full-branch analysis · ${duration(
+        liveElapsed(analystTask.elapsed_ms, analystTask.status, analystTask.started_at, now),
+      )}`,
+      tasks: analystTasks,
+    });
+  }
   activityGroups.push(
     ...detail.personas.map((persona) => ({
       id: `persona:${persona.reviewer_id}`,
@@ -1430,6 +1466,8 @@ function JobDetailPane({
         <div>
           {attentionState === "open" ? (
             <span class="status warning">needs attention</span>
+          ) : attentionState === "awaiting-full" ? (
+            <span class="status warning">full review pending</span>
           ) : attentionState === "unknown" ? (
             <span class="status warning">status unknown</span>
           ) : (
@@ -1471,6 +1509,14 @@ function JobDetailPane({
         <div>
           <dt>Router thinking</dt>
           <dd>{job.router_thinking_level || "Review persona default"}</dd>
+        </div>
+        <div>
+          <dt>Change analyst model</dt>
+          <dd>{job.analyst_model || job.model || "Missing configuration"}</dd>
+        </div>
+        <div>
+          <dt>Change analyst thinking</dt>
+          <dd>{job.analyst_thinking_level || "Review persona default"}</dd>
         </div>
         <div>
           <dt>Pending</dt>
@@ -1550,7 +1596,7 @@ function JobDetailPane({
       {hasOpenIssues && (
         <div class="banner warning stacked" role="alert">
           <strong>
-            {openIssueCount} confirmed issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
+            {openIssueCount} blocking issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
           </strong>
           <p>
             This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean incremental result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
@@ -1562,6 +1608,17 @@ function JobDetailPane({
           <strong>PR-wide open issue status is unknown</strong>
           <p>
             This legacy review predates PR-wide finding snapshots. It cannot establish that older findings are resolved, even when this round found no new issues.
+          </p>
+        </div>
+      )}
+      {reviewAwaitingFullCoverage(job) && (
+        <div class="banner warning stacked">
+          <strong>Full-branch confirmation pending</strong>
+          <p>
+            No blocking issues remain open, but this round reviewed only the changes since the
+            last review. The check reports success once a clean review covers the whole branch
+            as it now stands — resolve all review threads or request a full branch review to
+            run that round.
           </p>
         </div>
       )}
@@ -1623,7 +1680,9 @@ function JobDetailPane({
             <h2>{job.status === "running" || job.status === "queued" ? "Review overview" : "Completed overview"}</h2>
             <p>
               {job.issue_count} new confirmed findings
-              {openIssueCount != null && ` · ${openIssueCount} open across pull request`}
+              {openIssueCount != null && ` · ${openIssueCount} blocking open across pull request`}
+              {(job.advisory_open_issue_count ?? 0) > 0 &&
+                ` · ${job.advisory_open_issue_count} advisory`}
               {` · ${acceptedCandidateIds.size} selected candidates`}
               {" · "}
               {candidateRejections.length} rejected · {unadjudicatedCandidates.length} unresolved · {job.fixed_issue_count} fixed
@@ -2244,6 +2303,10 @@ function RepositoryEditor({
     (model) => model.id === (draft.router_model || draft.model),
   );
   const routerThinking = thinkingOptions(effectiveRouterModel);
+  const effectiveAnalystModel = models.find(
+    (model) => model.id === (draft.analyst_model || draft.model),
+  );
+  const analystThinking = thinkingOptions(effectiveAnalystModel);
   const compatibleThinking = (
     configured: string | undefined,
     model: Model | undefined,
@@ -2337,6 +2400,9 @@ function RepositoryEditor({
                 const selectedRouterModel = models.find(
                   (candidate) => candidate.id === (draft.router_model || model),
                 );
+                const selectedAnalystModel = models.find(
+                  (candidate) => candidate.id === (draft.analyst_model || model),
+                );
                 setDraft({
                   ...draft,
                   model,
@@ -2347,6 +2413,10 @@ function RepositoryEditor({
                   router_thinking_level: compatibleThinking(
                     draft.router_thinking_level,
                     selectedRouterModel,
+                  ),
+                  analyst_thinking_level: compatibleThinking(
+                    draft.analyst_thinking_level,
+                    selectedAnalystModel,
                   ),
                   reviewer_overrides: (draft.reviewer_overrides ?? []).map((override) => {
                     const profile = reviewers.find(
@@ -2452,6 +2522,60 @@ function RepositoryEditor({
               Controls reasoning for semantic triage. Inherit review default follows the Review
               mode setting.
               {!semanticRouterConfigEnabled && ` ${semanticRouterRequirement}`}
+            </small>
+          </label>
+          <label>
+            Change analyst model
+            <select
+              value={draft.analyst_model ?? ""}
+              onChange={(event) => {
+                const analystModel = event.currentTarget.value || undefined;
+                const selectedAnalystModel = models.find(
+                  (candidate) => candidate.id === (analystModel || draft.model),
+                );
+                setDraft({
+                  ...draft,
+                  analyst_model: analystModel,
+                  analyst_thinking_level: compatibleThinking(
+                    draft.analyst_thinking_level,
+                    selectedAnalystModel,
+                  ),
+                });
+              }}
+            >
+              <option value="">Inherit coordinator/fallback model</option>
+              {models.map((model) => (
+                <option value={model.id} key={model.id}>
+                  {model.display_name} · {model.id}
+                </option>
+              ))}
+            </select>
+            <small>
+              Once per review round, reads the full pull-request branch diff and derives what the
+              PR actually builds. The final review editor uses the result as whole-PR context and
+              as the observed counterpoint to the author's stated intent. It never sees the PR
+              title or description, and its output is advisory only — never evidence for or
+              against a finding.
+            </small>
+          </label>
+          <label>
+            {analystThinking.budget
+              ? "Change analyst thinking budget (tokens)"
+              : "Change analyst thinking"}
+            <ThinkingSetting
+              options={analystThinking}
+              value={draft.analyst_thinking_level ?? ""}
+              inheritLabel="Inherit review default"
+              onChange={(value) =>
+                setDraft({
+                  ...draft,
+                  analyst_thinking_level: value || undefined,
+                })
+              }
+            />
+            <small>
+              Controls reasoning for the PR analysis pass. Inherit review default follows the
+              Review mode setting.
             </small>
           </label>
         </div>

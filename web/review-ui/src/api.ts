@@ -136,6 +136,8 @@ export const saveRepository = (repository: Repository): Promise<Repository> =>
       coordinator_thinking_level: repository.coordinator_thinking_level || null,
       router_model: repository.router_model || null,
       router_thinking_level: repository.router_thinking_level || null,
+      analyst_model: repository.analyst_model || null,
+      analyst_thinking_level: repository.analyst_thinking_level || null,
       prompt: repository.prompt,
       reviewer_ids: repository.reviewer_ids,
       routing_mode: repository.routing_mode,

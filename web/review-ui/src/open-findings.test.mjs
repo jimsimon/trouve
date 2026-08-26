@@ -30,7 +30,7 @@ test("unknown PR-wide status is visually distinct from review failure", () => {
 test("attention replaces succeeded and job rows reserve its full width", () => {
   assert.match(
     source,
-    /attentionState === "open" \? \(\s*<span class="status warning">needs attention<\/span>\s*\) : attentionState === "unknown"/u,
+    /attentionState === "open" \? \(\s*<span class="status warning">needs attention<\/span>\s*\) : attentionState === "awaiting-full"/u,
   );
   assert.doesNotMatch(
     source,

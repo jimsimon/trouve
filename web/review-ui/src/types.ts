@@ -58,6 +58,8 @@ export interface Repository {
   coordinator_thinking_level?: string;
   router_model?: string;
   router_thinking_level?: string;
+  analyst_model?: string;
+  analyst_thinking_level?: string;
   prompt: string;
   reviewer_ids: string[];
   routing_mode: RoutingMode;
@@ -83,6 +85,7 @@ export interface ReviewJob {
   head_sha: string;
   review_base_sha?: string;
   review_watermark_sha?: string;
+  covered_full_branch?: boolean | null;
   base_ref: string;
   head_ref: string;
   scope: ReviewScope;
@@ -94,6 +97,8 @@ export interface ReviewJob {
   coordinator_thinking_level?: string;
   router_model?: string;
   router_thinking_level?: string;
+  analyst_model?: string;
+  analyst_thinking_level?: string;
   reviewer_ids: string[];
   routing_mode: RoutingMode;
   semantic_routing: boolean;
@@ -112,6 +117,7 @@ export interface ReviewJob {
   issue_count: number;
   fixed_issue_count: number;
   open_issue_count?: number | null;
+  advisory_open_issue_count?: number | null;
   error: string;
   created_at: string;
   started_at?: string;
@@ -127,7 +133,7 @@ export interface ReviewJob {
 export interface ReviewTask {
   id: string;
   job_id: string;
-  role: "router" | "reviewer" | "coordinator";
+  role: "router" | "analyst" | "reviewer" | "coordinator";
   reviewer_id?: string;
   reviewer_name: string;
   batch_index: number;

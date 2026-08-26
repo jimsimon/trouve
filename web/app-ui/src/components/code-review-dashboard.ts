@@ -13,6 +13,7 @@ import {
   CODE_REVIEW_STATUS_FILTERS,
   codeReviewSettingsDraft,
   codeReviewSettingsRequest,
+  codeReviewAwaitingFullCoverage,
   codeReviewNeedsAttention,
   codeReviewStatusClass,
   codeReviewStatusLabel,
@@ -651,8 +652,18 @@ export class TrouveCodeReviewDashboard extends LitElement {
     const pending = this.#pendingAction?.jobId === job.id ? this.#pendingAction : undefined;
     const busy = this.#busyJobId === job.id;
     const needsAttention = codeReviewNeedsAttention(job);
-    const outcomeLabel = needsAttention ? "Needs attention" : codeReviewStatusLabel(job.status);
-    const outcomeClass = needsAttention ? "failed" : codeReviewStatusClass(job.status);
+    const awaitingFullCoverage = codeReviewAwaitingFullCoverage(job);
+    const outcomeLabel = !needsAttention
+      ? codeReviewStatusLabel(job.status)
+      : awaitingFullCoverage
+        ? "Full review pending"
+        : "Needs attention";
+    // Pending confirmation is a waiting state, not a failure state.
+    const outcomeClass = !needsAttention
+      ? codeReviewStatusClass(job.status)
+      : awaitingFullCoverage
+        ? "queued"
+        : "failed";
 
     return html`
       <article class="job-card" aria-label=${`${job.repository} pull request ${job.pull_number}, ${outcomeLabel}`}>
@@ -665,7 +676,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
         </header>
 
         <dl class="job-meta">
-          <div><dt>Findings</dt><dd>${job.issue_count ?? 0} new${job.open_issue_count == null ? " · open status unknown" : ` · ${job.open_issue_count} open`}</dd></div>
+          <div><dt>Findings</dt><dd>${job.issue_count ?? 0} new${job.open_issue_count == null ? " · open status unknown" : ` · ${job.open_issue_count} blocking`}${(job.advisory_open_issue_count ?? 0) > 0 ? ` · ${job.advisory_open_issue_count} advisory` : ""}</dd></div>
           <div><dt>${job.status === "queued" ? "Waiting" : "Elapsed"}</dt><dd>${formatDuration(job.status === "queued" ? job.pending_elapsed_ms : job.running_elapsed_ms)}</dd></div>
           <div><dt>Started</dt><dd title=${formatDate(job.started_at ?? job.created_at)}>${formatDate(job.started_at ?? job.created_at)}</dd></div>
         </dl>

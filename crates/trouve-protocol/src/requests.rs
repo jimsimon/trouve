@@ -1775,6 +1775,14 @@ pub struct CodeReviewRepository {
     /// triage. Absent inherits the review mode's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Provider-qualified model used by the per-round implementation
+    /// analyst. Absent inherits `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    /// Preferred thinking level or fixed token budget for the implementation
+    /// analyst. Absent inherits the review mode's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
     /// Extra repository-specific review instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
@@ -1814,6 +1822,10 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub router_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
     #[serde(default)]
     pub prompt: String,
     /// Omitted by older clients to preserve the current/default selection.
@@ -1859,6 +1871,9 @@ pub struct CodeReviewProgress {
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewTaskRole {
     Router,
+    /// Per-round implementation analysis over the full-branch diff, derived
+    /// fresh each round and consumed only by the coordinator.
+    Analyst,
     Reviewer,
     Coordinator,
 }
@@ -2261,6 +2276,14 @@ pub struct CodeReviewJob {
     /// effective `review_base_sha` fall back to the pull request merge base.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub review_watermark_sha: String,
+    /// Whether this round's diff spanned the entire branch, recorded at the
+    /// moment the diff base was resolved. `review_base_sha` can be refined to
+    /// the pull-request merge base during execution, so comparing it against
+    /// `base_ref` misclassifies full first reviews whenever the base branch
+    /// advanced past the branch point; this flag is authoritative. None on
+    /// rounds that predate it (clients fall back to the sha comparison).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_full_branch: Option<bool>,
     pub base_ref: String,
     pub head_ref: String,
     #[serde(default)]
@@ -2285,6 +2308,13 @@ pub struct CodeReviewJob {
     /// Thinking level snapshotted for semantic persona triage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Model snapshotted for the per-round implementation analyst. Absent
+    /// inherits `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    /// Thinking level snapshotted for the implementation analyst.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
     /// Reviewer profiles are snapshotted internally; their stable ids are
     /// exposed here for history and diagnostics. Additive/Automatic jobs
     /// snapshot the candidate catalog; routing decisions record which
@@ -2325,12 +2355,20 @@ pub struct CodeReviewJob {
     pub issue_count: u64,
     #[serde(default)]
     pub fixed_issue_count: u64,
-    /// Total confirmed findings that remained open across the pull request
-    /// after this review was published. Absent while publication is pending
-    /// and for legacy jobs that predate this snapshot. Consumers must treat
-    /// absence on a succeeded job as unknown, never as a clean review.
+    /// Blocking confirmed findings (high severity, or medium severity with
+    /// at least medium confidence) that remained open across the pull
+    /// request after this review was published. Only these gate the check
+    /// run. Absent while publication is pending and for legacy jobs that
+    /// predate this snapshot. Consumers must treat absence on a succeeded
+    /// job as unknown, never as a clean review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_issue_count: Option<u64>,
+    /// Advisory findings (low severity, or medium severity with low
+    /// confidence) still open across the pull request: durable engineering
+    /// debt recorded in trouve, never posted to GitHub and never
+    /// merge-blocking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_open_issue_count: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     pub created_at: chrono::DateTime<chrono::Utc>,

@@ -423,6 +423,15 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
                 Router thinking
                 <input autocomplete="off" spellcheck="false" placeholder="Inherit, level, or token budget" .value=${draft.routerThinkingLevel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { routerThinkingLevel: (event.currentTarget as HTMLInputElement).value })} />
               </label>
+              <label>
+                Change analyst model
+                <input list="code-review-models" autocomplete="off" spellcheck="false" placeholder="Inherit review model" .value=${draft.analystModel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { analystModel: (event.currentTarget as HTMLInputElement).value })} />
+                <small>Derives what the PR builds from the full branch diff each round; the final editor uses it as whole-PR context.</small>
+              </label>
+              <label>
+                Change analyst thinking
+                <input autocomplete="off" spellcheck="false" placeholder="Inherit, level, or token budget" .value=${draft.analystThinkingLevel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { analystThinkingLevel: (event.currentTarget as HTMLInputElement).value })} />
+              </label>
             </div>
             <label class="check-row">
               <input type="checkbox" .checked=${draft.semanticRouting} ?disabled=${this.#busy !== "" || draft.routingMode === "manual"} @change=${(event: Event) => this.#patchRepositoryDraft(key, { semanticRouting: (event.currentTarget as HTMLInputElement).checked })} />
