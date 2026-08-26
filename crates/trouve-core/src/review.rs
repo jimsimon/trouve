@@ -7661,6 +7661,22 @@ impl Engine {
                 {
                     return Ok((Some(page), made_progress));
                 }
+                // Revalidate the ledger immediately before each dismissal:
+                // a finding restored while this cleanup was in flight makes
+                // the standing REQUEST_CHANGES review correct again, so the
+                // cleanup is obsolete and completes without dismissing. This
+                // also covers the unclaimed publication-time path, which has
+                // no claim token to invalidate. The residual window is one
+                // request round-trip, during which the reopen's count
+                // re-projection keeps the check run red and the next
+                // published round re-establishes the review verdict.
+                if self
+                    .store
+                    .code_review_open_blocking_finding_count(&job.repository, job.pull_number)?
+                    > 0
+                {
+                    return Ok((None, made_progress));
+                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Ok((Some(page), made_progress));
