@@ -729,6 +729,19 @@ impl AgentBackend for ClaudeBackend {
                     %thread_id,
                     "claude: terminating the pooled process for a deleted thread failed: {error}"
                 );
+                // Free the slot regardless: terminate_and_remove already
+                // quarantined the process before failing, and the thread can
+                // never use it again. Dropping the pool's reference releases
+                // the pending-background pin, and the child is spawned with
+                // kill_on_drop, so it is reaped when the last reference
+                // goes.
+                let mut procs = self.pool.procs.lock().await;
+                if procs
+                    .get(thread_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &proc_))
+                {
+                    procs.remove(thread_id);
+                }
             }
         }
     }
