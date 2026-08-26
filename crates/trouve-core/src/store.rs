@@ -11708,6 +11708,136 @@ impl Store {
         ))
     }
 
+    /// The newest published round for a pull request, used to re-project its
+    /// GitHub surfaces after ledger changes that happen without a round.
+    pub fn latest_published_code_review_job_id(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1
+                 ORDER BY publication_order DESC, created_at DESC, id DESC
+                 LIMIT 1",
+                params![repository, pull_number as i64],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The pull request whose lifecycle comment has this GitHub comment id,
+    /// if any. Used to attribute checkbox edits on the sticky comment.
+    pub fn code_review_pull_for_lifecycle_comment(
+        &self,
+        repository: &str,
+        comment_id: u64,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT pull_number FROM code_review_pr_state
+                 WHERE repository = ?1 AND lifecycle_comment_id = ?2",
+                params![repository, comment_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|value| value as u64))
+    }
+
+    /// Findings from published rounds that never received an inline review
+    /// thread (their strongest anchor was outside the diff, or inline
+    /// publication was not possible). These are the findings a maintainer
+    /// cannot address by resolving a thread; the lifecycle comment renders
+    /// them as dismissal checkboxes instead. Open findings first, then the
+    /// most recently dismissed.
+    pub(crate) fn threadless_code_review_findings(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.path, f.line, f.severity, f.confidence, f.title, f.body,
+                    f.status
+             FROM code_review_findings f
+             JOIN code_review_jobs j ON j.id = f.job_id
+             WHERE j.repository = ?1 AND j.pull_number = ?2
+               AND j.review_published = 1
+               AND f.github_comment_id IS NULL
+               AND f.status IN ('open', 'dismissed')
+             ORDER BY CASE f.status WHEN 'open' THEN 0 ELSE 1 END,
+                      f.resolved_at DESC, f.path, f.line, f.id
+             LIMIT 100",
+        )?;
+        let findings = stmt
+            .query_map(params![repository, pull_number as i64], |row| {
+                Ok(trouve_protocol::CodeReviewFinding {
+                    id: row.get(0)?,
+                    job_id: String::new(),
+                    path: row.get(1)?,
+                    line: row.get::<_, i64>(2)? as u64,
+                    side: "RIGHT".into(),
+                    severity: row.get(3)?,
+                    confidence: row.get(4)?,
+                    title: row.get(5)?,
+                    body: row.get(6)?,
+                    prompt_for_agents: String::new(),
+                    status: row.get(7)?,
+                    sources: Vec::new(),
+                    github_comment_id: None,
+                    github_comment_url: String::new(),
+                    github_publication_status: code_review_publication_status(""),
+                    github_thread_id: None,
+                    resolved_at: None,
+                    evidence: Default::default(),
+                    origin: code_review_finding_origin(""),
+                    theme_ids: Vec::new(),
+                    observed_head: String::new(),
+                    resolved_head: String::new(),
+                    resolved_by_job_id: String::new(),
+                    outside_diff: true,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(findings)
+    }
+
+    /// Applies a maintainer's checkbox dismissal to a threadless open
+    /// finding. Guarded so inline-threaded findings can only be dismissed
+    /// through their thread.
+    pub fn dismiss_threadless_code_review_finding(&self, finding_id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET status = 'dismissed',
+                 dismiss_reason = 'maintainer checked the dismissal box',
+                 resolved_at = ?2,
+                 resolved_head = '',
+                 resolved_by_job_id = '',
+                 collapse_pending = 0
+             WHERE id = ?1 AND status = 'open' AND github_comment_id IS NULL",
+            params![finding_id, chrono::Utc::now().to_rfc3339()],
+        )? > 0)
+    }
+
+    /// Restores a threadless dismissed finding after a maintainer unchecked
+    /// its box: trust is symmetric in both directions.
+    pub fn restore_threadless_code_review_finding(&self, finding_id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET status = 'open', dismiss_reason = '', resolved_at = NULL,
+                 resolved_head = '', resolved_by_job_id = ''
+             WHERE id = ?1 AND status = 'dismissed' AND github_comment_id IS NULL",
+            params![finding_id],
+        )? > 0)
+    }
+
     /// Recompute the open/advisory issue-count snapshots on the newest
     /// published round after thread reconciliation changed finding statuses
     /// (a trusted dismissal or a reopen), and arm the blocking-review
@@ -18825,6 +18955,128 @@ mod tests {
         assert!(
             after_requeue > chrono::Duration::minutes(59),
             "{after_requeue}"
+        );
+    }
+
+    #[test]
+    fn threadless_findings_dismiss_and_restore_only_without_an_inline_thread() {
+        let store = Store::open_in_memory().unwrap();
+        let finding_at = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 3,
+            side: "RIGHT".into(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            title: "Finding".into(),
+            body: "finding".into(),
+            prompt_for_agents: "fix".into(),
+            sources: Vec::new(),
+        };
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                2,
+                &[finding_at("src/a.rs"), finding_at("src/b.rs")],
+                &[],
+            )
+            .unwrap();
+        let (threadless, threaded) = (findings[0].clone(), findings[1].clone());
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        // Only one finding gets an inline comment; the other stays
+        // review-body only.
+        store
+            .update_code_review_finding_publication(
+                &threaded.id,
+                Some(9002),
+                "https://example/comment/9002",
+                None,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+
+        let listed = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, threadless.id);
+        assert_eq!(listed[0].status, "open");
+
+        // The lifecycle comment id attributes checkbox edits to this pull.
+        store
+            .set_code_review_lifecycle_comment("acme/widgets", 42, 777, "https://example/c/777")
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_pull_for_lifecycle_comment("acme/widgets", 777)
+                .unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            store
+                .code_review_pull_for_lifecycle_comment("acme/widgets", 778)
+                .unwrap(),
+            None
+        );
+
+        // Threaded findings cannot travel the checkbox path in either
+        // direction; threadless ones round-trip.
+        assert!(
+            !store
+                .dismiss_threadless_code_review_finding(&threaded.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .dismiss_threadless_code_review_finding(&threadless.id)
+                .unwrap()
+        );
+        let listed = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(listed[0].status, "dismissed");
+        assert_eq!(
+            store
+                .code_review_open_blocking_finding_count("acme/widgets", 42)
+                .unwrap(),
+            1,
+            "the threaded finding still gates"
+        );
+        assert!(
+            store
+                .restore_threadless_code_review_finding(&threadless.id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .restore_threadless_code_review_finding(&threadless.id)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .code_review_open_blocking_finding_count("acme/widgets", 42)
+                .unwrap(),
+            2
         );
     }
 
