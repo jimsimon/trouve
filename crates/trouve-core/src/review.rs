@@ -10696,17 +10696,19 @@ fn render_lifecycle_comment(
         })
         .count();
     if !confirmed_findings.is_empty() || carried_threaded_count > 0 {
+        // Counts are per finding, not per comment: findings grouped under a
+        // shared root-cause comment would otherwise inflate a comment count.
         body.push_str(&format!(
-            "**Inline comments posted this round:** {posted_count}"
+            "**Findings covered by inline comments this round:** {posted_count}"
         ));
         if pending_count > 0 {
             body.push_str(&format!(
-                "  \n**Inline publication pending:** {pending_count} comment(s)"
+                "  \n**Inline publication pending:** {pending_count} finding(s)"
             ));
         }
         if carried_threaded_count > 0 {
             body.push_str(&format!(
-                "  \n**Still open from earlier rounds:** {carried_threaded_count} inline comment(s)"
+                "  \n**Still open from earlier rounds:** {carried_threaded_count} threaded finding(s)"
             ));
         }
         body.push_str("\n\n");
@@ -11201,18 +11203,24 @@ fn lifecycle_prompt_for_agents(
     }
     let mut evidence = format!("Review summary: {}\n", prompt_single_line(summary, 2_048));
     let mut index = 0_usize;
+    // The public fence truncates this prompt at LIFECYCLE_PROMPT_MAX_BYTES,
+    // so entries that cannot appear are not formatted at all. Fresh findings
+    // must not starve carried blockers: when both exist, the fresh section
+    // keeps only half the budget and carried entries fill the rest. Every
+    // omission is disclosed deterministically.
+    // Reserve room for the fixed preamble and closing instructions around
+    // {evidence}, so the fence never truncates them away.
+    let prompt_budget = LIFECYCLE_PROMPT_MAX_BYTES.saturating_sub(1_024);
+    let fresh_budget = if carried_findings.is_empty() {
+        prompt_budget
+    } else {
+        prompt_budget / 2
+    };
     if !latest_findings.is_empty() {
         evidence.push_str("\nNew issues from this round:\n\n");
-        for finding in latest_findings {
-            // The public fence truncates this prompt at
-            // LIFECYCLE_PROMPT_MAX_BYTES; once the budget is exceeded,
-            // formatting further entries only produces discarded bytes.
-            if evidence.len() > LIFECYCLE_PROMPT_MAX_BYTES {
-                break;
-            }
-            index += 1;
-            evidence.push_str(&prompt_finding_entry(
-                index,
+        for (position, finding) in latest_findings.iter().enumerate() {
+            let entry = prompt_finding_entry(
+                index + 1,
                 &finding.path,
                 finding.line,
                 &finding.side,
@@ -11221,20 +11229,25 @@ fn lifecycle_prompt_for_agents(
                 &finding.title,
                 &finding.body,
                 &finding.evidence,
-            ));
+            );
+            if evidence.len() + entry.len() > fresh_budget {
+                evidence.push_str(&format!(
+                    "… {} more new finding(s) omitted; the trouve dashboard holds the complete prompt.\n",
+                    latest_findings.len() - position
+                ));
+                break;
+            }
+            index += 1;
+            evidence.push_str(&entry);
         }
     }
     if !carried_findings.is_empty() {
         evidence.push_str(
             "\nCarried forward from earlier review rounds (reported before, still open):\n\n",
         );
-        for finding in carried_findings {
-            if evidence.len() > LIFECYCLE_PROMPT_MAX_BYTES {
-                break;
-            }
-            index += 1;
-            evidence.push_str(&prompt_finding_entry(
-                index,
+        for (position, finding) in carried_findings.iter().enumerate() {
+            let entry = prompt_finding_entry(
+                index + 1,
                 &finding.path,
                 finding.line,
                 &finding.side,
@@ -11243,7 +11256,16 @@ fn lifecycle_prompt_for_agents(
                 &finding.title,
                 &finding.body,
                 &finding.evidence,
-            ));
+            );
+            if evidence.len() + entry.len() > prompt_budget {
+                evidence.push_str(&format!(
+                    "… {} more carried finding(s) omitted; the trouve dashboard holds the complete prompt.\n",
+                    carried_findings.len() - position
+                ));
+                break;
+            }
+            index += 1;
+            evidence.push_str(&entry);
         }
     }
     format!(
@@ -16602,8 +16624,8 @@ mod tests {
         // Inline findings are counted, not repeated: their threads carry the
         // full text. This finding's publication is still pending, so it is
         // disclosed as pending rather than claimed as posted.
-        assert!(body.contains("**Inline comments posted this round:** 0"));
-        assert!(body.contains("**Inline publication pending:** 1 comment(s)"));
+        assert!(body.contains("**Findings covered by inline comments this round:** 0"));
+        assert!(body.contains("**Inline publication pending:** 1 finding(s)"));
         assert!(!body.contains("### New issues in this round"));
         assert!(!body.contains(
             "- **Severity: HIGH · Confidence: HIGH** — `src/lib.rs` line 42: **Error bypasses handling**"
@@ -16653,9 +16675,9 @@ mod tests {
         // Generations are distinguished on both surfaces: the comment counts
         // this round's inline comments and the still-open threaded carries,
         // and the prompt separates the fresh diff pass from carried findings.
-        assert!(body.contains("**Inline comments posted this round:** 0"));
-        assert!(body.contains("**Inline publication pending:** 1 comment(s)"));
-        assert!(body.contains("**Still open from earlier rounds:** 1 inline comment(s)"));
+        assert!(body.contains("**Findings covered by inline comments this round:** 0"));
+        assert!(body.contains("**Inline publication pending:** 1 finding(s)"));
+        assert!(body.contains("**Still open from earlier rounds:** 1 threaded finding(s)"));
         // Threaded findings are not repeated in the comment; their threads
         // and the prompt carry the text.
         let prompt_start = body.find("<summary>Prompt for agents</summary>").unwrap();
@@ -17110,7 +17132,7 @@ mod tests {
         // Posted inline findings are counted, not repeated; only findings
         // whose inline comment failed to post keep their full text in the
         // comment (plus the agent prompt, which spans the ledger).
-        assert!(body.contains("**Inline comments posted this round:** 1"));
+        assert!(body.contains("**Findings covered by inline comments this round:** 1"));
         let failed_section = body
             .find("### Inline comments that failed to post")
             .unwrap();
@@ -17181,15 +17203,18 @@ mod tests {
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
         assert!(body.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
         assert!(body.ends_with(&lifecycle_comment_marker(&queued.id)));
-        assert!(body.contains("**Inline comments posted this round:** 0"));
+        assert!(body.contains("**Findings covered by inline comments this round:** 0"));
         assert!(body.contains(&format!(
-            "**Inline publication pending:** {} comment(s)",
+            "**Inline publication pending:** {} finding(s)",
             MAX_CANDIDATE_FINDINGS - 1
         )));
         assert!(body.contains("### Inline comments that failed to post"));
         assert!(body.contains("Failed publication remains visible"));
         assert!(body.contains("Review summary truncated"));
-        assert!(body.contains("Prompt truncated"));
+        // Prompt assembly stops at its budget with a deterministic omission
+        // notice instead of letting the fence slice entries mid-way.
+        assert!(body.contains("more new finding(s) omitted"));
+        assert!(!body.contains("Prompt truncated"));
     }
 
     #[test]
@@ -23361,23 +23386,40 @@ mod tests {
             .unwrap();
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         let template = detail.findings[0].clone();
-        let ledger: Vec<_> = (0..256)
+        let fresh: Vec<_> = (0..256)
             .map(|i| {
                 let mut finding = template.clone();
-                finding.id = format!("fnd-{i}");
+                finding.id = format!("fresh-{i}");
+                finding.title = "Fresh ledger entry".into();
                 finding
             })
             .collect();
-        let refs: Vec<_> = ledger.iter().collect();
-        let prompt = lifecycle_prompt_for_agents(&detail.job, "summary", &refs, &refs);
+        let carried: Vec<_> = (0..256)
+            .map(|i| {
+                let mut finding = template.clone();
+                finding.id = format!("carried-{i}");
+                finding.title = "Carried ledger entry".into();
+                finding
+            })
+            .collect();
+        let fresh_refs: Vec<_> = fresh.iter().collect();
+        let carried_refs: Vec<_> = carried.iter().collect();
+        let prompt =
+            lifecycle_prompt_for_agents(&detail.job, "summary", &fresh_refs, &carried_refs);
         // The public fence discards everything past LIFECYCLE_PROMPT_MAX_BYTES,
-        // so assembly stops shortly after the budget instead of formatting the
-        // whole ledger (256 entries x ~2KB each per section).
+        // so assembly stops at the budget instead of formatting the whole
+        // ledger (256 entries x ~2KB each per section).
         assert!(
             prompt.len() < 2 * LIFECYCLE_PROMPT_MAX_BYTES,
-            "assembly should stop near the budget, got {} bytes",
+            "assembly should stop at the budget, got {} bytes",
             prompt.len()
         );
+        // Fresh findings cannot starve carried blockers: both sections keep
+        // entries, and both omissions are disclosed.
+        assert!(prompt.contains("Fresh ledger entry"));
+        assert!(prompt.contains("Carried ledger entry"));
+        assert!(prompt.contains("more new finding(s) omitted"));
+        assert!(prompt.contains("more carried finding(s) omitted"));
     }
 
     #[test]
