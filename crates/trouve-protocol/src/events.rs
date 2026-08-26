@@ -267,6 +267,12 @@ pub enum Event {
         /// `GET /v1/attachments/{id}`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<crate::Attachment>,
+        /// The turn was dispatched by the server to attach to
+        /// vendor-autonomous agent activity; `content` is a fixed marker,
+        /// not user input. Clients should render the turn as background
+        /// agent activity.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        background: bool,
     },
     /// Additional user input accepted by the backend while `turn` was still
     /// running. This belongs on the active turn's timeline and does not start

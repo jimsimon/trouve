@@ -144,6 +144,9 @@ pub enum ChatItem {
         /// Files uploaded with the prompt (metadata only; bytes are served
         /// at `GET /v1/attachments/{id}`).
         attachments: Vec<trouve_protocol::Attachment>,
+        /// Server-dispatched attach turn for vendor-autonomous agent
+        /// activity; render as background activity, not user input.
+        background: bool,
     },
     /// Additional user guidance appended to an already-running turn.
     Steered {
@@ -346,10 +349,12 @@ impl From<ThreadViewItem> for ChatItem {
                 turn,
                 content,
                 attachments,
+                background,
             } => Self::User {
                 turn,
                 content,
                 attachments,
+                background,
             },
             ThreadViewItem::Steered {
                 turn,
@@ -739,11 +744,13 @@ impl ThreadViewModel {
                 turn,
                 content,
                 attachments,
+                background,
             } => {
                 self.items.push(ChatItem::User {
                     turn: *turn,
                     content: content.clone(),
                     attachments: attachments.clone(),
+                    background: *background,
                 });
                 Some(self.items.len() - 1)
             }
@@ -1336,6 +1343,25 @@ mod tests {
     }
 
     #[test]
+    fn background_user_messages_stay_marked_in_the_view_model() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::UserMessage {
+            turn: 3,
+            content: "[background agent activity]".into(),
+            attachments: Vec::new(),
+            background: true,
+        }));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::User {
+                turn: 3,
+                background: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn turn_phase_updates_activity_without_adding_a_chat_item() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnStarted {
@@ -1507,6 +1533,7 @@ mod tests {
                 turn: 1,
                 content: "do it".into(),
                 attachments: vec![],
+                background: false,
             },
             Event::AssistantDelta {
                 turn: 1,
@@ -2199,6 +2226,7 @@ mod tests {
                 turn: 1,
                 content: "hi".into(),
                 attachments: vec![],
+                background: false,
             },
             Event::AssistantDelta {
                 turn: 1,
@@ -2239,6 +2267,7 @@ mod tests {
                 turn: 1,
                 content: "go".into(),
                 attachments: vec![],
+                background: false,
             },
             Event::AssistantThinking {
                 turn: 1,

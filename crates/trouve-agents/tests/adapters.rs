@@ -35,6 +35,7 @@ fn turn(worktree: PathBuf, session: Option<&str>, permission: BackendPermission)
         instructions: Some("mode prompt".into()),
         permission,
         tool_free: false,
+        attach_background: false,
         mcp_bridge: None,
         mcp_servers: Vec::new(),
     }

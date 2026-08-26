@@ -310,10 +310,14 @@ pub use requests::*;
 // success only when the newest published round also covered the full branch;
 // jobs and repositories carry the implementation-analyst model/thinking
 // configuration and tasks gain the `analyst` role.
-// 7.17 is reserved by an in-flight branch.
+// 7.17 was reserved for an in-flight branch and never released; skipped.
 // 7.18: review stats expose the finding-thread auto-resolve backlog
 // (additive).
-pub const PROTOCOL_VERSION: &str = "7.18";
+// 7.19: queued prompts, user-message events, and thread-view user items carry
+// an explicit `background` flag marking server-dispatched attach turns for
+// vendor-autonomous agent activity, so attach intent is trusted dispatch
+// metadata rather than prompt-content inference (additive).
+pub const PROTOCOL_VERSION: &str = "7.19";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

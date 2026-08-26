@@ -2753,6 +2753,7 @@ for line in sys.stdin:
             instructions: None,
             permission: BackendPermission::ReadOnly,
             tool_free: false,
+            attach_background: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         };
@@ -2924,6 +2925,7 @@ for line in sys.stdin:
             instructions: None,
             permission: BackendPermission::ReadOnly,
             tool_free: false,
+            attach_background: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }

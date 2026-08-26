@@ -102,6 +102,8 @@ export type ThreadChatItem =
       readonly turn: number;
       readonly content: string;
       readonly attachments: readonly Attachment[];
+      /** Server-dispatched attach turn for background agent activity. */
+      readonly background?: boolean;
     }
   | {
       readonly id: string;
@@ -419,6 +421,7 @@ export class ThreadViewModel {
           turn: item.turn,
           content: item.content,
           attachments: item.attachments,
+          background: item.background ?? false,
         };
       case "steered":
         return {
@@ -685,6 +688,7 @@ export class ThreadViewModel {
           turn: envelope.turn,
           content: envelope.content,
           attachments: envelope.attachments ?? [],
+          background: envelope.background ?? false,
         });
         return true;
       case "turn.steered":
