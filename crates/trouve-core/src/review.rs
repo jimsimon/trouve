@@ -4606,14 +4606,13 @@ impl Engine {
         // `review_base_sha == base_ref` is wrong whenever the base branch
         // advanced past the branch point, because the merge base then differs
         // from the base tip even though the diff covers the full branch.
-        let covered_full_branch;
-        if incremental_diff_can_use_watermark(
+        let covered_full_branch = if incremental_diff_can_use_watermark(
             incremental_history,
             &previous_pull_state.last_reviewed_base_sha,
             &job.base_ref,
         ) {
             job.review_base_sha = review_watermark_sha;
-            covered_full_branch = false;
+            false
         } else {
             job.review_base_sha = self
                 .executor
@@ -4628,8 +4627,8 @@ impl Engine {
                 .map_err(|error| anyhow!(error))
                 .context("resolving the pull request merge base locally")?;
             validate_sha(&job.review_base_sha)?;
-            covered_full_branch = true;
-        }
+            true
+        };
         job.covered_full_branch = Some(covered_full_branch);
         if !self.store.set_code_review_job_review_base(
             &job.id,
