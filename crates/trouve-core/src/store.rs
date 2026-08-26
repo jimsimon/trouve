@@ -11846,11 +11846,13 @@ impl Store {
             .map(|value| value as u64))
     }
 
-    /// Findings from published rounds that never received an inline review
-    /// thread (their strongest anchor was outside the diff, or inline
-    /// publication was not possible). These are the findings a maintainer
-    /// cannot address by resolving a thread; the lifecycle comment renders
-    /// them as dismissal checkboxes instead. Open findings first, then the
+    /// Blocking-tier findings from published rounds that never received an
+    /// inline review thread (their strongest anchor was outside the diff, or
+    /// inline publication was not possible). These are the findings a
+    /// maintainer cannot address by resolving a thread; the lifecycle
+    /// comment renders them as dismissal checkboxes instead. Advisory
+    /// findings are excluded: they do not gate, and the pull request
+    /// surfaces stay blocking-only by policy. Open findings first, then the
     /// most recently dismissed.
     pub(crate) fn threadless_code_review_findings(
         &self,
@@ -11868,6 +11870,7 @@ impl Store {
                AND j.review_published = 1
                AND f.github_comment_id IS NULL
                AND f.status IN ('open', 'dismissed')
+               AND (lower(trim(f.severity)) = 'high' OR (lower(trim(f.severity)) != 'low' AND lower(trim(f.confidence)) != 'low'))
              ORDER BY CASE f.status WHEN 'open' THEN 0 ELSE 1 END,
                       f.resolved_at DESC, f.path, f.line, f.id
              LIMIT 101",
