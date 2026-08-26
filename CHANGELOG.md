@@ -4,6 +4,50 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-08-26
+
+This release makes automated reviews converge on merge-blocking defects while
+preserving advisory engineering debt and giving maintainers direct control over
+finding dismissal.
+
+### Added
+
+- **Whole-change review context**: each review round can run a configurable
+  Change analyst over the full branch diff, while the final editor receives the
+  pull-request description as untrusted claimed intent and the independent
+  analysis as observed implementation evidence.
+- **Maintainer dismissal controls**: resolving a finding thread now dismisses
+  the finding immediately, and findings without diff threads expose equivalent
+  task-list controls in the lifecycle comment. Restoring either control reopens
+  the finding and its linked root-cause themes.
+
+### Changed
+
+- **Blocking and advisory review gates**: only high-severity findings and
+  sufficiently confident medium-severity findings block merging or publish to
+  GitHub. Lower-severity findings remain durable and visible in trouve without
+  holding the check red.
+- **Full-branch confirmation before success**: a review reports success only
+  when no blocking findings remain and the newest published round covers the
+  entire branch. Clean incremental rounds remain pending until the existing
+  full-coverage recheck confirms the result.
+- **Broader review routing and lifecycle analysis**: user-facing changes are
+  routed per file instead of by a batch's dominant content, and reviewers must
+  trace writers of persisted state and verify re-execution assumptions across
+  startup and migration paths.
+- **Client/server compatibility**: protocol compatibility advances to 7.18.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+
+### Fixed
+
+- **Reliable review reconciliation**: fixed and dismissed findings no longer
+  wait on GitHub thread bookkeeping before full-coverage confirmation, while
+  lifecycle checkbox edits converge transactionally from durable state and
+  survive reordered, replayed, or missed webhook deliveries.
+- **Visible thread-cleanup backlog**: review statistics now report pending
+  thread collapses and the oldest pending age, making a stalled auto-resolution
+  worker visible from the dashboard.
+
 ## [4.2.0] - 2026-08-24
 
 This release improves automated review throughput and restores semantic search
@@ -864,6 +908,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.3.0]: https://github.com/jimsimon/trouve/compare/v4.2.0...v4.3.0
 [4.2.0]: https://github.com/jimsimon/trouve/compare/v4.1.2...v4.2.0
 [4.1.2]: https://github.com/jimsimon/trouve/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/jimsimon/trouve/compare/v4.1.0...v4.1.1
