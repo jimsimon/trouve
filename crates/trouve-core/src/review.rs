@@ -164,7 +164,6 @@ const CHECK_DETAILS_TRUNCATION_MARKER: &str =
     "\n\n---\nDetails truncated; open the trouve dashboard for complete output.";
 const LIFECYCLE_COMMENT_MAX_BYTES: usize = 65_000;
 const LIFECYCLE_FINDINGS_MAX_BYTES: usize = 32_000;
-const LIFECYCLE_FAILED_FINDINGS_MIN_BYTES: usize = 8_000;
 const LIFECYCLE_PROMPT_MAX_BYTES: usize = 12_000;
 const LIFECYCLE_SUMMARY_MAX_BYTES: usize = 6_000;
 const LIFECYCLE_ERROR_MAX_BYTES: usize = 4_000;
@@ -10344,8 +10343,19 @@ fn lifecycle_dismissal_entry(
     } else {
         " "
     };
-    let path = safe_public_inline_code(&finding.path, 512);
-    let finding_title = safe_public_model_markdown(&finding.title, 512, "…");
+    // The entry carries the same labeled severity/confidence and description
+    // as an inline finding, but flattened onto one line: the checkbox parser
+    // and GitHub's task-list renderer both need the dismissal marker on the
+    // same `- [ ]` line.
+    let path = safe_public_inline_code(&finding.path, 512).replace(PROMPT_LINE_BREAKS, " ");
+    let finding_title =
+        safe_public_model_markdown(&finding.title, 512, "…").replace(PROMPT_LINE_BREAKS, " ");
+    let finding_body = safe_public_model_markdown(
+        &finding.body,
+        LIFECYCLE_FINDING_BODY_MAX_BYTES,
+        "… _(finding text truncated)_",
+    )
+    .replace(PROMPT_LINE_BREAKS, " ");
     let note = if finding.status == "dismissed" {
         " _(dismissed by maintainer)_"
     } else if carried {
@@ -10354,7 +10364,7 @@ fn lifecycle_dismissal_entry(
         ""
     };
     format!(
-        "- [{checked}] **{}/{}** — `{path}` line {}: **{finding_title}**{note} {}\n",
+        "- [{checked}] **Severity: {} · Confidence: {}** — `{path}` line {}: **{finding_title}** — {finding_body}{note} {}\n",
         canonical_finding_level(&finding.severity).to_ascii_uppercase(),
         canonical_finding_level(&finding.confidence).to_ascii_uppercase(),
         finding.line,
@@ -10656,48 +10666,31 @@ fn render_lifecycle_comment(
             finding.github_publication_status
                 == trouve_protocol::CodeReviewFindingPublicationStatus::Failed
         });
-    let failed_reserve = if failed_findings.is_empty() {
-        0
-    } else {
-        LIFECYCLE_FAILED_FINDINGS_MIN_BYTES.min(LIFECYCLE_FINDINGS_MAX_BYTES)
-    };
-    // Carried findings with inline threads get their own section (linked to
-    // their threads); threadless carried findings live in the dismissal
-    // checkbox list below with a carried-forward annotation, so nothing is
-    // listed twice.
-    let carried_reserve = if carried_findings
-        .iter()
-        .any(|f| f.github_comment_id.is_some())
-    {
-        LIFECYCLE_FAILED_FINDINGS_MIN_BYTES.min(LIFECYCLE_FINDINGS_MAX_BYTES)
-    } else {
-        0
-    };
-    let used = append_lifecycle_finding_section(
-        &mut body,
-        "### New issues in this round",
-        &confirmed_findings,
-        LIFECYCLE_FINDINGS_MAX_BYTES.saturating_sub(failed_reserve + carried_reserve),
-        true,
-    );
-    let used = used
-        + append_lifecycle_finding_section(
-            &mut body,
-            "### Inline comments that failed to post",
-            &failed_findings,
-            LIFECYCLE_FINDINGS_MAX_BYTES.saturating_sub(used + carried_reserve),
-            false,
-        );
-    let carried_threaded = carried_findings
+    // Inline comments are not repeated in this comment — each finding's
+    // review thread already carries its full text. Only counts are reported
+    // here; full text renders below only for findings that could not post
+    // inline (failed publications and the threadless checkbox list).
+    let carried_threaded_count = carried_findings
         .iter()
         .filter(|finding| finding.github_comment_id.is_some())
-        .copied()
-        .collect::<Vec<_>>();
+        .count();
+    if !confirmed_findings.is_empty() || carried_threaded_count > 0 {
+        body.push_str(&format!(
+            "**Inline comments posted this round:** {}",
+            confirmed_findings.len()
+        ));
+        if carried_threaded_count > 0 {
+            body.push_str(&format!(
+                "  \n**Still open from earlier rounds:** {carried_threaded_count} inline comment(s)"
+            ));
+        }
+        body.push_str("\n\n");
+    }
     append_lifecycle_finding_section(
         &mut body,
-        "### Carried forward from earlier rounds (still open)",
-        &carried_threaded,
-        LIFECYCLE_FINDINGS_MAX_BYTES.saturating_sub(used),
+        "### Inline comments that failed to post",
+        &failed_findings,
+        LIFECYCLE_FINDINGS_MAX_BYTES,
         false,
     );
     append_lifecycle_dismissal_section(
@@ -16581,9 +16574,12 @@ mod tests {
         assert!(body.contains(
             "**Result:** 1 new confirmed issue(s); 1 blocking issue(s) remain open across the pull request"
         ));
-        assert!(body.contains("### New issues in this round"));
-        assert!(body.contains(
-            "- **Severity: HIGH · Confidence: HIGH** — `src/lib.rs` line 42: **Error bypasses handling** — Return a typed error"
+        // Inline findings are counted, not repeated: their threads carry the
+        // full text.
+        assert!(body.contains("**Inline comments posted this round:** 1"));
+        assert!(!body.contains("### New issues in this round"));
+        assert!(!body.contains(
+            "- **Severity: HIGH · Confidence: HIGH** — `src/lib.rs` line 42: **Error bypasses handling**"
         ));
         let mut legacy_finding = detail.findings[0].clone();
         legacy_finding.severity = "critical".into();
@@ -16599,7 +16595,6 @@ mod tests {
         assert!(inline.contains(
             "<details><summary>Prompt for agents</summary>\n\n```text\nAdd error handling and a regression test.\n```\n\n</details>"
         ));
-        assert!(body.contains("_(inline publication pending)_"));
         assert!(!body.contains("### Inline comments that failed to post"));
         assert!(body.contains("<summary>Prompt for agents</summary>"));
         assert!(body.contains("_Reviewed by Trouve._"));
@@ -16628,12 +16623,16 @@ mod tests {
         );
         assert!(body.contains("Earlier round finding still open"));
         assert!(!body.contains("Tidy the qualification harness"));
-        // Generations are distinguished in prose on both surfaces: the
-        // comment gets a carried-forward section for threaded carries, and
-        // the prompt separates the fresh diff pass from carried findings.
-        assert!(body.contains("### New issues in this round"));
-        assert!(body.contains("### Carried forward from earlier rounds (still open)"));
-        assert!(body.contains("Threaded carry with a linkable thread"));
+        // Generations are distinguished on both surfaces: the comment counts
+        // this round's inline comments and the still-open threaded carries,
+        // and the prompt separates the fresh diff pass from carried findings.
+        assert!(body.contains("**Inline comments posted this round:** 1"));
+        assert!(body.contains("**Still open from earlier rounds:** 1 inline comment(s)"));
+        // Threaded findings are not repeated in the comment; their threads
+        // and the prompt carry the text.
+        let prompt_start = body.find("<summary>Prompt for agents</summary>").unwrap();
+        assert!(!body[..prompt_start].contains("Threaded carry with a linkable thread"));
+        assert!(body[prompt_start..].contains("Threaded carry with a linkable thread"));
         assert!(body.contains("New issues from this round:"));
         assert!(body.contains("Carried forward from earlier review rounds"));
         let latest_at = body.find("New issues from this round:").unwrap();
@@ -17080,14 +17079,17 @@ mod tests {
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
-        let confirmed = body.find("### New issues in this round").unwrap();
+        // Posted inline findings are counted, not repeated; only findings
+        // whose inline comment failed to post keep their full text in the
+        // comment (plus the agent prompt, which spans the ledger).
+        assert!(body.contains("**Inline comments posted this round:** 1"));
         let failed_section = body
             .find("### Inline comments that failed to post")
             .unwrap();
-        assert!(confirmed < failed_section);
-        assert!(body.matches("Published inline body").count() >= 1);
-        assert!(body.matches("Failed inline body").count() >= 1);
-        assert!(body.contains("_(inline comment posted; link unavailable)_"));
+        let prompt_start = body.find("<summary>Prompt for agents</summary>").unwrap();
+        assert!(!body[..prompt_start].contains("Published inline body"));
+        assert!(body[prompt_start..].contains("Published inline body"));
+        assert!(body[failed_section..prompt_start].contains("Failed inline body"));
         assert!(body.contains("Three confirmed issues, including uncertain issue details."));
         assert!(body.contains(
             "1 of 3 confirmed finding(s) were retained in Trouve but not posted by the publication policy"
@@ -17151,7 +17153,10 @@ mod tests {
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
         assert!(body.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
         assert!(body.ends_with(&lifecycle_comment_marker(&queued.id)));
-        assert!(body.contains("additional finding(s) omitted"));
+        assert!(body.contains(&format!(
+            "**Inline comments posted this round:** {}",
+            MAX_CANDIDATE_FINDINGS - 1
+        )));
         assert!(body.contains("### Inline comments that failed to post"));
         assert!(body.contains("Failed publication remains visible"));
         assert!(body.contains("Review summary truncated"));
@@ -24695,13 +24700,19 @@ mod tests {
         ];
         let body = render_lifecycle_comment(&detail, &threadless, false, &[]);
         assert!(body.contains("### Findings without inline threads"));
-        assert!(body.contains("- [ ] **HIGH/MEDIUM**"));
+        // Checkbox entries render like inline findings: labeled severity and
+        // confidence plus the description, on one line with the marker.
+        assert!(body.contains("- [ ] **Severity: HIGH · Confidence: MEDIUM**"));
+        assert!(body.contains("**Unchanged caller breaks under the new invariant** — details"));
         assert!(body.contains("<!-- trouve-dismiss:fnd-open -->"));
         assert!(body.contains("- [x]"));
         assert!(body.contains("_(dismissed by maintainer)_ <!-- trouve-dismiss:fnd-done -->"));
 
         // A maintainer toggles both boxes; the parse sees exactly that.
-        let edited = body.replace("- [ ] **HIGH/MEDIUM**", "- [x] **HIGH/MEDIUM**");
+        let edited = body.replace(
+            "- [ ] **Severity: HIGH · Confidence: MEDIUM**",
+            "- [x] **Severity: HIGH · Confidence: MEDIUM**",
+        );
         let edited = {
             // uncheck the dismissed entry
             let marker = "<!-- trouve-dismiss:fnd-done -->";
