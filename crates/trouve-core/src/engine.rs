@@ -2047,7 +2047,7 @@ pub struct Engine {
     /// startup; the pump spawned by `start_background_turn_listener` drains
     /// it whenever `background_turn_intake_notify` fires.
     background_turn_intake: Mutex<Vec<(String, tokio::sync::mpsc::Receiver<String>)>>,
-    background_turn_intake_notify: tokio::sync::Notify,
+    background_turn_intake_notify: Arc<tokio::sync::Notify>,
     pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
@@ -2495,7 +2495,7 @@ impl Engine {
             backends: RwLock::new(backends),
             injected_backends: Mutex::new(HashMap::new()),
             background_turn_intake: Mutex::new(Vec::new()),
-            background_turn_intake_notify: tokio::sync::Notify::new(),
+            background_turn_intake_notify: Arc::new(tokio::sync::Notify::new()),
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
@@ -2818,36 +2818,80 @@ impl Engine {
     /// buffers it, and this listener turns it into an ordinary turn.
     pub fn start_background_turn_listener(self: &Arc<Self>) {
         self.intake_background_turn_signals();
-        let engine = Arc::clone(self);
+        // The pump and its forwarders hold only a Weak engine reference and
+        // exit when it no longer upgrades: a forever-parked task must not be
+        // what keeps the Engine (and through it every backend) alive.
+        let weak = Arc::downgrade(self);
+        let notify = Arc::clone(&self.background_turn_intake_notify);
         tokio::spawn(async move {
             loop {
-                let pending: Vec<(String, tokio::sync::mpsc::Receiver<String>)> = {
-                    let mut intake = engine.background_turn_intake.lock().unwrap();
-                    intake.drain(..).collect()
-                };
-                for (backend_id, mut signals) in pending {
-                    let engine = Arc::clone(&engine);
-                    tokio::spawn(async move {
-                        // The forwarder ends when its backend (the sender) is
-                        // dropped by a registry reload; the replacement
-                        // backend's receiver arrives through the intake.
-                        while let Some(thread_id) = signals.recv().await {
-                            if let Err(error) =
-                                engine.dispatch_background_attach_turn(&thread_id, &backend_id)
-                            {
-                                tracing::warn!(
-                                    %thread_id,
-                                    backend = %backend_id,
-                                    %error,
-                                    "background attach-turn dispatch failed"
-                                );
+                {
+                    let Some(engine) = weak.upgrade() else {
+                        return;
+                    };
+                    let pending: Vec<(String, tokio::sync::mpsc::Receiver<String>)> = {
+                        let mut intake = engine.background_turn_intake.lock().unwrap();
+                        intake.drain(..).collect()
+                    };
+                    for (backend_id, mut signals) in pending {
+                        let weak = weak.clone();
+                        tokio::spawn(async move {
+                            // The forwarder ends when its backend (the
+                            // sender) is dropped by a registry reload; the
+                            // replacement backend's receiver arrives through
+                            // the intake.
+                            while let Some(thread_id) = signals.recv().await {
+                                let Some(engine) = weak.upgrade() else {
+                                    return;
+                                };
+                                engine
+                                    .dispatch_background_attach_turn_with_retry(
+                                        &thread_id,
+                                        &backend_id,
+                                    )
+                                    .await;
                             }
-                        }
-                    });
+                        });
+                    }
                 }
-                engine.background_turn_intake_notify.notified().await;
+                notify.notified().await;
             }
         });
+    }
+
+    /// Dispatch with one bounded retry: a notification is consumed from the
+    /// signal channel when received, so a transiently failing dispatch (a
+    /// busy store, a mid-write race) must not silently strand the buffered
+    /// autonomous turn until some later boundary happens to re-announce it.
+    async fn dispatch_background_attach_turn_with_retry(
+        self: &Arc<Self>,
+        thread_id: &str,
+        backend_id: &str,
+    ) {
+        for attempt in 0..2_u8 {
+            match self.dispatch_background_attach_turn(thread_id, backend_id) {
+                Ok(()) => return,
+                // The thread is gone; there is nothing to attach to.
+                Err(EngineError::NotFound(_)) => return,
+                Err(error) if attempt == 0 => {
+                    tracing::debug!(
+                        %thread_id,
+                        backend = %backend_id,
+                        %error,
+                        "background attach-turn dispatch failed; retrying once"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %thread_id,
+                        backend = %backend_id,
+                        %error,
+                        "background attach-turn dispatch failed"
+                    );
+                }
+            }
+        }
     }
 
     /// Collect every registered backend's background-turn signal receiver
@@ -2886,6 +2930,16 @@ impl Engine {
         if self
             .store
             .is_code_review_thread(thread_id)
+            .map_err(EngineError::Internal)?
+        {
+            return Ok(());
+        }
+        // One queued attach drains the backend's buffered turns; backlog
+        // re-announcements for the same buffer coalesce into it instead of
+        // queueing surplus attaches that would surface as empty turns.
+        if self
+            .store
+            .has_queued_background_prompt(thread_id)
             .map_err(EngineError::Internal)?
         {
             return Ok(());

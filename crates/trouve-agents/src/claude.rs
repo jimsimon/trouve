@@ -140,8 +140,9 @@ impl Pool {
         let mut procs = self.procs.lock().await;
         let mut dead = Vec::new();
         for (id, p) in procs.iter() {
-            if Arc::strong_count(p) != 1 || p.router.is_busy() {
-                continue; // turn in flight
+            if Arc::strong_count(p) != 1 || p.router.is_busy() || p.router.has_pending_background()
+            {
+                continue; // turn in flight or buffered awaiting attach
             }
             if p.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT {
                 dead.push(id.clone());
@@ -174,7 +175,10 @@ impl Pool {
             let lru = procs
                 .iter()
                 .filter(|(_, p)| {
-                    p.is_reusable() && Arc::strong_count(p) == 1 && !p.router.is_busy()
+                    p.is_reusable()
+                        && Arc::strong_count(p) == 1
+                        && !p.router.is_busy()
+                        && !p.router.has_pending_background()
                 })
                 .min_by_key(|(_, p)| *p.last_used.lock().unwrap())
                 .map(|(id, _)| id.clone());
@@ -269,6 +273,14 @@ impl StdoutRouter {
     fn is_busy(&self) -> bool {
         let state = self.state.lock().unwrap();
         state.turn.is_some() || state.background_in_flight
+    }
+
+    /// True while completed autonomous turns sit buffered awaiting an attach
+    /// consumer. Pool reaping and cap eviction must treat such processes as
+    /// live: recycling one discards its buffered turns before the engine's
+    /// attach can drain them.
+    fn has_pending_background(&self) -> bool {
+        !self.state.lock().unwrap().background.is_empty()
     }
 
     /// The registered non-attach turn's prompt reached the vendor; lines

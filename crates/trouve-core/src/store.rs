@@ -7526,6 +7526,22 @@ impl Store {
         Ok(position as u64)
     }
 
+    /// Whether an unclaimed background attach prompt is already queued for
+    /// the thread. Backlog re-announcements can signal the same buffered
+    /// autonomous turn more than once; one queued attach drains it, so
+    /// surplus dispatches are coalesced instead of producing empty
+    /// nothing-pending turns.
+    pub fn has_queued_background_prompt(&self, thread_id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM queued_prompts
+               WHERE thread_id = ?1 AND background = 1 AND claimed = 0
+             )",
+            params![thread_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn queued_prompts(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
