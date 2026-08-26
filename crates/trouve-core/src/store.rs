@@ -584,6 +584,7 @@ CREATE TABLE IF NOT EXISTS code_review_pr_state (
   last_reviewed_publication_order INTEGER NOT NULL DEFAULT 0,
   lifecycle_comment_id INTEGER,
   lifecycle_comment_url TEXT NOT NULL DEFAULT '',
+  lifecycle_checkbox_edited_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (repository, pull_number)
 );
 CREATE TABLE IF NOT EXISTS code_review_thread_rechecks (
@@ -779,6 +780,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs DROP COLUMN publication_churn_signal",
     "ALTER TABLE code_review_jobs ADD COLUMN review_covered_full_branch INTEGER",
     "ALTER TABLE code_review_findings ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_checkbox_edited_at TEXT NOT NULL DEFAULT ''",
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -11831,7 +11833,8 @@ impl Store {
         &self,
         repository: &str,
         pull_number: u64,
-    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+    ) -> Result<(Vec<trouve_protocol::CodeReviewFinding>, bool)> {
+        const THREADLESS_FINDINGS_CAP: usize = 100;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT f.id, f.path, f.line, f.severity, f.confidence, f.title, f.body,
@@ -11844,7 +11847,7 @@ impl Store {
                AND f.status IN ('open', 'dismissed')
              ORDER BY CASE f.status WHEN 'open' THEN 0 ELSE 1 END,
                       f.resolved_at DESC, f.path, f.line, f.id
-             LIMIT 100",
+             LIMIT 101",
         )?;
         let findings = stmt
             .query_map(params![repository, pull_number as i64], |row| {
@@ -11875,8 +11878,11 @@ impl Store {
                     outside_diff: true,
                 })
             })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(findings)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut findings = findings;
+        let truncated = findings.len() > THREADLESS_FINDINGS_CAP;
+        findings.truncate(THREADLESS_FINDINGS_CAP);
+        Ok((findings, truncated))
     }
 
     /// Recompute the open/advisory issue-count snapshots on the newest
@@ -11907,10 +11913,37 @@ impl Store {
         &self,
         repository: &str,
         pull_number: u64,
+        observed_edited_at: &str,
         states: &[(String, bool)],
     ) -> Result<(bool, Option<String>)> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        // Monotonic edit watermark: a delivery carrying an older comment
+        // revision than one already applied is a reordered or replayed
+        // snapshot and must not overwrite the newer decision. Equal
+        // timestamps apply (idempotent states; GitHub's updated_at has
+        // second granularity), and the reconciliation heal bounds any
+        // same-second misorder at one pass.
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT lifecycle_checkbox_edited_at FROM code_review_pr_state
+                 WHERE repository = ?1 AND pull_number = ?2",
+                params![repository, pull_number as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = &stored
+            && !stored.is_empty()
+            && observed_edited_at < stored.as_str()
+        {
+            tx.commit()?;
+            return Ok((false, None));
+        }
+        tx.execute(
+            "UPDATE code_review_pr_state SET lifecycle_checkbox_edited_at = ?3
+             WHERE repository = ?1 AND pull_number = ?2",
+            params![repository, pull_number as i64, observed_edited_at],
+        )?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut changed = false;
         for (finding_id, checked) in states {
@@ -19060,10 +19093,11 @@ mod tests {
             .finish_code_review_job(&job.id, "succeeded", "", "")
             .unwrap();
 
-        let listed = store
+        let (listed, truncated) = store
             .threadless_code_review_findings("acme/widgets", 42)
             .unwrap();
         assert_eq!(listed.len(), 1);
+        assert!(!truncated);
         assert_eq!(listed[0].id, threadless.id);
         assert_eq!(listed[0].status, "open");
 
@@ -19091,6 +19125,7 @@ mod tests {
             .apply_lifecycle_dismissal_states(
                 "acme/widgets",
                 42,
+                "2026-08-26T10:00:00Z",
                 &[
                     (threaded.id.clone(), true),
                     (threadless.id.clone(), true),
@@ -19100,7 +19135,7 @@ mod tests {
             .unwrap();
         assert!(changed);
         assert_eq!(projection.as_deref(), Some(job.id.as_str()));
-        let listed = store
+        let (listed, _) = store
             .threadless_code_review_findings("acme/widgets", 42)
             .unwrap();
         assert_eq!(listed[0].status, "dismissed");
@@ -19111,14 +19146,34 @@ mod tests {
             1,
             "the threaded finding still gates"
         );
+        // A stale (older-timestamped) delivery is rejected outright.
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2026-08-26T09:59:59Z",
+                &[(threadless.id.clone(), false)],
+            )
+            .unwrap();
+        assert!(!changed);
         // Unchecking restores; re-applying the identical states is a no-op.
         let (changed, projection) = store
-            .apply_lifecycle_dismissal_states("acme/widgets", 42, &[(threadless.id.clone(), false)])
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2026-08-26T10:00:01Z",
+                &[(threadless.id.clone(), false)],
+            )
             .unwrap();
         assert!(changed);
         assert_eq!(projection.as_deref(), Some(job.id.as_str()));
         let (changed, projection) = store
-            .apply_lifecycle_dismissal_states("acme/widgets", 42, &[(threadless.id.clone(), false)])
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2026-08-26T10:00:02Z",
+                &[(threadless.id.clone(), false)],
+            )
             .unwrap();
         assert!(!changed);
         assert!(projection.is_none());
@@ -19131,7 +19186,12 @@ mod tests {
         // The scoping guard rejects a finding id that belongs to a
         // different pull request's ledger.
         let (changed, _) = store
-            .apply_lifecycle_dismissal_states("acme/other", 7, &[(threadless.id.clone(), true)])
+            .apply_lifecycle_dismissal_states(
+                "acme/other",
+                7,
+                "2026-08-26T10:00:03Z",
+                &[(threadless.id.clone(), true)],
+            )
             .unwrap();
         assert!(!changed);
     }

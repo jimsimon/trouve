@@ -4152,18 +4152,19 @@ impl Engine {
             .then(|| manual_review_comment(&payload))
             .flatten();
         // A maintainer toggling a dismissal checkbox edits the lifecycle
-        // comment; GitHub delivers that as an issue_comment `edited` event.
-        // The payload only gates on our marker being present — the handler
-        // refetches the comment's current body before applying, so a
-        // reordered or replayed delivery converges on the latest state
-        // instead of applying its own possibly-stale snapshot.
+        // comment; GitHub delivers that as an issue_comment `edited` event
+        // carrying the edited body and the comment's updated_at. The payload
+        // snapshot is applied ordered by that timestamp against a persisted
+        // watermark, so reordered or replayed deliveries cannot regress a
+        // newer decision, while rapid consecutive toggles are each preserved
+        // even when a ledger re-render lands between them.
         let lifecycle_checkbox_edit = (event == "issue_comment" && action == "edited")
             .then(|| {
                 let comment_id = payload["comment"]["id"].as_u64()?;
-                payload["comment"]["body"]
-                    .as_str()
-                    .filter(|body| body.contains("<!-- trouve-dismiss:"))
-                    .map(|_| comment_id)
+                let edited_at = payload["comment"]["updated_at"].as_str()?.to_owned();
+                let states =
+                    parse_lifecycle_dismissal_markers(payload["comment"]["body"].as_str()?)?;
+                Some((comment_id, edited_at, states))
             })
             .flatten();
         if !pull_request_event && manual_comment.is_none() && lifecycle_checkbox_edit.is_none() {
@@ -4218,22 +4219,14 @@ impl Engine {
             let engine = self.clone();
             tokio::spawn(async move {
                 let _guard = engine.code_review.reconcile_lock.lock().await;
-                if let Some(comment_id) = lifecycle_checkbox_edit {
-                    match engine.installation_api(repository.installation_id).await {
-                        Ok(api) => {
-                            if let Err(error) = engine
-                                .apply_lifecycle_dismissal_edit(&api, &repository, comment_id)
-                                .await
-                            {
-                                engine.record_review_error(format!(
-                                    "applying lifecycle dismissal checkboxes failed: {error:#}"
-                                ));
-                            }
-                        }
-                        Err(error) => engine.record_review_error(format!(
-                            "authenticating lifecycle checkbox webhook failed: {error:#}"
-                        )),
-                    }
+                if let Some((comment_id, edited_at, states)) = &lifecycle_checkbox_edit
+                    && let Err(error) = engine
+                        .apply_lifecycle_dismissal_edit(&repository, *comment_id, edited_at, states)
+                        .await
+                {
+                    engine.record_review_error(format!(
+                        "applying lifecycle dismissal checkboxes failed: {error:#}"
+                    ));
                 }
                 if let Some(pull_number) = converted_to_draft_pull {
                     match engine.installation_api(repository.installation_id).await {
@@ -8079,10 +8072,11 @@ impl Engine {
         let state = self
             .store
             .code_review_pull_state(&job.repository, job.pull_number)?;
-        let threadless_findings = self
+        let (threadless_findings, threadless_truncated) = self
             .store
             .threadless_code_review_findings(&job.repository, job.pull_number)?;
-        let lifecycle_body = render_lifecycle_comment(&detail, &threadless_findings);
+        let lifecycle_body =
+            render_lifecycle_comment(&detail, &threadless_findings, threadless_truncated);
         let terminal = matches!(
             job.status.as_str(),
             "succeeded" | "failed" | "cancelled" | "stale"
@@ -9403,11 +9397,19 @@ impl Engine {
     /// it. Maintainer judgment applies directly — no model re-adjudicates —
     /// and the counts, check run, and lifecycle comment re-project in place
     /// exactly as for a thread resolution.
+    /// Applies a webhook-delivered checkbox edit from its payload snapshot.
+    /// The persisted edit watermark orders deliveries by the comment's
+    /// `updated_at`, so a reordered or replayed snapshot can never overwrite
+    /// a newer maintainer decision — and unlike refetching the live body,
+    /// the payload preserves a toggle made while an earlier one was still
+    /// being applied and re-rendered (the ledger render would otherwise
+    /// erase it before its own delivery arrived).
     async fn apply_lifecycle_dismissal_edit(
         &self,
-        api: &GithubApi,
         repository: &CodeReviewRepository,
         comment_id: u64,
+        edited_at: &str,
+        states: &[(String, bool)],
     ) -> Result<()> {
         let Some(pull_number) = self
             .store
@@ -9415,17 +9417,14 @@ impl Engine {
         else {
             return Ok(());
         };
-        self.sync_lifecycle_dismissal_checkboxes(api, repository, pull_number)
+        self.apply_lifecycle_states_and_project(repository, pull_number, edited_at, states)
             .await
     }
 
-    /// Reads the lifecycle comment's *current* body from GitHub and applies
-    /// its checkbox states to the threadless finding ledger. Fetching fresh
-    /// state instead of trusting a delivered snapshot makes the operation a
-    /// convergence, not an event: reordered webhook deliveries cannot apply
-    /// an obsolete snapshot over a newer maintainer decision, and because
-    /// thread reconciliation also runs this sync, a webhook lost to a crash
-    /// or restart heals on the next pass without any durable retry queue.
+    /// Convergence backstop run on every thread-reconciliation pass: read
+    /// the lifecycle comment's current body and apply its checkbox states.
+    /// A webhook delivery lost to a crash or restart heals here, bounding
+    /// ledger/comment divergence at one pass without a durable retry queue.
     async fn sync_lifecycle_dismissal_checkboxes(
         &self,
         api: &GithubApi,
@@ -9455,14 +9454,27 @@ impl Engine {
         else {
             return Ok(());
         };
+        let edited_at = comment["updated_at"].as_str().unwrap_or_default();
+        self.apply_lifecycle_states_and_project(repository, pull_number, edited_at, &states)
+            .await
+    }
+
+    async fn apply_lifecycle_states_and_project(
+        &self,
+        repository: &CodeReviewRepository,
+        pull_number: u64,
+        edited_at: &str,
+        states: &[(String, bool)],
+    ) -> Result<()> {
         // All toggles and the count refresh commit in one transaction; the
         // store guards restrict every update to threadless findings of this
         // pull's published rounds, so unknown or fabricated marker ids are
-        // inert.
+        // inert, and the edit watermark rejects out-of-order snapshots.
         let (changed, projection_job) = self.store.apply_lifecycle_dismissal_states(
             &repository.repository,
             pull_number,
-            &states,
+            edited_at,
+            states,
         )?;
         if !changed {
             return Ok(());
@@ -10289,6 +10301,7 @@ const LIFECYCLE_DISMISSABLE_TAIL_RESERVE: usize = 512;
 fn append_lifecycle_dismissal_section(
     body: &mut String,
     threadless: &[trouve_protocol::CodeReviewFinding],
+    truncated: bool,
 ) {
     if threadless.is_empty() {
         return;
@@ -10311,13 +10324,19 @@ fn append_lifecycle_dismissal_section(
     }
     let start = body.len();
     body.push_str(heading);
+    let mut omitted = truncated;
     for finding in threadless {
         let entry = lifecycle_dismissal_entry(finding);
         if body.len() - start + entry.len() + omitted_marker.len() + 1 > budget {
-            body.push_str(omitted_marker);
+            omitted = true;
             break;
         }
         body.push_str(&entry);
+    }
+    if omitted {
+        // Emitted for byte-budget overflow AND for the query's row cap, so a
+        // finding without a rendered checkbox is always disclosed.
+        body.push_str(omitted_marker);
     }
     body.push('\n');
 }
@@ -10341,6 +10360,7 @@ fn finish_lifecycle_comment(mut body: String, job_id: &str) -> String {
 fn render_lifecycle_comment(
     detail: &trouve_protocol::CodeReviewJobDetail,
     threadless_findings: &[trouve_protocol::CodeReviewFinding],
+    threadless_truncated: bool,
 ) -> String {
     let job = &detail.job;
     let open_issue_count = review_open_issue_count(job);
@@ -10516,7 +10536,7 @@ fn render_lifecycle_comment(
         LIFECYCLE_FINDINGS_MAX_BYTES.saturating_sub(used),
         false,
     );
-    append_lifecycle_dismissal_section(&mut body, threadless_findings);
+    append_lifecycle_dismissal_section(&mut body, threadless_findings, threadless_truncated);
     if !lifecycle_prompt.is_empty() {
         let prompt = safe_public_prompt_fence(
             &lifecycle_prompt,
@@ -15957,7 +15977,7 @@ mod tests {
             .unwrap();
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
 
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(body.starts_with("## ❌ Trouve Code Review — Failed"));
         assert!(
             body.contains("**Error:** model review remained invalid after one JSON repair attempt")
@@ -15991,7 +16011,7 @@ mod tests {
             )
             .unwrap();
         let staged = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        let running_body = render_lifecycle_comment(&staged, &[]);
+        let running_body = render_lifecycle_comment(&staged, &[], false);
         assert!(running_body.starts_with("## 🔎 Trouve Code Review — Running"));
         assert!(!running_body.contains("Obsolete coordinator summary"));
         assert!(!running_body.contains("Obsolete finding title"));
@@ -16006,7 +16026,7 @@ mod tests {
             .unwrap();
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
 
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
 
         assert!(body.starts_with("## ⏹️ Trouve Code Review — Stale"));
         assert!(body.contains("**Error:** stale: pull request head changed before publication"));
@@ -16064,7 +16084,7 @@ mod tests {
             .unwrap();
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
 
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
 
         assert!(body.starts_with("## ❌ Trouve Code Review — Failed"));
         assert!(body.contains("**Error:** discarding staged review result failed"));
@@ -16139,7 +16159,7 @@ mod tests {
             .unwrap();
 
         let failed = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        let body = render_lifecycle_comment(&failed, &[]);
+        let body = render_lifecycle_comment(&failed, &[], false);
         assert!(body.starts_with("## ⚠️ Trouve Code Review — Needs Attention"));
         assert!(body.contains("**Result:** incomplete — 1 candidate decision(s) unresolved"));
         assert!(body.contains("### Unresolved final-editor decisions"));
@@ -16150,7 +16170,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let retrying = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        let body = render_lifecycle_comment(&retrying, &[]);
+        let body = render_lifecycle_comment(&retrying, &[], false);
         assert!(body.starts_with("## ⏳ Trouve Code Review — Queued"));
         assert!(!body.contains("Trouve Code Review — Needs Attention"));
         assert!(!body.contains("**Result:** incomplete"));
@@ -16221,7 +16241,7 @@ mod tests {
         let mut detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         detail.job.open_issue_count = Some(1);
 
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
         assert!(body.contains("### Reviewer coverage"));
         assert!(body.contains("| Application Reliability Engineer | Not Applicable |"));
@@ -16271,7 +16291,7 @@ mod tests {
             review_check_conclusion(&detail.job.status, Some(2), false, false),
             Some("neutral")
         );
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
         assert!(body.contains(
             "**Result:** 0 new confirmed issue(s); 2 blocking issue(s) remain open across the pull request"
@@ -16285,12 +16305,12 @@ mod tests {
         // Zero open blocking findings established by a partial round is
         // pending, not settled; a full-coverage clean round renders settled.
         assert!(
-            render_lifecycle_comment(&detail, &[])
+            render_lifecycle_comment(&detail, &[], false)
                 .starts_with("## 🟡 Trouve Code Review — Needs Attention")
         );
         detail.job.review_base_sha = detail.job.base_ref.clone();
         assert!(
-            render_lifecycle_comment(&detail, &[])
+            render_lifecycle_comment(&detail, &[], false)
                 .starts_with("## ✅ Trouve Code Review — Succeeded")
         );
 
@@ -16300,7 +16320,7 @@ mod tests {
             review_check_conclusion(&detail.job.status, None, false, false),
             Some("neutral")
         );
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
         assert!(body.contains("PR-wide open issue status is unknown for this legacy review"));
     }
@@ -16326,7 +16346,7 @@ mod tests {
             review_check_conclusion(&detail.job.status, Some(0), false, true),
             Some("neutral")
         );
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
         assert!(body.contains("### ⏳ Full-branch confirmation pending"));
         assert!(body.contains("reviewed only the changes since the last review"));
@@ -16339,7 +16359,7 @@ mod tests {
             review_check_conclusion(&detail.job.status, Some(0), false, false),
             Some("success")
         );
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(body.starts_with("## ✅ Trouve Code Review — Succeeded"));
         assert!(!body.contains("Full-branch confirmation pending"));
 
@@ -16366,7 +16386,7 @@ mod tests {
         // Open blocking findings dominate the presentation either way.
         detail.job.open_issue_count = Some(3);
         assert!(!review_awaiting_full_coverage(&detail.job, Some(3)));
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
     }
 
@@ -16683,7 +16703,7 @@ mod tests {
             .unwrap();
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         let confirmed = body.find("### Confirmed issues").unwrap();
         let failed_section = body
             .find("### Inline comments that failed to post")
@@ -16750,7 +16770,7 @@ mod tests {
             .unwrap();
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
 
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(body.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
         assert!(body.ends_with(&lifecycle_comment_marker(&queued.id)));
         assert!(body.contains("additional finding(s) omitted"));
@@ -16780,7 +16800,7 @@ mod tests {
             .unwrap();
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
 
-        let body = render_lifecycle_comment(&detail, &[]);
+        let body = render_lifecycle_comment(&detail, &[], false);
         assert!(!body.contains("Prompt for agents"));
         assert!(review_prompt_for_agents(&queued, "No issues found.", &[], &[]).is_empty());
     }
@@ -24182,14 +24202,14 @@ mod tests {
             .unwrap();
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
 
-        let without = render_lifecycle_comment(&detail, &[]);
+        let without = render_lifecycle_comment(&detail, &[], false);
         assert!(!without.contains("Findings without inline threads"));
 
         let threadless = [
             finding("fnd-open", "open"),
             finding("fnd-done", "dismissed"),
         ];
-        let body = render_lifecycle_comment(&detail, &threadless);
+        let body = render_lifecycle_comment(&detail, &threadless, false);
         assert!(body.contains("### Findings without inline threads"));
         assert!(body.contains("- [ ] **HIGH/MEDIUM**"));
         assert!(body.contains("<!-- trouve-dismiss:fnd-open -->"));
@@ -24264,7 +24284,7 @@ mod tests {
         // complete rows plus a complete omission notice, never content the
         // final truncation would slice mid-marker.
         let mut near_limit = "x".repeat(LIFECYCLE_COMMENT_MAX_BYTES - 900);
-        append_lifecycle_dismissal_section(&mut near_limit, &findings);
+        append_lifecycle_dismissal_section(&mut near_limit, &findings, false);
         let finished = finish_lifecycle_comment(near_limit.clone(), "rv_test");
         assert!(finished.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
         assert!(!finished.contains(LIFECYCLE_COMMENT_TRUNCATION_MARKER));
@@ -24281,7 +24301,7 @@ mod tests {
         // A body so close to the cap that not even the heading fits renders
         // no section at all rather than a sliced one.
         let mut over_limit = "x".repeat(LIFECYCLE_COMMENT_MAX_BYTES - 600);
-        append_lifecycle_dismissal_section(&mut over_limit, &findings);
+        append_lifecycle_dismissal_section(&mut over_limit, &findings, false);
         assert!(!over_limit.contains("### Findings without inline threads"));
     }
 
