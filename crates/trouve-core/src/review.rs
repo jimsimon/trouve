@@ -8392,13 +8392,16 @@ impl Engine {
             }
             return Err(error);
         }
-        self.explain_thread_resolution(api, repository, pull_number, finding)
-            .await;
+        // Clear the durable pending state before the explanatory reply: the
+        // reply is explicitly best-effort, while posting first would let an
+        // interruption in between re-run this path and post a duplicate.
         self.store.clear_code_review_thread_collapse(
             &finding.id,
             Some(comment_id),
             Some(thread_id),
         )?;
+        self.explain_thread_resolution(api, repository, pull_number, finding)
+            .await;
         Ok(())
     }
 
@@ -9096,6 +9099,7 @@ impl Engine {
                         .latest_published_code_review_round_covered_full_branch(
                             &repository.repository,
                             pull.number,
+                            &pull.head.sha,
                         )?,
                     Some(false)
                 );
@@ -9255,12 +9259,18 @@ impl Engine {
             if changed {
                 changed_jobs.insert(state.finding.job_id.clone());
             }
-            if !open {
+            // The gate derives from the post-transition status, not the
+            // pre-record snapshot: a resolved thread just dismissed an open
+            // finding, and an unresolved thread just restored a closed one.
+            let open_after_transition = if open {
+                !*is_resolved
+            } else {
+                state.is_resolved == Some(true) && !*is_resolved
+            };
+            if !open && !open_after_transition {
                 continue;
             }
-            // A finding whose thread was just observed resolved is dismissed
-            // by the record call above and no longer holds the gate.
-            if blocking && !*is_resolved {
+            if blocking && open_after_transition {
                 open_blocking += 1;
             }
             state_key.push((state.finding.id.clone(), generation, *is_resolved));
@@ -9302,6 +9312,7 @@ impl Engine {
                     .latest_published_code_review_round_covered_full_branch(
                         &repository.repository,
                         pull.number,
+                        &pull.head.sha,
                     )?,
                 Some(false)
             );
