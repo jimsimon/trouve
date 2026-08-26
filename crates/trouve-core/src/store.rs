@@ -584,6 +584,7 @@ CREATE TABLE IF NOT EXISTS code_review_pr_state (
   last_reviewed_publication_order INTEGER NOT NULL DEFAULT 0,
   lifecycle_comment_id INTEGER,
   lifecycle_comment_url TEXT NOT NULL DEFAULT '',
+  lifecycle_checkbox_edited_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (repository, pull_number)
 );
 CREATE TABLE IF NOT EXISTS code_review_thread_rechecks (
@@ -779,6 +780,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs DROP COLUMN publication_churn_signal",
     "ALTER TABLE code_review_jobs ADD COLUMN review_covered_full_branch INTEGER",
     "ALTER TABLE code_review_findings ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_checkbox_edited_at TEXT NOT NULL DEFAULT ''",
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -3118,6 +3120,76 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
         params![job_id],
     )?;
     Ok(())
+}
+
+/// Shared body of the post-hoc count refresh: recompute both tier snapshots
+/// on the newest published round, arm the blocking-review cleanup when the
+/// blocking ledger reaches zero, disarm it (invalidating any in-flight
+/// claim) when a reopen makes it positive again. Returns the round's id when
+/// either tier changed and its GitHub projections should re-sync.
+fn refresh_code_review_pull_projection_counts_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    repository: &str,
+    pull_number: u64,
+) -> Result<Option<String>> {
+    let latest: Option<(String, Option<i64>, Option<i64>)> = tx
+        .query_row(
+            "SELECT id, publication_open_issue_count,
+                    publication_advisory_open_issue_count
+             FROM code_review_jobs
+             WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1
+             ORDER BY publication_order DESC, created_at DESC, id DESC
+             LIMIT 1",
+            params![repository, pull_number as i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((job_id, previous_open, previous_advisory)) = latest else {
+        return Ok(None);
+    };
+    record_code_review_open_issue_count(tx, &job_id)?;
+    let (refreshed_open, refreshed_advisory): (Option<i64>, Option<i64>) = tx.query_row(
+        "SELECT publication_open_issue_count, publication_advisory_open_issue_count
+         FROM code_review_jobs WHERE id = ?1",
+        params![job_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if refreshed_open == Some(0) && previous_open != Some(0) {
+        // The gate cleared without a round (trusted dismissals): the
+        // standing REQUEST_CHANGES review must not outlive the ledger.
+        // The durable cleanup task dismisses it with retries.
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_pending = 1,
+                 blocking_review_cleanup_page = 1,
+                 blocking_review_cleanup_attempts = 0,
+                 blocking_review_cleanup_next_attempt_at = NULL,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1",
+            params![job_id],
+        )?;
+    } else if refreshed_open.is_some_and(|open| open > 0) {
+        // The ledger has open blocking findings again (a reopen): any
+        // cleanup armed while it was clear must not proceed to dismiss
+        // the standing REQUEST_CHANGES review out from under them.
+        // Clearing the claim fields also invalidates an in-flight claim.
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_pending = 0,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND blocking_review_cleanup_pending != 0",
+            params![job_id],
+        )?;
+    }
+    // Either tier changing requires a fresh GitHub projection: advisory
+    // counts surface in the check summary and lifecycle comment even
+    // though only the blocking tier gates.
+    Ok(
+        (refreshed_open != previous_open || refreshed_advisory != previous_advisory)
+            .then_some(job_id),
+    )
 }
 
 fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -11708,6 +11780,111 @@ impl Store {
         ))
     }
 
+    /// The newest published round for a pull request, used to re-project its
+    /// GitHub surfaces after ledger changes that happen without a round.
+    pub fn latest_published_code_review_job_id(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1
+                 ORDER BY publication_order DESC, created_at DESC, id DESC
+                 LIMIT 1",
+                params![repository, pull_number as i64],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The pull request whose lifecycle comment has this GitHub comment id,
+    /// if any. Used to attribute checkbox edits on the sticky comment.
+    pub fn code_review_pull_for_lifecycle_comment(
+        &self,
+        repository: &str,
+        comment_id: u64,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT pull_number FROM code_review_pr_state
+                 WHERE repository = ?1 AND lifecycle_comment_id = ?2",
+                params![repository, comment_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|value| value as u64))
+    }
+
+    /// Findings from published rounds that never received an inline review
+    /// thread (their strongest anchor was outside the diff, or inline
+    /// publication was not possible). These are the findings a maintainer
+    /// cannot address by resolving a thread; the lifecycle comment renders
+    /// them as dismissal checkboxes instead. Open findings first, then the
+    /// most recently dismissed.
+    pub(crate) fn threadless_code_review_findings(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<(Vec<trouve_protocol::CodeReviewFinding>, bool)> {
+        const THREADLESS_FINDINGS_CAP: usize = 100;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.path, f.line, f.severity, f.confidence, f.title, f.body,
+                    f.status
+             FROM code_review_findings f
+             JOIN code_review_jobs j ON j.id = f.job_id
+             WHERE j.repository = ?1 AND j.pull_number = ?2
+               AND j.review_published = 1
+               AND f.github_comment_id IS NULL
+               AND f.status IN ('open', 'dismissed')
+             ORDER BY CASE f.status WHEN 'open' THEN 0 ELSE 1 END,
+                      f.resolved_at DESC, f.path, f.line, f.id
+             LIMIT 101",
+        )?;
+        let findings = stmt
+            .query_map(params![repository, pull_number as i64], |row| {
+                Ok(trouve_protocol::CodeReviewFinding {
+                    id: row.get(0)?,
+                    job_id: String::new(),
+                    path: row.get(1)?,
+                    line: row.get::<_, i64>(2)? as u64,
+                    side: "RIGHT".into(),
+                    severity: row.get(3)?,
+                    confidence: row.get(4)?,
+                    title: row.get(5)?,
+                    body: row.get(6)?,
+                    prompt_for_agents: String::new(),
+                    status: row.get(7)?,
+                    sources: Vec::new(),
+                    github_comment_id: None,
+                    github_comment_url: String::new(),
+                    github_publication_status: code_review_publication_status(""),
+                    github_thread_id: None,
+                    resolved_at: None,
+                    evidence: Default::default(),
+                    origin: code_review_finding_origin(""),
+                    theme_ids: Vec::new(),
+                    observed_head: String::new(),
+                    resolved_head: String::new(),
+                    resolved_by_job_id: String::new(),
+                    outside_diff: true,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut findings = findings;
+        let truncated = findings.len() > THREADLESS_FINDINGS_CAP;
+        findings.truncate(THREADLESS_FINDINGS_CAP);
+        Ok((findings, truncated))
+    }
+
     /// Recompute the open/advisory issue-count snapshots on the newest
     /// published round after thread reconciliation changed finding statuses
     /// (a trusted dismissal or a reopen), and arm the blocking-review
@@ -11721,66 +11898,112 @@ impl Store {
     ) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        let latest: Option<(String, Option<i64>, Option<i64>)> = tx
+        let refreshed =
+            refresh_code_review_pull_projection_counts_in_tx(&tx, repository, pull_number)?;
+        tx.commit()?;
+        Ok(refreshed)
+    }
+
+    /// Applies a maintainer's lifecycle-comment checkbox states to the
+    /// threadless finding ledger and refreshes the projection counts in one
+    /// transaction, so an interruption can never leave some toggles durable
+    /// while the counts and cleanup arming lag behind. Returns the newest
+    /// published round's id when either count tier changed.
+    pub fn apply_lifecycle_dismissal_states(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        observed_edited_at: &str,
+        states: &[(String, bool)],
+    ) -> Result<(bool, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        // Monotonic edit watermark: a delivery carrying an older comment
+        // revision than one already applied is a reordered or replayed
+        // snapshot and must not overwrite the newer decision. Equal
+        // timestamps apply (idempotent states; GitHub's updated_at has
+        // second granularity), and the reconciliation heal bounds any
+        // same-second misorder at one pass.
+        let stored: Option<String> = tx
             .query_row(
-                "SELECT id, publication_open_issue_count,
-                        publication_advisory_open_issue_count
-                 FROM code_review_jobs
-                 WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1
-                 ORDER BY publication_order DESC, created_at DESC, id DESC
-                 LIMIT 1",
+                "SELECT lifecycle_checkbox_edited_at FROM code_review_pr_state
+                 WHERE repository = ?1 AND pull_number = ?2",
                 params![repository, pull_number as i64],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
             .optional()?;
-        let Some((job_id, previous_open, previous_advisory)) = latest else {
+        if let Some(stored) = &stored
+            && !stored.is_empty()
+            && observed_edited_at < stored.as_str()
+        {
             tx.commit()?;
-            return Ok(None);
-        };
-        record_code_review_open_issue_count(&tx, &job_id)?;
-        let (refreshed_open, refreshed_advisory): (Option<i64>, Option<i64>) = tx.query_row(
-            "SELECT publication_open_issue_count, publication_advisory_open_issue_count
-             FROM code_review_jobs WHERE id = ?1",
-            params![job_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if refreshed_open == Some(0) && previous_open != Some(0) {
-            // The gate cleared without a round (trusted dismissals): the
-            // standing REQUEST_CHANGES review must not outlive the ledger.
-            // The durable cleanup task dismisses it with retries.
-            tx.execute(
-                "UPDATE code_review_jobs
-                 SET blocking_review_cleanup_pending = 1,
-                     blocking_review_cleanup_page = 1,
-                     blocking_review_cleanup_attempts = 0,
-                     blocking_review_cleanup_next_attempt_at = NULL,
-                     blocking_review_cleanup_claim_token = NULL,
-                     blocking_review_cleanup_claim_until = NULL
-                 WHERE id = ?1",
-                params![job_id],
-            )?;
-        } else if refreshed_open.is_some_and(|open| open > 0) {
-            // The ledger has open blocking findings again (a reopen): any
-            // cleanup armed while it was clear must not proceed to dismiss
-            // the standing REQUEST_CHANGES review out from under them.
-            // Clearing the claim fields also invalidates an in-flight claim.
-            tx.execute(
-                "UPDATE code_review_jobs
-                 SET blocking_review_cleanup_pending = 0,
-                     blocking_review_cleanup_claim_token = NULL,
-                     blocking_review_cleanup_claim_until = NULL
-                 WHERE id = ?1 AND blocking_review_cleanup_pending != 0",
-                params![job_id],
-            )?;
+            return Ok((false, None));
         }
+        tx.execute(
+            "UPDATE code_review_pr_state SET lifecycle_checkbox_edited_at = ?3
+             WHERE repository = ?1 AND pull_number = ?2",
+            params![repository, pull_number as i64, observed_edited_at],
+        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut changed = false;
+        for (finding_id, checked) in states {
+            let applied = if *checked {
+                tx.execute(
+                    "UPDATE code_review_findings
+                     SET status = 'dismissed',
+                         dismiss_reason = 'maintainer checked the dismissal box',
+                         resolved_at = ?2,
+                         resolved_head = '',
+                         resolved_by_job_id = '',
+                         collapse_pending = 0
+                     WHERE id = ?1 AND status = 'open' AND github_comment_id IS NULL
+                       AND EXISTS (
+                         SELECT 1 FROM code_review_jobs job
+                         WHERE job.id = code_review_findings.job_id
+                           AND job.repository = ?3 AND job.pull_number = ?4
+                           AND job.review_published = 1
+                       )",
+                    params![finding_id, now, repository, pull_number as i64],
+                )?
+            } else {
+                let restored = tx.execute(
+                    "UPDATE code_review_findings
+                     SET status = 'open', dismiss_reason = '', resolved_at = NULL,
+                         resolved_head = '', resolved_by_job_id = ''
+                     WHERE id = ?1 AND status = 'dismissed' AND github_comment_id IS NULL
+                       AND EXISTS (
+                         SELECT 1 FROM code_review_jobs job
+                         WHERE job.id = code_review_findings.job_id
+                           AND job.repository = ?2 AND job.pull_number = ?3
+                           AND job.review_published = 1
+                       )",
+                    params![finding_id, repository, pull_number as i64],
+                )?;
+                if restored > 0 {
+                    // Mirror the thread-based reopen path: a theme resolved
+                    // while this finding was dismissed is open again now
+                    // that its manifestation is.
+                    tx.execute(
+                        "UPDATE code_review_themes
+                         SET status = 'open', resolved_head = '', updated_at = ?2
+                         WHERE id IN (
+                           SELECT theme_id FROM code_review_finding_themes
+                           WHERE finding_id = ?1
+                         )",
+                        params![finding_id, now],
+                    )?;
+                }
+                restored
+            };
+            changed |= applied > 0;
+        }
+        let projection_job = if changed {
+            refresh_code_review_pull_projection_counts_in_tx(&tx, repository, pull_number)?
+        } else {
+            None
+        };
         tx.commit()?;
-        // Either tier changing requires a fresh GitHub projection: advisory
-        // counts surface in the check summary and lifecycle comment even
-        // though only the blocking tier gates.
-        Ok(
-            (refreshed_open != previous_open || refreshed_advisory != previous_advisory)
-                .then_some(job_id),
-        )
+        Ok((changed, projection_job))
     }
 
     pub fn code_review_themes_for_pull(
@@ -18826,6 +19049,201 @@ mod tests {
             after_requeue > chrono::Duration::minutes(59),
             "{after_requeue}"
         );
+    }
+
+    #[test]
+    fn threadless_findings_dismiss_and_restore_only_without_an_inline_thread() {
+        let store = Store::open_in_memory().unwrap();
+        let finding_at = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 3,
+            side: "RIGHT".into(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            title: "Finding".into(),
+            body: "finding".into(),
+            prompt_for_agents: "fix".into(),
+            sources: Vec::new(),
+        };
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                2,
+                &[finding_at("src/a.rs"), finding_at("src/b.rs")],
+                &[],
+            )
+            .unwrap();
+        let (threadless, threaded) = (findings[0].clone(), findings[1].clone());
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        // Only one finding gets an inline comment; the other stays
+        // review-body only.
+        store
+            .update_code_review_finding_publication(
+                &threaded.id,
+                Some(9002),
+                "https://example/comment/9002",
+                None,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+
+        let (listed, truncated) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!truncated);
+        assert_eq!(listed[0].id, threadless.id);
+        assert_eq!(listed[0].status, "open");
+
+        // The lifecycle comment id attributes checkbox edits to this pull.
+        store
+            .set_code_review_lifecycle_comment("acme/widgets", 42, 777, "https://example/c/777")
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_pull_for_lifecycle_comment("acme/widgets", 777)
+                .unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            store
+                .code_review_pull_for_lifecycle_comment("acme/widgets", 778)
+                .unwrap(),
+            None
+        );
+
+        // One transaction applies every toggle plus the count refresh.
+        // Threaded findings and fabricated ids are inert; threadless ones
+        // round-trip. The projection job is returned when a tier changed.
+        let (changed, projection) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2026-08-26T10:00:00Z",
+                &[
+                    (threaded.id.clone(), true),
+                    (threadless.id.clone(), true),
+                    ("fnd-invented".into(), true),
+                ],
+            )
+            .unwrap();
+        assert!(changed);
+        assert_eq!(projection.as_deref(), Some(job.id.as_str()));
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(listed[0].status, "dismissed");
+        assert_eq!(
+            store
+                .code_review_open_blocking_finding_count("acme/widgets", 42)
+                .unwrap(),
+            1,
+            "the threaded finding still gates"
+        );
+        // A stale (older-timestamped) delivery is rejected outright.
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2026-08-26T09:59:59Z",
+                &[(threadless.id.clone(), false)],
+            )
+            .unwrap();
+        assert!(!changed);
+        // A theme resolved while its only manifestation was dismissed
+        // reopens when the checkbox restore reopens the finding, mirroring
+        // the thread-based reopen path.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_review_themes
+                        (id, repository, pull_number, root_cause, recommendation, status,
+                         first_seen_head, last_seen_head, resolved_head, created_at, updated_at)
+                 VALUES ('thm-1', 'acme/widgets', 42, 'cause', 'fix', 'resolved',
+                         'abc', 'abc', 'abc', '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO code_review_finding_themes (finding_id, theme_id, linked_by_job_id)
+                 VALUES (?1, 'thm-1', '')",
+                params![threadless.id],
+            )
+            .unwrap();
+        }
+        // Unchecking restores; re-applying the identical states is a no-op.
+        let (changed, projection) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2026-08-26T10:00:01Z",
+                &[(threadless.id.clone(), false)],
+            )
+            .unwrap();
+        assert!(changed);
+        assert_eq!(projection.as_deref(), Some(job.id.as_str()));
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM code_review_themes WHERE id = 'thm-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "open",
+            "the linked theme reopened with its restored manifestation"
+        );
+        let (changed, projection) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2026-08-26T10:00:02Z",
+                &[(threadless.id.clone(), false)],
+            )
+            .unwrap();
+        assert!(!changed);
+        assert!(projection.is_none());
+        assert_eq!(
+            store
+                .code_review_open_blocking_finding_count("acme/widgets", 42)
+                .unwrap(),
+            2
+        );
+        // The scoping guard rejects a finding id that belongs to a
+        // different pull request's ledger.
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/other",
+                7,
+                "2026-08-26T10:00:03Z",
+                &[(threadless.id.clone(), true)],
+            )
+            .unwrap();
+        assert!(!changed);
     }
 
     #[test]
