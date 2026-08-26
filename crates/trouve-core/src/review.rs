@@ -8109,13 +8109,19 @@ impl Engine {
                     {
                         let edited_at = comment["updated_at"].as_str().unwrap_or_default();
                         // Store-level apply only: re-projection is exactly
-                        // what this pass is already doing.
-                        self.store.apply_lifecycle_dismissal_states(
+                        // what this pass is already doing. The durable event
+                        // must still fire, or clients rebuilding from the
+                        // event log keep the pre-toggle finding status.
+                        let (changed, _) = self.store.apply_lifecycle_dismissal_states(
                             &repository,
                             pull_number,
                             edited_at,
                             &states,
                         )?;
+                        if changed {
+                            self.emit_code_review_job_updated(&job.id)?;
+                            self.emit_code_review_updated(Some(job.id.clone()))?;
+                        }
                     }
                 }
                 Err(error) => tracing::debug!(
@@ -9511,6 +9517,25 @@ impl Engine {
             .as_str()
             .and_then(parse_lifecycle_dismissal_markers)
         else {
+            // No markers in the registered lifecycle comment. That is the
+            // canonical state only when no threadless findings exist; if the
+            // ledger says checkboxes should be present, the comment was
+            // edited over (markers deleted or corrupted) and a
+            // state-preserving re-render restores the controls instead of
+            // leaving them absent until an unrelated projection.
+            let (threadless, _) = self
+                .store
+                .threadless_code_review_findings(&repository.repository, pull_number)?;
+            if threadless.is_empty() {
+                return Ok(());
+            }
+            if let Some(job_id) = self
+                .store
+                .latest_published_code_review_job_id(&repository.repository, pull_number)?
+                && let Ok(Some(record)) = self.store.code_review_job(&job_id)
+            {
+                self.sync_code_review_projection(&record.job).await;
+            }
             return Ok(());
         };
         let edited_at = comment["updated_at"].as_str().unwrap_or_default();
