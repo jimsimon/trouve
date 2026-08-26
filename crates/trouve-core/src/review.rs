@@ -190,6 +190,16 @@ source retrieved during this review or deterministic checked-in/CI evidence. Mod
 cadence, plausibility, and agreement between reviewers are not evidence. When authoritative or \
 reproducible verification is unavailable, do not report the claim; the coordinator must reject it \
 as insufficient_evidence.";
+const STATE_LIFECYCLE_GUIDANCE: &str = "\
+Cross-lifecycle assumption check: when changed code reads, compares, or derives a decision from \
+persisted state (a database column, stored field, configuration value, or cross-module global), \
+locate every writer of that state with search tools and verify the assumed invariant holds across \
+the value's whole lifecycle — including writers outside this diff that refine, overwrite, or \
+re-run against it later. A new assumption broken by an unchanged writer is a defect introduced by \
+this revision, not a pre-existing issue: the writer was correct until this change started relying \
+on it. The same applies to startup-time code: statements added to always-run initialization or \
+migration paths must be correct under re-execution and under the ordering of the surrounding \
+runner, not just on first run.";
 const COORDINATOR_EXECUTION_GUIDANCE: &str = "\
 Time and exploration budget: finish validation in about one minute. Use no more than 4 tool calls \
 total, only to resolve a concrete ambiguity that the supplied candidate and diff context cannot \
@@ -11942,7 +11952,13 @@ fn semantic_routing_prompt(
          that an upgrade is API-compatible.\n\nTesting routing rule: select `testing` when changed \
          behavior or validation has a specific negative, boundary, nondeterministic, or integration \
          path whose missing coverage could conceal a plausible defect. Do not select it merely \
-         because implementation changed or more tests would be beneficial.\n\nCandidate personas:\n{catalog}\n\n\
+         because implementation changed or more tests would be beneficial.\n\nUser-interface routing \
+         rule: select `accessibility` whenever any file in this batch changes user-facing \
+         presentation or interaction — markup, templates, components, labels, banners, badges, \
+         form controls, focus or announcement behavior, or ARIA/role semantics — in any language \
+         or framework. A single small user-facing change in an otherwise backend or plumbing \
+         batch is still materially relevant; judge each file, not the batch's dominant \
+         content.\n\nCandidate personas:\n{catalog}\n\n\
          {evidence_guidance}\n\nUntrusted pull-request evidence:\n{evidence}\n\nReturn JSON only with this exact shape:\n\
          {{\"selections\":[{{\"reviewer_id\":\"persona-id\",\"reason\":\"specific relevance to this diff\"}}]}}\n\
          Use only candidate ids listed above, give a concrete one-sentence reason, and return an \
@@ -12211,7 +12227,7 @@ fn reviewer_prompt(
          sweep every changed call site and state transition in this batch for sibling \
          manifestations and report each independently actionable consequence now. Report only \
          actionable problems introduced by the change. Do not ask \
-         questions and do not modify files.\n\n{external_fact_guidance}\n\n{level_guidance}\n\n{execution_guidance}\n\n\
+         questions and do not modify files.\n\n{lifecycle_guidance}\n\n{external_fact_guidance}\n\n{level_guidance}\n\n{execution_guidance}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
          {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"confidence\":\"high|medium|low\",\"title\":\"concise one-line issue summary\",\"body\":\"specific problem and fix\",\"evidence\":{{\"preconditions\":\"reachable state required to trigger the defect\",\"execution_path\":\"concrete call/event sequence through the changed code\",\"consequence\":\"specific user or system impact\",\"introduction\":\"changed line or behavior that introduced it\",\"regression_test\":\"behavioral test that would fail before the fix\"}}}}]}}\n\
          Use RIGHT for added/context lines in the new version and LEFT only \
@@ -12221,6 +12237,7 @@ fn reviewer_prompt(
         reviewer_instructions = reviewer.prompt,
         level_guidance = FINDING_LEVEL_GUIDANCE,
         execution_guidance = REVIEWER_EXECUTION_GUIDANCE,
+        lifecycle_guidance = STATE_LIFECYCLE_GUIDANCE,
         external_fact_guidance = EXTERNAL_FACT_EVIDENCE_GUIDANCE,
         number = job.pull_number,
         head = job.head_sha,
@@ -12413,7 +12430,11 @@ fn validation_prompt(
          a current candidate has a matching fingerprint, retain it only if the current revision or new \
          authoritative evidence invalidates the earlier rejection reason; reviewer repetition or \
          agreement is not materially new evidence. State that new evidence in the retained \
-         finding's body or structured evidence. Include each candidate \
+         finding's body or structured evidence. A candidate showing that changed code's new \
+         read, comparison, or startup-time statement is broken by an unchanged writer or runner \
+         elsewhere in the repository is introduced by this revision — the unchanged code was \
+         correct until this change started relying on it — and must not be rejected as \
+         `pre_existing:`. Include each candidate \
          you do not retain exactly once in `rejected_candidates` with a concise, specific \
          reason prefixed by exactly one category: `false_positive:`, `pre_existing:`, \
          `internal_duplicate:`, `external_duplicate:`, `insufficient_evidence:`, or \
@@ -23869,6 +23890,54 @@ mod tests {
         assert!(prompt.contains("crypto, parser, or runtime upgrades"));
         assert!(prompt.contains("specific negative, boundary, nondeterministic, or integration"));
         assert!(prompt.contains("merely because implementation changed"));
+    }
+
+    #[test]
+    fn semantic_routing_prompt_routes_ui_changes_per_file_not_per_batch() {
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .filter(|reviewer| reviewer.id == "accessibility")
+            .collect::<Vec<_>>();
+        // A plumbing-heavy batch with one small user-facing change: the
+        // production miss this rule exists for (PR #305's role="alert"
+        // banner drowned in protocol-client changes).
+        let batch = ReviewBatch {
+            paths: vec![
+                "web/app-ui/src/services/protocol-client.ts".into(),
+                "web/review-ui/src/main.tsx".into(),
+            ],
+            diff: "+        <div class=\"banner warning stacked\" role=\"alert\">\n".into(),
+        };
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:ui-routing");
+        job.routing_mode = CodeReviewRoutingMode::Automatic;
+
+        let prompt = semantic_routing_prompt(&job, "", &batch, 0, 1, &reviewers);
+        assert!(prompt.contains("User-interface routing"));
+        assert!(prompt.contains("markup, templates, components, labels, banners, badges"));
+        assert!(prompt.contains("in any language"));
+        assert!(prompt.contains("judge each file, not the batch's dominant"));
+    }
+
+    #[test]
+    fn review_prompts_demand_cross_lifecycle_assumption_checks() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:lifecycle-guidance");
+        let record = store.code_review_job(&queued.id).unwrap().unwrap();
+        let reviewer = crate::reviewers::built_in_reviewers().remove(0);
+        let batch = ReviewBatch {
+            paths: vec!["crates/core/src/store.rs".into()],
+            diff: "+let covered = review_base_sha == base_ref;\n".into(),
+        };
+        let prompt = reviewer_prompt(&record, &reviewer, &batch, 0, 1, &[], 0);
+        assert!(prompt.contains("Cross-lifecycle assumption check"));
+        assert!(prompt.contains("locate every writer of that state"));
+        assert!(prompt.contains("correct under re-execution"));
+
+        let coordinator =
+            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        assert!(coordinator.contains("broken by an unchanged writer or runner"));
+        assert!(coordinator.contains("must not be rejected as"));
     }
 
     #[test]
