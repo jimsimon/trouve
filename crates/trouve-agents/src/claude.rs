@@ -283,19 +283,6 @@ impl StdoutRouter {
         !self.state.lock().unwrap().background.is_empty()
     }
 
-    /// Drop buffered autonomous turns that can never be attached (their
-    /// thread is gone), releasing the pending-background pin on the process.
-    fn abandon_background(&self) {
-        let mut state = self.state.lock().unwrap();
-        if !state.background.is_empty() {
-            tracing::debug!(
-                lines = state.background.len(),
-                "claude: abandoning unattachable background turns"
-            );
-        }
-        state.background.clear();
-    }
-
     /// The registered non-attach turn's prompt reached the vendor; lines
     /// arriving from now on may belong to it.
     fn prompt_delivered(&self) {
@@ -731,10 +718,18 @@ impl AgentBackend for ClaudeBackend {
     async fn abandon_background_turns(&self, thread_id: &str) {
         let proc_ = self.pool.procs.lock().await.get(thread_id).cloned();
         if let Some(proc_) = proc_ {
-            // Unpin the process: with the buffer abandoned,
-            // has_pending_background() no longer holds it out of reaping and
-            // cap eviction.
-            proc_.router.abandon_background();
+            // The thread is gone, so this process can never serve another
+            // turn and its output can never be attached. Terminating it
+            // (rather than clearing router state at one instant) also covers
+            // an autonomous turn still streaming, which would otherwise
+            // refill the buffer and re-pin the pool slot with no later
+            // signal guaranteed to repeat the cleanup.
+            if let Err(error) = self.pool.terminate_and_remove(thread_id, &proc_).await {
+                tracing::warn!(
+                    %thread_id,
+                    "claude: terminating the pooled process for a deleted thread failed: {error}"
+                );
+            }
         }
     }
 
