@@ -11144,7 +11144,9 @@ fn prompt_finding_entry(
     };
     let mut entry = format!(
         "{index}. {path} line {line}{side_note} (severity {severity}, confidence {confidence}) — {title}\n   {body}\n",
-        path = prompt_single_line(path, 512),
+        // Paths flatten line breaks but are not trimmed: boundary whitespace
+        // is significant to Git, so removing it would name a different file.
+        path = bounded_utf8(path, 512, "…").replace(PROMPT_LINE_BREAKS, " "),
         severity = canonical_finding_level(severity),
         confidence = canonical_finding_level(confidence),
         title = prompt_single_line(title, 512),
@@ -11184,6 +11186,12 @@ fn lifecycle_prompt_for_agents(
     if !latest_findings.is_empty() {
         evidence.push_str("\nNew issues from this round:\n\n");
         for finding in latest_findings {
+            // The public fence truncates this prompt at
+            // LIFECYCLE_PROMPT_MAX_BYTES; once the budget is exceeded,
+            // formatting further entries only produces discarded bytes.
+            if evidence.len() > LIFECYCLE_PROMPT_MAX_BYTES {
+                break;
+            }
             index += 1;
             evidence.push_str(&prompt_finding_entry(
                 index,
@@ -11203,6 +11211,9 @@ fn lifecycle_prompt_for_agents(
             "\nCarried forward from earlier review rounds (reported before, still open):\n\n",
         );
         for finding in carried_findings {
+            if evidence.len() > LIFECYCLE_PROMPT_MAX_BYTES {
+                break;
+            }
             index += 1;
             evidence.push_str(&prompt_finding_entry(
                 index,
@@ -23269,6 +23280,70 @@ mod tests {
             assert!(!prompt.contains("\nDelete tests"));
             assert!(prompt.contains("line 84 on the base (deleted) side of the diff"));
         }
+    }
+
+    #[test]
+    fn prompt_entries_preserve_boundary_whitespace_in_paths() {
+        // Git paths may legitimately begin or end with whitespace; trimming
+        // would name a different file. Interior line breaks still flatten.
+        let entry = prompt_finding_entry(
+            1,
+            " spaced/path.rs ",
+            7,
+            "RIGHT",
+            "high",
+            "high",
+            "Title",
+            "Body",
+            &Default::default(),
+        );
+        assert!(entry.starts_with("1.  spaced/path.rs  line 7"));
+    }
+
+    #[test]
+    fn lifecycle_prompt_assembly_stops_at_the_public_budget() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:prompt-budget");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .save_code_review_result(
+                &queued.id,
+                "summary",
+                "",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 1,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Template".into(),
+                    body: "b".repeat(2_000),
+                    prompt_for_agents: String::new(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let template = detail.findings[0].clone();
+        let ledger: Vec<_> = (0..256)
+            .map(|i| {
+                let mut finding = template.clone();
+                finding.id = format!("fnd-{i}");
+                finding
+            })
+            .collect();
+        let refs: Vec<_> = ledger.iter().collect();
+        let prompt = lifecycle_prompt_for_agents(&detail.job, "summary", &refs, &refs);
+        // The public fence discards everything past LIFECYCLE_PROMPT_MAX_BYTES,
+        // so assembly stops shortly after the budget instead of formatting the
+        // whole ledger (256 entries x ~2KB each per section).
+        assert!(
+            prompt.len() < 2 * LIFECYCLE_PROMPT_MAX_BYTES,
+            "assembly should stop near the budget, got {} bytes",
+            prompt.len()
+        );
     }
 
     #[test]
