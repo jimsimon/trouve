@@ -783,10 +783,13 @@ const MIGRATIONS: &[&str] = &[
 /// Legacy snapshots counted every open finding; recompute both tiers on the
 /// newest published round of each pull so deployed databases adopt the
 /// blocking/advisory split at upgrade time. This runs after
-/// `repair_legacy_code_review_publications` so the counts never derive from
-/// stale `review_published` flags, and the `publication_advisory_open_issue_count
-/// IS NULL` guard makes it a one-time backfill per row instead of a
-/// full-table recount on every startup.
+/// `repair_legacy_code_review_publications` (so the counts never derive from
+/// stale `review_published` flags) and after
+/// `normalize_code_review_publication_orders` (so the newest-round selection
+/// never falls back to `created_at` while legacy rows still hold order 0).
+/// The `publication_advisory_open_issue_count IS NULL` guard makes it a
+/// one-time backfill per row instead of a full-table recount on every
+/// startup.
 fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
     conn.execute(
         "UPDATE code_review_jobs SET
@@ -843,13 +846,17 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
-    backfill_code_review_two_tier_issue_counts(conn)?;
     migrate_code_review_theme_observation_publication_authority(
         conn,
         had_theme_observation_publication_authority,
     )?;
     backfill_code_review_published_at(conn)?;
     normalize_code_review_publication_orders(conn)?;
+    // After publication repair AND order normalization: the backfill selects
+    // each pull's newest published round by publication_order, and its
+    // one-time guard makes whatever row it picks permanent, so it must never
+    // run while legacy rows still hold order 0.
+    backfill_code_review_two_tier_issue_counts(conn)?;
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS code_review_theme_transition_repair_targets (
            theme_id TEXT PRIMARY KEY
