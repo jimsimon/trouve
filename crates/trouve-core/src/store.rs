@@ -836,9 +836,16 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_checkbox_edited_at TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE queued_prompts ADD COLUMN background INTEGER NOT NULL DEFAULT 0",
+    // Smallest configured-model context window (tokens) resolved for this
+    // job's prompt budgets. NULL = never resolved; 0 = resolved but unknown
+    // (fixed default budgets). Persisted so retries re-batch identically
+    // even when provider metadata is transiently unavailable.
+    "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
+    USAGE_MODEL_COLUMN_MIGRATION,
     // Durable threadless resolve/unresolve commands claimed from webhooks;
     // rows survive restarts and are deleted when the command reaches a
-    // definitive outcome.
+    // definitive outcome. Positional append-only history: this must stay
+    // after every migration a deployed database may already have run.
     "CREATE TABLE IF NOT EXISTS code_review_pending_threadless_commands (
        trigger_key TEXT PRIMARY KEY,
        repository TEXT NOT NULL,
@@ -850,12 +857,6 @@ const MIGRATIONS: &[&str] = &[
        reason TEXT NOT NULL,
        created_at TEXT NOT NULL
      )",
-    // Smallest configured-model context window (tokens) resolved for this
-    // job's prompt budgets. NULL = never resolved; 0 = resolved but unknown
-    // (fixed default budgets). Persisted so retries re-batch identically
-    // even when provider metadata is transiently unavailable.
-    "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
-    USAGE_MODEL_COLUMN_MIGRATION,
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -4094,6 +4095,9 @@ pub enum ThreadlessCommandOutcome {
         finding_id: String,
         status: String,
     },
+    /// Another processor consumed this command's durable row first; nothing
+    /// was evaluated or mutated.
+    AlreadyConsumed,
 }
 
 #[derive(Debug, Clone)]
@@ -12235,10 +12239,18 @@ impl Store {
         // Every outcome below is definitive, so the durable command row is
         // consumed in the same transaction as the state it decides.
         if let Some(trigger_key) = trigger_key {
-            tx.execute(
+            // Consumption must be exclusive: a processor whose snapshot lost
+            // the race deletes zero rows and must not evaluate or mutate
+            // anything, or a stale command could reverse a newer opposite
+            // decision.
+            let consumed = tx.execute(
                 "DELETE FROM code_review_pending_threadless_commands WHERE trigger_key = ?1",
                 params![trigger_key],
             )?;
+            if consumed == 0 {
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::AlreadyConsumed, None));
+            }
         }
         let mut stmt = tx.prepare(
             "SELECT f.id, f.status FROM code_review_findings f
@@ -14380,45 +14392,16 @@ impl Store {
     /// Claim one GitHub webhook delivery and, when present, durably record its
     /// manual review request in the same transaction. Duplicate delivery ids
     /// are ignored, which makes GitHub's at-least-once delivery safe to retry.
+    /// Claim a webhook delivery, persisting any durable payloads it carries
+    /// — a manual review request and/or a threadless resolve command — in
+    /// the same transaction, so a crash after the claim can never lose
+    /// either: both are retried from their tables until consumed. A comment
+    /// may legitimately carry both a review request and a resolve command.
     pub fn claim_github_webhook_delivery(
         &self,
         delivery_id: &str,
         manual_request: Option<(&str, u64, &str)>,
-    ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&conn)?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO github_webhook_deliveries (delivery_id, received_at)
-             VALUES (?1, ?2)",
-            params![delivery_id, chrono::Utc::now().to_rfc3339()],
-        )?;
-        if inserted > 0
-            && let Some((repository, pull_number, trigger_key)) = manual_request
-        {
-            tx.execute(
-                "INSERT OR IGNORE INTO code_review_manual_requests
-                        (repository, pull_number, trigger_key, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    repository,
-                    pull_number as i64,
-                    trigger_key,
-                    chrono::Utc::now().to_rfc3339()
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(inserted > 0)
-    }
-
-    /// Claim a webhook delivery and persist its threadless command in the
-    /// same transaction, so a crash after the claim can never lose the
-    /// command: it is retried from this table until a definitive outcome
-    /// deletes it.
-    pub fn claim_github_webhook_delivery_with_threadless_command(
-        &self,
-        delivery_id: &str,
-        command: &PendingThreadlessCommand,
+        threadless_command: Option<&PendingThreadlessCommand>,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
@@ -14428,23 +14411,38 @@ impl Store {
             params![delivery_id, chrono::Utc::now().to_rfc3339()],
         )?;
         if inserted > 0 {
-            tx.execute(
-                "INSERT OR IGNORE INTO code_review_pending_threadless_commands
-                        (trigger_key, repository, pull_number, comment_id, author, resolve,
-                         finding_prefix, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    command.trigger_key,
-                    command.repository,
-                    command.pull_number as i64,
-                    command.comment_id as i64,
-                    command.author,
-                    command.resolve,
-                    command.finding_prefix,
-                    command.reason,
-                    chrono::Utc::now().to_rfc3339()
-                ],
-            )?;
+            if let Some((repository, pull_number, trigger_key)) = manual_request {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_manual_requests
+                            (repository, pull_number, trigger_key, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        repository,
+                        pull_number as i64,
+                        trigger_key,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?;
+            }
+            if let Some(command) = threadless_command {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_pending_threadless_commands
+                            (trigger_key, repository, pull_number, comment_id, author, resolve,
+                             finding_prefix, reason, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        command.trigger_key,
+                        command.repository,
+                        command.pull_number as i64,
+                        command.comment_id as i64,
+                        command.author,
+                        command.resolve,
+                        command.finding_prefix,
+                        command.reason,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(inserted > 0)
@@ -19401,6 +19399,7 @@ mod tests {
                 .claim_github_webhook_delivery(
                     "delivery-1",
                     Some(("acme/widgets", 42, "comment:100")),
+                    None,
                 )
                 .unwrap()
         );
@@ -19409,6 +19408,7 @@ mod tests {
                 .claim_github_webhook_delivery(
                     "delivery-1",
                     Some(("acme/widgets", 42, "comment:duplicate")),
+                    None,
                 )
                 .unwrap()
         );

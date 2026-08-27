@@ -1191,6 +1191,20 @@ struct ThreadlessResolveCommand {
     parsed: ThreadlessCommandParse,
 }
 
+/// Bounded number of durable commands examined per repository pass; the
+/// remainder waits for the next webhook batch or poll, keeping passes short
+/// and permission lookups admission-controlled.
+const THREADLESS_COMMAND_PASS_LIMIT: usize = 16;
+
+/// How one durable command left its processing attempt.
+enum ThreadlessCommandDisposition {
+    /// The command reached a definitive outcome and its row was consumed.
+    Done,
+    /// A transient failure left the row pending; the caller must halt this
+    /// pull's later commands so a newer opposite command cannot overtake it.
+    RetryPull,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ThreadlessCommandParse {
     Resolve {
@@ -4400,7 +4414,7 @@ impl Engine {
             "pull_request" | "issue_comment" | "check_run" | "pull_request_review_thread"
         ) {
             self.store
-                .claim_github_webhook_delivery(delivery_id, None)?;
+                .claim_github_webhook_delivery(delivery_id, None, None)?;
             return Ok(());
         }
         let payload: serde_json::Value = serde_json::from_slice(body)
@@ -4409,7 +4423,7 @@ impl Engine {
         if event == "check_run" {
             if !self
                 .store
-                .claim_github_webhook_delivery(delivery_id, None)?
+                .claim_github_webhook_delivery(delivery_id, None, None)?
             {
                 return Ok(());
             }
@@ -4511,7 +4525,7 @@ impl Engine {
             && resolve_command.is_none()
         {
             self.store
-                .claim_github_webhook_delivery(delivery_id, None)?;
+                .claim_github_webhook_delivery(delivery_id, None, None)?;
             return Ok(());
         }
         let repository_name = manual_comment
@@ -4557,7 +4571,7 @@ impl Engine {
         // guidance reply and need no durability.
         let pending_command = resolve_command
             .as_ref()
-            .filter(|_| repository.is_some() && durable_request.is_none())
+            .filter(|_| repository.is_some())
             .and_then(|command| {
                 let (resolve, finding_prefix, reason) = match &command.parsed {
                     ThreadlessCommandParse::Resolve {
@@ -4580,14 +4594,11 @@ impl Engine {
                     reason,
                 })
             });
-        let claimed = if let Some(command) = pending_command.as_ref() {
-            self.store
-                .claim_github_webhook_delivery_with_threadless_command(delivery_id, command)?
-        } else {
-            self.store
-                .claim_github_webhook_delivery(delivery_id, durable_request)?
-        };
-        if !claimed {
+        if !self.store.claim_github_webhook_delivery(
+            delivery_id,
+            durable_request,
+            pending_command.as_ref(),
+        )? {
             return Ok(());
         }
         if let Some(repository) = repository {
@@ -10234,12 +10245,25 @@ impl Engine {
         if username.is_empty() {
             return Ok(false);
         }
-        let (permission, rate): (serde_json::Value, _) = api
+        let (permission, rate): (serde_json::Value, _) = match api
             .get(&format!(
                 "/repos/{repository}/collaborators/{username}/permission"
             ))
             .await
-            .context("looking up commenter repository permission")?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                // 404 is the API's answer for "not a collaborator": a
+                // definitive no, never a retryable failure.
+                if format!("{error:#}")
+                    .to_lowercase()
+                    .contains("github api 404")
+                {
+                    return Ok(false);
+                }
+                return Err(error).context("looking up commenter repository permission");
+            }
+        };
         self.record_review_rate(rate);
         Ok(matches!(
             permission["permission"].as_str(),
@@ -10281,12 +10305,15 @@ impl Engine {
         }
     }
 
-    /// Apply every durably claimed resolve/unresolve command for this
+    /// Apply durably claimed resolve/unresolve commands for this
     /// repository: called from the webhook worker for immediacy and from
     /// every repository poll as the retry path, so a command claimed just
-    /// before a crash still reaches its outcome. Each command's row is
-    /// consumed in the same transaction as the decision it produces, making
-    /// the two processors race-free and replays inert.
+    /// before a crash still reaches its outcome. Commands apply in
+    /// created-at order; a retryable failure halts that pull's remaining
+    /// commands (a later opposite command must not overtake the one before
+    /// it), and each pass is bounded so a backlog cannot stall the pass or
+    /// stampede permission lookups. Row consumption is transactional and
+    /// exclusive, so the webhook and poll processors cannot double-apply.
     async fn process_pending_threadless_commands(&self, repository: &CodeReviewRepository) {
         let commands = match self
             .store
@@ -10300,74 +10327,104 @@ impl Engine {
                 return;
             }
         };
-        for command in commands {
-            self.apply_threadless_resolve_command_event(repository, &command)
-                .await;
+        if commands.is_empty() {
+            return;
+        }
+        // One authentication per pass; failure leaves every row for the
+        // next pass rather than failing each command individually.
+        let api = match self.installation_api(repository.installation_id).await {
+            Ok(api) => api,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "authenticating threadless resolve commands failed: {error:#}"
+                ));
+                return;
+            }
+        };
+        let mut permission_cache: HashMap<String, bool> = HashMap::new();
+        let mut halted_pulls: HashSet<u64> = HashSet::new();
+        for command in commands.into_iter().take(THREADLESS_COMMAND_PASS_LIMIT) {
+            if halted_pulls.contains(&command.pull_number) {
+                continue;
+            }
+            match self
+                .apply_threadless_resolve_command_event(
+                    &api,
+                    repository,
+                    &command,
+                    &mut permission_cache,
+                )
+                .await
+            {
+                ThreadlessCommandDisposition::Done => {}
+                ThreadlessCommandDisposition::RetryPull => {
+                    halted_pulls.insert(command.pull_number);
+                }
+            }
         }
     }
 
     /// Apply one maintainer `@trouve-ai resolve`/`unresolve` command. The
     /// happy path acknowledges with a reaction on the command comment;
     /// anything the maintainer needs to correct is answered with a short
-    /// reply. Failures are recorded and never propagate — the durable row
-    /// keeps the command retryable until a definitive outcome consumes it.
+    /// reply. `RetryPull` marks a transient failure: the durable row stays,
+    /// and the caller halts this pull's later commands so ordering holds.
     async fn apply_threadless_resolve_command_event(
         &self,
+        api: &GithubApi,
         repository: &CodeReviewRepository,
         command: &crate::store::PendingThreadlessCommand,
-    ) {
-        let api = match self.installation_api(repository.installation_id).await {
-            Ok(api) => api,
-            Err(error) => {
-                self.record_review_error(format!(
-                    "authenticating threadless resolve command failed: {error:#}"
-                ));
-                return;
-            }
-        };
+        permission_cache: &mut HashMap<String, bool>,
+    ) -> ThreadlessCommandDisposition {
         // Author association is only a cheap pre-filter: MEMBER admits
         // read-only organization members and COLLABORATOR does not imply
         // write. Mutating durable review state requires the commenter's
         // current effective repository permission, checked authoritatively —
         // the same authority GitHub demands before someone could have
         // toggled the old dismissal checkboxes by editing the bot's comment.
-        match self
-            .commenter_has_write_permission(&api, &repository.repository, &command.author)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::info!(
-                    repository = %repository.repository,
-                    author = %command.author,
-                    "dropping threadless resolve command from a commenter without write permission"
-                );
-                // A definitive outcome: consume the row so an unauthorized
-                // command is not retried forever.
-                if let Err(error) = self.store.apply_threadless_resolve_command(
-                    &repository.repository,
-                    command.pull_number,
-                    "rvf_never-matches",
-                    command.resolve,
-                    "",
-                    Some(&command.trigger_key),
-                ) {
-                    self.record_review_error(format!(
-                        "consuming unauthorized threadless command failed: {error:#}"
-                    ));
+        let authorized = match permission_cache.get(&command.author) {
+            Some(authorized) => *authorized,
+            None => match self
+                .commenter_has_write_permission(api, &repository.repository, &command.author)
+                .await
+            {
+                Ok(authorized) => {
+                    permission_cache.insert(command.author.clone(), authorized);
+                    authorized
                 }
-                return;
-            }
-            Err(error) => {
-                // Transient: leave the row pending; the next repository poll
-                // retries the permission lookup.
-                self.record_review_error(format!(
-                    "verifying threadless resolve command permission failed: {error:#}"
-                ));
-                return;
-            }
-        }
+                Err(error) => {
+                    self.record_review_error(format!(
+                        "verifying threadless resolve command permission failed: {error:#}"
+                    ));
+                    return ThreadlessCommandDisposition::RetryPull;
+                }
+            },
+        };
         use crate::store::ThreadlessCommandOutcome;
+        if !authorized {
+            tracing::info!(
+                repository = %repository.repository,
+                author = %command.author,
+                "dropping threadless resolve command from a commenter without write permission"
+            );
+            // A definitive outcome: consume the row (via a prefix that can
+            // never match a finding) so an unauthorized command is not
+            // retried forever.
+            if let Err(error) = self.store.apply_threadless_resolve_command(
+                &repository.repository,
+                command.pull_number,
+                "rvf_never-matches",
+                command.resolve,
+                "",
+                Some(&command.trigger_key),
+            ) {
+                self.record_review_error(format!(
+                    "consuming unauthorized threadless command failed: {error:#}"
+                ));
+                return ThreadlessCommandDisposition::RetryPull;
+            }
+            return ThreadlessCommandDisposition::Done;
+        }
         // The stored reason carries attribution so the ledger and dashboard
         // show who decided and why, without a schema change. Both fields are
         // untrusted text and bounded.
@@ -10420,6 +10477,7 @@ impl Engine {
                 }
                 None
             }
+            Ok((ThreadlessCommandOutcome::AlreadyConsumed, _)) => None,
             Ok((ThreadlessCommandOutcome::AmbiguousPrefix { matches }, _)) => Some(format!(
                 "`{}` matches {matches} findings on this pull request; \
                  use more of the id shown in the review comment.",
@@ -10445,7 +10503,7 @@ impl Engine {
                 self.record_review_error(format!(
                     "applying threadless resolve command failed: {error:#}"
                 ));
-                None
+                return ThreadlessCommandDisposition::RetryPull;
             }
         };
         if let Some(message) = feedback {
@@ -10465,6 +10523,7 @@ impl Engine {
                 )),
             }
         }
+        ThreadlessCommandDisposition::Done
     }
 
     async fn apply_lifecycle_dismissal_edit(
@@ -26986,7 +27045,7 @@ mod tests {
         assert!(
             !engine
                 .store
-                .claim_github_webhook_delivery("delivery-thread-1", None)
+                .claim_github_webhook_delivery("delivery-thread-1", None, None)
                 .unwrap(),
             "the review-thread delivery must have been claimed by the handler"
         );
