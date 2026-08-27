@@ -100,6 +100,12 @@ const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
 /// batches stop paying off — call latency grows and reviewer attention
 /// dilutes — before large context windows run out.
 const REVIEW_BATCH_TARGET_TOKENS_MAX: usize = 96 * 1024;
+/// Tokens reserved for the request envelope around batch content — persona
+/// prompt, rubric, changed paths, and the model's own output — when sizing
+/// content against a small window.
+const REVIEW_PROMPT_ENVELOPE_RESERVE_TOKENS: usize = 8 * 1024;
+/// Floor for the derived batch token target on very small windows.
+const REVIEW_BATCH_TARGET_TOKENS_MIN: usize = 1_024;
 // Bump when batch identity or composition changes so interrupted jobs never
 // reuse routing or reviewer output against a differently assembled batch.
 // 3: batch budgets derive from the smallest configured model context window.
@@ -12063,6 +12069,9 @@ struct ReviewPromptBudgets {
     batch_target_tokens: usize,
     batch_max_bytes: usize,
     coordinator_context_max_bytes: usize,
+    history_findings_max_bytes: usize,
+    history_themes_max_bytes: usize,
+    history_rejections_max_bytes: usize,
 }
 
 impl Default for ReviewPromptBudgets {
@@ -12071,6 +12080,9 @@ impl Default for ReviewPromptBudgets {
             batch_target_tokens: REVIEW_BATCH_TARGET_TOKENS,
             batch_max_bytes: REVIEW_BATCH_MAX_BYTES,
             coordinator_context_max_bytes: REVIEW_COORDINATOR_CONTEXT_MAX_BYTES,
+            history_findings_max_bytes: REVIEW_HISTORY_FINDINGS_MAX_BYTES,
+            history_themes_max_bytes: REVIEW_HISTORY_THEMES_MAX_BYTES,
+            history_rejections_max_bytes: REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES,
         }
     }
 }
@@ -12085,21 +12097,33 @@ fn derived_review_prompt_budgets(smallest_context_window: Option<u64>) -> Review
     };
     let window = usize::try_from(window).unwrap_or(usize::MAX);
     // An eighth of the window is a conservative growth basis; the historical
-    // default stays the floor so behavior never regresses, the 4x ceiling
-    // bounds per-call latency, and half the window is a hard cap so the
-    // persona prompt, shared sections, and the model's own output always
-    // have room even on small local models.
+    // default stays the floor so behavior never regresses, and the 4x
+    // ceiling bounds per-call latency. On small windows the content ceiling
+    // first subtracts the request envelope (persona prompt, rubric, changed
+    // paths, output) and then halves what remains, so batch content can
+    // never crowd the envelope out of the window.
+    let content_ceiling = window.saturating_sub(REVIEW_PROMPT_ENVELOPE_RESERVE_TOKENS) / 2;
     let batch_target_tokens = (window / 8)
         .clamp(REVIEW_BATCH_TARGET_TOKENS, REVIEW_BATCH_TARGET_TOKENS_MAX)
-        .min(window / 2)
-        .max(1);
+        .min(content_ceiling)
+        .max(REVIEW_BATCH_TARGET_TOKENS_MIN);
     // Keep the historical bytes-per-token ratio (128KB for a 24K-token
     // target) between the token target and the byte ceilings.
     let batch_max_bytes = batch_target_tokens.saturating_mul(16) / 3;
+    // History sections travel inside the coordinator request alongside the
+    // diff context; on small windows they scale down with it (never up), so
+    // the dynamic envelope shrinks together with the content.
+    let scale = |bytes: usize| {
+        (bytes.saturating_mul(batch_max_bytes.min(REVIEW_BATCH_MAX_BYTES)) / REVIEW_BATCH_MAX_BYTES)
+            .max(4 * 1024)
+    };
     ReviewPromptBudgets {
         batch_target_tokens,
         batch_max_bytes,
         coordinator_context_max_bytes: batch_max_bytes,
+        history_findings_max_bytes: scale(REVIEW_HISTORY_FINDINGS_MAX_BYTES),
+        history_themes_max_bytes: scale(REVIEW_HISTORY_THEMES_MAX_BYTES),
+        history_rejections_max_bytes: scale(REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES),
     }
 }
 
@@ -12853,9 +12877,12 @@ fn validation_prompt(
             Ok(value)
         })
         .collect::<Result<Vec<_>>>()?;
-    let finding_history = compact_finding_history(finding_history)?;
-    let prior_candidate_rejections =
-        compact_candidate_rejection_history(prior_candidate_rejections)?;
+    let finding_history =
+        compact_finding_history(finding_history, budgets.history_findings_max_bytes)?;
+    let prior_candidate_rejections = compact_candidate_rejection_history(
+        prior_candidate_rejections,
+        budgets.history_rejections_max_bytes,
+    )?;
     // Escalate on semantic recurrence: a durable theme that has recurred
     // despite fixes is the root-cause form of fix churn, and it needs a
     // design-level recommendation rather than another point fix.
@@ -12892,7 +12919,7 @@ fn validation_prompt(
             count = recurring_themes.len(),
         )
     };
-    let previous_themes = compact_theme_history(previous_themes)?;
+    let previous_themes = compact_theme_history(previous_themes, budgets.history_themes_max_bytes)?;
     let external_comments = compact_external_review_comments(external_comments)?;
     let reuse_note = if reused_hunk_count == 0 {
         String::new()
@@ -13174,6 +13201,7 @@ fn compact_external_review_comments(
 
 fn compact_candidate_rejection_history(
     rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+    max_bytes: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let values = rejections.iter().map(|rejection| {
         serde_json::json!({
@@ -13186,7 +13214,7 @@ fn compact_candidate_rejection_history(
                 .unwrap_or("unknown"),
         })
     });
-    bounded_json_values(values, REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES)
+    bounded_json_values(values, max_bytes)
 }
 
 fn candidate_adjudication_fingerprint(path: &str, title: &str, body: &str) -> String {
@@ -13205,13 +13233,14 @@ fn candidate_adjudication_fingerprint(path: &str, title: &str, body: &str) -> St
 
 fn compact_finding_history(
     findings: &[trouve_protocol::CodeReviewFinding],
+    max_bytes: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let values = findings
         .iter()
         .rev()
         .map(compact_finding_value)
         .collect::<Result<Vec<_>>>()?;
-    bounded_json_values(values, REVIEW_HISTORY_FINDINGS_MAX_BYTES)
+    bounded_json_values(values, max_bytes)
 }
 
 fn bounded_json_text(value: &str, max_serialized_bytes: usize, marker: &str) -> String {
@@ -13343,13 +13372,14 @@ fn compact_theme_value(theme: &trouve_protocol::CodeReviewTheme) -> Result<serde
 
 fn compact_theme_history(
     themes: &[trouve_protocol::CodeReviewTheme],
+    max_bytes: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let values = themes
         .iter()
         .rev()
         .map(compact_theme_value)
         .collect::<Result<Vec<_>>>()?;
-    bounded_json_values(values, REVIEW_HISTORY_THEMES_MAX_BYTES)
+    bounded_json_values(values, max_bytes)
 }
 
 fn coordinator_diff_context(
@@ -20219,7 +20249,8 @@ mod tests {
             }))
             .unwrap();
         let findings = (0..100).map(|_| finding.clone()).collect::<Vec<_>>();
-        let compact = compact_finding_history(&findings).unwrap();
+        let compact =
+            compact_finding_history(&findings, REVIEW_HISTORY_FINDINGS_MAX_BYTES).unwrap();
         let encoded = serde_json::to_string(&compact).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_FINDINGS_MAX_BYTES);
         assert!(!encoded.contains("must not be copied"));
@@ -20257,7 +20288,8 @@ mod tests {
             }))
             .unwrap();
 
-        let findings = compact_finding_history(&[finding]).unwrap();
+        let findings =
+            compact_finding_history(&[finding], REVIEW_HISTORY_FINDINGS_MAX_BYTES).unwrap();
         let encoded = serde_json::to_string(&findings).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_FINDINGS_MAX_BYTES);
         assert_eq!(findings.len(), 1);
@@ -20302,7 +20334,7 @@ mod tests {
             compact_value_len < REVIEW_HISTORY_THEMES_MAX_BYTES,
             "compacted theme still uses {compact_value_len} bytes"
         );
-        let themes = compact_theme_history(&[theme]).unwrap();
+        let themes = compact_theme_history(&[theme], REVIEW_HISTORY_THEMES_MAX_BYTES).unwrap();
         let encoded = serde_json::to_string(&themes).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_THEMES_MAX_BYTES);
         assert_eq!(themes.len(), 1);
@@ -22889,9 +22921,14 @@ mod tests {
         let expected_fingerprint =
             candidate_adjudication_fingerprint(&rejection.path, &rejection.title, &rejection.body);
 
-        let history =
-            serde_json::to_string(&compact_candidate_rejection_history(&[rejection]).unwrap())
-                .unwrap();
+        let history = serde_json::to_string(
+            &compact_candidate_rejection_history(
+                &[rejection],
+                REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES,
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         assert!(history.contains(&expected_fingerprint));
         assert!(history.contains(r#""category":"false_positive""#));
@@ -25210,29 +25247,43 @@ mod tests {
 
         // A 400K-token window grows the target to window/8 = 50K tokens and
         // keeps the historical bytes-per-token ratio for the byte ceilings.
+        // History caps scale down only — never past their defaults.
         let large = derived_review_prompt_budgets(Some(400_000));
         assert_eq!(large.batch_target_tokens, 50_000);
         assert_eq!(large.batch_max_bytes, 50_000 * 16 / 3);
         assert_eq!(large.coordinator_context_max_bytes, large.batch_max_bytes);
+        assert_eq!(
+            large.history_findings_max_bytes,
+            REVIEW_HISTORY_FINDINGS_MAX_BYTES
+        );
 
         // Growth caps at 4x the fixed default even for very large windows.
         let huge = derived_review_prompt_budgets(Some(1_050_000));
         assert_eq!(huge.batch_target_tokens, REVIEW_BATCH_TARGET_TOKENS_MAX);
 
-        // A window at or below the fixed default's comfort zone shrinks the
-        // target to half the window so the prompt envelope and output fit.
+        // A small window subtracts the request envelope before halving, so
+        // batch content can never crowd the persona prompt and output out of
+        // the window, and the history caps shrink with the content.
         let small = derived_review_prompt_budgets(Some(32_000));
-        assert_eq!(small.batch_target_tokens, 16_000);
+        assert_eq!(
+            small.batch_target_tokens,
+            (32_000 - REVIEW_PROMPT_ENVELOPE_RESERVE_TOKENS) / 2
+        );
+        assert!(small.history_findings_max_bytes < REVIEW_HISTORY_FINDINGS_MAX_BYTES);
+        assert!(small.history_themes_max_bytes < REVIEW_HISTORY_THEMES_MAX_BYTES);
+        assert!(small.history_rejections_max_bytes >= 4 * 1024);
         let tiny = derived_review_prompt_budgets(Some(8_000));
-        assert_eq!(tiny.batch_target_tokens, 4_000);
+        assert_eq!(tiny.batch_target_tokens, REVIEW_BATCH_TARGET_TOKENS_MIN);
 
-        // A window exactly at the historical break-even keeps the default.
+        // A window at or below the fixed default's comfort zone keeps every
+        // default budget.
         let default_window = derived_review_prompt_budgets(Some(8 * 24 * 1024));
         assert_eq!(
             default_window.batch_target_tokens,
             REVIEW_BATCH_TARGET_TOKENS
         );
         assert_eq!(default_window.batch_max_bytes, REVIEW_BATCH_MAX_BYTES);
+        assert_eq!(default_window, ReviewPromptBudgets::default());
     }
 
     #[test]
