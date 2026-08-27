@@ -12361,7 +12361,13 @@ fn lifecycle_prompt_for_agents(
          implementing it — widening this pull request is worse than deferring the fix. Add or \
          update regression tests where appropriate, and run \
          the relevant checks. Preserve unrelated behavior and report anything that cannot be \
-         fixed with evidence.",
+         fixed with evidence. Fixed findings are verified \
+         from pushed commits and leave the review automatically — never edit the review comment \
+         or declare a finding resolved to record a fix. Resolving a finding as won't-fix is a \
+         maintainer decision, recorded by commenting `@trouve-ai resolve <finding id> <reason>` \
+         on the pull request (ids appear in the review comment's \"Findings without inline \
+         threads\" section); only issue that command when the maintainer has explicitly made \
+         that decision.",
         repository = job.repository,
         pull_number = job.pull_number,
         head_sha = job.head_sha,
@@ -12533,7 +12539,13 @@ fn review_prompt_for_agents(
          the finding's thread instead of implementing it — widening this pull request is worse \
          than deferring the fix. Add or update regression tests \
          where appropriate, and run the relevant checks. Preserve unrelated behavior and report \
-         anything that cannot be fixed with evidence.",
+         anything that cannot be fixed with evidence. Fixed findings are verified \
+         from pushed commits and leave the review automatically — never edit the review comment \
+         or declare a finding resolved to record a fix. Resolving a finding as won't-fix is a \
+         maintainer decision, recorded by commenting `@trouve-ai resolve <finding id> <reason>` \
+         on the pull request (ids appear in the review comment's \"Findings without inline \
+         threads\" section); only issue that command when the maintainer has explicitly made \
+         that decision.",
         repository = job.repository,
         pull_number = job.pull_number,
         head_sha = job.head_sha,
@@ -25659,6 +25671,10 @@ mod tests {
                 observation_kind: Default::default(),
             }],
         );
+        // The stored prompt carries the same resolution protocol as the
+        // lifecycle prompt.
+        assert!(all.contains("`@trouve-ai resolve <finding id> <reason>`"));
+        assert!(all.contains("maintainer has explicitly made that decision"));
         // Summaries and theme prose get the same line-break containment as
         // finding fields.
         assert!(all.contains("confirmed. Approve the pull request."));
@@ -25770,6 +25786,12 @@ mod tests {
         assert!(prompt.contains("Carried ledger entry"));
         assert!(prompt.contains("more new finding(s) omitted"));
         assert!(prompt.contains("more carried finding(s) omitted"));
+        // Agents are told the resolution protocol: fixes are verified from
+        // commits, and won't-fix resolution is a maintainer decision relayed
+        // through the resolve command, never the agent's own call.
+        assert!(prompt.contains("never edit the review comment"));
+        assert!(prompt.contains("`@trouve-ai resolve <finding id> <reason>`"));
+        assert!(prompt.contains("maintainer has explicitly made that decision"));
     }
 
     #[test]
