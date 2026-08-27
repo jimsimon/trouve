@@ -15096,42 +15096,50 @@ fn finding_anchor_content(
     if !candidate.starts_with(&root) {
         return None;
     }
-    let file = std::fs::File::open(&candidate).ok()?;
-    let opened = file.metadata().ok()?;
-    // Anchor verification reads source files; anything larger than the
-    // anchor-blob bound is not a reviewable source file.
-    if opened.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 {
-        return None;
-    }
-    // The confinement check above validated a pathname, not the object this
-    // handle opened: a concurrent checkout sync could swap a symlink in
-    // between. Re-resolve after opening and require the open descriptor to
-    // be the very object now at the confined path, so the read below is
-    // bound to a checked filesystem object rather than a mutable name.
-    let recheck = std::fs::canonicalize(root.join(relative)).ok()?;
-    if !recheck.starts_with(&root) {
-        return None;
+    // Without descriptor identity (stable std exposes it only on unix), an
+    // opened handle cannot be bound to the confined object, so non-unix
+    // builds never read the checkout: the anchor degrades to unchecked
+    // instead of trusting a mutable pathname.
+    #[cfg(not(unix))]
+    {
+        None
     }
     #[cfg(unix)]
     {
+        use std::io::Read;
         use std::os::unix::fs::MetadataExt;
+
+        let file = std::fs::File::open(&candidate).ok()?;
+        let opened = file.metadata().ok()?;
+        // Anchor verification reads source files; anything larger than the
+        // anchor-blob bound is not a reviewable source file.
+        if opened.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 {
+            return None;
+        }
+        // The confinement check above validated a pathname, not the object
+        // this handle opened: a concurrent checkout sync could swap a
+        // symlink in between. Re-resolve after opening and require the open
+        // descriptor to be the very object now at the confined path, so the
+        // read below is bound to a checked filesystem object rather than a
+        // mutable name.
+        let recheck = std::fs::canonicalize(root.join(relative)).ok()?;
+        if !recheck.starts_with(&root) {
+            return None;
+        }
         let current = std::fs::metadata(&recheck).ok()?;
         if current.dev() != opened.dev() || current.ino() != opened.ino() {
             return None;
         }
-    }
-    let mut text = String::new();
-    {
-        use std::io::Read;
+        let mut text = String::new();
         file.take(REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 + 1)
             .read_to_string(&mut text)
             .ok()?;
+        if text.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES {
+            return None;
+        }
+        let index = usize::try_from(finding.line).ok()?.checked_sub(1)?;
+        text.lines().nth(index).map(str::to_owned)
     }
-    if text.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES {
-        return None;
-    }
-    let index = usize::try_from(finding.line).ok()?.checked_sub(1)?;
-    text.lines().nth(index).map(str::to_owned)
 }
 
 /// Mechanical verdict for a coordinator-quoted anchor line against the
