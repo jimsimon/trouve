@@ -573,14 +573,16 @@ impl ReviewReconciliationCandidate {
 
 fn review_reconciliation_order_key(
     candidate: &(String, u64),
-    priority_pull: Option<u64>,
+    priority: Option<&(String, u64)>,
     reconciled_at: &HashMap<(String, u64), Instant>,
     progress_keys: &HashSet<(String, u64)>,
 ) -> (bool, Option<Instant>, bool, (String, u64)) {
     (
-        // A pull named by a review-thread webhook reconciles first, ahead of
-        // the least-recently-reconciled rotation.
-        priority_pull != Some(candidate.1),
+        // The pull named by a review-thread webhook reconciles first, ahead
+        // of the least-recently-reconciled rotation. The complete
+        // (repository, pull) key is compared so an unrelated repository's
+        // identically numbered pull can never claim the priority slot.
+        priority != Some(candidate),
         reconciled_at.get(candidate).copied(),
         !progress_keys.contains(candidate),
         candidate.clone(),
@@ -3805,7 +3807,7 @@ impl Engine {
     async fn reconcile_oldest_review_thread_candidate(
         &self,
         candidates: &[ReviewReconciliationCandidate],
-        priority_pull: Option<u64>,
+        priority: Option<&(String, u64)>,
     ) -> Result<()> {
         let deadline = Instant::now() + REVIEW_RECONCILIATION_PASS_BUDGET;
         let progress_keys = self
@@ -3826,7 +3828,7 @@ impl Engine {
         let mut ordered = candidates.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|candidate| {
             let key = candidate.key();
-            review_reconciliation_order_key(&key, priority_pull, &reconciled_at, &progress_keys)
+            review_reconciliation_order_key(&key, priority, &reconciled_at, &progress_keys)
         });
 
         let mut first_error = None;
@@ -4257,6 +4259,7 @@ impl Engine {
         }
         if let Some(repository) = repository {
             let engine = self.clone();
+            let priority_key = review_thread_pull.map(|pull| (repository.repository.clone(), pull));
             tokio::spawn(async move {
                 let _guard = engine.code_review.reconcile_lock.lock().await;
                 if let Some((comment_id, edited_at, states)) = &lifecycle_checkbox_edit
@@ -4298,7 +4301,7 @@ impl Engine {
                 } else if let Err(error) = engine
                     .reconcile_oldest_review_thread_candidate(
                         &reconciliation_candidates,
-                        review_thread_pull,
+                        priority_key.as_ref(),
                     )
                     .await
                 {
@@ -15542,19 +15545,24 @@ mod tests {
         });
         assert_eq!(tied, vec![left, right]);
 
-        // A pull named by a review-thread webhook jumps the rotation even
-        // when it was reconciled most recently.
+        // The pull named by a review-thread webhook jumps the rotation even
+        // when it was reconciled most recently — and only the complete
+        // (repository, pull) key claims the slot, never another repository's
+        // identically numbered pull.
         let stale = ("acme/widgets".to_owned(), 7);
         let fresh = ("acme/widgets".to_owned(), 42);
+        let other_repo = ("acme/gadgets".to_owned(), 42);
         let ages = HashMap::from([
             (stale.clone(), now - Duration::from_secs(600)),
             (fresh.clone(), now),
+            (other_repo.clone(), now - Duration::from_secs(1_200)),
         ]);
-        let mut prioritized = vec![stale.clone(), fresh.clone()];
+        let priority = ("acme/widgets".to_owned(), 42);
+        let mut prioritized = vec![stale.clone(), other_repo.clone(), fresh.clone()];
         prioritized.sort_by_key(|candidate| {
-            review_reconciliation_order_key(candidate, Some(42), &ages, &HashSet::new())
+            review_reconciliation_order_key(candidate, Some(&priority), &ages, &HashSet::new())
         });
-        assert_eq!(prioritized, vec![fresh, stale]);
+        assert_eq!(prioritized, vec![fresh, other_repo, stale]);
     }
 
     #[test]
