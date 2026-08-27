@@ -2217,7 +2217,11 @@ pub struct Engine {
     github_dashboard_publication: Mutex<()>,
     /// Serializes provider upserts and deletions across config, secret-store,
     /// and registry mutations without blocking unrelated provider ids.
-    provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    provider_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Orders asynchronous backend teardown with registry replacement and
+    /// managed-runtime removal. A replacement backend is never published
+    /// while the previous backend still owns vendor child processes.
+    provider_reload: tokio::sync::Mutex<()>,
     /// Serializes persona-file mutations with durable deletion replay so a
     /// recreate cannot race a pending cleanup of the same user-level file.
     pub(crate) persona_mutations: Arc<tokio::sync::Mutex<()>>,
@@ -2655,6 +2659,7 @@ impl Engine {
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
+            provider_reload: tokio::sync::Mutex::new(()),
             persona_mutations: Arc::new(tokio::sync::Mutex::new(())),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
@@ -3513,7 +3518,7 @@ impl Engine {
 
     /// Create or update a provider. The API key (when present) goes to the
     /// secret store; the config file only holds non-secret settings.
-    pub fn upsert_provider(
+    pub async fn upsert_provider(
         &self,
         id: &str,
         req: &UpsertProviderRequest,
@@ -3542,7 +3547,7 @@ impl Engine {
             ));
         }
         let provider_lock = self.provider_lock(id);
-        let _provider_guard = provider_lock.lock().unwrap();
+        let _provider_guard = provider_lock.lock().await;
         if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
             self.secrets
                 .set(&trouve_providers::secrets::api_key_secret(id), key)
@@ -3560,7 +3565,13 @@ impl Engine {
         {
             let mut config = self.config.lock().unwrap();
             let entry = config.providers.entry(id.to_string()).or_default();
+            let migrating_legacy_cursor = entry.kind == "cursor-cli" && req.kind == "cursor-sdk";
             entry.kind = req.kind.clone();
+            if migrating_legacy_cursor {
+                // cursor-agent speaks ACP, not the Agent SDK Bridge protocol.
+                // Treat kind + runtime command as one server-owned migration.
+                entry.command = None;
+            }
             if let Some(base_url) = req.base_url.clone().filter(|url| !url.is_empty()) {
                 entry.base_url = Some(base_url);
             }
@@ -3602,7 +3613,7 @@ impl Engine {
             }
             self.persist_config(&config);
         }
-        self.reload_providers();
+        self.reload_providers().await?;
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
         let pc = config.providers.get(id).cloned().unwrap_or_default();
@@ -3625,9 +3636,9 @@ impl Engine {
     }
 
     /// Remove a provider from the config and its stored API key.
-    pub fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
         let provider_lock = self.provider_lock(id);
-        let _provider_guard = provider_lock.lock().unwrap();
+        let _provider_guard = provider_lock.lock().await;
         let secret_names = {
             let mut config = self.config.lock().unwrap();
             let removed = config
@@ -3648,16 +3659,16 @@ impl Engine {
                 .secrets
                 .delete(&trouve_providers::secrets::provider_secret(id, &name));
         }
-        self.reload_providers();
+        self.reload_providers().await?;
         Ok(())
     }
 
-    fn provider_lock(&self, id: &str) -> Arc<Mutex<()>> {
+    fn provider_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.provider_locks
             .lock()
             .unwrap()
             .entry(id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
 
@@ -3749,7 +3760,7 @@ impl Engine {
             let id = id.to_string();
             tokio::spawn(async move {
                 let result = oauth_flow::device_poll(&oauth, &device).await;
-                engine.finish_login(&id, result);
+                engine.finish_login(&id, result).await;
             });
             Ok(started)
         } else if oauth.authorization_url.is_some() {
@@ -3796,7 +3807,7 @@ impl Engine {
                         .await
                 }
                 .await;
-                engine.finish_login(&id, result);
+                engine.finish_login(&id, result).await;
             });
             Ok(started)
         } else {
@@ -3996,21 +4007,59 @@ impl Engine {
                         progress: progress.clone(),
                     },
                 );
-                match trouve_agents::install::install(&engine.data_dir, cli, &version, &progress)
+                if cli == trouve_agents::install::CliId::CursorSdkBridge {
+                    // Close admission and reap every warm Bridge before the
+                    // stable managed binary changes. Keep the transition lock
+                    // until a fresh backend registry has been published.
+                    let _transition = engine.provider_reload.lock().await;
+                    let install_result = match engine.shutdown_config_backends().await {
+                        Ok(()) => {
+                            match trouve_agents::install::install(
+                                &engine.data_dir,
+                                cli,
+                                &version,
+                                &progress,
+                            )
+                            .await
+                            {
+                                Ok(_) => Ok(Some(version)),
+                                Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        Err(error) => {
+                            Err(format!("stopping the active Cursor SDK runtime: {error}"))
+                        }
+                    };
+                    // A failed or cancelled install must also replace the
+                    // closed old pool so the prior managed/PATH runtime can
+                    // accept turns again.
+                    engine.replace_provider_registries();
+                    install_result
+                } else {
+                    match trouve_agents::install::install(
+                        &engine.data_dir,
+                        cli,
+                        &version,
+                        &progress,
+                    )
                     .await
-                {
-                    Ok(_) => Ok(Some(version)),
-                    Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
-                    Err(e) => Err(e.to_string()),
+                    {
+                        Ok(_) => {
+                            engine.reload_providers().await.map_err(|error| {
+                                format!("reloading providers after runtime install: {error}")
+                            })?;
+                            Ok(Some(version))
+                        }
+                        Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                    }
                 }
             }
             .await;
             let mut installs = engine.cli_installs.lock().unwrap();
             match result {
                 Ok(Some(version)) => {
-                    // The managed binary now exists; rebuild backends so it
-                    // takes over from any PATH resolution.
-                    engine.reload_providers();
                     engine.cli_latest.lock().unwrap().remove(id_owned.as_str());
                     installs.insert(id_owned, CliInstallState::Success(version));
                 }
@@ -4064,12 +4113,19 @@ impl Engine {
             self.local_manager.stop().await;
             self.title_model.stop().await;
         }
-        trouve_agents::install::uninstall(&self.data_dir, cli)
-            .map_err(|e| EngineError::Internal(e.into()))?;
+        let _transition = self.provider_reload.lock().await;
+        self.shutdown_config_backends().await?;
+        let uninstall = trouve_agents::install::uninstall(&self.data_dir, cli)
+            .map_err(|e| EngineError::Internal(e.into()));
         // Drop any stale success/failed state so status reads "none", and
         // rebuild backends so they fall back to PATH resolution (or none).
-        self.cli_installs.lock().unwrap().remove(state_id);
-        self.reload_providers();
+        if uninstall.is_ok() {
+            self.cli_installs.lock().unwrap().remove(state_id);
+        }
+        // Even on a filesystem error, replace the now-closed backend pool so
+        // the still-installed runtime can accept turns again.
+        self.replace_provider_registries();
+        uninstall?;
         Ok(())
     }
 
@@ -4926,7 +4982,7 @@ impl Engine {
         Ok(self.login_status(id))
     }
 
-    fn finish_login(
+    async fn finish_login(
         &self,
         id: &str,
         result: Result<trouve_providers::auth::OAuthTokens, trouve_providers::ProviderError>,
@@ -4938,10 +4994,12 @@ impl Engine {
                     self.secrets
                         .set(&trouve_providers::secrets::oauth_secret(id), &raw)
                 }) {
-                Ok(()) => {
-                    self.reload_providers();
-                    LoginState::Success
-                }
+                Ok(()) => match self.reload_providers().await {
+                    Ok(()) => LoginState::Success,
+                    Err(error) => {
+                        LoginState::Failed(format!("reloading providers after login: {error}"))
+                    }
+                },
                 Err(e) => LoginState::Failed(format!("storing tokens: {e}")),
             },
             Err(e) => LoginState::Failed(e.to_string()),
@@ -5103,12 +5161,18 @@ impl Engine {
         self.title_model
             .start_install(move || {
                 if let Some(engine) = engine.upgrade() {
-                    engine.reload_providers();
-                    engine
-                        .cli_latest
-                        .lock()
-                        .unwrap()
-                        .remove(trouve_agents::install::CliId::LlamaServer.as_str());
+                    tokio::spawn(async move {
+                        if let Err(error) = engine.reload_providers().await {
+                            tracing::warn!(
+                                "failed to reload providers after title-model install: {error}"
+                            );
+                        }
+                        engine
+                            .cli_latest
+                            .lock()
+                            .unwrap()
+                            .remove(trouve_agents::install::CliId::LlamaServer.as_str());
+                    });
                 }
             })
             .map_err(|error| EngineError::Conflict(error.to_string()))?;
@@ -5201,9 +5265,40 @@ impl Engine {
         }
     }
 
-    /// Rebuild the provider registry from the current config (after provider
-    /// CRUD), preserving programmatically injected providers.
-    fn reload_providers(&self) {
+    /// Stop config-owned agent backends while leaving programmatically
+    /// injected test/embedder backends under their caller's ownership.
+    async fn shutdown_config_backends(&self) -> Result<(), EngineError> {
+        let injected = self
+            .injected_backends
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let retiring = self
+            .backends
+            .read()
+            .unwrap()
+            .values()
+            .filter(|backend| {
+                !injected
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, backend))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for backend in retiring {
+            backend
+                .shutdown()
+                .await
+                .map_err(|error| EngineError::Internal(error.into()))?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild registries after their previous config-owned backends have
+    /// completed asynchronous teardown.
+    fn replace_provider_registries(&self) {
         let config = self.config.lock().unwrap().clone();
         let mut rebuilt = build_all_providers(&config, &self.secrets, &self.model_catalog);
         for (id, p) in self.injected_providers.lock().unwrap().iter() {
@@ -5221,6 +5316,16 @@ impl Engine {
         // survives the reload (the old instances' forwarders end when their
         // senders drop).
         self.intake_background_turn_signals();
+    }
+
+    /// Rebuild the provider registry from the current config (after provider
+    /// CRUD), preserving programmatically injected providers. Long-lived
+    /// vendor children are reaped before a replacement registry is visible.
+    async fn reload_providers(&self) -> Result<(), EngineError> {
+        let _transition = self.provider_reload.lock().await;
+        self.shutdown_config_backends().await?;
+        self.replace_provider_registries();
+        Ok(())
     }
 
     pub fn thread_usage(
@@ -25656,8 +25761,8 @@ default_permission_mode = "ask"
         unsafe { std::env::remove_var(ENV_ONLY) };
     }
 
-    #[test]
-    fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
+    #[tokio::test]
+    async fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
         let data = tempfile::tempdir().unwrap();
         let custom_base_url = "https://custom.azure.test/openai".to_string();
         let custom_headers =
@@ -25688,6 +25793,7 @@ default_permission_mode = "ask"
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         let config = engine.config.lock().unwrap();
@@ -25695,6 +25801,42 @@ default_permission_mode = "ask"
         assert_eq!(provider.base_url.as_deref(), Some(custom_base_url.as_str()));
         assert_eq!(provider.headers, custom_headers);
         assert_eq!(provider.query_params, custom_query);
+    }
+
+    #[tokio::test]
+    async fn cursor_sdk_migration_clears_the_legacy_acp_command() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-cli".into(),
+                command: Some("/legacy/bin/cursor-agent".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+
+        engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = engine.config.lock().unwrap();
+        let provider = config.providers.get("cursor").unwrap();
+        assert_eq!(provider.kind, "cursor-sdk");
+        assert_eq!(provider.command, None);
+        assert_eq!(configured_runtime_command(provider), None);
     }
 
     #[test]
@@ -25730,7 +25872,13 @@ default_permission_mode = "ask"
 
         let deleting = {
             let engine = engine.clone();
-            std::thread::spawn(move || engine.delete_provider(ID))
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(engine.delete_provider(ID))
+            })
         };
         secret_store.delete_started.wait();
 
@@ -25740,15 +25888,19 @@ default_permission_mode = "ask"
             let engine = engine.clone();
             std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
-                let result = engine.upsert_provider(
-                    ID,
-                    &UpsertProviderRequest {
-                        kind: "openai-compat".into(),
-                        base_url: Some("https://new.example.test/v1".into()),
-                        api_key: Some("new".into()),
-                        ..Default::default()
-                    },
-                );
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(engine.upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://new.example.test/v1".into()),
+                            api_key: Some("new".into()),
+                            ..Default::default()
+                        },
+                    ));
                 done_tx.send(result).unwrap();
             })
         };

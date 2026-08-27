@@ -9,9 +9,10 @@
 //! - `<id>/installed.json`    — pointer to the active version + binary
 //! - `bin/<id>`               — stable symlink backends resolve at spawn
 //!
-//! Sources (no custom mirrors, no version pinning by us):
-//! - cursor-sdk-bridge: GitHub `cursor/sdk-bridge` release tarball plus the
-//!   release's `SHA256SUMS.txt`
+//! Sources (no custom mirrors):
+//! - cursor-sdk-bridge: one independently reviewed GitHub `cursor/sdk-bridge`
+//!   release whose per-platform digests are pinned below; the release's
+//!   `SHA256SUMS.txt` is checked as corroborating metadata, not trusted alone
 //! - claude: `downloads.claude.ai/claude-code-releases` (`latest` + manifest
 //!   with sha256 checksums; single static binary)
 //! - codex: GitHub `openai/codex` latest release tarball (musl build on Linux)
@@ -25,6 +26,48 @@ use sha2::Digest;
 const MAX_TEXT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RUNTIME_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const CURSOR_SDK_BRIDGE_REVIEWED_VERSION: &str = "1.0.28";
+
+fn cursor_sdk_bridge_reviewed_checksum(version: &str, asset: &str) -> Option<&'static str> {
+    if version != CURSOR_SDK_BRIDGE_REVIEWED_VERSION {
+        return None;
+    }
+    match asset {
+        "cursor-sdk-bridge-standalone-darwin-arm64.tar.gz" => {
+            Some("52ebfdab4e7806270122bea6c8f972646516297343c483e6700b37d444515af5")
+        }
+        "cursor-sdk-bridge-standalone-darwin-x64.tar.gz" => {
+            Some("ba59c6eaad62338118e59ceb6d24006e06f7c75b28e32dbc13950c4027511c3c")
+        }
+        "cursor-sdk-bridge-standalone-linux-arm64.tar.gz" => {
+            Some("0222f5c60c88b82063a0547bd938945c777c2a470def69de6464c04470ae0560")
+        }
+        "cursor-sdk-bridge-standalone-linux-x64.tar.gz" => {
+            Some("5357a42d3faa668a3ef25c6669fe576544b032dd17fabbbfa515355cd8d33c19")
+        }
+        "cursor-sdk-bridge-standalone-win32-x64.tar.gz" => {
+            Some("8af767f8b60f48ccf9147ce89085cd1956a5a1b8c66d26ff078cc1bd193f2ebb")
+        }
+        _ => None,
+    }
+}
+
+fn verify_cursor_sdk_bridge_digests(
+    asset: &str,
+    reviewed: &str,
+    manifest: &str,
+    actual: &str,
+) -> Result<(), InstallError> {
+    if manifest != reviewed {
+        return Err(InstallError::Checksum(format!(
+            "{asset} release manifest did not match Trouve's reviewed digest"
+        )));
+    }
+    if actual != reviewed {
+        return Err(InstallError::Checksum(asset.into()));
+    }
+    Ok(())
+}
 
 /// A vendor agent runtime trouve knows how to install. `id` doubles as the
 /// binary name and the legacy API path segment.
@@ -275,10 +318,10 @@ async fn latest_version_controlled(
     progress: Option<&Progress>,
 ) -> Result<String, InstallError> {
     match id {
-        CliId::CursorSdkBridge => Ok(github_latest_tag("cursor/sdk-bridge", progress)
-            .await?
-            .trim_start_matches('v')
-            .to_string()),
+        // Managed execution stays on a release whose bytes were reviewed
+        // independently of Cursor's mutable release assets. A newer Bridge is
+        // promoted by updating this pin and its platform digests together.
+        CliId::CursorSdkBridge => Ok(CURSOR_SDK_BRIDGE_REVIEWED_VERSION.into()),
         CliId::Claude => {
             let v = get_text_controlled(
                 "https://downloads.claude.ai/claude-code-releases/latest",
@@ -590,9 +633,11 @@ pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
 }
 
 fn remove_legacy_cursor_agent(data_dir: &Path) -> std::io::Result<()> {
-    let legacy_link = data_dir.join("cli").join("bin").join("cursor-agent");
-    if legacy_link.symlink_metadata().is_ok() {
-        std::fs::remove_file(legacy_link)?;
+    for executable in ["cursor-agent", "cursor-agent.exe"] {
+        let legacy_link = data_dir.join("cli").join("bin").join(executable);
+        if legacy_link.symlink_metadata().is_ok() {
+            std::fs::remove_file(legacy_link)?;
+        }
     }
     let legacy_root = data_dir.join("cli").join("cursor-agent");
     if legacy_root.exists() {
@@ -621,11 +666,17 @@ async fn install_into(
         CliId::CursorSdkBridge => {
             let (os, arch) = cursor_sdk_bridge_platform()?;
             let asset = format!("cursor-sdk-bridge-standalone-{os}-{arch}.tar.gz");
+            let reviewed =
+                cursor_sdk_bridge_reviewed_checksum(version, &asset).ok_or_else(|| {
+                    InstallError::Unsupported(format!(
+                        "Cursor SDK Bridge {version} ({asset}) has no independently reviewed digest"
+                    ))
+                })?;
             let base = format!("https://github.com/cursor/sdk-bridge/releases/download/v{version}");
             let sums = get_text_with_progress(&format!("{base}/SHA256SUMS.txt"), progress).await?;
             let url = format!("{base}/{asset}");
             let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
-            let expected = checksum_for_asset(&sums, &asset).ok_or_else(|| {
+            let manifest = checksum_for_asset(&sums, &asset).ok_or_else(|| {
                 InstallError::Download(format!("SHA256SUMS.txt had no entry for {asset}"))
             })?;
             let actual = sha2::Sha256::digest(&bytes).iter().fold(
@@ -635,9 +686,7 @@ async fn install_into(
                     output
                 },
             );
-            if actual != expected {
-                return Err(InstallError::Checksum(asset));
-            }
+            verify_cursor_sdk_bridge_digests(&asset, reviewed, &manifest, &actual)?;
             untar_gz(bytes, dir).await?;
             let executable = if cfg!(windows) {
                 "cursor-sdk-bridge.exe"
@@ -1159,6 +1208,29 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
+    fn cursor_sdk_execution_trusts_only_reviewed_release_digests() {
+        let asset = "cursor-sdk-bridge-standalone-linux-x64.tar.gz";
+        let reviewed =
+            cursor_sdk_bridge_reviewed_checksum(CURSOR_SDK_BRIDGE_REVIEWED_VERSION, asset);
+        assert_eq!(
+            reviewed,
+            Some("5357a42d3faa668a3ef25c6669fe576544b032dd17fabbbfa515355cd8d33c19")
+        );
+        assert!(matches!(
+            verify_cursor_sdk_bridge_digests(asset, reviewed.unwrap(), "00", "00"),
+            Err(InstallError::Checksum(_))
+        ));
+        assert_eq!(cursor_sdk_bridge_reviewed_checksum("1.0.29", asset), None);
+        assert_eq!(
+            cursor_sdk_bridge_reviewed_checksum(
+                CURSOR_SDK_BRIDGE_REVIEWED_VERSION,
+                "cursor-sdk-bridge-standalone-plan9-x64.tar.gz"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn installed_reads_pointer_when_binary_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
@@ -1242,6 +1314,8 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         std::fs::write(legacy_root.join("installed.json"), "legacy").unwrap();
         let legacy_link = tmp.path().join("cli").join("bin").join("cursor-agent");
         std::fs::write(&legacy_link, "legacy").unwrap();
+        let legacy_windows_link = tmp.path().join("cli").join("bin").join("cursor-agent.exe");
+        std::fs::write(&legacy_windows_link, "legacy windows").unwrap();
         let external = tmp.path().join("system-cursor-agent");
         std::fs::write(&external, "outside trouve's managed layout").unwrap();
 
@@ -1251,6 +1325,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         assert!(sdk_link.symlink_metadata().is_err());
         assert!(!legacy_root.exists());
         assert!(legacy_link.symlink_metadata().is_err());
+        assert!(legacy_windows_link.symlink_metadata().is_err());
         assert!(external.exists());
     }
 

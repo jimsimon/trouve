@@ -490,6 +490,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 
 binary = os.path.abspath(sys.argv[0])
 count_path = binary + ".spawns"
@@ -635,9 +636,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # The callback is always adapter-owned loopback traffic.
                     # Bypass urllib's macOS system-proxy discovery so bridge
                     # startup never depends on platform proxy initialization.
-                    callback_port = int(callback_url.rsplit(":", 1)[1].rstrip("/"))
+                    callback_parts = urllib.parse.urlsplit(callback_url)
                     connection = http.client.HTTPConnection(
-                        "127.0.0.1", callback_port, timeout=10
+                        callback_parts.hostname, callback_parts.port, timeout=10
                     )
                     try:
                         connection.request(
@@ -746,6 +747,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cancel_received.set()
             response = {}
         elif self.path.endswith("/Shutdown"):
+            with open(binary + ".shutdown", "w", encoding="utf-8") as destination:
+                destination.write("shutdown")
             response = {}
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         else:
@@ -975,6 +978,12 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
         serde_json::json!({ "url": "", "authToken": "" })
     );
     assert_eq!(calls.lock().await.len(), 1);
+    backend.shutdown().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.shutdown")).unwrap(),
+        "shutdown",
+        "backend shutdown must gracefully stop its retained warm Bridge"
+    );
     mcp_task.abort();
 }
 

@@ -329,6 +329,10 @@ impl AgentBackend for CursorBackend {
         })
     }
 
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        self.pool.shutdown().await
+    }
+
     async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
         (!turn.tool_free).then_some(BackendStartupActivity::ConnectingTools)
     }
@@ -414,6 +418,8 @@ enum TurnTerminal {
 struct BridgePool {
     processes: Mutex<HashMap<String, Arc<PooledBridge>>>,
     thread_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    lifecycle: RwLock<()>,
+    closed: AtomicBool,
     capacity: Arc<Semaphore>,
     available: Arc<Notify>,
     reaper_started: AtomicBool,
@@ -424,6 +430,8 @@ impl Default for BridgePool {
         Self {
             processes: Mutex::new(HashMap::new()),
             thread_gates: Mutex::new(HashMap::new()),
+            lifecycle: RwLock::new(()),
+            closed: AtomicBool::new(false),
             capacity: Arc::new(Semaphore::new(POOL_CAP)),
             available: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
@@ -479,6 +487,15 @@ impl BridgePool {
         thread_id: &str,
         request: BridgeProcessRequest<'_>,
     ) -> Result<BridgeLease, BackendError> {
+        // Shutdown owns the write side until every retained process is reaped.
+        // Holding this read guard through admission makes a racing spawn either
+        // visible to shutdown or fail after shutdown has closed the pool.
+        let _lifecycle = self.lifecycle.read().await;
+        if !self.is_open() {
+            return Err(BackendError::Protocol(
+                "Cursor SDK Bridge pool is shutting down".into(),
+            ));
+        }
         if request.cancel.is_cancelled() || request.events.is_closed() {
             return Err(BackendError::Cancelled);
         }
@@ -601,6 +618,9 @@ impl BridgePool {
     }
 
     async fn reap_idle(&self) {
+        if !self.is_open() {
+            return;
+        }
         while let Some((thread_id, process, guard)) = self.take_evictable(Some(IDLE_TIMEOUT)).await
         {
             match process.terminate().await {
@@ -616,6 +636,46 @@ impl BridgePool {
                     break;
                 }
             }
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
+    }
+
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        let _lifecycle = self.lifecycle.write().await;
+        self.closed.store(true, Ordering::Release);
+        let mut first_error = None;
+        loop {
+            let thread_ids = self
+                .processes
+                .lock()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            if thread_ids.is_empty() {
+                break;
+            }
+            for thread_id in thread_ids {
+                let gate = self.thread_gate(&thread_id).await;
+                let _guard = gate.lock_owned().await;
+                let process = self.processes.lock().await.remove(&thread_id);
+                let Some(process) = process else {
+                    continue;
+                };
+                process.quarantine();
+                if let Err(error) = process.terminate().await {
+                    first_error.get_or_insert(error);
+                }
+                notify_available(&self.available);
+            }
+        }
+        self.thread_gates.lock().await.clear();
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -956,7 +1016,8 @@ async fn run_sdk_turn(
     // stays held until callback tasks are joined and its registration clears.
     callback.stop().await;
     let release = bridge.release_turn(&agent_id).await;
-    let keep_warm = matches!(&outcome, Ok(TurnTerminal::Finished(_))) && release.is_ok();
+    let keep_warm =
+        matches!(&outcome, Ok(TurnTerminal::Finished(_))) && release.is_ok() && pool.is_open();
     drop(bridge);
 
     if keep_warm {
@@ -2332,7 +2393,7 @@ async fn stream_turn(
     let mut stream = Box::pin(response.bytes_stream());
     let mut buffered = BytesMut::new();
     let mut projection = RunProjection::default();
-    let mut saw_connect_end = false;
+    let mut connect_state = ConnectStreamState::Active;
     let mut stop = None;
     let mut stop_deadline: Option<tokio::time::Instant> = None;
     let mut cancel_sent = false;
@@ -2428,6 +2489,11 @@ async fn stream_turn(
                     "compressed Cursor Connect frames are not supported".into(),
                 ));
             }
+            let is_connect_end = if stop.is_none() {
+                connect_state.observe_frame(flags)?
+            } else {
+                flags & 0x02 != 0
+            };
             let value = if length == 0 {
                 json!({})
             } else {
@@ -2441,8 +2507,7 @@ async fn stream_turn(
                     }
                 }
             };
-            if flags & 0x02 != 0 {
-                saw_connect_end = true;
+            if is_connect_end {
                 if stop.is_none()
                     && let Some(error) = value.get("error")
                 {
@@ -2476,12 +2541,33 @@ async fn stream_turn(
             "Cursor Send ended with a partial Connect frame".into(),
         ));
     }
-    if !saw_connect_end {
+    if connect_state != ConnectStreamState::Ended {
         return Err(BackendError::Protocol(
             "Cursor Send omitted the Connect end-stream frame".into(),
         ));
     }
     projection.finish(events, &turn.cancel).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectStreamState {
+    Active,
+    Ended,
+}
+
+impl ConnectStreamState {
+    fn observe_frame(&mut self, flags: u8) -> Result<bool, BackendError> {
+        if *self == Self::Ended {
+            return Err(BackendError::Protocol(
+                "Cursor Send emitted a frame after its Connect end-stream envelope".into(),
+            ));
+        }
+        let ended = flags & 0x02 != 0;
+        if ended {
+            *self = Self::Ended;
+        }
+        Ok(ended)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2503,6 +2589,14 @@ async fn send_projected_event(
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum DoneState {
+    #[default]
+    Missing,
+    Seen,
+    Malformed,
+}
+
 #[derive(Default)]
 struct RunProjection {
     run_id: Option<String>,
@@ -2512,7 +2606,7 @@ struct RunProjection {
     last_status_message: Option<String>,
     terminal_status: Option<Value>,
     terminal_error_code: Option<String>,
-    saw_done: bool,
+    done: DoneState,
 }
 
 impl RunProjection {
@@ -2597,8 +2691,11 @@ impl RunProjection {
                 }
             }
         }
-        if frame.get("done").is_some() {
-            self.saw_done = true;
+        if let Some(done) = frame.get("done") {
+            self.done = match (self.done, done.is_object()) {
+                (DoneState::Missing, true) => DoneState::Seen,
+                _ => DoneState::Malformed,
+            };
         }
         Ok(())
     }
@@ -2637,10 +2734,18 @@ impl RunProjection {
         if events.is_closed() {
             return Ok(TurnTerminal::ConsumerClosed);
         }
-        if !self.saw_done {
-            return Err(BackendError::Protocol(
-                "Cursor Send omitted its done envelope".into(),
-            ));
+        match self.done {
+            DoneState::Seen => {}
+            DoneState::Missing => {
+                return Err(BackendError::Protocol(
+                    "Cursor Send omitted its done envelope".into(),
+                ));
+            }
+            DoneState::Malformed => {
+                return Err(BackendError::Protocol(
+                    "Cursor Send emitted an invalid or duplicate done envelope".into(),
+                ));
+            }
         }
         let status = self.terminal_status.as_ref().ok_or_else(|| {
             BackendError::Protocol("Cursor Send omitted its terminal result".into())
@@ -3028,6 +3133,54 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(StreamStop::ConsumerClosed));
+    }
+
+    #[test]
+    fn connect_stream_rejects_frames_after_end_stream() {
+        let mut state = ConnectStreamState::Active;
+        assert!(!state.observe_frame(0).unwrap());
+        assert!(state.observe_frame(0x02).unwrap());
+        let error = state.observe_frame(0).unwrap_err();
+        assert!(error.to_string().contains("after its Connect end-stream"));
+    }
+
+    #[tokio::test]
+    async fn projection_rejects_done_false_as_completion() {
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+        let mut projection = RunProjection::default();
+        projection
+            .process(
+                json!({
+                    "result": {
+                        "status": "RUN_LIFECYCLE_STATUS_FINISHED",
+                        "result": { "result": "not complete" }
+                    }
+                }),
+                &events,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        projection
+            .process(json!({ "done": false }), &events, &cancel)
+            .await
+            .unwrap();
+
+        let error = match projection.finish(&events, &cancel).await {
+            Err(error) => error,
+            Ok(_) => panic!("done:false unexpectedly completed the projection"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("invalid or duplicate done envelope")
+        );
     }
 
     #[tokio::test]

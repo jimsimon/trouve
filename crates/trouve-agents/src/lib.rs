@@ -478,6 +478,14 @@ pub trait AgentBackend: Send + Sync {
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         None
     }
+
+    /// Stop and reap long-lived vendor processes owned by this backend.
+    /// Registry replacement awaits this hook before exposing a replacement
+    /// backend, so two harness instances never overlap the same durable state.
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Report startup work the backend expects before it can accept this
     /// turn. The default keeps other adapters on the generic processing
     /// activity. This is advisory; the backend remains authoritative for

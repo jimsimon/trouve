@@ -239,6 +239,10 @@ test("qualification rejects duplicate tool and terminal lifecycle events", () =>
       ),
     /exactly one result and done/u,
   );
+  assert.throws(
+    () => exactTerminalResult([{ result: { status: 3 } }, { done: false }], "fixture"),
+    /done frame had an invalid envelope/u,
+  );
 });
 
 test("unterminated Bridge diagnostics retain only a marked bounded suffix", () => {
