@@ -4574,17 +4574,16 @@ impl Engine {
                 Err(_) => return None,
             }
         }
-        // Distinct models resolve concurrently: with cold provider caches
-        // each lookup can hit the network, and the basis only needs the
-        // completed set.
-        let resolved = futures::future::join_all(
-            models
-                .iter()
-                .map(|model| async move { (model, self.resolve_model_info(model).await) }),
-        )
-        .await;
+        // Distinct models resolve concurrently (with cold provider caches
+        // each lookup can hit the network), and completions are consumed as
+        // they arrive so the first decisive failure returns immediately and
+        // drops the remaining lookups.
+        let mut lookups = models
+            .iter()
+            .map(|model| async move { (model, self.resolve_model_info(model).await) })
+            .collect::<stream::FuturesUnordered<_>>();
         let mut smallest: Option<u64> = None;
-        for (model, info) in resolved {
+        while let Some((model, info)) = lookups.next().await {
             match info {
                 Ok(info) if info.context_window > 0 => {
                     smallest =
@@ -4631,7 +4630,18 @@ impl Engine {
                 {
                     tracing::warn!(job_id = %job.id, %error, "persisting review prompt budget basis");
                 }
-                resolved
+                // The guarded UPDATE means a concurrent attempt's resolution
+                // may have won the write race; the stored value — not this
+                // attempt's local resolution — is the single source of truth
+                // for the job's batches.
+                match self.store.code_review_job_prompt_budget_window(&job.id) {
+                    Ok(Some(persisted)) => (persisted > 0).then_some(persisted),
+                    Ok(None) => resolved,
+                    Err(error) => {
+                        tracing::warn!(job_id = %job.id, %error, "rereading review prompt budget basis");
+                        resolved
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(job_id = %job.id, %error, "loading review prompt budget basis");
