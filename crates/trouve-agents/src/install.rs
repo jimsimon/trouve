@@ -553,7 +553,15 @@ impl PreparedInstall {
     /// Move the prepared runtime into its version directory, then publish its
     /// metadata and stable executable path.
     pub fn activate(self) -> Result<InstalledCli, InstallError> {
+        self.activate_with_checkpoint(|_| Ok(()))
+    }
+
+    fn activate_with_checkpoint(
+        self,
+        mut checkpoint: impl FnMut(ActivationCheckpoint) -> std::io::Result<()>,
+    ) -> Result<InstalledCli, InstallError> {
         let root = cli_root(&self.data_dir, self.id);
+        let _activation_lock = lock_runtime_activation(&self.data_dir, self.id)?;
         let version_dir = root.join(&self.version);
         let staged_bin = self.stage.join(&self.bin_rel);
         if !self.stage.is_dir() || !staged_bin.is_file() {
@@ -563,58 +571,81 @@ impl PreparedInstall {
                 self.version
             )));
         }
-        // Preserve a same-version install until the prepared directory has
-        // successfully taken its place. Each rollback path is attempt-owned,
-        // just like the stage, so concurrent engine instances cannot remove it.
-        let rollback = root.join(format!(
-            ".rollback-{}-{}",
-            self.version,
-            uuid::Uuid::new_v4().simple()
-        ));
-        let had_version = version_dir.symlink_metadata().is_ok();
-        if had_version {
-            std::fs::rename(&version_dir, &rollback)?;
-        }
-        if let Err(error) = std::fs::rename(&self.stage, &version_dir) {
-            if had_version && let Err(restore) = std::fs::rename(&rollback, &version_dir) {
-                return Err(InstallError::Download(format!(
-                    "activating {} {} failed ({error}); restoring the previous runtime failed ({restore})",
-                    self.id.as_str(),
-                    self.version
-                )));
-            }
-            return Err(error.into());
-        }
-        let _rollback_cleanup = had_version.then(|| DirectoryCleanup(rollback));
         let bin = version_dir.join(&self.bin_rel);
-
         let info = InstalledCli {
             version: self.version.clone(),
             bin: bin.to_string_lossy().into_owned(),
         };
-        // Write the pointer atomically: a crash mid-write would otherwise leave
-        // a truncated installed.json that parses as "not installed" even though
-        // the binary is present.
         let pointer = root.join("installed.json");
-        let tmp = root.join(".installed.json.tmp");
-        std::fs::write(
-            &tmp,
-            serde_json::to_string_pretty(&info).unwrap().as_bytes(),
-        )?;
-        std::fs::rename(&tmp, &pointer)?;
-
         let link = managed_bin(&self.data_dir, self.id);
         std::fs::create_dir_all(link.parent().unwrap())?;
+
+        // Build every fallible publication artifact before changing the live
+        // runtime. The candidates and rollback paths are attempt-owned, while
+        // the lock serializes activation across Engine instances and processes.
+        let pointer_candidate = unique_runtime_path(&root, "installed.json.candidate")?;
+        let _pointer_candidate_cleanup = PathCleanup(pointer_candidate.clone());
+        let mut pointer_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pointer_candidate)?;
+        std::io::Write::write_all(
+            &mut pointer_file,
+            serde_json::to_string_pretty(&info).unwrap().as_bytes(),
+        )?;
+        drop(pointer_file);
+
+        let link_parent = link
+            .parent()
+            .expect("managed binary has a parent")
+            .to_path_buf();
+        let link_candidate = unique_runtime_path(&link_parent, "runtime.candidate")?;
+        let _link_candidate_cleanup = PathCleanup(link_candidate.clone());
         #[cfg(unix)]
-        {
-            let _ = std::fs::remove_file(&link);
-            std::os::unix::fs::symlink(&bin, &link)?;
-        }
+        std::os::unix::fs::symlink(&bin, &link_candidate)?;
         #[cfg(not(unix))]
-        {
-            let _ = std::fs::remove_file(&link);
-            std::fs::copy(&bin, &link)?;
+        std::fs::copy(&staged_bin, &link_candidate)?;
+
+        let mut transaction = ActivationTransaction::new(
+            PathSwap::new(
+                version_dir,
+                self.stage.clone(),
+                unique_runtime_path(&root, &format!("rollback-{}", self.version))?,
+            ),
+            PathSwap::new(
+                pointer,
+                pointer_candidate,
+                unique_runtime_path(&root, "installed.json.rollback")?,
+            ),
+            PathSwap::new(
+                link,
+                link_candidate,
+                unique_runtime_path(&link_parent, "runtime.rollback")?,
+            ),
+        );
+        let publication = (|| -> std::io::Result<()> {
+            transaction.runtime.publish(|| Ok(()))?;
+            transaction
+                .pointer
+                .publish(|| checkpoint(ActivationCheckpoint::Metadata))?;
+            transaction
+                .link
+                .publish(|| checkpoint(ActivationCheckpoint::StableExecutable))?;
+            Ok(())
+        })();
+        if let Err(error) = publication {
+            let rollback_errors = transaction.rollback();
+            if rollback_errors.is_empty() {
+                return Err(error.into());
+            }
+            return Err(InstallError::Download(format!(
+                "activating {} {} failed ({error}); rollback also failed: {}",
+                self.id.as_str(),
+                self.version,
+                rollback_errors.join("; ")
+            )));
         }
+        transaction.commit();
 
         // Keep at most one older version around for rollback; drop the rest.
         prune_old_versions(&root, &self.version);
@@ -628,12 +659,183 @@ impl PreparedInstall {
     }
 }
 
-struct DirectoryCleanup(PathBuf);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationCheckpoint {
+    Metadata,
+    StableExecutable,
+}
 
-impl Drop for DirectoryCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+#[derive(Debug)]
+struct PathSwap {
+    destination: PathBuf,
+    replacement: PathBuf,
+    backup: PathBuf,
+    destination_backed_up: bool,
+    replacement_published: bool,
+}
+
+impl PathSwap {
+    fn new(destination: PathBuf, replacement: PathBuf, backup: PathBuf) -> Self {
+        Self {
+            destination,
+            replacement,
+            backup,
+            destination_backed_up: false,
+            replacement_published: false,
+        }
     }
+
+    fn publish(
+        &mut self,
+        after_backup: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        match std::fs::symlink_metadata(&self.destination) {
+            Ok(_) => {
+                std::fs::rename(&self.destination, &self.backup)?;
+                self.destination_backed_up = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        after_backup()?;
+        std::fs::rename(&self.replacement, &self.destination)?;
+        self.replacement_published = true;
+        Ok(())
+    }
+
+    fn rollback(&mut self, errors: &mut Vec<String>) {
+        if self.replacement_published {
+            if let Err(error) = remove_path(&self.destination) {
+                errors.push(format!(
+                    "removing replacement {}: {error}",
+                    self.destination.display()
+                ));
+            } else {
+                self.replacement_published = false;
+            }
+        }
+        if self.destination_backed_up {
+            if let Err(error) = std::fs::rename(&self.backup, &self.destination) {
+                errors.push(format!("restoring {}: {error}", self.destination.display()));
+            } else {
+                self.destination_backed_up = false;
+            }
+        }
+    }
+
+    fn discard_backup(&mut self) {
+        if !self.destination_backed_up {
+            return;
+        }
+        if let Err(error) = remove_path(&self.backup) {
+            tracing::warn!(
+                "runtime activation committed, but backup {} could not be removed: {error}",
+                self.backup.display()
+            );
+        } else {
+            self.destination_backed_up = false;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActivationTransaction {
+    runtime: PathSwap,
+    pointer: PathSwap,
+    link: PathSwap,
+    finished: bool,
+}
+
+impl ActivationTransaction {
+    fn new(runtime: PathSwap, pointer: PathSwap, link: PathSwap) -> Self {
+        Self {
+            runtime,
+            pointer,
+            link,
+            finished: false,
+        }
+    }
+
+    fn rollback(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        self.link.rollback(&mut errors);
+        self.pointer.rollback(&mut errors);
+        self.runtime.rollback(&mut errors);
+        self.finished = true;
+        errors
+    }
+
+    fn commit(&mut self) {
+        self.finished = true;
+        self.link.discard_backup();
+        self.pointer.discard_backup();
+        self.runtime.discard_backup();
+    }
+}
+
+impl Drop for ActivationTransaction {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        for error in self.rollback() {
+            tracing::warn!("runtime activation rollback failed: {error}");
+        }
+    }
+}
+
+struct PathCleanup(PathBuf);
+
+impl Drop for PathCleanup {
+    fn drop(&mut self) {
+        let _ = remove_path(&self.0);
+    }
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn unique_runtime_path(parent: &Path, label: &str) -> std::io::Result<PathBuf> {
+    for _ in 0..8 {
+        let path = parent.join(format!(".{label}-{}", uuid::Uuid::new_v4().simple()));
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not reserve a unique runtime path for {label}"),
+    ))
+}
+
+fn runtime_activation_lock_path(data_dir: &Path, id: CliId) -> PathBuf {
+    data_dir
+        .join("cli")
+        .join(".locks")
+        .join(format!("{}.lock", id.as_str()))
+}
+
+fn lock_runtime_activation(data_dir: &Path, id: CliId) -> std::io::Result<std::fs::File> {
+    use fs4::fs_std::FileExt as _;
+
+    let lock_path = runtime_activation_lock_path(data_dir, id);
+    std::fs::create_dir_all(lock_path.parent().expect("runtime lock has a parent"))?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    Ok(lock)
 }
 
 impl Drop for PreparedInstall {
@@ -712,6 +914,7 @@ pub async fn install(
 /// the pointer, and the stable symlink. Binaries found on PATH are
 /// untouched — trouve only manages its own copies.
 pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
+    let _activation_lock = lock_runtime_activation(data_dir, id)?;
     let link = managed_bin(data_dir, id);
     if link.symlink_metadata().is_ok() {
         std::fs::remove_file(&link)?;
@@ -1460,6 +1663,86 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             installed(tmp.path(), CliId::Codex).unwrap().version,
             "2.0.0"
         );
+    }
+
+    #[test]
+    fn publication_failures_restore_complete_same_version_install() {
+        for failed_checkpoint in [
+            ActivationCheckpoint::Metadata,
+            ActivationCheckpoint::StableExecutable,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = cli_root(tmp.path(), CliId::Codex);
+            let version_dir = root.join("2.0.0");
+            let active_bin = version_dir.join("codex");
+            std::fs::create_dir_all(&version_dir).unwrap();
+            std::fs::write(&active_bin, "active runtime").unwrap();
+            let previous_pointer = serde_json::to_string_pretty(&InstalledCli {
+                version: "2.0.0".into(),
+                bin: active_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+            std::fs::write(root.join("installed.json"), &previous_pointer).unwrap();
+            let link = managed_bin(tmp.path(), CliId::Codex);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&active_bin, &link).unwrap();
+            #[cfg(not(unix))]
+            std::fs::copy(&active_bin, &link).unwrap();
+
+            let stage = create_install_stage(&root, "2.0.0").unwrap();
+            std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
+            let prepared = PreparedInstall {
+                data_dir: tmp.path().to_path_buf(),
+                id: CliId::Codex,
+                version: "2.0.0".into(),
+                stage,
+                bin_rel: PathBuf::from("codex"),
+            };
+
+            let result = prepared.activate_with_checkpoint(|checkpoint| {
+                if checkpoint == failed_checkpoint {
+                    Err(std::io::Error::other("injected publication failure"))
+                } else {
+                    Ok(())
+                }
+            });
+
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read_to_string(&active_bin).unwrap(),
+                "active runtime"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("installed.json")).unwrap(),
+                previous_pointer
+            );
+            assert_eq!(std::fs::read_to_string(&link).unwrap(), "active runtime");
+            #[cfg(unix)]
+            assert_eq!(std::fs::read_link(&link).unwrap(), active_bin);
+            assert_eq!(
+                installed(tmp.path(), CliId::Codex).unwrap().version,
+                "2.0.0"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_activation_lock_serializes_independent_openers() {
+        use fs4::fs_std::FileExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let first = lock_runtime_activation(tmp.path(), CliId::Codex).unwrap();
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(runtime_activation_lock_path(tmp.path(), CliId::Codex))
+            .unwrap();
+
+        assert!(!second.try_lock_exclusive().unwrap());
+        fs4::fs_std::FileExt::unlock(&first).unwrap();
+        assert!(second.try_lock_exclusive().unwrap());
+        fs4::fs_std::FileExt::unlock(&second).unwrap();
     }
 
     #[test]
