@@ -633,6 +633,21 @@ fn next_thread_webhook_batch(
     Some((repository, keys))
 }
 
+/// Priority keys to requeue after a webhook walk: those the poll still
+/// tracks but the bounded walk never reached. Keys absent from the poll's
+/// candidates — closed, draft-filtered, or otherwise untracked pulls — are
+/// dropped: they can never be attempted, so requeueing them would spin the
+/// worker forever.
+fn requeue_after_thread_walk(
+    keys: HashSet<(String, u64)>,
+    known: &HashSet<(String, u64)>,
+    attempted: &HashSet<(String, u64)>,
+) -> Vec<(String, u64)> {
+    keys.into_iter()
+        .filter(|key| known.contains(key) && !attempted.contains(key))
+        .collect()
+}
+
 fn review_reconciliation_order_key(
     candidate: &(String, u64),
     priority: &HashSet<(String, u64)>,
@@ -4372,21 +4387,29 @@ impl Engine {
                                         // deadline); prioritized pulls it
                                         // never reached go back into the
                                         // queue for the next batch instead
-                                        // of dropping their events. Each
+                                        // of dropping their events. Only
+                                        // pulls the poll still tracks
+                                        // requeue — a closed or filtered
+                                        // pull can never be attempted. Each
                                         // pass attempts at least one
-                                        // priority key, so the requeued set
-                                        // shrinks every iteration. On error
-                                        // the poll rotation heals instead —
-                                        // an immediate requeue would
-                                        // hot-retry a failing repository.
-                                        for key in keys {
-                                            if !attempted.contains(&key) {
-                                                enqueue_thread_webhook_key(
-                                                    &engine.code_review.thread_webhook_dispatch,
-                                                    key,
-                                                    repository.clone(),
-                                                );
-                                            }
+                                        // tracked priority key, so the
+                                        // requeued set shrinks every
+                                        // iteration. On error the poll
+                                        // rotation heals instead — an
+                                        // immediate requeue would hot-retry
+                                        // a failing repository.
+                                        let known = reconciliation_candidates
+                                            .iter()
+                                            .map(ReviewReconciliationCandidate::key)
+                                            .collect::<HashSet<_>>();
+                                        for key in
+                                            requeue_after_thread_walk(keys, &known, &attempted)
+                                        {
+                                            enqueue_thread_webhook_key(
+                                                &engine.code_review.thread_webhook_dispatch,
+                                                key,
+                                                repository.clone(),
+                                            );
                                         }
                                     }
                                     Err(error) => {
@@ -25635,6 +25658,21 @@ mod tests {
                 pull_number: 42,
                 trigger_key: "manual:comment:100".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn only_tracked_unattempted_pulls_requeue_after_a_walk() {
+        let key = |pull: u64| ("acme/widgets".to_owned(), pull);
+        let keys = HashSet::from([key(1), key(2), key(3)]);
+        // 1 was attempted, 2 is tracked but deferred by the bounded walk,
+        // and 3 vanished from the poll (closed or filtered): only 2
+        // requeues — requeueing 3 would spin the worker forever.
+        let known = HashSet::from([key(1), key(2)]);
+        let attempted = HashSet::from([key(1)]);
+        assert_eq!(
+            requeue_after_thread_walk(keys, &known, &attempted),
+            vec![key(2)]
         );
     }
 
