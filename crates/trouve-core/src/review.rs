@@ -4546,16 +4546,16 @@ impl Engine {
         }
     }
 
-    /// Prompt budgets for one job, derived from the smallest context window
-    /// among every model the job can call: the repository review model, the
-    /// router and analyst overrides, and each reviewer's model. If any of
-    /// those models fails to report a positive window, the fixed default
-    /// budgets are used — a window is never guessed.
-    async fn review_prompt_budgets(
+    /// The budget basis for one job: the smallest context window among every
+    /// model the job can call — the repository review model, the router and
+    /// analyst overrides, and each reviewer's model. `None` when any model
+    /// fails to report a positive window; the fixed default budgets are used
+    /// then — a window is never guessed.
+    async fn resolve_review_prompt_budget_basis(
         &self,
         job: &trouve_protocol::CodeReviewJob,
         reviewers: &[ReviewerProfile],
-    ) -> ReviewPromptBudgets {
+    ) -> Option<u64> {
         let mut models = std::collections::BTreeSet::new();
         for resolved in [review_model(job), router_model(job), analyst_model(job)]
             .into_iter()
@@ -4571,7 +4571,7 @@ impl Engine {
                 }
                 // A missing model configuration fails later with its own
                 // actionable error; budgets just stay at the defaults.
-                Err(_) => return ReviewPromptBudgets::default(),
+                Err(_) => return None,
             }
         }
         let mut smallest: Option<u64> = None;
@@ -4581,19 +4581,59 @@ impl Engine {
                     smallest =
                         Some(smallest.map_or(info.context_window, |s| s.min(info.context_window)));
                 }
-                Ok(_) | Err(_) => {
+                Ok(_) => {
                     tracing::debug!(
                         %model,
-                        "model did not report a context window; using fixed review prompt budgets"
+                        "model reported no context window; using fixed review prompt budgets"
                     );
-                    return ReviewPromptBudgets::default();
+                    return None;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %model,
+                        %error,
+                        "model metadata unavailable; using fixed review prompt budgets"
+                    );
+                    return None;
                 }
             }
         }
-        let budgets = derived_review_prompt_budgets(smallest);
+        smallest
+    }
+
+    /// Prompt budgets for one job. The basis window is resolved once per job
+    /// and persisted, so every retry of the same job batches identically even
+    /// when provider metadata is transiently unavailable — otherwise a
+    /// changed digest would discard completed reviewer work.
+    async fn review_prompt_budgets(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+        reviewers: &[ReviewerProfile],
+    ) -> ReviewPromptBudgets {
+        let basis = match self.store.code_review_job_prompt_budget_window(&job.id) {
+            Ok(Some(persisted)) => (persisted > 0).then_some(persisted),
+            Ok(None) => {
+                let resolved = self
+                    .resolve_review_prompt_budget_basis(job, reviewers)
+                    .await;
+                if let Err(error) = self
+                    .store
+                    .set_code_review_job_prompt_budget_window(&job.id, resolved.unwrap_or(0))
+                {
+                    tracing::warn!(job_id = %job.id, %error, "persisting review prompt budget basis");
+                }
+                resolved
+            }
+            Err(error) => {
+                tracing::warn!(job_id = %job.id, %error, "loading review prompt budget basis");
+                self.resolve_review_prompt_budget_basis(job, reviewers)
+                    .await
+            }
+        };
+        let budgets = derived_review_prompt_budgets(basis);
         if budgets != ReviewPromptBudgets::default() {
             tracing::debug!(
-                smallest_context_window = smallest,
+                smallest_context_window = basis,
                 batch_target_tokens = budgets.batch_target_tokens,
                 batch_max_bytes = budgets.batch_max_bytes,
                 "derived review prompt budgets from configured models"
@@ -24994,6 +25034,49 @@ mod tests {
             batch.diff.len() <= derived.batch_max_bytes
                 && estimated_tokens(&batch.diff) <= derived.batch_target_tokens + 1
         }));
+    }
+
+    #[test]
+    fn prompt_budget_basis_persists_first_resolution_per_job() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:budget-basis");
+        // Never resolved: no basis on record.
+        assert_eq!(
+            store
+                .code_review_job_prompt_budget_window(&queued.id)
+                .unwrap(),
+            None
+        );
+        // First resolution wins and survives later attempts to overwrite,
+        // so every retry of the job batches identically.
+        store
+            .set_code_review_job_prompt_budget_window(&queued.id, 400_000)
+            .unwrap();
+        store
+            .set_code_review_job_prompt_budget_window(&queued.id, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_job_prompt_budget_window(&queued.id)
+                .unwrap(),
+            Some(400_000)
+        );
+        // A resolved-but-unknown basis persists as zero, which maps to the
+        // fixed default budgets.
+        let second = enqueue_test_review_job(&store, "acme/widgets#43:budget-basis-unknown");
+        store
+            .set_code_review_job_prompt_budget_window(&second.id, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_job_prompt_budget_window(&second.id)
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            derived_review_prompt_budgets(None),
+            derived_review_prompt_budgets(Some(0))
+        );
     }
 
     #[test]

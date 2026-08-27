@@ -783,6 +783,11 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_checkbox_edited_at TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE queued_prompts ADD COLUMN background INTEGER NOT NULL DEFAULT 0",
+    // Smallest configured-model context window (tokens) resolved for this
+    // job's prompt budgets. NULL = never resolved; 0 = resolved but unknown
+    // (fixed default budgets). Persisted so retries re-batch identically
+    // even when provider metadata is transiently unavailable.
+    "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -9359,6 +9364,36 @@ impl Store {
              WHERE id = ?1 AND status = 'running'",
             params![id, review_base_sha, covered_full_branch],
         )? > 0)
+    }
+
+    /// Smallest configured-model context window (tokens) resolved for this
+    /// job's prompt budgets. `None` = never resolved for this job; `Some(0)`
+    /// = resolved but unknown, so the fixed default budgets apply.
+    pub fn code_review_job_prompt_budget_window(&self, id: &str) -> Result<Option<u64>> {
+        let window = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT prompt_budget_window FROM code_review_jobs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(window.map(|window| window.max(0) as u64))
+    }
+
+    /// Persist the resolved budget basis so every attempt of this job batches
+    /// identically, even if provider metadata is transiently unavailable on a
+    /// retry. First resolution wins; later attempts reuse it.
+    pub fn set_code_review_job_prompt_budget_window(&self, id: &str, window: u64) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET prompt_budget_window = ?2
+             WHERE id = ?1 AND prompt_budget_window IS NULL",
+            params![id, window as i64],
+        )?;
+        Ok(())
     }
 
     /// Bind routing and reviewer attempts to the exact effective diff batches.
