@@ -5558,7 +5558,7 @@ impl Engine {
                 std::mem::take(&mut validated.findings),
                 &coordinator_candidates,
                 &diff_files,
-                Some(&repository_path),
+                Some((repository_path.as_path(), job.head_sha.as_str())),
             );
             let missing_adjudications =
                 unadjudicated_candidate_ids(&validated, &coordinator_candidates);
@@ -5593,7 +5593,7 @@ impl Engine {
                                         std::mem::take(&mut repaired_output.findings),
                                         &coordinator_candidates,
                                         &diff_files,
-                                        Some(&repository_path),
+                                        Some((repository_path.as_path(), job.head_sha.as_str())),
                                     );
                                     merge_coordinator_adjudication_repair(
                                         &mut validated,
@@ -13772,7 +13772,7 @@ fn coordinator_validated_findings(
     findings: Vec<ReviewFinding>,
     candidates: &[CandidateFinding],
     files: &[ReviewDiffFile],
-    repository_path: Option<&std::path::Path>,
+    repository: Option<(&std::path::Path, &str)>,
 ) -> Vec<ReviewFinding> {
     let candidate_ids = candidates
         .iter()
@@ -13797,11 +13797,7 @@ fn coordinator_validated_findings(
             .into_iter()
             .all(|value| !value.trim().is_empty());
             if !finding.source_candidate_ids.is_empty() && has_evidence {
-                apply_verification_derived_confidence(
-                    &mut finding,
-                    &diff_contents,
-                    repository_path,
-                );
+                apply_verification_derived_confidence(&mut finding, &diff_contents, repository);
                 Some(finding)
             } else {
                 None
@@ -15063,13 +15059,14 @@ fn diff_line_contents(files: &[ReviewDiffFile]) -> HashMap<(String, u64, bool), 
 }
 
 /// The source line a finding anchors to: from the diff when the anchor is a
-/// diff line, otherwise from the synced head checkout for RIGHT-side
-/// anchors. LEFT-side anchors outside the diff have no locally available
-/// base-revision content.
+/// diff line, otherwise from the immutable git object at the reviewed head
+/// revision. Reading the object store instead of the working tree makes the
+/// lookup immune to concurrent checkout syncs and symlinked paths, and
+/// returns the reviewed revision's content even when the worktree has moved.
 fn finding_anchor_content(
     finding: &ReviewFinding,
     diff_contents: &HashMap<(String, u64, bool), String>,
-    repository_path: Option<&std::path::Path>,
+    repository: Option<(&std::path::Path, &str)>,
 ) -> Option<String> {
     let left = finding.side.eq_ignore_ascii_case("left");
     if let Some(content) = diff_contents.get(&(finding.path.clone(), finding.line, left)) {
@@ -15079,10 +15076,7 @@ fn finding_anchor_content(
         return None;
     }
     // Structural validation already rejected unsafe paths; keep the lexical
-    // guard anyway, then confine the resolved target: canonicalization
-    // follows every symlink (intermediate and final), so requiring the
-    // canonical candidate to stay beneath the canonical root means a
-    // repository symlink can never redirect this read outside the checkout.
+    // guard so this lookup can never name anything outside the repository.
     let relative = std::path::Path::new(&finding.path);
     if relative.is_absolute()
         || relative
@@ -15091,55 +15085,23 @@ fn finding_anchor_content(
     {
         return None;
     }
-    let root = std::fs::canonicalize(repository_path?).ok()?;
-    let candidate = std::fs::canonicalize(root.join(relative)).ok()?;
-    if !candidate.starts_with(&root) {
+    let (root, head_sha) = repository?;
+    if head_sha.len() != 40 || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    // Without descriptor identity (stable std exposes it only on unix), an
-    // opened handle cannot be bound to the confined object, so non-unix
-    // builds never read the checkout: the anchor degrades to unchecked
-    // instead of trusting a mutable pathname.
-    #[cfg(not(unix))]
-    {
-        None
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("show")
+        .arg(format!("{head_sha}:{}", finding.path))
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES {
+        return None;
     }
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::fs::MetadataExt;
-
-        let file = std::fs::File::open(&candidate).ok()?;
-        let opened = file.metadata().ok()?;
-        // Anchor verification reads source files; anything larger than the
-        // anchor-blob bound is not a reviewable source file.
-        if opened.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 {
-            return None;
-        }
-        // The confinement check above validated a pathname, not the object
-        // this handle opened: a concurrent checkout sync could swap a
-        // symlink in between. Re-resolve after opening and require the open
-        // descriptor to be the very object now at the confined path, so the
-        // read below is bound to a checked filesystem object rather than a
-        // mutable name.
-        let recheck = std::fs::canonicalize(root.join(relative)).ok()?;
-        if !recheck.starts_with(&root) {
-            return None;
-        }
-        let current = std::fs::metadata(&recheck).ok()?;
-        if current.dev() != opened.dev() || current.ino() != opened.ino() {
-            return None;
-        }
-        let mut text = String::new();
-        file.take(REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 + 1)
-            .read_to_string(&mut text)
-            .ok()?;
-        if text.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES {
-            return None;
-        }
-        let index = usize::try_from(finding.line).ok()?.checked_sub(1)?;
-        text.lines().nth(index).map(str::to_owned)
-    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let index = usize::try_from(finding.line).ok()?.checked_sub(1)?;
+    text.lines().nth(index).map(str::to_owned)
 }
 
 /// Mechanical verdict for a coordinator-quoted anchor line against the
@@ -15203,7 +15165,7 @@ fn finding_level_rank(level: &str) -> u8 {
 fn apply_verification_derived_confidence(
     finding: &mut ReviewFinding,
     diff_contents: &HashMap<(String, u64, bool), String>,
-    repository_path: Option<&std::path::Path>,
+    repository: Option<(&std::path::Path, &str)>,
 ) {
     const ANCHOR_QUOTE_MAX_BYTES: usize = 512;
     // The persisted record must reproduce the verdict: a quote too large to
@@ -15216,7 +15178,7 @@ fn apply_verification_derived_confidence(
             bounded_utf8(&finding.evidence.anchor_quote, ANCHOR_QUOTE_MAX_BYTES, "…");
         finding.evidence.anchor_match = "unchecked".to_owned();
     } else {
-        let actual = finding_anchor_content(finding, diff_contents, repository_path);
+        let actual = finding_anchor_content(finding, diff_contents, repository);
         finding.evidence.anchor_match =
             anchor_match_verdict(&finding.evidence.anchor_quote, actual.as_deref()).to_owned();
     }
@@ -17505,12 +17467,38 @@ mod tests {
     }
 
     #[test]
-    fn outside_diff_anchor_quotes_verify_against_the_checkout() {
+    fn outside_diff_anchor_quotes_verify_against_the_head_git_object() {
         let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.test")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.test")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "--quiet"]);
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
         std::fs::write(
             repo.path().join("src/config.rs"),
             "line one\nlet retries = 5;\nline three\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        let head_sha = git(&["rev-parse", "HEAD"]).trim().to_owned();
+        // The worktree mutates after the commit: anchor verification must
+        // read the immutable object at the reviewed head, not the mutable
+        // checkout, so concurrent syncs and symlinks cannot influence it.
+        std::fs::write(
+            repo.path().join("src/config.rs"),
+            "line one\nlet retries = 99;\nline three\n",
         )
         .unwrap();
         let finding = |quote: &str| ReviewFinding {
@@ -17532,51 +17520,40 @@ mod tests {
             source_candidate_ids: vec!["c-1".into()],
         };
         let contents = HashMap::new();
+        let repository = Some((repo.path(), head_sha.as_str()));
         let mut matched = finding("let retries = 5;");
-        apply_verification_derived_confidence(&mut matched, &contents, Some(repo.path()));
+        apply_verification_derived_confidence(&mut matched, &contents, repository);
         assert_eq!(matched.evidence.anchor_match, "matched");
         assert_eq!(matched.confidence, "high");
+        // The mutated worktree content is not what the review examined.
+        let mut worktree = finding("let retries = 99;");
+        apply_verification_derived_confidence(&mut worktree, &contents, repository);
+        assert_eq!(worktree.evidence.anchor_match, "mismatched");
+        assert_eq!(worktree.confidence, "low");
         let mut mismatched = finding("let retries = 3;");
-        apply_verification_derived_confidence(&mut mismatched, &contents, Some(repo.path()));
+        apply_verification_derived_confidence(&mut mismatched, &contents, repository);
         assert_eq!(mismatched.evidence.anchor_match, "mismatched");
         assert_eq!(mismatched.confidence, "low");
-        // A hostile path can never escape the checkout: it degrades to an
-        // unchecked anchor instead of reading outside the root.
-        let mut hostile = finding("root:x:0:0");
-        hostile.path = "../etc/passwd".into();
-        apply_verification_derived_confidence(&mut hostile, &contents, Some(repo.path()));
-        assert_eq!(hostile.evidence.anchor_match, "unchecked");
 
         // An oversized quote is never verified: the persisted record must be
         // able to reproduce the verdict, so it degrades to unchecked and the
         // stored quote is truncated.
         let mut oversized = finding(&"x".repeat(700));
-        apply_verification_derived_confidence(&mut oversized, &contents, Some(repo.path()));
+        apply_verification_derived_confidence(&mut oversized, &contents, repository);
         assert_eq!(oversized.evidence.anchor_match, "unchecked");
         assert!(oversized.evidence.anchor_quote.len() <= 512 + '…'.len_utf8());
         assert_eq!(oversized.confidence, "medium");
 
-        // A repository symlink pointing outside the checkout is confined by
-        // canonicalization: the read never follows it, so the anchor stays
-        // unchecked instead of becoming a content oracle for host files.
-        #[cfg(unix)]
-        {
-            let outside = tempfile::tempdir().unwrap();
-            std::fs::write(outside.path().join("secret.txt"), "token = hunter2\n").unwrap();
-            std::os::unix::fs::symlink(
-                outside.path().join("secret.txt"),
-                repo.path().join("src/link.rs"),
-            )
-            .unwrap();
-            let mut through_symlink = finding("token = hunter2");
-            through_symlink.path = "src/link.rs".into();
-            apply_verification_derived_confidence(
-                &mut through_symlink,
-                &contents,
-                Some(repo.path()),
-            );
-            assert_eq!(through_symlink.evidence.anchor_match, "unchecked");
-        }
+        // A hostile path can never escape the repository: it degrades to an
+        // unchecked anchor, as does an uncommitted or unknown path.
+        let mut hostile = finding("root:x:0:0");
+        hostile.path = "../etc/passwd".into();
+        apply_verification_derived_confidence(&mut hostile, &contents, repository);
+        assert_eq!(hostile.evidence.anchor_match, "unchecked");
+        let mut uncommitted = finding("anything");
+        uncommitted.path = "src/not_committed.rs".into();
+        apply_verification_derived_confidence(&mut uncommitted, &contents, repository);
+        assert_eq!(uncommitted.evidence.anchor_match, "unchecked");
     }
 
     #[test]
