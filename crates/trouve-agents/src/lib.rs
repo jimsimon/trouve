@@ -531,6 +531,87 @@ pub trait AgentBackend: Send + Sync {
     async fn abandon_background_turns(&self, _thread_id: &str) {}
 }
 
+/// Delegating backend wrapper that keeps the managed runtime generation used
+/// to construct `inner` leased for the wrapper's full lifetime. Registry
+/// replacement can then reclaim an old generation only after every delayed
+/// backend clone that might still launch it has drained.
+pub struct RuntimeLeasedBackend {
+    inner: Arc<dyn AgentBackend>,
+    _runtime: install::RuntimeLease,
+}
+
+impl RuntimeLeasedBackend {
+    pub fn new(inner: Arc<dyn AgentBackend>, runtime: install::RuntimeLease) -> Self {
+        Self {
+            inner,
+            _runtime: runtime,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for RuntimeLeasedBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        self.inner.models()
+    }
+
+    async fn list_models(&self) -> Vec<ModelInfo> {
+        self.inner.list_models().await
+    }
+
+    fn status(&self) -> BackendStatus {
+        self.inner.status()
+    }
+
+    fn supports_tool_free_turns(&self) -> bool {
+        self.inner.supports_tool_free_turns()
+    }
+
+    fn confines_read_only_turns(&self) -> bool {
+        self.inner.confines_read_only_turns()
+    }
+
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        self.inner.subscription_health().await
+    }
+
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        self.inner.shutdown().await
+    }
+
+    async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
+        self.inner.startup_activity(turn).await
+    }
+
+    fn supports_steering(&self) -> bool {
+        self.inner.supports_steering()
+    }
+
+    async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
+        self.inner.steer_turn(steer).await
+    }
+
+    async fn start_login(&self) -> Result<BackendLogin, BackendError> {
+        self.inner.start_login().await
+    }
+
+    async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        self.inner.run_turn(turn).await
+    }
+
+    fn take_background_turn_signals(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+        self.inner.take_background_turn_signals()
+    }
+
+    async fn abandon_background_turns(&self, thread_id: &str) {
+        self.inner.abandon_background_turns(thread_id).await;
+    }
+}
+
 /// Locate a binary on PATH (absolute/relative paths pass through).
 pub(crate) fn binary_on_path(command: &str) -> bool {
     process_env::find_executable(command).is_some()

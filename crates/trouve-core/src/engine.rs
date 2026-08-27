@@ -2895,20 +2895,32 @@ fn canonical_cli_runtime_id(id: &str) -> &str {
 /// Resolve the executable for a managed agent runtime. An explicit command
 /// wins unless it is Trouve's retired stable path; otherwise the atomic
 /// managed-install pointer takes precedence over PATH.
-fn resolved_runtime_command(
-    kind: &str,
+struct ResolvedRuntime {
     command: Option<String>,
-    data_dir: &Path,
-) -> Option<String> {
+    lease: Option<trouve_agents::install::RuntimeLease>,
+}
+
+fn resolved_runtime(kind: &str, command: Option<String>, data_dir: &Path) -> ResolvedRuntime {
     let cli = cli_for_kind(kind);
     if let Some(command) = command
         && !cli
             .is_some_and(|cli| Path::new(&command) == data_dir.join("cli/bin").join(cli.as_str()))
     {
-        return Some(command);
+        return ResolvedRuntime {
+            command: Some(command),
+            lease: None,
+        };
     }
-    cli.and_then(|cli| trouve_agents::install::installed(data_dir, cli))
-        .map(|install| install.bin)
+    match cli.and_then(|cli| trouve_agents::install::installed_with_lease(data_dir, cli)) {
+        Some((install, lease)) => ResolvedRuntime {
+            command: Some(install.bin),
+            lease: Some(lease),
+        },
+        None => ResolvedRuntime {
+            command: None,
+            lease: None,
+        },
+    }
 }
 
 /// The old `cursor-cli` kind is retained only as an explicit migration state.
@@ -3041,7 +3053,8 @@ fn build_all_backends(
     for (id, pc) in &config.providers {
         // Explicit command wins; otherwise a trouve-managed install beats
         // whatever is on PATH (distro packages lag behind vendor releases).
-        let command = resolved_runtime_command(&pc.kind, configured_runtime_command(pc), data_dir);
+        let runtime = resolved_runtime(&pc.kind, configured_runtime_command(pc), data_dir);
+        let command = runtime.command;
         let backend: Arc<dyn AgentBackend> = match pc.kind.as_str() {
             "codex-app-server" => Arc::new(
                 trouve_agents::codex::CodexBackend::new(id, command).with_catalog(catalog.clone()),
@@ -3073,6 +3086,10 @@ fn build_all_backends(
                     .with_catalog(catalog.clone()),
             ),
             _ => continue,
+        };
+        let backend: Arc<dyn AgentBackend> = match runtime.lease {
+            Some(lease) => Arc::new(trouve_agents::RuntimeLeasedBackend::new(backend, lease)),
+            None => backend,
         };
         backends.insert(id.clone(), backend);
     }
@@ -25730,28 +25747,30 @@ default_permission_mode = "ask"
         std::fs::write(&obsolete_stable, b"uncommitted").unwrap();
 
         assert_eq!(
-            resolved_runtime_command("codex-app-server", None, tmp.path()),
+            resolved_runtime("codex-app-server", None, tmp.path()).command,
             Some(managed.to_string_lossy().into_owned())
         );
         assert_eq!(
-            resolved_runtime_command(
+            resolved_runtime(
                 "codex-app-server",
                 Some(obsolete_stable.to_string_lossy().into_owned()),
                 tmp.path()
-            ),
+            )
+            .command,
             Some(managed.to_string_lossy().into_owned())
         );
         assert_eq!(
-            resolved_runtime_command(
+            resolved_runtime(
                 "codex-app-server",
                 Some("/opt/custom/codex".into()),
                 tmp.path()
             )
+            .command
             .as_deref(),
             Some("/opt/custom/codex")
         );
         assert_eq!(
-            resolved_runtime_command("openai-compat", None, tmp.path()),
+            resolved_runtime("openai-compat", None, tmp.path()).command,
             None
         );
 
