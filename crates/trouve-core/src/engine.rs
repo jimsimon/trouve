@@ -2339,6 +2339,10 @@ pub struct Engine {
     logins: Mutex<HashMap<String, LoginState>>,
     /// In-flight managed vendor-CLI installs, keyed by CLI id.
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
+    /// Destructive managed-runtime operations, keyed by canonical CLI id.
+    /// Checked atomically with `cli_installs` so install and uninstall cannot
+    /// pass each other's preconditions concurrently.
+    cli_runtime_operations: Arc<Mutex<HashSet<String>>>,
     /// The llama-server sidecar behind the built-in "local" provider.
     local_manager: Arc<crate::local::LlamaManager>,
     /// A separate sidecar for session titles with independently configured
@@ -2439,6 +2443,21 @@ enum CliInstallState {
         warning: Option<String>,
     },
     Failed(String),
+}
+
+/// Cancellation-safe reservation for a destructive managed-runtime operation.
+/// Installs reserve themselves in `cli_installs`; this separate set closes the
+/// inverse race by preventing an install from starting after uninstall has
+/// passed its pending-install check.
+struct CliRuntimeOperationGuard {
+    operations: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for CliRuntimeOperationGuard {
+    fn drop(&mut self) {
+        self.operations.lock().unwrap().remove(&self.id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2646,8 +2665,24 @@ fn build_all_backends(
     data_dir: &Path,
     catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> HashMap<String, Arc<dyn AgentBackend>> {
+    build_backends_for_ids(config, secrets, data_dir, catalog, None)
+}
+
+/// Build only selected config-owned backends during a targeted registry
+/// transition. Avoid constructing and immediately dropping unrelated vendor
+/// pools and managed-runtime leases.
+fn build_backends_for_ids(
+    config: &Config,
+    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    data_dir: &Path,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
+    target_ids: Option<&HashSet<String>>,
+) -> HashMap<String, Arc<dyn AgentBackend>> {
     let mut backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
     for (id, pc) in &config.providers {
+        if target_ids.is_some_and(|target_ids| !target_ids.contains(id)) {
+            continue;
+        }
         // Explicit command wins; otherwise a trouve-managed install beats
         // whatever is on PATH (distro packages lag behind vendor releases).
         let runtime = resolved_runtime(&pc.kind, configured_runtime_command(pc), data_dir);
@@ -2804,6 +2839,7 @@ impl Engine {
             code_review: crate::review::CodeReviewRuntime::default(),
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
+            cli_runtime_operations: Arc::new(Mutex::new(HashSet::new())),
             local_manager,
             title_model,
             title_model_generation: tokio::sync::Mutex::new(None),
@@ -3745,10 +3781,11 @@ impl Engine {
             self.persist_config(&config);
             Ok(())
         })();
-        // This is also the rollback path for a secret-store failure after the
-        // old backend was retired: rebuild from the still-current config.
-        retirement.publish();
+        // Keep the registry transition serialized until the new durable
+        // definition is committed. On failure, dropping the unpublished
+        // retirement rebuilds from the still-current configuration.
         mutation?;
+        retirement.publish();
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
         let pc = config.providers.get(id).cloned().unwrap_or_default();
@@ -4117,6 +4154,12 @@ impl Engine {
         let state_id = cli.as_str();
         let progress = Arc::new(trouve_agents::install::Progress::default());
         {
+            let operations = self.cli_runtime_operations.lock().unwrap();
+            if operations.contains(state_id) {
+                return Err(EngineError::Conflict(format!(
+                    "an uninstall for {id} is already in progress"
+                )));
+            }
             let mut installs = self.cli_installs.lock().unwrap();
             if matches!(
                 installs.get(state_id),
@@ -4270,7 +4313,13 @@ impl Engine {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
         let state_id = cli.as_str();
-        {
+        let _runtime_operation = {
+            let mut operations = self.cli_runtime_operations.lock().unwrap();
+            if operations.contains(state_id) {
+                return Err(EngineError::Conflict(format!(
+                    "an uninstall for {id} is already in progress"
+                )));
+            }
             let installs = self.cli_installs.lock().unwrap();
             if matches!(
                 installs.get(state_id),
@@ -4280,7 +4329,12 @@ impl Engine {
                     "an install for {id} is in progress — cancel it first"
                 )));
             }
-        }
+            operations.insert(state_id.to_string());
+            CliRuntimeOperationGuard {
+                operations: self.cli_runtime_operations.clone(),
+                id: state_id.to_string(),
+            }
+        };
         if cli == trouve_agents::install::CliId::LlamaServer {
             self.local_manager.stop().await;
             self.title_model.stop().await;
@@ -5457,8 +5511,14 @@ impl Engine {
         self: &Arc<Self>,
         runtime: trouve_agents::install::CliId,
     ) -> Result<BackendRetirement, EngineError> {
+        let transition = self.provider_reload.clone().lock_owned().await;
         let target_ids = self.configured_provider_ids_for_runtime(runtime);
-        self.retire_config_backends_matching_ids(&target_ids).await
+        self.retire_config_backends_matching_ids_locked(
+            &target_ids,
+            BACKEND_RETIREMENT_TIMEOUT,
+            transition,
+        )
+        .await
     }
 
     fn configured_provider_ids_for_runtime(
@@ -5498,6 +5558,16 @@ impl Engine {
         timeout: Duration,
     ) -> Result<BackendRetirement, EngineError> {
         let transition = self.provider_reload.clone().lock_owned().await;
+        self.retire_config_backends_matching_ids_locked(target_ids, timeout, transition)
+            .await
+    }
+
+    async fn retire_config_backends_matching_ids_locked(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+        timeout: Duration,
+        transition: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<BackendRetirement, EngineError> {
         let retirement = BackendRetirement::new(self, target_ids.clone(), transition);
         let injected = self
             .injected_backends
@@ -5602,8 +5672,13 @@ impl Engine {
         }
         drop(providers);
 
-        let mut backend_replacements =
-            build_all_backends(&config, &self.secrets, &self.data_dir, &self.model_catalog);
+        let mut backend_replacements = build_backends_for_ids(
+            &config,
+            &self.secrets,
+            &self.data_dir,
+            &self.model_catalog,
+            Some(target_ids),
+        );
         let injected_backends = self.injected_backends.lock().unwrap().clone();
         let mut backends = self.backends.write().unwrap();
         for id in target_ids {
@@ -5658,10 +5733,7 @@ impl Engine {
         self: &Arc<Self>,
         runtime: trouve_agents::install::CliId,
     ) -> Result<(), EngineError> {
-        let target_ids = self.configured_provider_ids_for_runtime(runtime);
-        let retirement = self
-            .retire_config_backends_matching_ids(&target_ids)
-            .await?;
+        let retirement = self.retire_config_backends_for_runtime(runtime).await?;
         retirement.publish();
         Ok(())
     }
@@ -22441,6 +22513,44 @@ default_permission_mode = "ask"
         }
     }
 
+    struct RegistryObservingFailingSecretStore {
+        engine: Mutex<Weak<Engine>>,
+        saw_published_backend: std::sync::atomic::AtomicBool,
+    }
+
+    impl RegistryObservingFailingSecretStore {
+        fn new() -> Self {
+            Self {
+                engine: Mutex::new(Weak::new()),
+                saw_published_backend: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for RegistryObservingFailingSecretStore {
+        fn get(&self, _key: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn set(&self, _key: &str, _value: &str) -> anyhow::Result<()> {
+            if self
+                .engine
+                .lock()
+                .unwrap()
+                .upgrade()
+                .is_some_and(|engine| engine.backends.read().unwrap().contains_key("cursor"))
+            {
+                self.saw_published_backend
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(anyhow!("injected secret-store failure"))
+        }
+
+        fn delete(&self, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn removing_github_host_discards_its_dashboard_cache() {
         const HOST: &str = "github.example.com";
@@ -26330,6 +26440,201 @@ default_permission_mode = "ask"
         ) -> Result<trouve_agents::BackendEventStream, BackendError> {
             Err(BackendError::Protocol("not used".into()))
         }
+    }
+
+    #[test]
+    fn targeted_backend_build_skips_unrelated_vendor_runtimes() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [("cursor", "cursor-sdk"), ("claude", "claude-cli")] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+
+        let replacements = build_backends_for_ids(
+            &config,
+            &engine.secrets,
+            data.path(),
+            &engine.model_catalog,
+            Some(&HashSet::from(["cursor".to_string()])),
+        );
+
+        assert_eq!(replacements.len(), 1);
+        assert!(replacements.contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn provider_upsert_commits_config_before_publishing_replacement() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let observing_store = Arc::new(RegistryObservingFailingSecretStore::new());
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = observing_store.clone();
+        let engine = Arc::new(engine);
+        *observing_store.engine.lock().unwrap() = Arc::downgrade(&engine);
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered,
+                release: Arc::new(tokio::sync::Semaphore::new(1)),
+            }),
+        );
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    api_key: Some("replacement-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !observing_store
+                .saw_published_backend
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "replacement became visible before the config mutation completed"
+        );
+        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+        assert_eq!(
+            engine.config.lock().unwrap().providers["cursor"].kind,
+            "cursor-sdk"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_retirement_selects_targets_after_transition_admission() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let shutdowns = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let backend: Arc<dyn AgentBackend> = shutdowns.clone();
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), backend.clone());
+        let transition = engine.provider_reload.clone().lock_owned().await;
+        let retiring = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .retire_config_backends_for_runtime(
+                        trouve_agents::install::CliId::CursorSdkBridge,
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!retiring.is_finished());
+        engine
+            .config
+            .lock()
+            .unwrap()
+            .providers
+            .get_mut("cursor")
+            .unwrap()
+            .kind = "claude-cli".into();
+        drop(transition);
+
+        retiring.await.unwrap().unwrap().publish();
+
+        assert_eq!(
+            shutdowns
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()["cursor"],
+            &backend
+        ));
+    }
+
+    #[tokio::test]
+    async fn install_cannot_start_while_uninstall_is_retiring_runtime() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let uninstalling = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.uninstall_cli("cursor-sdk-bridge").await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        let install = engine.start_cli_install("cursor-sdk-bridge");
+
+        assert!(
+            matches!(install, Err(EngineError::Conflict(message)) if message.contains("uninstall"))
+        );
+        assert!(
+            !engine
+                .cli_installs
+                .lock()
+                .unwrap()
+                .contains_key("cursor-sdk-bridge")
+        );
+        release.add_permits(1);
+        uninstalling.await.unwrap().unwrap();
+        assert!(engine.cli_runtime_operations.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
