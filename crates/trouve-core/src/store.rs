@@ -836,6 +836,20 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_checkbox_edited_at TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE queued_prompts ADD COLUMN background INTEGER NOT NULL DEFAULT 0",
+    // Durable threadless resolve/unresolve commands claimed from webhooks;
+    // rows survive restarts and are deleted when the command reaches a
+    // definitive outcome.
+    "CREATE TABLE IF NOT EXISTS code_review_pending_threadless_commands (
+       trigger_key TEXT PRIMARY KEY,
+       repository TEXT NOT NULL,
+       pull_number INTEGER NOT NULL,
+       comment_id INTEGER NOT NULL,
+       author TEXT NOT NULL,
+       resolve INTEGER NOT NULL,
+       finding_prefix TEXT NOT NULL,
+       reason TEXT NOT NULL,
+       created_at TEXT NOT NULL
+     )",
     // Smallest configured-model context window (tokens) resolved for this
     // job's prompt budgets. NULL = never resolved; 0 = resolved but unknown
     // (fixed default budgets). Persisted so retries re-batch identically
@@ -4047,6 +4061,20 @@ fn cancel_active_code_review_tasks(
             .map_err(Into::into)
         })
         .collect()
+}
+
+/// A durable threadless resolve/unresolve command claimed from a webhook
+/// delivery, retried until it reaches a definitive outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingThreadlessCommand {
+    pub trigger_key: String,
+    pub repository: String,
+    pub pull_number: u64,
+    pub comment_id: u64,
+    pub author: String,
+    pub resolve: bool,
+    pub finding_prefix: String,
+    pub reason: String,
 }
 
 /// Outcome of a maintainer resolve/unresolve command against the threadless
@@ -12200,9 +12228,18 @@ impl Store {
         finding_prefix: &str,
         resolve: bool,
         dismiss_reason: &str,
+        trigger_key: Option<&str>,
     ) -> Result<(ThreadlessCommandOutcome, Option<String>)> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        // Every outcome below is definitive, so the durable command row is
+        // consumed in the same transaction as the state it decides.
+        if let Some(trigger_key) = trigger_key {
+            tx.execute(
+                "DELETE FROM code_review_pending_threadless_commands WHERE trigger_key = ?1",
+                params![trigger_key],
+            )?;
+        }
         let mut stmt = tx.prepare(
             "SELECT f.id, f.status FROM code_review_findings f
              JOIN code_review_jobs j ON j.id = f.job_id
@@ -14372,6 +14409,71 @@ impl Store {
         }
         tx.commit()?;
         Ok(inserted > 0)
+    }
+
+    /// Claim a webhook delivery and persist its threadless command in the
+    /// same transaction, so a crash after the claim can never lose the
+    /// command: it is retried from this table until a definitive outcome
+    /// deletes it.
+    pub fn claim_github_webhook_delivery_with_threadless_command(
+        &self,
+        delivery_id: &str,
+        command: &PendingThreadlessCommand,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO github_webhook_deliveries (delivery_id, received_at)
+             VALUES (?1, ?2)",
+            params![delivery_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        if inserted > 0 {
+            tx.execute(
+                "INSERT OR IGNORE INTO code_review_pending_threadless_commands
+                        (trigger_key, repository, pull_number, comment_id, author, resolve,
+                         finding_prefix, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    command.trigger_key,
+                    command.repository,
+                    command.pull_number as i64,
+                    command.comment_id as i64,
+                    command.author,
+                    command.resolve,
+                    command.finding_prefix,
+                    command.reason,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted > 0)
+    }
+
+    pub fn pending_threadless_commands(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<PendingThreadlessCommand>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT trigger_key, repository, pull_number, comment_id, author, resolve,
+                    finding_prefix, reason
+             FROM code_review_pending_threadless_commands
+             WHERE repository = ?1 ORDER BY created_at, trigger_key",
+        )?;
+        let rows = stmt.query_map(params![repository], |row| {
+            Ok(PendingThreadlessCommand {
+                trigger_key: row.get(0)?,
+                repository: row.get(1)?,
+                pull_number: row.get::<_, i64>(2)? as u64,
+                comment_id: row.get::<_, i64>(3)? as u64,
+                author: row.get(4)?,
+                resolve: row.get(5)?,
+                finding_prefix: row.get(6)?,
+                reason: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn pending_code_review_manual_requests(
@@ -19708,7 +19810,14 @@ mod tests {
         // Every finding id shares the rvf_ prefix, so a bare prefix is
         // ambiguous and applies nothing.
         let (outcome, _) = store
-            .apply_threadless_resolve_command("acme/widgets", 42, "rvf_", true, "reason — @jim")
+            .apply_threadless_resolve_command(
+                "acme/widgets",
+                42,
+                "rvf_",
+                true,
+                "reason — @jim",
+                None,
+            )
             .unwrap();
         assert!(matches!(
             outcome,
@@ -19723,6 +19832,7 @@ mod tests {
                 "rvf_000000",
                 true,
                 "reason — @jim",
+                None,
             )
             .unwrap();
         assert!(matches!(outcome, ThreadlessCommandOutcome::NotFound));
@@ -19735,6 +19845,7 @@ mod tests {
                 &target,
                 true,
                 "accepted limitation per ADR 0042 — resolved by @jim",
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -19752,7 +19863,14 @@ mod tests {
         // Resolving again is not applicable — fixed/dismissed states are
         // reported instead of silently re-applied.
         let (outcome, _) = store
-            .apply_threadless_resolve_command("acme/widgets", 42, &target, true, "again — @jim")
+            .apply_threadless_resolve_command(
+                "acme/widgets",
+                42,
+                &target,
+                true,
+                "again — @jim",
+                None,
+            )
             .unwrap();
         assert!(matches!(
             outcome,
@@ -19761,7 +19879,7 @@ mod tests {
 
         // Unresolve restores it.
         let (outcome, _) = store
-            .apply_threadless_resolve_command("acme/widgets", 42, &target, false, "")
+            .apply_threadless_resolve_command("acme/widgets", 42, &target, false, "", None)
             .unwrap();
         assert_eq!(
             outcome,

@@ -3760,6 +3760,7 @@ impl Engine {
                 && active_repositories
                     .contains(&(repository.installation_id, repository.repository.clone()))
         }) {
+            self.process_pending_threadless_commands(repository).await;
             match self
                 .poll_code_review_repository(repository, &mut reconciliation_candidates)
                 .await
@@ -4550,10 +4551,43 @@ impl Engine {
                         .unwrap_or_default()
                 })
                 .filter(|pull_number| *pull_number > 0);
-        if !self
-            .store
-            .claim_github_webhook_delivery(delivery_id, durable_request)?
-        {
+        // A valid resolve/unresolve command persists durably in the same
+        // transaction as the delivery claim, so a crash between claim and
+        // application cannot lose it; malformed commands only earn a
+        // guidance reply and need no durability.
+        let pending_command = resolve_command
+            .as_ref()
+            .filter(|_| repository.is_some() && durable_request.is_none())
+            .and_then(|command| {
+                let (resolve, finding_prefix, reason) = match &command.parsed {
+                    ThreadlessCommandParse::Resolve {
+                        finding_prefix,
+                        reason,
+                    } => (true, finding_prefix.clone(), reason.clone()),
+                    ThreadlessCommandParse::Unresolve { finding_prefix } => {
+                        (false, finding_prefix.clone(), String::new())
+                    }
+                    ThreadlessCommandParse::Invalid(_) => return None,
+                };
+                Some(crate::store::PendingThreadlessCommand {
+                    trigger_key: format!("command:comment:{}", command.comment_id),
+                    repository: command.repository.clone(),
+                    pull_number: command.pull_number,
+                    comment_id: command.comment_id,
+                    author: command.author.clone(),
+                    resolve,
+                    finding_prefix,
+                    reason,
+                })
+            });
+        let claimed = if let Some(command) = pending_command.as_ref() {
+            self.store
+                .claim_github_webhook_delivery_with_threadless_command(delivery_id, command)?
+        } else {
+            self.store
+                .claim_github_webhook_delivery(delivery_id, durable_request)?
+        };
+        if !claimed {
             return Ok(());
         }
         if let Some(repository) = repository {
@@ -4674,12 +4708,32 @@ impl Engine {
                 return Ok(());
             }
             let engine = self.clone();
+            // A command names its pull, so the walk that follows application
+            // prioritizes it: dismissing the last blocking finding by
+            // command schedules the full-coverage confirmation round in this
+            // same pass instead of waiting for the rotation.
+            let command_priority = resolve_command
+                .as_ref()
+                .map(|command| (command.repository.clone(), command.pull_number))
+                .into_iter()
+                .collect::<HashSet<_>>();
             tokio::spawn(async move {
                 let _guard = engine.code_review.reconcile_lock.lock().await;
                 if let Some(command) = &resolve_command {
-                    engine
-                        .apply_threadless_resolve_command_event(&repository, command)
-                        .await;
+                    if let ThreadlessCommandParse::Invalid(message) = &command.parsed {
+                        engine
+                            .reply_to_threadless_command(
+                                &repository,
+                                command.pull_number,
+                                &command.author,
+                                message,
+                            )
+                            .await;
+                    } else {
+                        engine
+                            .process_pending_threadless_commands(&repository)
+                            .await;
+                    }
                 }
                 if let Some((comment_id, edited_at, states)) = &lifecycle_checkbox_edit
                     && let Err(error) = engine
@@ -4721,7 +4775,7 @@ impl Engine {
                     let (_, _, reconcile_error) = engine
                         .reconcile_oldest_review_thread_candidate(
                             &reconciliation_candidates,
-                            &HashSet::new(),
+                            &command_priority,
                         )
                         .await;
                     if let Some(error) = reconcile_error {
@@ -10169,15 +10223,98 @@ impl Engine {
             }
         }
         lines
+    /// Authoritative effective-permission check for a commenter: only
+    /// write, maintain, or admin may mutate durable review state.
+    async fn commenter_has_write_permission(
+        &self,
+        api: &GithubApi,
+        repository: &str,
+        username: &str,
+    ) -> Result<bool> {
+        if username.is_empty() {
+            return Ok(false);
+        }
+        let (permission, rate): (serde_json::Value, _) = api
+            .get(&format!(
+                "/repos/{repository}/collaborators/{username}/permission"
+            ))
+            .await
+            .context("looking up commenter repository permission")?;
+        self.record_review_rate(rate);
+        Ok(matches!(
+            permission["permission"].as_str(),
+            Some("admin" | "write" | "maintain")
+        ))
+    }
+
+    /// Post a short guidance reply to a malformed command comment.
+    async fn reply_to_threadless_command(
+        &self,
+        repository: &CodeReviewRepository,
+        pull_number: u64,
+        author: &str,
+        message: &str,
+    ) {
+        let api = match self.installation_api(repository.installation_id).await {
+            Ok(api) => api,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "authenticating threadless command reply failed: {error:#}"
+                ));
+                return;
+            }
+        };
+        match api
+            .post::<serde_json::Value>(
+                &format!(
+                    "/repos/{}/issues/{pull_number}/comments",
+                    repository.repository
+                ),
+                &serde_json::json!({ "body": format!("@{author}: {message}") }),
+            )
+            .await
+        {
+            Ok((_, rate)) => self.record_review_rate(rate),
+            Err(error) => self.record_review_error(format!(
+                "replying to threadless resolve command failed: {error:#}"
+            )),
+        }
+    }
+
+    /// Apply every durably claimed resolve/unresolve command for this
+    /// repository: called from the webhook worker for immediacy and from
+    /// every repository poll as the retry path, so a command claimed just
+    /// before a crash still reaches its outcome. Each command's row is
+    /// consumed in the same transaction as the decision it produces, making
+    /// the two processors race-free and replays inert.
+    async fn process_pending_threadless_commands(&self, repository: &CodeReviewRepository) {
+        let commands = match self
+            .store
+            .pending_threadless_commands(&repository.repository)
+        {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "loading pending threadless commands failed: {error:#}"
+                ));
+                return;
+            }
+        };
+        for command in commands {
+            self.apply_threadless_resolve_command_event(repository, &command)
+                .await;
+        }
+    }
+
     /// Apply one maintainer `@trouve-ai resolve`/`unresolve` command. The
     /// happy path acknowledges with a reaction on the command comment;
     /// anything the maintainer needs to correct is answered with a short
-    /// reply. Failures are recorded and never propagate — a command can
-    /// always be re-issued.
+    /// reply. Failures are recorded and never propagate — the durable row
+    /// keeps the command retryable until a definitive outcome consumes it.
     async fn apply_threadless_resolve_command_event(
-        self: &Arc<Self>,
+        &self,
         repository: &CodeReviewRepository,
-        command: &ThreadlessResolveCommand,
+        command: &crate::store::PendingThreadlessCommand,
     ) {
         let api = match self.installation_api(repository.installation_id).await {
             Ok(api) => api,
@@ -10188,99 +10325,127 @@ impl Engine {
                 return;
             }
         };
-        use crate::store::ThreadlessCommandOutcome;
-        let feedback = match &command.parsed {
-            ThreadlessCommandParse::Invalid(message) => Some((*message).to_owned()),
-            ThreadlessCommandParse::Resolve { .. } | ThreadlessCommandParse::Unresolve { .. } => {
-                let (finding_prefix, resolve, reason) = match &command.parsed {
-                    ThreadlessCommandParse::Resolve {
-                        finding_prefix,
-                        reason,
-                    } => (finding_prefix, true, reason.as_str()),
-                    ThreadlessCommandParse::Unresolve { finding_prefix } => {
-                        (finding_prefix, false, "")
-                    }
-                    ThreadlessCommandParse::Invalid(_) => unreachable!(),
-                };
-                // The stored reason carries attribution so the ledger and
-                // dashboard show who decided and why, without a schema
-                // change. Both fields are untrusted text and bounded.
-                let dismiss_reason = format!(
-                    "{} — resolved by @{}",
-                    bounded_utf8(reason.trim(), 512, "…"),
-                    bounded_utf8(command.author.trim(), 64, "…"),
+        // Author association is only a cheap pre-filter: MEMBER admits
+        // read-only organization members and COLLABORATOR does not imply
+        // write. Mutating durable review state requires the commenter's
+        // current effective repository permission, checked authoritatively —
+        // the same authority GitHub demands before someone could have
+        // toggled the old dismissal checkboxes by editing the bot's comment.
+        match self
+            .commenter_has_write_permission(&api, &repository.repository, &command.author)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    repository = %repository.repository,
+                    author = %command.author,
+                    "dropping threadless resolve command from a commenter without write permission"
                 );
-                match self.store.apply_threadless_resolve_command(
+                // A definitive outcome: consume the row so an unauthorized
+                // command is not retried forever.
+                if let Err(error) = self.store.apply_threadless_resolve_command(
                     &repository.repository,
                     command.pull_number,
-                    finding_prefix,
-                    resolve,
-                    &dismiss_reason,
+                    "rvf_never-matches",
+                    command.resolve,
+                    "",
+                    Some(&command.trigger_key),
                 ) {
-                    Ok((ThreadlessCommandOutcome::Applied { .. }, projection_job)) => {
-                        match api
-                            .post::<serde_json::Value>(
-                                &format!(
-                                    "/repos/{}/issues/comments/{}/reactions",
-                                    repository.repository, command.comment_id
-                                ),
-                                &serde_json::json!({ "content": "+1" }),
-                            )
-                            .await
-                        {
-                            Ok((_, rate)) => self.record_review_rate(rate),
-                            Err(error) => tracing::debug!(
-                                %error,
-                                "acknowledging threadless resolve command failed"
-                            ),
-                        }
-                        let projection_job = match projection_job {
-                            Some(job_id) => Some(job_id),
-                            None => self
-                                .store
-                                .latest_published_code_review_job_id(
-                                    &repository.repository,
-                                    command.pull_number,
-                                )
-                                .ok()
-                                .flatten(),
-                        };
-                        if let Some(job_id) = projection_job {
-                            let _ = self.emit_code_review_updated(Some(job_id.clone()));
-                            if let Ok(Some(record)) = self.store.code_review_job(&job_id) {
-                                self.sync_code_review_projection(&record.job).await;
-                            }
-                        }
-                        None
-                    }
-                    Ok((ThreadlessCommandOutcome::AmbiguousPrefix { matches }, _)) => {
-                        Some(format!(
-                            "`{finding_prefix}` matches {matches} findings on this pull request; \
-                         use more of the id shown in the review comment."
-                        ))
-                    }
-                    Ok((ThreadlessCommandOutcome::NotFound, _)) => Some(format!(
-                        "`{finding_prefix}` does not match a finding without an inline thread on \
-                         this pull request. Fixed findings leave the list automatically; findings \
-                         with inline threads are resolved through their review thread instead."
-                    )),
-                    Ok((ThreadlessCommandOutcome::NotApplicable { status, .. }, _)) => {
-                        Some(if resolve {
-                            format!(
-                                "that finding is already `{status}`; nothing to resolve. \
-                                 Fixed findings leave the list automatically."
-                            )
-                        } else {
-                            format!("that finding is `{status}`, not resolved; nothing to restore.")
-                        })
-                    }
-                    Err(error) => {
-                        self.record_review_error(format!(
-                            "applying threadless resolve command failed: {error:#}"
-                        ));
-                        None
+                    self.record_review_error(format!(
+                        "consuming unauthorized threadless command failed: {error:#}"
+                    ));
+                }
+                return;
+            }
+            Err(error) => {
+                // Transient: leave the row pending; the next repository poll
+                // retries the permission lookup.
+                self.record_review_error(format!(
+                    "verifying threadless resolve command permission failed: {error:#}"
+                ));
+                return;
+            }
+        }
+        use crate::store::ThreadlessCommandOutcome;
+        // The stored reason carries attribution so the ledger and dashboard
+        // show who decided and why, without a schema change. Both fields are
+        // untrusted text and bounded.
+        let dismiss_reason = format!(
+            "{} — resolved by @{}",
+            bounded_utf8(command.reason.trim(), 512, "…"),
+            bounded_utf8(command.author.trim(), 64, "…"),
+        );
+        let feedback = match self.store.apply_threadless_resolve_command(
+            &repository.repository,
+            command.pull_number,
+            &command.finding_prefix,
+            command.resolve,
+            &dismiss_reason,
+            Some(&command.trigger_key),
+        ) {
+            Ok((ThreadlessCommandOutcome::Applied { .. }, projection_job)) => {
+                match api
+                    .post::<serde_json::Value>(
+                        &format!(
+                            "/repos/{}/issues/comments/{}/reactions",
+                            repository.repository, command.comment_id
+                        ),
+                        &serde_json::json!({ "content": "+1" }),
+                    )
+                    .await
+                {
+                    Ok((_, rate)) => self.record_review_rate(rate),
+                    Err(error) => tracing::debug!(
+                        %error,
+                        "acknowledging threadless resolve command failed"
+                    ),
+                }
+                let projection_job = match projection_job {
+                    Some(job_id) => Some(job_id),
+                    None => self
+                        .store
+                        .latest_published_code_review_job_id(
+                            &repository.repository,
+                            command.pull_number,
+                        )
+                        .ok()
+                        .flatten(),
+                };
+                if let Some(job_id) = projection_job {
+                    let _ = self.emit_code_review_updated(Some(job_id.clone()));
+                    if let Ok(Some(record)) = self.store.code_review_job(&job_id) {
+                        self.sync_code_review_projection(&record.job).await;
                     }
                 }
+                None
+            }
+            Ok((ThreadlessCommandOutcome::AmbiguousPrefix { matches }, _)) => Some(format!(
+                "`{}` matches {matches} findings on this pull request; \
+                 use more of the id shown in the review comment.",
+                command.finding_prefix
+            )),
+            Ok((ThreadlessCommandOutcome::NotFound, _)) => Some(format!(
+                "`{}` does not match a finding without an inline thread on \
+                 this pull request. Fixed findings leave the list automatically; findings \
+                 with inline threads are resolved through their review thread instead.",
+                command.finding_prefix
+            )),
+            Ok((ThreadlessCommandOutcome::NotApplicable { status, .. }, _)) => {
+                Some(if command.resolve {
+                    format!(
+                        "that finding is already `{status}`; nothing to resolve. \
+                         Fixed findings leave the list automatically."
+                    )
+                } else {
+                    format!("that finding is `{status}`, not resolved; nothing to restore.")
+                })
+            }
+            Err(error) => {
+                self.record_review_error(format!(
+                    "applying threadless resolve command failed: {error:#}"
+                ));
+                None
             }
         };
         if let Some(message) = feedback {
@@ -10358,7 +10523,7 @@ impl Engine {
             // over and needs a state-preserving re-render.
             if comment["body"]
                 .as_str()
-                .is_some_and(|body| body.contains("### Findings without inline threads"))
+                .is_some_and(|body| body.contains(LIFECYCLE_DISMISSAL_SECTION_TITLE))
             {
                 return Ok(());
             }
@@ -11233,6 +11398,8 @@ fn parse_lifecycle_dismissal_markers(body: &str) -> Option<Vec<(String, bool)>> 
 }
 
 const LIFECYCLE_DISMISSABLE_MAX_BYTES: usize = 16 * 1024;
+
+const LIFECYCLE_DISMISSAL_SECTION_TITLE: &str = "### Findings without inline threads";
 
 const LIFECYCLE_DISMISSAL_HEADING: &str = "### Findings without inline threads\n\nThese findings \
      anchor outside the pull-request diff, so they have no review thread to resolve. To resolve \
