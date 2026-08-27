@@ -7408,6 +7408,7 @@ dependencies = [
  "chrono",
  "dirs",
  "flate2",
+ "fs4",
  "futures",
  "libc",
  "portable-pty",
