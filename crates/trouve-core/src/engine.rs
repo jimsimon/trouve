@@ -2893,18 +2893,22 @@ fn canonical_cli_runtime_id(id: &str) -> &str {
 }
 
 /// Resolve the executable for a managed agent runtime. An explicit command
-/// wins; otherwise a trouve-managed binary takes precedence over PATH.
+/// wins unless it is Trouve's retired stable path; otherwise the atomic
+/// managed-install pointer takes precedence over PATH.
 fn resolved_runtime_command(
     kind: &str,
     command: Option<String>,
     data_dir: &Path,
 ) -> Option<String> {
-    command.or_else(|| {
-        cli_for_kind(kind)
-            .map(|cli| trouve_agents::install::managed_bin(data_dir, cli))
-            .filter(|bin| bin.exists())
-            .map(|bin| bin.to_string_lossy().into_owned())
-    })
+    let cli = cli_for_kind(kind);
+    if let Some(command) = command
+        && !cli
+            .is_some_and(|cli| Path::new(&command) == data_dir.join("cli/bin").join(cli.as_str()))
+    {
+        return Some(command);
+    }
+    cli.and_then(|cli| trouve_agents::install::installed(data_dir, cli))
+        .map(|install| install.bin)
 }
 
 /// The old `cursor-cli` kind is retained only as an explicit migration state.
@@ -4547,8 +4551,8 @@ impl Engine {
                         return Ok(None);
                     }
 
-                    // Close only Cursor-owned pools before swapping the stable
-                    // Bridge path. Claude and Codex remain usable throughout
+                    // Close only Cursor-owned pools before replacing the active
+                    // Bridge pointer. Claude and Codex remain usable throughout
                     // the download and activation.
                     if let Err(error) = engine.shutdown_config_backends_for_runtime(cli).await {
                         // Teardown may have closed one or more Cursor pools.
@@ -25707,13 +25711,34 @@ default_permission_mode = "ask"
     #[test]
     fn runtime_command_prefers_explicit_then_managed_binary() {
         let tmp = tempfile::tempdir().unwrap();
-        let managed =
-            trouve_agents::install::managed_bin(tmp.path(), trouve_agents::install::CliId::Codex);
+        let root = tmp.path().join("cli/codex");
+        let managed = root.join(".generations/runtime-current/codex");
         std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
         std::fs::write(&managed, b"stub").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_vec(&trouve_agents::install::InstalledCli {
+                version: "1.0.0".into(),
+                bin: managed.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let obsolete_stable = tmp.path().join("cli/bin/codex");
+        std::fs::create_dir_all(obsolete_stable.parent().unwrap()).unwrap();
+        std::fs::write(&obsolete_stable, b"uncommitted").unwrap();
 
         assert_eq!(
             resolved_runtime_command("codex-app-server", None, tmp.path()),
+            Some(managed.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            resolved_runtime_command(
+                "codex-app-server",
+                Some(obsolete_stable.to_string_lossy().into_owned()),
+                tmp.path()
+            ),
             Some(managed.to_string_lossy().into_owned())
         );
         assert_eq!(

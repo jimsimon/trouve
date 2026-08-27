@@ -7,7 +7,10 @@
 //! Layout under `<data_dir>/cli/`:
 //! - `<id>/.generations/…`    — immutable runtime generations
 //! - `<id>/installed.json`    — pointer to the active version + binary
-//! - `bin/<id>`               — stable symlink backends resolve at spawn
+//!
+//! `installed.json` is the single source used by both discovery and process
+//! launches. Activation atomically replaces it only after a complete immutable
+//! generation has been published.
 //!
 //! Sources (no custom mirrors):
 //! - cursor-sdk-bridge: one independently reviewed GitHub `cursor/sdk-bridge`
@@ -162,7 +165,7 @@ impl Progress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledCli {
     pub version: String,
-    /// Absolute path of the executable inside the version directory.
+    /// Absolute path of the executable inside the runtime generation.
     pub bin: String,
 }
 
@@ -170,8 +173,7 @@ fn cli_root(data_dir: &Path, id: CliId) -> PathBuf {
     data_dir.join("cli").join(id.as_str())
 }
 
-/// Stable path of the managed binary (a symlink), whether or not it exists.
-pub fn managed_bin(data_dir: &Path, id: CliId) -> PathBuf {
+fn legacy_managed_bin_path(data_dir: &Path, id: CliId) -> PathBuf {
     data_dir.join("cli").join("bin").join(id.as_str())
 }
 
@@ -180,6 +182,15 @@ pub fn installed(data_dir: &Path, id: CliId) -> Option<InstalledCli> {
     let raw = std::fs::read_to_string(cli_root(data_dir, id).join("installed.json")).ok()?;
     let info: InstalledCli = serde_json::from_str(&raw).ok()?;
     Path::new(&info.bin).exists().then_some(info)
+}
+
+/// Executable selected by the authoritative managed-install pointer. The
+/// retired conventional path is returned only when no valid pointer exists,
+/// preserving the historical API for callers that probe it with `exists()`.
+pub fn managed_bin(data_dir: &Path, id: CliId) -> PathBuf {
+    installed(data_dir, id)
+        .map(|install| PathBuf::from(install.bin))
+        .unwrap_or_else(|| legacy_managed_bin_path(data_dir, id))
 }
 
 fn http() -> Result<reqwest::Client, InstallError> {
@@ -551,7 +562,7 @@ pub struct PreparedInstall {
 
 impl PreparedInstall {
     /// Move the prepared runtime into an immutable generation, then atomically
-    /// publish its stable executable path and metadata pointer.
+    /// publish the metadata pointer used by both discovery and launches.
     pub fn activate(self) -> Result<InstalledCli, InstallError> {
         self.activate_with_checkpoint(|_| Ok(()))
     }
@@ -562,6 +573,7 @@ impl PreparedInstall {
     ) -> Result<InstalledCli, InstallError> {
         let root = cli_root(&self.data_dir, self.id);
         let _activation_lock = lock_runtime_activation(&self.data_dir, self.id)?;
+        let previous = installed(&self.data_dir, self.id);
         let staged_bin = self.stage.join(&self.bin_rel);
         if !self.stage.is_dir() || !staged_bin.is_file() {
             return Err(InstallError::Download(format!(
@@ -583,10 +595,20 @@ impl PreparedInstall {
             bin: bin.to_string_lossy().into_owned(),
         };
         let pointer = root.join("installed.json");
-        let link = managed_bin(&self.data_dir, self.id);
-        std::fs::create_dir_all(link.parent().expect("managed binary has a parent"))?;
+        let previous_generation = previous
+            .as_ref()
+            .and_then(|install| runtime_container(&generations, Path::new(&install.bin)));
+        let previous_legacy = previous.as_ref().and_then(|install| {
+            runtime_container(&root, Path::new(&install.bin)).filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
+            })
+        });
 
-        // Build and flush every file candidate before changing live state.
+        // Build and flush the sole publication candidate before changing live
+        // state. Until its atomic replacement, both discovery and launches
+        // continue resolving the complete previous generation.
         let pointer_candidate = unique_runtime_path(&root, "installed.json.candidate")?;
         let _pointer_candidate_cleanup = PathCleanup::new(pointer_candidate.clone());
         let mut pointer_file = std::fs::OpenOptions::new()
@@ -600,57 +622,20 @@ impl PreparedInstall {
         pointer_file.sync_all()?;
         drop(pointer_file);
 
-        let link_parent = link
-            .parent()
-            .expect("managed binary has a parent")
-            .to_path_buf();
-        let link_candidate = unique_runtime_path(&link_parent, "runtime.candidate")?;
-        let _link_candidate_cleanup = PathCleanup::new(link_candidate.clone());
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&bin, &link_candidate)?;
-        #[cfg(not(unix))]
-        {
-            std::fs::copy(&staged_bin, &link_candidate)?;
-            std::fs::File::open(&link_candidate)?.sync_all()?;
-        }
-
-        let link_backup = unique_runtime_path(&link_parent, "runtime.rollback")?;
-        let mut link_publication =
-            StableLinkPublication::capture(link, link_candidate, link_backup)?;
         let mut generation_cleanup = PathCleanup::new(generation.clone());
-        let publication = (|| -> std::io::Result<()> {
-            std::fs::rename(&self.stage, &generation)?;
-            link_publication.publish()?;
-            checkpoint(ActivationCheckpoint::StableExecutable)?;
-            checkpoint(ActivationCheckpoint::Metadata)?;
-            let replacing_pointer = path_exists(&pointer)?;
-            replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
-            Ok(())
-        })();
-        if let Err(error) = publication {
-            if let Err(rollback) = link_publication.rollback() {
-                // The stable path may still reference the new generation. Keep
-                // it and the backup so the reported error remains recoverable.
-                generation_cleanup.disarm();
-                return Err(InstallError::Download(format!(
-                    "activating {} {} failed ({error}); restoring the stable executable failed ({rollback})",
-                    self.id.as_str(),
-                    self.version
-                )));
-            }
-            return Err(error.into());
-        }
+        std::fs::rename(&self.stage, &generation)?;
+        checkpoint(ActivationCheckpoint::BeforePointer)?;
+        let replacing_pointer = path_exists(&pointer)?;
+        replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
 
-        // installed.json is the final, atomically replaced commit marker. No
-        // fallible publication step follows it, so readers always observe a
-        // complete previous or new generation, never a missing pointer.
+        // installed.json is the one atomically replaced commit marker. No
+        // fallible step follows it, so every reader observes a complete
+        // previous or new generation and uses that same selection to launch.
         generation_cleanup.disarm();
-        link_publication.commit();
 
-        prune_runtime_generations(&generations, &generation);
-        // Retain the historical version directories as a one-generation
-        // migration fallback while existing installs move to the new layout.
-        prune_old_versions(&root, &self.version);
+        prune_runtime_generations(&generations, &generation, previous_generation.as_deref());
+        prune_old_versions(&root, previous_legacy.as_deref());
+        remove_legacy_managed_bin_best_effort(&self.data_dir, self.id);
         if self.id == CliId::CursorSdkBridge {
             // The SDK is the Cursor transport now. Remove Trouve's obsolete
             // managed ACP binary once the replacement is active; system installs
@@ -663,92 +648,7 @@ impl PreparedInstall {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivationCheckpoint {
-    Metadata,
-    StableExecutable,
-}
-
-#[derive(Debug)]
-struct StableLinkPublication {
-    destination: PathBuf,
-    replacement: PathBuf,
-    backup: Option<PathBuf>,
-    published: bool,
-    finished: bool,
-}
-
-impl StableLinkPublication {
-    fn capture(
-        destination: PathBuf,
-        replacement: PathBuf,
-        backup: PathBuf,
-    ) -> std::io::Result<Self> {
-        let backup = match std::fs::symlink_metadata(&destination) {
-            Ok(metadata) => {
-                if let Err(error) = clone_runtime_entry(&destination, &backup, &metadata) {
-                    let _ = remove_path(&backup);
-                    return Err(error);
-                }
-                Some(backup)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        Ok(Self {
-            destination,
-            replacement,
-            backup,
-            published: false,
-            finished: false,
-        })
-    }
-
-    fn publish(&mut self) -> std::io::Result<()> {
-        replace_runtime_file(&self.replacement, &self.destination, self.backup.is_some())?;
-        self.published = true;
-        Ok(())
-    }
-
-    fn rollback(&mut self) -> std::io::Result<()> {
-        if !self.published {
-            self.finished = true;
-            if let Some(backup) = self.backup.take() {
-                remove_path(&backup)?;
-            }
-            return Ok(());
-        }
-        if let Some(backup) = self.backup.as_ref() {
-            replace_runtime_file(backup, &self.destination, true)?;
-            self.backup = None;
-        } else {
-            remove_path(&self.destination)?;
-        }
-        self.published = false;
-        self.finished = true;
-        Ok(())
-    }
-
-    fn commit(&mut self) {
-        self.finished = true;
-        if let Some(backup) = self.backup.take()
-            && let Err(error) = remove_path(&backup)
-        {
-            tracing::warn!(
-                "runtime activation committed, but stable executable backup {} could not be removed: {error}",
-                backup.display()
-            );
-        }
-    }
-}
-
-impl Drop for StableLinkPublication {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        if let Err(error) = self.rollback() {
-            tracing::warn!("stable executable rollback failed: {error}");
-        }
-    }
+    BeforePointer,
 }
 
 struct PathCleanup(Option<PathBuf>);
@@ -779,46 +679,14 @@ fn path_exists(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-#[cfg(unix)]
-fn clone_runtime_entry(
-    source: &Path,
-    destination: &Path,
-    metadata: &std::fs::Metadata,
-) -> std::io::Result<()> {
-    if metadata.file_type().is_symlink() {
-        return std::os::unix::fs::symlink(std::fs::read_link(source)?, destination);
-    }
-    clone_runtime_file(source, destination, metadata)
-}
-
-#[cfg(not(unix))]
-fn clone_runtime_entry(
-    source: &Path,
-    destination: &Path,
-    metadata: &std::fs::Metadata,
-) -> std::io::Result<()> {
-    clone_runtime_file(source, destination, metadata)
-}
-
-fn clone_runtime_file(
-    source: &Path,
-    destination: &Path,
-    metadata: &std::fs::Metadata,
-) -> std::io::Result<()> {
-    if !metadata.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("runtime executable {} is not a file", source.display()),
-        ));
-    }
-    let mut source_file = std::fs::File::open(source)?;
-    let mut destination_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    std::io::copy(&mut source_file, &mut destination_file)?;
-    destination_file.set_permissions(metadata.permissions())?;
-    destination_file.sync_all()
+/// Return the immediate child of `root` containing `bin`, if the recorded
+/// executable is actually beneath that managed root.
+fn runtime_container(root: &Path, bin: &Path) -> Option<PathBuf> {
+    let relative = bin.strip_prefix(root).ok()?;
+    let Component::Normal(name) = relative.components().next()? else {
+        return None;
+    };
+    Some(root.join(name))
 }
 
 #[cfg(not(windows))]
@@ -981,7 +849,7 @@ pub async fn prepare_install(
 
 /// Download and activate `version` of `id` under `data_dir`. Returns the
 /// activated install. Idempotent: re-installing the active version just
-/// re-downloads and re-points the symlink. Byte progress lands in
+/// re-downloads and atomically replaces the active pointer. Byte progress lands in
 /// `progress`, which also carries the cancel flag.
 pub async fn install(
     data_dir: &Path,
@@ -994,12 +862,12 @@ pub async fn install(
         .activate()
 }
 
-/// Remove the managed install of `id` entirely: every version directory,
-/// the pointer, and the stable symlink. Binaries found on PATH are
-/// untouched — trouve only manages its own copies.
+/// Remove the managed install of `id` entirely, including legacy stable-path
+/// artifacts. Binaries found on PATH are untouched — trouve only manages its
+/// own copies.
 pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
     let _activation_lock = lock_runtime_activation(data_dir, id)?;
-    let link = managed_bin(data_dir, id);
+    let link = legacy_managed_bin_path(data_dir, id);
     if link.symlink_metadata().is_ok() {
         std::fs::remove_file(&link)?;
     }
@@ -1011,6 +879,16 @@ pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
         remove_legacy_cursor_agent_best_effort(data_dir);
     }
     Ok(())
+}
+
+fn remove_legacy_managed_bin_best_effort(data_dir: &Path, id: CliId) {
+    let path = legacy_managed_bin_path(data_dir, id);
+    if let Err(error) = remove_path(&path) {
+        tracing::warn!(
+            "managed runtime activation completed, but obsolete stable executable {} could not be removed: {error}",
+            path.display()
+        );
+    }
 }
 
 fn remove_legacy_cursor_agent(data_dir: &Path) -> std::io::Result<()> {
@@ -1277,48 +1155,38 @@ fn make_executable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Keep the active immutable generation and at most one previous generation.
-/// Orphans left by an interrupted activation are collected on the next
-/// successful activation (and uninstall removes the whole runtime root).
-fn prune_runtime_generations(generations: &Path, active: &Path) {
+/// Keep the active immutable generation and the exact previously active
+/// generation. Orphans left by an interrupted activation are collected on the
+/// next successful activation (and uninstall removes the whole runtime root).
+fn prune_runtime_generations(generations: &Path, active: &Path, previous: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(generations) else {
         return;
     };
-    let mut others: Vec<PathBuf> = entries
+    for generation in entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path != active)
-        .collect();
-    others.sort_by_key(|path| {
-        path.metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-    });
-    for generation in others.iter().rev().skip(1) {
+        .filter(|path| path.is_dir() && path != active && previous != Some(path.as_path()))
+    {
         let _ = std::fs::remove_dir_all(generation);
     }
 }
 
-/// Remove all version directories except the active one and the
-/// lexicographically greatest other (a cheap "previous version" heuristic).
-fn prune_old_versions(root: &Path, active: &str) {
+/// During migration, keep only the exact legacy directory selected by the
+/// previous pointer. Once both current and previous installs are generations,
+/// all legacy version directories can be removed.
+fn prune_old_versions(root: &Path, previous: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    let mut others: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n != active && !n.starts_with('.'))
-                    .unwrap_or(false)
-        })
-        .collect();
-    others.sort();
-    for dir in others.iter().rev().skip(1) {
-        let _ = std::fs::remove_dir_all(dir);
+    for directory in entries.flatten().map(|e| e.path()).filter(|p| {
+        p.is_dir()
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| !n.starts_with('.'))
+                .unwrap_or(false)
+            && previous != Some(p.as_path())
+    }) {
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
 
@@ -1649,13 +1517,18 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             .unwrap(),
         )
         .unwrap();
+        let retired = legacy_managed_bin_path(tmp.path(), CliId::Codex);
+        std::fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        std::fs::write(&retired, "obsolete runtime").unwrap();
 
         let info = installed(tmp.path(), CliId::Codex).unwrap();
         assert_eq!(info.version, "1.0.0");
+        assert_eq!(managed_bin(tmp.path(), CliId::Codex), bin);
 
         // Pointer with a missing binary reports not installed.
         std::fs::remove_file(&bin).unwrap();
         assert!(installed(tmp.path(), CliId::Codex).is_none());
+        assert_eq!(managed_bin(tmp.path(), CliId::Codex), retired);
     }
 
     #[test]
@@ -1675,20 +1548,19 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         };
 
         assert!(installed(tmp.path(), CliId::Codex).is_none());
-        assert!(
-            managed_bin(tmp.path(), CliId::Codex)
-                .symlink_metadata()
-                .is_err()
-        );
+        let legacy_stable = legacy_managed_bin_path(tmp.path(), CliId::Codex);
+        std::fs::create_dir_all(legacy_stable.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_stable, "obsolete runtime").unwrap();
 
         let activated = prepared.activate().unwrap();
 
         assert_eq!(activated.version, "2.0.0");
         assert!(Path::new(&activated.bin).starts_with(root.join(".generations")));
         assert_eq!(
-            std::fs::read_to_string(managed_bin(tmp.path(), CliId::Codex)).unwrap(),
+            std::fs::read_to_string(&activated.bin).unwrap(),
             "new runtime"
         );
+        assert!(legacy_stable.symlink_metadata().is_err());
         assert_eq!(
             installed(tmp.path(), CliId::Codex).unwrap().version,
             "2.0.0"
@@ -1742,12 +1614,6 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             .unwrap(),
         )
         .unwrap();
-        let link = managed_bin(tmp.path(), CliId::Codex);
-        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&active_bin, &link).unwrap();
-        #[cfg(not(unix))]
-        std::fs::copy(&active_bin, &link).unwrap();
 
         let stage = create_install_stage(&root, "2.0.0").unwrap();
         std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
@@ -1765,7 +1631,6 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             std::fs::read_to_string(&active_bin).unwrap(),
             "active runtime"
         );
-        assert_eq!(std::fs::read_to_string(&link).unwrap(), "active runtime");
         assert_eq!(
             installed(tmp.path(), CliId::Codex).unwrap().version,
             "2.0.0"
@@ -1773,79 +1638,60 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
-    fn publication_failures_restore_complete_same_version_install() {
-        for failed_checkpoint in [
-            ActivationCheckpoint::Metadata,
-            ActivationCheckpoint::StableExecutable,
-        ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = cli_root(tmp.path(), CliId::Codex);
-            let version_dir = root.join("2.0.0");
-            let active_bin = version_dir.join("codex");
-            std::fs::create_dir_all(&version_dir).unwrap();
-            std::fs::write(&active_bin, "active runtime").unwrap();
-            let previous_pointer = serde_json::to_string_pretty(&InstalledCli {
-                version: "2.0.0".into(),
-                bin: active_bin.to_string_lossy().into_owned(),
-            })
-            .unwrap();
-            std::fs::write(root.join("installed.json"), &previous_pointer).unwrap();
-            let link = managed_bin(tmp.path(), CliId::Codex);
-            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&active_bin, &link).unwrap();
-            #[cfg(not(unix))]
-            std::fs::copy(&active_bin, &link).unwrap();
+    fn failure_before_pointer_keeps_previous_runtime_authoritative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let version_dir = root.join("2.0.0");
+        let active_bin = version_dir.join("codex");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(&active_bin, "active runtime").unwrap();
+        let previous_pointer = serde_json::to_string_pretty(&InstalledCli {
+            version: "2.0.0".into(),
+            bin: active_bin.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        std::fs::write(root.join("installed.json"), &previous_pointer).unwrap();
 
-            let stage = create_install_stage(&root, "2.0.0").unwrap();
-            std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
-            let prepared = PreparedInstall {
-                data_dir: tmp.path().to_path_buf(),
-                id: CliId::Codex,
-                version: "2.0.0".into(),
-                stage,
-                bin_rel: PathBuf::from("codex"),
-            };
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+        };
 
-            let result = prepared.activate_with_checkpoint(|checkpoint| {
-                if checkpoint == ActivationCheckpoint::Metadata {
-                    let visible = installed(tmp.path(), CliId::Codex).unwrap();
-                    assert_eq!(visible.bin, active_bin.to_string_lossy());
-                    assert_eq!(
-                        std::fs::read_to_string(&visible.bin).unwrap(),
-                        "active runtime"
-                    );
-                }
-                if checkpoint == failed_checkpoint {
-                    Err(std::io::Error::other("injected publication failure"))
-                } else {
-                    Ok(())
-                }
-            });
-
-            assert!(result.is_err());
+        let result = prepared.activate_with_checkpoint(|checkpoint| {
+            assert_eq!(checkpoint, ActivationCheckpoint::BeforePointer);
+            let visible = installed(tmp.path(), CliId::Codex).unwrap();
+            assert_eq!(visible.bin, active_bin.to_string_lossy());
             assert_eq!(
-                std::fs::read_to_string(&active_bin).unwrap(),
+                std::fs::read_to_string(&visible.bin).unwrap(),
                 "active runtime"
             );
-            assert_eq!(
-                std::fs::read_to_string(root.join("installed.json")).unwrap(),
-                previous_pointer
-            );
-            assert_eq!(std::fs::read_to_string(&link).unwrap(), "active runtime");
-            #[cfg(unix)]
-            assert_eq!(std::fs::read_link(&link).unwrap(), active_bin);
-            assert_eq!(
-                installed(tmp.path(), CliId::Codex).unwrap().version,
-                "2.0.0"
-            );
-            assert_eq!(
-                std::fs::read_dir(root.join(".generations"))
-                    .unwrap()
-                    .count(),
-                0
-            );
-        }
+            Err(std::io::Error::other("injected publication failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&active_bin).unwrap(),
+            "active runtime"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("installed.json")).unwrap(),
+            previous_pointer
+        );
+        assert_eq!(
+            installed(tmp.path(), CliId::Codex).unwrap().version,
+            "2.0.0"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(".generations"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -1882,7 +1728,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             .unwrap(),
         )
         .unwrap();
-        let link = managed_bin(tmp.path(), CliId::Codex);
+        let link = legacy_managed_bin_path(tmp.path(), CliId::Codex);
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bin, &link).unwrap();
@@ -1915,7 +1761,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             .unwrap(),
         )
         .unwrap();
-        let sdk_link = managed_bin(tmp.path(), CliId::CursorSdkBridge);
+        let sdk_link = legacy_managed_bin_path(tmp.path(), CliId::CursorSdkBridge);
         std::fs::create_dir_all(sdk_link.parent().unwrap()).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&sdk_bin, &sdk_link).unwrap();
@@ -1955,20 +1801,21 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
-    fn prune_keeps_active_and_one_previous() {
+    fn legacy_prune_keeps_the_exact_previous_runtime() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        for v in ["1.0.0", "1.1.0", "1.2.0", "2.0.0"] {
+        for v in ["1.0.0", "1.1.0", "1.2.0"] {
             std::fs::create_dir_all(root.join(v)).unwrap();
         }
-        prune_old_versions(&root, "2.0.0");
+        let previous = root.join("1.1.0");
+        prune_old_versions(&root, Some(&previous));
         let mut left: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, vec!["1.2.0", "2.0.0"]);
+        assert_eq!(left, vec!["1.1.0"]);
     }
 
     #[test]
@@ -1976,11 +1823,12 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         let tmp = tempfile::tempdir().unwrap();
         let generations = tmp.path();
         let active = generations.join("runtime-active");
+        let previous = generations.join("runtime-previous");
         for generation in ["runtime-oldest", "runtime-previous", "runtime-active"] {
             std::fs::create_dir(generations.join(generation)).unwrap();
         }
 
-        prune_runtime_generations(generations, &active);
+        prune_runtime_generations(generations, &active, Some(&previous));
 
         let remaining = std::fs::read_dir(generations)
             .unwrap()
@@ -1989,5 +1837,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             .collect::<Vec<_>>();
         assert_eq!(remaining.len(), 2);
         assert!(active.is_dir());
+        assert!(previous.is_dir());
+        assert!(!generations.join("runtime-oldest").exists());
     }
 }
