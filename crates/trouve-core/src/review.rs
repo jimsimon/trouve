@@ -10415,6 +10415,14 @@ fn parse_lifecycle_dismissal_markers(body: &str) -> Option<Vec<(String, bool)>> 
 
 const LIFECYCLE_DISMISSABLE_MAX_BYTES: usize = 16 * 1024;
 
+const LIFECYCLE_DISMISSAL_HEADING: &str = "### Findings without inline threads\n\nThese findings \
+     anchor outside the pull-request diff, so they have no review thread to resolve. A \
+     maintainer can check a box to dismiss one; unchecking restores it. Edits apply directly, \
+     without a new review round.\n\n";
+
+const LIFECYCLE_DISMISSAL_OMITTED_MARKER: &str =
+    "- _additional findings omitted; see the trouve dashboard._\n";
+
 /// Bytes reserved past this section for the trailing identity marker and a
 /// possible truncation suffix, so the global cap in finish_lifecycle_comment
 /// never slices a checkbox row or its dismissal marker mid-entry.
@@ -10439,11 +10447,8 @@ fn append_lifecycle_dismissal_section(
         .saturating_sub(reserved_after)
         .saturating_sub(LIFECYCLE_DISMISSABLE_TAIL_RESERVE);
     let budget = LIFECYCLE_DISMISSABLE_MAX_BYTES.min(remaining_global);
-    let omitted_marker = "- _additional findings omitted; see the trouve dashboard._\n";
-    let heading = "### Findings without inline threads\n\nThese findings anchor outside the \
-         pull-request diff, so they have no review thread to resolve. A maintainer can check a \
-         box to dismiss one; unchecking restores it. Edits apply directly, without a new review \
-         round.\n\n";
+    let omitted_marker = LIFECYCLE_DISMISSAL_OMITTED_MARKER;
+    let heading = LIFECYCLE_DISMISSAL_HEADING;
     if heading.len() + omitted_marker.len() + 1 > budget {
         // Not even the heading plus an honest omission notice fits; render
         // nothing rather than a sliced section.
@@ -10719,25 +10724,43 @@ fn render_lifecycle_comment(
     }
     // Section maxima are local, but the comment cap is global: budgets are
     // allocated in render order, with every earlier section reserving the
-    // space required by the sections after it so finish_lifecycle_comment
-    // never slices dismissal rows or the trailing remediation prompt.
-    let prompt_reserve = if lifecycle_prompt.is_empty() {
-        0
+    // space actually required by the sections after it so
+    // finish_lifecycle_comment never slices dismissal rows or the trailing
+    // remediation prompt. The prompt block is assembled up front so its
+    // reservation is exact — a small prompt does not starve earlier
+    // sections, and escape growth inside the fence is already measured.
+    let prompt_block = if lifecycle_prompt.is_empty() {
+        String::new()
     } else {
-        // Fenced prompt (bounded plus its truncation marker) and wrapper.
-        LIFECYCLE_PROMPT_MAX_BYTES + 256
+        format!(
+            "<details><summary>Prompt for agents</summary>\n\n```text\n{}\n```\n\n</details>\n\n",
+            safe_public_prompt_fence(
+                &lifecycle_prompt,
+                LIFECYCLE_PROMPT_MAX_BYTES,
+                "\n[Prompt truncated; open the trouve dashboard for the complete prompt.]",
+            )
+        )
     };
+    let prompt_reserve = prompt_block.len();
     let tail_reserve = if job.error.is_empty() {
         128
     } else {
         LIFECYCLE_ERROR_MAX_BYTES + 192
     };
-    let dismissal_reserve = if threadless_findings.is_empty() {
-        0
-    } else {
-        // Heading plus the honest omission notice, so the checkbox section
-        // is never squeezed out entirely by earlier sections.
-        1_024
+    // Reserve what the checkbox section actually needs to render its heading,
+    // its first row (rows carry bounded but non-trivial bodies), and the
+    // honest omission notice, so failed-publication content can never squeeze
+    // out every dismissal control.
+    let dismissal_reserve = match threadless_findings.first() {
+        None => 0,
+        Some(first) => {
+            let carried = !round_ids.contains(first.id.as_str());
+            LIFECYCLE_DISMISSAL_HEADING.len()
+                + lifecycle_dismissal_entry(first, carried).len()
+                + LIFECYCLE_DISMISSAL_OMITTED_MARKER.len()
+                + 1
+                + LIFECYCLE_DISMISSABLE_TAIL_RESERVE
+        }
     };
     let failed_budget = LIFECYCLE_FINDINGS_MAX_BYTES.min(
         LIFECYCLE_COMMENT_MAX_BYTES
@@ -10758,21 +10781,7 @@ fn render_lifecycle_comment(
         &round_ids,
         prompt_reserve + tail_reserve,
     );
-    if !lifecycle_prompt.is_empty() {
-        let remaining_for_prompt = LIFECYCLE_COMMENT_MAX_BYTES
-            .saturating_sub(body.len())
-            .saturating_sub(tail_reserve + 256);
-        let prompt_max = LIFECYCLE_PROMPT_MAX_BYTES.min(remaining_for_prompt);
-        let prompt = safe_public_prompt_fence(
-            &lifecycle_prompt,
-            prompt_max,
-            "\n[Prompt truncated; open the trouve dashboard for the complete prompt.]",
-        );
-        body.push_str(&format!(
-            "<details><summary>Prompt for agents</summary>\n\n```text\n{}\n```\n\n</details>\n\n",
-            prompt
-        ));
-    }
+    body.push_str(&prompt_block);
     if !job.error.is_empty() {
         body.push_str(&format!(
             "**Error:** {}\n\n",
@@ -17286,6 +17295,74 @@ mod tests {
         assert!(body.contains("<!-- trouve-dismiss:threadless-0 -->"));
         assert!(body.contains("additional findings omitted"));
         // The prompt block trails the comment and its fence is closed.
+        let prompt_open = body.rfind("```text").unwrap();
+        assert!(body[prompt_open..].contains("\n```\n\n</details>"));
+    }
+
+    #[test]
+    fn checkbox_rows_survive_failed_section_pressure() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:checkbox-pressure");
+        store.claim_code_review_job().unwrap().unwrap();
+        let large_body = "x".repeat(1_900);
+        let findings = (0..MAX_CANDIDATE_FINDINGS)
+            .map(|index| NewCodeReviewFinding {
+                path: format!("src/failed-{index}.rs"),
+                line: index as u64 + 1,
+                side: "RIGHT".into(),
+                severity: "high".into(),
+                confidence: "high".into(),
+                title: "Failed publication".into(),
+                body: large_body.clone(),
+                prompt_for_agents: String::new(),
+                sources: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let persisted = store
+            .save_code_review_result(
+                &queued.id,
+                "summary",
+                "",
+                findings.len() as u64,
+                &findings,
+                &[],
+            )
+            .unwrap();
+        for finding in &persisted {
+            store
+                .set_code_review_finding_publication_status(
+                    &finding.id,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                )
+                .unwrap();
+        }
+        store
+            .finish_code_review_job(&queued.id, "succeeded", "", "")
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        // Every failed finding wants the failed section's full 32K budget,
+        // and every checkbox row carries a maximally bounded body. The
+        // first-row reservation must still land at least one interactive
+        // dismissal control, with the remainder honestly disclosed.
+        let threadless: Vec<_> = (0..20)
+            .map(|i| {
+                let mut finding = detail.findings[0].clone();
+                finding.id = format!("threadless-{i}");
+                finding.github_comment_id = None;
+                finding.status = "open".into();
+                finding.title = "Threadless under pressure".into();
+                finding
+            })
+            .collect();
+        let body = render_lifecycle_comment(&detail, &threadless, false, &[]);
+        assert!(body.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
+        assert!(!body.contains(LIFECYCLE_COMMENT_TRUNCATION_MARKER));
+        assert!(body.contains("### Inline comments that failed to post"));
+        assert!(body.contains("### Findings without inline threads"));
+        assert!(body.contains("<!-- trouve-dismiss:threadless-0 -->"));
+        assert!(body.contains("additional findings omitted"));
+        // The prompt block was reserved exactly, so it trails intact.
         let prompt_open = body.rfind("```text").unwrap();
         assert!(body[prompt_open..].contains("\n```\n\n</details>"));
     }
