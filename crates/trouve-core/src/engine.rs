@@ -4514,33 +4514,60 @@ impl Engine {
                     },
                 );
                 if cli == trouve_agents::install::CliId::CursorSdkBridge {
-                    // Close admission and reap every warm Bridge before the
-                    // stable managed binary changes. Keep the transition lock
-                    // until a fresh backend registry has been published.
-                    let _transition = engine.provider_reload.lock().await;
-                    let install_result = match engine.shutdown_config_backends().await {
-                        Ok(()) => {
-                            match trouve_agents::install::install(
-                                &engine.data_dir,
-                                cli,
-                                &version,
-                                &progress,
-                            )
-                            .await
-                            {
-                                Ok(_) => Ok(Some(version)),
-                                Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
-                                Err(error) => Err(error.to_string()),
-                            }
-                        }
-                        Err(error) => {
-                            Err(format!("stopping the active Cursor SDK runtime: {error}"))
-                        }
+                    // Download and verify without blocking provider settings or
+                    // disturbing any live backend. Only the short activation
+                    // transition needs serialization.
+                    let prepared = match trouve_agents::install::prepare_install(
+                        &engine.data_dir,
+                        cli,
+                        &version,
+                        &progress,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => prepared,
+                        Err(trouve_agents::install::InstallError::Cancelled) => return Ok(None),
+                        Err(error) => return Err(error.to_string()),
                     };
-                    // A failed or cancelled install must also replace the
-                    // closed old pool so the prior managed/PATH runtime can
-                    // accept turns again.
-                    engine.replace_provider_registries();
+
+                    // Cancellation remains responsive while another provider
+                    // transition owns the lock. A cancelled prepared artifact
+                    // is dropped without touching the active runtime.
+                    let transition = engine.provider_reload.lock();
+                    tokio::pin!(transition);
+                    let _transition = tokio::select! {
+                        guard = &mut transition => guard,
+                        _ = async {
+                            while !progress.cancelled() {
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                        } => return Ok(None),
+                    };
+                    if progress.cancelled() {
+                        return Ok(None);
+                    }
+
+                    // Close only Cursor-owned pools before swapping the stable
+                    // Bridge path. Claude and Codex remain usable throughout
+                    // the download and activation.
+                    if let Err(error) = engine.shutdown_config_backends_for_runtime(cli).await {
+                        // Teardown may have closed one or more Cursor pools.
+                        // Rebuild them against the still-active prior runtime.
+                        engine.replace_config_backends_for_runtime(cli);
+                        return Err(format!("stopping the active Cursor SDK runtime: {error}"));
+                    }
+                    let install_result = if progress.cancelled() {
+                        Ok(None)
+                    } else {
+                        prepared
+                            .activate()
+                            .map(|_| Some(version))
+                            .map_err(|error| error.to_string())
+                    };
+                    // Activation success, failure, and late cancellation all
+                    // replace the retired Cursor pools before releasing the
+                    // transition lock.
+                    engine.replace_config_backends_for_runtime(cli);
                     install_result
                 } else {
                     match trouve_agents::install::install(
@@ -6270,6 +6297,23 @@ impl Engine {
     /// Stop config-owned agent backends while leaving programmatically
     /// injected test/embedder backends under their caller's ownership.
     async fn shutdown_config_backends(&self) -> Result<(), EngineError> {
+        self.shutdown_config_backends_matching_runtime(None).await
+    }
+
+    /// Stop only config-owned backends served by one managed runtime. Runtime
+    /// updates use this narrower scope so unrelated vendor backends stay live.
+    async fn shutdown_config_backends_for_runtime(
+        &self,
+        runtime: trouve_agents::install::CliId,
+    ) -> Result<(), EngineError> {
+        self.shutdown_config_backends_matching_runtime(Some(runtime))
+            .await
+    }
+
+    async fn shutdown_config_backends_matching_runtime(
+        &self,
+        runtime: Option<trouve_agents::install::CliId>,
+    ) -> Result<(), EngineError> {
         let injected = self
             .injected_backends
             .lock()
@@ -6277,16 +6321,30 @@ impl Engine {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let target_ids = runtime.map(|runtime| {
+            self.config
+                .lock()
+                .unwrap()
+                .providers
+                .iter()
+                .filter(|(_, provider)| cli_for_kind(&provider.kind) == Some(runtime))
+                .map(|(id, _)| id.clone())
+                .collect::<HashSet<_>>()
+        });
         let retiring = self
             .backends
             .read()
             .unwrap()
-            .values()
-            .filter(|backend| {
-                !injected
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, backend))
+            .iter()
+            .filter(|(id, backend)| {
+                target_ids
+                    .as_ref()
+                    .is_none_or(|target_ids| target_ids.contains(*id))
+                    && !injected
+                        .iter()
+                        .any(|candidate| Arc::ptr_eq(candidate, backend))
             })
+            .map(|(_, backend)| backend)
             .cloned()
             .collect::<Vec<_>>();
         let mut first_error = None;
@@ -6299,6 +6357,44 @@ impl Engine {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Rebuild only the config-owned backends served by one runtime. This
+    /// preserves unrelated backend instances and their active vendor state.
+    fn replace_config_backends_for_runtime(&self, runtime: trouve_agents::install::CliId) {
+        let config = self.config.lock().unwrap().clone();
+        let target_ids = config
+            .providers
+            .iter()
+            .filter(|(_, provider)| cli_for_kind(&provider.kind) == Some(runtime))
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        let mut replacements =
+            build_all_backends(&config, &self.secrets, &self.data_dir, &self.model_catalog);
+        replacements.retain(|id, _| target_ids.contains(id));
+        let injected_ids = self
+            .injected_backends
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut backends = self.backends.write().unwrap();
+        for id in target_ids {
+            if injected_ids.contains(&id) {
+                continue;
+            }
+            match replacements.remove(&id) {
+                Some(replacement) => {
+                    backends.insert(id, replacement);
+                }
+                None => {
+                    backends.remove(&id);
+                }
+            }
+        }
+        drop(backends);
+        self.intake_background_turn_signals();
     }
 
     /// Rebuild registries after their previous config-owned backends have
@@ -27891,6 +27987,69 @@ default_permission_mode = "ask"
         ) -> Result<trouve_agents::BackendEventStream, BackendError> {
             Err(BackendError::Protocol("not used".into()))
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_teardown_only_stops_matching_config_backends() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [
+            ("cursor", "cursor-sdk"),
+            ("claude", "claude-cli"),
+            ("codex", "codex-app-server"),
+        ] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        let cursor = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let claude = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let codex = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cursor_backend: Arc<dyn AgentBackend> = cursor.clone();
+        let claude_backend: Arc<dyn AgentBackend> = claude.clone();
+        let codex_backend: Arc<dyn AgentBackend> = codex.clone();
+        {
+            let mut backends = engine.backends.write().unwrap();
+            backends.insert("cursor".into(), cursor_backend.clone());
+            backends.insert("claude".into(), claude_backend.clone());
+            backends.insert("codex".into(), codex_backend.clone());
+        }
+
+        let result = engine
+            .shutdown_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            cursor.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            claude.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(codex.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        engine.replace_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge);
+        let backends = engine.backends.read().unwrap();
+        assert!(!Arc::ptr_eq(&cursor_backend, &backends["cursor"]));
+        assert!(Arc::ptr_eq(&claude_backend, &backends["claude"]));
+        assert!(Arc::ptr_eq(&codex_backend, &backends["codex"]));
     }
 
     #[tokio::test]
