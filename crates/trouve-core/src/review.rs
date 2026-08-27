@@ -395,6 +395,12 @@ pub struct CodeReviewRuntime {
     /// detached post-publication cleanup and the retry task never issue
     /// duplicate mutations for the same finding.
     collapse_in_flight: Mutex<HashSet<String>>,
+    /// (repository, pull) keys with a review-thread webhook pass pending or
+    /// running; the flag marks events that arrived mid-pass and need one
+    /// trailing pass. Bursts of resolutions therefore coalesce into at most
+    /// one running and one trailing reconciliation per pull instead of one
+    /// queued pass per delivery.
+    thread_webhook_pending: Mutex<HashMap<(String, u64), bool>>,
 }
 
 struct ReviewOutboxRetryState {
@@ -568,6 +574,49 @@ struct ReviewReconciliationCandidate {
 impl ReviewReconciliationCandidate {
     fn key(&self) -> (String, u64) {
         (self.repository.repository.clone(), self.pull.number)
+    }
+}
+
+/// True when the caller should run a review-thread webhook pass for this
+/// key now; false when a pass is already pending or running and the arrival
+/// was recorded for its single trailing pass.
+fn claim_thread_webhook_pass(
+    pending: &Mutex<HashMap<(String, u64), bool>>,
+    key: &(String, u64),
+) -> bool {
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match pending.get_mut(key) {
+        Some(rerun) => {
+            *rerun = true;
+            false
+        }
+        None => {
+            pending.insert(key.clone(), false);
+            true
+        }
+    }
+}
+
+/// True when deliveries arrived during the pass and the worker must run one
+/// more; false releases the key.
+fn finish_thread_webhook_pass(
+    pending: &Mutex<HashMap<(String, u64), bool>>,
+    key: &(String, u64),
+) -> bool {
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match pending.get_mut(key) {
+        Some(rerun) if *rerun => {
+            *rerun = false;
+            true
+        }
+        _ => {
+            pending.remove(key);
+            false
+        }
     }
 }
 
@@ -4258,8 +4307,55 @@ impl Engine {
             return Ok(());
         }
         if let Some(repository) = repository {
+            // Review-thread events run through a coalescing worker: bursts of
+            // resolutions collapse into at most one running and one trailing
+            // reconciliation pass per pull, instead of one queued pass per
+            // delivery re-fetching the same authoritative state. State is
+            // always read back from GitHub, so the trailing pass observes
+            // every event that arrived mid-pass.
+            if let Some(pull_number) = review_thread_pull {
+                let key = (repository.repository.clone(), pull_number);
+                if claim_thread_webhook_pass(&self.code_review.thread_webhook_pending, &key) {
+                    let engine = self.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            {
+                                let _guard = engine.code_review.reconcile_lock.lock().await;
+                                let mut reconciliation_candidates = Vec::new();
+                                if let Err(error) = engine
+                                    .poll_code_review_repository(
+                                        &repository,
+                                        &mut reconciliation_candidates,
+                                    )
+                                    .await
+                                {
+                                    engine.record_review_error(format!(
+                                        "webhook reconciliation failed: {error:#}"
+                                    ));
+                                } else if let Err(error) = engine
+                                    .reconcile_oldest_review_thread_candidate(
+                                        &reconciliation_candidates,
+                                        Some(&key),
+                                    )
+                                    .await
+                                {
+                                    engine.record_review_error(format!(
+                                        "webhook thread reconciliation failed: {error:#}"
+                                    ));
+                                }
+                            }
+                            if !finish_thread_webhook_pass(
+                                &engine.code_review.thread_webhook_pending,
+                                &key,
+                            ) {
+                                break;
+                            }
+                        }
+                    });
+                }
+                return Ok(());
+            }
             let engine = self.clone();
-            let priority_key = review_thread_pull.map(|pull| (repository.repository.clone(), pull));
             tokio::spawn(async move {
                 let _guard = engine.code_review.reconcile_lock.lock().await;
                 if let Some((comment_id, edited_at, states)) = &lifecycle_checkbox_edit
@@ -4299,10 +4395,7 @@ impl Engine {
                 {
                     engine.record_review_error(format!("webhook reconciliation failed: {error:#}"));
                 } else if let Err(error) = engine
-                    .reconcile_oldest_review_thread_candidate(
-                        &reconciliation_candidates,
-                        priority_key.as_ref(),
-                    )
+                    .reconcile_oldest_review_thread_candidate(&reconciliation_candidates, None)
                     .await
                 {
                     engine.record_review_error(format!(
@@ -25494,6 +25587,29 @@ mod tests {
                 trigger_key: "manual:comment:100".into(),
             }]
         );
+    }
+
+    #[test]
+    fn thread_webhook_bursts_coalesce_into_one_running_and_one_trailing_pass() {
+        let pending = Mutex::new(HashMap::new());
+        let key = ("acme/widgets".to_owned(), 42);
+        let other = ("acme/widgets".to_owned(), 7);
+
+        // First delivery claims the pass; a burst arriving before it runs
+        // records a single trailing pass instead of queueing per delivery.
+        assert!(claim_thread_webhook_pass(&pending, &key));
+        assert!(!claim_thread_webhook_pass(&pending, &key));
+        assert!(!claim_thread_webhook_pass(&pending, &key));
+        // A different pull is independent.
+        assert!(claim_thread_webhook_pass(&pending, &other));
+
+        // The finished pass runs exactly one trailing pass for the burst,
+        // then releases the key so the next delivery claims afresh.
+        assert!(finish_thread_webhook_pass(&pending, &key));
+        assert!(!finish_thread_webhook_pass(&pending, &key));
+        assert!(claim_thread_webhook_pass(&pending, &key));
+        assert!(!finish_thread_webhook_pass(&pending, &key));
+        assert!(!finish_thread_webhook_pass(&pending, &other));
     }
 
     #[tokio::test]
