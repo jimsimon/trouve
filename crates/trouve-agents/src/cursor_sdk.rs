@@ -659,6 +659,23 @@ impl BridgePool {
         BackendError::Protocol("Cursor SDK Bridge pool is shutting down".into())
     }
 
+    /// Commit warm retention while holding the lifecycle reader. Shutdown may
+    /// publish `closed` before waiting for the writer, but it cannot finish
+    /// draining the pool until this callback has either committed or declined
+    /// retention.
+    async fn retain_if_open<F, Fut>(&self, retain: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _lifecycle = self.lifecycle.read().await;
+        if !self.is_open() {
+            return false;
+        }
+        retain().await;
+        true
+    }
+
     async fn shutdown(&self) -> Result<(), BackendError> {
         // Publish closure before waiting for the lifecycle writer. Capacity,
         // thread-gate, and bridge-lock waiters may own read guards; waking
@@ -1059,12 +1076,20 @@ async fn run_sdk_turn(
     // stays held until callback tasks are joined and its registration clears.
     callback.stop().await;
     let release = bridge.release_turn(&agent_id).await;
-    let keep_warm =
-        matches!(&outcome, Ok(TurnTerminal::Finished(_))) && release.is_ok() && pool.is_open();
+    let warm_eligible = matches!(&outcome, Ok(TurnTerminal::Finished(_))) && release.is_ok();
     drop(bridge);
 
+    // Drop the Bridge mutex before waiting for the lifecycle reader: a queued
+    // shutdown writer may need that mutex to drain the process. Once admitted,
+    // retain_if_open keeps the retention commit ordered before shutdown.
+    let keep_warm = warm_eligible
+        && pool
+            .retain_if_open(|| async {
+                process.touch();
+            })
+            .await;
+
     if keep_warm {
-        process.touch();
         return outcome;
     }
     let process_cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
@@ -3215,6 +3240,42 @@ mod tests {
             .unwrap();
         let error = waiter.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("pool is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn warm_retention_commit_cannot_finish_after_pool_shutdown() {
+        let pool = Arc::new(BridgePool::default());
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let retaining_pool = pool.clone();
+        let retaining_entered = entered.clone();
+        let retaining_release = release.clone();
+        let retention = tokio::spawn(async move {
+            retaining_pool
+                .retain_if_open(|| async move {
+                    retaining_entered.add_permits(1);
+                    retaining_release.acquire().await.unwrap().forget();
+                })
+                .await
+        });
+        entered.acquire().await.unwrap().forget();
+
+        let shutting_pool = pool.clone();
+        let mut shutdown = tokio::spawn(async move { shutting_pool.shutdown().await });
+        while pool.is_open() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown crossed a retention commit that still owned the lifecycle reader"
+        );
+
+        release.add_permits(1);
+        assert!(retention.await.unwrap());
+        shutdown.await.unwrap().unwrap();
+        assert!(!pool.is_open());
     }
 
     #[tokio::test]
