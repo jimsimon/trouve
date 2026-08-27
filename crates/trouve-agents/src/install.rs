@@ -5,7 +5,7 @@
 //! API name covers both CLIs and Cursor's standalone Agent SDK Bridge.
 //!
 //! Layout under `<data_dir>/cli/`:
-//! - `<id>/<version>/…`       — one directory per installed version
+//! - `<id>/.generations/…`    — immutable runtime generations
 //! - `<id>/installed.json`    — pointer to the active version + binary
 //! - `bin/<id>`               — stable symlink backends resolve at spawn
 //!
@@ -550,8 +550,8 @@ pub struct PreparedInstall {
 }
 
 impl PreparedInstall {
-    /// Move the prepared runtime into its version directory, then publish its
-    /// metadata and stable executable path.
+    /// Move the prepared runtime into an immutable generation, then atomically
+    /// publish its stable executable path and metadata pointer.
     pub fn activate(self) -> Result<InstalledCli, InstallError> {
         self.activate_with_checkpoint(|_| Ok(()))
     }
@@ -562,7 +562,6 @@ impl PreparedInstall {
     ) -> Result<InstalledCli, InstallError> {
         let root = cli_root(&self.data_dir, self.id);
         let _activation_lock = lock_runtime_activation(&self.data_dir, self.id)?;
-        let version_dir = root.join(&self.version);
         let staged_bin = self.stage.join(&self.bin_rel);
         if !self.stage.is_dir() || !staged_bin.is_file() {
             return Err(InstallError::Download(format!(
@@ -571,20 +570,25 @@ impl PreparedInstall {
                 self.version
             )));
         }
-        let bin = version_dir.join(&self.bin_rel);
+
+        // A generation is never replaced in place. Therefore an interrupted
+        // activation always leaves the old pointer's runtime intact, and the
+        // final pointer rename can serve as the single commit point.
+        let generations = root.join(".generations");
+        std::fs::create_dir_all(&generations)?;
+        let generation = unique_runtime_path(&generations, &format!("runtime-{}", self.version))?;
+        let bin = generation.join(&self.bin_rel);
         let info = InstalledCli {
             version: self.version.clone(),
             bin: bin.to_string_lossy().into_owned(),
         };
         let pointer = root.join("installed.json");
         let link = managed_bin(&self.data_dir, self.id);
-        std::fs::create_dir_all(link.parent().unwrap())?;
+        std::fs::create_dir_all(link.parent().expect("managed binary has a parent"))?;
 
-        // Build every fallible publication artifact before changing the live
-        // runtime. The candidates and rollback paths are attempt-owned, while
-        // the lock serializes activation across Engine instances and processes.
+        // Build and flush every file candidate before changing live state.
         let pointer_candidate = unique_runtime_path(&root, "installed.json.candidate")?;
-        let _pointer_candidate_cleanup = PathCleanup(pointer_candidate.clone());
+        let _pointer_candidate_cleanup = PathCleanup::new(pointer_candidate.clone());
         let mut pointer_file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -593,6 +597,7 @@ impl PreparedInstall {
             &mut pointer_file,
             serde_json::to_string_pretty(&info).unwrap().as_bytes(),
         )?;
+        pointer_file.sync_all()?;
         drop(pointer_file);
 
         let link_parent = link
@@ -600,54 +605,51 @@ impl PreparedInstall {
             .expect("managed binary has a parent")
             .to_path_buf();
         let link_candidate = unique_runtime_path(&link_parent, "runtime.candidate")?;
-        let _link_candidate_cleanup = PathCleanup(link_candidate.clone());
+        let _link_candidate_cleanup = PathCleanup::new(link_candidate.clone());
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bin, &link_candidate)?;
         #[cfg(not(unix))]
-        std::fs::copy(&staged_bin, &link_candidate)?;
+        {
+            std::fs::copy(&staged_bin, &link_candidate)?;
+            std::fs::File::open(&link_candidate)?.sync_all()?;
+        }
 
-        let mut transaction = ActivationTransaction::new(
-            PathSwap::new(
-                version_dir,
-                self.stage.clone(),
-                unique_runtime_path(&root, &format!("rollback-{}", self.version))?,
-            ),
-            PathSwap::new(
-                pointer,
-                pointer_candidate,
-                unique_runtime_path(&root, "installed.json.rollback")?,
-            ),
-            PathSwap::new(
-                link,
-                link_candidate,
-                unique_runtime_path(&link_parent, "runtime.rollback")?,
-            ),
-        );
+        let link_backup = unique_runtime_path(&link_parent, "runtime.rollback")?;
+        let mut link_publication =
+            StableLinkPublication::capture(link, link_candidate, link_backup)?;
+        let mut generation_cleanup = PathCleanup::new(generation.clone());
         let publication = (|| -> std::io::Result<()> {
-            transaction.runtime.publish(|| Ok(()))?;
-            transaction
-                .pointer
-                .publish(|| checkpoint(ActivationCheckpoint::Metadata))?;
-            transaction
-                .link
-                .publish(|| checkpoint(ActivationCheckpoint::StableExecutable))?;
+            std::fs::rename(&self.stage, &generation)?;
+            link_publication.publish()?;
+            checkpoint(ActivationCheckpoint::StableExecutable)?;
+            checkpoint(ActivationCheckpoint::Metadata)?;
+            let replacing_pointer = path_exists(&pointer)?;
+            replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
             Ok(())
         })();
         if let Err(error) = publication {
-            let rollback_errors = transaction.rollback();
-            if rollback_errors.is_empty() {
-                return Err(error.into());
+            if let Err(rollback) = link_publication.rollback() {
+                // The stable path may still reference the new generation. Keep
+                // it and the backup so the reported error remains recoverable.
+                generation_cleanup.disarm();
+                return Err(InstallError::Download(format!(
+                    "activating {} {} failed ({error}); restoring the stable executable failed ({rollback})",
+                    self.id.as_str(),
+                    self.version
+                )));
             }
-            return Err(InstallError::Download(format!(
-                "activating {} {} failed ({error}); rollback also failed: {}",
-                self.id.as_str(),
-                self.version,
-                rollback_errors.join("; ")
-            )));
+            return Err(error.into());
         }
-        transaction.commit();
 
-        // Keep at most one older version around for rollback; drop the rest.
+        // installed.json is the final, atomically replaced commit marker. No
+        // fallible publication step follows it, so readers always observe a
+        // complete previous or new generation, never a missing pointer.
+        generation_cleanup.disarm();
+        link_publication.commit();
+
+        prune_runtime_generations(&generations, &generation);
+        // Retain the historical version directories as a one-generation
+        // migration fallback while existing installs move to the new layout.
         prune_old_versions(&root, &self.version);
         if self.id == CliId::CursorSdkBridge {
             // The SDK is the Cursor transport now. Remove Trouve's obsolete
@@ -666,129 +668,211 @@ enum ActivationCheckpoint {
 }
 
 #[derive(Debug)]
-struct PathSwap {
+struct StableLinkPublication {
     destination: PathBuf,
     replacement: PathBuf,
-    backup: PathBuf,
-    destination_backed_up: bool,
-    replacement_published: bool,
-}
-
-impl PathSwap {
-    fn new(destination: PathBuf, replacement: PathBuf, backup: PathBuf) -> Self {
-        Self {
-            destination,
-            replacement,
-            backup,
-            destination_backed_up: false,
-            replacement_published: false,
-        }
-    }
-
-    fn publish(
-        &mut self,
-        after_backup: impl FnOnce() -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
-        match std::fs::symlink_metadata(&self.destination) {
-            Ok(_) => {
-                std::fs::rename(&self.destination, &self.backup)?;
-                self.destination_backed_up = true;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        after_backup()?;
-        std::fs::rename(&self.replacement, &self.destination)?;
-        self.replacement_published = true;
-        Ok(())
-    }
-
-    fn rollback(&mut self, errors: &mut Vec<String>) {
-        if self.replacement_published {
-            if let Err(error) = remove_path(&self.destination) {
-                errors.push(format!(
-                    "removing replacement {}: {error}",
-                    self.destination.display()
-                ));
-            } else {
-                self.replacement_published = false;
-            }
-        }
-        if self.destination_backed_up {
-            if let Err(error) = std::fs::rename(&self.backup, &self.destination) {
-                errors.push(format!("restoring {}: {error}", self.destination.display()));
-            } else {
-                self.destination_backed_up = false;
-            }
-        }
-    }
-
-    fn discard_backup(&mut self) {
-        if !self.destination_backed_up {
-            return;
-        }
-        if let Err(error) = remove_path(&self.backup) {
-            tracing::warn!(
-                "runtime activation committed, but backup {} could not be removed: {error}",
-                self.backup.display()
-            );
-        } else {
-            self.destination_backed_up = false;
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ActivationTransaction {
-    runtime: PathSwap,
-    pointer: PathSwap,
-    link: PathSwap,
+    backup: Option<PathBuf>,
+    published: bool,
     finished: bool,
 }
 
-impl ActivationTransaction {
-    fn new(runtime: PathSwap, pointer: PathSwap, link: PathSwap) -> Self {
-        Self {
-            runtime,
-            pointer,
-            link,
+impl StableLinkPublication {
+    fn capture(
+        destination: PathBuf,
+        replacement: PathBuf,
+        backup: PathBuf,
+    ) -> std::io::Result<Self> {
+        let backup = match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                if let Err(error) = clone_runtime_entry(&destination, &backup, &metadata) {
+                    let _ = remove_path(&backup);
+                    return Err(error);
+                }
+                Some(backup)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            destination,
+            replacement,
+            backup,
+            published: false,
             finished: false,
-        }
+        })
     }
 
-    fn rollback(&mut self) -> Vec<String> {
-        let mut errors = Vec::new();
-        self.link.rollback(&mut errors);
-        self.pointer.rollback(&mut errors);
-        self.runtime.rollback(&mut errors);
+    fn publish(&mut self) -> std::io::Result<()> {
+        replace_runtime_file(&self.replacement, &self.destination, self.backup.is_some())?;
+        self.published = true;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> std::io::Result<()> {
+        if !self.published {
+            self.finished = true;
+            if let Some(backup) = self.backup.take() {
+                remove_path(&backup)?;
+            }
+            return Ok(());
+        }
+        if let Some(backup) = self.backup.as_ref() {
+            replace_runtime_file(backup, &self.destination, true)?;
+            self.backup = None;
+        } else {
+            remove_path(&self.destination)?;
+        }
+        self.published = false;
         self.finished = true;
-        errors
+        Ok(())
     }
 
     fn commit(&mut self) {
         self.finished = true;
-        self.link.discard_backup();
-        self.pointer.discard_backup();
-        self.runtime.discard_backup();
+        if let Some(backup) = self.backup.take()
+            && let Err(error) = remove_path(&backup)
+        {
+            tracing::warn!(
+                "runtime activation committed, but stable executable backup {} could not be removed: {error}",
+                backup.display()
+            );
+        }
     }
 }
 
-impl Drop for ActivationTransaction {
+impl Drop for StableLinkPublication {
     fn drop(&mut self) {
         if self.finished {
             return;
         }
-        for error in self.rollback() {
-            tracing::warn!("runtime activation rollback failed: {error}");
+        if let Err(error) = self.rollback() {
+            tracing::warn!("stable executable rollback failed: {error}");
         }
     }
 }
 
-struct PathCleanup(PathBuf);
+struct PathCleanup(Option<PathBuf>);
+
+impl PathCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
 
 impl Drop for PathCleanup {
     fn drop(&mut self) {
-        let _ = remove_path(&self.0);
+        if let Some(path) = self.0.as_ref() {
+            let _ = remove_path(path);
+        }
+    }
+}
+
+fn path_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn clone_runtime_entry(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    if metadata.file_type().is_symlink() {
+        return std::os::unix::fs::symlink(std::fs::read_link(source)?, destination);
+    }
+    clone_runtime_file(source, destination, metadata)
+}
+
+#[cfg(not(unix))]
+fn clone_runtime_entry(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    clone_runtime_file(source, destination, metadata)
+}
+
+fn clone_runtime_file(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("runtime executable {} is not a file", source.display()),
+        ));
+    }
+    let mut source_file = std::fs::File::open(source)?;
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    std::io::copy(&mut source_file, &mut destination_file)?;
+    destination_file.set_permissions(metadata.permissions())?;
+    destination_file.sync_all()
+}
+
+#[cfg(not(windows))]
+fn replace_runtime_file(
+    replacement: &Path,
+    destination: &Path,
+    _replacing_existing: bool,
+) -> std::io::Result<()> {
+    std::fs::rename(replacement, destination)
+}
+
+#[cfg(windows)]
+fn replace_runtime_file(
+    replacement: &Path,
+    destination: &Path,
+    replacing_existing: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
+    };
+
+    let replacement = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        if replacing_existing {
+            ReplaceFileW(
+                destination.as_ptr(),
+                replacement.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } else {
+            MoveFileExW(
+                replacement.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -1193,6 +1277,28 @@ fn make_executable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Keep the active immutable generation and at most one previous generation.
+/// Orphans left by an interrupted activation are collected on the next
+/// successful activation (and uninstall removes the whole runtime root).
+fn prune_runtime_generations(generations: &Path, active: &Path) {
+    let Ok(entries) = std::fs::read_dir(generations) else {
+        return;
+    };
+    let mut others: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path != active)
+        .collect();
+    others.sort_by_key(|path| {
+        path.metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    for generation in others.iter().rev().skip(1) {
+        let _ = std::fs::remove_dir_all(generation);
+    }
+}
+
 /// Remove all version directories except the active one and the
 /// lexicographically greatest other (a cheap "previous version" heuristic).
 fn prune_old_versions(root: &Path, active: &str) {
@@ -1578,6 +1684,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         let activated = prepared.activate().unwrap();
 
         assert_eq!(activated.version, "2.0.0");
+        assert!(Path::new(&activated.bin).starts_with(root.join(".generations")));
         assert_eq!(
             std::fs::read_to_string(managed_bin(tmp.path(), CliId::Codex)).unwrap(),
             "new runtime"
@@ -1701,6 +1808,14 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             };
 
             let result = prepared.activate_with_checkpoint(|checkpoint| {
+                if checkpoint == ActivationCheckpoint::Metadata {
+                    let visible = installed(tmp.path(), CliId::Codex).unwrap();
+                    assert_eq!(visible.bin, active_bin.to_string_lossy());
+                    assert_eq!(
+                        std::fs::read_to_string(&visible.bin).unwrap(),
+                        "active runtime"
+                    );
+                }
                 if checkpoint == failed_checkpoint {
                     Err(std::io::Error::other("injected publication failure"))
                 } else {
@@ -1723,6 +1838,12 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             assert_eq!(
                 installed(tmp.path(), CliId::Codex).unwrap().version,
                 "2.0.0"
+            );
+            assert_eq!(
+                std::fs::read_dir(root.join(".generations"))
+                    .unwrap()
+                    .count(),
+                0
             );
         }
     }
@@ -1848,5 +1969,25 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             .collect();
         left.sort();
         assert_eq!(left, vec!["1.2.0", "2.0.0"]);
+    }
+
+    #[test]
+    fn generation_prune_keeps_active_and_one_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let generations = tmp.path();
+        let active = generations.join("runtime-active");
+        for generation in ["runtime-oldest", "runtime-previous", "runtime-active"] {
+            std::fs::create_dir(generations.join(generation)).unwrap();
+        }
+
+        prune_runtime_generations(generations, &active);
+
+        let remaining = std::fs::read_dir(generations)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2);
+        assert!(active.is_dir());
     }
 }
