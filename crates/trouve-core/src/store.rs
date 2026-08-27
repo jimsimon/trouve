@@ -4049,6 +4049,25 @@ fn cancel_active_code_review_tasks(
         .collect()
 }
 
+/// Outcome of a maintainer resolve/unresolve command against the threadless
+/// finding ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadlessCommandOutcome {
+    Applied {
+        finding_id: String,
+    },
+    AmbiguousPrefix {
+        matches: usize,
+    },
+    NotFound,
+    /// The prefix matched exactly one finding, but it is not in the state
+    /// the verb expects (already resolved, or not resolved).
+    NotApplicable {
+        finding_id: String,
+        status: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewFinding {
     pub path: String,
@@ -12170,6 +12189,98 @@ impl Store {
         Ok((changed, projection_job))
     }
 
+    /// Resolve (won't-fix) or unresolve one threadless finding through a
+    /// maintainer command. The prefix must uniquely identify a threadless
+    /// finding of this pull's published rounds; the command records the
+    /// maintainer's reason and attribution in `dismiss_reason`.
+    pub fn apply_threadless_resolve_command(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        finding_prefix: &str,
+        resolve: bool,
+        dismiss_reason: &str,
+    ) -> Result<(ThreadlessCommandOutcome, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let mut stmt = tx.prepare(
+            "SELECT f.id, f.status FROM code_review_findings f
+             JOIN code_review_jobs j ON j.id = f.job_id
+             WHERE j.repository = ?1 AND j.pull_number = ?2
+               AND j.review_published = 1
+               AND f.github_comment_id IS NULL
+               AND f.status IN ('open', 'dismissed')
+               AND f.id LIKE ?3 || '%'",
+        )?;
+        let matches = stmt
+            .query_map(
+                params![repository, pull_number as i64, finding_prefix],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let (finding_id, status) = match matches.as_slice() {
+            [] => {
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::NotFound, None));
+            }
+            [only] => only.clone(),
+            many => {
+                let count = many.len();
+                tx.commit()?;
+                return Ok((
+                    ThreadlessCommandOutcome::AmbiguousPrefix { matches: count },
+                    None,
+                ));
+            }
+        };
+        let expected = if resolve { "open" } else { "dismissed" };
+        if status != expected {
+            tx.commit()?;
+            return Ok((
+                ThreadlessCommandOutcome::NotApplicable { finding_id, status },
+                None,
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        if resolve {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET status = 'dismissed', dismiss_reason = ?2, resolved_at = ?3,
+                     resolved_head = '', resolved_by_job_id = '', collapse_pending = 0
+                 WHERE id = ?1",
+                params![finding_id, dismiss_reason, now],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET status = 'open', dismiss_reason = '', resolved_at = NULL,
+                     resolved_head = '', resolved_by_job_id = ''
+                 WHERE id = ?1",
+                params![finding_id],
+            )?;
+            // Mirror the thread-based reopen path: a theme resolved while
+            // this finding was dismissed is open again now that its
+            // manifestation is.
+            tx.execute(
+                "UPDATE code_review_themes
+                 SET status = 'open', resolved_head = '', updated_at = ?2
+                 WHERE id IN (
+                   SELECT theme_id FROM code_review_finding_themes
+                   WHERE finding_id = ?1
+                 )",
+                params![finding_id, now],
+            )?;
+        }
+        let projection_job =
+            refresh_code_review_pull_projection_counts_in_tx(&tx, repository, pull_number)?;
+        tx.commit()?;
+        Ok((
+            ThreadlessCommandOutcome::Applied { finding_id },
+            projection_job,
+        ))
+    }
+
     pub fn code_review_themes_for_pull(
         &self,
         repository: &str,
@@ -19544,6 +19655,130 @@ mod tests {
         assert!(
             after_requeue > chrono::Duration::minutes(59),
             "{after_requeue}"
+        );
+    }
+
+    #[test]
+    fn threadless_resolve_commands_apply_by_unique_prefix_with_reasons() {
+        let store = Store::open_in_memory().unwrap();
+        let finding_at = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 4,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Finding".into(),
+            body: format!("finding at {path}"),
+            prompt_for_agents: "fix".into(),
+            sources: Vec::new(),
+        };
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                2,
+                &[finding_at("src/a.rs"), finding_at("src/b.rs")],
+                &[],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+        let target = findings[0].id.clone();
+
+        // Every finding id shares the rvf_ prefix, so a bare prefix is
+        // ambiguous and applies nothing.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command("acme/widgets", 42, "rvf_", true, "reason — @jim")
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::AmbiguousPrefix { matches: 2 }
+        ));
+
+        // An unknown prefix is reported as such.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(
+                "acme/widgets",
+                42,
+                "rvf_000000",
+                true,
+                "reason — @jim",
+            )
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::NotFound));
+
+        // The full id resolves the finding and records reason + attribution.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(
+                "acme/widgets",
+                42,
+                &target,
+                true,
+                "accepted limitation per ADR 0042 — resolved by @jim",
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ThreadlessCommandOutcome::Applied {
+                finding_id: target.clone()
+            }
+        );
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        let resolved = listed.iter().find(|finding| finding.id == target).unwrap();
+        assert_eq!(resolved.status, "dismissed");
+
+        // Resolving again is not applicable — fixed/dismissed states are
+        // reported instead of silently re-applied.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command("acme/widgets", 42, &target, true, "again — @jim")
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::NotApplicable { ref status, .. } if status == "dismissed"
+        ));
+
+        // Unresolve restores it.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command("acme/widgets", 42, &target, false, "")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ThreadlessCommandOutcome::Applied {
+                finding_id: target.clone()
+            }
+        );
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "open"
         );
     }
 

@@ -1181,6 +1181,114 @@ fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComm
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadlessResolveCommand {
+    repository: String,
+    installation_id: u64,
+    pull_number: u64,
+    comment_id: u64,
+    author: String,
+    parsed: ThreadlessCommandParse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThreadlessCommandParse {
+    Resolve {
+        finding_prefix: String,
+        reason: String,
+    },
+    Unresolve {
+        finding_prefix: String,
+    },
+    /// The line addressed a resolve/unresolve verb at the bot but was not a
+    /// usable command; the message explains what to correct.
+    Invalid(&'static str),
+}
+
+/// Parse the first `@trouve-ai resolve <id> <reason>` or
+/// `@trouve-ai unresolve <id>` line in a comment body. The id must be a
+/// `rvf_`-prefixed hex prefix long enough to be intentional; resolve
+/// requires a non-empty reason so every won't-fix decision is recorded with
+/// its justification.
+fn parse_threadless_resolve_command(body: &str) -> Option<ThreadlessCommandParse> {
+    for line in body.lines() {
+        let mut words = line.split_whitespace();
+        if !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(MANUAL_REVIEW_MENTION))
+        {
+            continue;
+        }
+        let Some(verb) = words.next() else { continue };
+        let resolve = verb.eq_ignore_ascii_case("resolve");
+        if !resolve && !verb.eq_ignore_ascii_case("unresolve") {
+            continue;
+        }
+        let Some(id) = words.next() else {
+            return Some(ThreadlessCommandParse::Invalid(
+                "a finding id is required, e.g. `@trouve-ai resolve rvf_12345678 <reason>`",
+            ));
+        };
+        let id = id.to_ascii_lowercase();
+        let valid_id = id
+            .strip_prefix("rvf_")
+            .is_some_and(|hex| hex.len() >= 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        if !valid_id {
+            return Some(ThreadlessCommandParse::Invalid(
+                "the finding id must start with `rvf_` followed by at least six hex characters, \
+                 as shown in the review comment",
+            ));
+        }
+        if !resolve {
+            return Some(ThreadlessCommandParse::Unresolve { finding_prefix: id });
+        }
+        let reason = words.collect::<Vec<_>>().join(" ");
+        if reason.trim().is_empty() {
+            return Some(ThreadlessCommandParse::Invalid(
+                "a reason is required to resolve a finding as won't-fix, e.g. \
+                 `@trouve-ai resolve rvf_12345678 accepted limitation per ADR 0042`",
+            ));
+        }
+        return Some(ThreadlessCommandParse::Resolve {
+            finding_prefix: id,
+            reason,
+        });
+    }
+    None
+}
+
+fn threadless_resolve_comment(payload: &serde_json::Value) -> Option<ThreadlessResolveCommand> {
+    if payload["action"].as_str()? != "created"
+        || !payload["issue"]["pull_request"].is_object()
+        || payload["comment"]["user"]["type"]
+            .as_str()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        || !matches!(
+            payload["comment"]["author_association"].as_str()?,
+            "OWNER" | "MEMBER" | "COLLABORATOR"
+        )
+    {
+        return None;
+    }
+    let parsed = parse_threadless_resolve_command(payload["comment"]["body"].as_str()?)?;
+    let repository = payload["repository"]["full_name"].as_str()?.to_owned();
+    let installation_id = payload["installation"]["id"].as_u64()?;
+    let pull_number = payload["issue"]["number"].as_u64()?;
+    let comment_id = payload["comment"]["id"].as_u64()?;
+    let author = payload["comment"]["user"]["login"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    (installation_id > 0 && pull_number > 0 && comment_id > 0).then_some(ThreadlessResolveCommand {
+        repository,
+        installation_id,
+        pull_number,
+        comment_id,
+        author,
+        parsed,
+    })
+}
+
 fn pull_number_from_issue_url(issue_url: &str) -> Option<u64> {
     issue_url
         .trim_end_matches('/')
@@ -4381,6 +4489,11 @@ impl Engine {
                 Some((comment_id, edited_at, states))
             })
             .flatten();
+        // A maintainer command resolving a threadless finding as won't-fix
+        // (with the required reason) or restoring it.
+        let resolve_command = (event == "issue_comment")
+            .then(|| threadless_resolve_comment(&payload))
+            .flatten();
         // A maintainer resolving or unresolving a finding's review thread is
         // the trust-dismissal signal. The event only prioritizes that pull in
         // the immediate reconciliation walk below — thread state itself is
@@ -4394,6 +4507,7 @@ impl Engine {
             && manual_comment.is_none()
             && lifecycle_checkbox_edit.is_none()
             && review_thread_pull.is_none()
+            && resolve_command.is_none()
         {
             self.store
                 .claim_github_webhook_delivery(delivery_id, None)?;
@@ -4562,6 +4676,11 @@ impl Engine {
             let engine = self.clone();
             tokio::spawn(async move {
                 let _guard = engine.code_review.reconcile_lock.lock().await;
+                if let Some(command) = &resolve_command {
+                    engine
+                        .apply_threadless_resolve_command_event(&repository, command)
+                        .await;
+                }
                 if let Some((comment_id, edited_at, states)) = &lifecycle_checkbox_edit
                     && let Err(error) = engine
                         .apply_lifecycle_dismissal_edit(&repository, *comment_id, edited_at, states)
@@ -10050,6 +10169,137 @@ impl Engine {
             }
         }
         lines
+    /// Apply one maintainer `@trouve-ai resolve`/`unresolve` command. The
+    /// happy path acknowledges with a reaction on the command comment;
+    /// anything the maintainer needs to correct is answered with a short
+    /// reply. Failures are recorded and never propagate — a command can
+    /// always be re-issued.
+    async fn apply_threadless_resolve_command_event(
+        self: &Arc<Self>,
+        repository: &CodeReviewRepository,
+        command: &ThreadlessResolveCommand,
+    ) {
+        let api = match self.installation_api(repository.installation_id).await {
+            Ok(api) => api,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "authenticating threadless resolve command failed: {error:#}"
+                ));
+                return;
+            }
+        };
+        use crate::store::ThreadlessCommandOutcome;
+        let feedback = match &command.parsed {
+            ThreadlessCommandParse::Invalid(message) => Some((*message).to_owned()),
+            ThreadlessCommandParse::Resolve { .. } | ThreadlessCommandParse::Unresolve { .. } => {
+                let (finding_prefix, resolve, reason) = match &command.parsed {
+                    ThreadlessCommandParse::Resolve {
+                        finding_prefix,
+                        reason,
+                    } => (finding_prefix, true, reason.as_str()),
+                    ThreadlessCommandParse::Unresolve { finding_prefix } => {
+                        (finding_prefix, false, "")
+                    }
+                    ThreadlessCommandParse::Invalid(_) => unreachable!(),
+                };
+                // The stored reason carries attribution so the ledger and
+                // dashboard show who decided and why, without a schema
+                // change. Both fields are untrusted text and bounded.
+                let dismiss_reason = format!(
+                    "{} — resolved by @{}",
+                    bounded_utf8(reason.trim(), 512, "…"),
+                    bounded_utf8(command.author.trim(), 64, "…"),
+                );
+                match self.store.apply_threadless_resolve_command(
+                    &repository.repository,
+                    command.pull_number,
+                    finding_prefix,
+                    resolve,
+                    &dismiss_reason,
+                ) {
+                    Ok((ThreadlessCommandOutcome::Applied { .. }, projection_job)) => {
+                        match api
+                            .post::<serde_json::Value>(
+                                &format!(
+                                    "/repos/{}/issues/comments/{}/reactions",
+                                    repository.repository, command.comment_id
+                                ),
+                                &serde_json::json!({ "content": "+1" }),
+                            )
+                            .await
+                        {
+                            Ok((_, rate)) => self.record_review_rate(rate),
+                            Err(error) => tracing::debug!(
+                                %error,
+                                "acknowledging threadless resolve command failed"
+                            ),
+                        }
+                        let projection_job = match projection_job {
+                            Some(job_id) => Some(job_id),
+                            None => self
+                                .store
+                                .latest_published_code_review_job_id(
+                                    &repository.repository,
+                                    command.pull_number,
+                                )
+                                .ok()
+                                .flatten(),
+                        };
+                        if let Some(job_id) = projection_job {
+                            let _ = self.emit_code_review_updated(Some(job_id.clone()));
+                            if let Ok(Some(record)) = self.store.code_review_job(&job_id) {
+                                self.sync_code_review_projection(&record.job).await;
+                            }
+                        }
+                        None
+                    }
+                    Ok((ThreadlessCommandOutcome::AmbiguousPrefix { matches }, _)) => {
+                        Some(format!(
+                            "`{finding_prefix}` matches {matches} findings on this pull request; \
+                         use more of the id shown in the review comment."
+                        ))
+                    }
+                    Ok((ThreadlessCommandOutcome::NotFound, _)) => Some(format!(
+                        "`{finding_prefix}` does not match a finding without an inline thread on \
+                         this pull request. Fixed findings leave the list automatically; findings \
+                         with inline threads are resolved through their review thread instead."
+                    )),
+                    Ok((ThreadlessCommandOutcome::NotApplicable { status, .. }, _)) => {
+                        Some(if resolve {
+                            format!(
+                                "that finding is already `{status}`; nothing to resolve. \
+                                 Fixed findings leave the list automatically."
+                            )
+                        } else {
+                            format!("that finding is `{status}`, not resolved; nothing to restore.")
+                        })
+                    }
+                    Err(error) => {
+                        self.record_review_error(format!(
+                            "applying threadless resolve command failed: {error:#}"
+                        ));
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(message) = feedback {
+            match api
+                .post::<serde_json::Value>(
+                    &format!(
+                        "/repos/{}/issues/{}/comments",
+                        repository.repository, command.pull_number
+                    ),
+                    &serde_json::json!({ "body": format!("@{}: {message}", command.author) }),
+                )
+                .await
+            {
+                Ok((_, rate)) => self.record_review_rate(rate),
+                Err(error) => self.record_review_error(format!(
+                    "replying to threadless resolve command failed: {error:#}"
+                )),
+            }
+        }
     }
 
     async fn apply_lifecycle_dismissal_edit(
@@ -10100,12 +10350,18 @@ impl Engine {
             .as_str()
             .and_then(parse_lifecycle_dismissal_markers)
         else {
-            // No markers in the registered lifecycle comment. That is the
-            // canonical state only when no threadless findings exist; if the
-            // ledger says checkboxes should be present, the comment was
-            // edited over (markers deleted or corrupted) and a
-            // state-preserving re-render restores the controls instead of
-            // leaving them absent until an unrelated projection.
+            // No markers in the registered lifecycle comment. Current
+            // renders use resolve/unresolve commands and legitimately carry
+            // no markers, so the comment is canonical whenever its
+            // threadless section is present (or nothing threadless exists);
+            // only a comment missing the section it should have was edited
+            // over and needs a state-preserving re-render.
+            if comment["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("### Findings without inline threads"))
+            {
+                return Ok(());
+            }
             let (threadless, _) = self
                 .store
                 .threadless_code_review_findings(&repository.repository, pull_number)?;
@@ -10892,22 +11148,16 @@ fn append_lifecycle_finding_section(
     body.len() - start
 }
 
-/// One dismissal checkbox in the lifecycle comment. The HTML-comment marker
-/// carries the finding id; GitHub renders `- [ ]` as an interactive task-list
-/// box that anyone with write access can toggle.
+/// One threadless-finding row in the lifecycle comment: the same labeled
+/// severity/confidence and description as an inline finding, flattened onto
+/// one line, ending with the copy-pasteable maintainer command for it. Rows
+/// deliberately carry no task-list checkbox: a checkbox reads as a progress
+/// list and invites "mark as reviewed" toggles, while resolution here is a
+/// won't-fix decision that must state its reason.
 fn lifecycle_dismissal_entry(
     finding: &trouve_protocol::CodeReviewFinding,
     carried: bool,
 ) -> String {
-    let checked = if finding.status == "dismissed" {
-        "x"
-    } else {
-        " "
-    };
-    // The entry carries the same labeled severity/confidence and description
-    // as an inline finding, but flattened onto one line: the checkbox parser
-    // and GitHub's task-list renderer both need the dismissal marker on the
-    // same `- [ ]` line.
     let path = safe_public_inline_code(&finding.path, 512).replace(PROMPT_LINE_BREAKS, " ");
     let finding_title =
         safe_public_model_markdown(&finding.title, 512, "…").replace(PROMPT_LINE_BREAKS, " ");
@@ -10917,22 +11167,30 @@ fn lifecycle_dismissal_entry(
         "… _(finding text truncated)_",
     )
     .replace(PROMPT_LINE_BREAKS, " ");
-    let note = if finding.status == "dismissed" {
-        " _(dismissed by maintainer)_"
-    } else if carried {
-        " _(carried forward)_"
+    // The command accepts any unique prefix; eight hex characters are shown
+    // because they are comfortably unique per pull request and short enough
+    // to retype from a phone.
+    let short_id: String = finding.id.chars().take("rvf_".len() + 8).collect();
+    let (note, command) = if finding.status == "dismissed" {
+        (
+            " _(resolved by maintainer)_",
+            format!("`@trouve-ai unresolve {short_id}`"),
+        )
     } else {
-        ""
+        (
+            if carried { " _(carried forward)_" } else { "" },
+            format!("`@trouve-ai resolve {short_id} <reason>`"),
+        )
     };
     format!(
-        "- [{checked}] **Severity: {} · Confidence: {}** — `{path}` line {}: **{finding_title}** — {finding_body}{note} {}\n",
+        "- **Severity: {} · Confidence: {}** — `{path}` line {}: **{finding_title}** — {finding_body}{note} — {command}\n",
         canonical_finding_level(&finding.severity).to_ascii_uppercase(),
         canonical_finding_level(&finding.confidence).to_ascii_uppercase(),
         finding.line,
-        lifecycle_dismissal_marker(&finding.id),
     )
 }
 
+#[cfg(test)]
 fn lifecycle_dismissal_marker(finding_id: &str) -> String {
     format!("<!-- trouve-dismiss:{finding_id} -->")
 }
@@ -10977,9 +11235,11 @@ fn parse_lifecycle_dismissal_markers(body: &str) -> Option<Vec<(String, bool)>> 
 const LIFECYCLE_DISMISSABLE_MAX_BYTES: usize = 16 * 1024;
 
 const LIFECYCLE_DISMISSAL_HEADING: &str = "### Findings without inline threads\n\nThese findings \
-     anchor outside the pull-request diff, so they have no review thread to resolve. A \
-     maintainer can check a box to dismiss one; unchecking restores it. Edits apply directly, \
-     without a new review round.\n\n";
+     anchor outside the pull-request diff, so they have no review thread to resolve. To resolve \
+     one as won't-fix, comment `@trouve-ai resolve <id> <reason>` (the reason is required and \
+     recorded); `@trouve-ai unresolve <id>` restores it. Commands apply directly, without a new \
+     review round. Fixed findings leave this list automatically on the next round — never \
+     resolve a finding to record that it was fixed.\n\n";
 
 const LIFECYCLE_DISMISSAL_OMITTED_MARKER: &str =
     "- _additional findings omitted; see the trouve dashboard._\n";
@@ -19055,7 +19315,7 @@ mod tests {
         // The checkbox section survives with at least one row and an honest
         // omission notice.
         assert!(body.contains("### Findings without inline threads"));
-        assert!(body.contains("<!-- trouve-dismiss:threadless-0 -->"));
+        assert!(body.contains("`@trouve-ai resolve threadless-0"));
         assert!(body.contains("additional findings omitted"));
         // The prompt block trails the comment and its fence is closed.
         let prompt_open = body.rfind("```text").unwrap();
@@ -19123,7 +19383,7 @@ mod tests {
         assert!(!body.contains(LIFECYCLE_COMMENT_TRUNCATION_MARKER));
         assert!(body.contains("### Inline comments that failed to post"));
         assert!(body.contains("### Findings without inline threads"));
-        assert!(body.contains("<!-- trouve-dismiss:threadless-0 -->"));
+        assert!(body.contains("`@trouve-ai resolve threadless-0"));
         assert!(body.contains("additional findings omitted"));
         // The prompt block was reserved exactly, so it trails intact.
         let prompt_open = body.rfind("```text").unwrap();
@@ -26544,6 +26804,90 @@ mod tests {
     }
 
     #[test]
+    fn threadless_resolve_command_grammar_requires_reasons_and_real_ids() {
+        use ThreadlessCommandParse::{Invalid, Resolve, Unresolve};
+        assert_eq!(
+            parse_threadless_resolve_command(
+                "Looks fine otherwise.\n@trouve-ai resolve rvf_9b7fc0c6 accepted limitation per ADR 0042"
+            ),
+            Some(Resolve {
+                finding_prefix: "rvf_9b7fc0c6".into(),
+                reason: "accepted limitation per ADR 0042".into(),
+            })
+        );
+        assert_eq!(
+            parse_threadless_resolve_command("@TROUVE-AI UNRESOLVE RVF_9B7FC0C6"),
+            Some(Unresolve {
+                finding_prefix: "rvf_9b7fc0c6".into(),
+            })
+        );
+        // A resolve without a reason, or with an unusable id, is answered
+        // with guidance instead of being applied or ignored.
+        assert!(matches!(
+            parse_threadless_resolve_command("@trouve-ai resolve rvf_9b7fc0c6"),
+            Some(Invalid(message)) if message.contains("reason is required")
+        ));
+        assert!(matches!(
+            parse_threadless_resolve_command("@trouve-ai resolve nonsense do it"),
+            Some(Invalid(message)) if message.contains("rvf_")
+        ));
+        assert!(matches!(
+            parse_threadless_resolve_command("@trouve-ai resolve rvf_9b some reason"),
+            Some(Invalid(_))
+        ));
+        assert!(matches!(
+            parse_threadless_resolve_command("@trouve-ai resolve"),
+            Some(Invalid(message)) if message.contains("finding id is required")
+        ));
+        // Unrelated bot mentions and plain review commands are not commands.
+        assert_eq!(parse_threadless_resolve_command("@trouve-ai review"), None);
+        assert_eq!(
+            parse_threadless_resolve_command("please @trouve-ai resolve rvf_9b7fc0c6 x"),
+            None
+        );
+        assert_eq!(
+            parse_threadless_resolve_command("resolve rvf_9b7fc0c6 x"),
+            None
+        );
+    }
+
+    #[test]
+    fn threadless_resolve_comment_requires_a_trusted_pull_request_author() {
+        let payload = |association: &str, user_type: &str, action: &str| {
+            serde_json::json!({
+                "action": action,
+                "installation": {"id": 7},
+                "repository": {"full_name": "acme/widgets"},
+                "issue": {
+                    "number": 42,
+                    "pull_request": {"url": "https://api.github.com/repos/acme/widgets/pulls/42"}
+                },
+                "comment": {
+                    "id": 100,
+                    "body": "@trouve-ai resolve rvf_9b7fc0c6 accepted per ADR 0042",
+                    "author_association": association,
+                    "user": {"type": user_type, "login": "jim"}
+                }
+            })
+        };
+        let accepted = threadless_resolve_comment(&payload("OWNER", "User", "created")).unwrap();
+        assert_eq!(accepted.repository, "acme/widgets");
+        assert_eq!(accepted.pull_number, 42);
+        assert_eq!(accepted.author, "jim");
+        assert_eq!(
+            accepted.parsed,
+            ThreadlessCommandParse::Resolve {
+                finding_prefix: "rvf_9b7fc0c6".into(),
+                reason: "accepted per ADR 0042".into(),
+            }
+        );
+        // Non-maintainers, bots, and comment edits are not command sources.
+        assert!(threadless_resolve_comment(&payload("CONTRIBUTOR", "User", "created")).is_none());
+        assert!(threadless_resolve_comment(&payload("OWNER", "Bot", "created")).is_none());
+        assert!(threadless_resolve_comment(&payload("OWNER", "User", "edited")).is_none());
+    }
+
+    #[test]
     fn converted_to_draft_webhook_ignores_unconfigured_repository() {
         let data = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -26849,37 +27193,28 @@ mod tests {
         ];
         let body = render_lifecycle_comment(&detail, &threadless, false, &[]);
         assert!(body.contains("### Findings without inline threads"));
-        // Checkbox entries render like inline findings: labeled severity and
-        // confidence plus the description, on one line with the marker.
-        assert!(body.contains("- [ ] **Severity: HIGH · Confidence: MEDIUM**"));
+        // Rows render like inline findings — labeled severity/confidence
+        // plus the description — with the copy-pasteable maintainer command
+        // and, deliberately, no task-list checkboxes or dismissal markers: a
+        // checkbox reads as a progress list and invites bulk "mark as
+        // reviewed" toggles.
+        assert!(body.contains("- **Severity: HIGH · Confidence: MEDIUM**"));
         assert!(body.contains("**Unchanged caller breaks under the new invariant** — details"));
-        assert!(body.contains("<!-- trouve-dismiss:fnd-open -->"));
-        assert!(body.contains("- [x]"));
-        assert!(body.contains("_(dismissed by maintainer)_ <!-- trouve-dismiss:fnd-done -->"));
+        assert!(body.contains("`@trouve-ai resolve fnd-open <reason>`"));
+        assert!(body.contains("_(resolved by maintainer)_ — `@trouve-ai unresolve fnd-done`"));
+        assert!(body.contains("never resolve a finding to record that it was fixed"));
+        assert!(!body.contains("- [ ]"));
+        assert!(!body.contains("- [x]"));
+        assert!(!body.contains("<!-- trouve-dismiss:"));
 
-        // A maintainer toggles both boxes; the parse sees exactly that.
-        let edited = body.replace(
-            "- [ ] **Severity: HIGH · Confidence: MEDIUM**",
-            "- [x] **Severity: HIGH · Confidence: MEDIUM**",
+        // Legacy comments rendered by earlier versions still parse, so a
+        // maintainer's checkbox toggle on an old comment keeps working.
+        let legacy = format!(
+            "- [x] old entry {}\n- [ ] other {}\n",
+            lifecycle_dismissal_marker("fnd-open"),
+            lifecycle_dismissal_marker("fnd-done"),
         );
-        let edited = {
-            // uncheck the dismissed entry
-            let marker = "<!-- trouve-dismiss:fnd-done -->";
-            let line_start = edited.lines().position(|l| l.contains(marker)).unwrap();
-            edited
-                .lines()
-                .enumerate()
-                .map(|(i, l)| {
-                    if i == line_start {
-                        l.replacen("- [x]", "- [ ]", 1)
-                    } else {
-                        l.to_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let states = parse_lifecycle_dismissal_markers(&edited).unwrap();
+        let states = parse_lifecycle_dismissal_markers(&legacy).unwrap();
         assert_eq!(
             states,
             [
