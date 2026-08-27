@@ -7,6 +7,7 @@
 //! Layout under `<data_dir>/cli/`:
 //! - `<id>/.generations/…`    — immutable runtime generations
 //! - `<id>/installed.json`    — pointer to the active version + binary
+//! - `.leases/<id>/…`         — filesystem-wide generation lifetime locks
 //!
 //! `installed.json` is the single source used by both discovery and process
 //! launches. Activation atomically replaces it only after a complete immutable
@@ -22,7 +23,6 @@
 
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -171,28 +171,27 @@ pub struct InstalledCli {
 }
 
 /// Keeps one resolved managed runtime generation alive for as long as a
-/// backend can still use the executable it selected. Activation consults the
-/// process-local lease registry before reclaiming retired generations.
+/// backend can still use the executable it selected. The shared filesystem
+/// lock is visible to every Trouve process using the same data directory.
 #[derive(Debug)]
 pub struct RuntimeLease {
-    _bin: PathBuf,
-    _token: Arc<()>,
+    _runtime: PathBuf,
+    _lock: std::fs::File,
 }
 
-#[derive(Default)]
-struct RuntimeGenerationLifecycle {
-    leases: std::collections::HashMap<PathBuf, Weak<()>>,
+#[derive(Clone, Copy, Debug)]
+enum RuntimeContainerKind {
+    Generation,
+    Legacy,
 }
 
-fn runtime_generation_lifecycle() -> &'static Mutex<RuntimeGenerationLifecycle> {
-    static LIFECYCLE: OnceLock<Mutex<RuntimeGenerationLifecycle>> = OnceLock::new();
-    LIFECYCLE.get_or_init(Default::default)
-}
-
-fn lock_runtime_generation_lifecycle() -> MutexGuard<'static, RuntimeGenerationLifecycle> {
-    runtime_generation_lifecycle()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+impl RuntimeContainerKind {
+    fn lease_directory(self) -> &'static str {
+        match self {
+            Self::Generation => "generations",
+            Self::Legacy => "legacy",
+        }
+    }
 }
 
 fn cli_root(data_dir: &Path, id: CliId) -> PathBuf {
@@ -211,34 +210,24 @@ fn installed_unlocked(data_dir: &Path, id: CliId) -> Option<InstalledCli> {
 
 /// The managed install of `id`, if one is active and its binary exists.
 pub fn installed(data_dir: &Path, id: CliId) -> Option<InstalledCli> {
-    let _lifecycle = lock_runtime_generation_lifecycle();
     installed_unlocked(data_dir, id)
 }
 
 /// Resolve the active managed install and lease its executable generation.
-/// The lifecycle lock makes pointer selection and lease registration atomic
-/// with activation-time reclamation.
+/// The activation lock makes pointer selection and shared-lease acquisition
+/// atomic with publication, reclamation, and uninstall in every process.
 pub fn installed_with_lease(data_dir: &Path, id: CliId) -> Option<(InstalledCli, RuntimeLease)> {
-    let mut lifecycle = lock_runtime_generation_lifecycle();
+    let _activation_lock = lock_runtime_activation(data_dir, id).ok()?;
     let info = installed_unlocked(data_dir, id)?;
     let bin = PathBuf::from(&info.bin);
-    lifecycle
-        .leases
-        .retain(|_, existing| existing.strong_count() > 0);
-    let token = lifecycle
-        .leases
-        .get(&bin)
-        .and_then(Weak::upgrade)
-        .unwrap_or_else(|| {
-            let token = Arc::new(());
-            lifecycle.leases.insert(bin.clone(), Arc::downgrade(&token));
-            token
-        });
+    let (kind, runtime) = managed_runtime_container(data_dir, id, &bin)?;
+    let lock = open_runtime_lease_file(data_dir, id, kind, &runtime).ok()?;
+    fs4::fs_std::FileExt::lock_shared(&lock).ok()?;
     Some((
         info,
         RuntimeLease {
-            _bin: bin,
-            _token: token,
+            _runtime: runtime,
+            _lock: lock,
         },
     ))
 }
@@ -652,6 +641,15 @@ impl PreparedInstall {
             version: self.version.clone(),
             bin: bin.to_string_lossy().into_owned(),
         };
+        // Establish the stable external lease inode before publication. A
+        // committed pointer must never name a generation that another process
+        // cannot protect from reclamation.
+        drop(open_runtime_lease_file(
+            &self.data_dir,
+            self.id,
+            RuntimeContainerKind::Generation,
+            &generation,
+        )?);
         let pointer = root.join("installed.json");
 
         // Build and flush the sole publication candidate before changing live
@@ -674,10 +672,10 @@ impl PreparedInstall {
         std::fs::rename(&self.stage, &generation)?;
         checkpoint(ActivationCheckpoint::BeforePointer)?;
 
-        // Couple the last pointer read, publication, and reclamation to lease
-        // acquisition. A backend can therefore never select a generation in
-        // the gap before an activation removes it.
-        let mut lifecycle = lock_runtime_generation_lifecycle();
+        // The filesystem-wide activation lock couples the last pointer read,
+        // publication, and reclamation to lease acquisition. A backend in any
+        // process can therefore never select a generation in the gap before
+        // an activation removes it.
         let previous = installed_unlocked(&self.data_dir, self.id);
         let previous_generation = previous
             .as_ref()
@@ -698,12 +696,13 @@ impl PreparedInstall {
         generation_cleanup.disarm();
 
         prune_runtime_generations(
+            &self.data_dir,
+            self.id,
             &generations,
             &generation,
             previous_generation.as_deref(),
-            &mut lifecycle,
         );
-        prune_old_versions(&root, previous_legacy.as_deref(), &mut lifecycle);
+        prune_old_versions(&self.data_dir, self.id, &root, previous_legacy.as_deref());
         remove_legacy_managed_bin_best_effort(&self.data_dir, self.id);
         if self.id == CliId::CursorSdkBridge {
             // The SDK is the Cursor transport now. Remove Trouve's obsolete
@@ -756,6 +755,26 @@ fn runtime_container(root: &Path, bin: &Path) -> Option<PathBuf> {
         return None;
     };
     Some(root.join(name))
+}
+
+fn managed_runtime_container(
+    data_dir: &Path,
+    id: CliId,
+    bin: &Path,
+) -> Option<(RuntimeContainerKind, PathBuf)> {
+    let root = cli_root(data_dir, id);
+    let generations = root.join(".generations");
+    if let Some(generation) = runtime_container(&generations, bin) {
+        return Some((RuntimeContainerKind::Generation, generation));
+    }
+    runtime_container(&root, bin)
+        .filter(|runtime| {
+            runtime
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with('.'))
+        })
+        .map(|runtime| (RuntimeContainerKind::Legacy, runtime))
 }
 
 #[cfg(not(windows))]
@@ -842,6 +861,41 @@ fn runtime_activation_lock_path(data_dir: &Path, id: CliId) -> PathBuf {
         .join("cli")
         .join(".locks")
         .join(format!("{}.lock", id.as_str()))
+}
+
+fn runtime_lease_directory(data_dir: &Path, id: CliId, kind: RuntimeContainerKind) -> PathBuf {
+    data_dir
+        .join("cli")
+        .join(".leases")
+        .join(id.as_str())
+        .join(kind.lease_directory())
+}
+
+fn open_runtime_lease_file(
+    data_dir: &Path,
+    id: CliId,
+    kind: RuntimeContainerKind,
+    runtime: &Path,
+) -> std::io::Result<std::fs::File> {
+    let runtime_name = runtime.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "managed runtime has no generation name: {}",
+                runtime.display()
+            ),
+        )
+    })?;
+    let directory = runtime_lease_directory(data_dir, id, kind);
+    std::fs::create_dir_all(&directory)?;
+    let mut lease_name = runtime_name.to_os_string();
+    lease_name.push(".lock");
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(lease_name))
 }
 
 fn lock_runtime_activation(data_dir: &Path, id: CliId) -> std::io::Result<std::fs::File> {
@@ -936,6 +990,10 @@ pub async fn install(
 /// own copies.
 pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
     let _activation_lock = lock_runtime_activation(data_dir, id)?;
+    // Lease files live outside the runtime root, so they remain lockable while
+    // that root is removed (including on Windows). Refuse the whole operation
+    // before changing any path when another process can still use a runtime.
+    let _runtime_leases = lock_all_runtime_leases_exclusive(data_dir, id)?;
     let link = legacy_managed_bin_path(data_dir, id);
     if link.symlink_metadata().is_ok() {
         std::fs::remove_file(&link)?;
@@ -948,6 +1006,42 @@ pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
         remove_legacy_cursor_agent_best_effort(data_dir);
     }
     Ok(())
+}
+
+fn lock_all_runtime_leases_exclusive(
+    data_dir: &Path,
+    id: CliId,
+) -> std::io::Result<Vec<std::fs::File>> {
+    let mut leases = Vec::new();
+    for kind in [
+        RuntimeContainerKind::Generation,
+        RuntimeContainerKind::Legacy,
+    ] {
+        let directory = runtime_lease_directory(data_dir, id, kind);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let lease = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())?;
+            if !fs4::fs_std::FileExt::try_lock_exclusive(&lease)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("managed {} runtime is still in use", id.as_str()),
+                ));
+            }
+            leases.push(lease);
+        }
+    }
+    Ok(leases)
 }
 
 fn remove_legacy_managed_bin_best_effort(data_dir: &Path, id: CliId) {
@@ -1224,32 +1318,44 @@ fn make_executable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn runtime_path_is_leased(lifecycle: &mut RuntimeGenerationLifecycle, runtime: &Path) -> bool {
-    lifecycle.leases.retain(|_, lease| lease.strong_count() > 0);
-    lifecycle
-        .leases
-        .iter()
-        .any(|(bin, _)| bin.starts_with(runtime))
+fn try_lock_runtime_exclusive(
+    data_dir: &Path,
+    id: CliId,
+    kind: RuntimeContainerKind,
+    runtime: &Path,
+) -> std::io::Result<Option<std::fs::File>> {
+    let lock = open_runtime_lease_file(data_dir, id, kind, runtime)?;
+    if fs4::fs_std::FileExt::try_lock_exclusive(&lock)? {
+        Ok(Some(lock))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Keep the active immutable generation, the exact previously active
 /// generation, and every retired generation still leased by a backend. Orphans
 /// are collected on a later activation after their last consumer drains.
 fn prune_runtime_generations(
+    data_dir: &Path,
+    id: CliId,
     generations: &Path,
     active: &Path,
     previous: Option<&Path>,
-    lifecycle: &mut RuntimeGenerationLifecycle,
 ) {
     let Ok(entries) = std::fs::read_dir(generations) else {
         return;
     };
-    for generation in entries.flatten().map(|entry| entry.path()).filter(|path| {
-        path.is_dir()
-            && path != active
-            && previous != Some(path.as_path())
-            && !runtime_path_is_leased(lifecycle, path)
-    }) {
+    for generation in entries.flatten().map(|entry| entry.path()) {
+        if !generation.is_dir() || generation == active || previous == Some(generation.as_path()) {
+            continue;
+        }
+        // The activation lock prevents new shared leases while this exclusive
+        // guard is held. A busy or unreadable lease is conservatively kept.
+        let Ok(Some(_lease)) =
+            try_lock_runtime_exclusive(data_dir, id, RuntimeContainerKind::Generation, &generation)
+        else {
+            continue;
+        };
         let _ = std::fs::remove_dir_all(generation);
     }
 }
@@ -1257,23 +1363,25 @@ fn prune_runtime_generations(
 /// During migration, keep only the exact legacy directory selected by the
 /// previous pointer. Once both current and previous installs are generations,
 /// all legacy version directories can be removed.
-fn prune_old_versions(
-    root: &Path,
-    previous: Option<&Path>,
-    lifecycle: &mut RuntimeGenerationLifecycle,
-) {
+fn prune_old_versions(data_dir: &Path, id: CliId, root: &Path, previous: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    for directory in entries.flatten().map(|e| e.path()).filter(|p| {
-        p.is_dir()
-            && p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| !n.starts_with('.'))
-                .unwrap_or(false)
-            && previous != Some(p.as_path())
-            && !runtime_path_is_leased(lifecycle, p)
-    }) {
+    for directory in entries.flatten().map(|entry| entry.path()) {
+        if !directory.is_dir()
+            || directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| name.starts_with('.'))
+            || previous == Some(directory.as_path())
+        {
+            continue;
+        }
+        let Ok(Some(_lease)) =
+            try_lock_runtime_exclusive(data_dir, id, RuntimeContainerKind::Legacy, &directory)
+        else {
+            continue;
+        };
         let _ = std::fs::remove_dir_all(directory);
     }
 }
@@ -1831,6 +1939,35 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
+    fn uninstall_refuses_to_remove_a_leased_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let version_dir = root.join("1.0.0");
+        let bin = version_dir.join("codex");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(&bin, "runtime").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "1.0.0".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (_, lease) = installed_with_lease(tmp.path(), CliId::Codex).unwrap();
+
+        let error = uninstall(tmp.path(), CliId::Codex).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(bin.is_file());
+        assert!(root.join("installed.json").is_file());
+
+        drop(lease);
+        uninstall(tmp.path(), CliId::Codex).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn cursor_sdk_uninstall_removes_only_trouve_managed_cursor_runtimes() {
         let tmp = tempfile::tempdir().unwrap();
         let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
@@ -1891,13 +2028,12 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     #[test]
     fn legacy_prune_keeps_the_exact_previous_runtime() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
+        let root = cli_root(tmp.path(), CliId::Codex);
         for v in ["1.0.0", "1.1.0", "1.2.0"] {
             std::fs::create_dir_all(root.join(v)).unwrap();
         }
         let previous = root.join("1.1.0");
-        let mut lifecycle = lock_runtime_generation_lifecycle();
-        prune_old_versions(&root, Some(&previous), &mut lifecycle);
+        prune_old_versions(tmp.path(), CliId::Codex, &root, Some(&previous));
         let mut left: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .flatten()
@@ -1910,17 +2046,24 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     #[test]
     fn generation_prune_keeps_active_and_one_previous() {
         let tmp = tempfile::tempdir().unwrap();
-        let generations = tmp.path();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let generations = root.join(".generations");
+        std::fs::create_dir_all(&generations).unwrap();
         let active = generations.join("runtime-active");
         let previous = generations.join("runtime-previous");
         for generation in ["runtime-oldest", "runtime-previous", "runtime-active"] {
             std::fs::create_dir(generations.join(generation)).unwrap();
         }
 
-        let mut lifecycle = lock_runtime_generation_lifecycle();
-        prune_runtime_generations(generations, &active, Some(&previous), &mut lifecycle);
+        prune_runtime_generations(
+            tmp.path(),
+            CliId::Codex,
+            &generations,
+            &active,
+            Some(&previous),
+        );
 
-        let remaining = std::fs::read_dir(generations)
+        let remaining = std::fs::read_dir(&generations)
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
@@ -1957,6 +2100,89 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
 
         assert!(Path::new(&first.bin).is_file());
         drop(lease);
+        activate("4.0.0");
+        assert!(!Path::new(&first.bin).exists());
+    }
+
+    const TEST_RUNTIME_LEASE_DATA_DIR_ENV: &str = "TROUVE_TEST_RUNTIME_LEASE_DATA_DIR";
+    const TEST_RUNTIME_LEASE_MARKER_ENV: &str = "TROUVE_TEST_RUNTIME_LEASE_MARKER";
+    const TEST_RUNTIME_LEASE_RELEASE_ENV: &str = "TROUVE_TEST_RUNTIME_LEASE_RELEASE";
+
+    #[test]
+    fn runtime_lease_process_helper() {
+        let Some(data_dir) = std::env::var_os(TEST_RUNTIME_LEASE_DATA_DIR_ENV) else {
+            return;
+        };
+        let marker = PathBuf::from(std::env::var_os(TEST_RUNTIME_LEASE_MARKER_ENV).unwrap());
+        let release = PathBuf::from(std::env::var_os(TEST_RUNTIME_LEASE_RELEASE_ENV).unwrap());
+        let data_dir = PathBuf::from(data_dir);
+        let (runtime, lease) = installed_with_lease(&data_dir, CliId::Codex).unwrap();
+        std::fs::write(&marker, "leased").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !release.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            release.exists(),
+            "parent never released runtime lease helper"
+        );
+        assert_eq!(std::fs::read_to_string(&runtime.bin).unwrap(), "1.0.0");
+        drop(lease);
+    }
+
+    #[test]
+    fn cross_process_lease_survives_two_later_activations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let activate = |version: &str| {
+            let stage = create_install_stage(&root, version).unwrap();
+            std::fs::write(stage.join("codex"), version).unwrap();
+            PreparedInstall {
+                data_dir: tmp.path().to_path_buf(),
+                id: CliId::Codex,
+                version: version.into(),
+                stage,
+                bin_rel: PathBuf::from("codex"),
+            }
+            .activate()
+            .unwrap()
+        };
+
+        let first = activate("1.0.0");
+        let marker = tmp.path().join("lease-held");
+        let release = tmp.path().join("lease-release");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("install::tests::runtime_lease_process_helper")
+            .arg("--nocapture")
+            .env(TEST_RUNTIME_LEASE_DATA_DIR_ENV, tmp.path())
+            .env(TEST_RUNTIME_LEASE_MARKER_ENV, &marker)
+            .env(TEST_RUNTIME_LEASE_RELEASE_ENV, &release)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut holder = trouve_process::spawn(&mut command).unwrap();
+
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < marker_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !marker.exists() {
+            let _ = std::fs::write(&release, "release");
+            let _ = holder.wait();
+            panic!("runtime lease helper did not acquire its shared lease");
+        }
+
+        activate("2.0.0");
+        activate("3.0.0");
+        let survived = Path::new(&first.bin).is_file();
+        std::fs::write(&release, "release").unwrap();
+        let status = holder.wait().unwrap();
+
+        assert!(status.success());
+        assert!(survived, "another process pruned the leased generation");
         activate("4.0.0");
         assert!(!Path::new(&first.bin).exists());
     }

@@ -4668,15 +4668,39 @@ impl Engine {
             self.title_model.stop().await;
         }
         let _transition = self.provider_reload.lock().await;
-        if let Err(error) = self.shutdown_config_backends().await {
+        if let Err(error) = self.shutdown_config_backends_for_runtime(cli).await {
             // Teardown may already have closed one or more backend pools.
             // Restore a fresh registry from the unchanged durable config
             // before reporting the cleanup failure.
-            self.replace_provider_registries();
+            self.replace_config_backends_for_runtime(cli);
             return Err(error);
         }
-        let uninstall = trouve_agents::install::uninstall(&self.data_dir, cli)
-            .map_err(|e| EngineError::Internal(e.into()));
+        // Runtime-specific teardown removes the registry's leased wrapper
+        // before returning. Cross-process or delayed turn clones are still
+        // protected by the install layer. Give just-drained file handles a
+        // short bounded window to close before surfacing a retryable conflict.
+        let mut drain_retries = 0;
+        let uninstall = loop {
+            match trouve_agents::install::uninstall(&self.data_dir, cli) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock && drain_retries < 4 =>
+                {
+                    drain_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                result => break result,
+            }
+        }
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                EngineError::Conflict(format!(
+                    "managed {} runtime is still in use; retry uninstall after active turns finish",
+                    cli.display_name()
+                ))
+            } else {
+                EngineError::Internal(error.into())
+            }
+        });
         // Drop any stale success/failed state so status reads "none", and
         // rebuild backends so they fall back to PATH resolution (or none).
         if uninstall.is_ok() {
@@ -4684,7 +4708,7 @@ impl Engine {
         }
         // Even on a filesystem error, replace the now-closed backend pool so
         // the still-installed runtime can accept turns again.
-        self.replace_provider_registries();
+        self.replace_config_backends_for_runtime(cli);
         uninstall?;
         Ok(())
     }
@@ -6352,28 +6376,38 @@ impl Engine {
                 .map(|(id, _)| id.clone())
                 .collect::<HashSet<_>>()
         });
-        let retiring = self
-            .backends
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(id, backend)| {
-                target_ids
-                    .as_ref()
-                    .is_none_or(|target_ids| target_ids.contains(*id))
-                    && !injected
-                        .iter()
-                        .any(|candidate| Arc::ptr_eq(candidate, backend))
-            })
-            .map(|(_, backend)| backend)
-            .cloned()
-            .collect::<Vec<_>>();
+        // Detach first so no new turn can clone a backend while teardown is
+        // underway. In particular, this drops the registry's managed-runtime
+        // lease before an update or uninstall tries to reclaim its files.
+        let retiring = {
+            let mut backends = self.backends.write().unwrap();
+            let retiring_ids = backends
+                .iter()
+                .filter(|(id, backend)| {
+                    target_ids
+                        .as_ref()
+                        .is_none_or(|target_ids| target_ids.contains(*id))
+                        && !injected
+                            .iter()
+                            .any(|candidate| Arc::ptr_eq(candidate, backend))
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            retiring_ids
+                .into_iter()
+                .filter_map(|id| backends.remove(&id))
+                .collect::<Vec<_>>()
+        };
         let mut first_error = None;
-        for backend in retiring {
+        for backend in &retiring {
             if let Err(error) = backend.shutdown().await {
                 first_error.get_or_insert_with(|| EngineError::Internal(error.into()));
             }
         }
+        // Async generator storage may otherwise retain this vector until the
+        // completed shutdown future itself is dropped by its caller. Release
+        // managed-runtime leases before reporting teardown completion.
+        drop(retiring);
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -28094,6 +28128,58 @@ default_permission_mode = "ask"
         assert!(!Arc::ptr_eq(&cursor_backend, &backends["cursor"]));
         assert!(Arc::ptr_eq(&claude_backend, &backends["claude"]));
         assert!(Arc::ptr_eq(&codex_backend, &backends["codex"]));
+    }
+
+    #[tokio::test]
+    async fn uninstall_drops_the_registry_runtime_lease_before_removal() {
+        let data = tempfile::tempdir().unwrap();
+        let runtime_root = data.path().join("cli").join("cursor-sdk-bridge");
+        let generation = runtime_root.join(".generations").join("runtime-test");
+        let bin = generation.join("bin").join("cursor-sdk-bridge");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "bridge").unwrap();
+        std::fs::write(
+            runtime_root.join("installed.json"),
+            serde_json::to_string(&trouve_agents::install::InstalledCli {
+                version: "test".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+
+        let blocked = trouve_agents::install::uninstall(
+            data.path(),
+            trouve_agents::install::CliId::CursorSdkBridge,
+        )
+        .unwrap_err();
+        assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(bin.is_file());
+
+        let delayed_turn_backend = engine.backends.read().unwrap()["cursor"].clone();
+        let blocked = engine.uninstall_cli("cursor-sdk-bridge").await.unwrap_err();
+        assert!(matches!(blocked, EngineError::Conflict(_)));
+        assert!(bin.is_file());
+        assert_eq!(Arc::strong_count(&delayed_turn_backend), 1);
+
+        drop(delayed_turn_backend);
+        engine.uninstall_cli("cursor-sdk-bridge").await.unwrap();
+        assert!(!runtime_root.exists());
     }
 
     #[tokio::test]
