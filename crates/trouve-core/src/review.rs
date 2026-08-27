@@ -3866,11 +3866,16 @@ impl Engine {
         Ok(had_errors)
     }
 
+    /// Returns the candidate keys this pass attempted (reconciled, found
+    /// current, or failed definitively). Keys absent from the set were never
+    /// reached — the deadline expired or the walk stopped after completing a
+    /// pull — and a caller holding webhook priorities must requeue them.
     async fn reconcile_oldest_review_thread_candidate(
         &self,
         candidates: &[ReviewReconciliationCandidate],
         priority: &HashSet<(String, u64)>,
-    ) -> Result<()> {
+    ) -> Result<HashSet<(String, u64)>> {
+        let mut attempted = HashSet::new();
         let deadline = Instant::now() + REVIEW_RECONCILIATION_PASS_BUDGET;
         let progress_keys = self
             .code_review
@@ -3908,6 +3913,7 @@ impl Engine {
             {
                 Ok(Ok(api)) => api,
                 Ok(Err(error)) => {
+                    attempted.insert(key.clone());
                     self.code_review
                         .thread_reconciled_at
                         .lock()
@@ -3975,6 +3981,7 @@ impl Engine {
                                     || progress_key.pull_number != key.1
                             });
                     }
+                    attempted.insert(key.clone());
                     self.code_review
                         .thread_reconciled_at
                         .lock()
@@ -3989,6 +3996,7 @@ impl Engine {
                 .lock()
                 .unwrap()
                 .remove(&key);
+            attempted.insert(key.clone());
             self.code_review
                 .thread_reconciled_at
                 .lock()
@@ -4001,7 +4009,7 @@ impl Engine {
         if let Some(error) = first_error {
             Err(error)
         } else {
-            Ok(())
+            Ok(attempted)
         }
     }
 
@@ -4350,16 +4358,43 @@ impl Engine {
                                 engine.record_review_error(format!(
                                     "webhook reconciliation failed: {error:#}"
                                 ));
-                            } else if let Err(error) = engine
-                                .reconcile_oldest_review_thread_candidate(
-                                    &reconciliation_candidates,
-                                    &keys,
-                                )
-                                .await
-                            {
-                                engine.record_review_error(format!(
-                                    "webhook thread reconciliation failed: {error:#}"
-                                ));
+                            } else {
+                                match engine
+                                    .reconcile_oldest_review_thread_candidate(
+                                        &reconciliation_candidates,
+                                        &keys,
+                                    )
+                                    .await
+                                {
+                                    Ok(attempted) => {
+                                        // The bounded walk stops after
+                                        // completing one pull (or at the
+                                        // deadline); prioritized pulls it
+                                        // never reached go back into the
+                                        // queue for the next batch instead
+                                        // of dropping their events. Each
+                                        // pass attempts at least one
+                                        // priority key, so the requeued set
+                                        // shrinks every iteration. On error
+                                        // the poll rotation heals instead —
+                                        // an immediate requeue would
+                                        // hot-retry a failing repository.
+                                        for key in keys {
+                                            if !attempted.contains(&key) {
+                                                enqueue_thread_webhook_key(
+                                                    &engine.code_review.thread_webhook_dispatch,
+                                                    key,
+                                                    repository.clone(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        engine.record_review_error(format!(
+                                            "webhook thread reconciliation failed: {error:#}"
+                                        ));
+                                    }
+                                }
                             }
                         }
                     });
