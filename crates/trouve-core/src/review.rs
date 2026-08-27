@@ -15078,8 +15078,11 @@ fn finding_anchor_content(
     if left {
         return None;
     }
-    // Structural validation already rejected unsafe paths; keep the guard
-    // anyway so this lookup can never leave the checkout.
+    // Structural validation already rejected unsafe paths; keep the lexical
+    // guard anyway, then confine the resolved target: canonicalization
+    // follows every symlink (intermediate and final), so requiring the
+    // canonical candidate to stay beneath the canonical root means a
+    // repository symlink can never redirect this read outside the checkout.
     let relative = std::path::Path::new(&finding.path);
     if relative.is_absolute()
         || relative
@@ -15088,8 +15091,17 @@ fn finding_anchor_content(
     {
         return None;
     }
-    let root = repository_path?;
-    let text = std::fs::read_to_string(root.join(relative)).ok()?;
+    let root = std::fs::canonicalize(repository_path?).ok()?;
+    let candidate = std::fs::canonicalize(root.join(relative)).ok()?;
+    if !candidate.starts_with(&root) {
+        return None;
+    }
+    // Anchor verification reads source files; anything larger than the
+    // anchor-blob bound is not a reviewable source file.
+    if std::fs::metadata(&candidate).ok()?.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 {
+        return None;
+    }
+    let text = std::fs::read_to_string(&candidate).ok()?;
     let index = usize::try_from(finding.line).ok()?.checked_sub(1)?;
     text.lines().nth(index).map(str::to_owned)
 }
@@ -15105,7 +15117,10 @@ fn anchor_match_verdict(quote: &str, actual: Option<&str>) -> &'static str {
     let Some(actual) = actual.map(str::trim) else {
         return "unchecked";
     };
-    if !actual.is_empty() && (actual == quote || actual.contains(quote) || quote.contains(actual)) {
+    // Exact equality after trimming: the contract asks for the verbatim
+    // source line, and containment would let a generic fragment (`}`) or a
+    // quote that merely embeds the line count as mechanically verified.
+    if !actual.is_empty() && actual == quote {
         "matched"
     } else {
         "mismatched"
@@ -17283,7 +17298,17 @@ mod tests {
             anchor_match_verdict("  let x = 1;  ", Some("\tlet x = 1;")),
             "matched"
         );
-        assert_eq!(anchor_match_verdict("x = 1", Some("let x = 1;")), "matched");
+        // Only the verbatim line counts: fragments and expanded quotes that
+        // merely contain the line are mismatches, not verification.
+        assert_eq!(
+            anchor_match_verdict("x = 1", Some("let x = 1;")),
+            "mismatched"
+        );
+        assert_eq!(anchor_match_verdict("}", Some("let x = 1;")), "mismatched");
+        assert_eq!(
+            anchor_match_verdict("prefix; let x = 1; suffix", Some("let x = 1;")),
+            "mismatched"
+        );
         assert_eq!(
             anchor_match_verdict("let y = 2;", Some("let x = 1;")),
             "mismatched"
@@ -17478,6 +17503,28 @@ mod tests {
         hostile.path = "../etc/passwd".into();
         apply_verification_derived_confidence(&mut hostile, &contents, Some(repo.path()));
         assert_eq!(hostile.evidence.anchor_match, "unchecked");
+
+        // A repository symlink pointing outside the checkout is confined by
+        // canonicalization: the read never follows it, so the anchor stays
+        // unchecked instead of becoming a content oracle for host files.
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret.txt"), "token = hunter2\n").unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("secret.txt"),
+                repo.path().join("src/link.rs"),
+            )
+            .unwrap();
+            let mut through_symlink = finding("token = hunter2");
+            through_symlink.path = "src/link.rs".into();
+            apply_verification_derived_confidence(
+                &mut through_symlink,
+                &contents,
+                Some(repo.path()),
+            );
+            assert_eq!(through_symlink.evidence.anchor_match, "unchecked");
+        }
     }
 
     #[test]
