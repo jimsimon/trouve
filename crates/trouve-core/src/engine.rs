@@ -4114,7 +4114,13 @@ impl Engine {
             self.title_model.stop().await;
         }
         let _transition = self.provider_reload.lock().await;
-        self.shutdown_config_backends().await?;
+        if let Err(error) = self.shutdown_config_backends().await {
+            // Teardown may already have closed one or more backend pools.
+            // Restore a fresh registry from the unchanged durable config
+            // before reporting the cleanup failure.
+            self.replace_provider_registries();
+            return Err(error);
+        }
         let uninstall = trouve_agents::install::uninstall(&self.data_dir, cli)
             .map_err(|e| EngineError::Internal(e.into()));
         // Drop any stale success/failed state so status reads "none", and
@@ -5287,13 +5293,16 @@ impl Engine {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let mut first_error = None;
         for backend in retiring {
-            backend
-                .shutdown()
-                .await
-                .map_err(|error| EngineError::Internal(error.into()))?;
+            if let Err(error) = backend.shutdown().await {
+                first_error.get_or_insert_with(|| EngineError::Internal(error.into()));
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Rebuild registries after their previous config-owned backends have
@@ -5323,9 +5332,13 @@ impl Engine {
     /// vendor children are reaped before a replacement registry is visible.
     async fn reload_providers(&self) -> Result<(), EngineError> {
         let _transition = self.provider_reload.lock().await;
-        self.shutdown_config_backends().await?;
+        let shutdown = self.shutdown_config_backends().await;
+        // Config and secret mutations are durable before reload begins. Even
+        // when one old process cannot acknowledge teardown, publish a fresh
+        // registry that matches that committed state instead of retaining a
+        // stale or already-closed backend until restart.
         self.replace_provider_registries();
-        Ok(())
+        shutdown
     }
 
     pub fn thread_usage(
@@ -25837,6 +25850,113 @@ default_permission_mode = "ask"
         assert_eq!(provider.kind, "cursor-sdk");
         assert_eq!(provider.command, None);
         assert_eq!(configured_runtime_command(provider), None);
+    }
+
+    struct FailingShutdownBackend {
+        shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for FailingShutdownBackend {
+        fn id(&self) -> &str {
+            "failing-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(BackendError::Protocol("injected shutdown failure".into()))
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_still_publishes_committed_provider_state() {
+        const ID: &str = "reload-consistency";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+
+        let failing = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert(ID.into(), failing.clone());
+        let upsert = engine
+            .upsert_provider(
+                ID,
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(upsert.is_err());
+        assert_eq!(
+            failing.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().providers[ID]
+                .base_url
+                .as_deref(),
+            Some("https://new.example.test/v1")
+        );
+        assert!(engine.providers.read().unwrap().contains_key(ID));
+        assert!(!engine.backends.read().unwrap().contains_key(ID));
+
+        let failing = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert(ID.into(), failing.clone());
+        let delete = engine.delete_provider(ID).await;
+        assert!(delete.is_err());
+        assert_eq!(
+            failing.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
+        assert!(!engine.providers.read().unwrap().contains_key(ID));
+        assert!(!engine.backends.read().unwrap().contains_key(ID));
     }
 
     #[test]

@@ -420,6 +420,7 @@ struct BridgePool {
     thread_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     lifecycle: RwLock<()>,
     closed: AtomicBool,
+    closing: CancellationToken,
     capacity: Arc<Semaphore>,
     available: Arc<Notify>,
     reaper_started: AtomicBool,
@@ -432,6 +433,7 @@ impl Default for BridgePool {
             thread_gates: Mutex::new(HashMap::new()),
             lifecycle: RwLock::new(()),
             closed: AtomicBool::new(false),
+            closing: CancellationToken::new(),
             capacity: Arc::new(Semaphore::new(POOL_CAP)),
             available: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
@@ -502,6 +504,7 @@ impl BridgePool {
         let gate = self.thread_gate(thread_id).await;
         let thread_guard = tokio::select! {
             biased;
+            _ = self.closing.cancelled() => return Err(Self::closed_error()),
             _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
             _ = request.events.closed() => return Err(BackendError::Cancelled),
             guard = gate.lock_owned() => guard,
@@ -514,6 +517,7 @@ impl BridgePool {
             {
                 let mut bridge = tokio::select! {
                     biased;
+                    _ = self.closing.cancelled() => return Err(Self::closed_error()),
                     _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
                     _ = request.events.closed() => return Err(BackendError::Cancelled),
                     bridge = process.bridge.lock() => bridge,
@@ -553,11 +557,13 @@ impl BridgePool {
             }
         }
 
-        let permit = self.acquire_capacity(&request).await?;
+        let permit = self
+            .acquire_capacity(request.cancel, request.events)
+            .await?;
         if request.cancel.is_cancelled() || request.events.is_closed() {
             return Err(BackendError::Cancelled);
         }
-        let bridge = BridgeProcess::start(
+        let mut bridge = BridgeProcess::start(
             request.command,
             request.worktree,
             request.state_dir,
@@ -567,6 +573,12 @@ impl BridgePool {
             request.events,
         )
         .await?;
+        if !self.is_open() {
+            return merge_cleanup_error(
+                Self::closed_error(),
+                bridge.shutdown().await.map_err(BackendError::Io),
+            );
+        }
         let process = Arc::new(PooledBridge {
             bridge: Mutex::new(bridge),
             reusable: AtomicBool::new(true),
@@ -643,9 +655,20 @@ impl BridgePool {
         !self.closed.load(Ordering::Acquire)
     }
 
+    fn closed_error() -> BackendError {
+        BackendError::Protocol("Cursor SDK Bridge pool is shutting down".into())
+    }
+
     async fn shutdown(&self) -> Result<(), BackendError> {
-        let _lifecycle = self.lifecycle.write().await;
+        // Publish closure before waiting for the lifecycle writer. Capacity,
+        // thread-gate, and bridge-lock waiters may own read guards; waking
+        // them first prevents provider reload from deadlocking behind queued
+        // admission that cannot otherwise make progress.
         self.closed.store(true, Ordering::Release);
+        self.closing.cancel();
+        self.capacity.close();
+        notify_available(&self.available);
+        let _lifecycle = self.lifecycle.write().await;
         let mut first_error = None;
         loop {
             let thread_ids = self
@@ -710,10 +733,18 @@ impl BridgePool {
 
     async fn acquire_capacity(
         &self,
-        request: &BridgeProcessRequest<'_>,
+        cancel: &CancellationToken,
+        events: &BackendEventSender,
     ) -> Result<OwnedSemaphorePermit, BackendError> {
         loop {
+            if !self.is_open() {
+                return Err(Self::closed_error());
+            }
             if let Ok(permit) = self.capacity.clone().try_acquire_owned() {
+                if !self.is_open() {
+                    drop(permit);
+                    return Err(Self::closed_error());
+                }
                 return Ok(permit);
             }
             if self.evict_one().await? {
@@ -721,12 +752,24 @@ impl BridgePool {
             }
             tokio::select! {
                 biased;
-                _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
-                _ = request.events.closed() => return Err(BackendError::Cancelled),
+                _ = self.closing.cancelled() => return Err(Self::closed_error()),
+                _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+                _ = events.closed() => return Err(BackendError::Cancelled),
                 permit = self.capacity.clone().acquire_owned() => {
-                    return permit.map_err(|_| BackendError::Protocol(
-                        "Cursor SDK Bridge pool capacity closed unexpectedly".into()
-                    ));
+                    let permit = permit.map_err(|_| {
+                        if self.is_open() {
+                            BackendError::Protocol(
+                                "Cursor SDK Bridge pool capacity closed unexpectedly".into()
+                            )
+                        } else {
+                            Self::closed_error()
+                        }
+                    })?;
+                    if !self.is_open() {
+                        drop(permit);
+                        return Err(Self::closed_error());
+                    }
+                    return Ok(permit);
                 }
                 _ = self.available.notified() => {}
             }
@@ -3142,6 +3185,36 @@ mod tests {
         assert!(state.observe_frame(0x02).unwrap());
         let error = state.observe_frame(0).unwrap_err();
         assert!(error.to_string().contains("after its Connect end-stream"));
+    }
+
+    #[tokio::test]
+    async fn pool_shutdown_wakes_capacity_waiters_before_taking_the_writer() {
+        let pool = Arc::new(BridgePool::default());
+        let _permits = (0..POOL_CAP)
+            .map(|_| pool.capacity.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let waiting_pool = pool.clone();
+        let waiter = tokio::spawn(async move {
+            let _lifecycle = waiting_pool.lifecycle.read().await;
+            let _ = waiting_tx.send(());
+            waiting_pool.acquire_capacity(&cancel, &events).await
+        });
+        waiting_rx.await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), pool.shutdown())
+            .await
+            .expect("shutdown remained blocked behind queued admission")
+            .unwrap();
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("pool is shutting down"));
     }
 
     #[tokio::test]
