@@ -1825,7 +1825,7 @@ async fn upsert_provider(
     Path(id): Path<String>,
     Json(req): Json<UpsertProviderRequest>,
 ) -> Result<Json<ProviderInfo>, ApiError> {
-    Ok(Json(engine.upsert_provider(&id, &req)?))
+    Ok(Json(engine.upsert_provider(&id, &req).await?))
 }
 
 #[utoipa::path(post, path = "/v1/providers/{id}/login", params(("id" = String, Path,)),
@@ -2076,7 +2076,7 @@ async fn delete_provider(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.delete_provider(&id)?;
+    engine.delete_provider(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -977,12 +977,19 @@ function exactTerminalResult(frames, label) {
         `(results=${results.length}, done=${done.length})`,
     );
   }
+  if (
+    done[0].done === null ||
+    typeof done[0].done !== "object" ||
+    Array.isArray(done[0].done)
+  ) {
+    throw new QualificationError(`${label}: done frame had an invalid envelope`);
+  }
   return results[0].result;
 }
 
 function toolIsForbidden(name) {
   const normalized = String(name).toLowerCase().replace(/[^a-z0-9]+/gu, "_");
-  if (normalized.includes("mcp") || normalized.includes(TOOL_NAME)) return false;
+  if (normalized === "mcp" || normalized === TOOL_NAME) return false;
   const segments = normalized.split("_").filter(Boolean);
   return segments.some((segment) => FORBIDDEN_BUILT_INS.has(segment));
 }
@@ -1033,6 +1040,15 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
     );
   }
   const callbackCall = callback.calls[callbackStart];
+  if (
+    callbackCall.toolName !== TOOL_NAME ||
+    callbackCall.agentId !== agentId ||
+    callbackCall.args?.token !== TOOL_ARGUMENT
+  ) {
+    throw new QualificationError(
+      `turn ${ordinal}: callback identity or arguments differed from the exact request`,
+    );
+  }
 
   const messages = sdkMessages(frames);
   const system = messages.find((message) => message.type === "system");
@@ -1475,16 +1491,19 @@ async function main() {
     );
   } catch (error) {
     qualificationError = error;
-    throw error;
   } finally {
     try {
       await cleanup();
     } catch (cleanupError) {
-      throw combineQualificationAndCleanupErrors(qualificationError, cleanupError);
+      qualificationError = combineQualificationAndCleanupErrors(
+        qualificationError,
+        cleanupError,
+      );
     } finally {
       signalCleanup.dispose();
     }
   }
+  if (qualificationError !== undefined) throw qualificationError;
 }
 
 export {

@@ -521,18 +521,23 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         assistant_text(&first_events, 1).contains(WRITE_MARKER),
         "{first_events:?}"
     );
-    let writes = first_events
+    let requests = first_events
         .iter()
-        .filter(|event| {
-            event["type"] == "tool.requested" && event["turn"] == 1 && event["tool"] == "write_file"
-        })
+        .filter(|event| event["type"] == "tool.requested" && event["turn"] == 1)
         .collect::<Vec<_>>();
     assert_eq!(
-        writes.len(),
+        requests.len(),
         1,
-        "write callback was not exactly once: {writes:?}"
+        "write turn escaped its exact one-call tool policy: {requests:?}"
     );
-    let write_call_id = writes[0]["call_id"].as_str().unwrap();
+    assert_eq!(requests[0]["tool"], "write_file", "{:?}", requests[0]);
+    assert_eq!(requests[0]["args"]["path"], FILE_NAME, "{:?}", requests[0]);
+    assert_eq!(
+        requests[0]["args"]["content"], FILE_CONTENT,
+        "{:?}",
+        requests[0]
+    );
+    let write_call_id = requests[0]["call_id"].as_str().unwrap();
     assert!(first_events.iter().any(|event| {
         event["type"] == "tool.completed"
             && event["call_id"] == write_call_id
@@ -580,18 +585,18 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         "Cursor did not return the resume marker: {}",
         assistant_text(&second_events, 2)
     );
-    let reads = second_events
+    let requests = second_events
         .iter()
-        .filter(|event| {
-            event["type"] == "tool.requested" && event["turn"] == 2 && event["tool"] == "read_file"
-        })
+        .filter(|event| event["type"] == "tool.requested" && event["turn"] == 2)
         .collect::<Vec<_>>();
     assert_eq!(
-        reads.len(),
+        requests.len(),
         1,
-        "read callback was not exactly once: {reads:?}"
+        "resume turn escaped its exact one-call tool policy: {requests:?}"
     );
-    let read_call_id = reads[0]["call_id"].as_str().unwrap();
+    assert_eq!(requests[0]["tool"], "read_file", "{:?}", requests[0]);
+    assert_eq!(requests[0]["args"]["path"], FILE_NAME, "{:?}", requests[0]);
+    let read_call_id = requests[0]["call_id"].as_str().unwrap();
     assert!(second_events.iter().any(|event| {
         event["type"] == "tool.completed"
             && event["call_id"] == read_call_id

@@ -73,8 +73,8 @@ const RESULTS = {
   read: "TROUVE_CURSOR_READ_OK",
   denied: "TROUVE_CURSOR_PERMISSION_DENIED",
   image: "TROUVE_CURSOR_IMAGE_OK",
-  parallelA: "TROUVE_CURSOR_PARALLEL_A",
-  parallelB: "TROUVE_CURSOR_PARALLEL_B",
+  parallelA: "TROUVE_CURSOR_PARALLEL_",
+  parallelB: "OK",
   parallelFinal: "TROUVE_CURSOR_PARALLEL_OK",
   blockReleased: "TROUVE_CURSOR_BLOCK_RELEASED",
 };
@@ -226,6 +226,14 @@ export async function startCallbackServer(handlers, timeoutMilliseconds) {
   const server = createServer(async (request, response) => {
     let releaseAdmission;
     let record;
+    const cancelled = deferred();
+    let cancelledAtMs = null;
+    response.once("close", () => {
+      if (response.writableEnded) return;
+      cancelledAtMs = performance.now();
+      if (record !== undefined) record.cancelledAtMs = cancelledAtMs;
+      cancelled.resolve();
+    });
     try {
       const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
       if (request.method !== "POST" || path !== CALLBACK_PATH) {
@@ -269,17 +277,11 @@ export async function startCallbackServer(handlers, timeoutMilliseconds) {
         agentId: body.agentId,
         startedAtMs: performance.now(),
         completedAtMs: null,
-        cancelledAtMs: null,
-        cancelled: deferred(),
+        cancelledAtMs,
+        cancelled,
         settled: deferred(),
         ok: false,
       };
-      response.once("close", () => {
-        if (!response.writableEnded) {
-          record.cancelledAtMs = performance.now();
-          record.cancelled.resolve();
-        }
-      });
       calls.push(record);
       const result = await handler(body.args, record);
       record.completedAtMs = performance.now();
@@ -569,6 +571,9 @@ async function runTurn({
     throw callback.failures.at(-1);
   }
   const callbacks = callback.calls.slice(callbackStart);
+  if (callbacks.some((call) => call.agentId !== agentId)) {
+    throw new QualificationError(`${label}: callback agent id did not match the active agent`);
+  }
   const tools = inspectToolCalls(
     frames,
     callbacks,
@@ -1034,6 +1039,7 @@ async function fullQualification(args) {
     ),
   });
   let qualificationError;
+  let qualificationResult;
   try {
     resolvedBridge = await resolveBridge(args.bridge, temporaryRoot, timeoutMilliseconds);
     const binaryStat = await stat(resolvedBridge.binary);
@@ -1142,7 +1148,7 @@ async function fullQualification(args) {
       label: "allow-read-under-validated-tool-policy",
       prompt:
         `Call ${TOOLS.read} exactly once with {"token":"full-read"}, then reply ` +
-        `only ${RESULTS.read}.`,
+        `only with the callback result's value field.`,
       expectedTools: [TOOLS.read],
       expectedText: RESULTS.read,
       timeoutMilliseconds,
@@ -1161,7 +1167,7 @@ async function fullQualification(args) {
       label: "host-owned-permission-denial",
       prompt:
         `Call ${TOOLS.deny} exactly once with {"operation":"write"}. Treat the ` +
-        `tool's denied result as authoritative and reply only ${RESULTS.denied}.`,
+        `tool's denied result as authoritative and reply only with its text content.`,
       expectedTools: [TOOLS.deny],
       expectedText: RESULTS.denied,
       timeoutMilliseconds,
@@ -1178,7 +1184,8 @@ async function fullQualification(args) {
         `Inspect the attached image, then call ${TOOLS.image} exactly once with ` +
         `{"token":"<color>"}, replacing <color> with the single lowercase English ` +
         `name of its dominant pixel color. Do not call the tool if the image is unavailable. ` +
-        `Accept its text, structured, and image content, then reply only ${RESULTS.image}.`,
+        `Accept its text, structured, and image content, then reply only with ` +
+        `the structured result field.`,
       images: [
         {
           data: { data: RED_PIXEL_PNG, mimeType: "image/png" },
@@ -1199,7 +1206,7 @@ async function fullQualification(args) {
       prompt:
         `Issue ${TOOLS.parallelA} and ${TOOLS.parallelB} together in the same ` +
         `parallel tool-call batch before awaiting either. After both return, reply only ` +
-        `${RESULTS.parallelFinal}.`,
+        `with their value fields concatenated in tool-name order without a separator.`,
       expectedTools: [TOOLS.parallelA, TOOLS.parallelB],
       expectedText: RESULTS.parallelFinal,
       timeoutMilliseconds,
@@ -1223,7 +1230,7 @@ async function fullQualification(args) {
       label: "post-cancellation-recovery",
       prompt:
         `Call ${TOOLS.read} exactly once with {"token":"full-read"} and reply only ` +
-        `${RESULTS.read}.`,
+        `with the callback result's value field.`,
       expectedTools: [TOOLS.read],
       expectedText: RESULTS.read,
       timeoutMilliseconds,
@@ -1307,7 +1314,7 @@ async function fullQualification(args) {
       label: "cold-bridge-resume",
       prompt:
         `Call ${TOOLS.read} exactly once with {"token":"full-read"} and reply only ` +
-        `${RESULTS.read}.`,
+        `with the callback result's value field.`,
       expectedTools: [TOOLS.read],
       expectedText: RESULTS.read,
       timeoutMilliseconds,
@@ -1388,7 +1395,9 @@ async function fullQualification(args) {
       agentId,
       timeoutMilliseconds,
     );
-    const usageTurns = turns.filter((turn) => turn.usage?.total_tokens > 0).length;
+    const usageTurns = turns.filter((turn) =>
+      Object.values(turn.usage ?? {}).some((value) => numberValue(value) > 0),
+    ).length;
     const effectiveToolLists = turns.filter((turn) =>
       turn.message_types.includes("system"),
     ).length;
@@ -1407,7 +1416,7 @@ async function fullQualification(args) {
       );
     }
 
-    return {
+    qualificationResult = {
       candidate: "cursor-sdk-bridge",
       result: blockers.length === 0 ? "pass" : "qualification-complete-with-blockers",
       decision:
@@ -1482,16 +1491,20 @@ async function fullQualification(args) {
     };
   } catch (error) {
     qualificationError = error;
-    throw error;
   } finally {
     try {
       await cleanup();
     } catch (cleanupError) {
-      throw combineQualificationAndCleanupErrors(qualificationError, cleanupError);
+      qualificationError = combineQualificationAndCleanupErrors(
+        qualificationError,
+        cleanupError,
+      );
     } finally {
       signalCleanup.dispose();
     }
   }
+  if (qualificationError !== undefined) throw qualificationError;
+  return qualificationResult;
 }
 
 export function qualificationExitCode(result) {
