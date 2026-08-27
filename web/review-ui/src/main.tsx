@@ -4131,7 +4131,7 @@ function ProviderSettings({
                   <strong>{cli.display_name}</strong>
                   <small>{cliVersionLabel(cli)}</small>
                   {status.status === "pending" && <small>{cliProgressLabel(status)}</small>}
-                  {status.warning && <small>{status.warning}</small>}
+                  {status.warning && <small role="status">{status.warning}</small>}
                   {status.status === "failed" && <small class="error-text">{status.error}</small>}
                 </span>
                 <div class="action-row">
