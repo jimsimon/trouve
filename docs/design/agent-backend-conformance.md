@@ -104,16 +104,23 @@ The baseline performs two paid SDK turns; the broader probe performs several.
 Both fail before downloading anything when `CURSOR_API_KEY` is absent. The SDK
 deliberately uses API-key authentication rather than a separate CLI login.
 Cursor's native sandbox is disabled in this baseline because the standalone
-runtime does not support it on every host. Confinement instead comes from the
-SDK's explicit `tools: ["mcp"]` allow-list. Before any paid turn, each probe
-deterministically submits an unknown built-in name and requires CreateAgent to
-reject it, proving that the pinned runtime is validating the allow-list control
-rather than silently ignoring it. Stream tool telemetry is corroborating
-evidence only: when present it must contain no filesystem, shell, task, or
-other native capability. Cursor may label a custom callback as either the
-generic `mcp` capability or its exact custom-tool name; the probe accepts only
-those exact spellings, correlates the call id with `CallCustomTool`, and rejects
-every additional call id or tool name. Model compliance with a prompt is never
+runtime does not support it on every host. Confinement instead follows the
+pinned SDK's published `AgentOptions.tools` allow-list contract. Trouve reviews
+the complete public `ToolName` vocabulary for v1.0.28, sends only `mcp`, and
+explicitly denies every other known native tool as defense in depth. Before any
+paid turn, each probe first creates and closes (without running) an agent that
+selects the real native `shell` tool, proving that identifier is recognized by
+the exact Bridge release. It then submits an unknown built-in name and requires
+a `ConnectRpcError` whose structured code is `invalid_argument` and whose
+detail names that exact probe; a generic transport or authentication failure
+cannot pass. The shipping agent is created only with `mcp` allowed and with
+`shell` plus every other known native tool explicitly denied. Stream tool
+telemetry is corroborating evidence only:
+when present it must contain no filesystem, shell, task, or other native
+capability. Cursor may label a custom callback as either the generic `mcp`
+capability or its exact custom-tool name; the probe accepts only those exact
+spellings, correlates the call id with `CallCustomTool`, and rejects every
+additional call id or tool name. Model compliance with a prompt is never
 treated as confinement evidence.
 
 Qualification is gated in this order:
@@ -143,6 +150,9 @@ cancellation followed by recovery, and a cold Bridge-process resume. The
 Bridge accepted a per-send plan-mode request and returned a tool-free plan, but
 SDK v1 does not echo the effective mode in run or stream results; qualification
 records that limitation instead of treating model behavior as proof of mode.
+The report places it under `non_gating_observations` with a `not-attested`
+status; it is not a certified SDK capability or a promotion claim. Read-only
+safety remains independently enforced by the MCP-only `ToolExecutor` boundary.
 Every callback id correlated with the generic `mcp` stream event, all seven
 turns reported token usage, and the final run had complete terminal tool
 events. Durable `ObserveRun` replay returned opaque offsets and resumed

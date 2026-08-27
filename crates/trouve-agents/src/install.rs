@@ -615,9 +615,23 @@ impl PreparedInstall {
         self.activate_with_checkpoint(|_| Ok(()))
     }
 
+    /// Activate only if the originating install is still live at the pointer
+    /// commit boundary. Preparation can finish concurrently with a late cancel,
+    /// so checking inside the activation lock is what prevents a cancelled
+    /// operation from publishing `installed.json`.
+    pub fn activate_cancellable(self, progress: &Progress) -> Result<InstalledCli, InstallError> {
+        self.activate_with_checkpoint(|_| {
+            if progress.cancelled() {
+                Err(InstallError::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     fn activate_with_checkpoint(
         self,
-        mut checkpoint: impl FnMut(ActivationCheckpoint) -> std::io::Result<()>,
+        mut checkpoint: impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
     ) -> Result<InstalledCli, InstallError> {
         let root = cli_root(&self.data_dir, self.id);
         let _activation_lock = lock_runtime_activation(&self.data_dir, self.id)?;
@@ -669,8 +683,8 @@ impl PreparedInstall {
         drop(pointer_file);
 
         let mut generation_cleanup = PathCleanup::new(generation.clone());
-        std::fs::rename(&self.stage, &generation)?;
-        checkpoint(ActivationCheckpoint::BeforePointer)?;
+        replace_runtime_file(&self.stage, &generation, false)?;
+        sync_runtime_directory(&generations)?;
 
         // The filesystem-wide activation lock couples the last pointer read,
         // publication, and reclamation to lease acquisition. A backend in any
@@ -688,12 +702,14 @@ impl PreparedInstall {
             })
         });
         let replacing_pointer = path_exists(&pointer)?;
+        checkpoint(ActivationCheckpoint::BeforePointer)?;
         replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
 
-        // installed.json is the one atomically replaced commit marker. No
-        // fallible step follows it, so every reader observes a complete
-        // previous or new generation and uses that same selection to launch.
+        // installed.json is the one atomically replaced commit marker. Disarm
+        // generation cleanup immediately: a later directory-sync error cannot
+        // roll the commit back or remove the runtime now named by the pointer.
         generation_cleanup.disarm();
+        sync_runtime_directory(&root)?;
 
         prune_runtime_generations(
             &self.data_dir,
@@ -704,12 +720,6 @@ impl PreparedInstall {
         );
         prune_old_versions(&self.data_dir, self.id, &root, previous_legacy.as_deref());
         remove_legacy_managed_bin_best_effort(&self.data_dir, self.id);
-        if self.id == CliId::CursorSdkBridge {
-            // The SDK is the Cursor transport now. Remove Trouve's obsolete
-            // managed ACP binary once the replacement is active; system installs
-            // remain outside our ownership and are never touched.
-            remove_legacy_cursor_agent_best_effort(&self.data_dir);
-        }
         Ok(info)
     }
 }
@@ -830,6 +840,17 @@ fn replace_runtime_file(
     } else {
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn sync_runtime_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_runtime_directory(_path: &Path) -> std::io::Result<()> {
+    // Windows publication uses MOVEFILE_WRITE_THROUGH / REPLACEFILE_WRITE_THROUGH.
+    Ok(())
 }
 
 fn remove_path(path: &Path) -> std::io::Result<()> {
@@ -982,7 +1003,7 @@ pub async fn install(
 ) -> Result<InstalledCli, InstallError> {
     prepare_install(data_dir, id, version, progress)
         .await?
-        .activate()
+        .activate_cancellable(progress)
 }
 
 /// Remove the managed install of `id` entirely, including legacy stable-path
@@ -1001,9 +1022,6 @@ pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
     let root = cli_root(data_dir, id);
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
-    }
-    if id == CliId::CursorSdkBridge {
-        remove_legacy_cursor_agent_best_effort(data_dir);
     }
     Ok(())
 }
@@ -1050,28 +1068,6 @@ fn remove_legacy_managed_bin_best_effort(data_dir: &Path, id: CliId) {
         tracing::warn!(
             "managed runtime activation completed, but obsolete stable executable {} could not be removed: {error}",
             path.display()
-        );
-    }
-}
-
-fn remove_legacy_cursor_agent(data_dir: &Path) -> std::io::Result<()> {
-    for executable in ["cursor-agent", "cursor-agent.exe"] {
-        let legacy_link = data_dir.join("cli").join("bin").join(executable);
-        if legacy_link.symlink_metadata().is_ok() {
-            std::fs::remove_file(legacy_link)?;
-        }
-    }
-    let legacy_root = data_dir.join("cli").join("cursor-agent");
-    if legacy_root.exists() {
-        std::fs::remove_dir_all(legacy_root)?;
-    }
-    Ok(())
-}
-
-fn remove_legacy_cursor_agent_best_effort(data_dir: &Path) {
-    if let Err(error) = remove_legacy_cursor_agent(data_dir) {
-        tracing::warn!(
-            "Cursor Agent SDK operation completed, but obsolete managed cursor-agent cleanup failed: {error}"
         );
     }
 }
@@ -1866,7 +1862,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
                 std::fs::read_to_string(&visible.bin).unwrap(),
                 "active runtime"
             );
-            Err(std::io::Error::other("injected publication failure"))
+            Err(InstallError::Io(std::io::Error::other(
+                "injected publication failure",
+            )))
         });
 
         assert!(result.is_err());
@@ -1881,6 +1879,56 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         assert_eq!(
             installed(tmp.path(), CliId::Codex).unwrap().version,
             "2.0.0"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(".generations"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cancellation_at_activation_commit_preserves_previous_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let previous = root.join("1.0.0");
+        let previous_bin = previous.join("codex");
+        std::fs::create_dir_all(&previous).unwrap();
+        std::fs::write(&previous_bin, "previous runtime").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string_pretty(&InstalledCli {
+                version: "1.0.0".into(),
+                bin: previous_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+        };
+        let progress = Progress::default();
+        progress
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(matches!(
+            prepared.activate_cancellable(&progress),
+            Err(InstallError::Cancelled)
+        ));
+        let active = installed(tmp.path(), CliId::Codex).unwrap();
+        assert_eq!(active.version, "1.0.0");
+        assert_eq!(
+            std::fs::read_to_string(active.bin).unwrap(),
+            "previous runtime"
         );
         assert_eq!(
             std::fs::read_dir(root.join(".generations"))
@@ -1968,7 +2016,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
-    fn cursor_sdk_uninstall_removes_only_trouve_managed_cursor_runtimes() {
+    fn cursor_sdk_uninstall_preserves_legacy_runtime_for_older_processes() {
         let tmp = tempfile::tempdir().unwrap();
         let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
         let sdk_bin = sdk_root
@@ -2005,14 +2053,14 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
 
         assert!(!sdk_root.exists());
         assert!(sdk_link.symlink_metadata().is_err());
-        assert!(!legacy_root.exists());
-        assert!(legacy_link.symlink_metadata().is_err());
-        assert!(legacy_windows_link.symlink_metadata().is_err());
+        assert!(legacy_root.exists());
+        assert!(legacy_link.exists());
+        assert!(legacy_windows_link.exists());
         assert!(external.exists());
     }
 
     #[test]
-    fn cursor_sdk_uninstall_succeeds_when_legacy_cleanup_fails() {
+    fn cursor_sdk_uninstall_does_not_touch_a_legacy_runtime_file() {
         let tmp = tempfile::tempdir().unwrap();
         let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
         std::fs::create_dir_all(&sdk_root).unwrap();

@@ -64,6 +64,30 @@ const MAX_CALLBACK_CONCURRENCY: usize = 8;
 const MAX_CALLBACK_HTTP_CONCURRENCY: usize = 16;
 const READY_PREFIX: &str = "cursor-sdk-bridge ready ";
 const CALLBACK_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
+/// Cursor-native tool vocabulary in the pinned Agent SDK (1.0.28), excluding
+/// the sole `mcp` transport capability that Trouve intentionally exposes.
+/// `tools.names` is the primary allowlist; this denylist makes confinement
+/// fail closed if a Bridge release ever broadens that field's interpretation.
+const CURSOR_NATIVE_TOOL_DENYLIST: &[&str] = &[
+    "shell",
+    "read",
+    "edit",
+    "grep",
+    "glob",
+    "ls",
+    "task",
+    "webSearch",
+    "delete",
+    "readLints",
+    "webFetch",
+    "semSearch",
+    "updateTodos",
+    "readTodos",
+    "askQuestion",
+    "await",
+    "generateImage",
+    "applyAgentDiff",
+];
 /// Most warm Cursor Bridge processes retained by one configured backend.
 const POOL_CAP: usize = 3;
 /// Warm Bridges are inexpensive to resume but large enough to reap when idle.
@@ -422,6 +446,7 @@ struct BridgePool {
     closed: AtomicBool,
     closing: CancellationToken,
     capacity: Arc<Semaphore>,
+    turn_admission: Arc<Semaphore>,
     available: Arc<Notify>,
     reaper_started: AtomicBool,
 }
@@ -435,6 +460,7 @@ impl Default for BridgePool {
             closed: AtomicBool::new(false),
             closing: CancellationToken::new(),
             capacity: Arc::new(Semaphore::new(POOL_CAP)),
+            turn_admission: Arc::new(Semaphore::new(POOL_CAP)),
             available: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
         }
@@ -684,6 +710,7 @@ impl BridgePool {
         self.closed.store(true, Ordering::Release);
         self.closing.cancel();
         self.capacity.close();
+        self.turn_admission.close();
         notify_available(&self.available);
         let _lifecycle = self.lifecycle.write().await;
         let mut first_error = None;
@@ -789,6 +816,31 @@ impl BridgePool {
                     return Ok(permit);
                 }
                 _ = self.available.notified() => {}
+            }
+        }
+    }
+
+    async fn acquire_turn_admission(
+        &self,
+        cancel: &CancellationToken,
+        events: &BackendEventSender,
+    ) -> Result<OwnedSemaphorePermit, BackendError> {
+        if !self.is_open() {
+            return Err(Self::closed_error());
+        }
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => Err(Self::closed_error()),
+            _ = cancel.cancelled() => Err(BackendError::Cancelled),
+            _ = events.closed() => Err(BackendError::Cancelled),
+            permit = self.turn_admission.clone().acquire_owned() => {
+                let permit = permit.map_err(|_| Self::closed_error())?;
+                if !self.is_open() {
+                    drop(permit);
+                    Err(Self::closed_error())
+                } else {
+                    Ok(permit)
+                }
             }
         }
     }
@@ -944,7 +996,25 @@ async fn run_sdk_turn(
         ));
     }
 
-    let mut callback = CallbackServer::start(local_http, mcp_url, &turn.cancel).await?;
+    // Bound all turn-scoped resources, not only spawned Bridge processes. A
+    // queued turn owns no listener, bearer, or callback supervisor until it
+    // has one of the pool's turn slots.
+    let _turn_admission = match pool.acquire_turn_admission(&turn.cancel, events).await {
+        Ok(permit) => permit,
+        Err(BackendError::Cancelled) if events.is_closed() => {
+            return Ok(TurnTerminal::ConsumerClosed);
+        }
+        Err(BackendError::Cancelled) => return Ok(TurnTerminal::Cancelled),
+        Err(error) => return Err(error),
+    };
+    let callback = tokio::select! {
+        biased;
+        _ = pool.closing.cancelled() => return Err(BridgePool::closed_error()),
+        _ = turn.cancel.cancelled() => return Ok(TurnTerminal::Cancelled),
+        _ = events.closed() => return Ok(TurnTerminal::ConsumerClosed),
+        callback = CallbackServer::start(local_http, mcp_url, &turn.cancel) => callback?,
+    };
+    let mut callback = callback;
     if events.is_closed() {
         callback.stop().await;
         return Ok(TurnTerminal::ConsumerClosed);
@@ -973,6 +1043,15 @@ async fn run_sdk_turn(
     };
     let mut bridge = tokio::select! {
         biased;
+        _ = pool.closing.cancelled() => {
+            return terminate_interrupted_process(
+                pool,
+                &turn.thread_id,
+                &process,
+                &mut callback,
+                BridgePool::closed_error(),
+            ).await;
+        }
         _ = turn.cancel.cancelled() => {
             callback.stop().await;
             pool.terminate_and_remove(&turn.thread_id, &process).await?;
@@ -1002,8 +1081,23 @@ async fn run_sdk_turn(
             "pooled Cursor SDK Bridge exited before the turn started".into(),
         ));
     }
-    if let Err(error) = bridge.set_tool_callback(Some(&callback)).await {
+    let callback_registration = tokio::select! {
+        biased;
+        _ = pool.closing.cancelled() => Err(BridgePool::closed_error()),
+        result = bridge.set_tool_callback(Some(&callback)) => result,
+    };
+    if let Err(error) = callback_registration {
         drop(bridge);
+        if pool.closing.is_cancelled() {
+            return terminate_interrupted_process(
+                pool,
+                &turn.thread_id,
+                &process,
+                &mut callback,
+                error,
+            )
+            .await;
+        }
         callback.stop().await;
         let cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
         return merge_cleanup_error(error, cleanup);
@@ -1012,6 +1106,7 @@ async fn run_sdk_turn(
     let options = agent_options(&turn, api_key, custom_tools);
     let setup = tokio::select! {
         biased;
+        _ = pool.closing.cancelled() => Err(BridgePool::closed_error()),
         _ = turn.cancel.cancelled() => Err(BackendError::Cancelled),
         _ = events.closed() => {
             drop(bridge);
@@ -1025,6 +1120,16 @@ async fn run_sdk_turn(
         Ok(value) => value,
         Err(error) => {
             drop(bridge);
+            if pool.closing.is_cancelled() {
+                return terminate_interrupted_process(
+                    pool,
+                    &turn.thread_id,
+                    &process,
+                    &mut callback,
+                    error,
+                )
+                .await;
+            }
             callback.stop().await;
             let cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
             return merge_cleanup_error(error, cleanup);
@@ -1046,14 +1151,31 @@ async fn run_sdk_turn(
         return Ok(TurnTerminal::ConsumerClosed);
     }
 
-    let outcome = stream_turn(
-        &bridge.client,
-        &agent_id,
-        &turn,
-        events,
-        &callback.supervisor.cancel,
-    )
-    .await;
+    let outcome = tokio::select! {
+        biased;
+        _ = pool.closing.cancelled() => {
+            callback.supervisor.cancel.cancel();
+            Err(BridgePool::closed_error())
+        }
+        outcome = stream_turn(
+            &bridge.client,
+            &agent_id,
+            &turn,
+            events,
+            &callback.supervisor.cancel,
+        ) => outcome,
+    };
+    if pool.closing.is_cancelled() {
+        drop(bridge);
+        return terminate_interrupted_process(
+            pool,
+            &turn.thread_id,
+            &process,
+            &mut callback,
+            BridgePool::closed_error(),
+        )
+        .await;
+    }
     if matches!(
         &outcome,
         Ok(TurnTerminal::Cancelled | TurnTerminal::ConsumerClosed)
@@ -1075,7 +1197,22 @@ async fn run_sdk_turn(
     // No callback may start after the terminal Send frame. The Bridge mutex
     // stays held until callback tasks are joined and its registration clears.
     callback.stop().await;
-    let release = bridge.release_turn(&agent_id).await;
+    let release = tokio::select! {
+        biased;
+        _ = pool.closing.cancelled() => None,
+        release = bridge.release_turn(&agent_id) => Some(release),
+    };
+    let Some(release) = release else {
+        drop(bridge);
+        return terminate_interrupted_process(
+            pool,
+            &turn.thread_id,
+            &process,
+            &mut callback,
+            BridgePool::closed_error(),
+        )
+        .await;
+    };
     let warm_eligible = matches!(&outcome, Ok(TurnTerminal::Finished(_))) && release.is_ok();
     drop(bridge);
 
@@ -1094,6 +1231,22 @@ async fn run_sdk_turn(
     }
     let process_cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
     finish_recycled_turn(outcome, release, process_cleanup)
+}
+
+async fn terminate_interrupted_process(
+    pool: &BridgePool,
+    thread_id: &str,
+    process: &BridgeLease,
+    callback: &mut CallbackServer,
+    primary: BackendError,
+) -> Result<TurnTerminal, BackendError> {
+    let callback_deadline = tokio::time::Instant::now() + INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT;
+    callback.stop_until(callback_deadline).await;
+    let reap_deadline = tokio::time::Instant::now() + INTERRUPTED_REAP_TIMEOUT;
+    let cleanup = pool
+        .terminate_and_remove_now_until(thread_id, process, reap_deadline)
+        .await;
+    merge_cleanup_error(primary, cleanup)
 }
 
 fn merge_cleanup_error<T>(
@@ -1186,7 +1339,7 @@ fn agent_options(turn: &BackendTurn, api_key: &str, custom_tools: Map<String, Va
         "name": format!("Trouve thread {}", turn.thread_id),
         "mode": sdk_mode(turn.permission),
         "tools": { "names": tool_names },
-        "disallowedTools": [],
+        "disallowedTools": CURSOR_NATIVE_TOOL_DENYLIST,
         "mcpServers": {},
         "agents": {},
         "local": {
@@ -3238,6 +3391,33 @@ mod tests {
             .await
             .expect("shutdown remained blocked behind queued admission")
             .unwrap();
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("pool is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn turn_admission_bounds_callback_owners_and_wakes_on_shutdown() {
+        let pool = Arc::new(BridgePool::default());
+        let _permits = (0..POOL_CAP)
+            .map(|_| pool.turn_admission.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(pool.turn_admission.clone().try_acquire_owned().is_err());
+
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+        let waiting_pool = pool.clone();
+        let waiter =
+            tokio::spawn(
+                async move { waiting_pool.acquire_turn_admission(&cancel, &events).await },
+            );
+        tokio::task::yield_now().await;
+
+        pool.shutdown().await.unwrap();
         let error = waiter.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("pool is shutting down"));
     }

@@ -10,9 +10,15 @@ no same-run steering. Cursor's supported Agent SDK now ships a standalone
 Bridge with a versioned `sdk.v1` Connect contract, API-key authentication,
 durable local agents, streaming, cancellation, model options, and host-owned
 custom-tool callbacks. Cursor's published protocol defines `tools` as an
-allow-list of the built-ins offered to the model; local qualification validates
-that the pinned Bridge rejects unknown tool names and emits no calls outside a
-strict `mcp` selection, even where Cursor's native sandbox is unavailable.
+allow-list of the built-ins offered to the model. Trouve pins and reviews the
+SDK's complete public `ToolName` vocabulary, sends only `mcp`, explicitly
+denies every other known native tool, and requires the Bridge to reject an
+unknown name with a correlated `invalid_argument` response. Qualification also
+creates and closes, without running, an agent selecting the recognized native
+`shell` tool so the check is anchored to a real identifier in that exact
+release. Stream telemetry is corroboration rather than the confinement proof,
+because the SDK does not always report an effective tool list. This contract
+remains usable where Cursor's native sandbox is unavailable.
 
 Maintaining ACP beside the SDK would preserve two authentication paths, two
 session models, and two tool-confinement contracts for one provider. It would
@@ -42,7 +48,9 @@ credentials, tools, and worktrees from unrelated turns.
   support until an idle least-recently-used process can be reaped or capacity
   becomes available. Idle processes are reaped after five minutes, checked once
   per minute. Backend reload, runtime update, and uninstall discard the pool.
-- Cursor receives only the SDK's `mcp` capability. Trouve projects the
+- Cursor receives only the SDK's `mcp` capability and also sends an explicit
+  denylist containing every other native tool in the pinned SDK vocabulary.
+  Trouve projects the
   thread-scoped internal MCP tool catalog into SDK custom-tool definitions and
   proxies callbacks back through that MCP endpoint. Cursor-native filesystem,
   shell, task, web, and editing tools are not exposed; every effect therefore

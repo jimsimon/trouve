@@ -3569,21 +3569,28 @@ impl Engine {
         }
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().await;
-        if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-            self.secrets
-                .set(&trouve_providers::secrets::api_key_secret(id), key)
-                .map_err(EngineError::Internal)?;
-        }
-        for (name, value) in req
-            .secret_values
-            .iter()
-            .filter(|(_, value)| !value.is_empty())
-        {
-            self.secrets
-                .set(&trouve_providers::secrets::provider_secret(id, name), value)
-                .map_err(EngineError::Internal)?;
-        }
-        {
+        let _transition = self.provider_reload.lock().await;
+        let target_ids = HashSet::from([id.to_string()]);
+        // Retire the previous backend before changing its durable definition.
+        // Until every shutdown succeeds the registry retains ownership, so a
+        // cancelled or failed transition can be retried without losing it.
+        self.shutdown_config_backends_matching_ids(&target_ids)
+            .await?;
+        let mutation = (|| -> Result<(), EngineError> {
+            if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+                self.secrets
+                    .set(&trouve_providers::secrets::api_key_secret(id), key)
+                    .map_err(EngineError::Internal)?;
+            }
+            for (name, value) in req
+                .secret_values
+                .iter()
+                .filter(|(_, value)| !value.is_empty())
+            {
+                self.secrets
+                    .set(&trouve_providers::secrets::provider_secret(id, name), value)
+                    .map_err(EngineError::Internal)?;
+            }
             let mut config = self.config.lock().unwrap();
             let entry = config.providers.entry(id.to_string()).or_default();
             let migrating_legacy_cursor = entry.kind == "cursor-cli" && req.kind == "cursor-sdk";
@@ -3633,8 +3640,12 @@ impl Engine {
                 }
             }
             self.persist_config(&config);
-        }
-        self.reload_providers().await?;
+            Ok(())
+        })();
+        // This is also the rollback path for a secret-store failure after the
+        // old backend was retired: rebuild from the still-current config.
+        self.replace_provider_registries_for_ids(&target_ids);
+        mutation?;
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
         let pc = config.providers.get(id).cloned().unwrap_or_default();
@@ -3660,14 +3671,26 @@ impl Engine {
     pub async fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().await;
-        let secret_names = {
+        let _transition = self.provider_reload.lock().await;
+        let secret_names = self
+            .config
+            .lock()
+            .unwrap()
+            .providers
+            .get(id)
+            .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?
+            .secret_names
+            .clone();
+        let target_ids = HashSet::from([id.to_string()]);
+        // Teardown is the only fallible part of the registry transition. Do it
+        // before deleting durable configuration or credentials so an error is
+        // reported only while the requested deletion is still uncommitted.
+        self.shutdown_config_backends_matching_ids(&target_ids)
+            .await?;
+        {
             let mut config = self.config.lock().unwrap();
-            let removed = config
-                .providers
-                .remove(id)
-                .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
+            config.providers.remove(id);
             self.persist_config(&config);
-            removed.secret_names
         };
         let _ = self
             .secrets
@@ -3680,7 +3703,7 @@ impl Engine {
                 .secrets
                 .delete(&trouve_providers::secrets::provider_secret(id, &name));
         }
-        self.reload_providers().await?;
+        self.replace_provider_registries_for_ids(&target_ids);
         Ok(())
     }
 
@@ -4066,18 +4089,12 @@ impl Engine {
                     // Bridge pointer. Claude and Codex remain usable throughout
                     // the download and activation.
                     if let Err(error) = engine.shutdown_config_backends_for_runtime(cli).await {
-                        // Teardown may have closed one or more Cursor pools.
-                        // Rebuild them against the still-active prior runtime.
-                        engine.replace_config_backends_for_runtime(cli);
                         return Err(format!("stopping the active Cursor SDK runtime: {error}"));
                     }
-                    let install_result = if progress.cancelled() {
-                        Ok(None)
-                    } else {
-                        prepared
-                            .activate()
-                            .map(|_| Some(version))
-                            .map_err(|error| error.to_string())
+                    let install_result = match prepared.activate_cancellable(&progress) {
+                        Ok(_) => Ok(Some(version)),
+                        Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
+                        Err(error) => Err(error.to_string()),
                     };
                     // Activation success, failure, and late cancellation all
                     // replace the retired Cursor pools before releasing the
@@ -4094,9 +4111,12 @@ impl Engine {
                     .await
                     {
                         Ok(_) => {
-                            engine.reload_providers().await.map_err(|error| {
-                                format!("reloading providers after runtime install: {error}")
-                            })?;
+                            engine
+                                .reload_providers_for_runtime(cli)
+                                .await
+                                .map_err(|error| {
+                                    format!("reloading providers after runtime install: {error}")
+                                })?;
                             Ok(Some(version))
                         }
                         Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
@@ -4162,30 +4182,13 @@ impl Engine {
             self.title_model.stop().await;
         }
         let _transition = self.provider_reload.lock().await;
-        if let Err(error) = self.shutdown_config_backends_for_runtime(cli).await {
-            // Teardown may already have closed one or more backend pools.
-            // Restore a fresh registry from the unchanged durable config
-            // before reporting the cleanup failure.
-            self.replace_config_backends_for_runtime(cli);
-            return Err(error);
-        }
+        self.shutdown_config_backends_for_runtime(cli).await?;
         // Runtime-specific teardown removes the registry's leased wrapper
-        // before returning. Cross-process or delayed turn clones are still
-        // protected by the install layer. Give just-drained file handles a
-        // short bounded window to close before surfacing a retryable conflict.
-        let mut drain_retries = 0;
-        let uninstall = loop {
-            match trouve_agents::install::uninstall(&self.data_dir, cli) {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock && drain_retries < 4 =>
-                {
-                    drain_retries += 1;
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                result => break result,
-            }
-        }
-        .map_err(|error| {
+        // before returning. There is deliberately no await between detaching
+        // it and publishing its replacement: cancellation cannot strand a
+        // missing registry entry. Delayed turn clones remain protected by the
+        // install layer and surface a retryable conflict.
+        let uninstall = trouve_agents::install::uninstall(&self.data_dir, cli).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 EngineError::Conflict(format!(
                     "managed {} runtime is still in use; retry uninstall after active turns finish",
@@ -5072,7 +5075,7 @@ impl Engine {
                     self.secrets
                         .set(&trouve_providers::secrets::oauth_secret(id), &raw)
                 }) {
-                Ok(()) => match self.reload_providers().await {
+                Ok(()) => match self.reload_provider(id).await {
                     Ok(()) => LoginState::Success,
                     Err(error) => {
                         LoginState::Failed(format!("reloading providers after login: {error}"))
@@ -5239,18 +5242,12 @@ impl Engine {
         self.title_model
             .start_install(move || {
                 if let Some(engine) = engine.upgrade() {
-                    tokio::spawn(async move {
-                        if let Err(error) = engine.reload_providers().await {
-                            tracing::warn!(
-                                "failed to reload providers after title-model install: {error}"
-                            );
-                        }
-                        engine
-                            .cli_latest
-                            .lock()
-                            .unwrap()
-                            .remove(trouve_agents::install::CliId::LlamaServer.as_str());
-                    });
+                    engine.refresh_api_provider_registry();
+                    engine
+                        .cli_latest
+                        .lock()
+                        .unwrap()
+                        .remove(trouve_agents::install::CliId::LlamaServer.as_str());
                 }
             })
             .map_err(|error| EngineError::Conflict(error.to_string()))?;
@@ -5343,25 +5340,40 @@ impl Engine {
         }
     }
 
-    /// Stop config-owned agent backends while leaving programmatically
-    /// injected test/embedder backends under their caller's ownership.
-    async fn shutdown_config_backends(&self) -> Result<(), EngineError> {
-        self.shutdown_config_backends_matching_runtime(None).await
-    }
-
     /// Stop only config-owned backends served by one managed runtime. Runtime
     /// updates use this narrower scope so unrelated vendor backends stay live.
     async fn shutdown_config_backends_for_runtime(
         &self,
         runtime: trouve_agents::install::CliId,
     ) -> Result<(), EngineError> {
-        self.shutdown_config_backends_matching_runtime(Some(runtime))
+        let target_ids = self.configured_provider_ids_for_runtime(runtime);
+        self.shutdown_config_backends_matching_ids(&target_ids)
             .await
     }
 
-    async fn shutdown_config_backends_matching_runtime(
+    fn configured_provider_ids_for_runtime(
         &self,
-        runtime: Option<trouve_agents::install::CliId>,
+        runtime: trouve_agents::install::CliId,
+    ) -> HashSet<String> {
+        self.config
+            .lock()
+            .unwrap()
+            .providers
+            .iter()
+            .filter(|(_, provider)| cli_for_kind(&provider.kind) == Some(runtime))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Shut down a selected set of config-owned backends transactionally.
+    /// Registry ownership is retained until every shutdown acknowledges. If
+    /// this future is cancelled or any backend fails, all instances remain
+    /// tracked so a later transition can retry cleanup. Once all shutdowns
+    /// succeed, removal is synchronous and the caller must synchronously
+    /// publish replacements before its next await point.
+    async fn shutdown_config_backends_matching_ids(
+        &self,
+        target_ids: &HashSet<String>,
     ) -> Result<(), EngineError> {
         let injected = self
             .injected_backends
@@ -5370,107 +5382,88 @@ impl Engine {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let target_ids = runtime.map(|runtime| {
-            self.config
-                .lock()
-                .unwrap()
-                .providers
-                .iter()
-                .filter(|(_, provider)| cli_for_kind(&provider.kind) == Some(runtime))
-                .map(|(id, _)| id.clone())
-                .collect::<HashSet<_>>()
-        });
-        // Detach first so no new turn can clone a backend while teardown is
-        // underway. In particular, this drops the registry's managed-runtime
-        // lease before an update or uninstall tries to reclaim its files.
         let retiring = {
-            let mut backends = self.backends.write().unwrap();
-            let retiring_ids = backends
+            let backends = self.backends.read().unwrap();
+            backends
                 .iter()
                 .filter(|(id, backend)| {
-                    target_ids
-                        .as_ref()
-                        .is_none_or(|target_ids| target_ids.contains(*id))
+                    target_ids.contains(*id)
                         && !injected
                             .iter()
                             .any(|candidate| Arc::ptr_eq(candidate, backend))
                 })
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            retiring_ids
-                .into_iter()
-                .filter_map(|id| backends.remove(&id))
+                .map(|(id, backend)| (id.clone(), backend.clone()))
                 .collect::<Vec<_>>()
         };
-        let mut first_error = None;
-        for backend in &retiring {
-            if let Err(error) = backend.shutdown().await {
-                first_error.get_or_insert_with(|| EngineError::Internal(error.into()));
+        for (_, backend) in &retiring {
+            backend
+                .shutdown()
+                .await
+                .map_err(|error| EngineError::Internal(error.into()))?;
+        }
+        let mut backends = self.backends.write().unwrap();
+        for (id, backend) in retiring {
+            if backends
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &backend))
+            {
+                backends.remove(&id);
             }
         }
-        // Async generator storage may otherwise retain this vector until the
-        // completed shutdown future itself is dropped by its caller. Release
-        // managed-runtime leases before reporting teardown completion.
-        drop(retiring);
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// Rebuild only the config-owned backends served by one runtime. This
     /// preserves unrelated backend instances and their active vendor state.
     fn replace_config_backends_for_runtime(&self, runtime: trouve_agents::install::CliId) {
+        let target_ids = self.configured_provider_ids_for_runtime(runtime);
+        self.replace_provider_registries_for_ids(&target_ids);
+    }
+
+    /// Rebuild only selected provider/backend ids after their previous
+    /// config-owned backends have completed asynchronous teardown. Unrelated
+    /// instances keep their vendor sessions, process pools, and receivers.
+    fn replace_provider_registries_for_ids(&self, target_ids: &HashSet<String>) {
         let config = self.config.lock().unwrap().clone();
-        let target_ids = config
-            .providers
-            .iter()
-            .filter(|(_, provider)| cli_for_kind(&provider.kind) == Some(runtime))
-            .map(|(id, _)| id.clone())
-            .collect::<HashSet<_>>();
-        let mut replacements =
-            build_all_backends(&config, &self.secrets, &self.data_dir, &self.model_catalog);
-        replacements.retain(|id, _| target_ids.contains(id));
-        let injected_ids = self
-            .injected_backends
-            .lock()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let mut backends = self.backends.write().unwrap();
+        let mut provider_replacements =
+            build_all_providers(&config, &self.secrets, &self.model_catalog);
+        let injected_providers = self.injected_providers.lock().unwrap().clone();
+        let mut providers = self.providers.write().unwrap();
         for id in target_ids {
-            if injected_ids.contains(&id) {
-                continue;
-            }
-            match replacements.remove(&id) {
+            match injected_providers
+                .get(id)
+                .cloned()
+                .or_else(|| provider_replacements.remove(id))
+            {
                 Some(replacement) => {
-                    backends.insert(id, replacement);
+                    providers.insert(id.clone(), replacement);
                 }
                 None => {
-                    backends.remove(&id);
+                    providers.remove(id);
+                }
+            }
+        }
+        drop(providers);
+
+        let mut backend_replacements =
+            build_all_backends(&config, &self.secrets, &self.data_dir, &self.model_catalog);
+        let injected_backends = self.injected_backends.lock().unwrap().clone();
+        let mut backends = self.backends.write().unwrap();
+        for id in target_ids {
+            match injected_backends
+                .get(id)
+                .cloned()
+                .or_else(|| backend_replacements.remove(id))
+            {
+                Some(replacement) => {
+                    backends.insert(id.clone(), replacement);
+                }
+                None => {
+                    backends.remove(id);
                 }
             }
         }
         drop(backends);
-        self.intake_background_turn_signals();
-    }
-
-    /// Rebuild registries after their previous config-owned backends have
-    /// completed asynchronous teardown.
-    fn replace_provider_registries(&self) {
-        let config = self.config.lock().unwrap().clone();
-        let mut rebuilt = build_all_providers(&config, &self.secrets, &self.model_catalog);
-        for (id, p) in self.injected_providers.lock().unwrap().iter() {
-            rebuilt.insert(id.clone(), p.clone());
-        }
-        *self.providers.write().unwrap() = rebuilt;
-        let mut backends =
-            build_all_backends(&config, &self.secrets, &self.data_dir, &self.model_catalog);
-        for (id, b) in self.injected_backends.lock().unwrap().iter() {
-            backends.insert(id.clone(), b.clone());
-        }
-        *self.backends.write().unwrap() = backends;
         // Rebuilt backends carry fresh background-turn signal channels; hand
         // their receivers to the listener pump so autonomous-turn attachment
         // survives the reload (the old instances' forwarders end when their
@@ -5478,18 +5471,37 @@ impl Engine {
         self.intake_background_turn_signals();
     }
 
-    /// Rebuild the provider registry from the current config (after provider
-    /// CRUD), preserving programmatically injected providers. Long-lived
-    /// vendor children are reaped before a replacement registry is visible.
-    async fn reload_providers(&self) -> Result<(), EngineError> {
+    /// Refresh API-backed providers without touching long-lived vendor
+    /// backends. Local/title-model lifecycle changes historically refreshed
+    /// provider metadata, but they do not change any agent runtime.
+    fn refresh_api_provider_registry(&self) {
+        let config = self.config.lock().unwrap().clone();
+        let mut replacements = build_all_providers(&config, &self.secrets, &self.model_catalog);
+        for (id, provider) in self.injected_providers.lock().unwrap().iter() {
+            replacements.insert(id.clone(), provider.clone());
+        }
+        *self.providers.write().unwrap() = replacements;
+    }
+
+    async fn reload_provider(&self, id: &str) -> Result<(), EngineError> {
         let _transition = self.provider_reload.lock().await;
-        let shutdown = self.shutdown_config_backends().await;
-        // Config and secret mutations are durable before reload begins. Even
-        // when one old process cannot acknowledge teardown, publish a fresh
-        // registry that matches that committed state instead of retaining a
-        // stale or already-closed backend until restart.
-        self.replace_provider_registries();
-        shutdown
+        let target_ids = HashSet::from([id.to_string()]);
+        self.shutdown_config_backends_matching_ids(&target_ids)
+            .await?;
+        self.replace_provider_registries_for_ids(&target_ids);
+        Ok(())
+    }
+
+    async fn reload_providers_for_runtime(
+        &self,
+        runtime: trouve_agents::install::CliId,
+    ) -> Result<(), EngineError> {
+        let _transition = self.provider_reload.lock().await;
+        let target_ids = self.configured_provider_ids_for_runtime(runtime);
+        self.shutdown_config_backends_matching_ids(&target_ids)
+            .await?;
+        self.replace_provider_registries_for_ids(&target_ids);
+        Ok(())
     }
 
     pub fn thread_usage(
@@ -26062,6 +26074,91 @@ default_permission_mode = "ask"
         }
     }
 
+    struct BlockingShutdownBackend {
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for BlockingShutdownBackend {
+        fn id(&self) -> &str {
+            "blocking-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(())
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_backend_teardown_retains_registry_ownership() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release,
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), blocking.clone());
+
+        let transitioning = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .shutdown_config_backends_for_runtime(
+                        trouve_agents::install::CliId::CursorSdkBridge,
+                    )
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+        transitioning.abort();
+        let _ = transitioning.await;
+
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()["cursor"],
+            &blocking
+        ));
+    }
+
     #[tokio::test]
     async fn runtime_teardown_only_stops_matching_config_backends() {
         let data = tempfile::tempdir().unwrap();
@@ -26117,12 +26214,78 @@ default_permission_mode = "ask"
             0
         );
         assert_eq!(codex.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        engine.replace_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge);
         let backends = engine.backends.read().unwrap();
-        assert!(!Arc::ptr_eq(&cursor_backend, &backends["cursor"]));
+        assert!(Arc::ptr_eq(&cursor_backend, &backends["cursor"]));
         assert!(Arc::ptr_eq(&claude_backend, &backends["claude"]));
         assert!(Arc::ptr_eq(&codex_backend, &backends["codex"]));
+    }
+
+    #[tokio::test]
+    async fn unrelated_api_upsert_preserves_every_vendor_backend_instance() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [
+            ("cursor", "cursor-sdk"),
+            ("claude", "claude-cli"),
+            ("codex", "codex-app-server"),
+        ] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        config.providers.insert(
+            "custom".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        let mut tracked = Vec::new();
+        for id in ["cursor", "claude", "codex"] {
+            let concrete = Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let backend: Arc<dyn AgentBackend> = concrete.clone();
+            engine
+                .backends
+                .write()
+                .unwrap()
+                .insert(id.into(), backend.clone());
+            tracked.push((id, concrete, backend));
+        }
+
+        engine
+            .upsert_provider(
+                "custom",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let backends = engine.backends.read().unwrap();
+        for (id, concrete, backend) in tracked {
+            assert_eq!(
+                concrete.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "unrelated upsert shut down {id}"
+            );
+            assert!(Arc::ptr_eq(&backends[id], &backend));
+        }
     }
 
     #[tokio::test]
@@ -26178,7 +26341,7 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
-    async fn teardown_failure_still_publishes_committed_provider_state() {
+    async fn teardown_failure_preserves_uncommitted_provider_state_and_ownership() {
         const ID: &str = "reload-consistency";
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -26200,11 +26363,12 @@ default_permission_mode = "ask"
         let failing = Arc::new(FailingShutdownBackend {
             shutdowns: std::sync::atomic::AtomicUsize::new(0),
         });
+        let failing_backend: Arc<dyn AgentBackend> = failing.clone();
         engine
             .backends
             .write()
             .unwrap()
-            .insert(ID.into(), failing.clone());
+            .insert(ID.into(), failing_backend.clone());
         let upsert = engine
             .upsert_provider(
                 ID,
@@ -26224,28 +26388,25 @@ default_permission_mode = "ask"
             engine.config.lock().unwrap().providers[ID]
                 .base_url
                 .as_deref(),
-            Some("https://new.example.test/v1")
+            Some("https://old.example.test/v1")
         );
         assert!(engine.providers.read().unwrap().contains_key(ID));
-        assert!(!engine.backends.read().unwrap().contains_key(ID));
-
-        let failing = Arc::new(FailingShutdownBackend {
-            shutdowns: std::sync::atomic::AtomicUsize::new(0),
-        });
-        engine
-            .backends
-            .write()
-            .unwrap()
-            .insert(ID.into(), failing.clone());
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()[ID],
+            &failing_backend
+        ));
         let delete = engine.delete_provider(ID).await;
         assert!(delete.is_err());
         assert_eq!(
             failing.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
-            1
+            2
         );
-        assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
-        assert!(!engine.providers.read().unwrap().contains_key(ID));
-        assert!(!engine.backends.read().unwrap().contains_key(ID));
+        assert!(engine.config.lock().unwrap().providers.contains_key(ID));
+        assert!(engine.providers.read().unwrap().contains_key(ID));
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()[ID],
+            &failing_backend
+        ));
     }
 
     #[test]

@@ -66,6 +66,29 @@ const MAX_PENDING_DIAGNOSTIC_CHARS = 16_384;
 const MAX_TIMER_DELAY_MILLISECONDS = 2_147_483_647;
 const READY_PREFIX = "cursor-sdk-bridge ready ";
 const INVALID_TOOL_NAME = "trouve_qualification_invalid_builtin";
+const KNOWN_NATIVE_TOOL_PROBE = "shell";
+// Public ToolName vocabulary from the pinned @cursor/sdk 1.0.28 package.
+// `mcp` is the only native capability Trouve intentionally allows.
+const CURSOR_NATIVE_TOOL_DENYLIST = Object.freeze([
+  "shell",
+  "read",
+  "edit",
+  "grep",
+  "glob",
+  "ls",
+  "task",
+  "webSearch",
+  "delete",
+  "readLints",
+  "webFetch",
+  "semSearch",
+  "updateTodos",
+  "readTodos",
+  "askQuestion",
+  "await",
+  "generateImage",
+  "applyAgentDiff",
+]);
 const FORBIDDEN_BUILT_INS = new Set([
   "browser",
   "delete",
@@ -1126,7 +1149,7 @@ function agentOptions(apiKey, model, workspace) {
     apiKey,
     name: "Trouve Cursor SDK Bridge qualification",
     tools: { names: ["mcp"] },
-    disallowedTools: [],
+    disallowedTools: [...CURSOR_NATIVE_TOOL_DENYLIST],
     mcpServers: {},
     agents: {},
     local: {
@@ -1156,6 +1179,44 @@ function agentOptions(apiKey, model, workspace) {
 }
 
 async function verifyToolAllowlist(client, options, timeoutMilliseconds) {
+  if (
+    JSON.stringify(options.disallowedTools) !==
+    JSON.stringify(CURSOR_NATIVE_TOOL_DENYLIST)
+  ) {
+    throw new QualificationError(
+      "tool-allowlist validation did not receive the pinned native-tool denylist",
+    );
+  }
+
+  // Prove the probe name is a real tool in this exact Bridge release rather
+  // than relying on a guessed identifier. The agent is never run, and is
+  // closed before testing the shipping MCP-only policy below.
+  const knownOptions = structuredClone(options);
+  knownOptions.tools = { names: [KNOWN_NATIVE_TOOL_PROBE] };
+  knownOptions.disallowedTools = knownOptions.disallowedTools.filter(
+    (tool) => tool !== KNOWN_NATIVE_TOOL_PROBE,
+  );
+  knownOptions.local.customTools = {};
+  const known = await unary(
+    client,
+    "SdkAgentService",
+    "CreateAgent",
+    { options: knownOptions },
+    timeoutMilliseconds,
+  );
+  if (typeof known?.agentId !== "string" || known.agentId.length === 0) {
+    throw new QualificationError(
+      `known native tool probe ${KNOWN_NATIVE_TOOL_PROBE} returned no agent id`,
+    );
+  }
+  await unary(
+    client,
+    "SdkAgentService",
+    "CloseAgent",
+    { agentId: known.agentId },
+    Math.min(timeoutMilliseconds, 10_000),
+  );
+
   const invalidOptions = structuredClone(options);
   invalidOptions.tools = { names: ["mcp", INVALID_TOOL_NAME] };
   let created;
@@ -1169,17 +1230,17 @@ async function verifyToolAllowlist(client, options, timeoutMilliseconds) {
     );
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (
-      !detail.includes(INVALID_TOOL_NAME) &&
-      !/(?:unknown|invalid).{0,40}tool|tool.{0,40}(?:unknown|invalid)/iu.test(detail)
-    ) {
+    if (!isUnknownToolValidationError(error)) {
       throw new QualificationError(
         `tool-allowlist validation failed for an unrelated reason: ${detail}`,
       );
     }
     return {
-      contract: "AgentOptions.tools allowlist",
-      unknown_tool_rejected: true,
+      contract: "@cursor/sdk 1.0.28 AgentOptions.tools allowlist",
+      known_native_tool_recognized: KNOWN_NATIVE_TOOL_PROBE,
+      known_native_probe_agent_run: false,
+      explicit_native_denylist: [...CURSOR_NATIVE_TOOL_DENYLIST],
+      unknown_tool_rejected_with_invalid_argument: true,
       model_behavior_used_as_evidence: false,
     };
   }
@@ -1195,6 +1256,12 @@ async function verifyToolAllowlist(client, options, timeoutMilliseconds) {
   throw new QualificationError(
     `CreateAgent accepted the unknown built-in tool ${INVALID_TOOL_NAME}`,
   );
+}
+
+function isUnknownToolValidationError(error) {
+  return error instanceof ConnectRpcError &&
+    ["invalid_argument", 3, "3"].includes(error.code) &&
+    error.message.includes(INVALID_TOOL_NAME);
 }
 
 async function safeUnary(client, service, method, body, timeoutMilliseconds) {
@@ -1508,6 +1575,7 @@ async function main() {
 
 export {
   BRIDGE_VERSION,
+  CURSOR_NATIVE_TOOL_DENYLIST,
   ConnectRpcError,
   QualificationError,
   assetName,
@@ -1520,6 +1588,7 @@ export {
   exactTerminalResult,
   expectedBridgeChecksum,
   installSignalCleanup,
+  isUnknownToolValidationError,
   isUnsupportedRpcMethodError,
   parseTimeoutSeconds,
   redact,

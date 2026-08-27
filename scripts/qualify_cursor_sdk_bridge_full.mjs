@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   BRIDGE_VERSION,
+  CURSOR_NATIVE_TOOL_DENYLIST,
   QualificationError,
   assistantText,
   assertUniqueToolLifecycle,
@@ -382,7 +383,7 @@ function fullAgentOptions(apiKey, model, workspace, customTools) {
     apiKey,
     name: "Trouve Cursor SDK Bridge full qualification",
     tools: { names: ["mcp"] },
-    disallowedTools: [],
+    disallowedTools: [...CURSOR_NATIVE_TOOL_DENYLIST],
     mcpServers: {},
     agents: {},
     local: {
@@ -1242,7 +1243,7 @@ async function fullQualification(args) {
       bridge,
       callback,
       agentId,
-      label: "plan-mode-text",
+      label: "plan-mode-request-observation",
       prompt:
         "In plan mode, call no tools and give a one-sentence read-only plan for inspecting a repository.",
       expectedTools: [],
@@ -1461,15 +1462,20 @@ async function fullQualification(args) {
         durable_observe_replay_after_cold_restart: coldReplay,
         cancellation,
         post_cancellation_recovery: true,
-        plan_mode: {
-          requested: planTurn.summary.requested_mode === "AGENT_MODE_OPTION_PLAN",
-          effective_mode_reported_by_sdk: false,
-        },
         get_run: true,
         list_runs: true,
         get_run_conversation: true,
         list_agent_messages: true,
         steering: "disabled-by-cursor-backend-capability",
+      },
+      non_gating_observations: {
+        plan_mode_request: {
+          requested: planTurn.summary.requested_mode === "AGENT_MODE_OPTION_PLAN",
+          qualification_status: "not-attested",
+          authoritative_effective_mode_evidence: "unavailable-from-sdk.v1",
+          semantic_attestation: false,
+          safety_boundary: "trouve-tool-executor",
+        },
       },
       usage: {
         turns_with_usage: usageTurns,
