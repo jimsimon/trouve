@@ -110,6 +110,11 @@ const MAX_ATTACHMENT_MIME_BYTES: usize = 255;
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// A defective backend must not hold the global provider transition forever.
+/// Cursor's own pool cleanup is bounded and has at most three warm processes;
+/// this outer aggregate budget leaves room for that normal path while fencing
+/// every backend implementation at the registry boundary.
+const BACKEND_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
 
@@ -2654,14 +2659,39 @@ impl Drop for BackendRetirement {
 async fn shutdown_retiring_backend_batch(
     engine: &Engine,
     retiring: Vec<(String, Arc<dyn AgentBackend>)>,
+    deadline: tokio::time::Instant,
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    for (id, backend) in retiring {
-        match backend.shutdown().await {
-            Ok(()) => engine.release_retiring_backend(&id, &backend),
-            Err(error) => failures.push(format!("{id}: {error}")),
+    let mut retiring = retiring.into_iter();
+    for (id, backend) in retiring.by_ref() {
+        let timed_out = match tokio::time::timeout_at(deadline, backend.shutdown()).await {
+            Ok(Ok(())) => {
+                engine.release_retiring_backend(&id, &backend);
+                false
+            }
+            Ok(Err(error)) => {
+                failures.push(format!("{id}: {error}"));
+                false
+            }
+            Err(_) => {
+                failures.push(format!(
+                    "{id}: backend shutdown exceeded the aggregate retirement deadline"
+                ));
+                true
+            }
+        };
+        // Drop the wrapper's runtime lease before the caller can proceed to
+        // uninstall. Timer registration and task-output cleanup are not relied
+        // upon for this ownership boundary.
+        drop(backend);
+        if timed_out {
+            break;
         }
     }
+    // A deadline may leave unattempted clones in the iterator. The retiring
+    // registry remains their durable owner; this batch must release its copies
+    // before publishing replacements or returning to runtime removal.
+    drop(retiring);
     failures
 }
 
@@ -2908,7 +2938,10 @@ enum CliInstallState {
         /// Byte progress + cancel flag, shared with the install task.
         progress: Arc<trouve_agents::install::Progress>,
     },
-    Success(String),
+    Success {
+        version: String,
+        warning: Option<String>,
+    },
     Failed(String),
 }
 
@@ -4665,7 +4698,10 @@ impl Engine {
                     }
 
                     let install_result = match prepared.activate_cancellable(&progress) {
-                        Ok(_) => Ok(Some(version)),
+                        Ok(outcome) => {
+                            let (_, warning) = outcome.into_parts();
+                            Ok(Some((version, warning)))
+                        }
                         Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
                         Err(error) => Err(error.to_string()),
                     };
@@ -4683,14 +4719,15 @@ impl Engine {
                     )
                     .await
                     {
-                        Ok(_) => {
+                        Ok(outcome) => {
+                            let (_, warning) = outcome.into_parts();
                             engine
                                 .reload_providers_for_runtime(cli)
                                 .await
                                 .map_err(|error| {
                                     format!("reloading providers after runtime install: {error}")
                                 })?;
-                            Ok(Some(version))
+                            Ok(Some((version, warning)))
                         }
                         Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
                         Err(error) => Err(error.to_string()),
@@ -4700,9 +4737,9 @@ impl Engine {
             .await;
             let mut installs = engine.cli_installs.lock().unwrap();
             match result {
-                Ok(Some(version)) => {
+                Ok(Some((version, warning))) => {
                     engine.cli_latest.lock().unwrap().remove(id_owned.as_str());
-                    installs.insert(id_owned, CliInstallState::Success(version));
+                    installs.insert(id_owned, CliInstallState::Success { version, warning });
                 }
                 // Cancelled: back to "none", like it never started.
                 Ok(None) => {
@@ -4790,6 +4827,7 @@ impl Engine {
                 status: "none".into(),
                 version: None,
                 error: None,
+                warning: None,
                 received_bytes: 0,
                 total_bytes: 0,
             },
@@ -4799,21 +4837,26 @@ impl Engine {
                     status: "pending".into(),
                     version: version.clone(),
                     error: None,
+                    warning: None,
                     received_bytes: progress.received.load(Relaxed),
                     total_bytes: progress.total.load(Relaxed),
                 }
             }
-            Some(CliInstallState::Success(version)) => trouve_protocol::CliInstallStatus {
-                status: "success".into(),
-                version: Some(version.clone()),
-                error: None,
-                received_bytes: 0,
-                total_bytes: 0,
-            },
+            Some(CliInstallState::Success { version, warning }) => {
+                trouve_protocol::CliInstallStatus {
+                    status: "success".into(),
+                    version: Some(version.clone()),
+                    error: None,
+                    warning: warning.clone(),
+                    received_bytes: 0,
+                    total_bytes: 0,
+                }
+            }
             Some(CliInstallState::Failed(e)) => trouve_protocol::CliInstallStatus {
                 status: "failed".into(),
                 version: None,
                 error: Some(e.clone()),
+                warning: None,
                 received_bytes: 0,
                 total_bytes: 0,
             },
@@ -6438,6 +6481,18 @@ impl Engine {
         self: &Arc<Self>,
         target_ids: &HashSet<String>,
     ) -> Result<BackendRetirement, EngineError> {
+        self.retire_config_backends_matching_ids_with_timeout(
+            target_ids,
+            BACKEND_RETIREMENT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn retire_config_backends_matching_ids_with_timeout(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+        timeout: Duration,
+    ) -> Result<BackendRetirement, EngineError> {
         let transition = self.provider_reload.clone().lock_owned().await;
         let retirement = BackendRetirement::new(self, target_ids.clone(), transition);
         let injected = self
@@ -6484,19 +6539,24 @@ impl Engine {
         }
 
         let engine = Arc::clone(self);
-        let task = tokio::spawn(async move {
-            let failures = shutdown_retiring_backend_batch(&engine, retiring).await;
-            if failures.is_empty() {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let _retirement_task = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
+            let completion = if failures.is_empty() {
                 Ok(retirement)
             } else {
                 Err(EngineError::Internal(anyhow!(
                     "backend retirement failed: {}",
                     failures.join("; ")
                 )))
-            }
+            };
+            let _ = completion_tx.send(completion);
         });
-        task.await.map_err(|error| {
-            EngineError::Internal(anyhow!("backend retirement task failed: {error}"))
+        completion_rx.await.map_err(|error| {
+            EngineError::Internal(anyhow!(
+                "backend retirement task exited before reporting completion: {error}"
+            ))
         })?
     }
 
@@ -28353,6 +28413,68 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
+    async fn backend_retirement_timeout_releases_global_transition_and_retains_cleanup() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), blocking.clone());
+
+        let result = engine
+            .retire_config_backends_matching_ids_with_timeout(
+                &HashSet::from(["cursor".to_string()]),
+                Duration::from_millis(25),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(entered.available_permits(), 1);
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &blocking))
+        );
+        assert!(engine.backend_for("cursor/test-model").is_some());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("timed-out retirement retained the provider transition lock");
+
+        release.add_permits(1);
+        let retirement = engine
+            .retire_config_backends_matching_ids_with_timeout(
+                &HashSet::from(["cursor".to_string()]),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("a later transition could not retry retained cleanup");
+        retirement.publish();
+        assert!(engine.retiring_backends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn runtime_teardown_only_stops_matching_config_backends() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -28547,6 +28669,33 @@ default_permission_mode = "ask"
             );
             assert!(Arc::ptr_eq(&backends[id], &backend));
         }
+    }
+
+    #[test]
+    fn cli_install_status_surfaces_a_committed_durability_warning() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        engine.cli_installs.lock().unwrap().insert(
+            "codex".into(),
+            CliInstallState::Success {
+                version: "1.2.3".into(),
+                warning: Some("crash durability could not be confirmed".into()),
+            },
+        );
+
+        let status = engine.cli_install_status("codex");
+
+        assert_eq!(status.status, "success");
+        assert_eq!(status.version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            status.warning.as_deref(),
+            Some("crash durability could not be confirmed")
+        );
+        assert!(status.error.is_none());
     }
 
     #[tokio::test]

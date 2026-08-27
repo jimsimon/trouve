@@ -163,7 +163,9 @@ export class TrouveCliSettings extends LitElement {
       height: 8px;
       accent-color: var(--trouve-accent);
     }
-    .install-error { grid-column: 1 / -1; color: var(--trouve-err); }
+    .install-error, .install-warning { grid-column: 1 / -1; }
+    .install-error { color: var(--trouve-err); }
+    .install-warning { color: var(--trouve-warn); }
 
     .confirmation {
       grid-column: 1 / -1;
@@ -321,7 +323,9 @@ export class TrouveCliSettings extends LitElement {
                   : html`<progress max="100" value=${percent} aria-label=${`${cli.display_name} download ${percent}% complete`}></progress>`}
               </div>
             `
-          : status.status === "failed"
+          : status.warning
+            ? html`<small class="install-warning" role="status">${status.warning}</small>`
+            : status.status === "failed"
             ? html`<small class="install-error" role="alert">Installation failed. Retry the install or check the server logs.</small>`
             : nothing}
 

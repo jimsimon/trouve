@@ -339,7 +339,9 @@ pub use requests::*;
 // activity from user-authored `user.message` events (additive).
 // 7.28: the legacy /v1/clis lifecycle also manages non-CLI agent runtimes;
 // Cursor's managed artifact is its standalone Agent SDK Bridge.
-pub const PROTOCOL_VERSION: &str = "7.28";
+// 7.29: CLI install status can expose a non-fatal durability warning after an
+// atomically committed runtime activation (additive).
+pub const PROTOCOL_VERSION: &str = "7.29";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

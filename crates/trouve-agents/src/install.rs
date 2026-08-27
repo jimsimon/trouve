@@ -170,6 +170,30 @@ pub struct InstalledCli {
     pub bin: String,
 }
 
+/// Result of atomically publishing a managed runtime pointer.
+///
+/// Directory sync is necessarily after the pointer rename. A failure at that
+/// boundary cannot be reported as an ordinary uncommitted install error:
+/// readers already observe the new runtime, but crash durability is unknown.
+#[derive(Debug)]
+#[must_use = "activation durability must be surfaced to the caller"]
+pub enum ActivationOutcome {
+    Durable(InstalledCli),
+    CommittedNotDurable {
+        installed: InstalledCli,
+        warning: String,
+    },
+}
+
+impl ActivationOutcome {
+    pub fn into_parts(self) -> (InstalledCli, Option<String>) {
+        match self {
+            Self::Durable(installed) => (installed, None),
+            Self::CommittedNotDurable { installed, warning } => (installed, Some(warning)),
+        }
+    }
+}
+
 /// Keeps one resolved managed runtime generation alive for as long as a
 /// backend can still use the executable it selected. The shared filesystem
 /// lock is visible to every Trouve process using the same data directory.
@@ -177,6 +201,22 @@ pub struct InstalledCli {
 pub struct RuntimeLease {
     _runtime: PathBuf,
     _lock: std::fs::File,
+}
+
+impl Drop for RuntimeLease {
+    fn drop(&mut self) {
+        // Closing a locked descriptor is not enough when a concurrent fork
+        // inherited the same open-file description before exec. Explicitly
+        // unlock so backend retirement cannot leave uninstall transiently
+        // blocked by an otherwise unrelated child launch.
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self._lock) {
+            tracing::warn!(
+                runtime = %self._runtime.display(),
+                %error,
+                "failed to release managed runtime lease"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -611,7 +651,7 @@ pub struct PreparedInstall {
 impl PreparedInstall {
     /// Move the prepared runtime into an immutable generation, then atomically
     /// publish the metadata pointer used by both discovery and launches.
-    pub fn activate(self) -> Result<InstalledCli, InstallError> {
+    pub fn activate(self) -> Result<ActivationOutcome, InstallError> {
         self.activate_with_checkpoint(|_| Ok(()))
     }
 
@@ -619,7 +659,10 @@ impl PreparedInstall {
     /// commit boundary. Preparation can finish concurrently with a late cancel,
     /// so checking inside the activation lock is what prevents a cancelled
     /// operation from publishing `installed.json`.
-    pub fn activate_cancellable(self, progress: &Progress) -> Result<InstalledCli, InstallError> {
+    pub fn activate_cancellable(
+        self,
+        progress: &Progress,
+    ) -> Result<ActivationOutcome, InstallError> {
         self.activate_with_checkpoint(|_| {
             if progress.cancelled() {
                 Err(InstallError::Cancelled)
@@ -632,7 +675,7 @@ impl PreparedInstall {
     fn activate_with_checkpoint(
         self,
         mut checkpoint: impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
-    ) -> Result<InstalledCli, InstallError> {
+    ) -> Result<ActivationOutcome, InstallError> {
         self.activate_with_checkpoint_and_sync(&mut checkpoint, sync_runtime_directory)
     }
 
@@ -640,7 +683,7 @@ impl PreparedInstall {
         self,
         checkpoint: &mut impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
         mut sync_directory: impl FnMut(&Path) -> std::io::Result<()>,
-    ) -> Result<InstalledCli, InstallError> {
+    ) -> Result<ActivationOutcome, InstallError> {
         let root = cli_root(&self.data_dir, self.id);
         let _activation_lock = lock_runtime_activation(&self.data_dir, self.id)?;
         let staged_bin = self.stage.join(&self.bin_rel);
@@ -716,28 +759,42 @@ impl PreparedInstall {
         // installed.json is the one atomically replaced commit marker. Disarm
         // generation cleanup immediately: a later directory-sync error cannot
         // roll the commit back or remove the runtime now named by the pointer.
-        // Report that post-commit durability failure as degraded success rather
-        // than inviting a retry of an activation that readers already observe.
         generation_cleanup.disarm();
-        if let Err(error) = sync_directory(&root) {
-            tracing::warn!(
-                runtime = self.id.as_str(),
-                path = %root.display(),
-                %error,
-                "managed runtime committed but its root directory could not be synced"
+        let durability_error = sync_directory(&root).err();
+        if durability_error.is_none() {
+            // Reclamation is safe only after the new pointer is known durable.
+            // Across one or more failed root syncs, the last durable pointer may
+            // lag behind the visible pointer by multiple generations.
+            prune_runtime_generations(
+                &self.data_dir,
+                self.id,
+                &generations,
+                &generation,
+                previous_generation.as_deref(),
             );
+            prune_old_versions(&self.data_dir, self.id, &root, previous_legacy.as_deref());
+            remove_legacy_managed_bin_best_effort(&self.data_dir, self.id);
         }
-
-        prune_runtime_generations(
-            &self.data_dir,
-            self.id,
-            &generations,
-            &generation,
-            previous_generation.as_deref(),
-        );
-        prune_old_versions(&self.data_dir, self.id, &root, previous_legacy.as_deref());
-        remove_legacy_managed_bin_best_effort(&self.data_dir, self.id);
-        Ok(info)
+        match durability_error {
+            None => Ok(ActivationOutcome::Durable(info)),
+            Some(error) => {
+                let warning = format!(
+                    "{} {} is active, but crash durability could not be confirmed: {error}; previous runtime generations were retained",
+                    self.id.display_name(),
+                    self.version
+                );
+                tracing::warn!(
+                    runtime = self.id.as_str(),
+                    path = %root.display(),
+                    %error,
+                    "managed runtime committed but its root directory could not be synced"
+                );
+                Ok(ActivationOutcome::CommittedNotDurable {
+                    installed: info,
+                    warning,
+                })
+            }
+        }
     }
 }
 
@@ -1017,7 +1074,7 @@ pub async fn install(
     id: CliId,
     version: &str,
     progress: &Progress,
-) -> Result<InstalledCli, InstallError> {
+) -> Result<ActivationOutcome, InstallError> {
     prepare_install(data_dir, id, version, progress)
         .await?
         .activate_cancellable(progress)
@@ -1761,7 +1818,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         std::fs::create_dir_all(legacy_stable.parent().unwrap()).unwrap();
         std::fs::write(&legacy_stable, "obsolete runtime").unwrap();
 
-        let activated = prepared.activate().unwrap();
+        let ActivationOutcome::Durable(activated) = prepared.activate().unwrap() else {
+            panic!("ordinary activation unexpectedly lacked durability");
+        };
 
         assert_eq!(activated.version, "2.0.0");
         assert!(Path::new(&activated.bin).starts_with(root.join(".generations")));
@@ -1906,7 +1965,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
-    fn directory_sync_failure_after_pointer_reports_committed_success() {
+    fn directory_sync_failure_after_pointer_reports_degraded_commit() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
         let stage = create_install_stage(&root, "2.0.0").unwrap();
@@ -1920,7 +1979,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         };
 
         let mut checkpoint = |_| Ok(());
-        let activated = prepared
+        let outcome = prepared
             .activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
                 if path == root {
                     Err(std::io::Error::other(
@@ -1931,13 +1990,63 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
                 }
             })
             .expect("the installed pointer already committed");
+        let ActivationOutcome::CommittedNotDurable {
+            installed: activated,
+            warning,
+        } = outcome
+        else {
+            panic!("the injected root sync failure was not surfaced");
+        };
 
         assert_eq!(activated.version, "2.0.0");
+        assert!(warning.contains("crash durability could not be confirmed"));
         let visible = installed(tmp.path(), CliId::Codex).unwrap();
         assert_eq!(visible.bin, activated.bin);
         assert_eq!(
             std::fs::read_to_string(visible.bin).unwrap(),
             "committed runtime"
+        );
+    }
+
+    #[test]
+    fn consecutive_pointer_sync_failures_retain_every_recovery_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let generations = root.join(".generations");
+
+        for version in ["1.0.0", "2.0.0"] {
+            let stage = create_install_stage(&root, version).unwrap();
+            std::fs::write(stage.join("codex"), version).unwrap();
+            let prepared = PreparedInstall {
+                data_dir: tmp.path().to_path_buf(),
+                id: CliId::Codex,
+                version: version.into(),
+                stage,
+                bin_rel: PathBuf::from("codex"),
+            };
+            let mut checkpoint = |_| Ok(());
+            assert!(matches!(
+                prepared.activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
+                    if path == root {
+                        Err(std::io::Error::other("injected root sync failure"))
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Ok(ActivationOutcome::CommittedNotDurable { .. })
+            ));
+        }
+
+        let retained = std::fs::read_dir(&generations)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2);
+        assert!(
+            retained
+                .iter()
+                .all(|generation| generation.join("codex").is_file())
         );
     }
 
@@ -2068,6 +2177,41 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         assert!(!root.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dropping_runtime_lease_unlocks_an_inherited_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let runtime = root.join(".generations").join("runtime-test");
+        let bin = runtime.join("codex");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(&bin, "codex").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "test".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (_, lease) = installed_with_lease(tmp.path(), CliId::Codex).unwrap();
+        let inherited = lease._lock.try_clone().unwrap();
+        drop(lease);
+
+        let contender = open_runtime_lease_file(
+            tmp.path(),
+            CliId::Codex,
+            RuntimeContainerKind::Generation,
+            &runtime,
+        )
+        .unwrap();
+        assert!(fs4::fs_std::FileExt::try_lock_exclusive(&contender).unwrap());
+        fs4::fs_std::FileExt::unlock(&contender).unwrap();
+        drop(inherited);
+    }
+
     #[test]
     fn cursor_sdk_uninstall_preserves_legacy_runtime_for_older_processes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2183,7 +2327,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         let activate = |version: &str| {
             let stage = create_install_stage(&root, version).unwrap();
             std::fs::write(stage.join("codex"), version).unwrap();
-            PreparedInstall {
+            let outcome = PreparedInstall {
                 data_dir: tmp.path().to_path_buf(),
                 id: CliId::Codex,
                 version: version.into(),
@@ -2191,7 +2335,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
                 bin_rel: PathBuf::from("codex"),
             }
             .activate()
-            .unwrap()
+            .unwrap();
+            let ActivationOutcome::Durable(installed) = outcome else {
+                panic!("ordinary activation unexpectedly lacked durability");
+            };
+            installed
         };
 
         let first = activate("1.0.0");
@@ -2239,7 +2387,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         let activate = |version: &str| {
             let stage = create_install_stage(&root, version).unwrap();
             std::fs::write(stage.join("codex"), version).unwrap();
-            PreparedInstall {
+            let outcome = PreparedInstall {
                 data_dir: tmp.path().to_path_buf(),
                 id: CliId::Codex,
                 version: version.into(),
@@ -2247,7 +2395,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
                 bin_rel: PathBuf::from("codex"),
             }
             .activate()
-            .unwrap()
+            .unwrap();
+            let ActivationOutcome::Durable(installed) = outcome else {
+                panic!("ordinary activation unexpectedly lacked durability");
+            };
+            installed
         };
 
         let first = activate("1.0.0");
