@@ -637,6 +637,14 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
     assert!(items.iter().any(|item| {
         item["kind"] == "tool_call" && item["tool"] == "read_file" && item["status"] == "ok"
     }));
+    // Scan the complete data directory while every managed-runtime generation
+    // still exists. Teardown must not be able to erase the only place where a
+    // leaked credential would otherwise have been found.
+    assert_eq!(
+        first_file_containing(&data_dir, api_key.as_bytes()),
+        None,
+        "Cursor API key was persisted under Trouve's data directory"
+    );
     let uninstall = client
         .delete(format!("{base}/clis/cursor-sdk-bridge"))
         .send()
@@ -654,6 +662,8 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
     runtime_guard.disarm();
 
     server.shutdown().await;
+    // Retain a post-cleanup assertion as a defense against credentials written
+    // outside the managed runtime tree during shutdown.
     assert_eq!(
         first_file_containing(&data_dir, api_key.as_bytes()),
         None,

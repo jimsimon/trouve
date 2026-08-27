@@ -981,9 +981,22 @@ async fn run_sdk_turn(
     let mcp_url = (!turn.tool_free)
         .then(|| turn.mcp_bridge.as_ref().map(|bridge| bridge.url.clone()))
         .flatten();
+
+    // Bound tool discovery along with every other turn-scoped resource. Tool
+    // lists may be large, so queued turns must not fetch and retain one before
+    // they own a pool admission slot.
+    let _turn_admission = match pool.acquire_turn_admission(&turn.cancel, events).await {
+        Ok(permit) => permit,
+        Err(BackendError::Cancelled) if events.is_closed() => {
+            return Ok(TurnTerminal::ConsumerClosed);
+        }
+        Err(BackendError::Cancelled) => return Ok(TurnTerminal::Cancelled),
+        Err(error) => return Err(error),
+    };
     let custom_tools = match mcp_url.as_deref() {
         Some(url) => tokio::select! {
             biased;
+            _ = pool.closing.cancelled() => return Err(BridgePool::closed_error()),
             _ = turn.cancel.cancelled() => return Ok(TurnTerminal::Cancelled),
             _ = events.closed() => return Ok(TurnTerminal::ConsumerClosed),
             tools = load_custom_tools(&local_http, url) => tools?,
@@ -995,18 +1008,6 @@ async fn run_sdk_turn(
             "trouve's Cursor tool bridge returned no tools".into(),
         ));
     }
-
-    // Bound all turn-scoped resources, not only spawned Bridge processes. A
-    // queued turn owns no listener, bearer, or callback supervisor until it
-    // has one of the pool's turn slots.
-    let _turn_admission = match pool.acquire_turn_admission(&turn.cancel, events).await {
-        Ok(permit) => permit,
-        Err(BackendError::Cancelled) if events.is_closed() => {
-            return Ok(TurnTerminal::ConsumerClosed);
-        }
-        Err(BackendError::Cancelled) => return Ok(TurnTerminal::Cancelled),
-        Err(error) => return Err(error),
-    };
     let callback = tokio::select! {
         biased;
         _ = pool.closing.cancelled() => return Err(BridgePool::closed_error()),
@@ -3118,14 +3119,19 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     let mut offset = 2;
-    while offset + 4 <= bytes.len() {
+    while offset < bytes.len() {
         if bytes[offset] != 0xff {
             offset += 1;
             continue;
         }
-        let marker = bytes[offset + 1];
-        offset += 2;
-        if matches!(marker, 0xd8 | 0xd9) {
+        // JPEG permits any number of 0xff fill bytes before a marker code.
+        while bytes.get(offset) == Some(&0xff) {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        // Stuffed zero bytes and standalone markers carry no segment length.
+        if marker == 0x00 || marker == 0x01 || matches!(marker, 0xd0..=0xd9) {
             continue;
         }
         let length = u16::from_be_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as usize;
@@ -3291,6 +3297,21 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_dimensions_accepts_marker_fill_bytes() {
+        let jpeg = [
+            0xff, 0xd8, // SOI
+            0xff, 0xff, 0xc0, // fill byte + baseline SOF
+            0x00, 0x11, // segment length
+            0x08, // sample precision
+            0x00, 0x18, // height: 24
+            0x00, 0x20, // width: 32
+            0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+        ];
+
+        assert_eq!(jpeg_dimensions(&jpeg), Some((32, 24)));
+    }
+
+    #[test]
     fn resume_replacement_requires_a_structured_not_found_code() {
         let prose = BridgeRpcFailure {
             code: None,
@@ -3420,6 +3441,98 @@ mod tests {
         pool.shutdown().await.unwrap();
         let error = waiter.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("pool is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn queued_turn_does_not_discover_tools_before_admission() {
+        let pool = BridgePool::default();
+        let _permits = (0..POOL_CAP)
+            .map(|_| pool.turn_admission.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/mcp",
+                    post(move || {
+                        let request_counter = request_counter.clone();
+                        async move {
+                            request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": { "tools": [] },
+                            }))
+                        }
+                    }),
+                ),
+            )
+            .await
+        });
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+        let turn = BackendTurn {
+            cancel: cancel.clone(),
+            thread_id: "queued-turn".into(),
+            worktree: "/tmp".into(),
+            session: None,
+            model: "composer-2".into(),
+            model_options: Map::new(),
+            prompt: "not reached".into(),
+            attachments: Vec::new(),
+            instructions: None,
+            permission: BackendPermission::Ask,
+            tool_free: false,
+            attach_background: false,
+            mcp_bridge: Some(crate::McpBridgeConfig {
+                url: format!("http://{address}/mcp"),
+                bridge_tools: true,
+                disallowed_tools: Vec::new(),
+            }),
+            mcp_servers: Vec::new(),
+        };
+        let state = tempfile::tempdir().unwrap();
+        let turn = run_sdk_turn(
+            &pool,
+            "cursor",
+            "not-reached",
+            "secret",
+            state.path(),
+            turn,
+            &events,
+        );
+        tokio::pin!(turn);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), turn.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "queued turn fetched a tool catalog before admission"
+        );
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), turn)
+                .await
+                .unwrap()
+                .unwrap(),
+            TurnTerminal::Cancelled
+        ));
+        server.abort();
     }
 
     #[tokio::test]
