@@ -96,9 +96,20 @@ const REVIEW_COLLAPSE_GROUP_CONCURRENCY: usize = 4;
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
+/// Ceiling for the derived batch token target: 4x the fixed default. Larger
+/// batches stop paying off — call latency grows and reviewer attention
+/// dilutes — before large context windows run out.
+const REVIEW_BATCH_TARGET_TOKENS_MAX: usize = 96 * 1024;
+/// Tokens reserved for the request envelope around batch content — persona
+/// prompt, rubric, changed paths, and the model's own output — when sizing
+/// content against a small window.
+const REVIEW_PROMPT_ENVELOPE_RESERVE_TOKENS: usize = 8 * 1024;
+/// Floor for the derived batch token target on very small windows.
+const REVIEW_BATCH_TARGET_TOKENS_MIN: usize = 1_024;
 // Bump when batch identity or composition changes so interrupted jobs never
 // reuse routing or reviewer output against a differently assembled batch.
-const REVIEW_BATCH_FORMAT_VERSION: &str = "2";
+// 3: batch budgets derive from the smallest configured model context window.
+const REVIEW_BATCH_FORMAT_VERSION: &str = "3";
 // The changed-path list is rendered outside `ReviewBatch::diff`, so bound it
 // separately. A byte budget admits many short paths without letting unusual
 // path names make the model request unbounded.
@@ -1277,9 +1288,15 @@ impl ReviewBatchAccumulator {
         }
     }
 
-    fn fits(&self, path: &str, section: &str, section_tokens: usize) -> bool {
-        self.batch.diff.len().saturating_add(section.len()) <= REVIEW_BATCH_MAX_BYTES
-            && self.estimated_tokens.saturating_add(section_tokens) <= REVIEW_BATCH_TARGET_TOKENS
+    fn fits(
+        &self,
+        path: &str,
+        section: &str,
+        section_tokens: usize,
+        budgets: ReviewPromptBudgets,
+    ) -> bool {
+        self.batch.diff.len().saturating_add(section.len()) <= budgets.batch_max_bytes
+            && self.estimated_tokens.saturating_add(section_tokens) <= budgets.batch_target_tokens
             && self
                 .path_bytes
                 .saturating_add(self.additional_path_bytes(path))
@@ -4534,6 +4551,121 @@ impl Engine {
         }
     }
 
+    /// The budget basis for one job: the smallest context window among every
+    /// model the job can call — the repository review model, the router and
+    /// analyst overrides, and each reviewer's model. `None` when any model
+    /// fails to report a positive window; the fixed default budgets are used
+    /// then — a window is never guessed.
+    async fn resolve_review_prompt_budget_basis(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+        reviewers: &[ReviewerProfile],
+    ) -> Option<u64> {
+        let mut models = std::collections::BTreeSet::new();
+        for resolved in [review_model(job), router_model(job), analyst_model(job)]
+            .into_iter()
+            .chain(
+                reviewers
+                    .iter()
+                    .map(|reviewer| reviewer_model(job, reviewer)),
+            )
+        {
+            match resolved {
+                Ok(model) => {
+                    models.insert(model);
+                }
+                // A missing model configuration fails later with its own
+                // actionable error; budgets just stay at the defaults.
+                Err(_) => return None,
+            }
+        }
+        // Distinct models resolve concurrently (with cold provider caches
+        // each lookup can hit the network), and completions are consumed as
+        // they arrive so the first decisive failure returns immediately and
+        // drops the remaining lookups.
+        let mut lookups = models
+            .iter()
+            .map(|model| async move { (model, self.resolve_model_info(model).await) })
+            .collect::<stream::FuturesUnordered<_>>();
+        let mut smallest: Option<u64> = None;
+        while let Some((model, info)) = lookups.next().await {
+            match info {
+                Ok(info) if info.context_window > 0 => {
+                    smallest =
+                        Some(smallest.map_or(info.context_window, |s| s.min(info.context_window)));
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        %model,
+                        "model reported no context window; using fixed review prompt budgets"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %model,
+                        %error,
+                        "model metadata unavailable; using fixed review prompt budgets"
+                    );
+                    return None;
+                }
+            }
+        }
+        smallest
+    }
+
+    /// Prompt budgets for one job. The basis window is resolved once per job
+    /// and persisted, so every retry of the same job batches identically even
+    /// when provider metadata is transiently unavailable — otherwise a
+    /// changed digest would discard completed reviewer work.
+    async fn review_prompt_budgets(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+        reviewers: &[ReviewerProfile],
+    ) -> ReviewPromptBudgets {
+        let basis = match self.store.code_review_job_prompt_budget_window(&job.id) {
+            Ok(Some(persisted)) => (persisted > 0).then_some(persisted),
+            Ok(None) => {
+                let resolved = self
+                    .resolve_review_prompt_budget_basis(job, reviewers)
+                    .await;
+                if let Err(error) = self
+                    .store
+                    .set_code_review_job_prompt_budget_window(&job.id, resolved.unwrap_or(0))
+                {
+                    tracing::warn!(job_id = %job.id, %error, "persisting review prompt budget basis");
+                }
+                // The guarded UPDATE means a concurrent attempt's resolution
+                // may have won the write race; the stored value — not this
+                // attempt's local resolution — is the single source of truth
+                // for the job's batches.
+                match self.store.code_review_job_prompt_budget_window(&job.id) {
+                    Ok(Some(persisted)) => (persisted > 0).then_some(persisted),
+                    Ok(None) => resolved,
+                    Err(error) => {
+                        tracing::warn!(job_id = %job.id, %error, "rereading review prompt budget basis");
+                        resolved
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(job_id = %job.id, %error, "loading review prompt budget basis");
+                self.resolve_review_prompt_budget_basis(job, reviewers)
+                    .await
+            }
+        };
+        let budgets = derived_review_prompt_budgets(basis);
+        if budgets != ReviewPromptBudgets::default() {
+            tracing::debug!(
+                smallest_context_window = basis,
+                batch_target_tokens = budgets.batch_target_tokens,
+                batch_max_bytes = budgets.batch_max_bytes,
+                "derived review prompt budgets from configured models"
+            );
+        }
+        budgets
+    }
+
     async fn execute_code_review(
         self: &Arc<Self>,
         record: &CodeReviewJobRecord,
@@ -4805,7 +4937,14 @@ impl Engine {
         } else {
             (diff_files, 0)
         };
-        let batches = build_effective_review_batches(&diff_files, reused_hunk_count);
+        let reviewers = if record.reviewers.is_empty() {
+            self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
+        } else {
+            record.reviewers.clone()
+        };
+        let prompt_budgets = self.review_prompt_budgets(&job, &reviewers).await;
+        let batches =
+            build_effective_review_batches(&diff_files, reused_hunk_count, prompt_budgets);
         let batch_digest = review_batch_digest(
             &job.review_base_sha,
             &job.head_sha,
@@ -4816,11 +4955,6 @@ impl Engine {
             .store
             .prepare_code_review_batch_snapshot(&job.id, &batch_digest)?;
         self.flush_pending_code_review_events(&job.id).await?;
-        let reviewers = if record.reviewers.is_empty() {
-            self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
-        } else {
-            record.reviewers.clone()
-        };
         let batch_snapshot_changed = snapshot.changed;
         let mut routing_decisions = self.store.code_review_routing_decisions(&job.id)?;
         if batch_snapshot_changed {
@@ -5353,6 +5487,7 @@ impl Engine {
                 implementation_analysis.as_ref(),
                 &diff_files,
                 reused_hunk_count,
+                prompt_budgets,
             )?;
             let task = if let Some(task) = queued_coordinator.take() {
                 task
@@ -12252,18 +12387,95 @@ fn diff_hunk_range(range: &str, sigil: char) -> Option<(u64, u64)> {
     parts.next().is_none().then_some((start, count))
 }
 
+/// Byte budgets for model-facing review prompts. Defaults mirror the fixed
+/// constants that predate model-derived sizing; when every model a job can
+/// call reports a context window, the budgets scale from the smallest window
+/// so large-window fleets pack more diff per call (fewer, cheaper reviewer
+/// invocations) while small windows shrink every budget monotonically below
+/// the fixed defaults. Floors keep prompts minimally useful: a window
+/// smaller than the combined floors (roughly twice the envelope reserve)
+/// stays best-effort, exactly as it was before this derivation existed —
+/// only with far less content than the old unconditional constants sent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewPromptBudgets {
+    batch_target_tokens: usize,
+    batch_max_bytes: usize,
+    coordinator_context_max_bytes: usize,
+    history_findings_max_bytes: usize,
+    history_themes_max_bytes: usize,
+    history_rejections_max_bytes: usize,
+}
+
+impl Default for ReviewPromptBudgets {
+    fn default() -> Self {
+        Self {
+            batch_target_tokens: REVIEW_BATCH_TARGET_TOKENS,
+            batch_max_bytes: REVIEW_BATCH_MAX_BYTES,
+            coordinator_context_max_bytes: REVIEW_COORDINATOR_CONTEXT_MAX_BYTES,
+            history_findings_max_bytes: REVIEW_HISTORY_FINDINGS_MAX_BYTES,
+            history_themes_max_bytes: REVIEW_HISTORY_THEMES_MAX_BYTES,
+            history_rejections_max_bytes: REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES,
+        }
+    }
+}
+
+/// Derive prompt budgets from the smallest context window (in tokens) among
+/// the models a review job can call. None (or a zero window) keeps the fixed
+/// defaults: budgets are never guessed for models that do not report a
+/// window.
+fn derived_review_prompt_budgets(smallest_context_window: Option<u64>) -> ReviewPromptBudgets {
+    let Some(window) = smallest_context_window.filter(|window| *window > 0) else {
+        return ReviewPromptBudgets::default();
+    };
+    let window = usize::try_from(window).unwrap_or(usize::MAX);
+    // An eighth of the window is a conservative growth basis; the historical
+    // default stays the floor so behavior never regresses, and the 4x
+    // ceiling bounds per-call latency. On small windows the content ceiling
+    // first subtracts the request envelope (persona prompt, rubric, changed
+    // paths, output) and then halves what remains, so batch content leaves
+    // the envelope room whenever the window can hold both; below that, the
+    // floor keeps a minimally useful batch and the window is best-effort.
+    let content_ceiling = window.saturating_sub(REVIEW_PROMPT_ENVELOPE_RESERVE_TOKENS) / 2;
+    let batch_target_tokens = (window / 8)
+        .clamp(REVIEW_BATCH_TARGET_TOKENS, REVIEW_BATCH_TARGET_TOKENS_MAX)
+        .min(content_ceiling)
+        .max(REVIEW_BATCH_TARGET_TOKENS_MIN);
+    // Keep the historical bytes-per-token ratio (128KB for a 24K-token
+    // target) between the token target and the byte ceilings.
+    let batch_max_bytes = batch_target_tokens.saturating_mul(16) / 3;
+    // History sections travel inside the coordinator request alongside the
+    // diff context; on small windows they scale down with it (never up), so
+    // the dynamic envelope shrinks together with the content.
+    let scale = |bytes: usize| {
+        (bytes.saturating_mul(batch_max_bytes.min(REVIEW_BATCH_MAX_BYTES)) / REVIEW_BATCH_MAX_BYTES)
+            .max(4 * 1024)
+    };
+    ReviewPromptBudgets {
+        batch_target_tokens,
+        batch_max_bytes,
+        coordinator_context_max_bytes: batch_max_bytes,
+        history_findings_max_bytes: scale(REVIEW_HISTORY_FINDINGS_MAX_BYTES),
+        history_themes_max_bytes: scale(REVIEW_HISTORY_THEMES_MAX_BYTES),
+        history_rejections_max_bytes: scale(REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES),
+    }
+}
+
 fn build_effective_review_batches(
     files: &[ReviewDiffFile],
     reused_hunk_count: usize,
+    budgets: ReviewPromptBudgets,
 ) -> Vec<ReviewBatch> {
     if files.is_empty() && reused_hunk_count > 0 {
         Vec::new()
     } else {
-        build_review_batches(files)
+        build_review_batches(files, budgets)
     }
 }
 
-fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
+fn build_review_batches(
+    files: &[ReviewDiffFile],
+    budgets: ReviewPromptBudgets,
+) -> Vec<ReviewBatch> {
     if files.is_empty() {
         return vec![ReviewBatch {
             paths: Vec::new(),
@@ -12274,14 +12486,15 @@ fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
     for file in files {
         if is_generated_review_artifact(file) {
             let section = generated_review_artifact_summary(file);
-            pack_review_section(&mut batches, &file.path, section, 0);
+            pack_review_section(&mut batches, &file.path, section, 0, budgets);
             continue;
         }
         // Reserve enough room for the repeated path/fragment header so even
         // one very large file cannot produce an oversized model request.
         let largest_header = format!("\n=== {} (diff fragment {}) ===\n", file.path, usize::MAX);
-        let token_byte_budget = REVIEW_BATCH_TARGET_TOKENS.saturating_mul(4);
-        let chunk_limit = REVIEW_BATCH_MAX_BYTES
+        let token_byte_budget = budgets.batch_target_tokens.saturating_mul(4);
+        let chunk_limit = budgets
+            .batch_max_bytes
             .min(token_byte_budget)
             .saturating_sub(largest_header.len() + 1)
             .max(1);
@@ -12295,8 +12508,13 @@ fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
                 index + 1,
                 chunk
             );
-            minimum_batch_index =
-                pack_review_section(&mut batches, &file.path, section, minimum_batch_index);
+            minimum_batch_index = pack_review_section(
+                &mut batches,
+                &file.path,
+                section,
+                minimum_batch_index,
+                budgets,
+            );
         }
     }
     batches.into_iter().map(|batch| batch.batch).collect()
@@ -12307,6 +12525,7 @@ fn pack_review_section(
     path: &str,
     section: String,
     minimum_batch_index: usize,
+    budgets: ReviewPromptBudgets,
 ) -> usize {
     let section_tokens = estimated_tokens(&section);
     // Best-fit backfills an earlier batch when a large intervening file did
@@ -12316,7 +12535,7 @@ fn pack_review_section(
         .iter()
         .enumerate()
         .filter(|(index, batch)| {
-            *index >= minimum_batch_index && batch.fits(path, &section, section_tokens)
+            *index >= minimum_batch_index && batch.fits(path, &section, section_tokens, budgets)
         })
         .max_by_key(|(_, batch)| batch.batch.diff.len())
         .map(|(index, _)| index);
@@ -12945,6 +13164,7 @@ fn validation_prompt(
     implementation_analysis: Option<&ImplementationAnalysis>,
     files: &[ReviewDiffFile],
     reused_hunk_count: usize,
+    budgets: ReviewPromptBudgets,
 ) -> Result<String> {
     let job = &record.job;
     let candidate_paths = candidates
@@ -12966,7 +13186,12 @@ fn validation_prompt(
                 .flat_map(|theme| theme.affected_paths.iter().map(String::as_str)),
         )
         .collect::<HashSet<_>>();
-    let diff_context = coordinator_diff_context(files, &relevant_paths, &candidate_paths);
+    let diff_context = coordinator_diff_context(
+        files,
+        &relevant_paths,
+        &candidate_paths,
+        budgets.coordinator_context_max_bytes,
+    );
     let candidate_findings = candidates
         .iter()
         .map(|candidate| -> Result<serde_json::Value> {
@@ -12985,9 +13210,12 @@ fn validation_prompt(
             Ok(value)
         })
         .collect::<Result<Vec<_>>>()?;
-    let finding_history = compact_finding_history(finding_history)?;
-    let prior_candidate_rejections =
-        compact_candidate_rejection_history(prior_candidate_rejections)?;
+    let finding_history =
+        compact_finding_history(finding_history, budgets.history_findings_max_bytes)?;
+    let prior_candidate_rejections = compact_candidate_rejection_history(
+        prior_candidate_rejections,
+        budgets.history_rejections_max_bytes,
+    )?;
     // Escalate on semantic recurrence: a durable theme that has recurred
     // despite fixes is the root-cause form of fix churn, and it needs a
     // design-level recommendation rather than another point fix.
@@ -13024,7 +13252,7 @@ fn validation_prompt(
             count = recurring_themes.len(),
         )
     };
-    let previous_themes = compact_theme_history(previous_themes)?;
+    let previous_themes = compact_theme_history(previous_themes, budgets.history_themes_max_bytes)?;
     let external_comments = compact_external_review_comments(external_comments)?;
     let reuse_note = if reused_hunk_count == 0 {
         String::new()
@@ -13306,6 +13534,7 @@ fn compact_external_review_comments(
 
 fn compact_candidate_rejection_history(
     rejections: &[trouve_protocol::CodeReviewCandidateRejection],
+    max_bytes: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let values = rejections.iter().map(|rejection| {
         serde_json::json!({
@@ -13318,7 +13547,7 @@ fn compact_candidate_rejection_history(
                 .unwrap_or("unknown"),
         })
     });
-    bounded_json_values(values, REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES)
+    bounded_json_values(values, max_bytes)
 }
 
 fn candidate_adjudication_fingerprint(path: &str, title: &str, body: &str) -> String {
@@ -13337,13 +13566,14 @@ fn candidate_adjudication_fingerprint(path: &str, title: &str, body: &str) -> St
 
 fn compact_finding_history(
     findings: &[trouve_protocol::CodeReviewFinding],
+    max_bytes: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let values = findings
         .iter()
         .rev()
         .map(compact_finding_value)
         .collect::<Result<Vec<_>>>()?;
-    bounded_json_values(values, REVIEW_HISTORY_FINDINGS_MAX_BYTES)
+    bounded_json_values(values, max_bytes)
 }
 
 fn bounded_json_text(value: &str, max_serialized_bytes: usize, marker: &str) -> String {
@@ -13475,19 +13705,21 @@ fn compact_theme_value(theme: &trouve_protocol::CodeReviewTheme) -> Result<serde
 
 fn compact_theme_history(
     themes: &[trouve_protocol::CodeReviewTheme],
+    max_bytes: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let values = themes
         .iter()
         .rev()
         .map(compact_theme_value)
         .collect::<Result<Vec<_>>>()?;
-    bounded_json_values(values, REVIEW_HISTORY_THEMES_MAX_BYTES)
+    bounded_json_values(values, max_bytes)
 }
 
 fn coordinator_diff_context(
     files: &[ReviewDiffFile],
     paths: &HashSet<&str>,
     priority_paths: &HashSet<&str>,
+    max_bytes: usize,
 ) -> String {
     let mut context = String::new();
     let ordered_files = files
@@ -13498,12 +13730,12 @@ fn coordinator_diff_context(
         }));
     for file in ordered_files {
         let header = format!("\n=== {} ===\n", file.path);
-        let remaining = REVIEW_COORDINATOR_CONTEXT_MAX_BYTES.saturating_sub(context.len());
+        let remaining = max_bytes.saturating_sub(context.len());
         if header.len() >= remaining {
             break;
         }
         context.push_str(&header);
-        let remaining = REVIEW_COORDINATOR_CONTEXT_MAX_BYTES.saturating_sub(context.len());
+        let remaining = max_bytes.saturating_sub(context.len());
         let chunk = split_diff_chunks(&file.diff, remaining)
             .into_iter()
             .next()
@@ -13511,7 +13743,7 @@ fn coordinator_diff_context(
         context.push_str(chunk);
         if chunk.len() < file.diff.len() {
             let marker = "\n[diff truncated; use git_diff for the remainder]\n";
-            let remaining = REVIEW_COORDINATOR_CONTEXT_MAX_BYTES.saturating_sub(context.len());
+            let remaining = max_bytes.saturating_sub(context.len());
             context.push_str(&bounded_utf8(marker, remaining, ""));
         }
     }
@@ -15807,10 +16039,11 @@ mod tests {
 
     #[test]
     fn only_rewrite_reuse_turns_an_empty_diff_into_zero_batches() {
-        let unchanged_empty = build_effective_review_batches(&[], 0);
+        let unchanged_empty =
+            build_effective_review_batches(&[], 0, ReviewPromptBudgets::default());
         assert_eq!(unchanged_empty.len(), 1);
         assert!(unchanged_empty[0].diff.contains("No textual file changes"));
-        assert!(build_effective_review_batches(&[], 1).is_empty());
+        assert!(build_effective_review_batches(&[], 1, ReviewPromptBudgets::default()).is_empty());
     }
 
     #[test]
@@ -16882,13 +17115,37 @@ mod tests {
         };
 
         // A theme seen once is history, not instability.
-        let calm =
-            validation_prompt(&record, &[], &[], &[], &[theme(1)], &[], "", None, &[], 0).unwrap();
+        let calm = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[theme(1)],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(!calm.contains("Recurring instability:"));
 
         // A recurring theme triggers the design-level escalation.
-        let escalated =
-            validation_prompt(&record, &[], &[], &[], &[theme(3)], &[], "", None, &[], 0).unwrap();
+        let escalated = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[theme(3)],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(escalated.contains("Recurring instability:"));
         assert!(escalated.contains("`th_lifecycle` (recurred 3 time(s))"));
         assert!(escalated.contains("design-level fix"));
@@ -16906,13 +17163,38 @@ mod tests {
         let mut record = store.code_review_job(&job.id).unwrap().unwrap();
 
         // Without a description, the guidance is omitted entirely.
-        let without =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let without = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(!without.contains("author's claimed intent"));
 
         record.pull_body =
             "Removes the per-engine caps so independent sessions are provider-limited.".into();
-        let with = validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let with = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(with.contains("author's claimed intent"));
         assert!(with.contains("never a reason by itself to reject a candidate"));
         assert!(with.contains("predate later revisions"));
@@ -16988,6 +17270,7 @@ mod tests {
             Some(&analysis),
             &[],
             0,
+            ReviewPromptBudgets::default(),
         )
         .unwrap();
         assert!(with.contains("derived_implementation_analysis"));
@@ -16995,8 +17278,20 @@ mod tests {
         assert!(with.contains("observed counterpoint"));
         assert!(with.contains("process-wide semaphore"));
 
-        let without =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let without = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(!without.contains("read only the full-branch diff"));
     }
 
@@ -20456,7 +20751,8 @@ mod tests {
             }))
             .unwrap();
         let findings = (0..100).map(|_| finding.clone()).collect::<Vec<_>>();
-        let compact = compact_finding_history(&findings).unwrap();
+        let compact =
+            compact_finding_history(&findings, REVIEW_HISTORY_FINDINGS_MAX_BYTES).unwrap();
         let encoded = serde_json::to_string(&compact).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_FINDINGS_MAX_BYTES);
         assert!(!encoded.contains("must not be copied"));
@@ -20494,7 +20790,8 @@ mod tests {
             }))
             .unwrap();
 
-        let findings = compact_finding_history(&[finding]).unwrap();
+        let findings =
+            compact_finding_history(&[finding], REVIEW_HISTORY_FINDINGS_MAX_BYTES).unwrap();
         let encoded = serde_json::to_string(&findings).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_FINDINGS_MAX_BYTES);
         assert_eq!(findings.len(), 1);
@@ -20539,7 +20836,7 @@ mod tests {
             compact_value_len < REVIEW_HISTORY_THEMES_MAX_BYTES,
             "compacted theme still uses {compact_value_len} bytes"
         );
-        let themes = compact_theme_history(&[theme]).unwrap();
+        let themes = compact_theme_history(&[theme], REVIEW_HISTORY_THEMES_MAX_BYTES).unwrap();
         let encoded = serde_json::to_string(&themes).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_THEMES_MAX_BYTES);
         assert_eq!(themes.len(), 1);
@@ -22641,7 +22938,7 @@ mod tests {
                 generated_header: None,
             },
         ];
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
         let covered: HashSet<_> = batches
             .iter()
             .flat_map(|batch| batch.paths.iter().map(String::as_str))
@@ -23127,9 +23424,14 @@ mod tests {
         let expected_fingerprint =
             candidate_adjudication_fingerprint(&rejection.path, &rejection.title, &rejection.body);
 
-        let history =
-            serde_json::to_string(&compact_candidate_rejection_history(&[rejection]).unwrap())
-                .unwrap();
+        let history = serde_json::to_string(
+            &compact_candidate_rejection_history(
+                &[rejection],
+                REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES,
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         assert!(history.contains(&expected_fingerprint));
         assert!(history.contains(r#""category":"false_positive""#));
@@ -23403,6 +23705,7 @@ mod tests {
                 generated_header: None,
             }],
             0,
+            ReviewPromptBudgets::default(),
         )
         .unwrap();
 
@@ -23734,8 +24037,20 @@ mod tests {
             diff: "+fn changed() {}\n".into(),
         };
         let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[], 0);
-        let coordinator_prompt =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let coordinator_prompt = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
 
         for (name, prompt) in [
             ("reviewer", reviewer_prompt.as_str()),
@@ -25063,8 +25378,20 @@ mod tests {
         assert!(prompt.contains("locate every writer of that state"));
         assert!(prompt.contains("correct under re-execution"));
 
-        let coordinator =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let coordinator = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(coordinator.contains("broken by an unchanged writer or runner"));
         assert!(coordinator.contains("must not be rejected as"));
     }
@@ -25370,12 +25697,216 @@ mod tests {
             diff: "+let value = 1234;\n".repeat(20_000),
             generated_header: None,
         }];
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
         assert!(batches.len() > 1);
         assert!(batches.iter().all(|batch| {
             batch.diff.len() <= REVIEW_BATCH_MAX_BYTES
                 && estimated_tokens(&batch.diff) <= REVIEW_BATCH_TARGET_TOKENS + 1
         }));
+
+        // Larger derived budgets pack the same diff into fewer batches, and
+        // every batch honors the derived caps rather than the fixed ones.
+        let derived = derived_review_prompt_budgets(Some(400_000));
+        let derived_batches = build_review_batches(&files, derived);
+        assert!(derived_batches.len() < batches.len());
+        assert!(derived_batches.iter().all(|batch| {
+            batch.diff.len() <= derived.batch_max_bytes
+                && estimated_tokens(&batch.diff) <= derived.batch_target_tokens + 1
+        }));
+    }
+
+    struct BudgetWindowProvider {
+        default_window: std::sync::atomic::AtomicU64,
+        small_window: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl trouve_providers::Provider for BudgetWindowProvider {
+        fn id(&self) -> &str {
+            "provider"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            let model = |id: &str, context_window: u64| trouve_protocol::ModelInfo {
+                id: id.into(),
+                display_name: id.into(),
+                context_window,
+                supports_tools: true,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                options_schema: serde_json::json!({}),
+            };
+            vec![
+                model(
+                    "provider/default",
+                    self.default_window
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                ),
+                model(
+                    "provider/small",
+                    self.small_window.load(std::sync::atomic::Ordering::SeqCst),
+                ),
+            ]
+        }
+
+        async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            self.models()
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            unreachable!("budget resolution never starts a model turn")
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_budgets_resolve_once_and_reuse_the_persisted_basis() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:budget-engine");
+        let second_job = enqueue_test_review_job(&store, "acme/widgets#42:budget-engine-fresh");
+        let provider = Arc::new(BudgetWindowProvider {
+            default_window: std::sync::atomic::AtomicU64::new(400_000),
+            small_window: std::sync::atomic::AtomicU64::new(200_000),
+        });
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        )
+        .with_provider("provider", provider.clone());
+        let reviewer = ReviewerProfile {
+            id: "correctness".into(),
+            name: "Correctness".into(),
+            prompt: String::new(),
+            model: Some("provider/small".into()),
+            default_thinking_level: None,
+            built_in: true,
+        };
+
+        // The smallest window across the job's models wins (the reviewer's
+        // 200K, not the review model's 400K).
+        let first = engine
+            .review_prompt_budgets(&job, std::slice::from_ref(&reviewer))
+            .await;
+        assert_eq!(first, derived_review_prompt_budgets(Some(200_000)));
+
+        // Provider metadata changes mid-job; the persisted basis wins, so a
+        // retry batches identically.
+        provider
+            .small_window
+            .store(50_000, std::sync::atomic::Ordering::SeqCst);
+        let retry = engine
+            .review_prompt_budgets(&job, std::slice::from_ref(&reviewer))
+            .await;
+        assert_eq!(retry, first);
+
+        // A different job resolves fresh and sees the new smaller window.
+        let fresh = engine
+            .review_prompt_budgets(&second_job, std::slice::from_ref(&reviewer))
+            .await;
+        assert_eq!(fresh, derived_review_prompt_budgets(Some(50_000)));
+    }
+
+    #[test]
+    fn prompt_budget_basis_persists_first_resolution_per_job() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:budget-basis");
+        // Never resolved: no basis on record.
+        assert_eq!(
+            store
+                .code_review_job_prompt_budget_window(&queued.id)
+                .unwrap(),
+            None
+        );
+        // First resolution wins and survives later attempts to overwrite,
+        // so every retry of the job batches identically.
+        store
+            .set_code_review_job_prompt_budget_window(&queued.id, 400_000)
+            .unwrap();
+        store
+            .set_code_review_job_prompt_budget_window(&queued.id, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_job_prompt_budget_window(&queued.id)
+                .unwrap(),
+            Some(400_000)
+        );
+        // A resolved-but-unknown basis persists as zero, which maps to the
+        // fixed default budgets.
+        let second = enqueue_test_review_job(&store, "acme/widgets#43:budget-basis-unknown");
+        store
+            .set_code_review_job_prompt_budget_window(&second.id, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_job_prompt_budget_window(&second.id)
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            derived_review_prompt_budgets(None),
+            derived_review_prompt_budgets(Some(0))
+        );
+    }
+
+    #[test]
+    fn prompt_budgets_derive_from_the_smallest_context_window() {
+        // No window (or zero) keeps the fixed defaults — never guess.
+        assert_eq!(
+            derived_review_prompt_budgets(None),
+            ReviewPromptBudgets::default()
+        );
+        assert_eq!(
+            derived_review_prompt_budgets(Some(0)),
+            ReviewPromptBudgets::default()
+        );
+
+        // A 400K-token window grows the target to window/8 = 50K tokens and
+        // keeps the historical bytes-per-token ratio for the byte ceilings.
+        // History caps scale down only — never past their defaults.
+        let large = derived_review_prompt_budgets(Some(400_000));
+        assert_eq!(large.batch_target_tokens, 50_000);
+        assert_eq!(large.batch_max_bytes, 50_000 * 16 / 3);
+        assert_eq!(large.coordinator_context_max_bytes, large.batch_max_bytes);
+        assert_eq!(
+            large.history_findings_max_bytes,
+            REVIEW_HISTORY_FINDINGS_MAX_BYTES
+        );
+
+        // Growth caps at 4x the fixed default even for very large windows.
+        let huge = derived_review_prompt_budgets(Some(1_050_000));
+        assert_eq!(huge.batch_target_tokens, REVIEW_BATCH_TARGET_TOKENS_MAX);
+
+        // A small window subtracts the request envelope before halving, so
+        // batch content can never crowd the persona prompt and output out of
+        // the window, and the history caps shrink with the content.
+        let small = derived_review_prompt_budgets(Some(32_000));
+        assert_eq!(
+            small.batch_target_tokens,
+            (32_000 - REVIEW_PROMPT_ENVELOPE_RESERVE_TOKENS) / 2
+        );
+        assert!(small.history_findings_max_bytes < REVIEW_HISTORY_FINDINGS_MAX_BYTES);
+        assert!(small.history_themes_max_bytes < REVIEW_HISTORY_THEMES_MAX_BYTES);
+        assert!(small.history_rejections_max_bytes >= 4 * 1024);
+        let tiny = derived_review_prompt_budgets(Some(8_000));
+        assert_eq!(tiny.batch_target_tokens, REVIEW_BATCH_TARGET_TOKENS_MIN);
+
+        // A window at or below the fixed default's comfort zone keeps every
+        // default budget.
+        let default_window = derived_review_prompt_budgets(Some(8 * 24 * 1024));
+        assert_eq!(
+            default_window.batch_target_tokens,
+            REVIEW_BATCH_TARGET_TOKENS
+        );
+        assert_eq!(default_window.batch_max_bytes, REVIEW_BATCH_MAX_BYTES);
+        assert_eq!(default_window, ReviewPromptBudgets::default());
     }
 
     #[test]
@@ -25398,7 +25929,7 @@ mod tests {
             },
         ];
 
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].paths.len(), 2);
@@ -25439,8 +25970,8 @@ mod tests {
         let second_file = file("old_b", "new_b");
         assert_eq!(first_file.diff.len(), second_file.diff.len());
 
-        let first = build_review_batches(&[first_file]);
-        let second = build_review_batches(&[second_file]);
+        let first = build_review_batches(&[first_file], ReviewPromptBudgets::default());
+        let second = build_review_batches(&[second_file], ReviewPromptBudgets::default());
         let persisted_prompt = review_batch_identity(&first[0], 0, 1);
 
         assert!(first[0].diff.contains("1 added and 1 removed lines"));
@@ -25467,7 +25998,7 @@ mod tests {
         };
 
         assert!(!is_generated_review_artifact(&file));
-        let batches = build_review_batches(&[file]);
+        let batches = build_review_batches(&[file], ReviewPromptBudgets::default());
         assert!(!batches[0].diff.contains("generated artifact summary"));
         assert!(batches[0].diff.contains("export const"));
     }
@@ -25484,7 +26015,7 @@ mod tests {
 
         assert!(!is_generated_review_artifact(&file));
         assert!(
-            build_review_batches(&[file])[0]
+            build_review_batches(&[file], ReviewPromptBudgets::default())[0]
                 .diff
                 .contains("reviewed_source")
         );
@@ -25501,7 +26032,7 @@ mod tests {
         };
 
         assert!(!is_generated_review_artifact(&file));
-        let batches = build_review_batches(&[file]);
+        let batches = build_review_batches(&[file], ReviewPromptBudgets::default());
         assert!(batches[0].diff.contains("checksum = \"untrusted-change\""));
 
         let nested = ReviewDiffFile {
@@ -25532,7 +26063,7 @@ mod tests {
             },
         ];
 
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
 
         assert_eq!(batches.len(), 2);
         assert_eq!(
@@ -25557,7 +26088,7 @@ mod tests {
             },
         ];
 
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
         let first = batches
             .iter()
             .position(|batch| batch.diff.contains("diff fragment 1/2"))
@@ -25763,7 +26294,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].paths.len(), files.len());
@@ -25784,7 +26315,8 @@ mod tests {
             },
         ];
         let paths = HashSet::from(["src/relevant.rs"]);
-        let context = coordinator_diff_context(&files, &paths, &paths);
+        let context =
+            coordinator_diff_context(&files, &paths, &paths, REVIEW_COORDINATOR_CONTEXT_MAX_BYTES);
         assert!(context.contains("broken"));
         assert!(!context.contains("unrelated"));
     }
@@ -25806,7 +26338,12 @@ mod tests {
         let paths = HashSet::from(["src/historical.rs", "src/candidate.rs"]);
         let priority = HashSet::from(["src/candidate.rs"]);
 
-        let context = coordinator_diff_context(&files, &paths, &priority);
+        let context = coordinator_diff_context(
+            &files,
+            &paths,
+            &priority,
+            REVIEW_COORDINATOR_CONTEXT_MAX_BYTES,
+        );
 
         assert!(context.contains("candidate_defect"));
     }
@@ -25820,7 +26357,8 @@ mod tests {
         }];
         let paths = HashSet::from(["src/relevant.rs"]);
 
-        let context = coordinator_diff_context(&files, &paths, &paths);
+        let context =
+            coordinator_diff_context(&files, &paths, &paths, REVIEW_COORDINATOR_CONTEXT_MAX_BYTES);
 
         assert!(context.len() <= REVIEW_COORDINATOR_CONTEXT_MAX_BYTES);
     }
