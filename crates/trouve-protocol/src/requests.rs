@@ -2128,6 +2128,24 @@ pub struct CodeReviewFindingEvidence {
     pub introduction: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub regression_test: String,
+    /// Verbatim source line at the finding's anchor, quoted by the
+    /// coordinator while verifying the finding. Mechanically matched against
+    /// the reviewed revision; empty when the anchor was never verified.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub anchor_quote: String,
+    /// Server-derived verdict for `anchor_quote`: `matched`, `mismatched`,
+    /// or `unchecked`. Model-provided values are overwritten.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub anchor_match: String,
+    /// The coordinator's grade of how much of `execution_path` it verified
+    /// against the repository: `verified`, `partial`, or `unverified`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub execution_path_verification: String,
+    /// The refuting guard, caller, or test the coordinator searched for to
+    /// disprove the finding, and what it found. Empty when no refutation was
+    /// attempted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub counterexample_search: String,
 }
 
 /// How a finding relates to earlier review rounds on the pull request.

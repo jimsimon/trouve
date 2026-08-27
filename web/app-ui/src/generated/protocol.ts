@@ -2056,8 +2056,30 @@ export interface components {
         };
         /** @description Concrete evidence that makes a confirmed finding independently verifiable. */
         CodeReviewFindingEvidence: {
+            /**
+             * @description Server-derived verdict for `anchor_quote`: `matched`, `mismatched`,
+             *     or `unchecked`. Model-provided values are overwritten.
+             */
+            anchor_match?: string;
+            /**
+             * @description Verbatim source line at the finding's anchor, quoted by the
+             *     coordinator while verifying the finding. Mechanically matched against
+             *     the reviewed revision; empty when the anchor was never verified.
+             */
+            anchor_quote?: string;
             consequence?: string;
+            /**
+             * @description The refuting guard, caller, or test the coordinator searched for to
+             *     disprove the finding, and what it found. Empty when no refutation was
+             *     attempted.
+             */
+            counterexample_search?: string;
             execution_path?: string;
+            /**
+             * @description The coordinator's grade of how much of `execution_path` it verified
+             *     against the repository: `verified`, `partial`, or `unverified`.
+             */
+            execution_path_verification?: string;
             introduction?: string;
             preconditions?: string;
             regression_test?: string;

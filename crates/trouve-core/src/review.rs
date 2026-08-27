@@ -234,7 +234,10 @@ degradation, or compatibility break affecting a subset of users or workflows.
 - low: a narrow edge case or limited-consequence defect that is still actionable; exclude style \
 preferences and non-actionable nits.
 - Confidence measures only how strongly the available code and diff prove the issue exists, \
-independently of severity. Do not lower severity merely because confidence is low.
+independently of severity. Do not lower severity merely because confidence is low. Reported \
+confidence is additionally capped server-side by each finding's verification record — the \
+mechanically matched anchor quote, the execution-path verification grade, and the \
+counterexample search — so confidence must be earned by verification, not asserted.
 Use your reviewer mandate to recognize domain-specific consequences, but do not redefine these \
 shared thresholds.
 - The level you assign also selects the reporting gate: high findings and evidence-backed medium \
@@ -5555,6 +5558,7 @@ impl Engine {
                 std::mem::take(&mut validated.findings),
                 &coordinator_candidates,
                 &diff_files,
+                Some(&repository_path),
             );
             let missing_adjudications =
                 unadjudicated_candidate_ids(&validated, &coordinator_candidates);
@@ -5589,6 +5593,7 @@ impl Engine {
                                         std::mem::take(&mut repaired_output.findings),
                                         &coordinator_candidates,
                                         &diff_files,
+                                        Some(&repository_path),
                                     );
                                     merge_coordinator_adjudication_repair(
                                         &mut validated,
@@ -13371,7 +13376,16 @@ fn validation_prompt(
          or recurrence even when every prior finding in that theme has been resolved. For every \
          retained finding, provide evidence with a reachable state in `preconditions`, the concrete \
          event/call sequence in `execution_path`, a specific `consequence`, the changed behavior in \
-         `introduction`, and a behavioral `regression_test`. Classify `origin` as `new_change`, \
+         `introduction`, and a behavioral `regression_test`. Then record how you verified the \
+         finding: copy the exact source line at its anchor verbatim into `evidence.anchor_quote` \
+         (from the head revision; from the base revision for LEFT-side anchors) — the quote is \
+         mechanically matched against the repository, and a missing or mismatching quote caps \
+         the finding's confidence. Grade how much of the execution path you personally confirmed \
+         in `evidence.execution_path_verification` as `verified`, `partial`, or `unverified`, \
+         and record in `evidence.counterexample_search` the specific guard, caller, or test you \
+         searched for that would disprove the finding together with what you found; leave it \
+         empty only when you attempted no refutation. Full confidence requires a matched anchor \
+         quote, a verified execution path, and an attempted refutation. Classify `origin` as `new_change`, \
          `recurrence`, `fix_regression`, or `previously_missed`; use a non-new origin only when the \
          durable history supports it. Finally, look across retained findings, previously published \
          finding history, and durable themes: when symptoms share an underlying mechanism or missing \
@@ -13397,7 +13411,7 @@ fn validation_prompt(
          \"severity\":\"high|medium|low\",\"confidence\":\"high|medium|low\",\
          \"title\":\"concise one-line issue summary\",\
          \"body\":\"specific verified problem and fix\",\
-         \"evidence\":{{\"preconditions\":\"reachable trigger state\",\"execution_path\":\"concrete event/call sequence\",\"consequence\":\"specific impact\",\"introduction\":\"where this change introduced the defect\",\"regression_test\":\"behavioral test for the fix\"}},\
+         \"evidence\":{{\"preconditions\":\"reachable trigger state\",\"execution_path\":\"concrete event/call sequence\",\"consequence\":\"specific impact\",\"introduction\":\"where this change introduced the defect\",\"regression_test\":\"behavioral test for the fix\",\"anchor_quote\":\"exact source line at path:line, verbatim\",\"execution_path_verification\":\"verified|partial|unverified\",\"counterexample_search\":\"refuting guard/caller/test searched and the outcome\"}},\
          \"origin\":\"new_change|recurrence|fix_regression|previously_missed\",\
          \"source_candidate_ids\":[\"candidate id\"]}}],\
          \"rejected_candidates\":[{{\"candidate_id\":\"candidate id\",\
@@ -13758,11 +13772,13 @@ fn coordinator_validated_findings(
     findings: Vec<ReviewFinding>,
     candidates: &[CandidateFinding],
     files: &[ReviewDiffFile],
+    repository_path: Option<&std::path::Path>,
 ) -> Vec<ReviewFinding> {
     let candidate_ids = candidates
         .iter()
         .map(|candidate| candidate.candidate_id.as_str())
         .collect::<HashSet<_>>();
+    let diff_contents = diff_line_contents(files);
     structurally_valid_findings(findings, files)
         .into_iter()
         .filter_map(|mut finding| {
@@ -13780,7 +13796,16 @@ fn coordinator_validated_findings(
             ]
             .into_iter()
             .all(|value| !value.trim().is_empty());
-            (!finding.source_candidate_ids.is_empty() && has_evidence).then_some(finding)
+            if !finding.source_candidate_ids.is_empty() && has_evidence {
+                apply_verification_derived_confidence(
+                    &mut finding,
+                    &diff_contents,
+                    repository_path,
+                );
+                Some(finding)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -14989,6 +15014,160 @@ fn diff_range_start(range: &str, prefix: char) -> Option<u64> {
     range.strip_prefix(prefix)?.split(',').next()?.parse().ok()
 }
 
+/// Source text per (path, line, left-side) for every line the diff carries,
+/// so anchor quotes can be verified without touching the repository.
+fn diff_line_contents(files: &[ReviewDiffFile]) -> HashMap<(String, u64, bool), String> {
+    let mut contents = HashMap::new();
+    for file in files {
+        let mut old_line = 0;
+        let mut new_line = 0;
+        let mut in_hunk = false;
+        for line in file.diff.lines() {
+            if line.starts_with("@@ ") {
+                let mut ranges = line.split_whitespace();
+                let _marker = ranges.next();
+                old_line = ranges
+                    .next()
+                    .and_then(|range| diff_range_start(range, '-'))
+                    .unwrap_or(0);
+                new_line = ranges
+                    .next()
+                    .and_then(|range| diff_range_start(range, '+'))
+                    .unwrap_or(0);
+                in_hunk = old_line > 0 || new_line > 0;
+                continue;
+            }
+            if !in_hunk || line.starts_with("\\ No newline at end of file") {
+                continue;
+            }
+            match line.as_bytes().first().copied() {
+                Some(b'+') => {
+                    contents.insert((file.path.clone(), new_line, false), line[1..].to_owned());
+                    new_line += 1;
+                }
+                Some(b'-') => {
+                    contents.insert((file.path.clone(), old_line, true), line[1..].to_owned());
+                    old_line += 1;
+                }
+                Some(b' ') => {
+                    contents.insert((file.path.clone(), old_line, true), line[1..].to_owned());
+                    contents.insert((file.path.clone(), new_line, false), line[1..].to_owned());
+                    old_line += 1;
+                    new_line += 1;
+                }
+                _ => in_hunk = false,
+            }
+        }
+    }
+    contents
+}
+
+/// The source line a finding anchors to: from the diff when the anchor is a
+/// diff line, otherwise from the synced head checkout for RIGHT-side
+/// anchors. LEFT-side anchors outside the diff have no locally available
+/// base-revision content.
+fn finding_anchor_content(
+    finding: &ReviewFinding,
+    diff_contents: &HashMap<(String, u64, bool), String>,
+    repository_path: Option<&std::path::Path>,
+) -> Option<String> {
+    let left = finding.side.eq_ignore_ascii_case("left");
+    if let Some(content) = diff_contents.get(&(finding.path.clone(), finding.line, left)) {
+        return Some(content.clone());
+    }
+    if left {
+        return None;
+    }
+    // Structural validation already rejected unsafe paths; keep the guard
+    // anyway so this lookup can never leave the checkout.
+    let relative = std::path::Path::new(&finding.path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let root = repository_path?;
+    let text = std::fs::read_to_string(root.join(relative)).ok()?;
+    let index = usize::try_from(finding.line).ok()?.checked_sub(1)?;
+    text.lines().nth(index).map(str::to_owned)
+}
+
+/// Mechanical verdict for a coordinator-quoted anchor line against the
+/// actual source: `matched`, `mismatched`, or `unchecked` (no quote, or no
+/// content available to compare against).
+fn anchor_match_verdict(quote: &str, actual: Option<&str>) -> &'static str {
+    let quote = quote.trim();
+    if quote.is_empty() {
+        return "unchecked";
+    }
+    let Some(actual) = actual.map(str::trim) else {
+        return "unchecked";
+    };
+    if !actual.is_empty() && (actual == quote || actual.contains(quote) || quote.contains(actual)) {
+        "matched"
+    } else {
+        "mismatched"
+    }
+}
+
+/// Confidence supported by the verification record alone. The final finding
+/// confidence is the minimum of this and the coordinator's own assessment:
+/// verification bounds confidence from above, the model may still lower it.
+fn verification_supported_confidence(
+    evidence: &trouve_protocol::CodeReviewFindingEvidence,
+) -> &'static str {
+    let path_verified = evidence.execution_path_verification.trim() == "verified";
+    let refutation_attempted = !evidence.counterexample_search.trim().is_empty();
+    match evidence.anchor_match.as_str() {
+        // The quoted anchor was mechanically confirmed; full verification of
+        // the causal chain earns high, anything partial earns medium.
+        "matched" if path_verified && refutation_attempted => "high",
+        "matched" => "medium",
+        // A quote that failed the mechanical check is a verification claim
+        // that did not survive checking: the strongest negative signal.
+        "mismatched" => "low",
+        // No quote, or nothing to compare against. An otherwise fully
+        // verified chain still earns medium; an unverified one earns low.
+        _ if !evidence.anchor_quote.trim().is_empty() && path_verified && refutation_attempted => {
+            "medium"
+        }
+        _ => "low",
+    }
+}
+
+fn finding_level_rank(level: &str) -> u8 {
+    match canonical_finding_level(level) {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
+}
+
+/// Verify the coordinator's anchor quote mechanically and derive the
+/// finding's confidence from the verification record: confidence can never
+/// exceed what verification supports, while a coordinator that doubts its
+/// own finding can still lower it.
+fn apply_verification_derived_confidence(
+    finding: &mut ReviewFinding,
+    diff_contents: &HashMap<(String, u64, bool), String>,
+    repository_path: Option<&std::path::Path>,
+) {
+    const ANCHOR_QUOTE_MAX_BYTES: usize = 512;
+    let actual = finding_anchor_content(finding, diff_contents, repository_path);
+    finding.evidence.anchor_match =
+        anchor_match_verdict(&finding.evidence.anchor_quote, actual.as_deref()).to_owned();
+    let supported = verification_supported_confidence(&finding.evidence);
+    if finding_level_rank(supported) < finding_level_rank(&finding.confidence) {
+        finding.confidence = supported.to_owned();
+    }
+    // Bound the stored quote after comparison so a pathological quote cannot
+    // bloat the persisted evidence.
+    finding.evidence.anchor_quote =
+        bounded_utf8(&finding.evidence.anchor_quote, ANCHOR_QUOTE_MAX_BYTES, "…");
+}
+
 fn parse_review_output(output: &str) -> Result<ReviewOutput> {
     let trimmed = output.trim();
     if let Ok(review) = serde_json::from_str(trimmed) {
@@ -15208,6 +15387,7 @@ mod tests {
             consequence: "behavior is incorrect".into(),
             introduction: "changed branch".into(),
             regression_test: "exercise the state sequence".into(),
+            ..Default::default()
         }
     }
 
@@ -17091,6 +17271,241 @@ mod tests {
         assert!(!review_awaiting_full_coverage(&detail.job, Some(3)));
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
+    }
+
+    #[test]
+    fn anchor_verdicts_and_supported_confidence_follow_the_verification_table() {
+        // Verdicts: empty quote or missing content are unchecked; trimmed
+        // containment either way matches; anything else is a mismatch.
+        assert_eq!(anchor_match_verdict("", Some("let x = 1;")), "unchecked");
+        assert_eq!(anchor_match_verdict("let x = 1;", None), "unchecked");
+        assert_eq!(
+            anchor_match_verdict("  let x = 1;  ", Some("\tlet x = 1;")),
+            "matched"
+        );
+        assert_eq!(anchor_match_verdict("x = 1", Some("let x = 1;")), "matched");
+        assert_eq!(
+            anchor_match_verdict("let y = 2;", Some("let x = 1;")),
+            "mismatched"
+        );
+
+        let evidence = |anchor_match: &str, quote: &str, path: &str, search: &str| {
+            trouve_protocol::CodeReviewFindingEvidence {
+                anchor_quote: quote.into(),
+                anchor_match: anchor_match.into(),
+                execution_path_verification: path.into(),
+                counterexample_search: search.into(),
+                ..Default::default()
+            }
+        };
+        // Full verification earns high; a matched anchor alone earns medium.
+        assert_eq!(
+            verification_supported_confidence(&evidence(
+                "matched",
+                "let x = 1;",
+                "verified",
+                "searched for a guard in qualify(); none exists"
+            )),
+            "high"
+        );
+        assert_eq!(
+            verification_supported_confidence(&evidence("matched", "let x = 1;", "partial", "")),
+            "medium"
+        );
+        // A quote that failed mechanical matching is the strongest negative.
+        assert_eq!(
+            verification_supported_confidence(&evidence(
+                "mismatched",
+                "let y = 2;",
+                "verified",
+                "searched"
+            )),
+            "low"
+        );
+        // Unchecked anchors: a fully verified chain still earns medium; an
+        // unverified one earns low, and no record at all earns low.
+        assert_eq!(
+            verification_supported_confidence(&evidence(
+                "unchecked",
+                "let x = 1;",
+                "verified",
+                "searched"
+            )),
+            "medium"
+        );
+        assert_eq!(
+            verification_supported_confidence(&evidence("unchecked", "let x = 1;", "partial", "")),
+            "low"
+        );
+        assert_eq!(
+            verification_supported_confidence(&Default::default()),
+            "low"
+        );
+    }
+
+    #[test]
+    fn coordinator_confidence_is_capped_by_the_verification_record() {
+        let files = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1,3 @@\n+let token = compare(a, b);\n+two\n+three\n"
+                .into(),
+            generated_header: None,
+        }];
+        let candidate = |id: &str| CandidateFinding {
+            candidate_id: id.into(),
+            task_id: "rt_test".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            finding: ReviewFinding {
+                path: "src/lib.rs".into(),
+                line: 1,
+                side: "RIGHT".into(),
+                outside_diff: false,
+                severity: "medium".into(),
+                confidence: "high".into(),
+                title: "Test issue".into(),
+                // Distinct bodies keep the four cases out of the
+                // same-location duplicate filter.
+                body: format!("Actionable issue {id}"),
+                evidence: test_review_evidence(),
+                origin: Default::default(),
+                source_candidate_ids: vec![id.into()],
+            },
+        };
+        let with_verification = |id: &str, quote: &str, path: &str, search: &str| {
+            let mut finding = candidate(id).finding.clone();
+            finding.evidence.anchor_quote = quote.into();
+            finding.evidence.execution_path_verification = path.into();
+            finding.evidence.counterexample_search = search.into();
+            finding
+        };
+
+        let candidates = [
+            candidate("c-verified"),
+            candidate("c-wrong-quote"),
+            candidate("c-no-record"),
+            candidate("c-self-doubt"),
+        ];
+        let mut self_doubt = with_verification(
+            "c-self-doubt",
+            "let token = compare(a, b);",
+            "verified",
+            "searched for a constant-time helper; none exists",
+        );
+        self_doubt.confidence = "low".into();
+        let findings = coordinator_validated_findings(
+            vec![
+                with_verification(
+                    "c-verified",
+                    "let token = compare(a, b);",
+                    "verified",
+                    "searched for a constant-time helper; none exists",
+                ),
+                with_verification(
+                    "c-wrong-quote",
+                    "let secret = load();",
+                    "verified",
+                    "searched",
+                ),
+                candidate("c-no-record").finding.clone(),
+                self_doubt,
+            ],
+            &candidates,
+            &files,
+            None,
+        );
+        assert_eq!(findings.len(), 4);
+        let by_id = |id: &str| {
+            findings
+                .iter()
+                .find(|finding| finding.source_candidate_ids == [id.to_owned()])
+                .unwrap()
+        };
+        // Fully verified: asserted high survives, anchor verdict recorded.
+        let verified = by_id("c-verified");
+        assert_eq!(verified.confidence, "high");
+        assert_eq!(verified.evidence.anchor_match, "matched");
+        // A quote that does not match the diff caps confidence to low.
+        let wrong = by_id("c-wrong-quote");
+        assert_eq!(wrong.confidence, "low");
+        assert_eq!(wrong.evidence.anchor_match, "mismatched");
+        // No verification record at all: asserted high is not honored.
+        assert_eq!(by_id("c-no-record").confidence, "low");
+        // Verification bounds confidence from above only: the coordinator's
+        // own doubt still lowers it.
+        assert_eq!(by_id("c-self-doubt").confidence, "low");
+    }
+
+    #[test]
+    fn outside_diff_anchor_quotes_verify_against_the_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/config.rs"),
+            "line one\nlet retries = 5;\nline three\n",
+        )
+        .unwrap();
+        let finding = |quote: &str| ReviewFinding {
+            path: "src/config.rs".into(),
+            line: 2,
+            side: "RIGHT".into(),
+            outside_diff: true,
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Test issue".into(),
+            body: "Actionable issue".into(),
+            evidence: trouve_protocol::CodeReviewFindingEvidence {
+                anchor_quote: quote.into(),
+                execution_path_verification: "verified".into(),
+                counterexample_search: "searched the retry docs; none cover this".into(),
+                ..test_review_evidence()
+            },
+            origin: Default::default(),
+            source_candidate_ids: vec!["c-1".into()],
+        };
+        let contents = HashMap::new();
+        let mut matched = finding("let retries = 5;");
+        apply_verification_derived_confidence(&mut matched, &contents, Some(repo.path()));
+        assert_eq!(matched.evidence.anchor_match, "matched");
+        assert_eq!(matched.confidence, "high");
+        let mut mismatched = finding("let retries = 3;");
+        apply_verification_derived_confidence(&mut mismatched, &contents, Some(repo.path()));
+        assert_eq!(mismatched.evidence.anchor_match, "mismatched");
+        assert_eq!(mismatched.confidence, "low");
+        // A hostile path can never escape the checkout: it degrades to an
+        // unchecked anchor instead of reading outside the root.
+        let mut hostile = finding("root:x:0:0");
+        hostile.path = "../etc/passwd".into();
+        apply_verification_derived_confidence(&mut hostile, &contents, Some(repo.path()));
+        assert_eq!(hostile.evidence.anchor_match, "unchecked");
+    }
+
+    #[test]
+    fn coordinator_prompt_requires_the_verification_record() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:verification-contract");
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        let prompt = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
+        assert!(prompt.contains("\"anchor_quote\""));
+        assert!(prompt.contains("\"execution_path_verification\":\"verified|partial|unverified\""));
+        assert!(prompt.contains("\"counterexample_search\""));
+        assert!(prompt.contains("mechanically matched against the repository"));
+        assert!(prompt.contains(
+            "Full confidence requires a matched anchor quote, a verified execution path, and an attempted refutation"
+        ));
     }
 
     #[test]
@@ -23165,6 +23580,7 @@ mod tests {
             }],
             &[candidate],
             &files,
+            None,
         );
 
         assert_eq!(findings.len(), 1);
@@ -23363,6 +23779,7 @@ mod tests {
             std::mem::take(&mut structurally_rejected.findings),
             &candidates,
             &files,
+            None,
         );
         let unadjudicated =
             normalize_coordinator_output(&mut structurally_rejected, &candidates, &[]);
