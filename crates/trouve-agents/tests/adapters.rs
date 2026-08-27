@@ -871,6 +871,29 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
         serde_json::json!(["mcp"])
     );
     assert_eq!(
+        create["options"]["disallowedTools"],
+        serde_json::json!([
+            "shell",
+            "read",
+            "edit",
+            "grep",
+            "glob",
+            "ls",
+            "task",
+            "webSearch",
+            "delete",
+            "readLints",
+            "webFetch",
+            "semSearch",
+            "updateTodos",
+            "readTodos",
+            "askQuestion",
+            "await",
+            "generateImage",
+            "applyAgentDiff"
+        ])
+    );
+    assert_eq!(
         create["options"]["local"]["settingSources"],
         serde_json::json!([])
     );
@@ -1051,6 +1074,68 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
             .await
             .is_err(),
         "cancelled Cursor Bridge was still accepting connections"
+    );
+}
+
+#[tokio::test]
+async fn cursor_backend_shutdown_interrupts_an_active_send_and_reaps_bridge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = cursor_sdk_bridge_stub(tmp.path());
+    let backend = std::sync::Arc::new(
+        CursorBackend::new(
+            "cursor",
+            Some(stub.clone()),
+            Some("test-cursor-api-key".into()),
+        )
+        .with_state_root(tmp.path().join("sdk-state")),
+    );
+    let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+    next.prompt = "STALL_FOR_CANCELLATION".into();
+    next.tool_free = true;
+    let mut stream = backend.run_turn(next).await.unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(BackendEvent::TextDelta(text))) if text == "RUN_READY" => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Cursor Send failed before shutdown: {error}"),
+                None => panic!("Cursor Send ended before publishing shutdown readiness"),
+            }
+        }
+    })
+    .await
+    .expect("Cursor Send did not publish shutdown readiness");
+
+    let shutting_backend = backend.clone();
+    let mut shutdown = tokio::spawn(async move { shutting_backend.shutdown().await });
+    let mut saw_shutdown = false;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if let Err(error) = event {
+                saw_shutdown |= error.to_string().contains("pool is shutting down");
+            }
+        }
+    })
+    .await
+    .expect("active Cursor turn did not stop after backend shutdown");
+    assert!(saw_shutdown, "active turn did not report pool shutdown");
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut shutdown)
+        .await
+        .expect("backend shutdown remained blocked behind the active turn")
+        .unwrap()
+        .unwrap();
+
+    let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "shut down Cursor Bridge was still accepting connections"
     );
 }
 

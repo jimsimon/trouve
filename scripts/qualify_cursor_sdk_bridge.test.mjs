@@ -17,6 +17,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  CURSOR_NATIVE_TOOL_DENYLIST,
   ConnectRpcError,
   assetName,
   assertUniqueToolLifecycle,
@@ -26,6 +27,7 @@ import {
   exactTerminalResult,
   expectedBridgeChecksum,
   installSignalCleanup,
+  isUnknownToolValidationError,
   isUnsupportedRpcMethodError,
   parseTimeoutSeconds,
   readBoundedJsonResponse,
@@ -36,6 +38,7 @@ import {
   terminateTimedOutChild,
   terminateProcessTree,
   validateLoopbackBridgeUrl,
+  verifyToolAllowlist,
   waitForChildSettlement,
 } from "./qualify_cursor_sdk_bridge.mjs";
 import {
@@ -121,6 +124,86 @@ test("a blocked full qualification returns a failing process status", () => {
   assert.equal(qualificationExitCode({ decision: "proceed-with-sdk-bridge-adapter" }), 0);
   assert.equal(qualificationExitCode({ decision: "hold-sdk-bridge-promotion" }), 1);
   assert.equal(qualificationExitCode({ result: "passed" }), 0);
+});
+
+test("tool confinement pins every Cursor native tool except mcp", () => {
+  assert.equal(CURSOR_NATIVE_TOOL_DENYLIST.includes("mcp"), false);
+  for (const tool of ["shell", "read", "edit", "task", "webSearch", "applyAgentDiff"]) {
+    assert.equal(CURSOR_NATIVE_TOOL_DENYLIST.includes(tool), true, tool);
+  }
+});
+
+test("allowlist qualification accepts only a correlated invalid-argument error", () => {
+  const expected = new ConnectRpcError("CreateAgent", 400, {
+    code: "invalid_argument",
+    message: "unknown tool trouve_qualification_invalid_builtin",
+  });
+  assert.equal(isUnknownToolValidationError(expected), true);
+  assert.equal(
+    isUnknownToolValidationError(new ConnectRpcError("CreateAgent", 500, {
+      code: "internal",
+      message: "unknown tool trouve_qualification_invalid_builtin",
+    })),
+    false,
+  );
+  assert.equal(
+    isUnknownToolValidationError(new ConnectRpcError("CreateAgent", 400, {
+      code: "invalid_argument",
+      message: "unrelated validation failure",
+    })),
+    false,
+  );
+  assert.equal(isUnknownToolValidationError(new Error(expected.message)), false);
+});
+
+test("allowlist qualification anchors confinement to a recognized native tool", async () => {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    requests.push({ path: request.url, body });
+    response.setHeader("content-type", "application/json");
+    if (request.url?.endsWith("/CreateAgent") && requests.filter(
+      (entry) => entry.path?.endsWith("/CreateAgent"),
+    ).length === 1) {
+      response.end(JSON.stringify({ agentId: "known-native-probe" }));
+    } else if (request.url?.endsWith("/CreateAgent")) {
+      response.statusCode = 400;
+      response.end(JSON.stringify({
+        code: "invalid_argument",
+        message: "unknown tool trouve_qualification_invalid_builtin",
+      }));
+    } else {
+      response.end("{}");
+    }
+  });
+  const address = await listen(server);
+  try {
+    const policy = await verifyToolAllowlist(
+      { url: `http://127.0.0.1:${address.port}`, token: "test-token" },
+      {
+        tools: { names: ["mcp"] },
+        disallowedTools: [...CURSOR_NATIVE_TOOL_DENYLIST],
+        local: { customTools: { trouve_test: {} } },
+      },
+      1_000,
+    );
+    assert.equal(policy.known_native_tool_recognized, "shell");
+    assert.equal(policy.unknown_tool_rejected_with_invalid_argument, true);
+    assert.deepEqual(requests[0].body.options.tools.names, ["shell"]);
+    assert.equal(requests[0].body.options.disallowedTools.includes("shell"), false);
+    assert.deepEqual(requests[1], {
+      path: "/sdk.v1.SdkAgentService/CloseAgent",
+      body: { agentId: "known-native-probe" },
+    });
+    assert.deepEqual(requests[2].body.options.tools.names, [
+      "mcp",
+      "trouve_qualification_invalid_builtin",
+    ]);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("Bridge discovery requires an uncredentialed literal loopback HTTP URL", () => {
