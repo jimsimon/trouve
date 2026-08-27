@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.0] - 2026-08-27
+
+This release surfaces agent-initiated Claude activity as durable turns and
+makes automated review output and prompt sizing more useful across model fleets.
+
+### Added
+
+- **Agent-initiated Claude turns**: Claude Code monitors and scheduled
+  wake-ups now appear as labeled background turns instead of blocking an unread
+  output pipe or leaking stale events into the next interactive turn. Continuous
+  routing, provider-reload recovery, and bounded process cleanup keep autonomous
+  activity attached to the correct thread throughout the process lifetime.
+
+### Changed
+
+- **Focused pull-request review output**: GitHub review surfaces now publish
+  only merge-blocking findings, distinguish new issues from carried-forward
+  blockers, and render remediation context as readable, injection-contained
+  prose. Advisory findings remain durable and visible in the trouve dashboard.
+- **Model-aware review prompt budgets**: reviewer batches, coordinator history,
+  and diff context now scale from the smallest configured model context window.
+  The resolved basis is persisted per job so retries remain deterministic even
+  when provider metadata changes or is temporarily unavailable.
+- **Client/server compatibility**: protocol compatibility advances to 7.19 for
+  the trusted background-turn marker. Upgrade the desktop or PWA client and
+  `trouve-server` together.
+
 ## [4.3.0] - 2026-08-26
 
 This release makes automated reviews converge on merge-blocking defects while
@@ -908,6 +935,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.4.0]: https://github.com/jimsimon/trouve/compare/v4.3.0...v4.4.0
 [4.3.0]: https://github.com/jimsimon/trouve/compare/v4.2.0...v4.3.0
 [4.2.0]: https://github.com/jimsimon/trouve/compare/v4.1.2...v4.2.0
 [4.1.2]: https://github.com/jimsimon/trouve/compare/v4.1.1...v4.1.2
