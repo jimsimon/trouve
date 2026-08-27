@@ -547,18 +547,45 @@ pub struct PreparedInstall {
     version: String,
     stage: PathBuf,
     bin_rel: PathBuf,
-    activated: bool,
 }
 
 impl PreparedInstall {
     /// Move the prepared runtime into its version directory, then publish its
     /// metadata and stable executable path.
-    pub fn activate(mut self) -> Result<InstalledCli, InstallError> {
+    pub fn activate(self) -> Result<InstalledCli, InstallError> {
         let root = cli_root(&self.data_dir, self.id);
         let version_dir = root.join(&self.version);
-        let _ = std::fs::remove_dir_all(&version_dir);
-        std::fs::rename(&self.stage, &version_dir)?;
-        self.activated = true;
+        let staged_bin = self.stage.join(&self.bin_rel);
+        if !self.stage.is_dir() || !staged_bin.is_file() {
+            return Err(InstallError::Download(format!(
+                "prepared {} {} artifact is no longer available",
+                self.id.as_str(),
+                self.version
+            )));
+        }
+        // Preserve a same-version install until the prepared directory has
+        // successfully taken its place. Each rollback path is attempt-owned,
+        // just like the stage, so concurrent engine instances cannot remove it.
+        let rollback = root.join(format!(
+            ".rollback-{}-{}",
+            self.version,
+            uuid::Uuid::new_v4().simple()
+        ));
+        let had_version = version_dir.symlink_metadata().is_ok();
+        if had_version {
+            std::fs::rename(&version_dir, &rollback)?;
+        }
+        if let Err(error) = std::fs::rename(&self.stage, &version_dir) {
+            if had_version && let Err(restore) = std::fs::rename(&rollback, &version_dir) {
+                return Err(InstallError::Download(format!(
+                    "activating {} {} failed ({error}); restoring the previous runtime failed ({restore})",
+                    self.id.as_str(),
+                    self.version
+                )));
+            }
+            return Err(error.into());
+        }
+        let _rollback_cleanup = had_version.then(|| DirectoryCleanup(rollback));
         let bin = version_dir.join(&self.bin_rel);
 
         let info = InstalledCli {
@@ -601,12 +628,30 @@ impl PreparedInstall {
     }
 }
 
+struct DirectoryCleanup(PathBuf);
+
+impl Drop for DirectoryCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 impl Drop for PreparedInstall {
     fn drop(&mut self) {
-        if !self.activated {
-            let _ = std::fs::remove_dir_all(&self.stage);
-        }
+        let _ = std::fs::remove_dir_all(&self.stage);
     }
+}
+
+fn create_install_stage(root: &Path, version: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let stage = root.join(format!(
+        ".stage-{version}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    // A UUID collision or externally created path is an error, never a path
+    // this attempt is allowed to delete and claim.
+    std::fs::create_dir(&stage)?;
+    Ok(stage)
 }
 
 /// Download and verify `version` of `id` into a staging directory without
@@ -626,11 +671,9 @@ pub async fn prepare_install(
     let version = normalized_version(id, version).to_string();
     validate_version(&version)?;
     let root = cli_root(data_dir, id);
-    // Stage into a temp sibling so a failed install never half-replaces an
-    // existing version directory.
-    let stage = root.join(format!(".stage-{version}"));
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)?;
+    // Stage into a unique sibling so failed or overlapping installs never
+    // half-replace the active version or clean up another attempt's files.
+    let stage = create_install_stage(&root, &version)?;
 
     let result = install_into(&stage, id, &version, progress).await;
     let bin_rel = match result {
@@ -647,7 +690,6 @@ pub async fn prepare_install(
         version,
         stage,
         bin_rel,
-        activated: false,
     })
 }
 
@@ -1321,7 +1363,6 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             version: "2.0.0".into(),
             stage,
             bin_rel,
-            activated: false,
         };
 
         assert!(installed(tmp.path(), CliId::Codex).is_none());
@@ -1348,20 +1389,77 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     fn dropping_prepared_install_removes_staged_runtime() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
-        let stage = root.join(".stage-2.0.0");
-        std::fs::create_dir_all(&stage).unwrap();
+        let stage_a = create_install_stage(&root, "2.0.0").unwrap();
+        let stage_b = create_install_stage(&root, "2.0.0").unwrap();
+        assert_ne!(stage_a, stage_b);
+        let prepared_a = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage: stage_a.clone(),
+            bin_rel: PathBuf::from("codex"),
+        };
+        let prepared_b = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage: stage_b.clone(),
+            bin_rel: PathBuf::from("codex"),
+        };
+
+        drop(prepared_b);
+
+        assert!(!stage_b.exists());
+        assert!(stage_a.exists());
+        drop(prepared_a);
+        assert!(!stage_a.exists());
+    }
+
+    #[test]
+    fn missing_prepared_artifact_preserves_same_version_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let version_dir = root.join("2.0.0");
+        let active_bin = version_dir.join("codex");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(&active_bin, "active runtime").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "2.0.0".into(),
+                bin: active_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let link = managed_bin(tmp.path(), CliId::Codex);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&active_bin, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&active_bin, &link).unwrap();
+
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
         let prepared = PreparedInstall {
             data_dir: tmp.path().to_path_buf(),
             id: CliId::Codex,
             version: "2.0.0".into(),
             stage: stage.clone(),
             bin_rel: PathBuf::from("codex"),
-            activated: false,
         };
+        std::fs::remove_dir_all(stage).unwrap();
 
-        drop(prepared);
-
-        assert!(!stage.exists());
+        assert!(prepared.activate().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&active_bin).unwrap(),
+            "active runtime"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "active runtime");
+        assert_eq!(
+            installed(tmp.path(), CliId::Codex).unwrap().version,
+            "2.0.0"
+        );
     }
 
     #[test]
