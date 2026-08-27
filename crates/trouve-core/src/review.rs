@@ -573,10 +573,14 @@ impl ReviewReconciliationCandidate {
 
 fn review_reconciliation_order_key(
     candidate: &(String, u64),
+    priority_pull: Option<u64>,
     reconciled_at: &HashMap<(String, u64), Instant>,
     progress_keys: &HashSet<(String, u64)>,
-) -> (Option<Instant>, bool, (String, u64)) {
+) -> (bool, Option<Instant>, bool, (String, u64)) {
     (
+        // A pull named by a review-thread webhook reconciles first, ahead of
+        // the least-recently-reconciled rotation.
+        priority_pull != Some(candidate.1),
         reconciled_at.get(candidate).copied(),
         !progress_keys.contains(candidate),
         candidate.clone(),
@@ -3512,7 +3516,7 @@ impl Engine {
             .unwrap()
             .retain(|key, _| active_reconciliation_keys.contains(key));
         if let Err(error) = self
-            .reconcile_oldest_review_thread_candidate(&reconciliation_candidates)
+            .reconcile_oldest_review_thread_candidate(&reconciliation_candidates, None)
             .await
         {
             had_errors = true;
@@ -3801,6 +3805,7 @@ impl Engine {
     async fn reconcile_oldest_review_thread_candidate(
         &self,
         candidates: &[ReviewReconciliationCandidate],
+        priority_pull: Option<u64>,
     ) -> Result<()> {
         let deadline = Instant::now() + REVIEW_RECONCILIATION_PASS_BUDGET;
         let progress_keys = self
@@ -3821,7 +3826,7 @@ impl Engine {
         let mut ordered = candidates.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|candidate| {
             let key = candidate.key();
-            review_reconciliation_order_key(&key, &reconciled_at, &progress_keys)
+            review_reconciliation_order_key(&key, priority_pull, &reconciled_at, &progress_keys)
         });
 
         let mut first_error = None;
@@ -4094,7 +4099,10 @@ impl Engine {
         mac.update(body);
         mac.verify_slice(&signature)
             .map_err(|_| EngineError::BadRequest("invalid webhook signature".into()))?;
-        if !matches!(event, "pull_request" | "issue_comment" | "check_run") {
+        if !matches!(
+            event,
+            "pull_request" | "issue_comment" | "check_run" | "pull_request_review_thread"
+        ) {
             self.store
                 .claim_github_webhook_delivery(delivery_id, None)?;
             return Ok(());
@@ -4186,7 +4194,20 @@ impl Engine {
                 Some((comment_id, edited_at, states))
             })
             .flatten();
-        if !pull_request_event && manual_comment.is_none() && lifecycle_checkbox_edit.is_none() {
+        // A maintainer resolving or unresolving a finding's review thread is
+        // the trust-dismissal signal. The event only prioritizes that pull in
+        // the immediate reconciliation walk below — thread state itself is
+        // still read back from GitHub, never from the untrusted payload.
+        let review_thread_pull = (event == "pull_request_review_thread"
+            && matches!(action, "resolved" | "unresolved"))
+        .then(|| payload["pull_request"]["number"].as_u64())
+        .flatten()
+        .filter(|pull_number| *pull_number > 0);
+        if !pull_request_event
+            && manual_comment.is_none()
+            && lifecycle_checkbox_edit.is_none()
+            && review_thread_pull.is_none()
+        {
             self.store
                 .claim_github_webhook_delivery(delivery_id, None)?;
             return Ok(());
@@ -4275,7 +4296,10 @@ impl Engine {
                 {
                     engine.record_review_error(format!("webhook reconciliation failed: {error:#}"));
                 } else if let Err(error) = engine
-                    .reconcile_oldest_review_thread_candidate(&reconciliation_candidates)
+                    .reconcile_oldest_review_thread_candidate(
+                        &reconciliation_candidates,
+                        review_thread_pull,
+                    )
                     .await
                 {
                     engine.record_review_error(format!(
@@ -15494,7 +15518,7 @@ mod tests {
         let progress = HashSet::from([second.clone()]);
         let mut candidates = vec![second.clone(), new.clone(), first.clone()];
         candidates.sort_by_key(|candidate| {
-            review_reconciliation_order_key(candidate, &reconciled_at, &progress)
+            review_reconciliation_order_key(candidate, None, &reconciled_at, &progress)
         });
         assert_eq!(candidates, vec![new, second, first]);
 
@@ -15503,15 +15527,34 @@ mod tests {
         let same_age = HashMap::from([(left.clone(), now), (right.clone(), now)]);
         let mut progress_tie = vec![left.clone(), right.clone()];
         progress_tie.sort_by_key(|candidate| {
-            review_reconciliation_order_key(candidate, &same_age, &HashSet::from([right.clone()]))
+            review_reconciliation_order_key(
+                candidate,
+                None,
+                &same_age,
+                &HashSet::from([right.clone()]),
+            )
         });
         assert_eq!(progress_tie, vec![right.clone(), left.clone()]);
 
         let mut tied = vec![right.clone(), left.clone()];
         tied.sort_by_key(|candidate| {
-            review_reconciliation_order_key(candidate, &same_age, &HashSet::new())
+            review_reconciliation_order_key(candidate, None, &same_age, &HashSet::new())
         });
         assert_eq!(tied, vec![left, right]);
+
+        // A pull named by a review-thread webhook jumps the rotation even
+        // when it was reconciled most recently.
+        let stale = ("acme/widgets".to_owned(), 7);
+        let fresh = ("acme/widgets".to_owned(), 42);
+        let ages = HashMap::from([
+            (stale.clone(), now - Duration::from_secs(600)),
+            (fresh.clone(), now),
+        ]);
+        let mut prioritized = vec![stale.clone(), fresh.clone()];
+        prioritized.sort_by_key(|candidate| {
+            review_reconciliation_order_key(candidate, Some(42), &ages, &HashSet::new())
+        });
+        assert_eq!(prioritized, vec![fresh, stale]);
     }
 
     #[test]
@@ -25442,6 +25485,49 @@ mod tests {
                 pull_number: 42,
                 trigger_key: "manual:comment:100".into(),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn review_thread_webhook_is_accepted_and_claimed_once() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        engine.secrets = Arc::new(trouve_providers::secrets::FileStore::new(
+            data.path().join("secrets.json"),
+        ));
+        let engine = Arc::new(engine);
+        engine.secrets.set(WEBHOOK_SECRET, "shared-secret").unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "resolved",
+            "installation": {"id": 7},
+            "repository": {"full_name": "acme/widgets"},
+            "pull_request": {"number": 42},
+            "thread": {"node_id": "PRRT_thread"}
+        }))
+        .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(&body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        // Hold the reconcile lock so the assertion covers the synchronous
+        // handoff: the event is recognized (not filtered) and its delivery
+        // is claimed durably, exactly once.
+        let _reconcile_guard = engine.code_review.reconcile_lock.lock().await;
+        engine
+            .accept_github_review_webhook(
+                "pull_request_review_thread",
+                "delivery-thread-1",
+                &signature,
+                &body,
+            )
+            .unwrap();
+        assert!(
+            !engine
+                .store
+                .claim_github_webhook_delivery("delivery-thread-1", None)
+                .unwrap(),
+            "the review-thread delivery must have been claimed by the handler"
         );
     }
 
