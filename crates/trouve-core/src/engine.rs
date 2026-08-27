@@ -26553,18 +26553,10 @@ default_permission_mode = "ask"
             .unwrap()
             .insert("cursor".into(), backend.clone());
         let transition = engine.provider_reload.clone().lock_owned().await;
-        let retiring = {
-            let engine = engine.clone();
-            tokio::spawn(async move {
-                engine
-                    .retire_config_backends_for_runtime(
-                        trouve_agents::install::CliId::CursorSdkBridge,
-                    )
-                    .await
-            })
-        };
-        tokio::task::yield_now().await;
-        assert!(!retiring.is_finished());
+        let retiring = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge);
+        tokio::pin!(retiring);
+        assert!(futures::poll!(retiring.as_mut()).is_pending());
         engine
             .config
             .lock()
@@ -26575,7 +26567,7 @@ default_permission_mode = "ask"
             .kind = "claude-cli".into();
         drop(transition);
 
-        retiring.await.unwrap().unwrap().publish();
+        retiring.await.unwrap().publish();
 
         assert_eq!(
             shutdowns
