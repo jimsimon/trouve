@@ -537,6 +537,120 @@ fn codex_triple() -> Result<String, InstallError> {
 
 // --- install -----------------------------------------------------------------
 
+/// A verified runtime artifact that has been downloaded and unpacked without
+/// changing the active managed runtime. Dropping it before activation removes
+/// its staging directory.
+#[derive(Debug)]
+pub struct PreparedInstall {
+    data_dir: PathBuf,
+    id: CliId,
+    version: String,
+    stage: PathBuf,
+    bin_rel: PathBuf,
+    activated: bool,
+}
+
+impl PreparedInstall {
+    /// Move the prepared runtime into its version directory, then publish its
+    /// metadata and stable executable path.
+    pub fn activate(mut self) -> Result<InstalledCli, InstallError> {
+        let root = cli_root(&self.data_dir, self.id);
+        let version_dir = root.join(&self.version);
+        let _ = std::fs::remove_dir_all(&version_dir);
+        std::fs::rename(&self.stage, &version_dir)?;
+        self.activated = true;
+        let bin = version_dir.join(&self.bin_rel);
+
+        let info = InstalledCli {
+            version: self.version.clone(),
+            bin: bin.to_string_lossy().into_owned(),
+        };
+        // Write the pointer atomically: a crash mid-write would otherwise leave
+        // a truncated installed.json that parses as "not installed" even though
+        // the binary is present.
+        let pointer = root.join("installed.json");
+        let tmp = root.join(".installed.json.tmp");
+        std::fs::write(
+            &tmp,
+            serde_json::to_string_pretty(&info).unwrap().as_bytes(),
+        )?;
+        std::fs::rename(&tmp, &pointer)?;
+
+        let link = managed_bin(&self.data_dir, self.id);
+        std::fs::create_dir_all(link.parent().unwrap())?;
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&bin, &link)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&link);
+            std::fs::copy(&bin, &link)?;
+        }
+
+        // Keep at most one older version around for rollback; drop the rest.
+        prune_old_versions(&root, &self.version);
+        if self.id == CliId::CursorSdkBridge {
+            // The SDK is the Cursor transport now. Remove Trouve's obsolete
+            // managed ACP binary once the replacement is active; system installs
+            // remain outside our ownership and are never touched.
+            remove_legacy_cursor_agent_best_effort(&self.data_dir);
+        }
+        Ok(info)
+    }
+}
+
+impl Drop for PreparedInstall {
+    fn drop(&mut self) {
+        if !self.activated {
+            let _ = std::fs::remove_dir_all(&self.stage);
+        }
+    }
+}
+
+/// Download and verify `version` of `id` into a staging directory without
+/// changing the active managed runtime. Call [`PreparedInstall::activate`]
+/// only after any runtime-specific teardown is complete.
+pub async fn prepare_install(
+    data_dir: &Path,
+    id: CliId,
+    version: &str,
+    progress: &Progress,
+) -> Result<PreparedInstall, InstallError> {
+    // `version` is scraped from vendor endpoints and also joined into
+    // filesystem paths (version dir, staging dir, download URLs). A crafted
+    // or compromised endpoint returning `1/../../../etc` would otherwise let
+    // `remove_dir_all`/`rename` touch an arbitrary directory. Constrain it to
+    // a strict, path-safe allowlist before it reaches the filesystem.
+    let version = normalized_version(id, version).to_string();
+    validate_version(&version)?;
+    let root = cli_root(data_dir, id);
+    // Stage into a temp sibling so a failed install never half-replaces an
+    // existing version directory.
+    let stage = root.join(format!(".stage-{version}"));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage)?;
+
+    let result = install_into(&stage, id, &version, progress).await;
+    let bin_rel = match result {
+        Ok(rel) => rel,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(e);
+        }
+    };
+
+    Ok(PreparedInstall {
+        data_dir: data_dir.to_path_buf(),
+        id,
+        version,
+        stage,
+        bin_rel,
+        activated: false,
+    })
+}
+
 /// Download and activate `version` of `id` under `data_dir`. Returns the
 /// activated install. Idempotent: re-installing the active version just
 /// re-downloads and re-points the symlink. Byte progress lands in
@@ -547,71 +661,9 @@ pub async fn install(
     version: &str,
     progress: &Progress,
 ) -> Result<InstalledCli, InstallError> {
-    // `version` is scraped from vendor endpoints and also joined into
-    // filesystem paths (version dir, staging dir, download URLs). A crafted
-    // or compromised endpoint returning `1/../../../etc` would otherwise let
-    // `remove_dir_all`/`rename` touch an arbitrary directory. Constrain it to
-    // a strict, path-safe allowlist before it reaches the filesystem.
-    let version = normalized_version(id, version);
-    validate_version(version)?;
-    let root = cli_root(data_dir, id);
-    let version_dir = root.join(version);
-    // Stage into a temp sibling so a failed install never half-replaces an
-    // existing version directory.
-    let stage = root.join(format!(".stage-{version}"));
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)?;
-
-    let result = install_into(&stage, id, version, progress).await;
-    let bin_rel = match result {
-        Ok(rel) => rel,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            return Err(e);
-        }
-    };
-
-    let _ = std::fs::remove_dir_all(&version_dir);
-    std::fs::rename(&stage, &version_dir)?;
-    let bin = version_dir.join(&bin_rel);
-
-    let info = InstalledCli {
-        version: version.to_string(),
-        bin: bin.to_string_lossy().into_owned(),
-    };
-    // Write the pointer atomically: a crash mid-write would otherwise leave
-    // a truncated installed.json that parses as "not installed" even though
-    // the binary is present.
-    let pointer = root.join("installed.json");
-    let tmp = root.join(".installed.json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&info).unwrap().as_bytes(),
-    )?;
-    std::fs::rename(&tmp, &pointer)?;
-
-    let link = managed_bin(data_dir, id);
-    std::fs::create_dir_all(link.parent().unwrap())?;
-    #[cfg(unix)]
-    {
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&bin, &link)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::remove_file(&link);
-        std::fs::copy(&bin, &link)?;
-    }
-
-    // Keep at most one older version around for rollback; drop the rest.
-    prune_old_versions(&root, version);
-    if id == CliId::CursorSdkBridge {
-        // The SDK is the Cursor transport now. Remove Trouve's obsolete
-        // managed ACP binary once the replacement is active; system installs
-        // remain outside our ownership and are never touched.
-        remove_legacy_cursor_agent_best_effort(data_dir);
-    }
-    Ok(info)
+    prepare_install(data_dir, id, version, progress)
+        .await?
+        .activate()
 }
 
 /// Remove the managed install of `id` entirely: every version directory,
@@ -1253,6 +1305,63 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         // Pointer with a missing binary reports not installed.
         std::fs::remove_file(&bin).unwrap();
         assert!(installed(tmp.path(), CliId::Codex).is_none());
+    }
+
+    #[test]
+    fn prepared_install_does_not_publish_until_activation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let stage = root.join(".stage-2.0.0");
+        let bin_rel = PathBuf::from("codex");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join(&bin_rel), "new runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel,
+            activated: false,
+        };
+
+        assert!(installed(tmp.path(), CliId::Codex).is_none());
+        assert!(
+            managed_bin(tmp.path(), CliId::Codex)
+                .symlink_metadata()
+                .is_err()
+        );
+
+        let activated = prepared.activate().unwrap();
+
+        assert_eq!(activated.version, "2.0.0");
+        assert_eq!(
+            std::fs::read_to_string(managed_bin(tmp.path(), CliId::Codex)).unwrap(),
+            "new runtime"
+        );
+        assert_eq!(
+            installed(tmp.path(), CliId::Codex).unwrap().version,
+            "2.0.0"
+        );
+    }
+
+    #[test]
+    fn dropping_prepared_install_removes_staged_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let stage = root.join(".stage-2.0.0");
+        std::fs::create_dir_all(&stage).unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage: stage.clone(),
+            bin_rel: PathBuf::from("codex"),
+            activated: false,
+        };
+
+        drop(prepared);
+
+        assert!(!stage.exists());
     }
 
     #[test]
