@@ -633,6 +633,14 @@ impl PreparedInstall {
         self,
         mut checkpoint: impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
     ) -> Result<InstalledCli, InstallError> {
+        self.activate_with_checkpoint_and_sync(&mut checkpoint, sync_runtime_directory)
+    }
+
+    fn activate_with_checkpoint_and_sync(
+        self,
+        checkpoint: &mut impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
+        mut sync_directory: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<InstalledCli, InstallError> {
         let root = cli_root(&self.data_dir, self.id);
         let _activation_lock = lock_runtime_activation(&self.data_dir, self.id)?;
         let staged_bin = self.stage.join(&self.bin_rel);
@@ -684,7 +692,7 @@ impl PreparedInstall {
 
         let mut generation_cleanup = PathCleanup::new(generation.clone());
         replace_runtime_file(&self.stage, &generation, false)?;
-        sync_runtime_directory(&generations)?;
+        sync_directory(&generations)?;
 
         // The filesystem-wide activation lock couples the last pointer read,
         // publication, and reclamation to lease acquisition. A backend in any
@@ -708,8 +716,17 @@ impl PreparedInstall {
         // installed.json is the one atomically replaced commit marker. Disarm
         // generation cleanup immediately: a later directory-sync error cannot
         // roll the commit back or remove the runtime now named by the pointer.
+        // Report that post-commit durability failure as degraded success rather
+        // than inviting a retry of an activation that readers already observe.
         generation_cleanup.disarm();
-        sync_runtime_directory(&root)?;
+        if let Err(error) = sync_directory(&root) {
+            tracing::warn!(
+                runtime = self.id.as_str(),
+                path = %root.display(),
+                %error,
+                "managed runtime committed but its root directory could not be synced"
+            );
+        }
 
         prune_runtime_generations(
             &self.data_dir,
@@ -1885,6 +1902,42 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
                 .unwrap()
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn directory_sync_failure_after_pointer_reports_committed_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "committed runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+        };
+
+        let mut checkpoint = |_| Ok(());
+        let activated = prepared
+            .activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
+                if path == root {
+                    Err(std::io::Error::other(
+                        "injected post-commit directory sync failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("the installed pointer already committed");
+
+        assert_eq!(activated.version, "2.0.0");
+        let visible = installed(tmp.path(), CliId::Codex).unwrap();
+        assert_eq!(visible.bin, activated.bin);
+        assert_eq!(
+            std::fs::read_to_string(visible.bin).unwrap(),
+            "committed runtime"
         );
     }
 

@@ -2108,6 +2108,69 @@ impl Drop for AutomatedReviewToolBudgetGuard {
     }
 }
 
+/// Owns one serialized backend-registry transition while the previous active
+/// instances are retired. Dropping an unpublished transition is the
+/// cancellation and error rollback path: it rebuilds the affected ids from the
+/// current durable configuration before releasing the transition lock.
+struct BackendRetirement {
+    engine: Weak<Engine>,
+    target_ids: HashSet<String>,
+    publish_on_drop: bool,
+    _transition: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl BackendRetirement {
+    fn new(
+        engine: &Arc<Engine>,
+        target_ids: HashSet<String>,
+        transition: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Self {
+        Self {
+            engine: Arc::downgrade(engine),
+            target_ids,
+            publish_on_drop: true,
+            _transition: transition,
+        }
+    }
+
+    /// Publish replacements from the caller's now-current configuration and
+    /// release the serialized transition. This is synchronous so no
+    /// cancellation point can separate durable mutation from publication.
+    fn publish(mut self) {
+        self.publish_on_drop = false;
+        if let Some(engine) = self.engine.upgrade() {
+            engine.replace_provider_registries_for_ids(&self.target_ids);
+        }
+    }
+}
+
+impl Drop for BackendRetirement {
+    fn drop(&mut self) {
+        if self.publish_on_drop
+            && let Some(engine) = self.engine.upgrade()
+        {
+            engine.replace_provider_registries_for_ids(&self.target_ids);
+        }
+    }
+}
+
+/// Complete one detached cleanup batch and drop every backend owner before
+/// handing the transition back to a caller that may immediately remove the
+/// managed runtime those backends leased.
+async fn shutdown_retiring_backend_batch(
+    engine: &Engine,
+    retiring: Vec<(String, Arc<dyn AgentBackend>)>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (id, backend) in retiring {
+        match backend.shutdown().await {
+            Ok(()) => engine.release_retiring_backend(&id, &backend),
+            Err(error) => failures.push(format!("{id}: {error}")),
+        }
+    }
+    failures
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -2133,7 +2196,12 @@ pub struct Engine {
     injected_providers: Mutex<HashMap<String, Arc<dyn Provider>>>,
     /// External agent backends (Codex app-server, Cursor Agent SDK Bridge,
     /// Claude Code CLI), keyed by provider id like `providers`.
-    backends: RwLock<HashMap<String, Arc<dyn AgentBackend>>>,
+    backends: Arc<RwLock<HashMap<String, Arc<dyn AgentBackend>>>>,
+    /// Config-owned backends removed from admission while their asynchronous
+    /// shutdown is running, or retained after a failed shutdown for a later
+    /// retry. Keeping cleanup ownership separate prevents a closed instance
+    /// from remaining selectable without orphaning its vendor processes.
+    retiring_backends: Mutex<HashMap<String, Vec<Arc<dyn AgentBackend>>>>,
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
@@ -2219,9 +2287,9 @@ pub struct Engine {
     /// and registry mutations without blocking unrelated provider ids.
     provider_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Orders asynchronous backend teardown with registry replacement and
-    /// managed-runtime removal. A replacement backend is never published
-    /// while the previous backend still owns vendor child processes.
-    provider_reload: tokio::sync::Mutex<()>,
+    /// managed-runtime removal. Failed cleanup remains explicitly owned in the
+    /// retiring registry while the active registry receives a fresh instance.
+    provider_reload: Arc<tokio::sync::Mutex<()>>,
     /// Serializes persona-file mutations with durable deletion replay so a
     /// recreate cannot race a pending cleanup of the same user-level file.
     pub(crate) persona_mutations: Arc<tokio::sync::Mutex<()>>,
@@ -2653,7 +2721,8 @@ impl Engine {
             model_catalog,
             providers: RwLock::new(providers),
             injected_providers: Mutex::new(injected_providers),
-            backends: RwLock::new(backends),
+            backends: Arc::new(RwLock::new(backends)),
+            retiring_backends: Mutex::new(HashMap::new()),
             injected_backends: Mutex::new(HashMap::new()),
             background_turn_intake: Mutex::new(Vec::new()),
             background_turn_intake_notify: Arc::new(tokio::sync::Notify::new()),
@@ -2680,7 +2749,7 @@ impl Engine {
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
-            provider_reload: tokio::sync::Mutex::new(()),
+            provider_reload: Arc::new(tokio::sync::Mutex::new(())),
             persona_mutations: Arc::new(tokio::sync::Mutex::new(())),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
@@ -3540,7 +3609,7 @@ impl Engine {
     /// Create or update a provider. The API key (when present) goes to the
     /// secret store; the config file only holds non-secret settings.
     pub async fn upsert_provider(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         req: &UpsertProviderRequest,
     ) -> Result<ProviderInfo, EngineError> {
@@ -3569,12 +3638,13 @@ impl Engine {
         }
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().await;
-        let _transition = self.provider_reload.lock().await;
         let target_ids = HashSet::from([id.to_string()]);
         // Retire the previous backend before changing its durable definition.
-        // Until every shutdown succeeds the registry retains ownership, so a
-        // cancelled or failed transition can be retried without losing it.
-        self.shutdown_config_backends_matching_ids(&target_ids)
+        // The retirement owns cleanup and registry rollback independently of
+        // this request future, so cancellation cannot expose a closing backend
+        // or lose the previous process tree.
+        let retirement = self
+            .retire_config_backends_matching_ids(&target_ids)
             .await?;
         let mutation = (|| -> Result<(), EngineError> {
             if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
@@ -3644,7 +3714,7 @@ impl Engine {
         })();
         // This is also the rollback path for a secret-store failure after the
         // old backend was retired: rebuild from the still-current config.
-        self.replace_provider_registries_for_ids(&target_ids);
+        retirement.publish();
         mutation?;
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
@@ -3668,10 +3738,9 @@ impl Engine {
     }
 
     /// Remove a provider from the config and its stored API key.
-    pub async fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn delete_provider(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().await;
-        let _transition = self.provider_reload.lock().await;
         let secret_names = self
             .config
             .lock()
@@ -3685,7 +3754,8 @@ impl Engine {
         // Teardown is the only fallible part of the registry transition. Do it
         // before deleting durable configuration or credentials so an error is
         // reported only while the requested deletion is still uncommitted.
-        self.shutdown_config_backends_matching_ids(&target_ids)
+        let retirement = self
+            .retire_config_backends_matching_ids(&target_ids)
             .await?;
         {
             let mut config = self.config.lock().unwrap();
@@ -3703,7 +3773,7 @@ impl Engine {
                 .secrets
                 .delete(&trouve_providers::secrets::provider_secret(id, &name));
         }
-        self.replace_provider_registries_for_ids(&target_ids);
+        retirement.publish();
         Ok(())
     }
 
@@ -4069,12 +4139,15 @@ impl Engine {
                     };
 
                     // Cancellation remains responsive while another provider
-                    // transition owns the lock. A cancelled prepared artifact
-                    // is dropped without touching the active runtime.
-                    let transition = engine.provider_reload.lock();
-                    tokio::pin!(transition);
-                    let _transition = tokio::select! {
-                        guard = &mut transition => guard,
+                    // transition or the previous backend's bounded teardown is
+                    // in progress. Once retirement starts, its detached task
+                    // completes cleanup and registry rollback independently.
+                    let retirement = engine.retire_config_backends_for_runtime(cli);
+                    tokio::pin!(retirement);
+                    let retirement = tokio::select! {
+                        result = &mut retirement => result.map_err(|error| {
+                            format!("stopping the active Cursor SDK runtime: {error}")
+                        })?,
                         _ = async {
                             while !progress.cancelled() {
                                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -4085,12 +4158,6 @@ impl Engine {
                         return Ok(None);
                     }
 
-                    // Close only Cursor-owned pools before replacing the active
-                    // Bridge pointer. Claude and Codex remain usable throughout
-                    // the download and activation.
-                    if let Err(error) = engine.shutdown_config_backends_for_runtime(cli).await {
-                        return Err(format!("stopping the active Cursor SDK runtime: {error}"));
-                    }
                     let install_result = match prepared.activate_cancellable(&progress) {
                         Ok(_) => Ok(Some(version)),
                         Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
@@ -4099,7 +4166,7 @@ impl Engine {
                     // Activation success, failure, and late cancellation all
                     // replace the retired Cursor pools before releasing the
                     // transition lock.
-                    engine.replace_config_backends_for_runtime(cli);
+                    retirement.publish();
                     install_result
                 } else {
                     match trouve_agents::install::install(
@@ -4162,7 +4229,7 @@ impl Engine {
 
     /// Remove the managed install of a CLI (PATH installs are untouched).
     /// For llama-server the sidecar is stopped first.
-    pub async fn uninstall_cli(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn uninstall_cli(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
         let state_id = cli.as_str();
@@ -4181,8 +4248,7 @@ impl Engine {
             self.local_manager.stop().await;
             self.title_model.stop().await;
         }
-        let _transition = self.provider_reload.lock().await;
-        self.shutdown_config_backends_for_runtime(cli).await?;
+        let retirement = self.retire_config_backends_for_runtime(cli).await?;
         // Runtime-specific teardown removes the registry's leased wrapper
         // before returning. There is deliberately no await between detaching
         // it and publishing its replacement: cancellation cannot strand a
@@ -4205,7 +4271,7 @@ impl Engine {
         }
         // Even on a filesystem error, replace the now-closed backend pool so
         // the still-installed runtime can accept turns again.
-        self.replace_config_backends_for_runtime(cli);
+        retirement.publish();
         uninstall?;
         Ok(())
     }
@@ -5064,7 +5130,7 @@ impl Engine {
     }
 
     async fn finish_login(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         result: Result<trouve_providers::auth::OAuthTokens, trouve_providers::ProviderError>,
     ) {
@@ -5242,12 +5308,14 @@ impl Engine {
         self.title_model
             .start_install(move || {
                 if let Some(engine) = engine.upgrade() {
-                    engine.refresh_api_provider_registry();
                     engine
                         .cli_latest
                         .lock()
                         .unwrap()
                         .remove(trouve_agents::install::CliId::LlamaServer.as_str());
+                    tokio::spawn(async move {
+                        engine.refresh_api_provider_registry().await;
+                    });
                 }
             })
             .map_err(|error| EngineError::Conflict(error.to_string()))?;
@@ -5340,15 +5408,14 @@ impl Engine {
         }
     }
 
-    /// Stop only config-owned backends served by one managed runtime. Runtime
+    /// Retire only config-owned backends served by one managed runtime. Runtime
     /// updates use this narrower scope so unrelated vendor backends stay live.
-    async fn shutdown_config_backends_for_runtime(
-        &self,
+    async fn retire_config_backends_for_runtime(
+        self: &Arc<Self>,
         runtime: trouve_agents::install::CliId,
-    ) -> Result<(), EngineError> {
+    ) -> Result<BackendRetirement, EngineError> {
         let target_ids = self.configured_provider_ids_for_runtime(runtime);
-        self.shutdown_config_backends_matching_ids(&target_ids)
-            .await
+        self.retire_config_backends_matching_ids(&target_ids).await
     }
 
     fn configured_provider_ids_for_runtime(
@@ -5365,16 +5432,18 @@ impl Engine {
             .collect()
     }
 
-    /// Shut down a selected set of config-owned backends transactionally.
-    /// Registry ownership is retained until every shutdown acknowledges. If
-    /// this future is cancelled or any backend fails, all instances remain
-    /// tracked so a later transition can retry cleanup. Once all shutdowns
-    /// succeed, removal is synchronous and the caller must synchronously
-    /// publish replacements before its next await point.
-    async fn shutdown_config_backends_matching_ids(
-        &self,
+    /// Retire a selected set of config-owned backends transactionally. Targets
+    /// leave the active registry before the first shutdown await, so new turns
+    /// cannot select a closing instance. The shutdown work owns the transition
+    /// lock in a detached task; request cancellation therefore cannot stop
+    /// cleanup or strand registry publication. Failed instances stay in the
+    /// retiring registry and are retried by the next matching transition.
+    async fn retire_config_backends_matching_ids(
+        self: &Arc<Self>,
         target_ids: &HashSet<String>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<BackendRetirement, EngineError> {
+        let transition = self.provider_reload.clone().lock_owned().await;
+        let retirement = BackendRetirement::new(self, target_ids.clone(), transition);
         let injected = self
             .injected_backends
             .lock()
@@ -5383,41 +5452,69 @@ impl Engine {
             .cloned()
             .collect::<Vec<_>>();
         let retiring = {
-            let backends = self.backends.read().unwrap();
-            backends
-                .iter()
-                .filter(|(id, backend)| {
-                    target_ids.contains(*id)
-                        && !injected
+            let mut backends = self.backends.write().unwrap();
+            let mut retiring_backends = self.retiring_backends.lock().unwrap();
+            let mut selected = Vec::new();
+            for id in target_ids {
+                let detach = backends.get(id).is_some_and(|backend| {
+                    !injected
+                        .iter()
+                        .any(|candidate| Arc::ptr_eq(candidate, backend))
+                });
+                if detach && let Some(backend) = backends.remove(id) {
+                    let entries = retiring_backends.entry(id.clone()).or_default();
+                    if !entries
+                        .iter()
+                        .any(|candidate| Arc::ptr_eq(candidate, &backend))
+                    {
+                        entries.push(backend);
+                    }
+                }
+                if let Some(entries) = retiring_backends.get(id) {
+                    for backend in entries {
+                        if !selected
                             .iter()
-                            .any(|candidate| Arc::ptr_eq(candidate, backend))
-                })
-                .map(|(id, backend)| (id.clone(), backend.clone()))
-                .collect::<Vec<_>>()
-        };
-        for (_, backend) in &retiring {
-            backend
-                .shutdown()
-                .await
-                .map_err(|error| EngineError::Internal(error.into()))?;
-        }
-        let mut backends = self.backends.write().unwrap();
-        for (id, backend) in retiring {
-            if backends
-                .get(&id)
-                .is_some_and(|current| Arc::ptr_eq(current, &backend))
-            {
-                backends.remove(&id);
+                            .any(|(_, candidate)| Arc::ptr_eq(candidate, backend))
+                        {
+                            selected.push((id.clone(), backend.clone()));
+                        }
+                    }
+                }
             }
+            selected
+        };
+        if retiring.is_empty() {
+            return Ok(retirement);
         }
-        Ok(())
+
+        let engine = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let failures = shutdown_retiring_backend_batch(&engine, retiring).await;
+            if failures.is_empty() {
+                Ok(retirement)
+            } else {
+                Err(EngineError::Internal(anyhow!(
+                    "backend retirement failed: {}",
+                    failures.join("; ")
+                )))
+            }
+        });
+        task.await.map_err(|error| {
+            EngineError::Internal(anyhow!("backend retirement task failed: {error}"))
+        })?
     }
 
-    /// Rebuild only the config-owned backends served by one runtime. This
-    /// preserves unrelated backend instances and their active vendor state.
-    fn replace_config_backends_for_runtime(&self, runtime: trouve_agents::install::CliId) {
-        let target_ids = self.configured_provider_ids_for_runtime(runtime);
-        self.replace_provider_registries_for_ids(&target_ids);
+    fn release_retiring_backend(&self, id: &str, backend: &Arc<dyn AgentBackend>) {
+        let mut retiring = self.retiring_backends.lock().unwrap();
+        let remove_entry = if let Some(entries) = retiring.get_mut(id) {
+            entries.retain(|candidate| !Arc::ptr_eq(candidate, backend));
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_entry {
+            retiring.remove(id);
+        }
     }
 
     /// Rebuild only selected provider/backend ids after their previous
@@ -5474,7 +5571,12 @@ impl Engine {
     /// Refresh API-backed providers without touching long-lived vendor
     /// backends. Local/title-model lifecycle changes historically refreshed
     /// provider metadata, but they do not change any agent runtime.
-    fn refresh_api_provider_registry(&self) {
+    async fn refresh_api_provider_registry(self: &Arc<Self>) {
+        let _transition = self.provider_reload.clone().lock_owned().await;
+        self.refresh_api_provider_registry_locked();
+    }
+
+    fn refresh_api_provider_registry_locked(&self) {
         let config = self.config.lock().unwrap().clone();
         let mut replacements = build_all_providers(&config, &self.secrets, &self.model_catalog);
         for (id, provider) in self.injected_providers.lock().unwrap().iter() {
@@ -5483,24 +5585,24 @@ impl Engine {
         *self.providers.write().unwrap() = replacements;
     }
 
-    async fn reload_provider(&self, id: &str) -> Result<(), EngineError> {
-        let _transition = self.provider_reload.lock().await;
+    async fn reload_provider(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let target_ids = HashSet::from([id.to_string()]);
-        self.shutdown_config_backends_matching_ids(&target_ids)
+        let retirement = self
+            .retire_config_backends_matching_ids(&target_ids)
             .await?;
-        self.replace_provider_registries_for_ids(&target_ids);
+        retirement.publish();
         Ok(())
     }
 
     async fn reload_providers_for_runtime(
-        &self,
+        self: &Arc<Self>,
         runtime: trouve_agents::install::CliId,
     ) -> Result<(), EngineError> {
-        let _transition = self.provider_reload.lock().await;
         let target_ids = self.configured_provider_ids_for_runtime(runtime);
-        self.shutdown_config_backends_matching_ids(&target_ids)
+        let retirement = self
+            .retire_config_backends_matching_ids(&target_ids)
             .await?;
-        self.replace_provider_registries_for_ids(&target_ids);
+        retirement.publish();
         Ok(())
     }
 
@@ -25344,11 +25446,11 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
         engine.set_base_url("http://127.0.0.1:4000");
         let _cancel = engine.register_cancel("th_1");
 
@@ -25979,11 +26081,11 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
         engine
             .upsert_provider(
                 "azure",
@@ -26014,11 +26116,11 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
 
         engine
             .upsert_provider(
@@ -26036,6 +26138,65 @@ default_permission_mode = "ask"
         assert_eq!(provider.kind, "cursor-sdk");
         assert_eq!(provider.command, None);
         assert_eq!(configured_runtime_command(provider), None);
+    }
+
+    #[tokio::test]
+    async fn title_model_provider_refresh_waits_for_provider_transition() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "old-api".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let transition = engine.provider_reload.clone().lock_owned().await;
+        let refresh = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.refresh_api_provider_registry().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !refresh.is_finished(),
+            "title-model refresh bypassed the provider transition"
+        );
+
+        {
+            let mut config = engine.config.lock().unwrap();
+            config.providers.remove("old-api");
+            config.providers.insert(
+                "new-api".into(),
+                ProviderConfig {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        engine.replace_provider_registries_for_ids(&HashSet::from([
+            "old-api".to_string(),
+            "new-api".to_string(),
+        ]));
+        drop(transition);
+        tokio::time::timeout(Duration::from_secs(3), refresh)
+            .await
+            .expect("serialized title-model refresh did not finish")
+            .unwrap();
+
+        let providers = engine.providers.read().unwrap();
+        assert!(!providers.contains_key("old-api"));
+        assert!(providers.contains_key("new-api"));
     }
 
     struct FailingShutdownBackend {
@@ -26131,7 +26292,7 @@ default_permission_mode = "ask"
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
             entered: entered.clone(),
-            release,
+            release: release.clone(),
         });
         engine
             .backends
@@ -26143,20 +26304,47 @@ default_permission_mode = "ask"
             let engine = engine.clone();
             tokio::spawn(async move {
                 engine
-                    .shutdown_config_backends_for_runtime(
+                    .retire_config_backends_for_runtime(
                         trouve_agents::install::CliId::CursorSdkBridge,
                     )
                     .await
             })
         };
         entered.acquire().await.unwrap().forget();
+
+        assert!(engine.backend_for("cursor/test-model").is_none());
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &blocking))
+        );
+
         transitioning.abort();
         let _ = transitioning.await;
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let retired = engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .get("cursor")
+                    .is_some_and(|entries| {
+                        entries
+                            .iter()
+                            .any(|backend| Arc::ptr_eq(backend, &blocking))
+                    });
+                if !retired {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached retirement did not finish after cancellation");
 
-        assert!(Arc::ptr_eq(
-            &engine.backends.read().unwrap()["cursor"],
-            &blocking
-        ));
+        let replacement = engine.backends.read().unwrap()["cursor"].clone();
+        assert!(!Arc::ptr_eq(&replacement, &blocking));
     }
 
     #[tokio::test]
@@ -26176,11 +26364,11 @@ default_permission_mode = "ask"
                 },
             );
         }
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
         let cursor = Arc::new(FailingShutdownBackend {
             shutdowns: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -26201,7 +26389,7 @@ default_permission_mode = "ask"
         }
 
         let result = engine
-            .shutdown_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
             .await;
 
         assert!(result.is_err());
@@ -26215,9 +26403,77 @@ default_permission_mode = "ask"
         );
         assert_eq!(codex.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 0);
         let backends = engine.backends.read().unwrap();
-        assert!(Arc::ptr_eq(&cursor_backend, &backends["cursor"]));
+        assert!(!Arc::ptr_eq(&cursor_backend, &backends["cursor"]));
         assert!(Arc::ptr_eq(&claude_backend, &backends["claude"]));
         assert!(Arc::ptr_eq(&codex_backend, &backends["codex"]));
+        drop(backends);
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &cursor_backend))
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_backend_teardown_rebuilds_successes_and_retains_failures() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for id in ["cursor-success", "cursor-failure"] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: "cursor-sdk".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let success_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let success: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: success_entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let failure_count = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let failure: Arc<dyn AgentBackend> = failure_count.clone();
+        {
+            let mut backends = engine.backends.write().unwrap();
+            backends.insert("cursor-success".into(), success.clone());
+            backends.insert("cursor-failure".into(), failure.clone());
+        }
+
+        let result = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(success_entered.available_permits(), 1);
+        assert_eq!(
+            failure_count
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let retiring = engine.retiring_backends.lock().unwrap();
+        assert!(retiring.get("cursor-success").is_none_or(|entries| {
+            entries
+                .iter()
+                .all(|backend| !Arc::ptr_eq(backend, &success))
+        }));
+        assert!(
+            retiring["cursor-failure"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failure))
+        );
+        drop(retiring);
+        let backends = engine.backends.read().unwrap();
+        assert!(!Arc::ptr_eq(&backends["cursor-success"], &success));
+        assert!(!Arc::ptr_eq(&backends["cursor-failure"], &failure));
     }
 
     #[tokio::test]
@@ -26246,11 +26502,11 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
         let mut tracked = Vec::new();
         for id in ["cursor", "claude", "codex"] {
             let concrete = Arc::new(FailingShutdownBackend {
@@ -26315,11 +26571,11 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
 
         let blocked = trouve_agents::install::uninstall(
             data.path(),
@@ -26354,11 +26610,11 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
 
         let failing = Arc::new(FailingShutdownBackend {
             shutdowns: std::sync::atomic::AtomicUsize::new(0),
@@ -26391,10 +26647,19 @@ default_permission_mode = "ask"
             Some("https://old.example.test/v1")
         );
         assert!(engine.providers.read().unwrap().contains_key(ID));
-        assert!(Arc::ptr_eq(
-            &engine.backends.read().unwrap()[ID],
-            &failing_backend
-        ));
+        assert!(
+            engine
+                .backends
+                .read()
+                .unwrap()
+                .get(ID)
+                .is_none_or(|backend| !Arc::ptr_eq(backend, &failing_backend))
+        );
+        assert!(
+            engine.retiring_backends.lock().unwrap()[ID]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failing_backend))
+        );
         let delete = engine.delete_provider(ID).await;
         assert!(delete.is_err());
         assert_eq!(
@@ -26403,10 +26668,19 @@ default_permission_mode = "ask"
         );
         assert!(engine.config.lock().unwrap().providers.contains_key(ID));
         assert!(engine.providers.read().unwrap().contains_key(ID));
-        assert!(Arc::ptr_eq(
-            &engine.backends.read().unwrap()[ID],
-            &failing_backend
-        ));
+        assert!(
+            engine
+                .backends
+                .read()
+                .unwrap()
+                .get(ID)
+                .is_none_or(|backend| !Arc::ptr_eq(backend, &failing_backend))
+        );
+        assert!(
+            engine.retiring_backends.lock().unwrap()[ID]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failing_backend))
+        );
     }
 
     #[test]
