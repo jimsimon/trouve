@@ -395,12 +395,18 @@ pub struct CodeReviewRuntime {
     /// detached post-publication cleanup and the retry task never issue
     /// duplicate mutations for the same finding.
     collapse_in_flight: Mutex<HashSet<String>>,
-    /// (repository, pull) keys with a review-thread webhook pass pending or
-    /// running; the flag marks events that arrived mid-pass and need one
-    /// trailing pass. Bursts of resolutions therefore coalesce into at most
-    /// one running and one trailing reconciliation per pull instead of one
-    /// queued pass per delivery.
-    thread_webhook_pending: Mutex<HashMap<(String, u64), bool>>,
+    /// Review-thread webhook dispatcher: a deduplicated queue of
+    /// (repository, pull) priority keys drained by at most one worker.
+    /// Bursts — within one pull or across many — coalesce into one
+    /// repository poll and one prioritized walk per repository batch,
+    /// instead of one blocked task and one redundant poll per delivery.
+    thread_webhook_dispatch: Mutex<ThreadWebhookDispatch>,
+}
+
+#[derive(Default)]
+struct ThreadWebhookDispatch {
+    queue: HashMap<(String, u64), CodeReviewRepository>,
+    running: bool,
 }
 
 struct ReviewOutboxRetryState {
@@ -577,61 +583,68 @@ impl ReviewReconciliationCandidate {
     }
 }
 
-/// True when the caller should run a review-thread webhook pass for this
-/// key now; false when a pass is already pending or running and the arrival
-/// was recorded for its single trailing pass.
-fn claim_thread_webhook_pass(
-    pending: &Mutex<HashMap<(String, u64), bool>>,
-    key: &(String, u64),
+/// Enqueue a review-thread priority key; true when the caller must spawn
+/// the single drain worker. Keys arriving while a batch for their pull is
+/// mid-pass re-enter the queue, so the worker's next iteration is their
+/// trailing pass.
+fn enqueue_thread_webhook_key(
+    dispatch: &Mutex<ThreadWebhookDispatch>,
+    key: (String, u64),
+    repository: CodeReviewRepository,
 ) -> bool {
-    let mut pending = pending
+    let mut dispatch = dispatch
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match pending.get_mut(key) {
-        Some(rerun) => {
-            *rerun = true;
-            false
-        }
-        None => {
-            pending.insert(key.clone(), false);
-            true
-        }
+    dispatch.queue.insert(key, repository);
+    if dispatch.running {
+        false
+    } else {
+        dispatch.running = true;
+        true
     }
 }
 
-/// True when deliveries arrived during the pass and the worker must run one
-/// more; false releases the key.
-fn finish_thread_webhook_pass(
-    pending: &Mutex<HashMap<(String, u64), bool>>,
-    key: &(String, u64),
-) -> bool {
-    let mut pending = pending
+/// The next repository batch to drain: every queued pull of one repository,
+/// removed from the queue together so one poll and one prioritized walk
+/// serve them all. Returns None — atomically releasing the worker slot —
+/// only when the queue is empty.
+fn next_thread_webhook_batch(
+    dispatch: &Mutex<ThreadWebhookDispatch>,
+) -> Option<(CodeReviewRepository, HashSet<(String, u64)>)> {
+    let mut dispatch = dispatch
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match pending.get_mut(key) {
-        Some(rerun) if *rerun => {
-            *rerun = false;
-            true
-        }
-        _ => {
-            pending.remove(key);
-            false
-        }
+    let Some(repository) = dispatch.queue.values().next().cloned() else {
+        dispatch.running = false;
+        return None;
+    };
+    let keys = dispatch
+        .queue
+        .iter()
+        .filter(|(_, queued)| {
+            queued.repository == repository.repository
+                && queued.installation_id == repository.installation_id
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<HashSet<_>>();
+    for key in &keys {
+        dispatch.queue.remove(key);
     }
+    Some((repository, keys))
 }
 
 fn review_reconciliation_order_key(
     candidate: &(String, u64),
-    priority: Option<&(String, u64)>,
+    priority: &HashSet<(String, u64)>,
     reconciled_at: &HashMap<(String, u64), Instant>,
     progress_keys: &HashSet<(String, u64)>,
 ) -> (bool, Option<Instant>, bool, (String, u64)) {
     (
-        // The pull named by a review-thread webhook reconciles first, ahead
-        // of the least-recently-reconciled rotation. The complete
-        // (repository, pull) key is compared so an unrelated repository's
-        // identically numbered pull can never claim the priority slot.
-        priority != Some(candidate),
+        // Pulls named by review-thread webhooks reconcile first, ahead of
+        // the least-recently-reconciled rotation. Complete (repository,
+        // pull) keys are compared so an unrelated repository's identically
+        // numbered pull can never claim a priority slot.
+        !priority.contains(candidate),
         reconciled_at.get(candidate).copied(),
         !progress_keys.contains(candidate),
         candidate.clone(),
@@ -3567,7 +3580,7 @@ impl Engine {
             .unwrap()
             .retain(|key, _| active_reconciliation_keys.contains(key));
         if let Err(error) = self
-            .reconcile_oldest_review_thread_candidate(&reconciliation_candidates, None)
+            .reconcile_oldest_review_thread_candidate(&reconciliation_candidates, &HashSet::new())
             .await
         {
             had_errors = true;
@@ -3856,7 +3869,7 @@ impl Engine {
     async fn reconcile_oldest_review_thread_candidate(
         &self,
         candidates: &[ReviewReconciliationCandidate],
-        priority: Option<&(String, u64)>,
+        priority: &HashSet<(String, u64)>,
     ) -> Result<()> {
         let deadline = Instant::now() + REVIEW_RECONCILIATION_PASS_BUDGET;
         let progress_keys = self
@@ -4315,40 +4328,38 @@ impl Engine {
             // every event that arrived mid-pass.
             if let Some(pull_number) = review_thread_pull {
                 let key = (repository.repository.clone(), pull_number);
-                if claim_thread_webhook_pass(&self.code_review.thread_webhook_pending, &key) {
+                if enqueue_thread_webhook_key(
+                    &self.code_review.thread_webhook_dispatch,
+                    key,
+                    repository,
+                ) {
                     let engine = self.clone();
                     tokio::spawn(async move {
-                        loop {
+                        while let Some((repository, keys)) =
+                            next_thread_webhook_batch(&engine.code_review.thread_webhook_dispatch)
+                        {
+                            let _guard = engine.code_review.reconcile_lock.lock().await;
+                            let mut reconciliation_candidates = Vec::new();
+                            if let Err(error) = engine
+                                .poll_code_review_repository(
+                                    &repository,
+                                    &mut reconciliation_candidates,
+                                )
+                                .await
                             {
-                                let _guard = engine.code_review.reconcile_lock.lock().await;
-                                let mut reconciliation_candidates = Vec::new();
-                                if let Err(error) = engine
-                                    .poll_code_review_repository(
-                                        &repository,
-                                        &mut reconciliation_candidates,
-                                    )
-                                    .await
-                                {
-                                    engine.record_review_error(format!(
-                                        "webhook reconciliation failed: {error:#}"
-                                    ));
-                                } else if let Err(error) = engine
-                                    .reconcile_oldest_review_thread_candidate(
-                                        &reconciliation_candidates,
-                                        Some(&key),
-                                    )
-                                    .await
-                                {
-                                    engine.record_review_error(format!(
-                                        "webhook thread reconciliation failed: {error:#}"
-                                    ));
-                                }
-                            }
-                            if !finish_thread_webhook_pass(
-                                &engine.code_review.thread_webhook_pending,
-                                &key,
-                            ) {
-                                break;
+                                engine.record_review_error(format!(
+                                    "webhook reconciliation failed: {error:#}"
+                                ));
+                            } else if let Err(error) = engine
+                                .reconcile_oldest_review_thread_candidate(
+                                    &reconciliation_candidates,
+                                    &keys,
+                                )
+                                .await
+                            {
+                                engine.record_review_error(format!(
+                                    "webhook thread reconciliation failed: {error:#}"
+                                ));
                             }
                         }
                     });
@@ -4395,7 +4406,10 @@ impl Engine {
                 {
                     engine.record_review_error(format!("webhook reconciliation failed: {error:#}"));
                 } else if let Err(error) = engine
-                    .reconcile_oldest_review_thread_candidate(&reconciliation_candidates, None)
+                    .reconcile_oldest_review_thread_candidate(
+                        &reconciliation_candidates,
+                        &HashSet::new(),
+                    )
                     .await
                 {
                     engine.record_review_error(format!(
@@ -15614,7 +15628,7 @@ mod tests {
         let progress = HashSet::from([second.clone()]);
         let mut candidates = vec![second.clone(), new.clone(), first.clone()];
         candidates.sort_by_key(|candidate| {
-            review_reconciliation_order_key(candidate, None, &reconciled_at, &progress)
+            review_reconciliation_order_key(candidate, &HashSet::new(), &reconciled_at, &progress)
         });
         assert_eq!(candidates, vec![new, second, first]);
 
@@ -15625,7 +15639,7 @@ mod tests {
         progress_tie.sort_by_key(|candidate| {
             review_reconciliation_order_key(
                 candidate,
-                None,
+                &HashSet::new(),
                 &same_age,
                 &HashSet::from([right.clone()]),
             )
@@ -15634,7 +15648,7 @@ mod tests {
 
         let mut tied = vec![right.clone(), left.clone()];
         tied.sort_by_key(|candidate| {
-            review_reconciliation_order_key(candidate, None, &same_age, &HashSet::new())
+            review_reconciliation_order_key(candidate, &HashSet::new(), &same_age, &HashSet::new())
         });
         assert_eq!(tied, vec![left, right]);
 
@@ -15650,10 +15664,10 @@ mod tests {
             (fresh.clone(), now),
             (other_repo.clone(), now - Duration::from_secs(1_200)),
         ]);
-        let priority = ("acme/widgets".to_owned(), 42);
+        let priority = HashSet::from([("acme/widgets".to_owned(), 42)]);
         let mut prioritized = vec![stale.clone(), other_repo.clone(), fresh.clone()];
         prioritized.sort_by_key(|candidate| {
-            review_reconciliation_order_key(candidate, Some(&priority), &ages, &HashSet::new())
+            review_reconciliation_order_key(candidate, &priority, &ages, &HashSet::new())
         });
         assert_eq!(prioritized, vec![fresh, other_repo, stale]);
     }
@@ -25590,26 +25604,79 @@ mod tests {
     }
 
     #[test]
-    fn thread_webhook_bursts_coalesce_into_one_running_and_one_trailing_pass() {
-        let pending = Mutex::new(HashMap::new());
-        let key = ("acme/widgets".to_owned(), 42);
-        let other = ("acme/widgets".to_owned(), 7);
+    fn thread_webhook_bursts_coalesce_into_repository_batches() {
+        let repository = |name: &str| CodeReviewRepository {
+            installation_id: 7,
+            repository: name.to_owned(),
+            private: false,
+            mode: CodeReviewMode::Automatic,
+            model: None,
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            analyst_model: None,
+            analyst_thinking_level: None,
+            prompt: String::new(),
+            reviewer_ids: Vec::new(),
+            routing_mode: CodeReviewRoutingMode::Additive,
+            semantic_routing: true,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            reviewer_overrides: Vec::new(),
+        };
+        let dispatch = Mutex::new(ThreadWebhookDispatch::default());
 
-        // First delivery claims the pass; a burst arriving before it runs
-        // records a single trailing pass instead of queueing per delivery.
-        assert!(claim_thread_webhook_pass(&pending, &key));
-        assert!(!claim_thread_webhook_pass(&pending, &key));
-        assert!(!claim_thread_webhook_pass(&pending, &key));
-        // A different pull is independent.
-        assert!(claim_thread_webhook_pass(&pending, &other));
+        // The first delivery claims the single worker; a burst across pulls
+        // and repositories only enqueues.
+        assert!(enqueue_thread_webhook_key(
+            &dispatch,
+            ("acme/widgets".into(), 42),
+            repository("acme/widgets"),
+        ));
+        assert!(!enqueue_thread_webhook_key(
+            &dispatch,
+            ("acme/widgets".into(), 42),
+            repository("acme/widgets"),
+        ));
+        assert!(!enqueue_thread_webhook_key(
+            &dispatch,
+            ("acme/widgets".into(), 7),
+            repository("acme/widgets"),
+        ));
+        assert!(!enqueue_thread_webhook_key(
+            &dispatch,
+            ("acme/gadgets".into(), 42),
+            repository("acme/gadgets"),
+        ));
 
-        // The finished pass runs exactly one trailing pass for the burst,
-        // then releases the key so the next delivery claims afresh.
-        assert!(finish_thread_webhook_pass(&pending, &key));
-        assert!(!finish_thread_webhook_pass(&pending, &key));
-        assert!(claim_thread_webhook_pass(&pending, &key));
-        assert!(!finish_thread_webhook_pass(&pending, &key));
-        assert!(!finish_thread_webhook_pass(&pending, &other));
+        // One batch drains every queued pull of one repository together, so
+        // a single poll and one prioritized walk serve the whole burst.
+        let (first_repo, first_keys) = next_thread_webhook_batch(&dispatch).unwrap();
+        let (second_repo, second_keys) = next_thread_webhook_batch(&dispatch).unwrap();
+        let mut drained = vec![
+            (first_repo.repository, first_keys.len()),
+            (second_repo.repository, second_keys.len()),
+        ];
+        drained.sort();
+        assert_eq!(
+            drained,
+            vec![
+                ("acme/gadgets".to_owned(), 1),
+                ("acme/widgets".to_owned(), 2)
+            ]
+        );
+
+        // An empty queue releases the worker slot atomically; the next
+        // delivery claims a fresh worker, and a key arriving mid-pass is the
+        // next batch (its trailing pass).
+        assert!(next_thread_webhook_batch(&dispatch).is_none());
+        assert!(enqueue_thread_webhook_key(
+            &dispatch,
+            ("acme/widgets".into(), 42),
+            repository("acme/widgets"),
+        ));
+        assert!(next_thread_webhook_batch(&dispatch).is_some());
+        assert!(next_thread_webhook_batch(&dispatch).is_none());
     }
 
     #[tokio::test]
