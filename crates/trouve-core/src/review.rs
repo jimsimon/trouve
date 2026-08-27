@@ -4574,9 +4574,18 @@ impl Engine {
                 Err(_) => return None,
             }
         }
+        // Distinct models resolve concurrently: with cold provider caches
+        // each lookup can hit the network, and the basis only needs the
+        // completed set.
+        let resolved = futures::future::join_all(
+            models
+                .iter()
+                .map(|model| async move { (model, self.resolve_model_info(model).await) }),
+        )
+        .await;
         let mut smallest: Option<u64> = None;
-        for model in &models {
-            match self.resolve_model_info(model).await {
+        for (model, info) in resolved {
+            match info {
                 Ok(info) if info.context_window > 0 => {
                     smallest =
                         Some(smallest.map_or(info.context_window, |s| s.min(info.context_window)));
@@ -25034,6 +25043,104 @@ mod tests {
             batch.diff.len() <= derived.batch_max_bytes
                 && estimated_tokens(&batch.diff) <= derived.batch_target_tokens + 1
         }));
+    }
+
+    struct BudgetWindowProvider {
+        default_window: std::sync::atomic::AtomicU64,
+        small_window: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl trouve_providers::Provider for BudgetWindowProvider {
+        fn id(&self) -> &str {
+            "provider"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            let model = |id: &str, context_window: u64| trouve_protocol::ModelInfo {
+                id: id.into(),
+                display_name: id.into(),
+                context_window,
+                supports_tools: true,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                options_schema: serde_json::json!({}),
+            };
+            vec![
+                model(
+                    "provider/default",
+                    self.default_window
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                ),
+                model(
+                    "provider/small",
+                    self.small_window.load(std::sync::atomic::Ordering::SeqCst),
+                ),
+            ]
+        }
+
+        async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            self.models()
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            unreachable!("budget resolution never starts a model turn")
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_budgets_resolve_once_and_reuse_the_persisted_basis() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:budget-engine");
+        let second_job = enqueue_test_review_job(&store, "acme/widgets#42:budget-engine-fresh");
+        let provider = Arc::new(BudgetWindowProvider {
+            default_window: std::sync::atomic::AtomicU64::new(400_000),
+            small_window: std::sync::atomic::AtomicU64::new(200_000),
+        });
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        )
+        .with_provider("provider", provider.clone());
+        let reviewer = ReviewerProfile {
+            id: "correctness".into(),
+            name: "Correctness".into(),
+            prompt: String::new(),
+            model: Some("provider/small".into()),
+            default_thinking_level: None,
+            built_in: true,
+        };
+
+        // The smallest window across the job's models wins (the reviewer's
+        // 200K, not the review model's 400K).
+        let first = engine
+            .review_prompt_budgets(&job, std::slice::from_ref(&reviewer))
+            .await;
+        assert_eq!(first, derived_review_prompt_budgets(Some(200_000)));
+
+        // Provider metadata changes mid-job; the persisted basis wins, so a
+        // retry batches identically.
+        provider
+            .small_window
+            .store(50_000, std::sync::atomic::Ordering::SeqCst);
+        let retry = engine
+            .review_prompt_budgets(&job, std::slice::from_ref(&reviewer))
+            .await;
+        assert_eq!(retry, first);
+
+        // A different job resolves fresh and sees the new smaller window.
+        let fresh = engine
+            .review_prompt_budgets(&second_job, std::slice::from_ref(&reviewer))
+            .await;
+        assert_eq!(fresh, derived_review_prompt_budgets(Some(50_000)));
     }
 
     #[test]
