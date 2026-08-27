@@ -12063,7 +12063,11 @@ fn diff_hunk_range(range: &str, sigil: char) -> Option<(u64, u64)> {
 /// constants that predate model-derived sizing; when every model a job can
 /// call reports a context window, the budgets scale from the smallest window
 /// so large-window fleets pack more diff per call (fewer, cheaper reviewer
-/// invocations) and small local models are never overflowed.
+/// invocations) while small windows shrink every budget monotonically below
+/// the fixed defaults. Floors keep prompts minimally useful: a window
+/// smaller than the combined floors (roughly twice the envelope reserve)
+/// stays best-effort, exactly as it was before this derivation existed —
+/// only with far less content than the old unconditional constants sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReviewPromptBudgets {
     batch_target_tokens: usize,
@@ -12100,8 +12104,9 @@ fn derived_review_prompt_budgets(smallest_context_window: Option<u64>) -> Review
     // default stays the floor so behavior never regresses, and the 4x
     // ceiling bounds per-call latency. On small windows the content ceiling
     // first subtracts the request envelope (persona prompt, rubric, changed
-    // paths, output) and then halves what remains, so batch content can
-    // never crowd the envelope out of the window.
+    // paths, output) and then halves what remains, so batch content leaves
+    // the envelope room whenever the window can hold both; below that, the
+    // floor keeps a minimally useful batch and the window is best-effort.
     let content_ceiling = window.saturating_sub(REVIEW_PROMPT_ENVELOPE_RESERVE_TOKENS) / 2;
     let batch_target_tokens = (window / 8)
         .clamp(REVIEW_BATCH_TARGET_TOKENS, REVIEW_BATCH_TARGET_TOKENS_MAX)
