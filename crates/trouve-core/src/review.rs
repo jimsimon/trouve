@@ -96,9 +96,14 @@ const REVIEW_COLLAPSE_GROUP_CONCURRENCY: usize = 4;
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
+/// Ceiling for the derived batch token target: 4x the fixed default. Larger
+/// batches stop paying off — call latency grows and reviewer attention
+/// dilutes — before large context windows run out.
+const REVIEW_BATCH_TARGET_TOKENS_MAX: usize = 96 * 1024;
 // Bump when batch identity or composition changes so interrupted jobs never
 // reuse routing or reviewer output against a differently assembled batch.
-const REVIEW_BATCH_FORMAT_VERSION: &str = "2";
+// 3: batch budgets derive from the smallest configured model context window.
+const REVIEW_BATCH_FORMAT_VERSION: &str = "3";
 // The changed-path list is rendered outside `ReviewBatch::diff`, so bound it
 // separately. A byte budget admits many short paths without letting unusual
 // path names make the model request unbounded.
@@ -1278,9 +1283,15 @@ impl ReviewBatchAccumulator {
         }
     }
 
-    fn fits(&self, path: &str, section: &str, section_tokens: usize) -> bool {
-        self.batch.diff.len().saturating_add(section.len()) <= REVIEW_BATCH_MAX_BYTES
-            && self.estimated_tokens.saturating_add(section_tokens) <= REVIEW_BATCH_TARGET_TOKENS
+    fn fits(
+        &self,
+        path: &str,
+        section: &str,
+        section_tokens: usize,
+        budgets: ReviewPromptBudgets,
+    ) -> bool {
+        self.batch.diff.len().saturating_add(section.len()) <= budgets.batch_max_bytes
+            && self.estimated_tokens.saturating_add(section_tokens) <= budgets.batch_target_tokens
             && self
                 .path_bytes
                 .saturating_add(self.additional_path_bytes(path))
@@ -4535,6 +4546,62 @@ impl Engine {
         }
     }
 
+    /// Prompt budgets for one job, derived from the smallest context window
+    /// among every model the job can call: the repository review model, the
+    /// router and analyst overrides, and each reviewer's model. If any of
+    /// those models fails to report a positive window, the fixed default
+    /// budgets are used — a window is never guessed.
+    async fn review_prompt_budgets(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+        reviewers: &[ReviewerProfile],
+    ) -> ReviewPromptBudgets {
+        let mut models = std::collections::BTreeSet::new();
+        for resolved in [review_model(job), router_model(job), analyst_model(job)]
+            .into_iter()
+            .chain(
+                reviewers
+                    .iter()
+                    .map(|reviewer| reviewer_model(job, reviewer)),
+            )
+        {
+            match resolved {
+                Ok(model) => {
+                    models.insert(model);
+                }
+                // A missing model configuration fails later with its own
+                // actionable error; budgets just stay at the defaults.
+                Err(_) => return ReviewPromptBudgets::default(),
+            }
+        }
+        let mut smallest: Option<u64> = None;
+        for model in &models {
+            match self.resolve_model_info(model).await {
+                Ok(info) if info.context_window > 0 => {
+                    smallest =
+                        Some(smallest.map_or(info.context_window, |s| s.min(info.context_window)));
+                }
+                Ok(_) | Err(_) => {
+                    tracing::debug!(
+                        %model,
+                        "model did not report a context window; using fixed review prompt budgets"
+                    );
+                    return ReviewPromptBudgets::default();
+                }
+            }
+        }
+        let budgets = derived_review_prompt_budgets(smallest);
+        if budgets != ReviewPromptBudgets::default() {
+            tracing::debug!(
+                smallest_context_window = smallest,
+                batch_target_tokens = budgets.batch_target_tokens,
+                batch_max_bytes = budgets.batch_max_bytes,
+                "derived review prompt budgets from configured models"
+            );
+        }
+        budgets
+    }
+
     async fn execute_code_review(
         self: &Arc<Self>,
         record: &CodeReviewJobRecord,
@@ -4806,7 +4873,14 @@ impl Engine {
         } else {
             (diff_files, 0)
         };
-        let batches = build_effective_review_batches(&diff_files, reused_hunk_count);
+        let reviewers = if record.reviewers.is_empty() {
+            self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
+        } else {
+            record.reviewers.clone()
+        };
+        let prompt_budgets = self.review_prompt_budgets(&job, &reviewers).await;
+        let batches =
+            build_effective_review_batches(&diff_files, reused_hunk_count, prompt_budgets);
         let batch_digest = review_batch_digest(
             &job.review_base_sha,
             &job.head_sha,
@@ -4817,11 +4891,6 @@ impl Engine {
             .store
             .prepare_code_review_batch_snapshot(&job.id, &batch_digest)?;
         self.flush_pending_code_review_events(&job.id).await?;
-        let reviewers = if record.reviewers.is_empty() {
-            self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
-        } else {
-            record.reviewers.clone()
-        };
         let batch_snapshot_changed = snapshot.changed;
         let mut routing_decisions = self.store.code_review_routing_decisions(&job.id)?;
         if batch_snapshot_changed {
@@ -5354,6 +5423,7 @@ impl Engine {
                 implementation_analysis.as_ref(),
                 &diff_files,
                 reused_hunk_count,
+                prompt_budgets,
             )?;
             let task = if let Some(task) = queued_coordinator.take() {
                 task
@@ -11924,18 +11994,72 @@ fn diff_hunk_range(range: &str, sigil: char) -> Option<(u64, u64)> {
     parts.next().is_none().then_some((start, count))
 }
 
+/// Byte budgets for model-facing review prompts. Defaults mirror the fixed
+/// constants that predate model-derived sizing; when every model a job can
+/// call reports a context window, the budgets scale from the smallest window
+/// so large-window fleets pack more diff per call (fewer, cheaper reviewer
+/// invocations) and small local models are never overflowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewPromptBudgets {
+    batch_target_tokens: usize,
+    batch_max_bytes: usize,
+    coordinator_context_max_bytes: usize,
+}
+
+impl Default for ReviewPromptBudgets {
+    fn default() -> Self {
+        Self {
+            batch_target_tokens: REVIEW_BATCH_TARGET_TOKENS,
+            batch_max_bytes: REVIEW_BATCH_MAX_BYTES,
+            coordinator_context_max_bytes: REVIEW_COORDINATOR_CONTEXT_MAX_BYTES,
+        }
+    }
+}
+
+/// Derive prompt budgets from the smallest context window (in tokens) among
+/// the models a review job can call. None (or a zero window) keeps the fixed
+/// defaults: budgets are never guessed for models that do not report a
+/// window.
+fn derived_review_prompt_budgets(smallest_context_window: Option<u64>) -> ReviewPromptBudgets {
+    let Some(window) = smallest_context_window.filter(|window| *window > 0) else {
+        return ReviewPromptBudgets::default();
+    };
+    let window = usize::try_from(window).unwrap_or(usize::MAX);
+    // An eighth of the window is a conservative growth basis; the historical
+    // default stays the floor so behavior never regresses, the 4x ceiling
+    // bounds per-call latency, and half the window is a hard cap so the
+    // persona prompt, shared sections, and the model's own output always
+    // have room even on small local models.
+    let batch_target_tokens = (window / 8)
+        .clamp(REVIEW_BATCH_TARGET_TOKENS, REVIEW_BATCH_TARGET_TOKENS_MAX)
+        .min(window / 2)
+        .max(1);
+    // Keep the historical bytes-per-token ratio (128KB for a 24K-token
+    // target) between the token target and the byte ceilings.
+    let batch_max_bytes = batch_target_tokens.saturating_mul(16) / 3;
+    ReviewPromptBudgets {
+        batch_target_tokens,
+        batch_max_bytes,
+        coordinator_context_max_bytes: batch_max_bytes,
+    }
+}
+
 fn build_effective_review_batches(
     files: &[ReviewDiffFile],
     reused_hunk_count: usize,
+    budgets: ReviewPromptBudgets,
 ) -> Vec<ReviewBatch> {
     if files.is_empty() && reused_hunk_count > 0 {
         Vec::new()
     } else {
-        build_review_batches(files)
+        build_review_batches(files, budgets)
     }
 }
 
-fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
+fn build_review_batches(
+    files: &[ReviewDiffFile],
+    budgets: ReviewPromptBudgets,
+) -> Vec<ReviewBatch> {
     if files.is_empty() {
         return vec![ReviewBatch {
             paths: Vec::new(),
@@ -11946,14 +12070,15 @@ fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
     for file in files {
         if is_generated_review_artifact(file) {
             let section = generated_review_artifact_summary(file);
-            pack_review_section(&mut batches, &file.path, section, 0);
+            pack_review_section(&mut batches, &file.path, section, 0, budgets);
             continue;
         }
         // Reserve enough room for the repeated path/fragment header so even
         // one very large file cannot produce an oversized model request.
         let largest_header = format!("\n=== {} (diff fragment {}) ===\n", file.path, usize::MAX);
-        let token_byte_budget = REVIEW_BATCH_TARGET_TOKENS.saturating_mul(4);
-        let chunk_limit = REVIEW_BATCH_MAX_BYTES
+        let token_byte_budget = budgets.batch_target_tokens.saturating_mul(4);
+        let chunk_limit = budgets
+            .batch_max_bytes
             .min(token_byte_budget)
             .saturating_sub(largest_header.len() + 1)
             .max(1);
@@ -11967,8 +12092,13 @@ fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
                 index + 1,
                 chunk
             );
-            minimum_batch_index =
-                pack_review_section(&mut batches, &file.path, section, minimum_batch_index);
+            minimum_batch_index = pack_review_section(
+                &mut batches,
+                &file.path,
+                section,
+                minimum_batch_index,
+                budgets,
+            );
         }
     }
     batches.into_iter().map(|batch| batch.batch).collect()
@@ -11979,6 +12109,7 @@ fn pack_review_section(
     path: &str,
     section: String,
     minimum_batch_index: usize,
+    budgets: ReviewPromptBudgets,
 ) -> usize {
     let section_tokens = estimated_tokens(&section);
     // Best-fit backfills an earlier batch when a large intervening file did
@@ -11988,7 +12119,7 @@ fn pack_review_section(
         .iter()
         .enumerate()
         .filter(|(index, batch)| {
-            *index >= minimum_batch_index && batch.fits(path, &section, section_tokens)
+            *index >= minimum_batch_index && batch.fits(path, &section, section_tokens, budgets)
         })
         .max_by_key(|(_, batch)| batch.batch.diff.len())
         .map(|(index, _)| index);
@@ -12617,6 +12748,7 @@ fn validation_prompt(
     implementation_analysis: Option<&ImplementationAnalysis>,
     files: &[ReviewDiffFile],
     reused_hunk_count: usize,
+    budgets: ReviewPromptBudgets,
 ) -> Result<String> {
     let job = &record.job;
     let candidate_paths = candidates
@@ -12638,7 +12770,12 @@ fn validation_prompt(
                 .flat_map(|theme| theme.affected_paths.iter().map(String::as_str)),
         )
         .collect::<HashSet<_>>();
-    let diff_context = coordinator_diff_context(files, &relevant_paths, &candidate_paths);
+    let diff_context = coordinator_diff_context(
+        files,
+        &relevant_paths,
+        &candidate_paths,
+        budgets.coordinator_context_max_bytes,
+    );
     let candidate_findings = candidates
         .iter()
         .map(|candidate| -> Result<serde_json::Value> {
@@ -13160,6 +13297,7 @@ fn coordinator_diff_context(
     files: &[ReviewDiffFile],
     paths: &HashSet<&str>,
     priority_paths: &HashSet<&str>,
+    max_bytes: usize,
 ) -> String {
     let mut context = String::new();
     let ordered_files = files
@@ -13170,12 +13308,12 @@ fn coordinator_diff_context(
         }));
     for file in ordered_files {
         let header = format!("\n=== {} ===\n", file.path);
-        let remaining = REVIEW_COORDINATOR_CONTEXT_MAX_BYTES.saturating_sub(context.len());
+        let remaining = max_bytes.saturating_sub(context.len());
         if header.len() >= remaining {
             break;
         }
         context.push_str(&header);
-        let remaining = REVIEW_COORDINATOR_CONTEXT_MAX_BYTES.saturating_sub(context.len());
+        let remaining = max_bytes.saturating_sub(context.len());
         let chunk = split_diff_chunks(&file.diff, remaining)
             .into_iter()
             .next()
@@ -13183,7 +13321,7 @@ fn coordinator_diff_context(
         context.push_str(chunk);
         if chunk.len() < file.diff.len() {
             let marker = "\n[diff truncated; use git_diff for the remainder]\n";
-            let remaining = REVIEW_COORDINATOR_CONTEXT_MAX_BYTES.saturating_sub(context.len());
+            let remaining = max_bytes.saturating_sub(context.len());
             context.push_str(&bounded_utf8(marker, remaining, ""));
         }
     }
@@ -15479,10 +15617,11 @@ mod tests {
 
     #[test]
     fn only_rewrite_reuse_turns_an_empty_diff_into_zero_batches() {
-        let unchanged_empty = build_effective_review_batches(&[], 0);
+        let unchanged_empty =
+            build_effective_review_batches(&[], 0, ReviewPromptBudgets::default());
         assert_eq!(unchanged_empty.len(), 1);
         assert!(unchanged_empty[0].diff.contains("No textual file changes"));
-        assert!(build_effective_review_batches(&[], 1).is_empty());
+        assert!(build_effective_review_batches(&[], 1, ReviewPromptBudgets::default()).is_empty());
     }
 
     #[test]
@@ -16502,13 +16641,37 @@ mod tests {
         };
 
         // A theme seen once is history, not instability.
-        let calm =
-            validation_prompt(&record, &[], &[], &[], &[theme(1)], &[], "", None, &[], 0).unwrap();
+        let calm = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[theme(1)],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(!calm.contains("Recurring instability:"));
 
         // A recurring theme triggers the design-level escalation.
-        let escalated =
-            validation_prompt(&record, &[], &[], &[], &[theme(3)], &[], "", None, &[], 0).unwrap();
+        let escalated = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[theme(3)],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(escalated.contains("Recurring instability:"));
         assert!(escalated.contains("`th_lifecycle` (recurred 3 time(s))"));
         assert!(escalated.contains("design-level fix"));
@@ -16526,13 +16689,38 @@ mod tests {
         let mut record = store.code_review_job(&job.id).unwrap().unwrap();
 
         // Without a description, the guidance is omitted entirely.
-        let without =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let without = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(!without.contains("author's claimed intent"));
 
         record.pull_body =
             "Removes the per-engine caps so independent sessions are provider-limited.".into();
-        let with = validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let with = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(with.contains("author's claimed intent"));
         assert!(with.contains("never a reason by itself to reject a candidate"));
         assert!(with.contains("predate later revisions"));
@@ -16608,6 +16796,7 @@ mod tests {
             Some(&analysis),
             &[],
             0,
+            ReviewPromptBudgets::default(),
         )
         .unwrap();
         assert!(with.contains("derived_implementation_analysis"));
@@ -16615,8 +16804,20 @@ mod tests {
         assert!(with.contains("observed counterpoint"));
         assert!(with.contains("process-wide semaphore"));
 
-        let without =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let without = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(!without.contains("read only the full-branch diff"));
     }
 
@@ -22143,7 +22344,7 @@ mod tests {
                 generated_header: None,
             },
         ];
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
         let covered: HashSet<_> = batches
             .iter()
             .flat_map(|batch| batch.paths.iter().map(String::as_str))
@@ -22905,6 +23106,7 @@ mod tests {
                 generated_header: None,
             }],
             0,
+            ReviewPromptBudgets::default(),
         )
         .unwrap();
 
@@ -23122,8 +23324,20 @@ mod tests {
             diff: "+fn changed() {}\n".into(),
         };
         let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[], 0);
-        let coordinator_prompt =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let coordinator_prompt = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
 
         for (name, prompt) in [
             ("reviewer", reviewer_prompt.as_str()),
@@ -24445,8 +24659,20 @@ mod tests {
         assert!(prompt.contains("locate every writer of that state"));
         assert!(prompt.contains("correct under re-execution"));
 
-        let coordinator =
-            validation_prompt(&record, &[], &[], &[], &[], &[], "", None, &[], 0).unwrap();
+        let coordinator = validation_prompt(
+            &record,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            0,
+            ReviewPromptBudgets::default(),
+        )
+        .unwrap();
         assert!(coordinator.contains("broken by an unchanged writer or runner"));
         assert!(coordinator.contains("must not be rejected as"));
     }
@@ -24752,12 +24978,61 @@ mod tests {
             diff: "+let value = 1234;\n".repeat(20_000),
             generated_header: None,
         }];
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
         assert!(batches.len() > 1);
         assert!(batches.iter().all(|batch| {
             batch.diff.len() <= REVIEW_BATCH_MAX_BYTES
                 && estimated_tokens(&batch.diff) <= REVIEW_BATCH_TARGET_TOKENS + 1
         }));
+
+        // Larger derived budgets pack the same diff into fewer batches, and
+        // every batch honors the derived caps rather than the fixed ones.
+        let derived = derived_review_prompt_budgets(Some(400_000));
+        let derived_batches = build_review_batches(&files, derived);
+        assert!(derived_batches.len() < batches.len());
+        assert!(derived_batches.iter().all(|batch| {
+            batch.diff.len() <= derived.batch_max_bytes
+                && estimated_tokens(&batch.diff) <= derived.batch_target_tokens + 1
+        }));
+    }
+
+    #[test]
+    fn prompt_budgets_derive_from_the_smallest_context_window() {
+        // No window (or zero) keeps the fixed defaults — never guess.
+        assert_eq!(
+            derived_review_prompt_budgets(None),
+            ReviewPromptBudgets::default()
+        );
+        assert_eq!(
+            derived_review_prompt_budgets(Some(0)),
+            ReviewPromptBudgets::default()
+        );
+
+        // A 400K-token window grows the target to window/8 = 50K tokens and
+        // keeps the historical bytes-per-token ratio for the byte ceilings.
+        let large = derived_review_prompt_budgets(Some(400_000));
+        assert_eq!(large.batch_target_tokens, 50_000);
+        assert_eq!(large.batch_max_bytes, 50_000 * 16 / 3);
+        assert_eq!(large.coordinator_context_max_bytes, large.batch_max_bytes);
+
+        // Growth caps at 4x the fixed default even for very large windows.
+        let huge = derived_review_prompt_budgets(Some(1_050_000));
+        assert_eq!(huge.batch_target_tokens, REVIEW_BATCH_TARGET_TOKENS_MAX);
+
+        // A window at or below the fixed default's comfort zone shrinks the
+        // target to half the window so the prompt envelope and output fit.
+        let small = derived_review_prompt_budgets(Some(32_000));
+        assert_eq!(small.batch_target_tokens, 16_000);
+        let tiny = derived_review_prompt_budgets(Some(8_000));
+        assert_eq!(tiny.batch_target_tokens, 4_000);
+
+        // A window exactly at the historical break-even keeps the default.
+        let default_window = derived_review_prompt_budgets(Some(8 * 24 * 1024));
+        assert_eq!(
+            default_window.batch_target_tokens,
+            REVIEW_BATCH_TARGET_TOKENS
+        );
+        assert_eq!(default_window.batch_max_bytes, REVIEW_BATCH_MAX_BYTES);
     }
 
     #[test]
@@ -24780,7 +25055,7 @@ mod tests {
             },
         ];
 
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].paths.len(), 2);
@@ -24821,8 +25096,8 @@ mod tests {
         let second_file = file("old_b", "new_b");
         assert_eq!(first_file.diff.len(), second_file.diff.len());
 
-        let first = build_review_batches(&[first_file]);
-        let second = build_review_batches(&[second_file]);
+        let first = build_review_batches(&[first_file], ReviewPromptBudgets::default());
+        let second = build_review_batches(&[second_file], ReviewPromptBudgets::default());
         let persisted_prompt = review_batch_identity(&first[0], 0, 1);
 
         assert!(first[0].diff.contains("1 added and 1 removed lines"));
@@ -24849,7 +25124,7 @@ mod tests {
         };
 
         assert!(!is_generated_review_artifact(&file));
-        let batches = build_review_batches(&[file]);
+        let batches = build_review_batches(&[file], ReviewPromptBudgets::default());
         assert!(!batches[0].diff.contains("generated artifact summary"));
         assert!(batches[0].diff.contains("export const"));
     }
@@ -24866,7 +25141,7 @@ mod tests {
 
         assert!(!is_generated_review_artifact(&file));
         assert!(
-            build_review_batches(&[file])[0]
+            build_review_batches(&[file], ReviewPromptBudgets::default())[0]
                 .diff
                 .contains("reviewed_source")
         );
@@ -24883,7 +25158,7 @@ mod tests {
         };
 
         assert!(!is_generated_review_artifact(&file));
-        let batches = build_review_batches(&[file]);
+        let batches = build_review_batches(&[file], ReviewPromptBudgets::default());
         assert!(batches[0].diff.contains("checksum = \"untrusted-change\""));
 
         let nested = ReviewDiffFile {
@@ -24914,7 +25189,7 @@ mod tests {
             },
         ];
 
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
 
         assert_eq!(batches.len(), 2);
         assert_eq!(
@@ -24939,7 +25214,7 @@ mod tests {
             },
         ];
 
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
         let first = batches
             .iter()
             .position(|batch| batch.diff.contains("diff fragment 1/2"))
@@ -25145,7 +25420,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let batches = build_review_batches(&files);
+        let batches = build_review_batches(&files, ReviewPromptBudgets::default());
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].paths.len(), files.len());
@@ -25166,7 +25441,8 @@ mod tests {
             },
         ];
         let paths = HashSet::from(["src/relevant.rs"]);
-        let context = coordinator_diff_context(&files, &paths, &paths);
+        let context =
+            coordinator_diff_context(&files, &paths, &paths, REVIEW_COORDINATOR_CONTEXT_MAX_BYTES);
         assert!(context.contains("broken"));
         assert!(!context.contains("unrelated"));
     }
@@ -25188,7 +25464,12 @@ mod tests {
         let paths = HashSet::from(["src/historical.rs", "src/candidate.rs"]);
         let priority = HashSet::from(["src/candidate.rs"]);
 
-        let context = coordinator_diff_context(&files, &paths, &priority);
+        let context = coordinator_diff_context(
+            &files,
+            &paths,
+            &priority,
+            REVIEW_COORDINATOR_CONTEXT_MAX_BYTES,
+        );
 
         assert!(context.contains("candidate_defect"));
     }
@@ -25202,7 +25483,8 @@ mod tests {
         }];
         let paths = HashSet::from(["src/relevant.rs"]);
 
-        let context = coordinator_diff_context(&files, &paths, &paths);
+        let context =
+            coordinator_diff_context(&files, &paths, &paths, REVIEW_COORDINATOR_CONTEXT_MAX_BYTES);
 
         assert!(context.len() <= REVIEW_COORDINATOR_CONTEXT_MAX_BYTES);
     }
