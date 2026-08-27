@@ -15729,7 +15729,7 @@ validate349.evaluated = {"props":{"clis":true},"dynamicProps":false,"dynamicItem
 
 export const cliInstallStatus = validate354;
 const schema166 = {"$id":"urn:trouve:protocol-validator:cliInstallStatus","$ref":"urn:trouve:protocol-openapi#/components/schemas/CliInstallStatus"};
-const schema167 = {"type":"object","description":"State of a CLI install started with `POST /v1/clis/{id}/install`.","required":["status"],"properties":{"error":{"type":["string","null"]},"received_bytes":{"type":"integer","format":"int64","description":"Bytes downloaded so far (pending only).","minimum":0},"status":{"type":"string","description":"\"none\" (nothing running), \"pending\", \"success\", or \"failed\"."},"total_bytes":{"type":"integer","format":"int64","description":"Expected total from Content-Length; 0 when unknown.","minimum":0},"version":{"type":["string","null"],"description":"Version being (or just) installed, when known."}}};
+const schema167 = {"type":"object","description":"State of a CLI install started with `POST /v1/clis/{id}/install`.","required":["status"],"properties":{"error":{"type":["string","null"],"description":"The terminal error when `status = \"failed\"`."},"received_bytes":{"type":"integer","format":"int64","description":"Bytes downloaded so far (pending only).","minimum":0},"status":{"type":"string","description":"\"none\" (nothing running), \"pending\", \"success\", or \"failed\"."},"total_bytes":{"type":"integer","format":"int64","description":"Expected total from Content-Length; 0 when unknown.","minimum":0},"version":{"type":["string","null"],"description":"Version being (or just) installed, when known."},"warning":{"type":["string","null"],"description":"A non-fatal activation warning. When present with `status = \"success\"`,\nthe runtime is active but its crash durability could not be confirmed."}}};
 
 function validate355(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -15828,6 +15828,20 @@ var valid0 = _errs9 === errors;
 else {
 var valid0 = true;
 }
+if(valid0){
+if(data.warning !== undefined){
+let data5 = data.warning;
+const _errs11 = errors;
+if((typeof data5 !== "string") && (data5 !== null)){
+validate355.errors = [{instancePath:instancePath+"/warning",schemaPath:"#/properties/warning/type",keyword:"type",params:{type: schema167.properties.warning.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs11 === errors;
+}
+else {
+var valid0 = true;
+}
+}
 }
 }
 }
@@ -15842,7 +15856,7 @@ return false;
 validate355.errors = vErrors;
 return errors === 0;
 }
-validate355.evaluated = {"props":{"error":true,"received_bytes":true,"status":true,"total_bytes":true,"version":true},"dynamicProps":false,"dynamicItems":false};
+validate355.evaluated = {"props":{"error":true,"received_bytes":true,"status":true,"total_bytes":true,"version":true,"warning":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate354(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -15863,7 +15877,7 @@ errors = vErrors.length;
 validate354.errors = vErrors;
 return errors === 0;
 }
-validate354.evaluated = {"props":{"error":true,"received_bytes":true,"status":true,"total_bytes":true,"version":true},"dynamicProps":false,"dynamicItems":false};
+validate354.evaluated = {"props":{"error":true,"received_bytes":true,"status":true,"total_bytes":true,"version":true,"warning":true},"dynamicProps":false,"dynamicItems":false};
 
 export const knownEnvelope = validate357;
 const schema168 = {"$id":"urn:trouve:protocol-validator:knownEnvelope","$ref":"urn:trouve:protocol-openapi#/components/schemas/EventEnvelope"};

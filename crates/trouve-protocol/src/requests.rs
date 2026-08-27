@@ -3209,6 +3209,11 @@ pub struct CliInstallStatus {
     /// Version being (or just) installed, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// A non-fatal activation warning. When present with `status = "success"`,
+    /// the runtime is active but its crash durability could not be confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    /// The terminal error when `status = "failed"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Bytes downloaded so far (pending only).

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.24"
+    "version": "7.25"
   },
   "paths": {
     "/v1/approvals": {
@@ -5383,7 +5383,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The terminal error when `status = \"failed\"`."
           },
           "received_bytes": {
             "type": "integer",
@@ -5407,6 +5408,13 @@
               "null"
             ],
             "description": "Version being (or just) installed, when known."
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A non-fatal activation warning. When present with `status = \"success\"`,\nthe runtime is active but its crash durability could not be confirmed."
           }
         }
       },

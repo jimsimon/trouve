@@ -1910,6 +1910,7 @@ export interface components {
         };
         /** @description State of a CLI install started with `POST /v1/clis/{id}/install`. */
         CliInstallStatus: {
+            /** @description The terminal error when `status = "failed"`. */
             error?: string | null;
             /**
              * Format: int64
@@ -1925,6 +1926,11 @@ export interface components {
             total_bytes?: number;
             /** @description Version being (or just) installed, when known. */
             version?: string | null;
+            /**
+             * @description A non-fatal activation warning. When present with `status = "success"`,
+             *     the runtime is active but its crash durability could not be confirmed.
+             */
+            warning?: string | null;
         };
         CliList: {
             clis: components["schemas"]["CliInfo"][];
