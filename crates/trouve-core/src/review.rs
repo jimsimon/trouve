@@ -15096,12 +15096,40 @@ fn finding_anchor_content(
     if !candidate.starts_with(&root) {
         return None;
     }
+    let file = std::fs::File::open(&candidate).ok()?;
+    let opened = file.metadata().ok()?;
     // Anchor verification reads source files; anything larger than the
     // anchor-blob bound is not a reviewable source file.
-    if std::fs::metadata(&candidate).ok()?.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 {
+    if opened.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 {
         return None;
     }
-    let text = std::fs::read_to_string(&candidate).ok()?;
+    // The confinement check above validated a pathname, not the object this
+    // handle opened: a concurrent checkout sync could swap a symlink in
+    // between. Re-resolve after opening and require the open descriptor to
+    // be the very object now at the confined path, so the read below is
+    // bound to a checked filesystem object rather than a mutable name.
+    let recheck = std::fs::canonicalize(root.join(relative)).ok()?;
+    if !recheck.starts_with(&root) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = std::fs::metadata(&recheck).ok()?;
+        if current.dev() != opened.dev() || current.ino() != opened.ino() {
+            return None;
+        }
+    }
+    let mut text = String::new();
+    {
+        use std::io::Read;
+        file.take(REVIEW_ANCHOR_BLOB_MAX_BYTES as u64 + 1)
+            .read_to_string(&mut text)
+            .ok()?;
+    }
+    if text.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES {
+        return None;
+    }
     let index = usize::try_from(finding.line).ok()?.checked_sub(1)?;
     text.lines().nth(index).map(str::to_owned)
 }
@@ -15170,17 +15198,24 @@ fn apply_verification_derived_confidence(
     repository_path: Option<&std::path::Path>,
 ) {
     const ANCHOR_QUOTE_MAX_BYTES: usize = 512;
-    let actual = finding_anchor_content(finding, diff_contents, repository_path);
-    finding.evidence.anchor_match =
-        anchor_match_verdict(&finding.evidence.anchor_quote, actual.as_deref()).to_owned();
+    // The persisted record must reproduce the verdict: a quote too large to
+    // store verbatim is never verified, so `matched` always refers to the
+    // exact quote consumers can see. Real source lines fit comfortably; an
+    // oversized quote degrades to an unchecked anchor and is truncated for
+    // storage.
+    if finding.evidence.anchor_quote.len() > ANCHOR_QUOTE_MAX_BYTES {
+        finding.evidence.anchor_quote =
+            bounded_utf8(&finding.evidence.anchor_quote, ANCHOR_QUOTE_MAX_BYTES, "…");
+        finding.evidence.anchor_match = "unchecked".to_owned();
+    } else {
+        let actual = finding_anchor_content(finding, diff_contents, repository_path);
+        finding.evidence.anchor_match =
+            anchor_match_verdict(&finding.evidence.anchor_quote, actual.as_deref()).to_owned();
+    }
     let supported = verification_supported_confidence(&finding.evidence);
     if finding_level_rank(supported) < finding_level_rank(&finding.confidence) {
         finding.confidence = supported.to_owned();
     }
-    // Bound the stored quote after comparison so a pathological quote cannot
-    // bloat the persisted evidence.
-    finding.evidence.anchor_quote =
-        bounded_utf8(&finding.evidence.anchor_quote, ANCHOR_QUOTE_MAX_BYTES, "…");
 }
 
 fn parse_review_output(output: &str) -> Result<ReviewOutput> {
@@ -17503,6 +17538,15 @@ mod tests {
         hostile.path = "../etc/passwd".into();
         apply_verification_derived_confidence(&mut hostile, &contents, Some(repo.path()));
         assert_eq!(hostile.evidence.anchor_match, "unchecked");
+
+        // An oversized quote is never verified: the persisted record must be
+        // able to reproduce the verdict, so it degrades to unchecked and the
+        // stored quote is truncated.
+        let mut oversized = finding(&"x".repeat(700));
+        apply_verification_derived_confidence(&mut oversized, &contents, Some(repo.path()));
+        assert_eq!(oversized.evidence.anchor_match, "unchecked");
+        assert!(oversized.evidence.anchor_quote.len() <= 512 + '…'.len_utf8());
+        assert_eq!(oversized.confidence, "medium");
 
         // A repository symlink pointing outside the checkout is confined by
         // canonicalization: the read never follows it, so the anchor stays
