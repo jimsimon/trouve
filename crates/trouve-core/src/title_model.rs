@@ -795,11 +795,13 @@ fn sanitize_title_candidate(raw: &str) -> Result<SanitizedTitleCandidate> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
     };
 
+    use serde::Deserialize;
     use trouve_protocol::{TitleModelLoadBehavior, TitleModelResourcePolicy};
 
     use super::{
@@ -808,6 +810,128 @@ mod tests {
         TitleModelManager, cap_title_model_prompt, install_progress_key, sanitize_title,
         title_from_response, title_messages, title_request,
     };
+
+    const TITLE_QUALITY_CASES: &str = include_str!("../tests/data/title-quality-cases.json");
+    const TITLE_QUALITY_INTENT_MINIMUM: usize = 18;
+    const TITLE_QUALITY_SUBJECT_MINIMUM: usize = 18;
+
+    #[derive(Debug, Deserialize)]
+    struct TitleQualityCase {
+        id: String,
+        prompt: String,
+        allowed_prefixes: Vec<String>,
+        forbidden_prefixes: Vec<String>,
+        required_any: Vec<String>,
+    }
+
+    fn title_quality_cases() -> Vec<TitleQualityCase> {
+        serde_json::from_str(TITLE_QUALITY_CASES).expect("valid title-quality fixture")
+    }
+
+    #[test]
+    fn title_quality_fixture_has_independent_property_based_cases() {
+        let cases = title_quality_cases();
+        let ids: HashSet<_> = cases.iter().map(|case| case.id.as_str()).collect();
+        let prompts: HashSet<_> = cases.iter().map(|case| case.prompt.as_str()).collect();
+
+        assert_eq!(cases.len(), 20);
+        assert_eq!(ids.len(), cases.len());
+        assert_eq!(prompts.len(), cases.len());
+        for case in cases {
+            assert!(!case.id.trim().is_empty());
+            assert!(!case.prompt.trim().is_empty());
+            assert!(!case.allowed_prefixes.is_empty(), "{}", case.id);
+            assert!(!case.required_any.is_empty(), "{}", case.id);
+            assert!(
+                case.allowed_prefixes
+                    .iter()
+                    .chain(&case.forbidden_prefixes)
+                    .chain(&case.required_any)
+                    .all(|term| !term.trim().is_empty()),
+                "{}",
+                case.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TROUVE_E2E=1 and a Qwen3 Q5 llama-server at TROUVE_TITLE_E2E_URL"]
+    async fn local_title_model_preserves_intent_and_subject() {
+        assert_eq!(
+            std::env::var("TROUVE_E2E").as_deref(),
+            Ok("1"),
+            "set TROUVE_E2E=1 to run local-model quality tests"
+        );
+        let base_url = std::env::var("TROUVE_TITLE_E2E_URL")
+            .expect("set TROUVE_TITLE_E2E_URL to the llama-server /v1 endpoint");
+        let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let cases = title_quality_cases();
+        let mut generated = Vec::new();
+        let mut structural_failures = Vec::new();
+
+        for case in &cases {
+            let prompt = cap_title_model_prompt(&case.prompt);
+            let response = client
+                .post(&endpoint)
+                .json(&title_request(prompt.as_ref()))
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{} request failed: {error}", case.id))
+                .error_for_status()
+                .unwrap_or_else(|error| panic!("{} request was rejected: {error}", case.id))
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|error| panic!("{} response was invalid: {error}", case.id));
+            match title_from_response(&response) {
+                Ok(title) => generated.push((case, title)),
+                Err(error) => structural_failures.push(format!("{}: {error}", case.id)),
+            }
+        }
+
+        assert!(
+            structural_failures.is_empty(),
+            "structurally invalid titles:\n{}",
+            structural_failures.join("\n")
+        );
+
+        let mut intent_failures = Vec::new();
+        let mut subject_failures = Vec::new();
+        for (case, title) in &generated {
+            let prefix = title.split_whitespace().next().unwrap_or_default();
+            let allowed = case
+                .allowed_prefixes
+                .iter()
+                .any(|candidate| prefix.eq_ignore_ascii_case(candidate));
+            let forbidden = case
+                .forbidden_prefixes
+                .iter()
+                .any(|candidate| prefix.eq_ignore_ascii_case(candidate));
+            if !allowed || forbidden {
+                intent_failures.push(format!("{}: {title}", case.id));
+            }
+
+            let folded = title.to_ascii_lowercase();
+            if !case
+                .required_any
+                .iter()
+                .any(|term| folded.contains(&term.to_ascii_lowercase()))
+            {
+                subject_failures.push(format!("{}: {title}", case.id));
+            }
+        }
+
+        assert!(
+            generated.len() - intent_failures.len() >= TITLE_QUALITY_INTENT_MINIMUM,
+            "intent threshold missed:\n{}",
+            intent_failures.join("\n")
+        );
+        assert!(
+            generated.len() - subject_failures.len() >= TITLE_QUALITY_SUBJECT_MINIMUM,
+            "subject threshold missed:\n{}",
+            subject_failures.join("\n")
+        );
+    }
 
     #[test]
     fn presents_examples_as_instructions_not_conversation_history() {
