@@ -15,6 +15,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { inflateSync } from "node:zlib";
 
 import {
   CURSOR_NATIVE_TOOL_DENYLIST,
@@ -40,10 +41,14 @@ import {
   validateLoopbackBridgeUrl,
   verifyToolAllowlist,
   waitForChildSettlement,
+  toolIsForbidden,
 } from "./qualify_cursor_sdk_bridge.mjs";
 import {
+  RED_PIXEL_PNG,
   createCallbackAdmission,
   inspectToolCalls,
+  isNonEmptyTimestamp,
+  parseConversationEvidence,
   qualificationExitCode,
   startCallbackServer,
 } from "./qualify_cursor_sdk_bridge_full.mjs";
@@ -128,9 +133,53 @@ test("a blocked full qualification returns a failing process status", () => {
 
 test("tool confinement pins every Cursor native tool except mcp", () => {
   assert.equal(CURSOR_NATIVE_TOOL_DENYLIST.includes("mcp"), false);
-  for (const tool of ["shell", "read", "edit", "task", "webSearch", "applyAgentDiff"]) {
+  for (const tool of CURSOR_NATIVE_TOOL_DENYLIST) {
     assert.equal(CURSOR_NATIVE_TOOL_DENYLIST.includes(tool), true, tool);
+    assert.equal(toolIsForbidden(tool), true, tool);
   }
+  assert.equal(toolIsForbidden("mcp"), false);
+  assert.equal(toolIsForbidden("trouve_qualification_echo"), false);
+});
+
+test("red-pixel fixture is a one-pixel RGBA PNG with an opaque red scanline", () => {
+  const png = Buffer.from(RED_PIXEL_PNG, "base64");
+  assert.equal(png.readUInt32BE(16), 1);
+  assert.equal(png.readUInt32BE(20), 1);
+  assert.equal(png[25], 6);
+  const idat = [];
+  for (let offset = 8; offset < png.length;) {
+    const length = png.readUInt32BE(offset);
+    const type = png.toString("ascii", offset + 4, offset + 8);
+    if (type === "IDAT") idat.push(png.subarray(offset + 8, offset + 8 + length));
+    offset += 12 + length;
+  }
+  assert.deepEqual([...inflateSync(Buffer.concat(idat))], [0, 255, 0, 0, 255]);
+});
+
+test("subscription-health billing cycles require a real timestamp", () => {
+  assert.equal(isNonEmptyTimestamp("2026-08-27T12:00:00Z"), true);
+  for (const value of [undefined, null, "", "not-a-date", 123]) {
+    assert.equal(isNonEmptyTimestamp(value), false);
+  }
+});
+
+test("cold-resume conversations require populated run-specific evidence", () => {
+  assert.deepEqual(
+    parseConversationEvidence(
+      JSON.stringify({ messages: [{ text: "TROUVE_CURSOR_PRE_RESTART_OK" }] }),
+      "historical conversation",
+      "TROUVE_CURSOR_PRE_RESTART_OK",
+    ),
+    { messages: [{ text: "TROUVE_CURSOR_PRE_RESTART_OK" }] },
+  );
+  assert.throws(
+    () => parseConversationEvidence("[]", "historical conversation", "expected"),
+    /omitted expected durable evidence/u,
+  );
+  assert.throws(
+    () => parseConversationEvidence('{"messages":[]}', "historical conversation", "expected"),
+    /omitted expected durable evidence/u,
+  );
 });
 
 test("allowlist qualification accepts only a correlated invalid-argument error", () => {
@@ -484,6 +533,35 @@ test("full qualification requires callback and stream ids to be one-to-one", () 
   ));
 });
 
+test("denied-tool qualification requires the stream to propagate an error terminal", () => {
+  const frame = (status) => ({
+    sdkMessage: {
+      message: { type: "tool_call", name: "mcp", call_id: "call-denied", status },
+    },
+  });
+  const callbacks = [{
+    toolName: "trouve_qualification_permission_denied",
+    toolCallId: "call-denied",
+  }];
+  assert.throws(
+    () => inspectToolCalls(
+      [frame("started"), frame("completed")],
+      callbacks,
+      ["trouve_qualification_permission_denied"],
+      true,
+      "denied turn",
+    ),
+    /did not finish with error stream events/u,
+  );
+  assert.doesNotThrow(() => inspectToolCalls(
+    [frame("started"), frame("error")],
+    callbacks,
+    ["trouve_qualification_permission_denied"],
+    true,
+    "denied turn",
+  ));
+});
+
 test("bounded downloads remove their partial destination", async () => {
   const root = await mkdtemp(join(tmpdir(), "trouve-cursor-download-test-"));
   const destination = join(root, "artifact");
@@ -620,6 +698,26 @@ test(
       () => process.kill(child.pid, 0),
       (error) => error?.code === "ESRCH",
     );
+  },
+);
+
+test(
+  "process-tree cleanup is single-flight and never re-signals a settled group",
+  { skip: process.platform === "win32" },
+  async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    await new Promise((accept, reject) => {
+      child.once("spawn", accept);
+      child.once("error", reject);
+    });
+
+    const termination = terminateProcessTree(child);
+    assert.equal(terminateProcessTree(child), termination);
+    await termination;
+    assert.equal(terminateProcessTree(child), termination);
   },
 );
 

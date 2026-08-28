@@ -972,6 +972,22 @@ fn open_runtime_lease_file(
     kind: RuntimeContainerKind,
     runtime: &Path,
 ) -> std::io::Result<std::fs::File> {
+    let path = runtime_lease_path(data_dir, id, kind, runtime)?;
+    std::fs::create_dir_all(path.parent().expect("runtime lease has a parent"))?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+fn runtime_lease_path(
+    data_dir: &Path,
+    id: CliId,
+    kind: RuntimeContainerKind,
+    runtime: &Path,
+) -> std::io::Result<PathBuf> {
     let runtime_name = runtime.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -982,15 +998,9 @@ fn open_runtime_lease_file(
         )
     })?;
     let directory = runtime_lease_directory(data_dir, id, kind);
-    std::fs::create_dir_all(&directory)?;
     let mut lease_name = runtime_name.to_os_string();
     lease_name.push(".lock");
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join(lease_name))
+    Ok(directory.join(lease_name))
 }
 
 fn lock_runtime_activation(data_dir: &Path, id: CliId) -> std::io::Result<std::fs::File> {
@@ -1097,6 +1107,8 @@ pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
     }
+    drop(_runtime_leases);
+    remove_path(&data_dir.join("cli").join(".leases").join(id.as_str()))?;
     Ok(())
 }
 
@@ -1421,12 +1433,19 @@ fn prune_runtime_generations(
         }
         // The activation lock prevents new shared leases while this exclusive
         // guard is held. A busy or unreadable lease is conservatively kept.
-        let Ok(Some(_lease)) =
+        let Ok(Some(lease)) =
             try_lock_runtime_exclusive(data_dir, id, RuntimeContainerKind::Generation, &generation)
         else {
             continue;
         };
-        let _ = std::fs::remove_dir_all(generation);
+        let lease_path =
+            runtime_lease_path(data_dir, id, RuntimeContainerKind::Generation, &generation);
+        if std::fs::remove_dir_all(&generation).is_ok() {
+            drop(lease);
+            if let Ok(lease_path) = lease_path {
+                let _ = std::fs::remove_file(lease_path);
+            }
+        }
     }
 }
 
@@ -1447,12 +1466,18 @@ fn prune_old_versions(data_dir: &Path, id: CliId, root: &Path, previous: Option<
         {
             continue;
         }
-        let Ok(Some(_lease)) =
+        let Ok(Some(lease)) =
             try_lock_runtime_exclusive(data_dir, id, RuntimeContainerKind::Legacy, &directory)
         else {
             continue;
         };
-        let _ = std::fs::remove_dir_all(directory);
+        let lease_path = runtime_lease_path(data_dir, id, RuntimeContainerKind::Legacy, &directory);
+        if std::fs::remove_dir_all(&directory).is_ok() {
+            drop(lease);
+            if let Ok(lease_path) = lease_path {
+                let _ = std::fs::remove_file(lease_path);
+            }
+        }
     }
 }
 
@@ -2138,11 +2163,21 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bin, &link).unwrap();
+        drop(
+            open_runtime_lease_file(
+                tmp.path(),
+                CliId::Codex,
+                RuntimeContainerKind::Legacy,
+                &root.join("1.0.0"),
+            )
+            .unwrap(),
+        );
 
         uninstall(tmp.path(), CliId::Codex).unwrap();
         assert!(installed(tmp.path(), CliId::Codex).is_none());
         assert!(!root.exists());
         assert!(link.symlink_metadata().is_err());
+        assert!(!tmp.path().join("cli/.leases/codex").exists());
 
         // Uninstalling again is a no-op, not an error.
         uninstall(tmp.path(), CliId::Codex).unwrap();
@@ -2317,6 +2352,16 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         assert!(active.is_dir());
         assert!(previous.is_dir());
         assert!(!generations.join("runtime-oldest").exists());
+        assert!(
+            !runtime_lease_path(
+                tmp.path(),
+                CliId::Codex,
+                RuntimeContainerKind::Generation,
+                &generations.join("runtime-oldest"),
+            )
+            .unwrap()
+            .exists()
+        );
     }
 
     #[test]

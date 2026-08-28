@@ -41,7 +41,6 @@ import {
   redact,
   resolveBridge,
   runCleanupSteps,
-  safeUnary,
   sdkMessages,
   send,
   serverStream,
@@ -58,8 +57,8 @@ const MAX_CALLBACK_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_QUALIFICATION_CALLBACKS = 256;
 const MAX_QUALIFICATION_CALLBACK_CONCURRENCY = 16;
 const SCHEMA_PROBE_COUNT = 128;
-const RED_PIXEL_PNG =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zt9sAAAAASUVORK5CYII=";
+export const RED_PIXEL_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 const TOOLS = {
   read: "trouve_qualification_read",
@@ -72,6 +71,8 @@ const TOOLS = {
 
 const RESULTS = {
   read: "TROUVE_CURSOR_READ_OK",
+  preRestartRead: "TROUVE_CURSOR_PRE_RESTART_OK",
+  coldResumeRead: "TROUVE_CURSOR_COLD_RESUME_OK",
   denied: "TROUVE_CURSOR_PERMISSION_DENIED",
   image: "TROUVE_CURSOR_IMAGE_OK",
   parallelA: "TROUVE_CURSOR_PARALLEL_",
@@ -453,7 +454,7 @@ function arraysEqual(left, right) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-export function inspectToolCalls(frames, callbacks, expectedTools, allowToolError, label) {
+export function inspectToolCalls(frames, callbacks, expectedTools, expectToolError, label) {
   const messages = sdkMessages(frames);
   const toolMessages = messages.filter((message) => message.type === "tool_call");
   assertUniqueToolLifecycle(toolMessages, label);
@@ -503,8 +504,22 @@ export function inspectToolCalls(frames, callbacks, expectedTools, allowToolErro
         `stream=${[...streamIds].join(",") || "none"})`,
     );
   }
-  if (!allowToolError && toolMessages.some((message) => message.status === "error")) {
+  const errorIds = new Set(
+    toolMessages
+      .filter((message) => message.status === "error")
+      .map((message) => message.call_id)
+      .filter(Boolean),
+  );
+  if (!expectToolError && errorIds.size > 0) {
     throw new QualificationError("a custom tool unexpectedly completed with error status");
+  }
+  if (
+    expectToolError &&
+    !arraysEqual(sorted(errorIds), sorted(streamIds))
+  ) {
+    throw new QualificationError(
+      `${label}: denied custom-tool callbacks did not finish with error stream events`,
+    );
   }
   const completedIds = new Set(
     toolMessages
@@ -513,7 +528,7 @@ export function inspectToolCalls(frames, callbacks, expectedTools, allowToolErro
       .filter(Boolean),
   );
   const terminalEventsComplete = completedIds.size === expectedTools.length;
-  if (!terminalEventsComplete && !allowToolError) {
+  if (!terminalEventsComplete) {
     const statuses = sorted(
       new Set(toolMessages.map((message) => message.status).filter(Boolean)),
     );
@@ -546,7 +561,7 @@ async function runTurn({
   images,
   mode,
   force = false,
-  allowToolError = false,
+  expectToolError = false,
 }) {
   const callbackStart = callback.calls.length;
   const failureStart = callback.failures.length;
@@ -579,7 +594,7 @@ async function runTurn({
     frames,
     callbacks,
     expectedTools,
-    allowToolError,
+    expectToolError,
     label,
   );
   const terminal = exactTerminalResult(frames, label);
@@ -880,7 +895,7 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
     "apiPercentUsed",
     "autoPercentUsed",
   ].filter((field) => Number.isFinite(usage.planUsage?.[field]));
-  if (usage.billingCycleEnd === undefined || planUsageFields.length === 0) {
+  if (!isNonEmptyTimestamp(usage.billingCycleEnd) || planUsageFields.length === 0) {
     throw new QualificationError(
       "Cursor GetCurrentPeriodUsage omitted the billing cycle or plan meters",
     );
@@ -909,6 +924,35 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
   };
 }
 
+export function isNonEmptyTimestamp(value) {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+export function parseConversationEvidence(conversationJson, label, expectedEvidence) {
+  if (typeof conversationJson !== "string" || conversationJson.length === 0) {
+    throw new QualificationError(`${label} omitted conversation JSON`);
+  }
+  let conversation;
+  try {
+    conversation = JSON.parse(conversationJson);
+  } catch (error) {
+    throw new QualificationError(`${label} returned invalid conversation JSON: ${error}`);
+  }
+  const populated =
+    (Array.isArray(conversation) && conversation.length > 0) ||
+    (conversation !== null &&
+      typeof conversation === "object" &&
+      Object.keys(conversation).length > 0);
+  if (!populated || !JSON.stringify(conversation).includes(expectedEvidence)) {
+    throw new QualificationError(`${label} omitted expected durable evidence ${expectedEvidence}`);
+  }
+  return conversation;
+}
+
 async function fullQualification(args) {
   const apiKey = process.env.CURSOR_API_KEY;
   if (!apiKey) {
@@ -925,10 +969,15 @@ async function fullQualification(args) {
   let blockControl = null;
   const handlers = new Map();
   handlers.set(TOOLS.read, async (input) => {
-    if (input.token !== "full-read") {
+    const result = new Map([
+      ["full-read", RESULTS.read],
+      ["pre-restart-read", RESULTS.preRestartRead],
+      ["cold-resume-read", RESULTS.coldResumeRead],
+    ]).get(input.token);
+    if (result === undefined) {
       throw new QualificationError("read callback token differed");
     }
-    return { value: RESULTS.read };
+    return { value: result };
   });
   handlers.set(TOOLS.deny, async () => ({
     content: [{ type: "text", text: RESULTS.denied }],
@@ -995,7 +1044,7 @@ async function fullQualification(args) {
       callback = undefined;
       const cleanupSteps = [];
       if (signal === undefined && activeBridge !== undefined && activeAgentId !== undefined) {
-        cleanupSteps.push(["close SDK agent", () => safeUnary(
+        cleanupSteps.push(["close SDK agent", () => unary(
           activeBridge,
           "SdkAgentService",
           "CloseAgent",
@@ -1004,7 +1053,7 @@ async function fullQualification(args) {
         )]);
       }
       if (signal === undefined && activeBridge !== undefined) {
-        cleanupSteps.push(["shut down SDK Bridge", () => safeUnary(
+        cleanupSteps.push(["shut down SDK Bridge", () => unary(
           activeBridge,
           "SdkBridgeControlService",
           "Shutdown",
@@ -1148,10 +1197,10 @@ async function fullQualification(args) {
       agentId,
       label: "allow-read-under-validated-tool-policy",
       prompt:
-        `Call ${TOOLS.read} exactly once with {"token":"full-read"}, then reply ` +
+        `Call ${TOOLS.read} exactly once with {"token":"pre-restart-read"}, then reply ` +
         `only with the callback result's value field.`,
       expectedTools: [TOOLS.read],
-      expectedText: RESULTS.read,
+      expectedText: RESULTS.preRestartRead,
       timeoutMilliseconds,
     });
     turns.push(readTurn.summary);
@@ -1172,7 +1221,7 @@ async function fullQualification(args) {
       expectedTools: [TOOLS.deny],
       expectedText: RESULTS.denied,
       timeoutMilliseconds,
-      allowToolError: true,
+      expectToolError: true,
     });
     turns.push(deniedTurn.summary);
 
@@ -1270,7 +1319,7 @@ async function fullQualification(args) {
       { agentId },
       timeoutMilliseconds,
     );
-    await safeUnary(
+    await unary(
       bridge,
       "SdkBridgeControlService",
       "Shutdown",
@@ -1314,10 +1363,10 @@ async function fullQualification(args) {
       agentId,
       label: "cold-bridge-resume",
       prompt:
-        `Call ${TOOLS.read} exactly once with {"token":"full-read"} and reply only ` +
+        `Call ${TOOLS.read} exactly once with {"token":"cold-resume-read"} and reply only ` +
         `with the callback result's value field.`,
       expectedTools: [TOOLS.read],
-      expectedText: RESULTS.read,
+      expectedText: RESULTS.coldResumeRead,
       timeoutMilliseconds,
     });
     turns.push(coldTurn.summary);
@@ -1363,10 +1412,11 @@ async function fullQualification(args) {
       { runId: coldTurn.summary.run_id },
       timeoutMilliseconds,
     );
-    if (typeof conversation.conversationJson !== "string") {
-      throw new QualificationError("GetRunConversation omitted conversation JSON");
-    }
-    JSON.parse(conversation.conversationJson);
+    parseConversationEvidence(
+      conversation.conversationJson,
+      "GetRunConversation for cold resumed run",
+      RESULTS.coldResumeRead,
+    );
     const historicalConversation = await unary(
       bridge,
       "SdkAgentService",
@@ -1374,12 +1424,11 @@ async function fullQualification(args) {
       { runId: preRestartRunId },
       timeoutMilliseconds,
     );
-    if (typeof historicalConversation.conversationJson !== "string") {
-      throw new QualificationError(
-        "cold restart lost the pre-restart conversation",
-      );
-    }
-    JSON.parse(historicalConversation.conversationJson);
+    parseConversationEvidence(
+      historicalConversation.conversationJson,
+      "GetRunConversation for pre-restart run",
+      RESULTS.preRestartRead,
+    );
     const agentMessages = await unary(
       bridge,
       "SdkAgentService",
@@ -1387,8 +1436,14 @@ async function fullQualification(args) {
       { agentId, options: { limit: 20, offset: 0 } },
       timeoutMilliseconds,
     );
-    if (!Array.isArray(agentMessages.messages)) {
-      throw new QualificationError("ListAgentMessages omitted messages");
+    const serializedMessages = JSON.stringify(agentMessages.messages);
+    if (
+      !Array.isArray(agentMessages.messages) ||
+      agentMessages.messages.length === 0 ||
+      !serializedMessages.includes(RESULTS.preRestartRead) ||
+      !serializedMessages.includes(RESULTS.coldResumeRead)
+    ) {
+      throw new QualificationError("ListAgentMessages omitted durable pre- or post-restart evidence");
     }
 
     const localUsageAfterRestart = await getLocalUsage(
