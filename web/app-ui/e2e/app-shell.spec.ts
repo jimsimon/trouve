@@ -441,19 +441,20 @@ test("repository grouping exposes nested headings and disables ambiguous workspa
     await page.getByRole("button", { name: "Sessions", exact: true }).click();
   }
 
-  await expect(page.getByRole("heading", { level: 2, name: "app" })).toBeVisible();
-  const groupedWorkspaceHeading = page.getByRole("heading", { level: 3, name: "first" });
+  await expect(page.getByRole("heading", { level: 2, name: "Workspaces" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "app" })).toBeVisible();
+  const groupedWorkspaceHeading = page.getByRole("heading", { level: 4, name: "first" });
   await expect(groupedWorkspaceHeading).toBeVisible();
   await expect(groupedWorkspaceHeading).toHaveCSS("margin", "0px");
   await expect(groupedWorkspaceHeading).toHaveCSS("font-size", "13px");
-  await expect(page.getByRole("heading", { level: 3, name: "clone" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 4, name: "clone" })).toBeVisible();
   await expect(page.locator(".workspace-grip")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Workspace list options" }).click();
   await page.getByRole("combobox", { name: "Group sessions by" }).selectOption("workspace");
-  await expect(page.getByRole("heading", { level: 2, name: "first" })).toBeVisible();
-  await expect(page.getByRole("heading", { level: 2, name: "clone" })).toBeVisible();
-  await expect(page.getByRole("heading", { level: 3, name: "first" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { level: 3, name: "first" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "clone" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 4, name: "first" })).toHaveCount(0);
   await expect(page.locator(".workspace-grip")).toHaveCount(3);
 });
 
