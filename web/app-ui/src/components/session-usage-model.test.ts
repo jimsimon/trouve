@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  latestCompletedTurnDuration,
   localMemoryUtilization,
   sessionUsagePanelKind,
   usageThroughput,
@@ -35,5 +36,14 @@ describe("session usage panel presentation", () => {
     expect(localMemoryUtilization(2, 0)).toBe(0);
     expect(usageThroughput(50, 2_000)).toBe(25);
     expect(usageThroughput(50, undefined)).toBeUndefined();
+  });
+
+  it("selects the latest duration from a large turn history without variadic arguments", () => {
+    const durations = new Map<number, number>();
+    for (let turn = 0; turn < 200_000; turn += 1) durations.set(turn, turn * 10);
+    durations.set(-1, 999);
+
+    expect(latestCompletedTurnDuration(durations)).toBe(1_999_990);
+    expect(latestCompletedTurnDuration(new Map())).toBeUndefined();
   });
 });

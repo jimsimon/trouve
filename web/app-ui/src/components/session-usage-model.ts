@@ -29,6 +29,20 @@ export const usageThroughput = (
     ? undefined
     : outputTokens / (durationMs / 1_000);
 
+export const latestCompletedTurnDuration = (
+  turnDurationMs: ReadonlyMap<number, number>,
+): number | undefined => {
+  let latestTurn: number | undefined;
+  let latestDuration: number | undefined;
+  for (const [turn, duration] of turnDurationMs) {
+    if (latestTurn === undefined || turn > latestTurn) {
+      latestTurn = turn;
+      latestDuration = duration;
+    }
+  }
+  return latestDuration;
+};
+
 export const localMemoryUtilization = (
   modelBytes: number,
   capacityBytes: number,

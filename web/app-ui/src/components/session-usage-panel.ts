@@ -16,6 +16,7 @@ import {
   subscriptionUsageTone,
 } from "./model-health.js";
 import {
+  latestCompletedTurnDuration,
   localMemoryUtilization,
   sessionUsagePanelKind,
   type SessionUsagePanelKind,
@@ -190,9 +191,9 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     const currentMemoryPercent = running ? memoryPercent : 0;
     const view = this.#store.value?.threadView(this.threadId);
     const usage = view?.lastUsage;
-    const duration = view === undefined || view.turnRunning || view.turnDurationMs.size === 0
+    const duration = view === undefined || view.turnRunning
       ? undefined
-      : view.turnDurationMs.get(Math.max(...view.turnDurationMs.keys()));
+      : latestCompletedTurnDuration(view.turnDurationMs);
     const throughput = usageThroughput(usage?.output_tokens ?? 0, duration);
     return html`
       <article class="session-usage-content" aria-label="Local model utilization and performance">
