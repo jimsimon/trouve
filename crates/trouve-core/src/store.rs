@@ -132,6 +132,10 @@ CREATE TABLE IF NOT EXISTS usage (
   cost_usd REAL,
   PRIMARY KEY (thread_id, turn)
 );
+CREATE TABLE IF NOT EXISTS data_migrations (
+  name TEXT PRIMARY KEY,
+  completed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS backend_sessions (
   thread_id TEXT NOT NULL REFERENCES threads(id),
   backend TEXT NOT NULL,          -- provider id ("cursor", "claude", …)
@@ -625,13 +629,20 @@ CREATE TABLE IF NOT EXISTS code_review_polled_comments (
 const USAGE_MODEL_COLUMN_MIGRATION: &str =
     "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT ''";
 
-// Retried independently from the column addition so an interrupted upgrade
-// can resume. Materialize the small set of blank usage keys first, then use
-// the events scope index so unrelated thread histories are never ranked.
+const USAGE_MODEL_BACKFILL_MIGRATION: &str = "usage-model-backfill-v1";
+
+// This repair runs once inside the same transaction as its completion marker.
+// It can therefore resume after an interrupted column migration without
+// imposing history-sized work on every later store open. Each affected thread
+// is scanned once, regardless of how many of its turns need attribution.
 const USAGE_MODEL_BACKFILL: &str = "WITH missing_usage AS MATERIALIZED (
-  SELECT DISTINCT thread_id, turn
+  SELECT thread_id, turn
   FROM usage
   WHERE model = ''
+),
+affected_threads AS MATERIALIZED (
+  SELECT DISTINCT thread_id
+  FROM missing_usage
 ),
 turn_models AS MATERIALIZED (
   SELECT
@@ -642,13 +653,18 @@ turn_models AS MATERIALIZED (
       PARTITION BY events.scope_id, CAST(json_extract(events.payload, '$.turn') AS INTEGER)
       ORDER BY events.cursor DESC
     ) AS model_rank
-  FROM missing_usage
+  FROM affected_threads
   CROSS JOIN events INDEXED BY events_scope
   WHERE events.scope_kind = 'thread'
-    AND events.scope_id = missing_usage.thread_id
-    AND CAST(json_extract(events.payload, '$.turn') AS INTEGER) = missing_usage.turn
+    AND events.scope_id = affected_threads.thread_id
     AND json_extract(events.payload, '$.type') = 'turn.started'
     AND typeof(json_extract(events.payload, '$.model')) = 'text'
+    AND EXISTS (
+      SELECT 1
+      FROM missing_usage
+      WHERE missing_usage.thread_id = events.scope_id
+        AND missing_usage.turn = CAST(json_extract(events.payload, '$.turn') AS INTEGER)
+    )
 )
 UPDATE usage
 SET model = turn_models.model
@@ -874,6 +890,30 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn backfill_usage_models(conn: &mut Connection) -> Result<()> {
+    let transaction = conn.transaction()?;
+    let complete = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM data_migrations WHERE name = ?1)",
+        [USAGE_MODEL_BACKFILL_MIGRATION],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if complete {
+        transaction.commit()?;
+        return Ok(());
+    }
+
+    transaction
+        .execute_batch(USAGE_MODEL_BACKFILL)
+        .context("usage model backfill failed")?;
+    transaction.execute(
+        "INSERT INTO data_migrations (name, completed_at)
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [USAGE_MODEL_BACKFILL_MIGRATION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
     let had_theme_observation_publication_authority = conn.query_row(
         "SELECT EXISTS (
@@ -891,8 +931,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
-    conn.execute_batch(USAGE_MODEL_BACKFILL)
-        .context("usage model backfill failed")?;
+    backfill_usage_models(conn)?;
     preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
@@ -15322,6 +15361,12 @@ mod tests {
         // repeat-safe duplicate-column path used by current databases.
         let legacy = Connection::open(&path).unwrap();
         legacy
+            .execute(
+                "DELETE FROM data_migrations WHERE name = ?1",
+                [USAGE_MODEL_BACKFILL_MIGRATION],
+            )
+            .unwrap();
+        legacy
             .execute_batch("ALTER TABLE usage DROP COLUMN model")
             .unwrap();
         drop(legacy);
@@ -15368,16 +15413,48 @@ mod tests {
                 .unwrap();
         }
 
+        // Simulate an interrupted upgrade that added the column but did not
+        // atomically complete the backfill.
+        let partial = Connection::open(&path).unwrap();
+        partial
+            .execute(
+                "DELETE FROM data_migrations WHERE name = ?1",
+                [USAGE_MODEL_BACKFILL_MIGRATION],
+            )
+            .unwrap();
+        drop(partial);
+
+        {
+            let reopened = Store::open(&path).unwrap();
+            let summary = reopened
+                .usage_summary(UsageScope::Thread("partial-upgrade-thread"))
+                .unwrap();
+            assert_eq!(summary.models.len(), 1);
+            assert_eq!(summary.models[0].model, "resumed/model");
+        }
+
+        // Once the durable marker is committed, later opens must not rescan
+        // history. Current writes always provide a model; blanking this row
+        // makes an accidental repeated backfill observable.
+        let completed = Connection::open(&path).unwrap();
+        completed
+            .execute(
+                "UPDATE usage SET model = '' WHERE thread_id = ?1 AND turn = ?2",
+                params!["partial-upgrade-thread", 4],
+            )
+            .unwrap();
+        drop(completed);
+
         let reopened = Store::open(&path).unwrap();
         let summary = reopened
             .usage_summary(UsageScope::Thread("partial-upgrade-thread"))
             .unwrap();
         assert_eq!(summary.models.len(), 1);
-        assert_eq!(summary.models[0].model, "resumed/model");
+        assert_eq!(summary.models[0].model, "");
     }
 
     #[test]
-    fn usage_model_backfill_only_ranks_missing_usage_histories() {
+    fn usage_model_backfill_scans_each_affected_thread_once() {
         let store = Store::open_in_memory().unwrap();
         let conn = store.conn.lock().unwrap();
         let explain = format!("EXPLAIN QUERY PLAN {USAGE_MODEL_BACKFILL}");
@@ -15391,6 +15468,11 @@ mod tests {
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("MATERIALIZE missing_usage")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("MATERIALIZE affected_threads")),
             "{plan:?}"
         );
         assert!(
@@ -15409,7 +15491,8 @@ mod tests {
             "{plan:?}"
         );
         assert!(
-            plan.iter().all(|detail| !detail.contains("CORRELATED")),
+            plan.iter()
+                .any(|detail| detail.contains("SCAN affected_threads")),
             "{plan:?}"
         );
     }
