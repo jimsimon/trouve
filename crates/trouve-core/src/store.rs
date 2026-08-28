@@ -4591,6 +4591,12 @@ enum StoreMutation {
         initial_checkpoint: Box<CheckpointRow>,
         idempotency_key: Option<String>,
         request_fingerprint: Option<String>,
+        review_job_id: Option<String>,
+    },
+    RegisterReviewWorkspace {
+        job_id: String,
+        workspace: Box<Workspace>,
+        inherited_generation: Option<u64>,
     },
     Update {
         id: String,
@@ -5101,6 +5107,104 @@ fn insert_artifact_cleanup_job(
     Ok(())
 }
 
+fn commit_review_workspace_registration_rows(
+    conn: &Connection,
+    job_id: &str,
+    workspace: &Workspace,
+    inherited_generation: Option<u64>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<ReviewWorkspaceRegistrationResult> {
+    let existing: Option<(String, bool, i64)> = conn
+        .query_row(
+            "SELECT id, closed, review_registration_generation
+             FROM workspaces WHERE path = ?1",
+            params![workspace.path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let running = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_review_jobs
+         WHERE id = ?1 AND status = 'running')",
+        params![job_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    anyhow::ensure!(running, "stale: review job {job_id} is no longer running");
+
+    let (mutated, cleanup_generation) = match existing {
+        Some((workspace_id, closed, generation)) => {
+            anyhow::ensure!(
+                workspace_id == workspace.id,
+                "workspace path changed identity during review registration"
+            );
+            let generation = u64::try_from(generation)
+                .context("workspace review-registration generation is negative")?;
+            let durable_provisional = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM code_review_workspace_cleanup_intents
+                   WHERE workspace_id = ?1 AND generation = ?2
+                 )",
+                params![workspace.id, i64::try_from(generation)?],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if closed {
+                let next = generation
+                    .checked_add(1)
+                    .context("workspace review-registration generation overflow")?;
+                conn.execute(
+                    "UPDATE workspaces
+                     SET closed = 0, review_registration_generation = ?2
+                     WHERE id = ?1",
+                    params![workspace.id, i64::try_from(next)?],
+                )?;
+                (true, Some(next))
+            } else if durable_provisional || inherited_generation == Some(generation) {
+                (false, Some(generation))
+            } else {
+                (false, None)
+            }
+        }
+        None => {
+            let generation = 1_u64;
+            conn.execute(
+                "INSERT INTO workspaces
+                     (id, name, path, closed, review_registration_generation, created_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                params![
+                    workspace.id,
+                    workspace.name,
+                    workspace.path,
+                    i64::try_from(generation)?,
+                    timestamp.to_rfc3339()
+                ],
+            )?;
+            (true, Some(generation))
+        }
+    };
+
+    if let Some(generation) = cleanup_generation {
+        conn.execute(
+            "INSERT INTO code_review_workspace_cleanup_intents
+                    (job_id, workspace_id, generation, attempts, next_attempt_at, created_at)
+             VALUES (?1, ?2, ?3, 0, NULL, ?4)
+             ON CONFLICT(job_id) DO UPDATE SET
+               workspace_id = excluded.workspace_id,
+               generation = excluded.generation,
+               attempts = 0,
+               next_attempt_at = NULL",
+            params![
+                job_id,
+                workspace.id,
+                i64::try_from(generation)?,
+                timestamp.to_rfc3339()
+            ],
+        )?;
+    }
+    Ok(ReviewWorkspaceRegistrationResult {
+        mutated,
+        cleanup_generation,
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StoreMutationOutcome {
     AppendEvent,
@@ -5119,6 +5223,7 @@ fn apply_store_mutation(
             initial_checkpoint,
             idempotency_key,
             request_fingerprint,
+            review_job_id,
         } => {
             insert_session_row(conn, session)?;
             if let (Some(idempotency_key), Some(request_fingerprint)) =
@@ -5131,7 +5236,35 @@ fn apply_store_mutation(
                     params![idempotency_key, session.id, request_fingerprint],
                 )?;
             }
+            if let Some(review_job_id) = review_job_id {
+                let updated = conn.execute(
+                    "UPDATE code_review_jobs SET session_id = ?2, thread_id = NULL
+                     WHERE id = ?1 AND status = 'running' AND session_id IS NULL",
+                    params![review_job_id, session.id],
+                )?;
+                anyhow::ensure!(
+                    updated == 1,
+                    "stale: review job {review_job_id} cannot own session {}",
+                    session.id
+                );
+            }
             insert_initial_checkpoint_row(conn, initial_checkpoint, timestamp)?;
+        }
+        StoreMutation::RegisterReviewWorkspace {
+            job_id,
+            workspace,
+            inherited_generation,
+        } => {
+            let registration = commit_review_workspace_registration_rows(
+                conn,
+                job_id,
+                workspace,
+                *inherited_generation,
+                timestamp,
+            )?;
+            if !registration.mutated {
+                return Ok(StoreMutationOutcome::CommitWithoutEvent);
+            }
         }
         StoreMutation::Update {
             id,
@@ -5993,12 +6126,27 @@ impl Store {
     }
 
     fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events_with_isolation(events, false)
+    }
+
+    fn append_pending_events_isolated(
+        &self,
+        events: Vec<PendingEvent>,
+    ) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events_with_isolation(events, true)
+    }
+
+    fn append_pending_events_with_isolation(
+        &self,
+        events: Vec<PendingEvent>,
+        isolated: bool,
+    ) -> Result<Vec<EventEnvelope>> {
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
                 events,
                 code_review_outbox_ids: Vec::new(),
-                isolated: false,
+                isolated,
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -6775,94 +6923,24 @@ impl Store {
         workspace: &Workspace,
         inherited_generation: Option<u64>,
     ) -> Result<ReviewWorkspaceRegistrationResult> {
-        let conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&conn)?;
-        let existing: Option<(String, bool, i64)> = tx
-            .query_row(
-                "SELECT id, closed, review_registration_generation
-                 FROM workspaces WHERE path = ?1",
-                params![workspace.path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let running = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM code_review_jobs
-             WHERE id = ?1 AND status = 'running')",
-            params![job_id],
-            |row| row.get::<_, bool>(0),
+        let pending = serialize_lifecycle_events(
+            vec![(
+                Scope::Server,
+                Event::WorkspaceRegistered {
+                    workspace_id: workspace.id.clone(),
+                    path: workspace.path.clone(),
+                },
+            )],
+            StoreMutation::RegisterReviewWorkspace {
+                job_id: job_id.to_owned(),
+                workspace: Box::new(workspace.clone()),
+                inherited_generation,
+            },
         )?;
-        anyhow::ensure!(running, "stale: review job {job_id} is no longer running");
-
-        let (mutated, cleanup_generation) = match existing {
-            Some((workspace_id, closed, generation)) => {
-                anyhow::ensure!(
-                    workspace_id == workspace.id,
-                    "workspace path changed identity during review registration"
-                );
-                let generation = u64::try_from(generation)
-                    .context("workspace review-registration generation is negative")?;
-                let durable_provisional = tx.query_row(
-                    "SELECT EXISTS(
-                       SELECT 1 FROM code_review_workspace_cleanup_intents
-                       WHERE workspace_id = ?1 AND generation = ?2
-                     )",
-                    params![workspace.id, i64::try_from(generation)?],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if closed {
-                    let next = generation
-                        .checked_add(1)
-                        .context("workspace review-registration generation overflow")?;
-                    tx.execute(
-                        "UPDATE workspaces
-                         SET closed = 0, review_registration_generation = ?2
-                         WHERE id = ?1",
-                        params![workspace.id, i64::try_from(next)?],
-                    )?;
-                    (true, Some(next))
-                } else if durable_provisional || inherited_generation == Some(generation) {
-                    (false, Some(generation))
-                } else {
-                    (false, None)
-                }
-            }
-            None => {
-                let generation = 1_u64;
-                tx.execute(
-                    "INSERT INTO workspaces
-                         (id, name, path, closed, review_registration_generation, created_at)
-                     VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-                    params![
-                        workspace.id,
-                        workspace.name,
-                        workspace.path,
-                        i64::try_from(generation)?,
-                        chrono::Utc::now().to_rfc3339()
-                    ],
-                )?;
-                (true, Some(generation))
-            }
-        };
-
-        if let Some(generation) = cleanup_generation {
-            tx.execute(
-                "INSERT INTO code_review_workspace_cleanup_intents
-                        (job_id, workspace_id, generation, attempts, next_attempt_at, created_at)
-                 VALUES (?1, ?2, ?3, 0, NULL, ?4)
-                 ON CONFLICT(job_id) DO UPDATE SET
-                   workspace_id = excluded.workspace_id,
-                   generation = excluded.generation,
-                   attempts = 0,
-                   next_attempt_at = NULL",
-                params![
-                    job_id,
-                    workspace.id,
-                    i64::try_from(generation)?,
-                    chrono::Utc::now().to_rfc3339()
-                ],
-            )?;
-        }
-        tx.commit()?;
+        let mutated = !self.append_pending_events_isolated(pending)?.is_empty();
+        let cleanup_generation = self
+            .review_workspace_cleanup_intent(job_id)?
+            .map(|intent| intent.generation);
         Ok(ReviewWorkspaceRegistrationResult {
             mutated,
             cleanup_generation,
@@ -7111,6 +7189,7 @@ impl Store {
         session: &Session,
         initial_checkpoint: &CheckpointRow,
         idempotency: Option<(&str, &str)>,
+        review_job_id: Option<&str>,
         events: Vec<(Scope, Event)>,
     ) -> Result<Vec<EventEnvelope>> {
         self.append_pending_events(serialize_lifecycle_events(
@@ -7120,6 +7199,7 @@ impl Store {
                 initial_checkpoint: Box::new(initial_checkpoint.clone()),
                 idempotency_key: idempotency.map(|(key, _)| key.to_owned()),
                 request_fingerprint: idempotency.map(|(_, fingerprint)| fingerprint.to_owned()),
+                review_job_id: review_job_id.map(str::to_owned),
             },
         )?)
     }
@@ -9749,22 +9829,6 @@ impl Store {
             "UPDATE code_review_jobs SET session_id = ?2, thread_id = ?3
              WHERE id = ?1 AND status = 'running'",
             params![id, session_id, thread_id],
-        )?;
-        Ok(updated > 0)
-    }
-
-    /// Persist the review session as soon as its durable session row exists,
-    /// before thread creation or any later fallible setup. Terminal cleanup
-    /// can then recover every interrupted attempt.
-    pub(crate) fn record_code_review_job_session(
-        &self,
-        id: &str,
-        session_id: &str,
-    ) -> Result<bool> {
-        let updated = self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET session_id = ?2, thread_id = NULL
-             WHERE id = ?1 AND session_id IS NULL",
-            params![id, session_id],
         )?;
         Ok(updated > 0)
     }
@@ -17213,6 +17277,11 @@ mod tests {
     #[test]
     fn lifecycle_mutation_rolls_back_when_its_event_transaction_fails() {
         let store = Store::open_in_memory().unwrap();
+        let review_job = store
+            .enqueue_code_review_job(&backoff_test_job_request())
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
         store
             .insert_workspace(&Workspace {
                 id: "ws_atomic".into(),
@@ -17246,6 +17315,7 @@ mod tests {
                     &session,
                     &invalid_checkpoint,
                     None,
+                    Some(&review_job.id),
                     vec![(
                         Scope::Server,
                         Event::SessionCreated {
@@ -17257,6 +17327,15 @@ mod tests {
                 .is_err()
         );
         assert!(store.session(&session.id).unwrap().is_none());
+        assert!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .is_none()
+        );
         assert!(store.events_after(&Scope::Server, 0).unwrap().is_empty());
         assert!(
             store
@@ -17265,6 +17344,98 @@ mod tests {
                 .summaries
                 .is_empty()
         );
+
+        let checkpoint = CheckpointRow {
+            session_id: session.id.clone(),
+            ..invalid_checkpoint
+        };
+        store
+            .insert_session_with_lifecycle(
+                &session,
+                &checkpoint,
+                None,
+                Some(&review_job.id),
+                vec![(
+                    Scope::Server,
+                    Event::SessionCreated {
+                        session_id: session.id.clone(),
+                        workspace_id: session.workspace_id.clone(),
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(store.session(&session.id).unwrap().is_some());
+        assert_eq!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .as_deref(),
+            Some(session.id.as_str())
+        );
+    }
+
+    #[test]
+    fn review_workspace_registration_rolls_back_with_its_lifecycle_event() {
+        let store = Store::open_in_memory().unwrap();
+        let review_job = store
+            .enqueue_code_review_job(&backoff_test_job_request())
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let workspace = Workspace {
+            id: "ws_review_atomic".into(),
+            name: "atomic review".into(),
+            path: "/tmp/review-atomic".into(),
+        };
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_review_workspace_registration_event
+                 BEFORE INSERT ON events
+                 WHEN json_extract(NEW.payload, '$.type') = 'workspace.registered'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected workspace event failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .commit_review_workspace_registration(&review_job.id, &workspace, None)
+                .is_err()
+        );
+        assert!(store.workspace_by_path(&workspace.path).unwrap().is_none());
+        assert!(
+            store
+                .review_workspace_cleanup_intent(&review_job.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.events_after(&Scope::Server, 0).unwrap().is_empty());
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_review_workspace_registration_event;")
+            .unwrap();
+        let registration = store
+            .commit_review_workspace_registration(&review_job.id, &workspace, None)
+            .unwrap();
+        assert!(registration.mutated);
+        assert_eq!(registration.cleanup_generation, Some(1));
+        let events = store.events_after(&Scope::Server, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].event,
+            Event::WorkspaceRegistered { workspace_id, path }
+                if workspace_id == &workspace.id && path == &workspace.path
+        ));
     }
 
     #[test]

@@ -8288,13 +8288,6 @@ impl Engine {
                         self.terminals.reopen_session(&session.id);
                     }
                 }
-                self.store.append_event(
-                    Scope::Server,
-                    Event::WorkspaceRegistered {
-                        workspace_id: workspace.id.clone(),
-                        path: workspace.path.clone(),
-                    },
-                )?;
             }
             (
                 self.cache_workspace_list_item(item),
@@ -8659,7 +8652,8 @@ impl Engine {
     }
 
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
-        self.create_session_with_workspace_adoption(req, true).await
+        self.create_session_with_workspace_adoption(req, true, None)
+            .await
     }
 
     pub(crate) async fn create_review_session(
@@ -8669,7 +8663,7 @@ impl Engine {
         commit_fence: &ReviewWorkspaceRegistrationFence,
     ) -> Result<Session, EngineError> {
         let session = self
-            .create_session_with_workspace_adoption(req, false)
+            .create_session_with_workspace_adoption(req, false, commit_fence.job_id.as_deref())
             .await?;
         let (recorded, cancelled) = {
             let mut committed = commit_fence.committed.lock().unwrap();
@@ -8688,16 +8682,6 @@ impl Engine {
             };
             (recorded, cancelled)
         };
-        if recorded
-            && let Some(job_id) = commit_fence.job_id.as_deref()
-            && !self
-                .store
-                .record_code_review_job_session(job_id, &session.id)?
-        {
-            return Err(EngineError::BadRequest(
-                "stale: review job already owns a different session".into(),
-            ));
-        }
         if recorded && !cancelled {
             return Ok(session);
         }
@@ -8718,6 +8702,7 @@ impl Engine {
         &self,
         req: CreateSessionRequest,
         adopt_workspace_registration: bool,
+        review_job_id: Option<&str>,
     ) -> Result<Session, EngineError> {
         let create_started = Instant::now();
         let idempotency_key = match req.idempotency_key.as_deref() {
@@ -8842,6 +8827,7 @@ impl Engine {
             idempotency_key
                 .as_deref()
                 .map(|key| (key, request_fingerprint.as_str())),
+            review_job_id,
             vec![
                 (
                     Scope::Server,
