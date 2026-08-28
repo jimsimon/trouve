@@ -74,15 +74,18 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
   }
 
   protected override updated(_changed: PropertyValues<this>): void {
+    const store = this.#store.value;
     const usageCursor = this.threadId === ""
       ? 0
-      : this.#store.value?.threadView(this.threadId).lastUsageCursor ?? 0;
+      : store?.threadView(this.threadId).lastUsageCursor ?? 0;
+    const sessionUsageRevision = store?.sessionUsageRevision(this.sessionId) ?? 0;
     const key = [
       this.sessionId,
       this.threadId,
       this.model,
       this.placeholder ? "placeholder" : "active",
       String(usageCursor),
+      String(sessionUsageRevision),
     ].join("|");
     if (key === this.#loadKey) return;
     this.#loadKey = key;

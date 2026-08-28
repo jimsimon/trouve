@@ -41,6 +41,11 @@ describe("session usage panel asynchronous lifecycle guards", () => {
     );
   });
 
+  it("invalidates session totals when any thread in the session completes", () => {
+    expect(source).toContain("store?.sessionUsageRevision(this.sessionId)");
+    expect(source).toContain("String(sessionUsageRevision)");
+  });
+
   it("keeps complete model labels visible without hover-only truncation", () => {
     expect(source).toContain("html`<small>${this.model}</small>`");
     expect(source).toContain("<span>${row.label}</span>");

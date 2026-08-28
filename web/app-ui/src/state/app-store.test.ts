@@ -488,6 +488,44 @@ describe("AppStore", () => {
     });
   });
 
+  it("advances session usage revision when a background thread completes", () => {
+    const store = new AppStore();
+    store.replaceThreadsForSession("se_1", [thread("th_1"), thread("th_2")]);
+    store.replaceThreadStatusesForSession("se_1", [
+      threadStatus("th_1", { active: true, outcome: "running", latest_cursor: 2 }),
+      threadStatus("th_2", { active: true, outcome: "running", latest_cursor: 3 }),
+    ]);
+    expect(store.sessionUsageRevision("se_1")).toBe(0);
+
+    store.applyServerEvent({
+      cursor: 9,
+      scope: "server",
+      ts: "2026-08-01T12:08:00Z",
+      type: "thread.status_updated",
+      status: threadStatus("th_2", {
+        outcome: "succeeded",
+        latest_cursor: 8,
+        completed_at: "2026-08-01T12:08:00Z",
+      }),
+    });
+    expect(store.sessionUsageRevision("se_1")).toBe(1);
+
+    store.applyServerEvent({
+      cursor: 10,
+      scope: "server",
+      ts: "2026-08-01T12:08:01Z",
+      type: "thread.status_updated",
+      status: threadStatus("th_2", {
+        attention: "question",
+        outcome: "succeeded",
+        latest_cursor: 9,
+        completed_at: "2026-08-01T12:08:00Z",
+      }),
+    });
+    expect(store.sessionUsageRevision("se_1")).toBe(1);
+    expect(store.sessionUsageRevision("se_other")).toBe(0);
+  });
+
   it("folds durable account PR snapshots independently per GitHub host", () => {
     const store = new AppStore();
     const event = (

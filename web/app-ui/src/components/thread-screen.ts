@@ -5544,7 +5544,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const lastUsageCursor = this.threadId === ""
       ? 0
       : store.threadView(this.threadId).lastUsageCursor;
-    return `${this.sessionId}:${sessionUpdatedAt}:${lastUsageCursor}`;
+    const sessionUsageRevision = store.sessionUsageRevision(this.sessionId);
+    return `${this.sessionId}:${sessionUpdatedAt}:${lastUsageCursor}:${sessionUsageRevision}`;
   }
 
   async #ensureSessionUsage(): Promise<void> {

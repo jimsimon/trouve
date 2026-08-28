@@ -205,6 +205,7 @@ export class AppStore {
   readonly #seenThreadCursors = new Map<string, number>();
   readonly #initializedThreadSessions = new Set<string>();
   readonly #initializedThreadStatusSessions = new Set<string>();
+  readonly #sessionUsageRevisions = new Map<string, number>();
   readonly #githubPullRequests = new Map<string, GithubPullRequestSnapshot>();
   readonly #sessionPullRequests = new Map<string, readonly ProtocolPrInfo[]>();
   #serverProjectionCursor = 0;
@@ -303,6 +304,7 @@ export class AppStore {
     this.#sessionSummaries.delete(sessionId);
     this.#seenSessionCursors.delete(sessionId);
     this.#sessionPullRequests.delete(sessionId);
+    this.#sessionUsageRevisions.delete(sessionId);
     for (const [threadId, thread] of this.#threads) {
       if (thread.session_id === sessionId) {
         this.#threads.delete(threadId);
@@ -443,6 +445,7 @@ export class AppStore {
       ) continue;
       const current = this.#threadStatuses.get(status.thread_id);
       if (current !== undefined && current.latest_cursor > status.latest_cursor) continue;
+      this.#recordSessionUsageCompletion(current, status);
       this.#threadStatuses.set(status.thread_id, status);
       if (firstSnapshot) {
         this.#seenThreadCursors.set(status.thread_id, status.latest_cursor);
@@ -480,6 +483,14 @@ export class AppStore {
       if (status.session_id === sessionId) ids.add(status.thread_id);
     }
     return Object.freeze([...ids]);
+  }
+
+  /** Monotonic invalidation token for authoritative session usage totals.
+   * Thread status events are server-scoped, so background-thread completions
+   * advance this even when that thread's transcript stream is not open. */
+  sessionUsageRevision(sessionId: string): number {
+    this.#revision.get();
+    return this.#sessionUsageRevisions.get(sessionId) ?? 0;
   }
 
   thread(threadId: string): ProtocolThread | undefined {
@@ -802,6 +813,7 @@ export class AppStore {
             this.#seenThreadCursors.set(next.thread_id, next.latest_cursor);
           }
         }
+        this.#recordSessionUsageCompletion(previous, next);
         this.#threadStatuses.set(next.thread_id, next);
         this.#touch();
         return false;
@@ -902,6 +914,15 @@ export class AppStore {
 
   #touch(): void {
     this.#revision.set(this.#revision.get() + 1);
+  }
+
+  #recordSessionUsageCompletion(
+    previous: ProtocolThreadStatus | undefined,
+    next: ProtocolThreadStatus,
+  ): void {
+    if (next.completed_at == null || next.completed_at === previous?.completed_at) return;
+    const revision = this.#sessionUsageRevisions.get(next.session_id) ?? 0;
+    this.#sessionUsageRevisions.set(next.session_id, revision + 1);
   }
 
   #storeThreadSnapshot(thread: ProtocolThread): void {
