@@ -10343,10 +10343,18 @@ impl Engine {
         };
         let mut permission_cache: HashMap<String, bool> = HashMap::new();
         let mut halted_pulls: HashSet<u64> = HashSet::new();
-        for command in commands.into_iter().take(THREADLESS_COMMAND_PASS_LIMIT) {
+        let mut processed = 0usize;
+        for command in commands {
+            if processed >= THREADLESS_COMMAND_PASS_LIMIT {
+                break;
+            }
+            // Skipping a halted pull's later commands costs no budget, so a
+            // pull whose head-of-line command keeps failing can never starve
+            // other pulls out of the pass window.
             if halted_pulls.contains(&command.pull_number) {
                 continue;
             }
+            processed += 1;
             match self
                 .apply_threadless_resolve_command_event(
                     &api,

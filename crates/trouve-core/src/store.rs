@@ -14448,6 +14448,10 @@ impl Store {
         Ok(inserted > 0)
     }
 
+    /// Pending commands ordered by comment id — GitHub's monotonically
+    /// increasing comment ids give comment-creation order even when webhook
+    /// deliveries arrive out of order, so a resolve and its follow-up
+    /// unresolve always apply in the order the maintainer wrote them.
     pub fn pending_threadless_commands(
         &self,
         repository: &str,
@@ -14457,7 +14461,7 @@ impl Store {
             "SELECT trigger_key, repository, pull_number, comment_id, author, resolve,
                     finding_prefix, reason
              FROM code_review_pending_threadless_commands
-             WHERE repository = ?1 ORDER BY created_at, trigger_key",
+             WHERE repository = ?1 ORDER BY comment_id",
         )?;
         let rows = stmt.query_map(params![repository], |row| {
             Ok(PendingThreadlessCommand {
