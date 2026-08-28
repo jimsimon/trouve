@@ -11324,18 +11324,6 @@ fn render_lifecycle_comment(
                 + LIFECYCLE_DISMISSABLE_TAIL_RESERVE
         }
     };
-    let failed_budget = LIFECYCLE_FINDINGS_MAX_BYTES.min(
-        LIFECYCLE_COMMENT_MAX_BYTES
-            .saturating_sub(body.len())
-            .saturating_sub(dismissal_reserve + prompt_reserve + tail_reserve),
-    );
-    append_lifecycle_finding_section(
-        &mut body,
-        "### Inline comments that failed to post",
-        &failed_findings,
-        failed_budget,
-        false,
-    );
     // Findings whose severity and confidence would block, but whose
     // causation this change could not be mechanically tied to. They are
     // surfaced for awareness — real signal, visible on the pull request —
@@ -11349,6 +11337,40 @@ fn render_lifecycle_comment(
                 && !finding_scope_blocks(&finding.evidence)
         })
         .collect::<Vec<_>>();
+    const NOTICED_HEADING: &str = "### Noticed beyond this change\n\nReal issues in code this \
+         change was not shown to cause. They do not block this pull request and should not be \
+         fixed here — track or fix them separately.";
+    // This section is the noticed findings' only PR-visible surface — they
+    // publish neither inline nor in the threadless list — so like the
+    // dismissal section it reserves the space its heading, first row, and
+    // honest omission notice actually need. Without the reserve, a large
+    // failed-publication section could zero its budget and hide the
+    // findings this feature promises stay visible.
+    let noticed_reserve = match noticed_findings.first() {
+        None => 0,
+        Some(first) => {
+            NOTICED_HEADING.len()
+                + lifecycle_finding_entry(first, false).len()
+                + format!(
+                    "- _{} additional finding(s) omitted._\n",
+                    noticed_findings.len()
+                )
+                .len()
+                + 8
+        }
+    };
+    let failed_budget = LIFECYCLE_FINDINGS_MAX_BYTES.min(
+        LIFECYCLE_COMMENT_MAX_BYTES
+            .saturating_sub(body.len())
+            .saturating_sub(noticed_reserve + dismissal_reserve + prompt_reserve + tail_reserve),
+    );
+    append_lifecycle_finding_section(
+        &mut body,
+        "### Inline comments that failed to post",
+        &failed_findings,
+        failed_budget,
+        false,
+    );
     let noticed_budget = LIFECYCLE_FINDINGS_MAX_BYTES.min(
         LIFECYCLE_COMMENT_MAX_BYTES
             .saturating_sub(body.len())
@@ -11356,9 +11378,7 @@ fn render_lifecycle_comment(
     );
     append_lifecycle_finding_section(
         &mut body,
-        "### Noticed beyond this change\n\nReal issues in code this change was not shown to \
-         cause. They do not block this pull request and should not be fixed here — track or \
-         fix them separately.",
+        NOTICED_HEADING,
         &noticed_findings,
         noticed_budget,
         false,
@@ -18362,6 +18382,86 @@ mod tests {
         // noticed finding appears only in its own non-gating section.
         assert!(body.contains("In scope issue"));
         assert_eq!(body.matches("Beyond scope issue").count(), 1);
+    }
+
+    #[test]
+    fn noticed_section_survives_a_lifecycle_comment_at_its_budget() {
+        // This section is the noticed findings' only PR-visible surface, so
+        // a failed-publication flood must not squeeze it out entirely: the
+        // render-order reservation keeps at least its heading, one row, and
+        // the honest omission notice.
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:noticed-reserve");
+        store.claim_code_review_job().unwrap().unwrap();
+        let large_body = "🦀".repeat(2_000);
+        let mut findings = Vec::new();
+        let mut details = Vec::new();
+        for index in 0..MAX_CANDIDATE_FINDINGS {
+            let noticed = index >= MAX_CANDIDATE_FINDINGS - 2;
+            findings.push(NewCodeReviewFinding {
+                path: format!("src/generated-{index}.rs"),
+                line: index as u64 + 1,
+                side: "RIGHT".into(),
+                severity: "high".into(),
+                confidence: "high".into(),
+                title: if noticed {
+                    "Beyond scope issue".into()
+                } else {
+                    "Failed publication".into()
+                },
+                body: large_body.clone(),
+                prompt_for_agents: "Fix this issue.".into(),
+                sources: Vec::new(),
+            });
+            details.push(crate::store::NewCodeReviewFindingDetails {
+                evidence: trouve_protocol::CodeReviewFindingEvidence {
+                    change_scope: if noticed { "unverified" } else { "verified" }.into(),
+                    ..Default::default()
+                },
+                outside_diff: noticed,
+                ..Default::default()
+            });
+        }
+        let persisted = store
+            .save_code_review_result_with_themes(
+                &queued.id,
+                "summary",
+                "prompt",
+                findings.len() as u64,
+                &findings,
+                &details,
+                &[],
+                &[],
+            )
+            .unwrap();
+        for finding in persisted
+            .iter()
+            .filter(|finding| finding.title == "Failed publication")
+        {
+            store
+                .set_code_review_finding_publication_status(
+                    &finding.id,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                )
+                .unwrap();
+        }
+        store
+            .finish_code_review_job(&queued.id, "succeeded", "", "")
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        let body = render_lifecycle_comment(&detail, &[], false, &[]);
+        assert!(body.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
+        assert!(body.contains("### Inline comments that failed to post"));
+        assert!(body.contains("### Noticed beyond this change"));
+        // At least one noticed row or its omission notice renders after the
+        // heading, so the retained findings are never silently invisible.
+        let section = body.split("### Noticed beyond this change").nth(1).unwrap();
+        assert!(
+            section.contains("Beyond scope issue")
+                || section.contains("additional finding(s) omitted"),
+            "noticed section rendered no rows and no omission notice"
+        );
     }
 
     #[test]
