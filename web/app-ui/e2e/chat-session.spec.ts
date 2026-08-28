@@ -1368,7 +1368,8 @@ test("model picker escapes the composer control strip", async ({ page }) => {
   await expect(popup).toHaveCount(0);
 });
 
-test("subscription status renders complete quota lines in the workspace usage panel", async ({ page }) => {
+test("subscription status renders complete quota lines in the workspace usage panel", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith("mobile"), "the workspace usage panel belongs to the desktop navigation surface");
   await installProtocolFixtures(page);
   await page.route("**/v1/subscriptions", async (route) => {
     await route.fulfill({
