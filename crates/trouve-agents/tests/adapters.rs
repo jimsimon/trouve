@@ -1106,7 +1106,7 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
 }
 
 #[tokio::test]
-async fn cursor_backend_shutdown_interrupts_an_active_send_and_reaps_bridge() {
+async fn cursor_backend_shutdown_drains_an_active_send_before_reaping_bridge() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_sdk_bridge_stub(tmp.path());
     let backend = std::sync::Arc::new(
@@ -1120,6 +1120,7 @@ async fn cursor_backend_shutdown_interrupts_an_active_send_and_reaps_bridge() {
     let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
     next.prompt = "STALL_FOR_CANCELLATION".into();
     next.tool_free = true;
+    let turn_cancel = next.cancel.clone();
     let mut stream = backend.run_turn(next).await.unwrap();
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1137,17 +1138,19 @@ async fn cursor_backend_shutdown_interrupts_an_active_send_and_reaps_bridge() {
 
     let shutting_backend = backend.clone();
     let mut shutdown = tokio::spawn(async move { shutting_backend.shutdown().await });
-    let mut saw_shutdown = false;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "backend shutdown interrupted an admitted Cursor turn"
+    );
+
+    turn_cancel.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while let Some(event) = stream.next().await {
-            if let Err(error) = event {
-                saw_shutdown |= error.to_string().contains("pool is shutting down");
-            }
-        }
+        while stream.next().await.is_some() {}
     })
     .await
-    .expect("active Cursor turn did not stop after backend shutdown");
-    assert!(saw_shutdown, "active turn did not report pool shutdown");
+    .expect("cancelled Cursor turn did not finish while backend shutdown drained it");
     tokio::time::timeout(std::time::Duration::from_secs(5), &mut shutdown)
         .await
         .expect("backend shutdown remained blocked behind the active turn")

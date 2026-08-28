@@ -277,13 +277,11 @@ pub fn installed_with_lease(data_dir: &Path, id: CliId) -> Option<(InstalledCli,
     ))
 }
 
-/// Executable selected by the authoritative managed-install pointer. The
-/// retired conventional path is returned only when no valid pointer exists,
-/// preserving the historical API for callers that probe it with `exists()`.
+/// Legacy probe path. Launch generation-backed installs with
+/// [`installed_with_lease`] so reclamation cannot invalidate the executable.
+#[deprecated(note = "use installed_with_lease when launching a managed runtime")]
 pub fn managed_bin(data_dir: &Path, id: CliId) -> PathBuf {
-    installed(data_dir, id)
-        .map(|install| PathBuf::from(install.bin))
-        .unwrap_or_else(|| legacy_managed_bin_path(data_dir, id))
+    legacy_managed_bin_path(data_dir, id)
 }
 
 fn http() -> Result<reqwest::Client, InstallError> {
@@ -1888,6 +1886,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
+    #[allow(deprecated)]
     fn installed_reads_pointer_when_binary_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
@@ -1909,7 +1908,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
 
         let info = installed(tmp.path(), CliId::Codex).unwrap();
         assert_eq!(info.version, "1.0.0");
-        assert_eq!(managed_bin(tmp.path(), CliId::Codex), bin);
+        assert_eq!(managed_bin(tmp.path(), CliId::Codex), retired);
 
         // Pointer with a missing binary reports not installed.
         std::fs::remove_file(&bin).unwrap();
