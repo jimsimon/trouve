@@ -2353,6 +2353,8 @@ pub struct Engine {
     logins: Mutex<HashMap<String, LoginState>>,
     /// In-flight managed vendor-CLI installs, keyed by CLI id.
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
+    #[cfg(test)]
+    test_cli_install_result: Mutex<Option<(String, trouve_agents::install::ActivationOutcome)>>,
     /// Destructive managed-runtime operations, keyed by canonical CLI id.
     /// Checked atomically with `cli_installs` so install and uninstall cannot
     /// pass each other's preconditions concurrently.
@@ -2868,6 +2870,8 @@ impl Engine {
             code_review: crate::review::CodeReviewRuntime::default(),
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_cli_install_result: Mutex::new(None),
             cli_runtime_operations: Arc::new(Mutex::new(HashSet::new())),
             local_manager,
             title_model,
@@ -4216,14 +4220,26 @@ impl Engine {
         let id_owned = state_id.to_string();
         tokio::spawn(async move {
             let result = async {
-                let version = match trouve_agents::install::latest_version_for_install(
-                    cli, &progress,
-                )
-                .await
-                {
-                    Ok(version) => version,
-                    Err(trouve_agents::install::InstallError::Cancelled) => return Ok(None),
-                    Err(error) => return Err(error.to_string()),
+                #[cfg(test)]
+                let injected_install = engine.test_cli_install_result.lock().unwrap().take();
+                #[cfg(not(test))]
+                let injected_install: Option<(
+                    String,
+                    trouve_agents::install::ActivationOutcome,
+                )> = None;
+                let version = match injected_install.as_ref() {
+                    Some((version, _)) => version.clone(),
+                    None => {
+                        match trouve_agents::install::latest_version_for_install(cli, &progress)
+                            .await
+                        {
+                            Ok(version) => version,
+                            Err(trouve_agents::install::InstallError::Cancelled) => {
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
                 };
                 engine.cli_installs.lock().unwrap().insert(
                     id_owned.clone(),
@@ -4283,14 +4299,19 @@ impl Engine {
                     retirement.publish();
                     install_result
                 } else {
-                    match trouve_agents::install::install(
-                        &engine.data_dir,
-                        cli,
-                        &version,
-                        &progress,
-                    )
-                    .await
-                    {
+                    let install = match injected_install {
+                        Some((_, outcome)) => Ok(outcome),
+                        None => {
+                            trouve_agents::install::install(
+                                &engine.data_dir,
+                                cli,
+                                &version,
+                                &progress,
+                            )
+                            .await
+                        }
+                    };
+                    match install {
                         Ok(outcome) => {
                             let (_, warning) = outcome.into_parts();
                             let warning = engine
@@ -27389,33 +27410,6 @@ default_permission_mode = "ask"
         }
     }
 
-    #[test]
-    fn cli_install_status_surfaces_a_committed_durability_warning() {
-        let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().to_path_buf(),
-            &Config::default(),
-        );
-        engine.cli_installs.lock().unwrap().insert(
-            "codex".into(),
-            CliInstallState::Success {
-                version: "1.2.3".into(),
-                warning: Some("crash durability could not be confirmed".into()),
-            },
-        );
-
-        let status = engine.cli_install_status("codex");
-
-        assert_eq!(status.status, "success");
-        assert_eq!(status.version.as_deref(), Some("1.2.3"));
-        assert_eq!(
-            status.warning.as_deref(),
-            Some("crash durability could not be confirmed")
-        );
-        assert!(status.error.is_none());
-    }
-
     #[tokio::test]
     async fn committed_runtime_reload_failure_is_an_install_warning() {
         let data = tempfile::tempdir().unwrap();
@@ -27425,13 +27419,13 @@ default_permission_mode = "ask"
             .join("codex");
         std::fs::create_dir_all(runtime_bin.parent().unwrap()).unwrap();
         std::fs::write(&runtime_bin, "codex fixture").unwrap();
+        let installed = trouve_agents::install::InstalledCli {
+            version: "1.2.3".into(),
+            bin: runtime_bin.to_string_lossy().into_owned(),
+        };
         std::fs::write(
             runtime_root.join("installed.json"),
-            serde_json::to_string(&trouve_agents::install::InstalledCli {
-                version: "1.2.3".into(),
-                bin: runtime_bin.to_string_lossy().into_owned(),
-            })
-            .unwrap(),
+            serde_json::to_string(&installed).unwrap(),
         )
         .unwrap();
         let mut config = Config::default();
@@ -27453,23 +27447,23 @@ default_permission_mode = "ask"
                 shutdowns: std::sync::atomic::AtomicUsize::new(0),
             }),
         );
+        engine.test_cli_install_result.lock().unwrap().replace((
+            installed.version.clone(),
+            trouve_agents::install::ActivationOutcome::Durable(installed),
+        ));
 
-        let warning = engine
-            .reload_after_committed_runtime_install(
-                trouve_agents::install::CliId::Codex,
-                "1.2.3",
-                None,
-            )
-            .await;
-        engine.cli_installs.lock().unwrap().insert(
-            "codex".into(),
-            CliInstallState::Success {
-                version: "1.2.3".into(),
-                warning,
-            },
-        );
-
-        let status = engine.cli_install_status("codex");
+        engine.start_cli_install("codex").unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = engine.cli_install_status("codex");
+                if status.status != "pending" {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("managed install completed");
         assert_eq!(status.status, "success");
         assert_eq!(status.version.as_deref(), Some("1.2.3"));
         assert!(status.error.is_none());
