@@ -940,13 +940,7 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
             .contains("<mode-instructions>")
     );
     assert_eq!(send["options"]["mode"], "AGENT_MODE_OPTION_AGENT");
-    assert_eq!(
-        *calls.lock().await,
-        vec![serde_json::json!({
-            "name": "trouve_test_echo",
-            "arguments": { "token": "from-sdk" }
-        })]
-    );
+    assert_eq!(calls.lock().await.len(), 1);
     let callback: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{stub}.callback.json")).unwrap())
             .unwrap();

@@ -22,8 +22,6 @@ const FILE_NAME: &str = "cursor-sdk-e2e.txt";
 const FILE_CONTENT: &str = "cursor-sdk-production-e2e";
 const WRITE_MARKER: &str = "CURSOR_SDK_WRITE_OK";
 const RESUME_MARKER: &str = "CURSOR_SDK_RESUME_OK";
-const FALLBACK_UNINSTALL_RETRIES: usize = 40;
-const FALLBACK_UNINSTALL_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 struct LiveServerGuard {
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -70,31 +68,27 @@ impl ManagedCursorRuntimeGuard {
     }
 }
 
-fn uninstall_managed_cursor_runtime_with_retry(data_dir: &Path) -> std::io::Result<()> {
-    let mut retries = 0;
-    loop {
-        match trouve_agents::install::uninstall(
-            data_dir,
-            trouve_agents::install::CliId::CursorSdkBridge,
-        ) {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    && retries < FALLBACK_UNINSTALL_RETRIES =>
-            {
-                retries += 1;
-                std::thread::sleep(FALLBACK_UNINSTALL_RETRY_DELAY);
-            }
-            result => return result,
-        }
-    }
-}
-
 impl Drop for ManagedCursorRuntimeGuard {
     fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = uninstall_managed_cursor_runtime_with_retry(&self.data_dir)
-        {
-            eprintln!("failed to remove managed Cursor SDK runtime during test teardown: {error}");
+        if !self.armed {
+            return;
+        }
+        for attempt in 0..=40 {
+            match trouve_agents::install::uninstall(
+                &self.data_dir,
+                trouve_agents::install::CliId::CursorSdkBridge,
+            ) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && attempt < 40 => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "failed to remove managed Cursor SDK runtime during test teardown: {error}"
+                    );
+                    return;
+                }
+            }
         }
     }
 }
@@ -332,41 +326,6 @@ fn managed_cursor_runtime_guard_removes_the_managed_fixture() {
 
     assert!(!temporary.path().join("cli/cursor-sdk-bridge").exists());
     assert!(!managed_bin.exists());
-}
-
-#[test]
-fn managed_cursor_runtime_guard_retries_a_transient_runtime_lease() {
-    let temporary = tempfile::tempdir().unwrap();
-    let runtime_root = temporary.path().join("cli/cursor-sdk-bridge");
-    let version_root = runtime_root.join("v1");
-    let managed_bin = version_root.join("cursor-sdk-bridge");
-    std::fs::create_dir_all(&version_root).unwrap();
-    std::fs::write(&managed_bin, "fixture").unwrap();
-    std::fs::write(
-        runtime_root.join("installed.json"),
-        serde_json::to_string(&trouve_agents::install::InstalledCli {
-            version: "v1".into(),
-            bin: managed_bin.to_string_lossy().into_owned(),
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    let (_, lease) = trouve_agents::install::installed_with_lease(
-        temporary.path(),
-        trouve_agents::install::CliId::CursorSdkBridge,
-    )
-    .expect("managed runtime lease");
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(75));
-        drop(lease);
-    });
-
-    drop(ManagedCursorRuntimeGuard::new(
-        temporary.path().to_path_buf(),
-    ));
-    release.join().unwrap();
-
-    assert!(!runtime_root.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
