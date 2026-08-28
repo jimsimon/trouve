@@ -4076,6 +4076,9 @@ pub struct PendingThreadlessCommand {
     pub resolve: bool,
     pub finding_prefix: String,
     pub reason: String,
+    /// Claim time, set by the store when the delivery is claimed. Used to
+    /// bound how long a premature no-op is retained for replay.
+    pub created_at: String,
 }
 
 /// Outcome of a maintainer resolve/unresolve command against the threadless
@@ -4098,6 +4101,10 @@ pub enum ThreadlessCommandOutcome {
     /// Another processor consumed this command's durable row first; nothing
     /// was evaluated or mutated.
     AlreadyConsumed,
+    /// The command is not applicable yet, but an out-of-order sibling
+    /// delivery could still make it applicable, so its row was retained for
+    /// replay instead of being consumed.
+    NotApplicableDeferred,
 }
 
 #[derive(Debug, Clone)]
@@ -12227,25 +12234,27 @@ impl Store {
     /// maintainer's reason and attribution in `dismiss_reason`.
     pub fn apply_threadless_resolve_command(
         &self,
-        repository: &str,
-        pull_number: u64,
-        finding_prefix: &str,
-        resolve: bool,
+        command: &PendingThreadlessCommand,
         dismiss_reason: &str,
-        trigger_key: Option<&str>,
+        defer_not_applicable_within: Option<std::time::Duration>,
     ) -> Result<(ThreadlessCommandOutcome, Option<String>)> {
+        let repository = command.repository.as_str();
+        let pull_number = command.pull_number;
+        let finding_prefix = command.finding_prefix.as_str();
+        let resolve = command.resolve;
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        // Every outcome below is definitive, so the durable command row is
-        // consumed in the same transaction as the state it decides.
-        if let Some(trigger_key) = trigger_key {
+        // Outcomes below are definitive (except an in-window NotApplicable,
+        // which re-inserts the row), so the durable command row is consumed
+        // in the same transaction as the state it decides.
+        if !command.trigger_key.is_empty() {
             // Consumption must be exclusive: a processor whose snapshot lost
             // the race deletes zero rows and must not evaluate or mutate
             // anything, or a stale command could reverse a newer opposite
             // decision.
             let consumed = tx.execute(
                 "DELETE FROM code_review_pending_threadless_commands WHERE trigger_key = ?1",
-                params![trigger_key],
+                params![command.trigger_key],
             )?;
             if consumed == 0 {
                 tx.commit()?;
@@ -12285,6 +12294,40 @@ impl Store {
         };
         let expected = if resolve { "open" } else { "dismissed" };
         if status != expected {
+            // Deliveries can arrive out of order: an unresolve whose earlier
+            // resolve has not been delivered yet is inapplicable now but
+            // becomes applicable the moment the sibling lands (comment-id
+            // ordering then replays them in the order the maintainer wrote
+            // them). Retain such a command briefly instead of consuming it;
+            // past the window it is a genuine no-op and gets its reply.
+            if !command.trigger_key.is_empty()
+                && let Some(window) = defer_not_applicable_within
+                && chrono::DateTime::parse_from_rfc3339(&command.created_at)
+                    .ok()
+                    .map(|created| chrono::Utc::now().signed_duration_since(created))
+                    .and_then(|age| age.to_std().ok())
+                    .is_some_and(|age| age < window)
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_pending_threadless_commands
+                            (trigger_key, repository, pull_number, comment_id, author, resolve,
+                             finding_prefix, reason, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        command.trigger_key,
+                        command.repository,
+                        command.pull_number as i64,
+                        command.comment_id as i64,
+                        command.author,
+                        command.resolve,
+                        command.finding_prefix,
+                        command.reason,
+                        command.created_at
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::NotApplicableDeferred, None));
+            }
             tx.commit()?;
             return Ok((
                 ThreadlessCommandOutcome::NotApplicable { finding_id, status },
@@ -14459,7 +14502,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT trigger_key, repository, pull_number, comment_id, author, resolve,
-                    finding_prefix, reason
+                    finding_prefix, reason, created_at
              FROM code_review_pending_threadless_commands
              WHERE repository = ?1 ORDER BY comment_id",
         )?;
@@ -14473,6 +14516,7 @@ impl Store {
                 resolve: row.get(5)?,
                 finding_prefix: row.get(6)?,
                 reason: row.get(7)?,
+                created_at: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -19810,18 +19854,22 @@ mod tests {
             .finish_code_review_job(&job.id, "succeeded", "", "")
             .unwrap();
         let target = findings[0].id.clone();
+        let command = |prefix: &str, resolve: bool| PendingThreadlessCommand {
+            trigger_key: String::new(),
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            comment_id: 100,
+            author: "jim".into(),
+            resolve,
+            finding_prefix: prefix.into(),
+            reason: "because".into(),
+            created_at: String::new(),
+        };
 
         // Every finding id shares the rvf_ prefix, so a bare prefix is
         // ambiguous and applies nothing.
         let (outcome, _) = store
-            .apply_threadless_resolve_command(
-                "acme/widgets",
-                42,
-                "rvf_",
-                true,
-                "reason — @jim",
-                None,
-            )
+            .apply_threadless_resolve_command(&command("rvf_", true), "reason — @jim", None)
             .unwrap();
         assert!(matches!(
             outcome,
@@ -19830,24 +19878,14 @@ mod tests {
 
         // An unknown prefix is reported as such.
         let (outcome, _) = store
-            .apply_threadless_resolve_command(
-                "acme/widgets",
-                42,
-                "rvf_000000",
-                true,
-                "reason — @jim",
-                None,
-            )
+            .apply_threadless_resolve_command(&command("rvf_000000", true), "reason — @jim", None)
             .unwrap();
         assert!(matches!(outcome, ThreadlessCommandOutcome::NotFound));
 
         // The full id resolves the finding and records reason + attribution.
         let (outcome, _) = store
             .apply_threadless_resolve_command(
-                "acme/widgets",
-                42,
-                &target,
-                true,
+                &command(&target, true),
                 "accepted limitation per ADR 0042 — resolved by @jim",
                 None,
             )
@@ -19867,14 +19905,7 @@ mod tests {
         // Resolving again is not applicable — fixed/dismissed states are
         // reported instead of silently re-applied.
         let (outcome, _) = store
-            .apply_threadless_resolve_command(
-                "acme/widgets",
-                42,
-                &target,
-                true,
-                "again — @jim",
-                None,
-            )
+            .apply_threadless_resolve_command(&command(&target, true), "again — @jim", None)
             .unwrap();
         assert!(matches!(
             outcome,
@@ -19883,7 +19914,7 @@ mod tests {
 
         // Unresolve restores it.
         let (outcome, _) = store
-            .apply_threadless_resolve_command("acme/widgets", 42, &target, false, "", None)
+            .apply_threadless_resolve_command(&command(&target, false), "", None)
             .unwrap();
         assert_eq!(
             outcome,
@@ -19901,6 +19932,50 @@ mod tests {
                 .unwrap()
                 .status,
             "open"
+        );
+
+        // Out-of-order protection: a durable, recently claimed command that
+        // is not applicable yet is retained for replay instead of consumed —
+        // its out-of-order sibling may still land. Past the window it is a
+        // genuine no-op.
+        let mut durable = command(&target, false);
+        durable.trigger_key = "command:comment:100".into();
+        durable.created_at = chrono::Utc::now().to_rfc3339();
+        store
+            .claim_github_webhook_delivery("delivery-defer-1", None, Some(&durable))
+            .unwrap();
+        let fresh = store.pending_threadless_commands("acme/widgets").unwrap()[0].clone();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&fresh, "", Some(std::time::Duration::from_secs(120)))
+            .unwrap();
+        assert_eq!(outcome, ThreadlessCommandOutcome::NotApplicableDeferred);
+        assert_eq!(
+            store
+                .pending_threadless_commands("acme/widgets")
+                .unwrap()
+                .len(),
+            1,
+            "the deferred command's row must survive for replay"
+        );
+        let mut expired = fresh.clone();
+        expired.created_at = "2020-01-01T00:00:00Z".into();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(
+                &expired,
+                "",
+                Some(std::time::Duration::from_secs(120)),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::NotApplicable { ref status, .. } if status == "open"
+        ));
+        assert!(
+            store
+                .pending_threadless_commands("acme/widgets")
+                .unwrap()
+                .is_empty(),
+            "an expired no-op is consumed"
         );
     }
 

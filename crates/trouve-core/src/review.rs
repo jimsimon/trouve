@@ -1196,6 +1196,11 @@ struct ThreadlessResolveCommand {
 /// and permission lookups admission-controlled.
 const THREADLESS_COMMAND_PASS_LIMIT: usize = 16;
 
+/// How long a not-yet-applicable command is retained for replay before it is
+/// consumed as a genuine no-op. Covers out-of-order webhook delivery of a
+/// resolve/unresolve pair; past this window the sibling is not coming.
+const THREADLESS_COMMAND_REPLAY_WINDOW: Duration = Duration::from_secs(120);
+
 /// How one durable command left its processing attempt.
 enum ThreadlessCommandDisposition {
     /// The command reached a definitive outcome and its row was consumed.
@@ -4592,6 +4597,9 @@ impl Engine {
                     resolve,
                     finding_prefix,
                     reason,
+                    // The claim writes its own timestamp; processors always
+                    // reload rows, so this placeholder is never read.
+                    created_at: String::new(),
                 })
             });
         if !self.store.claim_github_webhook_delivery(
@@ -10408,14 +10416,14 @@ impl Engine {
             // A definitive outcome: consume the row (via a prefix that can
             // never match a finding) so an unauthorized command is not
             // retried forever.
-            if let Err(error) = self.store.apply_threadless_resolve_command(
-                &repository.repository,
-                command.pull_number,
-                "rvf_never-matches",
-                command.resolve,
-                "",
-                Some(&command.trigger_key),
-            ) {
+            let unauthorized = crate::store::PendingThreadlessCommand {
+                finding_prefix: "rvf_never-matches".to_owned(),
+                ..command.clone()
+            };
+            if let Err(error) = self
+                .store
+                .apply_threadless_resolve_command(&unauthorized, "", None)
+            {
                 self.record_review_error(format!(
                     "consuming unauthorized threadless command failed: {error:#}"
                 ));
@@ -10432,12 +10440,9 @@ impl Engine {
             bounded_utf8(command.author.trim(), 64, "…"),
         );
         let feedback = match self.store.apply_threadless_resolve_command(
-            &repository.repository,
-            command.pull_number,
-            &command.finding_prefix,
-            command.resolve,
+            command,
             &dismiss_reason,
-            Some(&command.trigger_key),
+            Some(THREADLESS_COMMAND_REPLAY_WINDOW),
         ) {
             Ok((ThreadlessCommandOutcome::Applied { .. }, projection_job)) => {
                 match api
@@ -10476,6 +10481,12 @@ impl Engine {
                 None
             }
             Ok((ThreadlessCommandOutcome::AlreadyConsumed, _)) => None,
+            Ok((ThreadlessCommandOutcome::NotApplicableDeferred, _)) => {
+                // The command may become applicable when its out-of-order
+                // sibling delivery lands; halt this pull's later commands so
+                // comment-id ordering replays them correctly next pass.
+                return ThreadlessCommandDisposition::RetryPull;
+            }
             Ok((ThreadlessCommandOutcome::AmbiguousPrefix { matches }, _)) => Some(format!(
                 "`{}` matches {matches} findings on this pull request; \
                  use more of the id shown in the review comment.",
