@@ -3,8 +3,9 @@
 //! This test deliberately starts at the public HTTP API: it installs the
 //! managed runtime, creates a real session worktree, drives the production
 //! Cursor backend through the secured internal MCP bridge, observes the
-//! durable event log, resumes the same SDK agent in the same warm Bridge
-//! process, and removes the managed runtime again.
+//! durable event log, concurrently routes two SDK agents in separate session
+//! worktrees through one warm Bridge process, resumes the first agent, and
+//! removes the managed runtime again.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,8 +21,11 @@ use trouve_protocol::Scope;
 const LIVE_TIMEOUT: Duration = Duration::from_secs(300);
 const FILE_NAME: &str = "cursor-sdk-e2e.txt";
 const FILE_CONTENT: &str = "cursor-sdk-production-e2e";
+const PARALLEL_FILE_NAME: &str = "cursor-sdk-parallel-e2e.txt";
+const PARALLEL_FILE_CONTENT: &str = "cursor-sdk-parallel-worktree";
 const WRITE_MARKER: &str = "CURSOR_SDK_WRITE_OK";
 const RESUME_MARKER: &str = "CURSOR_SDK_RESUME_OK";
+const PARALLEL_MARKER: &str = "CURSOR_SDK_PARALLEL_OK";
 
 struct LiveServerGuard {
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -575,6 +579,51 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         "the first turn should retain exactly one warm Bridge process: {first_runtime_dirs:?}"
     );
 
+    let parallel_session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({
+            "workspace_id": workspace["id"],
+            "title": "Cursor SDK shared-Bridge qualification",
+            "fetch_latest": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let parallel_worktree = PathBuf::from(parallel_session["worktree_path"].as_str().unwrap());
+    std::fs::write(
+        parallel_worktree.join(PARALLEL_FILE_NAME),
+        PARALLEL_FILE_CONTENT,
+    )
+    .unwrap();
+    assert!(
+        !worktree.join(PARALLEL_FILE_NAME).exists(),
+        "parallel fixture leaked into the first session worktree"
+    );
+    let parallel_thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({
+            "session_id": parallel_session["id"],
+            "title": "Cursor SDK parallel agent",
+            "mode": "code",
+            "model": format!("cursor/{model}"),
+            "permission_mode": "ask"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let parallel_thread_id = parallel_thread["id"].as_str().unwrap().to_string();
+    let parallel_events_url = format!("{base}/threads/{parallel_thread_id}/events");
+
     let second_send = client
         .post(format!("{base}/threads/{thread_id}/messages"))
         .json(&serde_json::json!({
@@ -588,8 +637,28 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         .await
         .unwrap();
     assert!(second_send.status().is_success(), "{second_send:?}");
+    let parallel_send = client
+        .post(format!(
+            "{base}/threads/{parallel_thread_id}/messages"
+        ))
+        .json(&serde_json::json!({
+            "content": format!(
+                "Call read_file exactly once with {{\"path\":\"{PARALLEL_FILE_NAME}\"}}. \
+                 If its complete content after removing one optional trailing newline is exactly \
+                 {PARALLEL_FILE_CONTENT}, reply with exactly {PARALLEL_MARKER}. Do not call any other tool."
+            )
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(parallel_send.status().is_success(), "{parallel_send:?}");
 
-    wait_for_event(&client, &events_url, |event| terminal_event(event, 2)).await;
+    tokio::join!(
+        wait_for_event(&client, &events_url, |event| terminal_event(event, 2)),
+        wait_for_event(&client, &parallel_events_url, |event| terminal_event(
+            event, 1
+        )),
+    );
     let second_events = persisted_thread_events(&engine, thread_id);
     assert_turn_completed(&second_events, 2);
     assert!(
@@ -614,6 +683,28 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
             && event["call_id"] == read_call_id
             && event["status"] == "ok"
     }));
+    let parallel_events = persisted_thread_events(&engine, &parallel_thread_id);
+    assert_turn_completed(&parallel_events, 1);
+    assert!(
+        assistant_text(&parallel_events, 1).contains(PARALLEL_MARKER),
+        "Cursor did not return the parallel marker: {}",
+        assistant_text(&parallel_events, 1)
+    );
+    let parallel_requests = parallel_events
+        .iter()
+        .filter(|event| event["type"] == "tool.requested" && event["turn"] == 1)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parallel_requests.len(),
+        1,
+        "parallel turn escaped its exact one-call tool policy: {parallel_requests:?}"
+    );
+    assert_eq!(parallel_requests[0]["tool"], "read_file");
+    assert_eq!(
+        parallel_requests[0]["args"]["path"], PARALLEL_FILE_NAME,
+        "parallel callback was routed to the wrong thread: {:?}",
+        parallel_requests[0]
+    );
     assert_eq!(
         engine
             .store()
@@ -624,10 +715,19 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         vendor_session.0,
         "the warm Bridge process did not resume the same SDK agent"
     );
+    let parallel_vendor_session = engine
+        .store()
+        .backend_session(&parallel_thread_id, "cursor")
+        .unwrap()
+        .expect("parallel turn stored its Cursor SDK agent id");
+    assert_ne!(
+        parallel_vendor_session.0, vendor_session.0,
+        "two Trouve threads unexpectedly shared one Cursor agent id"
+    );
     assert_eq!(
         bridge_runtime_dirs(&cursor_state_root),
         first_runtime_dirs,
-        "the second turn started a new Bridge instead of reusing the warm process"
+        "parallel agents started another Bridge instead of sharing the warm process"
     );
 
     let view: serde_json::Value = client
