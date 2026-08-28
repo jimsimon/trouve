@@ -890,8 +890,8 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn backfill_usage_models(conn: &mut Connection) -> Result<()> {
-    let transaction = conn.transaction()?;
+fn backfill_usage_models(conn: &Connection) -> Result<()> {
+    let transaction = write_transaction(conn)?;
     let complete = transaction.query_row(
         "SELECT EXISTS (SELECT 1 FROM data_migrations WHERE name = ?1)",
         [USAGE_MODEL_BACKFILL_MIGRATION],
