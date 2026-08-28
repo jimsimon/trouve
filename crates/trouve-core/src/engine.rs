@@ -1974,6 +1974,13 @@ impl ReviewWorkspaceRegistrationLifecycle {
             self.stabilize();
             self.provisional_workspace_id = Some(workspace_id.to_string());
             self.provisional_generation = cleanup_generation;
+        } else if self.provisional_workspace_id.is_none() && cleanup_generation.is_some() {
+            // A fresh engine can recover provisional ownership from the
+            // durable intent even though its process-local lifecycle starts
+            // empty. Cache that generation locally; the store remains the
+            // authority for whether it may be adopted.
+            self.provisional_workspace_id = Some(workspace_id.to_string());
+            self.provisional_generation = cleanup_generation;
         }
         if self.provisional_workspace_id.as_deref() != Some(workspace_id)
             || self.provisional_generation != cleanup_generation

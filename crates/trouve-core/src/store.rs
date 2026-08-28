@@ -6801,6 +6801,14 @@ impl Store {
                 );
                 let generation = u64::try_from(generation)
                     .context("workspace review-registration generation is negative")?;
+                let durable_provisional = tx.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM code_review_workspace_cleanup_intents
+                       WHERE workspace_id = ?1 AND generation = ?2
+                     )",
+                    params![workspace.id, i64::try_from(generation)?],
+                    |row| row.get::<_, bool>(0),
+                )?;
                 if closed {
                     let next = generation
                         .checked_add(1)
@@ -6812,7 +6820,7 @@ impl Store {
                         params![workspace.id, i64::try_from(next)?],
                     )?;
                     (true, Some(next))
-                } else if inherited_generation == Some(generation) {
+                } else if durable_provisional || inherited_generation == Some(generation) {
                     (false, Some(generation))
                 } else {
                     (false, None)

@@ -17502,7 +17502,7 @@ mod tests {
             .commit_review_workspace_registration(&first.id, &workspace, None)
             .unwrap();
         store
-            .commit_review_workspace_registration(&second.id, &workspace, Some(1))
+            .commit_review_workspace_registration(&second.id, &workspace, None)
             .unwrap();
         let first_intent = store
             .review_workspace_cleanup_intent(&first.id)
@@ -17526,6 +17526,76 @@ mod tests {
                 .review_workspace_cleanup_should_close(&second_intent)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn fresh_engine_adopts_a_durable_provisional_workspace_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).current_dir(&repository);
+        assert!(trouve_process::status(&mut init).unwrap().success());
+        let repository = repository.canonicalize().unwrap();
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let first = enqueue_test_review_job(&store, "acme/widgets#42:restart-first-lease");
+        let second = enqueue_test_review_job(&store, "acme/widgets#42:restart-second-lease");
+        store.claim_code_review_job().unwrap().unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_restart_generation".into(),
+            name: "widgets".into(),
+            path: repository.to_string_lossy().into_owned(),
+        };
+        store
+            .commit_review_workspace_registration(&first.id, &workspace, None)
+            .unwrap();
+
+        // Constructing the engine after the first registration simulates a
+        // restart: its process-local lifecycle has never seen generation 1.
+        let engine = Engine::new(
+            store.clone(),
+            temporary.path().join("data"),
+            &crate::config::Config::default(),
+        );
+        let cancel = CancellationToken::new();
+        let fence = ReviewWorkspaceRegistrationFence::for_job(second.id.clone());
+        let adopted = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("widgets".into()),
+                &cancel,
+                &fence,
+            )
+            .unwrap();
+        assert_eq!(adopted.id, workspace.id);
+
+        let first_intent = store
+            .review_workspace_cleanup_intent(&first.id)
+            .unwrap()
+            .unwrap();
+        engine
+            .reconcile_review_workspace_cleanup(&first_intent)
+            .unwrap();
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        assert!(
+            store
+                .review_workspace_cleanup_intent(&second.id)
+                .unwrap()
+                .is_some()
+        );
+
+        engine
+            .complete_review_workspace_registration(&cancel, &fence)
+            .unwrap();
+        assert!(
+            store
+                .review_workspace_cleanup_intent(&second.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
