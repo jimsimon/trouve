@@ -6,6 +6,7 @@
 //! conditions; [`crate::Engine`] falls back to [`crate::title`] for all of
 //! them.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,13 +26,12 @@ const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STAGE_RUNTIME: u8 = 1;
 const STAGE_MODEL: u8 = 2;
-const MAX_TITLE_WORDS: usize = 7;
+const MAX_TITLE_WORDS: usize = 5;
 const MAX_TITLE_CHARS: usize = 80;
-const MAX_UTF8_BYTES_PER_CHAR: usize = 4;
-// The title model uses byte fallback for text that is not represented by a
-// single vocabulary token. Reserve one token per possible UTF-8 byte, plus
-// one for the stop token, so every title accepted by the validator can finish.
-const MAX_TITLE_TOKENS: usize = MAX_TITLE_CHARS * MAX_UTF8_BYTES_PER_CHAR + 1;
+// The response grammar is ASCII-only, so one token per accepted byte is the
+// worst case. Keep additional headroom beyond the 80-character validator
+// ceiling while stopping malformed or runaway generations promptly.
+const MAX_TITLE_TOKENS: usize = 96;
 const TITLE_SYSTEM_PROMPT: &str = "Create a concise navigation title for the user's primary \
 software request or question. First identify the requested outcome across the whole prompt. Title \
 that outcome, not background observations, examples, prompt wording, or a guessed solution. Do not \
@@ -46,10 +46,19 @@ Title: Investigate Log Warnings\n\
 Prompt: Does adaptive naming consider CPU load or only memory?\n\
 Title: Explain Naming Resource Checks\n\
 Prompt: Would SQLite or RocksDB better fit the local event store?\n\
-Title: Compare SQLite and RocksDB\n\n\
-/no_think";
+Title: Compare SQLite and RocksDB\n\
+Prompt: How does the current authentication flow work, and would OAuth be better?\n\
+Title: Evaluate Authentication Approach";
 
-const TITLE_FIXED_MESSAGE_BYTES: usize = TITLE_SYSTEM_PROMPT.len();
+const TITLE_USER_PROMPT_PREFIX: &str = "Prompt:\n<content>\n";
+const TITLE_USER_PROMPT_SUFFIX: &str = "\n</content>";
+const TITLE_RESPONSE_GRAMMAR: &str = r#"
+root ::= word " " word (" " word){0,3}
+word ::= [A-Za-z0-9] [A-Za-z0-9+.#_/-]*
+"#;
+
+const TITLE_FIXED_MESSAGE_BYTES: usize =
+    TITLE_SYSTEM_PROMPT.len() + TITLE_USER_PROMPT_PREFIX.len() + TITLE_USER_PROMPT_SUFFIX.len();
 // Reserve the output and fixed message budgets plus a conservative allowance
 // for Qwen3's chat-template wrappers. The remaining bytes bound token-dense
 // prompts by their worst-case byte fallback.
@@ -306,7 +315,7 @@ impl TitleModelManager {
         let response = tokio::time::timeout(GENERATION_TIMEOUT, async {
             self.http
                 .post(format!("{base_url}/chat/completions"))
-                .json(&title_request(prompt))
+                .json(&title_request(prompt.as_ref()))
                 .send()
                 .await?
                 .error_for_status()?
@@ -552,16 +561,27 @@ impl TitleModelManager {
     }
 }
 
-fn cap_title_model_prompt(prompt: &str) -> &str {
+const TITLE_PROMPT_ELISION: &str = "\n[...]\n";
+
+fn cap_title_model_prompt(prompt: &str) -> Cow<'_, str> {
     let prompt = crate::title::cap_prompt(prompt);
     if prompt.len() <= MAX_TITLE_PROMPT_BYTES {
-        return prompt;
+        return Cow::Borrowed(prompt);
     }
-    let mut end = MAX_TITLE_PROMPT_BYTES;
-    while !prompt.is_char_boundary(end) {
-        end -= 1;
+    let content_bytes = MAX_TITLE_PROMPT_BYTES - TITLE_PROMPT_ELISION.len();
+    let mut head_end = content_bytes / 2;
+    while !prompt.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    &prompt[..end]
+    let mut tail_start = prompt.len() - (content_bytes - head_end);
+    while !prompt.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    Cow::Owned(format!(
+        "{}{TITLE_PROMPT_ELISION}{}",
+        &prompt[..head_end],
+        &prompt[tail_start..]
+    ))
 }
 
 fn title_request(prompt: &str) -> serde_json::Value {
@@ -571,6 +591,7 @@ fn title_request(prompt: &str) -> serde_json::Value {
         "temperature": 0.7,
         "top_p": 0.8,
         "top_k": 20,
+        "grammar": TITLE_RESPONSE_GRAMMAR,
         // Repetition is unlikely in a title this short. A positive penalty
         // made the small model substitute less accurate wording in the
         // title-quality corpus.
@@ -586,8 +607,6 @@ fn title_request(prompt: &str) -> serde_json::Value {
         // their KV prefix reduces subsequent prefill.
         "cache_prompt": true,
         // Avoid spending the output budget on Qwen3's reasoning trace.
-        // `/no_think` remains in the prompt as a model-level fallback for
-        // runtimes that ignore kwargs.
         "chat_template_kwargs": {
             "enable_thinking": false
         },
@@ -598,7 +617,10 @@ fn title_request(prompt: &str) -> serde_json::Value {
 fn title_messages(prompt: &str) -> serde_json::Value {
     serde_json::json!([
         { "role": "system", "content": TITLE_SYSTEM_PROMPT },
-        { "role": "user", "content": prompt }
+        {
+            "role": "user",
+            "content": format!("{TITLE_USER_PROMPT_PREFIX}{prompt}{TITLE_USER_PROMPT_SUFFIX}")
+        },
     ])
 }
 
@@ -724,11 +746,10 @@ fn sanitize_title(raw: &str) -> Result<String> {
 }
 
 fn sanitize_title_candidate(raw: &str) -> Result<SanitizedTitleCandidate> {
-    // A runtime that ignores `chat_template_kwargs` falls back to the
-    // prompt-level `/no_think`. Depending on the chat template, content can
-    // contain the whole empty block or only its closing tag. A closed or
-    // externally-opened block is also evidence that following text is title
-    // output rather than a truncated reasoning line.
+    // A runtime may ignore `chat_template_kwargs`. Depending on the chat
+    // template, content can contain the whole reasoning block or only its
+    // closing tag. A closed or externally-opened block is also evidence that
+    // following text is title output rather than a truncated reasoning line.
     let trimmed = raw.trim_start();
     let (raw, crossed_reasoning_boundary) = match trimmed.strip_prefix("<think>") {
         Some(rest) => match rest.split_once("</think>") {
@@ -783,8 +804,9 @@ mod tests {
 
     use super::{
         MAX_TITLE_CHARS, MAX_TITLE_PROMPT_BYTES, MAX_TITLE_TOKENS,
-        TITLE_CHAT_TEMPLATE_TOKEN_RESERVE, TitleModelManager, cap_title_model_prompt,
-        install_progress_key, sanitize_title, title_from_response, title_messages, title_request,
+        TITLE_CHAT_TEMPLATE_TOKEN_RESERVE, TITLE_PROMPT_ELISION, TITLE_RESPONSE_GRAMMAR,
+        TitleModelManager, cap_title_model_prompt, install_progress_key, sanitize_title,
+        title_from_response, title_messages, title_request,
     };
 
     #[test]
@@ -795,7 +817,10 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"], prompt);
+        assert_eq!(
+            messages[1]["content"],
+            format!("Prompt:\n<content>\n{prompt}\n</content>")
+        );
         assert!(
             !messages[0]["content"]
                 .as_str()
@@ -811,16 +836,14 @@ mod tests {
             "Fix prompt drafts between sessions"
         );
         assert_eq!(
-            sanitize_title("Fix OAuth PKCE Redirect URI Mismatch").unwrap(),
-            "Fix OAuth PKCE Redirect URI Mismatch"
+            sanitize_title("Fix OAuth PKCE Redirect Mismatch").unwrap(),
+            "Fix OAuth PKCE Redirect Mismatch"
         );
         assert!(sanitize_title("one").is_err());
+        assert!(sanitize_title("Avoid GPU contention during local session naming").is_err());
         assert_eq!(
-            sanitize_title("Avoid GPU contention during local session naming").unwrap(),
-            "Avoid GPU contention during local session naming"
-        );
-        assert!(
-            sanitize_title("Avoid GPU resource contention during local session naming").is_err()
+            sanitize_title("Avoid Local Naming GPU Contention").unwrap(),
+            "Avoid Local Naming GPU Contention"
         );
         assert!(sanitize_title("<tool_call>bad title</tool_call>").is_err());
     }
@@ -904,13 +927,13 @@ mod tests {
     }
 
     #[test]
-    fn output_budget_covers_maximum_length_non_ascii_title() {
-        let title = format!("{} {}", "\u{10000}".repeat(39), "\u{10000}".repeat(40));
+    fn output_budget_covers_maximum_length_ascii_title() {
+        let title = format!("{} {}", "x".repeat(39), "y".repeat(40));
 
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
         assert!(sanitize_title(&title).is_ok());
-        // Byte fallback needs at most one token per UTF-8 byte; the strict
-        // inequality leaves room for the model to emit its stop token.
+        // Byte fallback needs at most one token per grammar-accepted ASCII
+        // byte; the strict inequality leaves ample room for the stop token.
         assert!(MAX_TITLE_TOKENS > title.len());
     }
 
@@ -933,7 +956,10 @@ mod tests {
         let non_ascii = "\u{10000}".repeat(crate::title::MAX_PROMPT_CHARS);
         let capped = cap_title_model_prompt(&non_ascii);
         assert!(capped.len() <= MAX_TITLE_PROMPT_BYTES);
-        assert!(non_ascii.starts_with(capped));
+        assert!(capped.contains(TITLE_PROMPT_ELISION));
+        let (head, tail) = capped.split_once(TITLE_PROMPT_ELISION).unwrap();
+        assert!(non_ascii.starts_with(head));
+        assert!(non_ascii.ends_with(tail));
     }
 
     #[test]
@@ -942,6 +968,7 @@ mod tests {
 
         assert_eq!(request["max_tokens"], MAX_TITLE_TOKENS);
         assert!(request.get("stop").is_none());
+        assert_eq!(request["grammar"], TITLE_RESPONSE_GRAMMAR);
     }
 
     #[test]
