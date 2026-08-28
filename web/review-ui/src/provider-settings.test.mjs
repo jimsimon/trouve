@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  consumeCursorMigrationFocusRequest,
   cursorSdkPreset,
   providerNeedsCursorSdkMigration,
   providerSetupGroups,
@@ -51,9 +52,25 @@ test("API key inputs expose their guidance to assistive technology", () => {
   }
 });
 
-test("Cursor migration focus requests are consumed after focusing the API key", () => {
+test("Cursor migration focus is one-shot and wired to the subscription API-key input", () => {
+  let focusCount = 0;
+  const input = { focus: () => { focusCount += 1; } };
+  const cursor = { kind: "cursor-sdk", auth: "api-key" };
+  let request = consumeCursorMigrationFocusRequest(1, cursor, input);
+  assert.equal(request, 0);
+  assert.equal(focusCount, 1);
+
+  request = consumeCursorMigrationFocusRequest(request, cursor, input);
+  assert.equal(request, 0);
+  assert.equal(focusCount, 1);
+  assert.equal(
+    consumeCursorMigrationFocusRequest(1, { kind: "claude-cli", auth: "cli" }, input),
+    1,
+  );
+  assert.equal(consumeCursorMigrationFocusRequest(1, cursor, null), 1);
+  assert.equal(focusCount, 1);
   assert.match(
     providerSetupSource,
-    /input\.focus\(\);\s*setCursorMigrationFocusRequest\(0\);/u,
+    /consumeCursorMigrationFocusRequest\(\s*cursorMigrationFocusRequest,\s*selectedSubscription,\s*subscriptionApiKeyInput\.current,/u,
   );
 });

@@ -55,6 +55,7 @@ import {
   thinkingSelectionIsValid,
 } from "./model-settings";
 import {
+  consumeCursorMigrationFocusRequest,
   cursorSdkPreset,
   providerNeedsCursorSdkMigration,
   providerSetupGroups,
@@ -3797,15 +3798,13 @@ function ProviderSettings({
     (provider) => provider.id === subscriptionId,
   );
   useEffect(() => {
-    const input = subscriptionApiKeyInput.current;
-    if (
-      cursorMigrationFocusRequest > 0
-      && selectedSubscription?.kind === "cursor-sdk"
-      && selectedSubscription.auth === "api-key"
-      && input
-    ) {
-      input.focus();
-      setCursorMigrationFocusRequest(0);
+    const remainingRequest = consumeCursorMigrationFocusRequest(
+      cursorMigrationFocusRequest,
+      selectedSubscription,
+      subscriptionApiKeyInput.current,
+    );
+    if (remainingRequest !== cursorMigrationFocusRequest) {
+      setCursorMigrationFocusRequest(remainingRequest);
     }
   }, [
     cursorMigrationFocusRequest,

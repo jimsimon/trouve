@@ -2677,11 +2677,14 @@ async fn shutdown_retiring_backend_batch(
     // Poll every backend immediately under the same aggregate deadline. A
     // stalled first entry must not prevent later independent owners from
     // receiving their shutdown request and releasing their runtime leases.
-    let shutdowns = retiring.into_iter().map(|(id, backend)| async move {
-        let result = tokio::time::timeout_at(deadline, backend.shutdown()).await;
-        (id, backend, result)
-    });
-    for (id, backend, result) in futures::future::join_all(shutdowns).await {
+    let mut shutdowns = retiring
+        .into_iter()
+        .map(|(id, backend)| async move {
+            let result = tokio::time::timeout_at(deadline, backend.shutdown()).await;
+            (id, backend, result)
+        })
+        .collect::<futures::stream::FuturesUnordered<_>>();
+    while let Some((id, backend, result)) = shutdowns.next().await {
         match result {
             Ok(Ok(())) => {
                 engine.release_retiring_backend(&id, &backend);
@@ -28999,38 +29002,78 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
-    async fn retirement_starts_every_backend_shutdown_before_the_shared_deadline() {
+    async fn retirement_releases_each_backend_before_the_shared_deadline() {
         let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &Config::default(),
-        );
-        let entered = Arc::new(tokio::sync::Semaphore::new(0));
-        let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
-            entered: entered.clone(),
-            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        ));
+        let slow_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let slow_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let slow: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: slow_entered.clone(),
+            release: slow_release.clone(),
         });
-        let later = Arc::new(FailingShutdownBackend {
-            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        let fast_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let fast: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: fast_entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
         });
-        let failures = shutdown_retiring_backend_batch(
-            &engine,
-            vec![
-                ("blocking".into(), blocking),
-                ("later".into(), later.clone()),
-            ],
-            tokio::time::Instant::now() + Duration::from_millis(25),
-        )
-        .await;
+        engine
+            .retiring_backends
+            .lock()
+            .unwrap()
+            .insert("slow".into(), vec![slow.clone()]);
+        engine
+            .retiring_backends
+            .lock()
+            .unwrap()
+            .insert("fast".into(), vec![fast.clone()]);
+        let retirement = {
+            let engine = engine.clone();
+            let slow = slow.clone();
+            let fast = fast.clone();
+            tokio::spawn(async move {
+                shutdown_retiring_backend_batch(
+                    &engine,
+                    vec![("slow".into(), slow), ("fast".into(), fast)],
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+            })
+        };
+        slow_entered.acquire().await.unwrap().forget();
+        fast_entered.acquire().await.unwrap().forget();
 
-        assert_eq!(entered.available_permits(), 1);
-        assert_eq!(
-            later.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the later backend was never asked to shut down"
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if !engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .contains_key("fast")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful retirement remained buffered behind the slow backend");
+        assert!(
+            engine
+                .retiring_backends
+                .lock()
+                .unwrap()
+                .contains_key("slow")
         );
-        assert_eq!(failures.len(), 2);
+        assert_eq!(Arc::strong_count(&fast), 1);
+        assert!(!retirement.is_finished());
+
+        slow_release.add_permits(1);
+        assert!(retirement.await.unwrap().is_empty());
+        assert!(engine.retiring_backends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

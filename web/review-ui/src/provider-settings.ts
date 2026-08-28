@@ -30,6 +30,23 @@ export function cursorSdkPreset(
   return providers.find((provider) => provider.kind === "cursor-sdk");
 }
 
+export function consumeCursorMigrationFocusRequest(
+  request: number,
+  provider: Pick<KnownProvider, "kind" | "auth"> | undefined,
+  input: { focus: () => void } | null,
+): number {
+  if (
+    request <= 0
+    || provider?.kind !== "cursor-sdk"
+    || provider.auth !== "api-key"
+    || !input
+  ) {
+    return request;
+  }
+  input.focus();
+  return 0;
+}
+
 export function savedProviderMessage(
   displayName: string,
   provider: Pick<Provider, "has_credentials">,
