@@ -925,11 +925,65 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
 }
 
 export function isNonEmptyTimestamp(value) {
-  return (
-    typeof value === "string" &&
-    value.trim().length > 0 &&
-    Number.isFinite(Date.parse(value))
-  );
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/u.exec(value);
+  if (match === null) return false;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[8] === undefined ? 0 : Number(match[8]);
+  const offsetMinute = match[9] === undefined ? 0 : Number(match[9]);
+  if (
+    year === 0 ||
+    month < 1 ||
+    month > 12 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59
+  ) {
+    return false;
+  }
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day >= 1 && day <= daysInMonth[month - 1];
+}
+
+function assistantConversationText(conversation) {
+  if (!Array.isArray(conversation)) return [];
+  const text = [];
+  for (const entry of conversation) {
+    if (entry?.type !== "agentConversationTurn" || !Array.isArray(entry.turn?.steps)) {
+      continue;
+    }
+    for (const step of entry.turn.steps) {
+      if (
+        step?.type === "assistantMessage" &&
+        typeof step.message?.text === "string"
+      ) {
+        text.push(step.message.text);
+      }
+    }
+  }
+  return text;
+}
+
+export function agentMessagesContainEvidence(messages, expectedEvidence) {
+  if (!Array.isArray(messages) || typeof expectedEvidence !== "string") return false;
+  return messages.some((message) => {
+    if (message?.type !== "assistant" || !Array.isArray(message.message?.content)) {
+      return false;
+    }
+    return message.message.content.some((block) =>
+      block?.type === "text" &&
+      typeof block.text === "string" &&
+      block.text.includes(expectedEvidence));
+  });
 }
 
 export function parseConversationEvidence(conversationJson, label, expectedEvidence) {
@@ -942,12 +996,7 @@ export function parseConversationEvidence(conversationJson, label, expectedEvide
   } catch (error) {
     throw new QualificationError(`${label} returned invalid conversation JSON: ${error}`);
   }
-  const populated =
-    (Array.isArray(conversation) && conversation.length > 0) ||
-    (conversation !== null &&
-      typeof conversation === "object" &&
-      Object.keys(conversation).length > 0);
-  if (!populated || !JSON.stringify(conversation).includes(expectedEvidence)) {
+  if (!assistantConversationText(conversation).some((text) => text.includes(expectedEvidence))) {
     throw new QualificationError(`${label} omitted expected durable evidence ${expectedEvidence}`);
   }
   return conversation;
@@ -1436,12 +1485,11 @@ async function fullQualification(args) {
       { agentId, options: { limit: 20, offset: 0 } },
       timeoutMilliseconds,
     );
-    const serializedMessages = JSON.stringify(agentMessages.messages);
     if (
       !Array.isArray(agentMessages.messages) ||
       agentMessages.messages.length === 0 ||
-      !serializedMessages.includes(RESULTS.preRestartRead) ||
-      !serializedMessages.includes(RESULTS.coldResumeRead)
+      !agentMessagesContainEvidence(agentMessages.messages, RESULTS.preRestartRead) ||
+      !agentMessagesContainEvidence(agentMessages.messages, RESULTS.coldResumeRead)
     ) {
       throw new QualificationError("ListAgentMessages omitted durable pre- or post-restart evidence");
     }
