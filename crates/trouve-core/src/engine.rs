@@ -1947,7 +1947,7 @@ struct WorkspaceListCacheEntry {
 #[derive(Clone)]
 struct ReviewWorkspaceRegistrationCommit {
     workspace_id: String,
-    mutated: bool,
+    provisional: bool,
     canonical_path: PathBuf,
     generation: Arc<AtomicU64>,
     observed_generation: u64,
@@ -7841,8 +7841,17 @@ impl Engine {
         generation
     }
 
-    fn advance_workspace_registration_generation(generation: &AtomicU64) -> u64 {
-        generation.fetch_add(1, Ordering::SeqCst) + 1
+    fn advance_workspace_registration_generation(generation: &AtomicU64, provisional: bool) -> u64 {
+        let next = (generation.load(Ordering::SeqCst) & !1)
+            .checked_add(2)
+            .expect("workspace registration generation overflow")
+            | u64::from(provisional);
+        generation.store(next, Ordering::SeqCst);
+        next
+    }
+
+    fn workspace_registration_is_provisional(generation: u64) -> bool {
+        generation & 1 == 1
     }
 
     fn acquire_workspace_registration_lock<'a>(
@@ -7957,7 +7966,7 @@ impl Engine {
             WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
         );
         let (item, _mutated) = self.commit_workspace_registration(workspace, item, existing)?;
-        Self::advance_workspace_registration_generation(&generation);
+        Self::advance_workspace_registration_generation(&generation, false);
         Ok(item)
     }
 
@@ -7978,12 +7987,12 @@ impl Engine {
     ) -> Result<(), EngineError> {
         cancel.cancel();
         let committed = commit_fence.committed.lock().unwrap().clone();
-        if let Some(committed) = committed.filter(|committed| committed.mutated) {
+        if let Some(committed) = committed.filter(|committed| committed.provisional) {
             let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
             let _registration = registration_lock.lock().unwrap();
             if committed.generation.load(Ordering::SeqCst) == committed.observed_generation {
                 self.commit_workspace_close(&committed.workspace_id)?;
-                Self::advance_workspace_registration_generation(&committed.generation);
+                Self::advance_workspace_registration_generation(&committed.generation, false);
             }
         }
         Ok(())
@@ -7993,7 +8002,14 @@ impl Engine {
         &self,
         commit_fence: &ReviewWorkspaceRegistrationFence,
     ) {
-        commit_fence.committed.lock().unwrap().take();
+        let committed = commit_fence.committed.lock().unwrap().take();
+        if let Some(committed) = committed.filter(|committed| committed.provisional) {
+            let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
+            let _registration = registration_lock.lock().unwrap();
+            if committed.generation.load(Ordering::SeqCst) == committed.observed_generation {
+                Self::advance_workspace_registration_generation(&committed.generation, false);
+            }
+        }
     }
 
     fn register_review_workspace_with(
@@ -8034,11 +8050,15 @@ impl Engine {
             ));
         }
         after_cancel_check();
+        let inherited_provisional =
+            Self::workspace_registration_is_provisional(generation.load(Ordering::SeqCst));
         let (item, mutated) = self.commit_workspace_registration(workspace, item, existing)?;
-        let observed_generation = Self::advance_workspace_registration_generation(&generation);
+        let provisional = mutated || inherited_provisional;
+        let observed_generation =
+            Self::advance_workspace_registration_generation(&generation, provisional);
         *committed = Some(ReviewWorkspaceRegistrationCommit {
             workspace_id: item.id.clone(),
-            mutated,
+            provisional,
             canonical_path: canonical,
             generation,
             observed_generation,
@@ -8253,7 +8273,7 @@ impl Engine {
         let _registration =
             Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
         self.commit_workspace_close(id)?;
-        Self::advance_workspace_registration_generation(&generation);
+        Self::advance_workspace_registration_generation(&generation, false);
         Ok(())
     }
 
@@ -23136,6 +23156,67 @@ default_permission_mode = "ask"
             })
             .collect::<Vec<_>>();
         assert_eq!(lifecycle, ["registered"]);
+    }
+
+    #[test]
+    fn later_cancelled_review_inherits_workspace_compensation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first_cancel = tokio_util::sync::CancellationToken::new();
+        let first_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                None,
+                &first_cancel,
+                &first_fence,
+            )
+            .unwrap();
+        let second_cancel = tokio_util::sync::CancellationToken::new();
+        let second_fence = ReviewWorkspaceRegistrationFence::default();
+        engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                None,
+                &second_cancel,
+                &second_fence,
+            )
+            .unwrap();
+
+        engine
+            .cancel_review_workspace_registration(&first_cancel, &first_fence)
+            .unwrap();
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        engine
+            .cancel_review_workspace_registration(&second_cancel, &second_fence)
+            .unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
     }
 
     #[test]
