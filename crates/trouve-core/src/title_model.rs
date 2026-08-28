@@ -855,38 +855,78 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TROUVE_E2E=1 and a Qwen3 Q5 llama-server at TROUVE_TITLE_E2E_URL"]
+    #[ignore = "requires TROUVE_E2E=1; downloads the title model unless TROUVE_TITLE_E2E_URL is set"]
     async fn local_title_model_preserves_intent_and_subject() {
         assert_eq!(
             std::env::var("TROUVE_E2E").as_deref(),
             Ok("1"),
             "set TROUVE_E2E=1 to run local-model quality tests"
         );
-        let base_url = std::env::var("TROUVE_TITLE_E2E_URL")
-            .expect("set TROUVE_TITLE_E2E_URL to the llama-server /v1 endpoint");
-        let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let endpoint = std::env::var("TROUVE_TITLE_E2E_URL")
+            .ok()
+            .map(|base_url| format!("{}/chat/completions", base_url.trim_end_matches('/')));
         let client = reqwest::Client::new();
+        let temporary_data = (endpoint.is_none()
+            && std::env::var_os("TROUVE_TITLE_E2E_DATA_DIR").is_none())
+        .then(|| tempfile::tempdir().expect("create title-model test data directory"));
+        let managed_model = if endpoint.is_none() {
+            let data_dir = std::env::var_os("TROUVE_TITLE_E2E_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| temporary_data.as_ref().unwrap().path().to_path_buf());
+            std::fs::create_dir_all(&data_dir).expect("create title-model test data directory");
+            let local_model = Arc::new(crate::local::LlamaManager::new(&data_dir));
+            let manager = Arc::new(TitleModelManager::new(
+                data_dir,
+                TitleModelLoadBehavior::OnDemand,
+                TitleModelResourcePolicy::CpuRamOnly,
+                false,
+                &local_model,
+                crate::store::Store::open_in_memory().unwrap(),
+            ));
+            if !manager.installed() {
+                manager
+                    .install_assets(
+                        Arc::new(AtomicU8::new(0)),
+                        Arc::new(trouve_agents::install::Progress::default()),
+                        Box::new(|| {}),
+                    )
+                    .await
+                    .expect("install title-model test assets");
+            }
+            Some(manager)
+        } else {
+            None
+        };
         let cases = title_quality_cases();
         let mut generated = Vec::new();
         let mut structural_failures = Vec::new();
 
         for case in &cases {
-            let prompt = cap_title_model_prompt(&case.prompt);
-            let response = client
-                .post(&endpoint)
-                .json(&title_request(prompt.as_ref()))
-                .send()
-                .await
-                .unwrap_or_else(|error| panic!("{} request failed: {error}", case.id))
-                .error_for_status()
-                .unwrap_or_else(|error| panic!("{} request was rejected: {error}", case.id))
-                .json::<serde_json::Value>()
-                .await
-                .unwrap_or_else(|error| panic!("{} response was invalid: {error}", case.id));
-            match title_from_response(&response) {
+            let result = if let Some(endpoint) = &endpoint {
+                let prompt = cap_title_model_prompt(&case.prompt);
+                let response = client
+                    .post(endpoint)
+                    .json(&title_request(prompt.as_ref()))
+                    .send()
+                    .await
+                    .unwrap_or_else(|error| panic!("{} request failed: {error}", case.id))
+                    .error_for_status()
+                    .unwrap_or_else(|error| panic!("{} request was rejected: {error}", case.id))
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|error| panic!("{} response was invalid: {error}", case.id));
+                title_from_response(&response)
+            } else {
+                managed_model.as_ref().unwrap().generate(&case.prompt).await
+            };
+            match result {
                 Ok(title) => generated.push((case, title)),
                 Err(error) => structural_failures.push(format!("{}: {error}", case.id)),
             }
+        }
+
+        if let Some(manager) = &managed_model {
+            manager.stop().await;
         }
 
         assert!(

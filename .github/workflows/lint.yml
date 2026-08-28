@@ -176,7 +176,7 @@ jobs:
       - name: Review UI tests
         working-directory: web/review-ui
         run: npm test
-      # The test-with-model job in test.yml runs ignored tests from these two
+      # The test-with-model job in test.yml runs ignored tests from these three
       # crates, so an #[ignore]d test anywhere else would silently never run.
       # Keep them there, or widen that job's scope on purpose.
       # Matches bare #[ignore] and #[cfg_attr(..., ignore)] forms; a comment
@@ -184,7 +184,7 @@ jobs:
       # fix, unlike a silently skipped test.
       - name: Ignored tests are covered by the gated job
         run: |
-          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -vE '^crates/(trouve-search|trouve-client-core)/'; then
+          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -vE '^crates/(trouve-search|trouve-client-core|trouve-core)/'; then
             echo "Found an #[ignore]d test outside crates covered by test-with-model — update test.yml or move the test" >&2
             exit 1
           fi
