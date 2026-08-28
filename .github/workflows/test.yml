@@ -135,7 +135,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/trouve-title-e2e
-          key: ${{ runner.os }}-title-model-qwen3-1.7b-q5-k-m-v1
+          key: ${{ runner.os }}-title-model-qwen3-1.7b-q5-k-m-bartowski-v1
       - name: Model-backed end-to-end tests
         run: cargo test -p trouve-search -- --ignored
         env:
