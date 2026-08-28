@@ -187,12 +187,12 @@ describe("Trouve visual contract", () => {
     }
   });
 
-  it("keeps the established desktop navigation hierarchy and density", () => {
+  it("keeps a compact, labeled desktop navigation hierarchy", () => {
     expect(shell).not.toContain('class="brand-row"');
     expect(shell).not.toContain(">Inbox</button>");
-    const pullRequests = shell.indexOf("<strong>Pull Requests</strong>");
-    const automations = shell.indexOf("<strong>Automations</strong>");
-    const settings = shell.indexOf("<strong>Settings</strong>");
+    const pullRequests = shell.indexOf('aria-label="Pull Requests"');
+    const automations = shell.indexOf('aria-label="Automations"');
+    const settings = shell.indexOf('aria-label="Settings"');
     const workspaces = shell.indexOf("<strong>Workspaces</strong>");
     expect(pullRequests).toBeGreaterThan(-1);
     expect(pullRequests).toBeLessThan(automations);
@@ -205,7 +205,12 @@ describe("Trouve visual contract", () => {
     expect(shell).toContain("#toggleWorkspace");
     expect(shell).toContain("?hidden=\${collapsed}");
     expect(app).toContain("trouve-session-list[hidden] { display: none; }");
+    expect(shell).toContain('data-tooltip="Pull Requests"');
+    expect(app).toMatch(/\.primary-links \{[^}]*display:\s*flex/s);
     expect(app).toMatch(/\.primary-links button \{[^}]*height:\s*34px/s);
+    expect(app).toContain(".navigation-icon-button:focus-visible::after");
+    expect(app).toContain(".navigation-panel > trouve-session-usage-panel");
+    expect(app).toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*position:\s*sticky/s);
     expect(app).toMatch(/\.workspace-row \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.workspace-toggle > span \{[^}]*inset-inline-start:\s*3px/s);
     expect(app).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);

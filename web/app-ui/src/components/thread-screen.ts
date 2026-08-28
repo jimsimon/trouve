@@ -118,7 +118,6 @@ import {
   modelOptionLabel,
 } from "./model-option-controls.js";
 import {
-  modelHealthPresentation,
   modelHealthPresentations,
 } from "./model-health.js";
 import {
@@ -556,6 +555,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   });
 
   protected override willUpdate(changed: PropertyValues<this>): void {
+    const newThreadSetupWasOpen = this.#newThreadSetupOpen;
     const composerScopeChanged = changed.has("sessionId") || changed.has("threadId");
     if (composerScopeChanged) this.#persistComposerDraftNow();
     if (changed.has("workspaceId")) {
@@ -719,6 +719,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       // tail as well as clearing the persisted preference in the shell.
       this.#virtualizer.enableFollowTail();
       this.#restoredScrollThreadId = this.threadId;
+    }
+    if (newThreadSetupWasOpen && !this.#newThreadSetupOpen) {
+      this.#publishNewThreadSetupState(false);
     }
   }
 
@@ -1461,18 +1464,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const steerPending = this.#requestPending && this.#messageRequest === undefined;
     const modelControls = modelOptionControls(selectedModel, thread?.model_options);
     const modelHealth = modelHealthPresentations(models, this.#subscriptionHealth);
-    const selectedProviderId = thread?.model.split("/", 1)[0] ?? "";
-    const selectedSubscription = this.#subscriptionHealth.find(
-      (health) => health.provider_id === selectedProviderId,
-    );
-    const selectedModelHealth = selectedSubscription === undefined
-      ? undefined
-      : modelHealthPresentation(selectedSubscription);
-    const subscriptionLoading = selectedModelHealth === undefined && (
-      this.#optionCatalogKey === ""
-      || (this.#services.value !== undefined
-        && readSignal(this.#services.value.subscriptionHealth.loading))
-    );
     const contextUsage = composerContextUsage(
       view?.lastUsage,
       selectedModel?.context_window,
@@ -2097,31 +2088,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                       "Model could not be changed.",
                     )}
                   ></trouve-model-picker>
-                </div>
-                <div class="composer-option subscription-option">
-                  <span>Subscription</span>
-                  ${selectedModelHealth === undefined
-                    ? html`<div
-                        class=${`model-health-pill ${subscriptionLoading ? "loading" : "unavailable"}`}
-                        role="status"
-                        aria-busy=${subscriptionLoading ? "true" : "false"}
-                        aria-label=${subscriptionLoading
-                          ? "Loading subscription status"
-                          : "Subscription status is unavailable"}
-                      >
-                        <span class="model-health-placeholder-dot" aria-hidden="true"></span>
-                        <span>${subscriptionLoading ? "Loading…" : "Not available"}</span>
-                      </div>`
-                    : html`
-                      <div
-                        class=${`model-health-pill tone-${selectedModelHealth.tone}`}
-                        tabindex="0"
-                        title=${selectedModelHealth.detail}
-                        aria-label=${`Subscription status: ${selectedModelHealth.summary}. ${selectedModelHealth.detail}`}
-                      >
-                        <span class=${`model-health-dot tone-${selectedModelHealth.tone}`} aria-hidden="true"></span>
-                        <span>${selectedModelHealth.summary}</span>
-                      </div>`}
                 </div>
                 <label class="composer-option thinking-option">
                   <span>Thinking</span>
@@ -5811,6 +5777,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   openNewThreadSetup = (): void => {
     if (this.sessionId === "" || this.#newThreadBusy) return;
     this.#newThreadSetupOpen = true;
+    this.#publishNewThreadSetupState(true);
     this.#newThreadError = "";
     this.requestUpdate();
     void this.updateComplete.then(() => {
@@ -5824,6 +5791,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (this.threadId !== "") this.#store.value?.markThreadRead(this.threadId);
     this.#store.value?.markThreadRead(threadId);
     this.#newThreadSetupOpen = false;
+    this.#publishNewThreadSetupState(false);
     this.#newThreadError = "";
     services.router.navigate({
       kind: "session",
@@ -6095,6 +6063,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       token.createdThreadId = thread.id;
       store.upsertThread(thread);
       this.#newThreadSetupOpen = false;
+      this.#publishNewThreadSetupState(false);
       services.router.navigate({
         kind: "session",
         workspaceId: token.workspaceId,
@@ -6138,12 +6107,21 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     ) return;
     event.preventDefault();
     this.#newThreadSetupOpen = false;
+    this.#publishNewThreadSetupState(false);
     this.#newThreadError = "";
     this.requestUpdate();
     void this.updateComplete.then(() => {
       this.querySelector<HTMLButtonElement>('[aria-label="New thread"]')?.focus();
     });
   };
+
+  #publishNewThreadSetupState(open: boolean): void {
+    this.dispatchEvent(new CustomEvent("trouve-new-thread-setup-state", {
+      detail: { open },
+      bubbles: true,
+      composed: true,
+    }));
+  }
 
   #startQueueEdit(prompt: QueuedPrompt): void {
     if (

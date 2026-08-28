@@ -49,7 +49,7 @@ describe("thread screen provisional setup integration", () => {
     expect(screen).not.toContain(
       "this.#threadSettingsPending || this.#models.length === 0 || connectivityBlocked",
     );
-    expect(screen).toContain('class=${`model-health-pill ${subscriptionLoading ? "loading" : "unavailable"}`}');
+    expect(screen).not.toContain('class="composer-option subscription-option"');
   });
 
   it("keeps async new-thread defaults synchronized with native select options", () => {
