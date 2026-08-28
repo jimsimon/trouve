@@ -929,6 +929,17 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         Err("review repository diff is unavailable in this executor".into())
     }
+    /// Read one line of an immutable git object at the reviewed revision,
+    /// for anchor-quote verification. Behind the executor so this git
+    /// invocation keeps the audited chokepoint; the implementation disables
+    /// replacement-ref indirection and checks the object's size before
+    /// buffering any content.
+    async fn review_repository_object_line(
+        &self,
+        _request: &ReviewRepositoryObjectLine,
+    ) -> Result<Option<String>, String> {
+        Err("review object reads are unavailable in this executor".into())
+    }
     /// Read review diffs with optional trusted snapshot metadata. Existing
     /// executors remain compatible by supplying ordinary diff files.
     async fn review_repository_diff_with_metadata(
@@ -1051,6 +1062,16 @@ pub struct ReviewRepositoryDiff {
     pub max_files: usize,
     pub max_changed_lines: u64,
     pub max_bytes: usize,
+}
+
+pub struct ReviewRepositoryObjectLine {
+    pub managed_root: PathBuf,
+    pub worktree: PathBuf,
+    pub head_sha: String,
+    pub path: String,
+    pub line: u64,
+    pub max_bytes: usize,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 pub struct ReviewRepositoryAnchors {
@@ -3239,6 +3260,28 @@ impl ToolExecutor for LocalToolExecutor {
             return Err(format!("deleting temporary review refs: {stderr}"));
         }
         Ok(())
+    }
+
+    async fn review_repository_object_line(
+        &self,
+        request: &ReviewRepositoryObjectLine,
+    ) -> Result<Option<String>, String> {
+        validate_review_commit(&request.head_sha)?;
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let head_sha = request.head_sha.clone();
+        let path = request.path.clone();
+        let line = request.line;
+        let max_bytes = request.max_bytes;
+        let cancel = request.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Err("review object read cancelled".to_owned());
+            }
+            crate::git::review_object_line(&worktree, &head_sha, &path, line, max_bytes, &cancel)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("review object read task failed: {error}"))?
     }
 
     async fn review_repository_diff(

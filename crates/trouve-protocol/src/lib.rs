@@ -317,7 +317,11 @@ pub use requests::*;
 // an explicit `background` flag marking server-dispatched attach turns for
 // vendor-autonomous agent activity, so attach intent is trusted dispatch
 // metadata rather than prompt-content inference (additive).
-pub const PROTOCOL_VERSION: &str = "7.19";
+// 7.20: finding evidence carries the coordinator's verification record —
+// anchor quote with a server-derived match verdict, execution-path
+// verification grade, and counterexample search — from which finding
+// confidence is now derived (additive).
+pub const PROTOCOL_VERSION: &str = "7.20";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.19"
+    "version": "7.20"
   },
   "paths": {
     "/v1/approvals": {
@@ -5758,11 +5758,27 @@
         "type": "object",
         "description": "Concrete evidence that makes a confirmed finding independently verifiable.",
         "properties": {
+          "anchor_match": {
+            "type": "string",
+            "description": "Server-derived verdict for `anchor_quote`: `matched`, `mismatched`,\nor `unchecked`. Model-provided values are overwritten."
+          },
+          "anchor_quote": {
+            "type": "string",
+            "description": "Verbatim source line at the finding's anchor, quoted by the\ncoordinator while verifying the finding. Mechanically matched against\nthe reviewed revision; empty when the anchor was never verified."
+          },
           "consequence": {
             "type": "string"
           },
+          "counterexample_search": {
+            "type": "string",
+            "description": "The refuting guard, caller, or test the coordinator searched for to\ndisprove the finding, and what it found. Empty when no refutation was\nattempted."
+          },
           "execution_path": {
             "type": "string"
+          },
+          "execution_path_verification": {
+            "type": "string",
+            "description": "The coordinator's grade of how much of `execution_path` it verified\nagainst the repository: `verified`, `partial`, or `unverified`."
           },
           "introduction": {
             "type": "string"

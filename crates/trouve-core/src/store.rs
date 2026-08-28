@@ -23243,6 +23243,7 @@ mod tests {
                         consequence: "the failure is silently ignored".into(),
                         introduction: "the new handler drops the result".into(),
                         regression_test: "assert that the failure is returned".into(),
+                        ..Default::default()
                     },
                     origin: trouve_protocol::CodeReviewFindingOrigin::NewChange,
                     theme_ids: vec!["rvth-test".into()],

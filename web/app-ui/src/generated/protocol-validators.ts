@@ -1909,7 +1909,7 @@ validate112.evaluated = {"props":{"reviewer":true,"state":true},"dynamicProps":f
 
 const schema49 = {"type":"object","description":"A review produced by trouve's first-party review service. The marker is\njoined from durable job/finding records rather than inferred from an\nuntrusted comment author or body.","required":["job_id","bot_login","status","summary","prompt_for_agents","review_url"],"properties":{"bot_login":{"type":"string"},"findings":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFinding"}},"job_id":{"type":"string"},"prompt_for_agents":{"type":"string"},"review_url":{"type":"string"},"status":{"type":"string"},"summary":{"type":"string"},"themes":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewTheme"}}}};
 const schema50 = {"type":"object","description":"A confirmed issue produced by the coordinator. Findings on commentable\ndiff lines are published as inline GitHub review comments; findings whose\nstrongest valid anchor is unchanged code are published in the review body.","required":["id","job_id","path","line","side","severity","title","body","status"],"properties":{"body":{"type":"string"},"confidence":{"type":"string","description":"Strength of the evidence for the issue, independently of impact.\n`high`, `medium`, or `low`; legacy records default to `medium`."},"evidence":{"$ref":"#/components/schemas/CodeReviewFindingEvidence"},"github_comment_id":{"type":["integer","null"],"format":"int64","minimum":0},"github_comment_url":{"type":"string"},"github_publication_status":{"$ref":"#/components/schemas/CodeReviewFindingPublicationStatus"},"github_thread_id":{"type":["string","null"]},"id":{"type":"string"},"job_id":{"type":"string"},"line":{"type":"integer","format":"int64","minimum":0},"observed_head":{"type":"string","description":"Immutable PR head on which this finding was first observed."},"origin":{"$ref":"#/components/schemas/CodeReviewFindingOrigin"},"outside_diff":{"type":"boolean","description":"The finding is anchored to a head-revision line that GitHub cannot\nrepresent as an inline pull-request diff comment."},"path":{"type":"string"},"prompt_for_agents":{"type":"string"},"resolved_at":{"type":["string","null"],"format":"date-time"},"resolved_by_job_id":{"type":"string","description":"Review job that demonstrated the fix, for exact fix-diff reconstruction."},"resolved_head":{"type":"string","description":"Immutable PR head whose review demonstrated that the finding was fixed."},"severity":{"type":"string"},"side":{"type":"string"},"sources":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewFindingSource"}},"status":{"type":"string","description":"`open`, `fixed`, or `dismissed`."},"theme_ids":{"type":"array","items":{"type":"string"}},"title":{"type":"string","description":"Concise, generated one-line summary of the issue."}}};
-const schema51 = {"type":"object","description":"Concrete evidence that makes a confirmed finding independently verifiable.","properties":{"consequence":{"type":"string"},"execution_path":{"type":"string"},"introduction":{"type":"string"},"preconditions":{"type":"string"},"regression_test":{"type":"string"}}};
+const schema51 = {"type":"object","description":"Concrete evidence that makes a confirmed finding independently verifiable.","properties":{"anchor_match":{"type":"string","description":"Server-derived verdict for `anchor_quote`: `matched`, `mismatched`,\nor `unchecked`. Model-provided values are overwritten."},"anchor_quote":{"type":"string","description":"Verbatim source line at the finding's anchor, quoted by the\ncoordinator while verifying the finding. Mechanically matched against\nthe reviewed revision; empty when the anchor was never verified."},"consequence":{"type":"string"},"counterexample_search":{"type":"string","description":"The refuting guard, caller, or test the coordinator searched for to\ndisprove the finding, and what it found. Empty when no refutation was\nattempted."},"execution_path":{"type":"string"},"execution_path_verification":{"type":"string","description":"The coordinator's grade of how much of `execution_path` it verified\nagainst the repository: `verified`, `partial`, or `unverified`."},"introduction":{"type":"string"},"preconditions":{"type":"string"},"regression_test":{"type":"string"}}};
 
 function validate116(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -1923,10 +1923,10 @@ evaluated0.items = undefined;
 }
 if(errors === 0){
 if(data && typeof data == "object" && !Array.isArray(data)){
-if(data.consequence !== undefined){
+if(data.anchor_match !== undefined){
 const _errs1 = errors;
-if(typeof data.consequence !== "string"){
-validate116.errors = [{instancePath:instancePath+"/consequence",schemaPath:"#/properties/consequence/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.anchor_match !== "string"){
+validate116.errors = [{instancePath:instancePath+"/anchor_match",schemaPath:"#/properties/anchor_match/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs1 === errors;
@@ -1935,10 +1935,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.execution_path !== undefined){
+if(data.anchor_quote !== undefined){
 const _errs3 = errors;
-if(typeof data.execution_path !== "string"){
-validate116.errors = [{instancePath:instancePath+"/execution_path",schemaPath:"#/properties/execution_path/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.anchor_quote !== "string"){
+validate116.errors = [{instancePath:instancePath+"/anchor_quote",schemaPath:"#/properties/anchor_quote/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs3 === errors;
@@ -1947,10 +1947,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.introduction !== undefined){
+if(data.consequence !== undefined){
 const _errs5 = errors;
-if(typeof data.introduction !== "string"){
-validate116.errors = [{instancePath:instancePath+"/introduction",schemaPath:"#/properties/introduction/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.consequence !== "string"){
+validate116.errors = [{instancePath:instancePath+"/consequence",schemaPath:"#/properties/consequence/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs5 === errors;
@@ -1959,10 +1959,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.preconditions !== undefined){
+if(data.counterexample_search !== undefined){
 const _errs7 = errors;
-if(typeof data.preconditions !== "string"){
-validate116.errors = [{instancePath:instancePath+"/preconditions",schemaPath:"#/properties/preconditions/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.counterexample_search !== "string"){
+validate116.errors = [{instancePath:instancePath+"/counterexample_search",schemaPath:"#/properties/counterexample_search/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs7 === errors;
@@ -1971,16 +1971,68 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.regression_test !== undefined){
+if(data.execution_path !== undefined){
 const _errs9 = errors;
-if(typeof data.regression_test !== "string"){
-validate116.errors = [{instancePath:instancePath+"/regression_test",schemaPath:"#/properties/regression_test/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.execution_path !== "string"){
+validate116.errors = [{instancePath:instancePath+"/execution_path",schemaPath:"#/properties/execution_path/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs9 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.execution_path_verification !== undefined){
+const _errs11 = errors;
+if(typeof data.execution_path_verification !== "string"){
+validate116.errors = [{instancePath:instancePath+"/execution_path_verification",schemaPath:"#/properties/execution_path_verification/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs11 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.introduction !== undefined){
+const _errs13 = errors;
+if(typeof data.introduction !== "string"){
+validate116.errors = [{instancePath:instancePath+"/introduction",schemaPath:"#/properties/introduction/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs13 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.preconditions !== undefined){
+const _errs15 = errors;
+if(typeof data.preconditions !== "string"){
+validate116.errors = [{instancePath:instancePath+"/preconditions",schemaPath:"#/properties/preconditions/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs15 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.regression_test !== undefined){
+const _errs17 = errors;
+if(typeof data.regression_test !== "string"){
+validate116.errors = [{instancePath:instancePath+"/regression_test",schemaPath:"#/properties/regression_test/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs17 === errors;
+}
+else {
+var valid0 = true;
+}
+}
+}
+}
 }
 }
 }
@@ -1995,7 +2047,7 @@ return false;
 validate116.errors = vErrors;
 return errors === 0;
 }
-validate116.evaluated = {"props":{"consequence":true,"execution_path":true,"introduction":true,"preconditions":true,"regression_test":true},"dynamicProps":false,"dynamicItems":false};
+validate116.evaluated = {"props":{"anchor_match":true,"anchor_quote":true,"consequence":true,"counterexample_search":true,"execution_path":true,"execution_path_verification":true,"introduction":true,"preconditions":true,"regression_test":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema52 = {"type":"string","description":"The outcome of attempting to publish a finding as an inline GitHub comment.","enum":["pending","published","not_eligible","suppressed_by_policy","grouped_by_theme","failed"]};
 
