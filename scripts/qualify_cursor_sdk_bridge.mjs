@@ -679,6 +679,18 @@ function terminateProcessTree(child) {
   if (existing !== undefined) return existing;
   const termination = terminateProcessTreeOnce(child);
   PROCESS_TREE_TERMINATIONS.set(child, termination);
+  void termination.catch(() => {
+    // Retry a transient failure only while this ChildProcess still identifies
+    // the original group leader. Once the leader exits, retaining the failed
+    // attempt avoids signalling a recycled POSIX process-group id.
+    if (
+      child.exitCode === null &&
+      child.signalCode === null &&
+      PROCESS_TREE_TERMINATIONS.get(child) === termination
+    ) {
+      PROCESS_TREE_TERMINATIONS.delete(child);
+    }
+  });
   return termination;
 }
 

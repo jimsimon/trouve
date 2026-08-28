@@ -45,6 +45,7 @@ import {
 } from "./qualify_cursor_sdk_bridge.mjs";
 import {
   RED_PIXEL_PNG,
+  agentMessagesContainEvidence,
   createCallbackAdmission,
   inspectToolCalls,
   isNonEmptyTimestamp,
@@ -158,19 +159,39 @@ test("red-pixel fixture is a one-pixel RGBA PNG with an opaque red scanline", ()
 
 test("subscription-health billing cycles require a real timestamp", () => {
   assert.equal(isNonEmptyTimestamp("2026-08-27T12:00:00Z"), true);
-  for (const value of [undefined, null, "", "not-a-date", 123]) {
+  assert.equal(isNonEmptyTimestamp("2024-02-29T23:59:59.123456+05:30"), true);
+  for (const value of [
+    undefined,
+    null,
+    "",
+    "0",
+    "not-a-date",
+    "2026-08-27",
+    "2026-02-29T12:00:00Z",
+    "2026-04-31T12:00:00Z",
+    "2026-08-27T24:00:00Z",
+    "2026-08-27T12:00:00+24:00",
+    123,
+  ]) {
     assert.equal(isNonEmptyTimestamp(value), false);
   }
 });
 
 test("cold-resume conversations require populated run-specific evidence", () => {
+  const evidence = "TROUVE_CURSOR_PRE_RESTART_OK";
+  const conversation = [{
+    type: "agentConversationTurn",
+    turn: {
+      steps: [{ type: "assistantMessage", message: { text: evidence } }],
+    },
+  }];
   assert.deepEqual(
     parseConversationEvidence(
-      JSON.stringify({ messages: [{ text: "TROUVE_CURSOR_PRE_RESTART_OK" }] }),
+      JSON.stringify(conversation),
       "historical conversation",
-      "TROUVE_CURSOR_PRE_RESTART_OK",
+      evidence,
     ),
-    { messages: [{ text: "TROUVE_CURSOR_PRE_RESTART_OK" }] },
+    conversation,
   );
   assert.throws(
     () => parseConversationEvidence("[]", "historical conversation", "expected"),
@@ -180,6 +201,46 @@ test("cold-resume conversations require populated run-specific evidence", () => 
     () => parseConversationEvidence('{"messages":[]}', "historical conversation", "expected"),
     /omitted expected durable evidence/u,
   );
+  for (const misplaced of [
+    [{ metadata: evidence }],
+    [{
+      type: "agentConversationTurn",
+      turn: { steps: [{ type: "toolCall", message: { result: evidence } }] },
+    }],
+    [{
+      type: "agentConversationTurn",
+      turn: { steps: [{ type: "thinkingMessage", message: { text: evidence } }] },
+    }],
+  ]) {
+    assert.throws(
+      () => parseConversationEvidence(
+        JSON.stringify(misplaced),
+        "historical conversation",
+        evidence,
+      ),
+      /omitted expected durable evidence/u,
+    );
+  }
+});
+
+test("agent message evidence must be assistant text content", () => {
+  const evidence = "TROUVE_CURSOR_COLD_RESUME_OK";
+  assert.equal(agentMessagesContainEvidence([{
+    type: "assistant",
+    uuid: "assistant-1",
+    agentId: "agent-1",
+    message: { content: [{ type: "text", text: evidence }] },
+  }], evidence), true);
+  for (const messages of [
+    [{ type: "assistant", metadata: evidence, message: { content: [] } }],
+    [{
+      type: "assistant",
+      message: { content: [{ type: "tool_result", content: evidence }] },
+    }],
+    [{ type: "user", message: { content: [{ type: "text", text: evidence }] } }],
+  ]) {
+    assert.equal(agentMessagesContainEvidence(messages, evidence), false);
+  }
 });
 
 test("allowlist qualification accepts only a correlated invalid-argument error", () => {
@@ -718,6 +779,51 @@ test(
     assert.equal(terminateProcessTree(child), termination);
     await termination;
     assert.equal(terminateProcessTree(child), termination);
+  },
+);
+
+test(
+  "failed process-tree cleanup can retry while the original leader is active",
+  { skip: process.platform === "win32", concurrency: false },
+  async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    await new Promise((accept, reject) => {
+      child.once("spawn", accept);
+      child.once("error", reject);
+    });
+
+    const originalKill = process.kill;
+    let injected = false;
+    try {
+      process.kill = (pid, signal) => {
+        if (!injected && pid === -child.pid && signal === "SIGTERM") {
+          injected = true;
+          const error = new Error("injected process-group signal failure");
+          error.code = "EPERM";
+          throw error;
+        }
+        return originalKill(pid, signal);
+      };
+      const failed = terminateProcessTree(child);
+      await assert.rejects(failed, /injected process-group signal failure/u);
+      process.kill = originalKill;
+
+      const retry = terminateProcessTree(child);
+      assert.notEqual(retry, failed);
+      await retry;
+      assert.equal(terminateProcessTree(child), retry);
+    } finally {
+      process.kill = originalKill;
+      try {
+        originalKill(-child.pid, "SIGKILL");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+      await waitForChildSettlement(child, 1_000);
+    }
   },
 );
 
