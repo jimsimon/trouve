@@ -405,9 +405,34 @@ pub struct CodeReviewRuntime {
 
 #[derive(Default)]
 struct ThreadWebhookDispatch {
-    queue: HashMap<(String, u64), CodeReviewRepository>,
+    queue: HashMap<(String, u64), ThreadWebhookEntry>,
     running: bool,
 }
+
+#[derive(Clone)]
+struct ThreadWebhookEntry {
+    repository: CodeReviewRepository,
+    /// Failed processing attempts so far. Fresh deliveries reset this to
+    /// zero; failure requeues carry it forward so a persistently failing
+    /// pull retries a bounded number of times before the rotating poll
+    /// takes over as the heal path.
+    attempts: u32,
+}
+
+/// Webhook-side retries per priority key before the rotation takes over.
+const THREAD_WEBHOOK_MAX_ATTEMPTS: u32 = 3;
+
+/// One drained dispatcher batch: the repository and its queued priority
+/// keys with their carried attempt counts.
+type ThreadWebhookBatch = (CodeReviewRepository, HashMap<(String, u64), u32>);
+
+/// One reconciliation walk's result: the keys it completed, the keys whose
+/// per-candidate reconciliation failed, and the pass's first error.
+type ThreadWalkOutcome = (
+    HashSet<(String, u64)>,
+    HashSet<(String, u64)>,
+    Option<anyhow::Error>,
+);
 
 struct ReviewOutboxRetryState {
     failures: u32,
@@ -592,10 +617,32 @@ fn enqueue_thread_webhook_key(
     key: (String, u64),
     repository: CodeReviewRepository,
 ) -> bool {
+    enqueue_thread_webhook_entry(
+        dispatch,
+        key,
+        ThreadWebhookEntry {
+            repository,
+            attempts: 0,
+        },
+    )
+}
+
+fn enqueue_thread_webhook_entry(
+    dispatch: &Mutex<ThreadWebhookDispatch>,
+    key: (String, u64),
+    entry: ThreadWebhookEntry,
+) -> bool {
     let mut dispatch = dispatch
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    dispatch.queue.insert(key, repository);
+    // A fresh delivery resets a failure-requeued entry's attempt count: the
+    // maintainer acted again, so the key earns a fresh retry budget.
+    match dispatch.queue.get(&key) {
+        Some(queued) if queued.attempts < entry.attempts => {}
+        _ => {
+            dispatch.queue.insert(key, entry);
+        }
+    }
     if dispatch.running {
         false
     } else {
@@ -610,11 +657,16 @@ fn enqueue_thread_webhook_key(
 /// only when the queue is empty.
 fn next_thread_webhook_batch(
     dispatch: &Mutex<ThreadWebhookDispatch>,
-) -> Option<(CodeReviewRepository, HashSet<(String, u64)>)> {
+) -> Option<ThreadWebhookBatch> {
     let mut dispatch = dispatch
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(repository) = dispatch.queue.values().next().cloned() else {
+    let Some(repository) = dispatch
+        .queue
+        .values()
+        .next()
+        .map(|entry| entry.repository.clone())
+    else {
         dispatch.running = false;
         return None;
     };
@@ -622,29 +674,42 @@ fn next_thread_webhook_batch(
         .queue
         .iter()
         .filter(|(_, queued)| {
-            queued.repository == repository.repository
-                && queued.installation_id == repository.installation_id
+            queued.repository.repository == repository.repository
+                && queued.repository.installation_id == repository.installation_id
         })
-        .map(|(key, _)| key.clone())
-        .collect::<HashSet<_>>();
-    for key in &keys {
+        .map(|(key, entry)| (key.clone(), entry.attempts))
+        .collect::<HashMap<_, _>>();
+    for key in keys.keys() {
         dispatch.queue.remove(key);
     }
     Some((repository, keys))
 }
 
-/// Priority keys to requeue after a webhook walk: those the poll still
-/// tracks but the bounded walk never reached. Keys absent from the poll's
-/// candidates — closed, draft-filtered, or otherwise untracked pulls — are
-/// dropped: they can never be attempted, so requeueing them would spin the
-/// worker forever.
+/// Priority keys to requeue after a webhook walk, with their carried
+/// attempt counts. Keys the poll no longer tracks — closed, draft-filtered,
+/// or otherwise untracked pulls — are dropped (requeueing them would spin
+/// the worker forever), as are keys that completed. Keys the bounded walk
+/// deferred requeue with their budget intact; keys whose reconciliation
+/// failed consume one bounded attempt, after which the rotating poll takes
+/// over as the heal path.
 fn requeue_after_thread_walk(
-    keys: HashSet<(String, u64)>,
+    keys: HashMap<(String, u64), u32>,
     known: &HashSet<(String, u64)>,
     attempted: &HashSet<(String, u64)>,
-) -> Vec<(String, u64)> {
+    failed: &HashSet<(String, u64)>,
+) -> Vec<((String, u64), u32)> {
     keys.into_iter()
-        .filter(|key| known.contains(key) && !attempted.contains(key))
+        .filter_map(|(key, attempts)| {
+            if !known.contains(&key) || attempted.contains(&key) {
+                return None;
+            }
+            if failed.contains(&key) {
+                let attempts = attempts.saturating_add(1);
+                (attempts < THREAD_WEBHOOK_MAX_ATTEMPTS).then_some((key, attempts))
+            } else {
+                Some((key, attempts))
+            }
+        })
         .collect()
 }
 
@@ -3617,7 +3682,7 @@ impl Engine {
             .lock()
             .unwrap()
             .retain(|key, _| active_reconciliation_keys.contains(key));
-        let (_, reconcile_error) = self
+        let (_, _, reconcile_error) = self
             .reconcile_oldest_review_thread_candidate(&reconciliation_candidates, &HashSet::new())
             .await;
         if let Some(error) = reconcile_error {
@@ -3904,18 +3969,19 @@ impl Engine {
         Ok(had_errors)
     }
 
-    /// Returns the candidate keys this pass attempted (reconciled, found
-    /// current, or failed definitively) alongside the pass's first error, if
-    /// any. Keys absent from the set were never reached — the deadline
-    /// expired, credentials timed out, or the walk stopped after completing
-    /// a pull — and a caller holding webhook priorities must requeue them
-    /// whether or not the pass also erred.
+    /// Returns the candidate keys this pass completed (reconciled or found
+    /// current), the keys whose per-candidate reconciliation failed, and the
+    /// pass's first error, if any. Keys in neither set were never reached —
+    /// the deadline expired, credentials timed out, or the walk stopped
+    /// after completing a pull — and a caller holding webhook priorities
+    /// must requeue them; failed keys retry on a bounded budget.
     async fn reconcile_oldest_review_thread_candidate(
         &self,
         candidates: &[ReviewReconciliationCandidate],
         priority: &HashSet<(String, u64)>,
-    ) -> (HashSet<(String, u64)>, Option<anyhow::Error>) {
+    ) -> ThreadWalkOutcome {
         let mut attempted = HashSet::new();
+        let mut failed = HashSet::new();
         let deadline = Instant::now() + REVIEW_RECONCILIATION_PASS_BUDGET;
         let progress_keys = self
             .code_review
@@ -3953,7 +4019,7 @@ impl Engine {
             {
                 Ok(Ok(api)) => api,
                 Ok(Err(error)) => {
-                    attempted.insert(key.clone());
+                    failed.insert(key.clone());
                     self.code_review
                         .thread_reconciled_at
                         .lock()
@@ -4021,7 +4087,7 @@ impl Engine {
                                     || progress_key.pull_number != key.1
                             });
                     }
-                    attempted.insert(key.clone());
+                    failed.insert(key.clone());
                     self.code_review
                         .thread_reconciled_at
                         .lock()
@@ -4046,7 +4112,7 @@ impl Engine {
                 break;
             }
         }
-        (attempted, first_error)
+        (attempted, failed, first_error)
     }
 
     fn supersede_automatic_code_reviews_for_draft(
@@ -4386,56 +4452,93 @@ impl Engine {
                         while let Some((repository, keys)) =
                             next_thread_webhook_batch(&engine.code_review.thread_webhook_dispatch)
                         {
-                            let _guard = engine.code_review.reconcile_lock.lock().await;
-                            let mut reconciliation_candidates = Vec::new();
-                            if let Err(error) = engine
-                                .poll_code_review_repository(
-                                    &repository,
-                                    &mut reconciliation_candidates,
-                                )
-                                .await
-                            {
-                                engine.record_review_error(format!(
-                                    "webhook reconciliation failed: {error:#}"
-                                ));
-                            } else {
-                                let (attempted, reconcile_error) = engine
-                                    .reconcile_oldest_review_thread_candidate(
-                                        &reconciliation_candidates,
-                                        &keys,
+                            // All reconciliation work happens inside the
+                            // lock scope; requeueing and retry pacing happen
+                            // after it drops, so a failing repository never
+                            // stalls the poll loop or other webhook work.
+                            let priority = keys.keys().cloned().collect::<HashSet<_>>();
+                            let outcome = {
+                                let _guard = engine.code_review.reconcile_lock.lock().await;
+                                let mut reconciliation_candidates = Vec::new();
+                                match engine
+                                    .poll_code_review_repository(
+                                        &repository,
+                                        &mut reconciliation_candidates,
                                     )
-                                    .await;
-                                // The bounded walk stops after completing
-                                // one pull (or at the deadline); prioritized
-                                // pulls it never reached go back into the
-                                // queue for the next batch instead of
-                                // dropping their events — including when
-                                // the pass also erred, since a failed key
-                                // counts as attempted and unrelated
-                                // deferred keys must not pay for it. Only
-                                // pulls the poll still tracks requeue — a
-                                // closed or filtered pull can never be
-                                // attempted.
-                                let known = reconciliation_candidates
-                                    .iter()
-                                    .map(ReviewReconciliationCandidate::key)
-                                    .collect::<HashSet<_>>();
-                                for key in requeue_after_thread_walk(keys, &known, &attempted) {
-                                    enqueue_thread_webhook_key(
-                                        &engine.code_review.thread_webhook_dispatch,
-                                        key,
-                                        repository.clone(),
-                                    );
+                                    .await
+                                {
+                                    Err(error) => Err(error),
+                                    Ok(_) => {
+                                        let (attempted, failed, error) = engine
+                                            .reconcile_oldest_review_thread_candidate(
+                                                &reconciliation_candidates,
+                                                &priority,
+                                            )
+                                            .await;
+                                        let known = reconciliation_candidates
+                                            .iter()
+                                            .map(ReviewReconciliationCandidate::key)
+                                            .collect::<HashSet<_>>();
+                                        Ok((known, attempted, failed, error))
+                                    }
                                 }
-                                if let Some(error) = reconcile_error {
+                            };
+                            let erred = match outcome {
+                                Err(error) => {
                                     engine.record_review_error(format!(
-                                        "webhook thread reconciliation failed: {error:#}"
+                                        "webhook reconciliation failed: {error:#}"
                                     ));
-                                    // Pace error batches so a failing
-                                    // repository retries at a bounded rate
-                                    // instead of hot-looping the worker.
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    // The poll itself failed, so nothing is
+                                    // known about any key: every one retries
+                                    // on its bounded budget rather than
+                                    // silently falling back to the rotation.
+                                    for (key, attempts) in keys {
+                                        let attempts = attempts.saturating_add(1);
+                                        if attempts < THREAD_WEBHOOK_MAX_ATTEMPTS {
+                                            enqueue_thread_webhook_entry(
+                                                &engine.code_review.thread_webhook_dispatch,
+                                                key,
+                                                ThreadWebhookEntry {
+                                                    repository: repository.clone(),
+                                                    attempts,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    true
                                 }
+                                Ok((known, attempted, failed, error)) => {
+                                    // Deferred pulls keep their retry
+                                    // budget; failed pulls consume one;
+                                    // pulls the poll no longer tracks drop.
+                                    for (key, attempts) in
+                                        requeue_after_thread_walk(keys, &known, &attempted, &failed)
+                                    {
+                                        enqueue_thread_webhook_entry(
+                                            &engine.code_review.thread_webhook_dispatch,
+                                            key,
+                                            ThreadWebhookEntry {
+                                                repository: repository.clone(),
+                                                attempts,
+                                            },
+                                        );
+                                    }
+                                    if let Some(error) = error {
+                                        engine.record_review_error(format!(
+                                            "webhook thread reconciliation failed: {error:#}"
+                                        ));
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                            };
+                            if erred {
+                                // Pace retry batches with the lock released,
+                                // so a failing repository retries at a
+                                // bounded rate without holding up the
+                                // reconciliation critical section.
+                                tokio::time::sleep(Duration::from_secs(5)).await;
                             }
                         }
                         slot.armed = false;
@@ -4483,7 +4586,7 @@ impl Engine {
                 {
                     engine.record_review_error(format!("webhook reconciliation failed: {error:#}"));
                 } else {
-                    let (_, reconcile_error) = engine
+                    let (_, _, reconcile_error) = engine
                         .reconcile_oldest_review_thread_candidate(
                             &reconciliation_candidates,
                             &HashSet::new(),
@@ -25685,16 +25788,25 @@ mod tests {
     #[test]
     fn only_tracked_unattempted_pulls_requeue_after_a_walk() {
         let key = |pull: u64| ("acme/widgets".to_owned(), pull);
-        let keys = HashSet::from([key(1), key(2), key(3)]);
-        // 1 was attempted, 2 is tracked but deferred by the bounded walk,
-        // and 3 vanished from the poll (closed or filtered): only 2
-        // requeues — requeueing 3 would spin the worker forever.
-        let known = HashSet::from([key(1), key(2)]);
+        // 1 completed, 2 is tracked but deferred by the bounded walk, 3
+        // vanished from the poll (closed or filtered), 4 failed with budget
+        // left, and 5 failed on its final attempt: 2 requeues with its
+        // budget intact, 4 requeues one attempt down, 3 and 5 drop —
+        // requeueing 3 would spin the worker, and 5 hands off to the poll
+        // rotation.
+        let keys = HashMap::from([
+            (key(1), 0),
+            (key(2), 1),
+            (key(3), 0),
+            (key(4), 0),
+            (key(5), THREAD_WEBHOOK_MAX_ATTEMPTS - 1),
+        ]);
+        let known = HashSet::from([key(1), key(2), key(4), key(5)]);
         let attempted = HashSet::from([key(1)]);
-        assert_eq!(
-            requeue_after_thread_walk(keys, &known, &attempted),
-            vec![key(2)]
-        );
+        let failed = HashSet::from([key(4), key(5)]);
+        let mut requeued = requeue_after_thread_walk(keys, &known, &attempted, &failed);
+        requeued.sort();
+        assert_eq!(requeued, vec![(key(2), 1), (key(4), 1)]);
     }
 
     #[test]
