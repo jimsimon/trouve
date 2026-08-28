@@ -12268,11 +12268,19 @@ impl Store {
                AND j.review_published = 1
                AND f.github_comment_id IS NULL
                AND f.status IN ('open', 'dismissed')
-               AND f.id LIKE ?3 || '%'",
+               AND f.id LIKE ?3 || '%' ESCAPE '\\'",
         )?;
+        // The command parser only admits `rvf_` plus hex, but this is a
+        // public store method and the prefix is untrusted comment text:
+        // neutralize LIKE metacharacters so a prefix can never
+        // wildcard-match a finding the maintainer did not name.
+        let escaped_prefix = finding_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let matches = stmt
             .query_map(
-                params![repository, pull_number as i64, finding_prefix],
+                params![repository, pull_number as i64, escaped_prefix],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -20068,6 +20076,54 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "an expired no-op is consumed"
+        );
+
+        // LIKE metacharacters in the prefix are data, not wildcards: a
+        // prefix whose hex region holds `_` must not match the finding
+        // whose real id differs at that position.
+        let mut wildcard = target[..10].to_string();
+        wildcard.replace_range(6..7, "_");
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&wildcard, true), "reason — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::NotFound));
+
+        // Exclusive consumption: a stale snapshot of an already-consumed
+        // command must not evaluate or reverse a newer opposite decision.
+        let mut durable = command(&target, true);
+        durable.trigger_key = "command:comment:200".into();
+        durable.created_at = chrono::Utc::now().to_rfc3339();
+        store
+            .claim_github_webhook_delivery("delivery-consumed-1", None, Some(&durable))
+            .unwrap();
+        let claimed = store
+            .pending_threadless_commands("acme/widgets")
+            .unwrap()
+            .into_iter()
+            .find(|pending| pending.trigger_key == durable.trigger_key)
+            .unwrap();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&claimed, "first — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::Applied { .. }));
+        store
+            .apply_threadless_resolve_command(&command(&target, false), "", None)
+            .unwrap();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&claimed, "replay — @jim", None)
+            .unwrap();
+        assert_eq!(outcome, ThreadlessCommandOutcome::AlreadyConsumed);
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "open",
+            "a consumed command must not reverse the newer decision"
         );
     }
 
