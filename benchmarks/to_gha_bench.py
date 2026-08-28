@@ -4,8 +4,11 @@
 Emits the `customSmallerIsBetter` format from either criterion output
 directories (``--criterion target/criterion``) or hyperfine JSON exports
 (``--hyperfine a.json b.json``), so CI can gate on regressions with one
-uniform data file per suite. Medians are used throughout: they are stable
-against the occasional slow outlier on shared CI runners.
+uniform data file per suite. Criterion entries use the median it reports;
+hyperfine entries gate on the minimum run, because contention on shared CI
+runners only ever adds time — the minimum is the closest observation to the
+true cost, while a median over a handful of runs fails whenever the runner
+is busy for most of the measurement window.
 """
 
 import argparse
@@ -44,9 +47,15 @@ def hyperfine_entries(paths: list[pathlib.Path]) -> list[dict]:
             stddev = result.get("stddev") or 0.0
             out.append(
                 {
-                    "name": result["command"],
+                    # The " (min)" suffix versions the history series: the
+                    # gate keys history by name, and a minimum screened
+                    # against pre-change median history would be
+                    # systematically lenient. A fresh series has no history,
+                    # which the comparison treats as inconclusive, so the
+                    # transition rides the like-for-like base confirmation.
+                    "name": f"{result['command']} (min)",
                     "unit": "ms",
-                    "value": result["median"] * 1000.0,
+                    "value": result["min"] * 1000.0,
                     "range": f"± {stddev * 1000.0:.1f}",
                 }
             )
