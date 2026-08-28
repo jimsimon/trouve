@@ -984,38 +984,9 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
         "1",
         "two turns on one Trouve thread should reuse one Bridge process"
     );
-    assert_eq!(
-        std::fs::read_to_string(format!("{stub}.callback-updates"))
-            .unwrap()
-            .trim(),
-        "4",
-        "each turn should register and then clear its callback"
-    );
-    let callback_history: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{stub}.callback-history.json")).unwrap(),
-    )
-    .unwrap();
-    let callback_history = callback_history.as_array().unwrap();
-    assert_eq!(callback_history.len(), 4);
-    assert!(!callback_history[0]["url"].as_str().unwrap().is_empty());
     assert!(
-        !callback_history[0]["authToken"]
-            .as_str()
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        callback_history[1],
-        serde_json::json!({ "url": "", "authToken": "" })
-    );
-    assert!(!callback_history[2]["url"].as_str().unwrap().is_empty());
-    assert_ne!(
-        callback_history[0]["authToken"], callback_history[2]["authToken"],
-        "a reused Bridge must receive a fresh callback bearer for each turn"
-    );
-    assert_eq!(
-        callback_history[3],
-        serde_json::json!({ "url": "", "authToken": "" })
+        !Path::new(&format!("{stub}.callback-updates")).exists(),
+        "the shared callback endpoint should be registered once at process startup"
     );
     assert_eq!(calls.lock().await.len(), 1);
     backend.shutdown().await.unwrap();
@@ -1028,7 +999,7 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
 }
 
 #[tokio::test]
-async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() {
+async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_keeps_shared_bridge() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_sdk_bridge_stub(tmp.path());
     let backend = CursorBackend::new(
@@ -1071,16 +1042,22 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
     std::fs::write(format!("{stub}.release-run-id"), "").unwrap();
 
     let mut saw_cancelled = false;
+    let mut observed = Vec::new();
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
         while let Some(event) = stream.next().await {
-            if matches!(event, Err(trouve_agents::BackendError::Cancelled)) {
+            if matches!(&event, Err(trouve_agents::BackendError::Cancelled)) {
                 saw_cancelled = true;
             }
+            observed.push(
+                event
+                    .map(|event| format!("{event:?}"))
+                    .map_err(|error| error.to_string()),
+            );
         }
     })
     .await
     .expect("cancelled Cursor turn did not finish bounded cleanup");
-    assert!(saw_cancelled);
+    assert!(saw_cancelled, "cancelled turn events: {observed:?}");
     assert_eq!(
         std::fs::read_to_string(format!("{stub}.cancel-run"))
             .unwrap()
@@ -1095,13 +1072,19 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
-            .is_err(),
-        "cancelled Cursor Bridge was still accepting connections"
+            .is_ok(),
+        "cancelling one agent unexpectedly stopped the shared Cursor Bridge"
     );
     #[cfg(target_os = "linux")]
     assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "cancelling one agent reaped the shared Cursor Bridge process"
+    );
+    backend.shutdown().await.unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(
         !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "cancelled Cursor stream closed before the Bridge process was reaped"
+        "backend shutdown did not reap the shared Cursor Bridge process"
     );
 }
 
