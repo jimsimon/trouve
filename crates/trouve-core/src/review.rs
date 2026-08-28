@@ -4753,8 +4753,12 @@ impl Engine {
             // A blocking registration may outlive its dropped join future. If
             // it crossed the cancellation check before this job stopped,
             // wait for the commit and compensate the review-owned mutation.
-            if let Err(error) =
-                self.cancel_review_workspace_registration(&cancel, &workspace_registration_fence)
+            if let Err(error) = self
+                .cancel_review_workspace_registration_and_session(
+                    &cancel,
+                    &workspace_registration_fence,
+                )
+                .await
             {
                 self.record_review_error(format!(
                     "compensating workspace registration for stopped review job {job_id}: {error}"
@@ -5166,14 +5170,18 @@ impl Engine {
         .await
         .context("joining review workspace registration worker")??;
         let session = self
-            .create_session(CreateSessionRequest {
-                workspace_id: workspace.id,
-                idempotency_key: None,
-                title: Some(format!("Review {} #{}", job.repository, job.pull_number)),
-                base_ref: Some(job.review_base_sha.clone()),
-                checkout_ref: Some(job.head_sha.clone()),
-                fetch_latest: false,
-            })
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id,
+                    idempotency_key: None,
+                    title: Some(format!("Review {} #{}", job.repository, job.pull_number)),
+                    base_ref: Some(job.review_base_sha.clone()),
+                    checkout_ref: Some(job.head_sha.clone()),
+                    fetch_latest: false,
+                },
+                superseded,
+                workspace_registration_fence,
+            )
             .await?;
         let coordinator = self.create_thread(CreateThreadRequest {
             session_id: session.id.clone(),
