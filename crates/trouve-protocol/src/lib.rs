@@ -323,7 +323,11 @@ pub use requests::*;
 // confidence is now derived (additive).
 // 7.21: session and thread usage summaries include per-model token, turn,
 // and estimated-cost aggregates (additive).
-pub const PROTOCOL_VERSION: &str = "7.21";
+// 7.22: finding evidence carries the coordinator's causation claim
+// (`change_causation`) with mechanically verified causal waypoints and a
+// server-derived `change_scope` verdict; only scope-verified findings block
+// the review (additive).
+pub const PROTOCOL_VERSION: &str = "7.22";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

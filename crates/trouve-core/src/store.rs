@@ -844,7 +844,22 @@ const MIGRATIONS: &[&str] = &[
     USAGE_MODEL_COLUMN_MIGRATION,
 ];
 
-/// Legacy snapshots counted every open finding; recompute both tiers on the
+/// Blocking-tier predicate for one findings row under the given SQL alias:
+/// the severity/confidence cutoff plus the scope verdict (legacy rows carry
+/// no verdict and block as before). Every blocking count, listing, and
+/// backfill interpolates this single definition so the policy cannot diverge
+/// between code paths; the advisory tier is its negation.
+fn blocking_finding_predicate(alias: &str) -> String {
+    format!(
+        "(lower(trim({alias}.severity)) = 'high' OR (lower(trim({alias}.severity)) != 'low' \
+         AND lower(trim({alias}.confidence)) != 'low')) \
+         AND COALESCE(json_extract({alias}.evidence, '$.change_scope'), '') != 'unverified'"
+    )
+}
+
+/// Legacy snapshots counted every open finding; recompute both tiers —
+/// blocking (severity/confidence cutoff with a non-`unverified` scope
+/// verdict) and advisory (everything else) — on the
 /// newest published round of each pull so deployed databases adopt the
 /// blocking/advisory split at upgrade time. This runs after
 /// `repair_legacy_code_review_publications` (so the counts never derive from
@@ -856,7 +871,8 @@ const MIGRATIONS: &[&str] = &[
 /// startup.
 fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
     conn.execute(
-        "UPDATE code_review_jobs SET
+        &format!(
+            "UPDATE code_review_jobs SET
            publication_open_issue_count = (
              SELECT COUNT(*) FROM code_review_findings finding
              JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
@@ -864,7 +880,7 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
                AND finding_job.pull_number = code_review_jobs.pull_number
                AND finding_job.review_published != 0
                AND finding.status = 'open'
-               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+               AND {blocking}
            ),
            publication_advisory_open_issue_count = (
              SELECT COUNT(*) FROM code_review_findings finding
@@ -873,7 +889,7 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
                AND finding_job.pull_number = code_review_jobs.pull_number
                AND finding_job.review_published != 0
                AND finding.status = 'open'
-               AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+               AND NOT ({blocking})
            )
          WHERE publication_open_issue_count IS NOT NULL
            AND publication_advisory_open_issue_count IS NULL
@@ -885,6 +901,8 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
              ORDER BY latest.publication_order DESC, latest.created_at DESC, latest.id DESC
              LIMIT 1
            )",
+            blocking = blocking_finding_predicate("finding")
+        ),
         [],
     )?;
     Ok(())
@@ -3178,10 +3196,12 @@ fn finalize_code_review_theme_publication(
 }
 
 /// Blocking findings gate the check; advisory findings (low severity, or
-/// medium with low confidence) are tracked separately as durable debt.
+/// medium with low confidence, or a scope verdict this change could not be
+/// tied to) are tracked separately as durable debt.
 fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &str) -> Result<()> {
     tx.execute(
-        "UPDATE code_review_jobs
+        &format!(
+            "UPDATE code_review_jobs
          SET publication_open_issue_count = (
            SELECT COUNT(*)
            FROM code_review_findings finding
@@ -3190,7 +3210,7 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status = 'open'
-             AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+             AND {blocking}
          ),
          publication_advisory_open_issue_count = (
            SELECT COUNT(*)
@@ -3200,9 +3220,11 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status = 'open'
-             AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+             AND NOT ({blocking})
          )
          WHERE id = ?1",
+            blocking = blocking_finding_predicate("finding")
+        ),
         params![job_id],
     )?;
     Ok(())
@@ -11976,7 +11998,7 @@ impl Store {
     ) -> Result<(Vec<trouve_protocol::CodeReviewFinding>, bool)> {
         const THREADLESS_FINDINGS_CAP: usize = 100;
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT f.id, f.path, f.line, f.severity, f.confidence, f.title, f.body,
                     f.status
              FROM code_review_findings f
@@ -11985,11 +12007,12 @@ impl Store {
                AND j.review_published = 1
                AND f.github_comment_id IS NULL
                AND f.status IN ('open', 'dismissed')
-               AND (lower(trim(f.severity)) = 'high' OR (lower(trim(f.severity)) != 'low' AND lower(trim(f.confidence)) != 'low'))
+               AND {blocking}
              ORDER BY CASE f.status WHEN 'open' THEN 0 ELSE 1 END,
                       f.resolved_at DESC, f.path, f.line, f.id
              LIMIT 101",
-        )?;
+            blocking = blocking_finding_predicate("f")
+        ))?;
         let findings = stmt
             .query_map(params![repository, pull_number as i64], |row| {
                 Ok(trouve_protocol::CodeReviewFinding {
@@ -13608,21 +13631,24 @@ impl Store {
     }
 
     /// Count of open blocking findings across all published rounds of a pull
-    /// request, using the same severity/confidence tier cutoff as the
-    /// publication snapshot.
+    /// request, using the same severity/confidence tier cutoff and scope
+    /// verdict as the publication snapshot.
     pub fn code_review_open_blocking_finding_count(
         &self,
         repository: &str,
         pull_number: u64,
     ) -> Result<u64> {
         Ok(self.conn.lock().unwrap().query_row(
-            "SELECT COUNT(*)
+            &format!(
+                "SELECT COUNT(*)
              FROM code_review_findings finding
              JOIN code_review_jobs job ON job.id = finding.job_id
              WHERE job.repository = ?1 AND job.pull_number = ?2
                AND job.review_published != 0
                AND finding.status = 'open'
-               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))",
+               AND {blocking}",
+                blocking = blocking_finding_predicate("finding")
+            ),
             params![repository, pull_number as i64],
             |row| row.get::<_, i64>(0),
         )? as u64)

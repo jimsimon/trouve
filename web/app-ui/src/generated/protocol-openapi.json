@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.21"
+    "version": "7.22"
   },
   "paths": {
     "/v1/approvals": {
@@ -5483,6 +5483,28 @@
           }
         }
       },
+      "CodeReviewCausalWaypoint": {
+        "type": "object",
+        "description": "One step of the causal chain from changed code to a finding's anchor,\nquoted by the coordinator and mechanically verified against the reviewed\nrevision. A finding anchored outside the diff can only block the review\nwhen its waypoints verify and at least one lies on a changed line.",
+        "required": [
+          "path",
+          "line"
+        ],
+        "properties": {
+          "line": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          },
+          "quote": {
+            "type": "string",
+            "description": "Verbatim source line at `path:line`, from the head revision."
+          }
+        }
+      },
       "CodeReviewChurnStats": {
         "type": "object",
         "description": "Signals that measure repeated review work rather than raw issue volume.",
@@ -5765,6 +5787,21 @@
           "anchor_quote": {
             "type": "string",
             "description": "Verbatim source line at the finding's anchor, quoted by the\ncoordinator while verifying the finding. Mechanically matched against\nthe reviewed revision; empty when the anchor was never verified."
+          },
+          "causal_waypoints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewCausalWaypoint"
+            },
+            "description": "The causal chain from changed code to the finding's anchor, required\nto verify an `introduced` claim whose anchor is outside the diff."
+          },
+          "change_causation": {
+            "type": "string",
+            "description": "Coordinator's causation claim for the finding: `introduced` when this\nchange caused the issue, `pre_existing` when the issue predates it and\nis surfaced for awareness only. Empty on legacy records."
+          },
+          "change_scope": {
+            "type": "string",
+            "description": "Server-derived scope verdict: `verified` when the causation claim is\nmechanically corroborated (anchor on a changed line, or verified\nwaypoints reaching one), `unverified` otherwise. Only scope-verified\nfindings block the review. Model-provided values are overwritten;\nempty legacy records block as before."
           },
           "consequence": {
             "type": "string"
