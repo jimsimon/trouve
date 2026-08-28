@@ -595,6 +595,23 @@ test("full qualification requires callback and stream ids to be one-to-one", () 
   ));
 });
 
+test("full qualification rejects tool events without call ids in plan mode", () => {
+  assert.throws(
+    () => inspectToolCalls(
+      [{
+        sdkMessage: {
+          message: { type: "tool_call", name: "mcp", status: "started" },
+        },
+      }],
+      [],
+      [],
+      false,
+      "plan turn",
+    ),
+    /tool lifecycle event omitted its call id/u,
+  );
+});
+
 test("denied-tool qualification requires the stream to propagate an error terminal", () => {
   const frame = (status) => ({
     sdkMessage: {

@@ -457,7 +457,22 @@ async fn cursor_sdk_mcp(
             }]
         }),
         "tools/call" => {
-            state.calls.lock().await.push(request["params"].clone());
+            let params = request["params"].clone();
+            let expected = serde_json::json!({
+                "name": "trouve_test_echo",
+                "arguments": { "token": "from-sdk" }
+            });
+            if params != expected {
+                return axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": format!("unexpected tools/call params: {params}")
+                    }
+                }));
+            }
+            state.calls.lock().await.push(params);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             serde_json::json!({
                 "content": [{ "type": "text", "text": "tool-ok" }],
@@ -925,7 +940,13 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
             .contains("<mode-instructions>")
     );
     assert_eq!(send["options"]["mode"], "AGENT_MODE_OPTION_AGENT");
-    assert_eq!(calls.lock().await.len(), 1);
+    assert_eq!(
+        *calls.lock().await,
+        vec![serde_json::json!({
+            "name": "trouve_test_echo",
+            "arguments": { "token": "from-sdk" }
+        })]
+    );
     let callback: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{stub}.callback.json")).unwrap())
             .unwrap();
