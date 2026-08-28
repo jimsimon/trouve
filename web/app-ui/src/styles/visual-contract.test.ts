@@ -193,7 +193,7 @@ describe("Trouve visual contract", () => {
     const pullRequests = shell.indexOf('aria-label="Pull Requests"');
     const automations = shell.indexOf('aria-label="Automations"');
     const settings = shell.indexOf('aria-label="Settings"');
-    const workspaces = shell.indexOf("<strong>Workspaces</strong>");
+    const workspaces = shell.indexOf("<h2>Workspaces</h2>");
     expect(pullRequests).toBeGreaterThan(-1);
     expect(pullRequests).toBeLessThan(automations);
     expect(automations).toBeLessThan(settings);

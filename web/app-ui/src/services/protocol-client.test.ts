@@ -1090,7 +1090,7 @@ describe("protocol compatibility", () => {
   });
 
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.21")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.22")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
