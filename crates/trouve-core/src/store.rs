@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
   name TEXT NOT NULL,
   path TEXT NOT NULL UNIQUE,
   closed INTEGER NOT NULL DEFAULT 0,
+  review_registration_generation INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -392,6 +393,20 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
   ON code_review_jobs (repository, status, completed_at, created_at);
+-- A review may provisionally create or reopen a workspace before its session
+-- is admitted. Keep that ownership durable so timeout/crash cleanup can be
+-- handed to the scheduler without letting an old attempt close a workspace
+-- that a user or later review has since adopted.
+CREATE TABLE IF NOT EXISTS code_review_workspace_cleanup_intents (
+  job_id TEXT PRIMARY KEY REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_due
+  ON code_review_workspace_cleanup_intents (next_attempt_at, created_at);
 CREATE TABLE IF NOT EXISTS code_review_tasks (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
@@ -680,6 +695,7 @@ WHERE usage.model = ''
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE session_create_requests ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE workspaces ADD COLUMN review_registration_generation INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
@@ -716,6 +732,16 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_repositories ADD COLUMN router_thinking_level TEXT",
     "ALTER TABLE code_review_repositories ADD COLUMN coordinator_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
+    "CREATE TABLE IF NOT EXISTS code_review_workspace_cleanup_intents (
+       job_id TEXT PRIMARY KEY REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+       workspace_id TEXT NOT NULL,
+       generation INTEGER NOT NULL,
+       attempts INTEGER NOT NULL DEFAULT 0,
+       next_attempt_at TEXT,
+       created_at TEXT NOT NULL
+     )",
+    "CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_due
+       ON code_review_workspace_cleanup_intents (next_attempt_at, created_at)",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_base_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_watermark_sha TEXT NOT NULL DEFAULT ''",
@@ -4322,6 +4348,20 @@ pub(crate) struct ArtifactCleanupJob {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewWorkspaceCleanupIntent {
+    pub job_id: String,
+    pub workspace_id: String,
+    pub generation: u64,
+    pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReviewWorkspaceRegistrationResult {
+    pub mutated: bool,
+    pub cleanup_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionPrVerificationIntent {
     pub session_id: String,
     pub host: String,
@@ -6720,6 +6760,257 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "INSERT INTO workspaces (id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![ws.id, ws.name, ws.path, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Commit a review-owned workspace registration and its compensating
+    /// cleanup intent in one transaction. `inherited_generation` identifies
+    /// an already-open workspace that is still provisional for another
+    /// concurrent review; a stable open workspace is never owned by review
+    /// cleanup.
+    pub(crate) fn commit_review_workspace_registration(
+        &self,
+        job_id: &str,
+        workspace: &Workspace,
+        inherited_generation: Option<u64>,
+    ) -> Result<ReviewWorkspaceRegistrationResult> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let existing: Option<(String, bool, i64)> = tx
+            .query_row(
+                "SELECT id, closed, review_registration_generation
+                 FROM workspaces WHERE path = ?1",
+                params![workspace.path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let running = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_review_jobs
+             WHERE id = ?1 AND status = 'running')",
+            params![job_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        anyhow::ensure!(running, "stale: review job {job_id} is no longer running");
+
+        let (mutated, cleanup_generation) = match existing {
+            Some((workspace_id, closed, generation)) => {
+                anyhow::ensure!(
+                    workspace_id == workspace.id,
+                    "workspace path changed identity during review registration"
+                );
+                let generation = u64::try_from(generation)
+                    .context("workspace review-registration generation is negative")?;
+                if closed {
+                    let next = generation
+                        .checked_add(1)
+                        .context("workspace review-registration generation overflow")?;
+                    tx.execute(
+                        "UPDATE workspaces
+                         SET closed = 0, review_registration_generation = ?2
+                         WHERE id = ?1",
+                        params![workspace.id, i64::try_from(next)?],
+                    )?;
+                    (true, Some(next))
+                } else if inherited_generation == Some(generation) {
+                    (false, Some(generation))
+                } else {
+                    (false, None)
+                }
+            }
+            None => {
+                let generation = 1_u64;
+                tx.execute(
+                    "INSERT INTO workspaces
+                         (id, name, path, closed, review_registration_generation, created_at)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                    params![
+                        workspace.id,
+                        workspace.name,
+                        workspace.path,
+                        i64::try_from(generation)?,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?;
+                (true, Some(generation))
+            }
+        };
+
+        if let Some(generation) = cleanup_generation {
+            tx.execute(
+                "INSERT INTO code_review_workspace_cleanup_intents
+                        (job_id, workspace_id, generation, attempts, next_attempt_at, created_at)
+                 VALUES (?1, ?2, ?3, 0, NULL, ?4)
+                 ON CONFLICT(job_id) DO UPDATE SET
+                   workspace_id = excluded.workspace_id,
+                   generation = excluded.generation,
+                   attempts = 0,
+                   next_attempt_at = NULL",
+                params![
+                    job_id,
+                    workspace.id,
+                    i64::try_from(generation)?,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ReviewWorkspaceRegistrationResult {
+            mutated,
+            cleanup_generation,
+        })
+    }
+
+    /// Invalidate every provisional review registration for a workspace.
+    /// This is called while the engine's per-path registration lock is held
+    /// whenever a user/session adopts the workspace.
+    pub(crate) fn stabilize_workspace_registration(&self, workspace_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let has_intents = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_review_workspace_cleanup_intents
+             WHERE workspace_id = ?1)",
+            params![workspace_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_intents {
+            tx.execute(
+                "UPDATE workspaces
+                 SET review_registration_generation = review_registration_generation + 1
+                 WHERE id = ?1",
+                params![workspace_id],
+            )?;
+            tx.execute(
+                "DELETE FROM code_review_workspace_cleanup_intents WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn review_workspace_cleanup_intent(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ReviewWorkspaceCleanupIntent>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT job_id, workspace_id, generation, attempts
+                 FROM code_review_workspace_cleanup_intents WHERE job_id = ?1",
+                params![job_id],
+                |row| {
+                    let generation = row.get::<_, i64>(2)?;
+                    let attempts = row.get::<_, i64>(3)?;
+                    Ok(ReviewWorkspaceCleanupIntent {
+                        job_id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        generation: generation.max(0) as u64,
+                        attempts: attempts.max(0) as u32,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn pending_review_workspace_cleanups(
+        &self,
+    ) -> Result<Vec<ReviewWorkspaceCleanupIntent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT intents.job_id, intents.workspace_id, intents.generation, intents.attempts
+             FROM code_review_workspace_cleanup_intents AS intents
+             JOIN code_review_jobs AS jobs ON jobs.id = intents.job_id
+             WHERE jobs.status IN ('succeeded', 'failed', 'cancelled', 'stale')
+               AND (intents.next_attempt_at IS NULL OR intents.next_attempt_at <= ?1)
+             ORDER BY COALESCE(intents.next_attempt_at, intents.created_at), intents.job_id",
+        )?;
+        let rows = statement.query_map([chrono::Utc::now().to_rfc3339()], |row| {
+            let generation = row.get::<_, i64>(2)?;
+            let attempts = row.get::<_, i64>(3)?;
+            Ok(ReviewWorkspaceCleanupIntent {
+                job_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                generation: generation.max(0) as u64,
+                attempts: attempts.max(0) as u32,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Return whether this intent still owns the last provisional lease for
+    /// its exact workspace generation. The caller holds the per-path lock
+    /// while acting on this answer.
+    pub(crate) fn review_workspace_cleanup_should_close(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let current_generation: Option<i64> = conn
+            .query_row(
+                "SELECT review_registration_generation FROM workspaces WHERE id = ?1",
+                params![intent.workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_generation != Some(i64::try_from(intent.generation)?) {
+            return Ok(false);
+        }
+        let other = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM code_review_workspace_cleanup_intents
+               WHERE workspace_id = ?1 AND generation = ?2 AND job_id != ?3
+             )",
+            params![
+                intent.workspace_id,
+                i64::try_from(intent.generation)?,
+                intent.job_id
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(!other)
+    }
+
+    pub(crate) fn complete_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM code_review_workspace_cleanup_intents
+             WHERE job_id = ?1 AND workspace_id = ?2 AND generation = ?3",
+            params![
+                intent.job_id,
+                intent.workspace_id,
+                i64::try_from(intent.generation)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn defer_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<()> {
+        let attempt = intent.attempts.saturating_add(1);
+        #[cfg(not(test))]
+        let delay_seconds = 1_i64 << attempt.min(8);
+        #[cfg(not(test))]
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+        #[cfg(test)]
+        let next_attempt = chrono::Utc::now() + chrono::Duration::milliseconds(1);
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_workspace_cleanup_intents
+             SET attempts = ?4, next_attempt_at = ?5
+             WHERE job_id = ?1 AND workspace_id = ?2 AND generation = ?3",
+            params![
+                intent.job_id,
+                intent.workspace_id,
+                i64::try_from(intent.generation)?,
+                i64::from(attempt),
+                next_attempt.to_rfc3339()
+            ],
         )?;
         Ok(())
     }
@@ -9452,6 +9743,31 @@ impl Store {
             params![id, session_id, thread_id],
         )?;
         Ok(updated > 0)
+    }
+
+    /// Persist the review session as soon as its durable session row exists,
+    /// before thread creation or any later fallible setup. Terminal cleanup
+    /// can then recover every interrupted attempt.
+    pub(crate) fn record_code_review_job_session(
+        &self,
+        id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET session_id = ?2, thread_id = NULL
+             WHERE id = ?1 AND session_id IS NULL",
+            params![id, session_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub(crate) fn clear_code_review_job_session(&self, id: &str, session_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET session_id = NULL, thread_id = NULL
+             WHERE id = ?1 AND session_id = ?2",
+            params![id, session_id],
+        )?;
+        Ok(())
     }
 
     pub fn set_code_review_job_review_base(

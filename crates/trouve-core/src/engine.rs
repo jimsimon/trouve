@@ -36,7 +36,7 @@ use crate::permissions::{
 };
 use crate::store::{
     ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
-    SessionPrVerificationIntent, Store,
+    ReviewWorkspaceCleanupIntent, SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
@@ -1946,10 +1946,12 @@ struct WorkspaceListCacheEntry {
 
 #[derive(Clone)]
 struct ReviewWorkspaceRegistrationCommit {
+    job_id: Option<String>,
     workspace_id: String,
     canonical_path: PathBuf,
     lifecycle: Arc<Mutex<ReviewWorkspaceRegistrationLifecycle>>,
     lease_id: Option<u64>,
+    cleanup_generation: Option<u64>,
     provisional_session_id: Option<String>,
 }
 
@@ -1957,16 +1959,25 @@ struct ReviewWorkspaceRegistrationCommit {
 struct ReviewWorkspaceRegistrationLifecycle {
     next_lease_id: u64,
     provisional_workspace_id: Option<String>,
+    provisional_generation: Option<u64>,
     outstanding_leases: HashSet<u64>,
 }
 
 impl ReviewWorkspaceRegistrationLifecycle {
-    fn register(&mut self, workspace_id: &str, mutated: bool) -> Option<u64> {
+    fn register(
+        &mut self,
+        workspace_id: &str,
+        mutated: bool,
+        cleanup_generation: Option<u64>,
+    ) -> Option<u64> {
         if mutated {
             self.stabilize();
             self.provisional_workspace_id = Some(workspace_id.to_string());
+            self.provisional_generation = cleanup_generation;
         }
-        if self.provisional_workspace_id.as_deref() != Some(workspace_id) {
+        if self.provisional_workspace_id.as_deref() != Some(workspace_id)
+            || self.provisional_generation != cleanup_generation
+        {
             return None;
         }
         self.next_lease_id = self
@@ -1979,13 +1990,24 @@ impl ReviewWorkspaceRegistrationLifecycle {
 
     fn stabilize(&mut self) {
         self.provisional_workspace_id = None;
+        self.provisional_generation = None;
         self.outstanding_leases.clear();
     }
 }
 
 #[derive(Default)]
 pub(crate) struct ReviewWorkspaceRegistrationFence {
+    job_id: Option<String>,
     committed: Mutex<Option<ReviewWorkspaceRegistrationCommit>>,
+}
+
+impl ReviewWorkspaceRegistrationFence {
+    pub(crate) fn for_job(job_id: String) -> Self {
+        Self {
+            job_id: Some(job_id),
+            committed: Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -7987,6 +8009,7 @@ impl Engine {
             WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
         );
         let (item, _mutated) = self.commit_workspace_registration(workspace, item, existing)?;
+        self.store.stabilize_workspace_registration(&item.id)?;
         lifecycle.lock().unwrap().stabilize();
         Ok(item)
     }
@@ -8074,8 +8097,10 @@ impl Engine {
         let finished = {
             let mut current = commit_fence.committed.lock().unwrap();
             if let Some(current_commit) = current.as_mut()
+                && current_commit.job_id == committed.job_id
                 && current_commit.workspace_id == committed.workspace_id
                 && current_commit.lease_id == committed.lease_id
+                && current_commit.cleanup_generation == committed.cleanup_generation
                 && Arc::ptr_eq(&current_commit.lifecycle, &committed.lifecycle)
                 && current_commit.provisional_session_id == committed.provisional_session_id
             {
@@ -8104,6 +8129,24 @@ impl Engine {
         &self,
         committed: ReviewWorkspaceRegistrationCommit,
     ) -> Result<(), EngineError> {
+        if let (Some(job_id), Some(cleanup_generation)) =
+            (committed.job_id.as_deref(), committed.cleanup_generation)
+        {
+            if let Some(intent) = self.store.review_workspace_cleanup_intent(job_id)?
+                && intent.workspace_id == committed.workspace_id
+                && intent.generation == cleanup_generation
+            {
+                self.reconcile_review_workspace_cleanup(&intent)?;
+            }
+            if let Some(lease_id) = committed.lease_id {
+                let mut lifecycle = committed.lifecycle.lock().unwrap();
+                lifecycle.outstanding_leases.remove(&lease_id);
+                if lifecycle.outstanding_leases.is_empty() {
+                    lifecycle.stabilize();
+                }
+            }
+            return Ok(());
+        }
         if let Some(lease_id) = committed.lease_id {
             let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
             let _registration = registration_lock.lock().unwrap();
@@ -8119,6 +8162,32 @@ impl Engine {
                 lifecycle.outstanding_leases.remove(&lease_id);
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<(), EngineError> {
+        let Some(workspace) = self.store.workspace(&intent.workspace_id)? else {
+            self.store.complete_review_workspace_cleanup(intent)?;
+            return Ok(());
+        };
+        let canonical_path = PathBuf::from(&workspace.path);
+        let registration_lock = self.workspace_registration_lock(&canonical_path);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical_path);
+        let _registration = registration_lock.lock().unwrap();
+        let Some(current) = self.store.review_workspace_cleanup_intent(&intent.job_id)? else {
+            return Ok(());
+        };
+        if current.workspace_id != intent.workspace_id || current.generation != intent.generation {
+            return Ok(());
+        }
+        if self.store.review_workspace_cleanup_should_close(&current)? {
+            self.commit_workspace_close(&current.workspace_id)?;
+            lifecycle.lock().unwrap().stabilize();
+        }
+        self.store.complete_review_workspace_cleanup(&current)?;
         Ok(())
     }
 
@@ -8150,6 +8219,8 @@ impl Engine {
             let lease_id = committed.lease_id.unwrap();
             let mut lifecycle = committed.lifecycle.lock().unwrap();
             if lifecycle.outstanding_leases.contains(&lease_id) {
+                self.store
+                    .stabilize_workspace_registration(&committed.workspace_id)?;
                 lifecycle.stabilize();
             }
         }
@@ -8195,13 +8266,49 @@ impl Engine {
             ));
         }
         after_cancel_check();
-        let (item, mutated) = self.commit_workspace_registration(workspace, item, existing)?;
-        let lease_id = lifecycle.lock().unwrap().register(&item.id, mutated);
+        let inherited_generation = lifecycle.lock().unwrap().provisional_generation;
+        let (item, mutated, cleanup_generation) = if let Some(job_id) =
+            commit_fence.job_id.as_deref()
+        {
+            let result = self.store.commit_review_workspace_registration(
+                job_id,
+                &workspace,
+                inherited_generation,
+            )?;
+            if result.mutated {
+                for session in self.store.list_sessions(Some(&workspace.id))? {
+                    if !session.archived {
+                        self.terminals.reopen_session(&session.id);
+                    }
+                }
+                self.store.append_event(
+                    Scope::Server,
+                    Event::WorkspaceRegistered {
+                        workspace_id: workspace.id.clone(),
+                        path: workspace.path.clone(),
+                    },
+                )?;
+            }
+            (
+                self.cache_workspace_list_item(item),
+                result.mutated,
+                result.cleanup_generation,
+            )
+        } else {
+            let (item, mutated) = self.commit_workspace_registration(workspace, item, existing)?;
+            (item, mutated, None)
+        };
+        let lease_id = lifecycle
+            .lock()
+            .unwrap()
+            .register(&item.id, mutated, cleanup_generation);
         *committed = Some(ReviewWorkspaceRegistrationCommit {
+            job_id: commit_fence.job_id.clone(),
             workspace_id: item.id.clone(),
             canonical_path: canonical,
             lifecycle,
             lease_id,
+            cleanup_generation,
             provisional_session_id: None,
         });
         Ok(item)
@@ -8414,6 +8521,7 @@ impl Engine {
         let _registration =
             Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
         self.commit_workspace_close(id)?;
+        self.store.stabilize_workspace_registration(id)?;
         lifecycle.lock().unwrap().stabilize();
         Ok(())
     }
@@ -8506,6 +8614,7 @@ impl Engine {
             .store
             .open_workspace(workspace_id)?
             .ok_or_else(|| EngineError::NotFound(format!("workspace {workspace_id}")))?;
+        self.store.stabilize_workspace_registration(workspace_id)?;
         lifecycle.lock().unwrap().stabilize();
         Ok(workspace)
     }
@@ -8572,6 +8681,16 @@ impl Engine {
             };
             (recorded, cancelled)
         };
+        if recorded
+            && let Some(job_id) = commit_fence.job_id.as_deref()
+            && !self
+                .store
+                .record_code_review_job_session(job_id, &session.id)?
+        {
+            return Err(EngineError::BadRequest(
+                "stale: review job already owns a different session".into(),
+            ));
+        }
         if recorded && !cancelled {
             return Ok(session);
         }

@@ -53,10 +53,11 @@ const REVIEW_THREAD_VERIFICATION_EPOCH: Duration = Duration::from_secs(90);
 const REVIEW_RECONCILIATION_FAILURE_RESET_THRESHOLD: u32 = 3;
 const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
-/// A stopped review retains its workspace-registration fence until cleanup is
-/// acknowledged. Retrying promptly keeps transient store/filesystem failures
-/// from unnecessarily occupying a review concurrency slot.
+/// A stopped review retains its workspace-registration fence only for a small
+/// foreground retry budget. The durable generation-bearing intent then lets
+/// the scheduler finish cleanup without occupying review concurrency forever.
 const REVIEW_WORKSPACE_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const REVIEW_WORKSPACE_CLEANUP_FOREGROUND_ATTEMPTS: usize = 3;
 const REVIEW_OUTBOX_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -4743,25 +4744,33 @@ impl Engine {
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
         self.sync_code_review_projection(&record.job).await;
         let active_threads = Arc::new(Mutex::new(HashSet::new()));
-        let workspace_registration_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let workspace_registration_fence =
+            Arc::new(ReviewWorkspaceRegistrationFence::for_job(job_id.clone()));
+        let previous_attempt_cleanup = self.cleanup_previous_code_review_attempt(&record).await;
         let review_settings = self.effective_code_review_settings();
         let review_timeout = Duration::from_secs(review_settings.total_timeout_seconds);
-        let result = tokio::time::timeout(
-            review_timeout,
-            self.execute_code_review(
-                &record,
-                &cancel,
-                &active_threads,
-                &workspace_registration_fence,
-                &review_settings,
-            ),
-        )
-        .await;
+        let result = match previous_attempt_cleanup {
+            Ok(()) => {
+                tokio::time::timeout(
+                    review_timeout,
+                    self.execute_code_review(
+                        &record,
+                        &cancel,
+                        &active_threads,
+                        &workspace_registration_fence,
+                        &review_settings,
+                    ),
+                )
+                .await
+            }
+            Err(error) => Ok(Err(anyhow!(error)
+                .context("cleaning up the interrupted attempt before restarting review"))),
+        };
         if !matches!(result, Ok(Ok(_))) {
             // A blocking registration may outlive its dropped join future. If
             // it crossed the cancellation check before this job stopped,
             // wait for the commit and compensate the review-owned mutation.
-            self.cleanup_stopped_review_workspace_until_acknowledged(
+            self.cleanup_stopped_review_workspace_with_budget(
                 &job_id,
                 &cancel,
                 &workspace_registration_fence,
@@ -4877,14 +4886,14 @@ impl Engine {
         }
     }
 
-    async fn cleanup_stopped_review_workspace_until_acknowledged(
+    async fn cleanup_stopped_review_workspace_with_budget(
         &self,
         job_id: &str,
         cancel: &CancellationToken,
         workspace_registration_fence: &ReviewWorkspaceRegistrationFence,
     ) {
         let mut first_failure = None;
-        loop {
+        for attempt in 0..REVIEW_WORKSPACE_CLEANUP_FOREGROUND_ATTEMPTS {
             let cleanup = {
                 #[cfg(test)]
                 if self
@@ -4932,10 +4941,58 @@ impl Engine {
                         ));
                         first_failure = Some(error);
                     }
+                    if attempt + 1 == REVIEW_WORKSPACE_CLEANUP_FOREGROUND_ATTEMPTS {
+                        break;
+                    }
                     tokio::time::sleep(REVIEW_WORKSPACE_CLEANUP_RETRY_INTERVAL).await;
                 }
             }
         }
+        if let Ok(Some(intent)) = self.store.review_workspace_cleanup_intent(job_id)
+            && let Err(error) = self.store.defer_review_workspace_cleanup(&intent)
+        {
+            self.record_review_error(format!(
+                "deferring workspace cleanup for stopped review job {job_id}: {error:#}"
+            ));
+        }
+    }
+
+    async fn cleanup_previous_code_review_attempt(
+        &self,
+        record: &CodeReviewJobRecord,
+    ) -> Result<(), EngineError> {
+        if let Some(session_id) = record.job.session_id.as_deref() {
+            match self.delete_session(session_id).await {
+                Ok(()) | Err(EngineError::NotFound(_)) => self
+                    .store
+                    .clear_code_review_job_session(&record.job.id, session_id)?,
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(intent) = self.store.review_workspace_cleanup_intent(&record.job.id)? {
+            self.reconcile_review_workspace_cleanup_with_injection(&intent)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_review_workspace_cleanup_with_injection(
+        &self,
+        intent: &crate::store::ReviewWorkspaceCleanupIntent,
+    ) -> Result<(), EngineError> {
+        #[cfg(test)]
+        if self
+            .code_review
+            .injected_workspace_cleanup_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(EngineError::Internal(anyhow!(
+                "injected stopped-review workspace cleanup failure"
+            )));
+        }
+        self.reconcile_review_workspace_cleanup(intent)
     }
 
     async fn retry_code_review_cleanup(&self) {
@@ -4963,6 +5020,29 @@ impl Engine {
                 Err(error) => {
                     self.record_review_error(format!(
                         "cleaning up terminal review job {job_id}: {error}"
+                    ));
+                }
+            }
+        }
+        let pending = match self.store.pending_review_workspace_cleanups() {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "listing terminal review workspace cleanups: {error:#}"
+                ));
+                return;
+            }
+        };
+        for intent in pending {
+            if let Err(error) = self.reconcile_review_workspace_cleanup_with_injection(&intent) {
+                self.record_review_error(format!(
+                    "cleaning up terminal review workspace for job {}: {error}",
+                    intent.job_id
+                ));
+                if let Err(store_error) = self.store.defer_review_workspace_cleanup(&intent) {
+                    self.record_review_error(format!(
+                        "deferring terminal review workspace cleanup for job {}: {store_error:#}",
+                        intent.job_id
                     ));
                 }
             }
@@ -17370,8 +17450,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adopted_workspace_generation_fences_stale_review_cleanup() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:workspace-generation");
+        store.claim_code_review_job().unwrap().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_generation".into(),
+            name: "widgets".into(),
+            path: "/tmp/widgets-generation".into(),
+        };
+        let registration = store
+            .commit_review_workspace_registration(&job.id, &workspace, None)
+            .unwrap();
+        assert_eq!(registration.cleanup_generation, Some(1));
+        let stale_intent = store
+            .review_workspace_cleanup_intent(&job.id)
+            .unwrap()
+            .unwrap();
+
+        store
+            .stabilize_workspace_registration(&workspace.id)
+            .unwrap();
+
+        assert!(
+            !store
+                .review_workspace_cleanup_should_close(&stale_intent)
+                .unwrap()
+        );
+        assert!(
+            store
+                .review_workspace_cleanup_intent(&job.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_review_cleanup_closes_only_after_the_last_generation_lease() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let first = enqueue_test_review_job(&store, "acme/widgets#42:first-workspace-lease");
+        let second = enqueue_test_review_job(&store, "acme/widgets#42:second-workspace-lease");
+        store.claim_code_review_job().unwrap().unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_shared_generation".into(),
+            name: "widgets".into(),
+            path: "/tmp/widgets-shared-generation".into(),
+        };
+        store
+            .commit_review_workspace_registration(&first.id, &workspace, None)
+            .unwrap();
+        store
+            .commit_review_workspace_registration(&second.id, &workspace, Some(1))
+            .unwrap();
+        let first_intent = store
+            .review_workspace_cleanup_intent(&first.id)
+            .unwrap()
+            .unwrap();
+        let second_intent = store
+            .review_workspace_cleanup_intent(&second.id)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !store
+                .review_workspace_cleanup_should_close(&first_intent)
+                .unwrap()
+        );
+        store
+            .complete_review_workspace_cleanup(&first_intent)
+            .unwrap();
+        assert!(
+            store
+                .review_workspace_cleanup_should_close(&second_intent)
+                .unwrap()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn stopped_job_retries_workspace_cleanup_until_session_artifacts_are_deleted() {
+    async fn persistent_workspace_cleanup_failure_hands_off_terminal_job_to_durable_retry() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         std::fs::create_dir(&repository).unwrap();
@@ -17399,7 +17557,10 @@ mod tests {
         engine
             .code_review
             .injected_workspace_cleanup_failures
-            .store(1, Ordering::SeqCst);
+            .store(
+                REVIEW_WORKSPACE_CLEANUP_FOREGROUND_ATTEMPTS + 1,
+                Ordering::SeqCst,
+            );
         *engine
             .code_review
             .injected_stopped_job_repository
@@ -17412,12 +17573,7 @@ mod tests {
                 engine.run_code_review_job(record).await;
             }
         });
-        while engine
-            .code_review
-            .injected_workspace_cleanup_failures
-            .load(Ordering::SeqCst)
-            != 0
-        {
+        while store.list_sessions(None).unwrap().is_empty() {
             tokio::task::yield_now().await;
         }
         let sessions = store.list_sessions(None).unwrap();
@@ -17425,9 +17581,25 @@ mod tests {
         let session = &sessions[0];
         let worktree = Path::new(&session.worktree_path).to_path_buf();
 
-        assert!(!stopped_job.is_finished());
-        assert!(store.session(&session.id).unwrap().is_some());
-        assert!(worktree.exists());
+        tokio::time::advance(
+            REVIEW_WORKSPACE_CLEANUP_RETRY_INTERVAL
+                * REVIEW_WORKSPACE_CLEANUP_FOREGROUND_ATTEMPTS as u32,
+        )
+        .await;
+        stopped_job.await.unwrap();
+
+        assert!(store.session(&session.id).unwrap().is_none());
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        assert!(
+            store
+                .review_workspace_cleanup_intent(&job.id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.code_review_job(&job.id).unwrap().unwrap().job.status,
+            "failed"
+        );
         assert!(
             engine
                 .code_review
@@ -17438,15 +17610,21 @@ mod tests {
                 .contains("injected stopped-review workspace cleanup failure")
         );
 
-        tokio::time::advance(REVIEW_WORKSPACE_CLEANUP_RETRY_INTERVAL).await;
-        stopped_job.await.unwrap();
+        engine
+            .code_review
+            .injected_workspace_cleanup_failures
+            .store(0, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(2));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        engine.retry_code_review_cleanup().await;
         tokio::time::resume();
 
-        assert!(store.session(&session.id).unwrap().is_none());
         assert!(engine.list_workspaces().unwrap().is_empty());
-        assert_eq!(
-            store.code_review_job(&job.id).unwrap().unwrap().job.status,
-            "failed"
+        assert!(
+            store
+                .review_workspace_cleanup_intent(&job.id)
+                .unwrap()
+                .is_none()
         );
         tokio::time::timeout(Duration::from_secs(5), async {
             while worktree.exists() {
