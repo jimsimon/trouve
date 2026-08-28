@@ -12364,6 +12364,22 @@ impl Store {
                 params![finding_id, now],
             )?;
         }
+        // Legacy checkbox snapshots and commands mutate the same threadless
+        // ledger. Advancing the checkbox watermark in this transaction makes
+        // the command the newer writer: a checkbox snapshot captured before
+        // the command but delivered after it is watermark-rejected instead
+        // of silently reverting the decision. The watermark is compared as
+        // a string, so this uses GitHub's second-granularity `Z` timestamp
+        // format; same-second snapshots still apply, matching the bounded
+        // same-second window the checkbox path already documents.
+        let watermark = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        tx.execute(
+            "UPDATE code_review_pr_state
+             SET lifecycle_checkbox_edited_at = ?3
+             WHERE repository = ?1 AND pull_number = ?2
+               AND lifecycle_checkbox_edited_at < ?3",
+            params![repository, pull_number as i64, watermark],
+        )?;
         let projection_job =
             refresh_code_review_pull_projection_counts_in_tx(&tx, repository, pull_number)?;
         // The GitHub projection (lifecycle comment, check run) runs only
@@ -19949,6 +19965,47 @@ mod tests {
                 .status,
             "open"
         );
+
+        // A command advances the shared checkbox watermark in its own
+        // transaction: a checkbox snapshot captured before the command but
+        // delivered after it is watermark-rejected instead of reverting the
+        // decision, while a genuinely newer edit still applies.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&target, true), "final — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::Applied { .. }));
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2020-01-01T00:00:00Z",
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(!changed, "a stale checkbox snapshot must not apply");
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "dismissed"
+        );
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                &future,
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(changed, "a newer checkbox edit still applies");
 
         // Out-of-order protection: a durable, recently claimed command that
         // is not applicable yet is retained for replay instead of consumed —
