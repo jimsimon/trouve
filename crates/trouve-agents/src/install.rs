@@ -219,12 +219,13 @@ pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
         // llama.cpp publishes binary builds as prereleases ("b9957"). Its
         // `/releases/latest` entry is now a metadata-only nightly marker, so
         // resolve the newest release that actually carries build artifacts.
-        CliId::LlamaServer => {
-            let body =
-                get_text("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20")
-                    .await?;
-            parse_llama_release_tag(&body)
-        }
+        CliId::LlamaServer => latest_llama_release_tag(|page| async move {
+            get_text(&format!(
+                "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100&page={page}"
+            ))
+            .await
+        })
+        .await,
     }
 }
 
@@ -241,10 +242,27 @@ async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
         .ok_or_else(|| InstallError::Download("github release had no tag_name".into()))
 }
 
-fn parse_llama_release_tag(body: &str) -> Result<String, InstallError> {
+const LLAMA_RELEASE_PAGE_LIMIT: usize = 5;
+
+async fn latest_llama_release_tag<F, Fut>(mut fetch: F) -> Result<String, InstallError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<String, InstallError>>,
+{
+    for page in 1..=LLAMA_RELEASE_PAGE_LIMIT {
+        if let Some(tag) = parse_llama_release_tag(&fetch(page).await?)? {
+            return Ok(tag);
+        }
+    }
+    Err(InstallError::Download(format!(
+        "the first {LLAMA_RELEASE_PAGE_LIMIT} github release pages had no llama.cpp build"
+    )))
+}
+
+fn parse_llama_release_tag(body: &str) -> Result<Option<String>, InstallError> {
     let releases: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| InstallError::Download(format!("github release json: {e}")))?;
-    releases
+    Ok(releases
         .as_array()
         .into_iter()
         .flatten()
@@ -267,8 +285,7 @@ fn parse_llama_release_tag(body: &str) -> Result<String, InstallError> {
                         .is_some_and(|name| name.starts_with(&artifact_prefix))
                 })
                 .then(|| tag.to_string())
-        })
-        .ok_or_else(|| InstallError::Download("github releases had no llama.cpp build".into()))
+        }))
 }
 
 /// Pull the pinned version out of the official cursor install script
@@ -717,9 +734,50 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
         ]);
 
         assert_eq!(
-            parse_llama_release_tag(&releases.to_string()).unwrap(),
-            "b10665"
+            parse_llama_release_tag(&releases.to_string())
+                .unwrap()
+                .as_deref(),
+            Some("b10665")
         );
+    }
+
+    #[tokio::test]
+    async fn searches_later_llama_release_pages_for_builds() {
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pages = std::sync::Arc::new([
+            serde_json::json!([{
+                "tag_name": "v0.3.0",
+                "draft": false,
+                "assets": [{ "name": "nightly-tag.txt" }]
+            }])
+            .to_string(),
+            serde_json::json!([{
+                "tag_name": "b10665",
+                "draft": false,
+                "prerelease": true,
+                "assets": [
+                    { "name": "llama-b10665-bin-ubuntu-vulkan-x64.tar.gz" }
+                ]
+            }])
+            .to_string(),
+        ]);
+
+        let tag = latest_llama_release_tag({
+            let requested = requested.clone();
+            move |page| {
+                let requested = requested.clone();
+                let pages = pages.clone();
+                async move {
+                    requested.lock().unwrap().push(page);
+                    Ok(pages[page - 1].clone())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(tag, "b10665");
+        assert_eq!(*requested.lock().unwrap(), [1, 2]);
     }
 
     #[test]
