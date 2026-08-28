@@ -89,6 +89,10 @@ const MAX_ATTACHMENT_MIME_BYTES: usize = 255;
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// A background shell registers its transferred mutation lease immediately
+/// after acquiring the session lane. Polling closes the tiny handoff race for
+/// callers that arrived between lock acquisition and lease registration.
+const BACKGROUND_MUTATION_OWNER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
 
@@ -2068,6 +2072,10 @@ pub struct Engine {
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
     tool_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
+    /// Background shells transfer their session write lane beyond the
+    /// launching tool call. Weak entries let later calls identify that owner
+    /// and fail fast instead of becoming an undispatchable lock waiter.
+    background_mutation_leases: Mutex<HashMap<String, Weak<BackgroundMutationLease>>>,
     /// Serializes durable PR-intent reconciliation per session. Weak entries
     /// avoid retaining deleted sessions while still preventing duplicate
     /// GitHub reads and association events from overlapping retry triggers.
@@ -2504,6 +2512,7 @@ impl Engine {
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
+            background_mutation_leases: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
             session_pr_verification_wake: Arc::new(tokio::sync::Notify::new()),
             session_pr_verification_worker_started: AtomicBool::new(false),
@@ -7655,6 +7664,15 @@ impl Engine {
         let lock = Arc::new(tokio::sync::RwLock::new(()));
         locks.insert(session_id.to_string(), Arc::downgrade(&lock));
         lock
+    }
+
+    fn background_mutation_lease(&self, session_id: &str) -> Option<Arc<BackgroundMutationLease>> {
+        let mut leases = self.background_mutation_leases.lock().unwrap();
+        let lease = leases.get(session_id).and_then(Weak::upgrade);
+        if lease.is_none() {
+            leases.remove(session_id);
+        }
+        lease
     }
 
     // --- workspaces ---------------------------------------------------------
@@ -14427,22 +14445,41 @@ impl Engine {
             BackgroundControl,
         }
         let execution_lock = self.tool_execution_lock(&session.id);
+        let mut background_owner = None;
         let permit = if matches!(call.name.as_str(), "shell_output" | "shell_kill") {
             Some(ExecutionPermit::BackgroundControl)
         } else if mutates || pr_creation.is_some() {
             // A confirmed or unresolved creator must hold the write lane even
             // if its tool metadata incorrectly labels it read-only: the exact
             // branch/HEAD snapshot is durable authorization evidence.
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => None,
-                permit = execution_lock.clone().write_owned() => Some(ExecutionPermit::Write { guard: Some(permit) }),
+            let mut acquire = Box::pin(execution_lock.clone().write_owned());
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break None,
+                    permit = &mut acquire => break Some(ExecutionPermit::Write { guard: Some(permit) }),
+                    _ = tokio::time::sleep(BACKGROUND_MUTATION_OWNER_POLL_INTERVAL) => {
+                        if let Some(lease) = self.background_mutation_lease(&session.id) {
+                            background_owner = Some(lease.job_id());
+                            break None;
+                        }
+                    }
+                }
             }
         } else {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => None,
-                permit = execution_lock.clone().read_owned() => Some(ExecutionPermit::Read { _guard: permit }),
+            let mut acquire = Box::pin(execution_lock.clone().read_owned());
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break None,
+                    permit = &mut acquire => break Some(ExecutionPermit::Read { _guard: permit }),
+                    _ = tokio::time::sleep(BACKGROUND_MUTATION_OWNER_POLL_INTERVAL) => {
+                        if let Some(lease) = self.background_mutation_lease(&session.id) {
+                            background_owner = Some(lease.job_id());
+                            break None;
+                        }
+                    }
+                }
             }
         };
         let (mut outcome, execution_duration_ms, verification) = if let Some(permit) = permit {
@@ -14468,8 +14505,12 @@ impl Engine {
                 && let Some(ExecutionPermit::Write { guard }) = permit.as_mut()
                 && let Some(guard) = guard.take()
             {
-                tool_ctx.background_mutation_lease =
-                    Some(Arc::new(BackgroundMutationLease::new(guard)));
+                let lease = Arc::new(BackgroundMutationLease::new(guard));
+                self.background_mutation_leases
+                    .lock()
+                    .unwrap()
+                    .insert(session.id.clone(), Arc::downgrade(&lease));
+                tool_ctx.background_mutation_lease = Some(lease);
             }
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
@@ -14564,7 +14605,31 @@ impl Engine {
                 verification,
             )
         } else {
-            (ToolResult::error("tool call cancelled"), None, None)
+            let outcome = match background_owner {
+                Some(job_id) => {
+                    let message = match job_id.as_deref() {
+                        Some(job_id) => format!(
+                            "session tool lane is held by background shell job {job_id}; use shell_output or shell_kill before calling {}",
+                            call.name
+                        ),
+                        None => format!(
+                            "session tool lane is being transferred to a background shell job; wait for its job id, then use shell_output or shell_kill before calling {}",
+                            call.name
+                        ),
+                    };
+                    ToolResult {
+                        status: ToolStatus::Error,
+                        result: serde_json::json!({
+                            "error": message,
+                            "code": "background_shell_active",
+                            "job_id": job_id,
+                            "allowed_tools": ["shell_output", "shell_kill"],
+                        }),
+                    }
+                }
+                None => ToolResult::error("tool call cancelled"),
+            };
+            (outcome, None, None)
         };
         // Peel vision content ("_images") out of the result: megabytes of
         // base64 must not land in the event log or the text transcript —
@@ -23237,6 +23302,99 @@ default_permission_mode = "ask"
         assert_eq!(outcome.call_id, "vendor-call");
         assert!(outcome.approved.unwrap());
         assert!(outcome.mutation_permit.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridged_calls_fail_fast_while_background_shell_owns_tool_lane() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_background_bridge".into(),
+            name: "background bridge".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_background_bridge".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Background bridge".into(),
+            branch: "trouve/background-bridge".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_background_bridge".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Arc::new(Engine::new(store, data.path().into(), &Config::default()));
+        engine.register_cancel(&thread.id);
+
+        let launched = engine
+            .bridged_tool_call(
+                &thread.id,
+                "shell",
+                &serde_json::json!({
+                    "command": "sleep 60",
+                    "run_in_background": true
+                }),
+            )
+            .await
+            .unwrap();
+        let launched: serde_json::Value = serde_json::from_str(&launched).unwrap();
+        let job_id = launched["job_id"].as_str().unwrap().to_string();
+
+        let blocked = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.bridged_tool_call(&thread.id, "list_dir", &serde_json::json!({ "path": "." })),
+        )
+        .await
+        .expect("a bridged call must not wait behind a background shell")
+        .unwrap();
+        let blocked: serde_json::Value = serde_json::from_str(&blocked).unwrap();
+        assert_eq!(blocked["code"], "background_shell_active");
+        assert_eq!(blocked["job_id"], job_id);
+        assert_eq!(
+            blocked["allowed_tools"],
+            serde_json::json!(["shell_output", "shell_kill"])
+        );
+
+        let killed = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.bridged_tool_call(
+                &thread.id,
+                "shell_kill",
+                &serde_json::json!({ "job_id": job_id }),
+            ),
+        )
+        .await
+        .expect("background control must bypass the occupied tool lane")
+        .unwrap();
+        assert!(!killed.contains("error"));
+
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.bridged_tool_call(&thread.id, "list_dir", &serde_json::json!({ "path": "." })),
+        )
+        .await
+        .expect("the tool lane must become available after shell_kill")
+        .unwrap();
+        assert!(!resumed.contains("session tool lane is held"));
+        engine.clear_cancel(&thread.id);
     }
 
     #[tokio::test]
