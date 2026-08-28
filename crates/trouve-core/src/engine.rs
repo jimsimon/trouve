@@ -8021,16 +8021,63 @@ impl Engine {
         commit_fence: &ReviewWorkspaceRegistrationFence,
     ) -> Result<(), EngineError> {
         cancel.cancel();
-        let committed = commit_fence.committed.lock().unwrap().take();
+        let committed = commit_fence.committed.lock().unwrap().clone();
         if let Some(committed) = committed {
-            if let Some(session_id) = committed.provisional_session_id.as_deref()
-                && self.store.session(session_id)?.is_some()
-            {
-                self.delete_session(session_id).await?;
-            }
-            self.compensate_review_workspace_registration(committed)?;
+            let session_cleanup =
+                if let Some(session_id) = committed.provisional_session_id.as_deref() {
+                    match self.store.session(session_id) {
+                        Ok(Some(_)) => self.delete_session(session_id).await,
+                        Ok(None) => Ok(()),
+                        Err(error) => Err(error.into()),
+                    }
+                } else {
+                    Ok(())
+                };
+            let workspace_compensation =
+                self.compensate_review_workspace_registration(committed.clone());
+            Self::finish_review_workspace_cancellation(
+                commit_fence,
+                &committed,
+                session_cleanup,
+                workspace_compensation,
+            )?;
         }
         Ok(())
+    }
+
+    fn finish_review_workspace_cancellation(
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+        committed: &ReviewWorkspaceRegistrationCommit,
+        session_cleanup: Result<(), EngineError>,
+        workspace_compensation: Result<(), EngineError>,
+    ) -> Result<(), EngineError> {
+        let session_cleaned = session_cleanup.is_ok();
+        let workspace_compensated = workspace_compensation.is_ok();
+        {
+            let mut current = commit_fence.committed.lock().unwrap();
+            if let Some(current_commit) = current.as_mut()
+                && current_commit.workspace_id == committed.workspace_id
+                && current_commit.lease_id == committed.lease_id
+                && Arc::ptr_eq(&current_commit.lifecycle, &committed.lifecycle)
+            {
+                if session_cleaned {
+                    current_commit.provisional_session_id = None;
+                }
+                if session_cleaned && workspace_compensated {
+                    current.take();
+                }
+            }
+        }
+
+        match (session_cleanup, workspace_compensation) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(session_error), Err(workspace_error)) => {
+                Err(EngineError::Internal(anyhow::anyhow!(
+                    "review workspace cleanup failed: session cleanup failed: {session_error}; workspace compensation failed: {workspace_error}"
+                )))
+            }
+        }
     }
 
     fn compensate_review_workspace_registration(
@@ -23189,6 +23236,83 @@ default_permission_mode = "ask"
         })
         .await
         .expect("provisional review worktree was not cleaned up");
+    }
+
+    #[test]
+    fn cancellation_cleanup_failures_remain_retryable_after_workspace_compensation() {
+        for failure_stage in ["session lookup", "session deletion"] {
+            let repository = tempfile::tempdir().unwrap();
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository.path());
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+            let data = tempfile::tempdir().unwrap();
+            let engine = Engine::new(
+                Store::open_in_memory().unwrap(),
+                data.path().to_path_buf(),
+                &Config::default(),
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let commit_fence = ReviewWorkspaceRegistrationFence::default();
+            engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    Some(format!("{failure_stage} failure")),
+                    &cancel,
+                    &commit_fence,
+                )
+                .unwrap();
+            commit_fence
+                .committed
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .provisional_session_id = Some("provisional-session".into());
+            let committed = commit_fence.committed.lock().unwrap().clone().unwrap();
+
+            let mut compensation_attempts = 0;
+            compensation_attempts += 1;
+            let workspace_compensation =
+                engine.compensate_review_workspace_registration(committed.clone());
+            let error = Engine::finish_review_workspace_cancellation(
+                &commit_fence,
+                &committed,
+                Err(EngineError::Internal(anyhow::anyhow!(
+                    "injected {failure_stage} failure"
+                ))),
+                workspace_compensation,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains(failure_stage));
+            assert_eq!(compensation_attempts, 1);
+            assert!(engine.list_workspaces().unwrap().is_empty());
+            assert_eq!(
+                commit_fence
+                    .committed
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|commit| commit.provisional_session_id.as_deref()),
+                Some("provisional-session")
+            );
+
+            let committed = commit_fence.committed.lock().unwrap().clone().unwrap();
+            compensation_attempts += 1;
+            let workspace_compensation =
+                engine.compensate_review_workspace_registration(committed.clone());
+            Engine::finish_review_workspace_cancellation(
+                &commit_fence,
+                &committed,
+                Ok(()),
+                workspace_compensation,
+            )
+            .unwrap();
+
+            assert_eq!(compensation_attempts, 2);
+            assert!(commit_fence.committed.lock().unwrap().is_none());
+        }
     }
 
     #[tokio::test]
