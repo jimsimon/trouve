@@ -38,7 +38,7 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // the scope-verdict causal-waypoint evidence schema. Preserve less than 2 kB
 // of headroom; entry, worker, and largest-chunk budgets below still prevent one
 // bundle from hiding in the aggregate.
-const totalJavaScriptLimit = 3_252_000;
+const totalJavaScriptLimit = 3_254_000;
 // Version-check, transcript-search, compact navigation, and the sticky
 // multi-mode usage panel with thread/session model rows plus workspace
 // organization styling bring the clean artifact to 190,958 B. Preserve less

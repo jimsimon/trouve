@@ -1120,7 +1120,6 @@ async fn cursor_backend_shutdown_drains_an_active_send_before_reaping_bridge() {
     let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
     next.prompt = "STALL_FOR_CANCELLATION".into();
     next.tool_free = true;
-    let turn_cancel = next.cancel.clone();
     let mut stream = backend.run_turn(next).await.unwrap();
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1137,25 +1136,25 @@ async fn cursor_backend_shutdown_drains_an_active_send_before_reaping_bridge() {
     .expect("Cursor Send did not publish shutdown readiness");
 
     let shutting_backend = backend.clone();
+    let shutdown_started = std::time::Instant::now();
     let mut shutdown = tokio::spawn(async move { shutting_backend.shutdown().await });
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown)
-            .await
-            .is_err(),
-        "backend shutdown interrupted an admitted Cursor turn"
-    );
-
-    turn_cancel.cancel();
+    let mut saw_shutdown = false;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while stream.next().await.is_some() {}
+        while let Some(event) = stream.next().await {
+            if let Err(error) = event {
+                saw_shutdown |= error.to_string().contains("pool is shutting down");
+            }
+        }
     })
     .await
-    .expect("cancelled Cursor turn did not finish while backend shutdown drained it");
+    .expect("active Cursor turn did not stop after the bounded shutdown drain");
+    assert!(saw_shutdown, "active turn did not report pool shutdown");
     tokio::time::timeout(std::time::Duration::from_secs(5), &mut shutdown)
         .await
         .expect("backend shutdown remained blocked behind the active turn")
         .unwrap()
         .unwrap();
+    assert!(shutdown_started.elapsed() >= std::time::Duration::from_millis(750));
 
     let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
         .unwrap()
