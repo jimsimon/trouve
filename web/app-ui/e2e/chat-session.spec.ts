@@ -1369,7 +1369,6 @@ test("model picker escapes the composer control strip", async ({ page }) => {
 });
 
 test("subscription status renders complete quota lines in the workspace usage panel", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name.startsWith("mobile"), "the workspace usage panel belongs to the desktop navigation surface");
   await installProtocolFixtures(page);
   await page.route("**/v1/subscriptions", async (route) => {
     await route.fulfill({
@@ -1385,8 +1384,14 @@ test("subscription status renders complete quota lines in the workspace usage pa
   });
   await page.goto("/");
   await replayHistory(page);
+  if (testInfo.project.name.startsWith("mobile")) {
+    const sessionsButton = page.getByRole("button", { name: "Sessions", exact: true });
+    await sessionsButton.evaluate((button: HTMLButtonElement) => button.click());
+    await expect(sessionsButton).toHaveAttribute("aria-pressed", "true");
+  }
 
   const panel = page.locator("trouve-session-usage-panel");
+  await expect(panel).toBeVisible();
   const subscription = panel.locator('[aria-label="test subscription usage"]');
   await expect(subscription).toContainText("pro plan");
   await expect(subscription).toContainText("Weekly");
