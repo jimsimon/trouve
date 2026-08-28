@@ -5554,11 +5554,20 @@ impl Engine {
                 }
             };
             let (mut turn, mut validated) = turn;
+            let anchor_object_lines = self
+                .prefetch_anchor_object_lines(
+                    &validated.findings,
+                    &diff_files,
+                    repository_path.as_path(),
+                    &job.head_sha,
+                    superseded,
+                )
+                .await;
             validated.findings = coordinator_validated_findings(
                 std::mem::take(&mut validated.findings),
                 &coordinator_candidates,
                 &diff_files,
-                Some((repository_path.as_path(), job.head_sha.as_str())),
+                &anchor_object_lines,
             );
             let missing_adjudications =
                 unadjudicated_candidate_ids(&validated, &coordinator_candidates);
@@ -5589,11 +5598,20 @@ impl Engine {
                             merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
                             match parse_review_output(&repaired.output) {
                                 Ok(mut repaired_output) => {
+                                    let repaired_anchor_lines = self
+                                        .prefetch_anchor_object_lines(
+                                            &repaired_output.findings,
+                                            &diff_files,
+                                            repository_path.as_path(),
+                                            &job.head_sha,
+                                            superseded,
+                                        )
+                                        .await;
                                     repaired_output.findings = coordinator_validated_findings(
                                         std::mem::take(&mut repaired_output.findings),
                                         &coordinator_candidates,
                                         &diff_files,
-                                        Some((repository_path.as_path(), job.head_sha.as_str())),
+                                        &repaired_anchor_lines,
                                     );
                                     merge_coordinator_adjudication_repair(
                                         &mut validated,
@@ -9631,6 +9649,71 @@ impl Engine {
     /// the payload preserves a toggle made while an earlier one was still
     /// being applied and re-rendered (the ledger render would otherwise
     /// erase it before its own delivery arrived).
+    /// Prefetch immutable-object lines for every anchor the coordinator's
+    /// findings reference outside the diff, through the executor's audited
+    /// git boundary. Reading before validation keeps verification itself
+    /// pure, and the object store makes the read immune to concurrent
+    /// checkout syncs, symlinks, and replacement refs.
+    async fn prefetch_anchor_object_lines(
+        &self,
+        findings: &[ReviewFinding],
+        diff_files: &[ReviewDiffFile],
+        repository_path: &std::path::Path,
+        head_sha: &str,
+        cancel: &CancellationToken,
+    ) -> HashMap<(String, u64), String> {
+        let diff_contents = diff_line_contents(diff_files);
+        let mut lines = HashMap::new();
+        for finding in findings {
+            if finding.side.eq_ignore_ascii_case("left") {
+                continue;
+            }
+            let key = (finding.path.clone(), finding.line);
+            if lines.contains_key(&key)
+                || diff_contents.contains_key(&(finding.path.clone(), finding.line, false))
+            {
+                continue;
+            }
+            // Structural validation rejects unsafe paths later; the guard
+            // here just avoids handing them to git at all.
+            let relative = std::path::Path::new(&finding.path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            match self
+                .executor
+                .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
+                    managed_root: self.data_dir.join("review-repositories"),
+                    worktree: repository_path.to_path_buf(),
+                    head_sha: head_sha.to_owned(),
+                    path: finding.path.clone(),
+                    line: finding.line,
+                    max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
+                    cancel: cancel.clone(),
+                })
+                .await
+            {
+                Ok(Some(line)) => {
+                    lines.insert(key, line);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        path = %finding.path,
+                        line = finding.line,
+                        %error,
+                        "anchor object line unavailable; anchor stays unchecked"
+                    );
+                }
+            }
+        }
+        lines
+    }
+
     async fn apply_lifecycle_dismissal_edit(
         &self,
         repository: &CodeReviewRepository,
@@ -13772,7 +13855,7 @@ fn coordinator_validated_findings(
     findings: Vec<ReviewFinding>,
     candidates: &[CandidateFinding],
     files: &[ReviewDiffFile],
-    repository: Option<(&std::path::Path, &str)>,
+    object_lines: &HashMap<(String, u64), String>,
 ) -> Vec<ReviewFinding> {
     let candidate_ids = candidates
         .iter()
@@ -13797,7 +13880,7 @@ fn coordinator_validated_findings(
             .into_iter()
             .all(|value| !value.trim().is_empty());
             if !finding.source_candidate_ids.is_empty() && has_evidence {
-                apply_verification_derived_confidence(&mut finding, &diff_contents, repository);
+                apply_verification_derived_confidence(&mut finding, &diff_contents, object_lines);
                 Some(finding)
             } else {
                 None
@@ -15059,14 +15142,14 @@ fn diff_line_contents(files: &[ReviewDiffFile]) -> HashMap<(String, u64, bool), 
 }
 
 /// The source line a finding anchors to: from the diff when the anchor is a
-/// diff line, otherwise from the immutable git object at the reviewed head
-/// revision. Reading the object store instead of the working tree makes the
-/// lookup immune to concurrent checkout syncs and symlinked paths, and
-/// returns the reviewed revision's content even when the worktree has moved.
+/// diff line, otherwise from the prefetched immutable-object lines (RIGHT
+/// side only; LEFT anchors outside the diff have no locally available base
+/// content). Object lines are read through the executor's audited git
+/// boundary before validation, so this lookup is pure.
 fn finding_anchor_content(
     finding: &ReviewFinding,
     diff_contents: &HashMap<(String, u64, bool), String>,
-    repository: Option<(&std::path::Path, &str)>,
+    object_lines: &HashMap<(String, u64), String>,
 ) -> Option<String> {
     let left = finding.side.eq_ignore_ascii_case("left");
     if let Some(content) = diff_contents.get(&(finding.path.clone(), finding.line, left)) {
@@ -15075,33 +15158,9 @@ fn finding_anchor_content(
     if left {
         return None;
     }
-    // Structural validation already rejected unsafe paths; keep the lexical
-    // guard so this lookup can never name anything outside the repository.
-    let relative = std::path::Path::new(&finding.path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return None;
-    }
-    let (root, head_sha) = repository?;
-    if head_sha.len() != 40 || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .arg("show")
-        .arg(format!("{head_sha}:{}", finding.path))
-        .output()
-        .ok()?;
-    if !output.status.success() || output.stdout.len() > REVIEW_ANCHOR_BLOB_MAX_BYTES {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let index = usize::try_from(finding.line).ok()?.checked_sub(1)?;
-    text.lines().nth(index).map(str::to_owned)
+    object_lines
+        .get(&(finding.path.clone(), finding.line))
+        .cloned()
 }
 
 /// Mechanical verdict for a coordinator-quoted anchor line against the
@@ -15165,7 +15224,7 @@ fn finding_level_rank(level: &str) -> u8 {
 fn apply_verification_derived_confidence(
     finding: &mut ReviewFinding,
     diff_contents: &HashMap<(String, u64, bool), String>,
-    repository: Option<(&std::path::Path, &str)>,
+    object_lines: &HashMap<(String, u64), String>,
 ) {
     const ANCHOR_QUOTE_MAX_BYTES: usize = 512;
     // The persisted record must reproduce the verdict: a quote too large to
@@ -15178,7 +15237,7 @@ fn apply_verification_derived_confidence(
             bounded_utf8(&finding.evidence.anchor_quote, ANCHOR_QUOTE_MAX_BYTES, "…");
         finding.evidence.anchor_match = "unchecked".to_owned();
     } else {
-        let actual = finding_anchor_content(finding, diff_contents, repository);
+        let actual = finding_anchor_content(finding, diff_contents, object_lines);
         finding.evidence.anchor_match =
             anchor_match_verdict(&finding.evidence.anchor_quote, actual.as_deref()).to_owned();
     }
@@ -17442,7 +17501,7 @@ mod tests {
             ],
             &candidates,
             &files,
-            None,
+            &HashMap::new(),
         );
         assert_eq!(findings.len(), 4);
         let by_id = |id: &str| {
@@ -17467,40 +17526,7 @@ mod tests {
     }
 
     #[test]
-    fn outside_diff_anchor_quotes_verify_against_the_head_git_object() {
-        let repo = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo.path())
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.test")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.test")
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?}: {output:?}");
-            String::from_utf8(output.stdout).unwrap()
-        };
-        git(&["init", "--quiet"]);
-        std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        std::fs::write(
-            repo.path().join("src/config.rs"),
-            "line one\nlet retries = 5;\nline three\n",
-        )
-        .unwrap();
-        git(&["add", "."]);
-        git(&["commit", "--quiet", "-m", "initial"]);
-        let head_sha = git(&["rev-parse", "HEAD"]).trim().to_owned();
-        // The worktree mutates after the commit: anchor verification must
-        // read the immutable object at the reviewed head, not the mutable
-        // checkout, so concurrent syncs and symlinks cannot influence it.
-        std::fs::write(
-            repo.path().join("src/config.rs"),
-            "line one\nlet retries = 99;\nline three\n",
-        )
-        .unwrap();
+    fn outside_diff_anchor_quotes_verify_against_prefetched_object_lines() {
         let finding = |quote: &str| ReviewFinding {
             path: "src/config.rs".into(),
             line: 2,
@@ -17520,18 +17546,18 @@ mod tests {
             source_candidate_ids: vec!["c-1".into()],
         };
         let contents = HashMap::new();
-        let repository = Some((repo.path(), head_sha.as_str()));
+        // Object lines come from the executor's audited git boundary, keyed
+        // by (path, line); verification itself is pure.
+        let object_lines = HashMap::from([(
+            ("src/config.rs".to_owned(), 2),
+            "let retries = 5;".to_owned(),
+        )]);
         let mut matched = finding("let retries = 5;");
-        apply_verification_derived_confidence(&mut matched, &contents, repository);
+        apply_verification_derived_confidence(&mut matched, &contents, &object_lines);
         assert_eq!(matched.evidence.anchor_match, "matched");
         assert_eq!(matched.confidence, "high");
-        // The mutated worktree content is not what the review examined.
-        let mut worktree = finding("let retries = 99;");
-        apply_verification_derived_confidence(&mut worktree, &contents, repository);
-        assert_eq!(worktree.evidence.anchor_match, "mismatched");
-        assert_eq!(worktree.confidence, "low");
         let mut mismatched = finding("let retries = 3;");
-        apply_verification_derived_confidence(&mut mismatched, &contents, repository);
+        apply_verification_derived_confidence(&mut mismatched, &contents, &object_lines);
         assert_eq!(mismatched.evidence.anchor_match, "mismatched");
         assert_eq!(mismatched.confidence, "low");
 
@@ -17539,21 +17565,17 @@ mod tests {
         // able to reproduce the verdict, so it degrades to unchecked and the
         // stored quote is truncated.
         let mut oversized = finding(&"x".repeat(700));
-        apply_verification_derived_confidence(&mut oversized, &contents, repository);
+        apply_verification_derived_confidence(&mut oversized, &contents, &object_lines);
         assert_eq!(oversized.evidence.anchor_match, "unchecked");
         assert!(oversized.evidence.anchor_quote.len() <= 512 + '…'.len_utf8());
         assert_eq!(oversized.confidence, "medium");
 
-        // A hostile path can never escape the repository: it degrades to an
-        // unchecked anchor, as does an uncommitted or unknown path.
-        let mut hostile = finding("root:x:0:0");
-        hostile.path = "../etc/passwd".into();
-        apply_verification_derived_confidence(&mut hostile, &contents, repository);
-        assert_eq!(hostile.evidence.anchor_match, "unchecked");
-        let mut uncommitted = finding("anything");
-        uncommitted.path = "src/not_committed.rs".into();
-        apply_verification_derived_confidence(&mut uncommitted, &contents, repository);
-        assert_eq!(uncommitted.evidence.anchor_match, "unchecked");
+        // Anchors without a prefetched line — unknown paths, hostile paths
+        // the prefetch refused, or LEFT-side anchors — stay unchecked.
+        let mut unknown = finding("anything");
+        unknown.path = "src/not_committed.rs".into();
+        apply_verification_derived_confidence(&mut unknown, &contents, &object_lines);
+        assert_eq!(unknown.evidence.anchor_match, "unchecked");
     }
 
     #[test]
@@ -23656,7 +23678,7 @@ mod tests {
             }],
             &[candidate],
             &files,
-            None,
+            &HashMap::new(),
         );
 
         assert_eq!(findings.len(), 1);
@@ -23855,7 +23877,7 @@ mod tests {
             std::mem::take(&mut structurally_rejected.findings),
             &candidates,
             &files,
-            None,
+            &HashMap::new(),
         );
         let unadjudicated =
             normalize_coordinator_output(&mut structurally_rejected, &candidates, &[]);

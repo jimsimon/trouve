@@ -3309,6 +3309,66 @@ pub fn diff_between(
     Ok(String::from_utf8_lossy(&output.bytes).into_owned())
 }
 
+/// One line of an immutable object at `revision:path`, or None when the
+/// object does not exist at that revision, exceeds `max_bytes`, or has no
+/// such line. Replacement-ref indirection is disabled so the read is pinned
+/// to the exact reviewed object even in a repository carrying hostile
+/// `refs/replace` entries, and the object's size is checked before any
+/// content is buffered.
+pub fn review_object_line(
+    repo: &Path,
+    revision: &str,
+    path: &str,
+    line: u64,
+    max_bytes: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<String>> {
+    ensure_safe_ref(revision)?;
+    let spec = format!("{revision}:{path}");
+    let operation =
+        GitOperation::with_timeout(Some(cancel), REVIEW_GIT_TIMEOUT, "review anchor object");
+    let size = run_git_bounded_with_status(
+        repo,
+        None,
+        &["--no-replace-objects", "cat-file", "-s", &spec],
+        None,
+        64,
+        &operation,
+    )?;
+    if !size.status.success() {
+        // The path has no object at the reviewed revision.
+        return Ok(None);
+    }
+    let Ok(size) = String::from_utf8_lossy(&size.stdout.bytes)
+        .trim()
+        .parse::<u64>()
+    else {
+        return Ok(None);
+    };
+    if size > max_bytes as u64 {
+        return Ok(None);
+    }
+    let output = run_git_bounded_with_status(
+        repo,
+        None,
+        &["--no-replace-objects", "show", &spec],
+        None,
+        max_bytes,
+        &operation,
+    )?;
+    if !output.status.success() || output.stdout.truncated {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout.bytes);
+    let Some(index) = usize::try_from(line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+    else {
+        return Ok(None);
+    };
+    Ok(text.lines().nth(index).map(str::to_owned))
+}
+
 /// URL of the named remote (usually "origin"), if configured.
 pub fn remote_url(worktree: &Path, remote: &str) -> Option<String> {
     git(worktree, &["remote", "get-url", remote])
@@ -3586,6 +3646,98 @@ mod tests {
         assert_eq!(
             std::fs::read(attachments.join("new.bin")).unwrap(),
             b"materialized new"
+        );
+    }
+
+    #[test]
+    fn review_object_line_reads_the_exact_reviewed_object() {
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.test")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.test")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(&["init", "--quiet"]);
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/config.rs"),
+            "line one
+let retries = 5;
+line three
+",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "--quiet", "-m", "reviewed"]);
+        let reviewed = run(&["rev-parse", "HEAD"]).trim().to_owned();
+
+        // A second commit with different content plus a replace ref that
+        // redirects the reviewed commit to it, and a mutated worktree: the
+        // read must still return the reviewed object's line.
+        std::fs::write(
+            repo.path().join("src/config.rs"),
+            "line one
+let retries = 99;
+line three
+",
+        )
+        .unwrap();
+        run(&["commit", "--quiet", "-am", "hostile"]);
+        let hostile = run(&["rev-parse", "HEAD"]).trim().to_owned();
+        run(&["replace", &reviewed, &hostile]);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert_eq!(
+            review_object_line(
+                repo.path(),
+                &reviewed,
+                "src/config.rs",
+                2,
+                64 * 1024,
+                &cancel
+            )
+            .unwrap()
+            .as_deref(),
+            Some("let retries = 5;"),
+        );
+        // Missing paths, out-of-range lines, and objects over the byte cap
+        // degrade to None instead of erroring or buffering.
+        assert_eq!(
+            review_object_line(
+                repo.path(),
+                &reviewed,
+                "src/missing.rs",
+                1,
+                64 * 1024,
+                &cancel
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            review_object_line(
+                repo.path(),
+                &reviewed,
+                "src/config.rs",
+                99,
+                64 * 1024,
+                &cancel
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            review_object_line(repo.path(), &reviewed, "src/config.rs", 2, 8, &cancel).unwrap(),
+            None
         );
     }
 
