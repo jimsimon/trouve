@@ -47,13 +47,13 @@ class CompareBenchmarksTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertIn("Insufficient history (1/3)", report)
 
-    def test_new_benchmark_is_not_a_regression(self):
+    def test_new_benchmark_requests_confirmation_instead_of_passing(self):
         status, report = compare(
             suite(100, name="new"), [suite(100, name="old")], 1.5, 1, "Test"
         )
 
-        self.assertEqual(status, 0)
-        self.assertIn("New benchmark", report)
+        self.assertEqual(status, 2)
+        self.assertIn("New benchmark (needs base confirmation)", report)
 
     def test_unit_mismatch_is_rejected(self):
         with self.assertRaises(BenchmarkDataError):

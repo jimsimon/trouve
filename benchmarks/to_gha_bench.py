@@ -47,7 +47,13 @@ def hyperfine_entries(paths: list[pathlib.Path]) -> list[dict]:
             stddev = result.get("stddev") or 0.0
             out.append(
                 {
-                    "name": result["command"],
+                    # The " (min)" suffix versions the history series: the
+                    # gate keys history by name, and a minimum screened
+                    # against pre-change median history would be
+                    # systematically lenient. A fresh series has no history,
+                    # which the comparison treats as inconclusive, so the
+                    # transition rides the like-for-like base confirmation.
+                    "name": f"{result['command']} (min)",
                     "unit": "ms",
                     "value": result["min"] * 1000.0,
                     "range": f"± {stddev * 1000.0:.1f}",
