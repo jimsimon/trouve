@@ -10352,7 +10352,12 @@ impl Engine {
         // reordering, sixteen distinct pulls whose head commands keep
         // failing retryably would reload as the identical prefix every pass
         // and a later pull's valid command would never be reached.
-        let mut deprioritized = self
+        // Deprioritization lasts exactly one pass — a deprioritized pull
+        // the next pass never reaches (because fresh traffic filled the
+        // budget) rejoins the front of the pass after, in comment-id order —
+        // so retrying and fresh pulls alternate instead of either side
+        // starving the other permanently.
+        let deprioritized = self
             .code_review
             .threadless_retry_pulls
             .lock()
@@ -10360,11 +10365,6 @@ impl Engine {
             .get(&repository.repository)
             .cloned()
             .unwrap_or_default();
-        let pending_pulls = commands
-            .iter()
-            .map(|command| command.pull_number)
-            .collect::<HashSet<_>>();
-        deprioritized.retain(|pull| pending_pulls.contains(pull));
         deprioritize_retrying_pulls(&mut commands, &deprioritized);
         // One authentication per pass; failure leaves every row for the
         // next pass rather than failing each command individually.
@@ -10379,7 +10379,6 @@ impl Engine {
         };
         let mut permission_cache: HashMap<String, bool> = HashMap::new();
         let mut halted_pulls: HashSet<u64> = HashSet::new();
-        let mut advanced_pulls: HashSet<u64> = HashSet::new();
         let mut processed = 0usize;
         for command in commands {
             if processed >= THREADLESS_COMMAND_PASS_LIMIT {
@@ -10401,24 +10400,22 @@ impl Engine {
                 )
                 .await
             {
-                ThreadlessCommandDisposition::Done => {
-                    advanced_pulls.insert(command.pull_number);
-                }
+                ThreadlessCommandDisposition::Done => {}
                 ThreadlessCommandDisposition::RetryPull => {
                     halted_pulls.insert(command.pull_number);
                 }
             }
         }
-        // Pulls whose head command reached an outcome rejoin the front of
-        // the next pass; pulls that failed retryably (now or on an earlier
-        // pass whose rows are still pending) stay behind everyone else.
-        deprioritized.retain(|pull| !advanced_pulls.contains(pull));
-        deprioritized.extend(halted_pulls);
+        // Only the pulls that failed retryably in this pass sort behind
+        // everyone next pass; everything else — advanced, consumed, or
+        // simply not reached — competes at the front again in comment-id
+        // order. Replacing (not accumulating) the set is what makes the
+        // deprioritization age out.
         let mut retry_pulls = self.code_review.threadless_retry_pulls.lock().unwrap();
-        if deprioritized.is_empty() {
+        if halted_pulls.is_empty() {
             retry_pulls.remove(&repository.repository);
         } else {
-            retry_pulls.insert(repository.repository.clone(), deprioritized);
+            retry_pulls.insert(repository.repository.clone(), halted_pulls);
         }
     }
 

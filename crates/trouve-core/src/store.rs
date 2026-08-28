@@ -12366,6 +12366,22 @@ impl Store {
         }
         let projection_job =
             refresh_code_review_pull_projection_counts_in_tx(&tx, repository, pull_number)?;
+        // The GitHub projection (lifecycle comment, check run) runs only
+        // after this transaction commits; a crash in between would leave
+        // durable state and GitHub disagreeing with no pending row left to
+        // replay. Arming the durable projection-retry marker in the same
+        // commit hands the sync to the poll's projection-repair pass, and
+        // the in-process success path clears it immediately.
+        if let Some(job_id) = projection_job.as_deref() {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET check_sync_error = 'threadless command applied; projection sync pending',
+                     projection_retry_at = NULL,
+                     projection_retryable = 1
+                 WHERE id = ?1",
+                params![job_id],
+            )?;
+        }
         tx.commit()?;
         Ok((
             ThreadlessCommandOutcome::Applied { finding_id },
