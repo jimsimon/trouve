@@ -50,7 +50,7 @@ use trouve_protocol::{
     ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
     UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
     UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertPersonaRequest,
-    UpsertProviderRequest, UsageSummary, Workspace, WorkspaceListItem,
+    UpsertProviderRequest, UsageSummary, WorkspaceListItem,
 };
 use utoipa::OpenApi;
 
@@ -234,7 +234,6 @@ impl IntoResponse for ApiError {
     components(schemas(
         ServerInfo,
         RegisterWorkspaceRequest,
-        Workspace,
         WorkspaceListItem,
         BranchList,
         CreateSessionRequest,

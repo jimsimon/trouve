@@ -32,14 +32,13 @@ describe("workspace list model", () => {
     expect(separate.map(({ key }) => key)).toEqual(["first", "other", "clone"]);
   });
 
-  it("falls back to workspace identity for malformed optional repository metadata", () => {
+  it("falls back to workspace identity for blank optional repository metadata", () => {
     const workspaces = [
       { id: "blank", name: "Blank", repository_key: "", repository_name: "" },
-      { id: "wrong-type", name: "Wrong type", repository_key: 42, repository_name: false },
-    ] as unknown as readonly WorkspaceListEntry[];
+    ];
 
     const groups = organizeWorkspaceList(workspaces, "repository");
-    expect(groups.map(({ key }) => key)).toEqual(["workspace:blank", "workspace:wrong-type"]);
-    expect(groups.map(({ label }) => label)).toEqual(["Blank", "Wrong type"]);
+    expect(groups.map(({ key }) => key)).toEqual(["workspace:blank"]);
+    expect(groups.map(({ label }) => label)).toEqual(["Blank"]);
   });
 });

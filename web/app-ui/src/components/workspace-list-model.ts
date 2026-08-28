@@ -14,9 +14,6 @@ export interface WorkspaceListGroup<T extends WorkspaceListEntry> {
   readonly repository: boolean;
 }
 
-const nonBlankString = (value: unknown): string | undefined =>
-  typeof value === "string" && value.trim() !== "" ? value : undefined;
-
 /**
  * Resolve top-level repository/workspace organization before rendering child
  * session lists. Repository identity comes from the server so separate clones
@@ -27,28 +24,28 @@ export const organizeWorkspaceList = <T extends WorkspaceListEntry>(
   grouping: WorkspaceListGrouping,
 ): readonly WorkspaceListGroup<T>[] => {
   if (grouping !== "repository") {
-    return Object.freeze(workspaces.map((workspace) => Object.freeze({
+    return workspaces.map((workspace) => ({
       key: workspace.id,
       label: workspace.name,
-      workspaces: Object.freeze([workspace]),
+      workspaces: [workspace],
       repository: false,
-    })));
+    }));
   }
 
   const groups = new Map<string, { label: string; workspaces: T[] }>();
   for (const workspace of workspaces) {
-    const repositoryKey = nonBlankString(workspace.repository_key) ?? "workspace:" + workspace.id;
+    const repositoryKey = workspace.repository_key?.trim() || "workspace:" + workspace.id;
     const group = groups.get(repositoryKey) ?? {
-      label: nonBlankString(workspace.repository_name) ?? workspace.name,
+      label: workspace.repository_name?.trim() || workspace.name,
       workspaces: [],
     };
     group.workspaces.push(workspace);
     groups.set(repositoryKey, group);
   }
-  return Object.freeze([...groups].map(([key, group]) => Object.freeze({
+  return [...groups].map(([key, group]) => ({
     key,
     label: group.label,
-    workspaces: Object.freeze(group.workspaces),
+    workspaces: group.workspaces,
     repository: true,
-  })));
+  }));
 };

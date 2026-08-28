@@ -5195,9 +5195,9 @@ impl Engine {
             }
             bail!("stale: review was superseded before model dispatch");
         }
-        self.complete_review_workspace_registration(workspace_registration_fence);
         self.emit_code_review_updated(Some(job.id.clone()))?;
         ensure_review_current(superseded)?;
+        self.complete_review_workspace_registration(superseded, workspace_registration_fence)?;
         let diff_cache_key = format!(
             "{}\0{}\0{}",
             job.repository, job.review_base_sha, job.head_sha

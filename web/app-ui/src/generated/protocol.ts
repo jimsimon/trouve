@@ -5057,11 +5057,6 @@ export interface components {
             /** Format: int64 */
             turns: number;
         };
-        Workspace: {
-            id: components["schemas"]["String"];
-            name: string;
-            path: string;
-        };
         /**
          * @description Workspace presentation returned by the list and registration endpoints.
          *     Separate checkouts and linked worktrees share repository_key when they

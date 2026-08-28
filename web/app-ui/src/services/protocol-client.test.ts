@@ -279,7 +279,13 @@ describe("ProtocolClient", () => {
   });
 
   it("loads generated workspace/thread models and validates both collections", async () => {
-    const workspace = { id: "ws_1", name: "trouve", path: "/src/trouve" };
+    const workspace = {
+      id: "ws_1",
+      name: "trouve",
+      path: "/src/trouve",
+      repository_key: "github.com/jimsimon/trouve",
+      repository_name: "trouve",
+    };
     const thread = {
       id: "th_1",
       session_id: "se_1",
@@ -302,6 +308,21 @@ describe("ProtocolClient", () => {
     expect(threadsInput instanceof Request ? threadsInput.url : String(threadsInput)).toContain(
       "session_id=se_1",
     );
+  });
+
+  it("rejects malformed optional workspace repository identity", async () => {
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async () => Response.json([{
+        id: "ws_1",
+        name: "trouve",
+        path: "/src/trouve",
+        repository_key: 42,
+      }])),
+    });
+
+    await expect(client.workspaces()).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
   });
 
   it("loads a bounded folded thread view with its exact stream cursor", async () => {

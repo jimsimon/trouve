@@ -8028,18 +8028,37 @@ impl Engine {
 
     pub(crate) fn complete_review_workspace_registration(
         &self,
+        cancel: &tokio_util::sync::CancellationToken,
         commit_fence: &ReviewWorkspaceRegistrationFence,
-    ) {
-        let committed = commit_fence.committed.lock().unwrap().take();
-        if let Some(committed) = committed.filter(|committed| committed.lease_id.is_some()) {
+    ) -> Result<(), EngineError> {
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let committed = commit_fence.committed.lock().unwrap().clone();
+        if let Some(committed) = committed
+            .as_ref()
+            .filter(|committed| committed.lease_id.is_some())
+        {
             let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
             let _registration = registration_lock.lock().unwrap();
+            // This is the review's admission point. Recheck cancellation while
+            // holding the same guard that protects lease compensation so
+            // cancellation before admission cannot race lease stabilization.
+            if cancel.is_cancelled() {
+                return Err(EngineError::BadRequest(
+                    "stale: review workspace registration was cancelled".into(),
+                ));
+            }
             let lease_id = committed.lease_id.unwrap();
             let mut lifecycle = committed.lifecycle.lock().unwrap();
             if lifecycle.outstanding_leases.contains(&lease_id) {
                 lifecycle.stabilize();
             }
         }
+        commit_fence.committed.lock().unwrap().take();
+        Ok(())
     }
 
     fn register_review_workspace_with(
@@ -22978,6 +22997,45 @@ default_permission_mode = "ask"
     }
 
     #[test]
+    fn cancellation_before_workspace_admission_preserves_compensation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("cancelled before admission".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        assert!(!cancel.is_cancelled());
+
+        // Model the cancellation becoming visible after the caller's
+        // preceding check but before the guarded admission point.
+        cancel.cancel();
+        let error = engine
+            .complete_review_workspace_registration(&cancel, &commit_fence)
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+        engine
+            .cancel_review_workspace_registration(&cancel, &commit_fence)
+            .unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+    }
+
+    #[test]
     fn cancellation_compensates_registration_admitted_before_timeout() {
         let repository = tempfile::tempdir().unwrap();
         let mut init = std::process::Command::new("git");
@@ -23161,7 +23219,9 @@ default_permission_mode = "ask"
         engine
             .cancel_review_workspace_registration(&first_cancel, &first_fence)
             .unwrap();
-        engine.complete_review_workspace_registration(&second_fence);
+        engine
+            .complete_review_workspace_registration(&second_cancel, &second_fence)
+            .unwrap();
 
         assert_eq!(adopted.id, workspace.id);
         assert_eq!(engine.list_workspaces().unwrap().len(), 1);
@@ -23280,13 +23340,17 @@ default_permission_mode = "ask"
                 .unwrap();
 
             if complete_first_before_cancel {
-                engine.complete_review_workspace_registration(&first_fence);
+                engine
+                    .complete_review_workspace_registration(&first_cancel, &first_fence)
+                    .unwrap();
             }
             engine
                 .cancel_review_workspace_registration(&second_cancel, &second_fence)
                 .unwrap();
             if !complete_first_before_cancel {
-                engine.complete_review_workspace_registration(&first_fence);
+                engine
+                    .complete_review_workspace_registration(&first_cancel, &first_fence)
+                    .unwrap();
             }
 
             assert_eq!(engine.list_workspaces().unwrap().len(), 1);
