@@ -648,6 +648,29 @@ fn requeue_after_thread_walk(
         .collect()
 }
 
+/// Clears the dispatcher's worker slot if the drain task unwinds, so a
+/// panic (for example a poisoned shared-state lock) can never leave
+/// `running` latched true with an undrained queue — later deliveries could
+/// then never spawn a worker and webhook prioritization would silently
+/// degrade to poll latency forever. The clean exit path disarms the guard,
+/// because `next_thread_webhook_batch` already releases the slot atomically
+/// with observing the empty queue.
+struct ThreadWebhookWorkerSlot<'a> {
+    dispatch: &'a Mutex<ThreadWebhookDispatch>,
+    armed: bool,
+}
+
+impl Drop for ThreadWebhookWorkerSlot<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.dispatch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .running = false;
+        }
+    }
+}
+
 fn review_reconciliation_order_key(
     candidate: &(String, u64),
     priority: &HashSet<(String, u64)>,
@@ -4358,6 +4381,10 @@ impl Engine {
                 ) {
                     let engine = self.clone();
                     tokio::spawn(async move {
+                        let mut slot = ThreadWebhookWorkerSlot {
+                            dispatch: &engine.code_review.thread_webhook_dispatch,
+                            armed: true,
+                        };
                         while let Some((repository, keys)) =
                             next_thread_webhook_batch(&engine.code_review.thread_webhook_dispatch)
                         {
@@ -4420,6 +4447,7 @@ impl Engine {
                                 }
                             }
                         }
+                        slot.armed = false;
                     });
                 }
                 return Ok(());
