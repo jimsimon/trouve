@@ -679,18 +679,6 @@ function terminateProcessTree(child) {
   if (existing !== undefined) return existing;
   const termination = terminateProcessTreeOnce(child);
   PROCESS_TREE_TERMINATIONS.set(child, termination);
-  void termination.catch(() => {
-    // Retry a transient failure only while this ChildProcess still identifies
-    // the original group leader. Once the leader exits, retaining the failed
-    // attempt avoids signalling a recycled POSIX process-group id.
-    if (
-      child.exitCode === null &&
-      child.signalCode === null &&
-      PROCESS_TREE_TERMINATIONS.get(child) === termination
-    ) {
-      PROCESS_TREE_TERMINATIONS.delete(child);
-    }
-  });
   return termination;
 }
 
@@ -1326,6 +1314,28 @@ async function runCleanupSteps(steps) {
   }
 }
 
+function createProcessCleanupBoundary() {
+  let processCleanupFailure;
+  return {
+    async terminate(cleanup) {
+      try {
+        await cleanup();
+      } catch (error) {
+        processCleanupFailure ??= error;
+        throw error;
+      }
+    },
+    async remove(label, cleanup) {
+      if (processCleanupFailure !== undefined) {
+        throw new QualificationError(
+          `${label} retained because SDK Bridge process-tree cleanup failed`,
+        );
+      }
+      await cleanup();
+    },
+  };
+}
+
 function combineQualificationAndCleanupErrors(qualificationError, cleanupError) {
   if (qualificationError === undefined) return cleanupError;
   const qualificationDetail = qualificationError instanceof Error
@@ -1408,6 +1418,7 @@ async function main() {
       agentId = undefined;
       callback = undefined;
       const cleanupSteps = [];
+      const processCleanup = createProcessCleanupBoundary();
       if (signal === undefined && activeBridge !== undefined && activeAgentId !== undefined) {
         cleanupSteps.push(["close SDK agent", () => unary(
           activeBridge,
@@ -1427,7 +1438,10 @@ async function main() {
         )]);
       }
       for (const child of bridgeChildren) {
-        cleanupSteps.push(["terminate SDK Bridge process tree", () => terminateProcessTree(child)]);
+        cleanupSteps.push([
+          "terminate SDK Bridge process tree",
+          () => processCleanup.terminate(() => terminateProcessTree(child)),
+        ]);
       }
       bridgeChildren.clear();
       if (activeCallback !== undefined) {
@@ -1436,16 +1450,22 @@ async function main() {
           await new Promise((accept) => activeCallback.server.close(accept));
         }]);
       }
-      cleanupSteps.push([
-        "remove SDK Bridge state",
-        () => rm(stateRoot, { recursive: true, force: true }),
-      ]);
       if (!args.keepDownload) {
         cleanupSteps.push([
-          "remove verified SDK Bridge download",
-          () => rm(temporaryRoot, { recursive: true, force: true }),
+          "remove SDK Bridge qualification files",
+          () => processCleanup.remove(
+            "SDK Bridge qualification files",
+            () => rm(temporaryRoot, { recursive: true, force: true }),
+          ),
         ]);
       } else {
+        cleanupSteps.push([
+          "remove SDK Bridge state",
+          () => processCleanup.remove(
+            "SDK Bridge state",
+            () => rm(stateRoot, { recursive: true, force: true }),
+          ),
+        ]);
         process.stderr.write(`Kept verified download files at ${temporaryRoot}\n`);
       }
       await runCleanupSteps(cleanupSteps);
@@ -1619,6 +1639,7 @@ export {
   capPendingDiagnostic,
   combineQualificationAndCleanupErrors,
   connectFrame,
+  createProcessCleanupBoundary,
   download,
   exactTerminalResult,
   expectedBridgeChecksum,

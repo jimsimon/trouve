@@ -24,6 +24,7 @@ import {
   assertUniqueToolLifecycle,
   capPendingDiagnostic,
   combineQualificationAndCleanupErrors,
+  createProcessCleanupBoundary,
   download,
   exactTerminalResult,
   expectedBridgeChecksum,
@@ -782,50 +783,35 @@ test(
   },
 );
 
-test(
-  "failed process-tree cleanup can retry while the original leader is active",
-  { skip: process.platform === "win32", concurrency: false },
-  async () => {
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-      detached: true,
-      stdio: "ignore",
-    });
-    await new Promise((accept, reject) => {
-      child.once("spawn", accept);
-      child.once("error", reject);
-    });
-
-    const originalKill = process.kill;
-    let injected = false;
-    try {
-      process.kill = (pid, signal) => {
-        if (!injected && pid === -child.pid && signal === "SIGTERM") {
-          injected = true;
-          const error = new Error("injected process-group signal failure");
-          error.code = "EPERM";
-          throw error;
-        }
-        return originalKill(pid, signal);
-      };
-      const failed = terminateProcessTree(child);
-      await assert.rejects(failed, /injected process-group signal failure/u);
-      process.kill = originalKill;
-
-      const retry = terminateProcessTree(child);
-      assert.notEqual(retry, failed);
-      await retry;
-      assert.equal(terminateProcessTree(child), retry);
-    } finally {
-      process.kill = originalKill;
-      try {
-        originalKill(-child.pid, "SIGKILL");
-      } catch (error) {
-        if (error?.code !== "ESRCH") throw error;
-      }
-      await waitForChildSettlement(child, 1_000);
-    }
-  },
-);
+test("failed process-tree cleanup retains Bridge state", async () => {
+  const processCleanup = createProcessCleanupBoundary();
+  let unrelatedCleanupRan = false;
+  let stateRemoved = false;
+  await assert.rejects(
+    runCleanupSteps([
+      ["terminate SDK Bridge process tree", () => processCleanup.terminate(async () => {
+        throw new Error("injected termination failure");
+      })],
+      ["close callback server", async () => {
+        unrelatedCleanupRan = true;
+      }],
+      ["remove SDK Bridge state", () => processCleanup.remove(
+        "SDK Bridge state",
+        async () => {
+          stateRemoved = true;
+        },
+      )],
+    ]),
+    (error) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(error.message, /injected termination failure/u);
+      assert.match(error.message, /state retained because SDK Bridge process-tree cleanup failed/u);
+      return true;
+    },
+  );
+  assert.equal(unrelatedCleanupRan, true);
+  assert.equal(stateRemoved, false);
+});
 
 test("repeated signals wait for the same asynchronous cleanup", async () => {
   const target = new EventEmitter();
