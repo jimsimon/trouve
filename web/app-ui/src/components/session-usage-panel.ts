@@ -247,7 +247,9 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       if (this.model.startsWith("local/")) {
-        this.#localStatus = await services.protocol.localStatus();
+        const localStatus = await services.protocol.localStatus();
+        if (generation !== this.#generation) return;
+        this.#localStatus = localStatus;
       } else {
         const providerId = this.model.split("/", 1)[0] ?? "";
         const [healthResult, summaryResult] = await Promise.allSettled([
