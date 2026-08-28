@@ -53,6 +53,10 @@ const REVIEW_THREAD_VERIFICATION_EPOCH: Duration = Duration::from_secs(90);
 const REVIEW_RECONCILIATION_FAILURE_RESET_THRESHOLD: u32 = 3;
 const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
+/// A stopped review retains its workspace-registration fence until cleanup is
+/// acknowledged. Retrying promptly keeps transient store/filesystem failures
+/// from unnecessarily occupying a review concurrency slot.
+const REVIEW_WORKSPACE_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const REVIEW_OUTBOX_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -385,6 +389,10 @@ pub struct CodeReviewRuntime {
     thread_listing_progress: Mutex<HashMap<ReviewThreadListingKey, ReviewThreadListingProgress>>,
     thread_listing_locks: Mutex<HashMap<ReviewThreadListingKey, Weak<tokio::sync::Mutex<()>>>>,
     running: Mutex<HashMap<String, RunningReview>>,
+    #[cfg(test)]
+    injected_workspace_cleanup_failures: AtomicUsize,
+    #[cfg(test)]
+    injected_stopped_job_repository: Mutex<Option<std::path::PathBuf>>,
     projection_queue: Mutex<HashMap<String, ProjectionQueueState>>,
     projection_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     diff_cache: Mutex<ReviewDiffCache>,
@@ -4753,17 +4761,12 @@ impl Engine {
             // A blocking registration may outlive its dropped join future. If
             // it crossed the cancellation check before this job stopped,
             // wait for the commit and compensate the review-owned mutation.
-            if let Err(error) = self
-                .cancel_review_workspace_registration_and_session(
-                    &cancel,
-                    &workspace_registration_fence,
-                )
-                .await
-            {
-                self.record_review_error(format!(
-                    "compensating workspace registration for stopped review job {job_id}: {error}"
-                ));
-            }
+            self.cleanup_stopped_review_workspace_until_acknowledged(
+                &job_id,
+                &cancel,
+                &workspace_registration_fence,
+            )
+            .await;
         }
         if result.is_err() {
             let active_threads = match active_threads.lock() {
@@ -4871,6 +4874,67 @@ impl Engine {
                 error = %cleanup_error,
                 "could not delete temporary review-history refs during job cleanup"
             );
+        }
+    }
+
+    async fn cleanup_stopped_review_workspace_until_acknowledged(
+        &self,
+        job_id: &str,
+        cancel: &CancellationToken,
+        workspace_registration_fence: &ReviewWorkspaceRegistrationFence,
+    ) {
+        let mut first_failure = None;
+        loop {
+            let cleanup = {
+                #[cfg(test)]
+                if self
+                    .code_review
+                    .injected_workspace_cleanup_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    Err(EngineError::Internal(anyhow!(
+                        "injected stopped-review workspace cleanup failure"
+                    )))
+                } else {
+                    self.cancel_review_workspace_registration_and_session(
+                        cancel,
+                        workspace_registration_fence,
+                    )
+                    .await
+                }
+
+                #[cfg(not(test))]
+                self.cancel_review_workspace_registration_and_session(
+                    cancel,
+                    workspace_registration_fence,
+                )
+                .await
+            };
+            match cleanup {
+                Ok(()) => {
+                    if let Some(error) = first_failure {
+                        tracing::warn!(
+                            job_id,
+                            %error,
+                            "stopped review workspace cleanup was acknowledged after a retry"
+                        );
+                    }
+                    return;
+                }
+                Err(error) => {
+                    if first_failure.is_none() {
+                        let error = error.to_string();
+                        self.record_review_error(format!(
+                            "compensating workspace registration for stopped review job {job_id}: {error}"
+                        ));
+                        first_failure = Some(error);
+                    }
+                    tokio::time::sleep(REVIEW_WORKSPACE_CLEANUP_RETRY_INTERVAL).await;
+                }
+            }
         }
     }
 
@@ -5030,6 +5094,36 @@ impl Engine {
     ) -> Result<String> {
         let preparation_started = Instant::now();
         let mut job = record.job.clone();
+        #[cfg(test)]
+        let injected_stopped_job_repository = self
+            .code_review
+            .injected_stopped_job_repository
+            .lock()
+            .unwrap()
+            .take();
+        #[cfg(test)]
+        if let Some(repository_path) = injected_stopped_job_repository {
+            let workspace = self.register_review_workspace(
+                repository_path.to_str().unwrap(),
+                Some(job.repository.clone()),
+                superseded,
+                workspace_registration_fence,
+            )?;
+            self.create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id,
+                    idempotency_key: None,
+                    title: Some("injected stopped review".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                superseded,
+                workspace_registration_fence,
+            )
+            .await?;
+            bail!("injected review failure after session creation");
+        }
         let prior_revision_job_exists = self.store.code_review_job_has_prior_revision(
             &job.id,
             &job.repository,
@@ -17274,6 +17368,93 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_job_retries_workspace_cleanup_until_session_artifacts_are_deleted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let git = |args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            command.args(args).current_dir(&repository);
+            assert!(trouve_process::status(&mut command).unwrap().success());
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repository.join("tracked.txt"), "tracked\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-m", "initial"]);
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            temporary.path().join("data"),
+            &crate::config::Config::default(),
+        ));
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:stopped-cleanup-retry");
+        let record = store.claim_code_review_job().unwrap().unwrap();
+        assert_eq!(record.job.id, job.id);
+        engine
+            .code_review
+            .injected_workspace_cleanup_failures
+            .store(1, Ordering::SeqCst);
+        *engine
+            .code_review
+            .injected_stopped_job_repository
+            .lock()
+            .unwrap() = Some(repository);
+
+        let stopped_job = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            async move {
+                engine.run_code_review_job(record).await;
+            }
+        });
+        while engine
+            .code_review
+            .injected_workspace_cleanup_failures
+            .load(Ordering::SeqCst)
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+        let sessions = store.list_sessions(None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+
+        assert!(!stopped_job.is_finished());
+        assert!(store.session(&session.id).unwrap().is_some());
+        assert!(worktree.exists());
+        assert!(
+            engine
+                .code_review
+                .state
+                .lock()
+                .unwrap()
+                .last_error
+                .contains("injected stopped-review workspace cleanup failure")
+        );
+
+        tokio::time::advance(REVIEW_WORKSPACE_CLEANUP_RETRY_INTERVAL).await;
+        stopped_job.await.unwrap();
+        tokio::time::resume();
+
+        assert!(store.session(&session.id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        assert_eq!(
+            store.code_review_job(&job.id).unwrap().unwrap().job.status,
+            "failed"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stopped review session worktree was not deleted");
     }
 
     fn queue_test_final_editor_retry(
