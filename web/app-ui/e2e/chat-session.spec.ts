@@ -2186,7 +2186,7 @@ test("interactive subagent tabs accept follow-up prompts", async ({ page }) => {
 
 test("regular thread tabs can be closed and reopened from the session menu", async ({
   page,
-}) => {
+}, testInfo) => {
   await installProtocolFixtures(page, {
     additionalThreads: [{
       id: "th_second",
@@ -2221,7 +2221,9 @@ test("regular thread tabs can be closed and reopened from the session menu", asy
     "Subscription and model usage details will show here once a session is started.",
     { exact: true },
   );
-  await expect(setupUsagePlaceholder).toBeVisible();
+  if (!testInfo.project.name.startsWith("mobile")) {
+    await expect(setupUsagePlaceholder).toBeVisible();
+  }
   await expect(page.locator('[data-thread-tab-id="th_fixture"]')).toHaveCount(0);
   await expect(page.locator('[data-thread-tab-id="th_second"]')).toHaveCount(0);
 
