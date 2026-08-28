@@ -772,7 +772,13 @@ impl BridgePool {
         // Shutdown owns the write side until every retained process is reaped.
         // Publish closure before taking that writer wakes all of the selects
         // below, including same-thread queues that hold lifecycle readers.
-        let lifecycle = self.lifecycle.read().await;
+        let lifecycle = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => return Err(Self::closed_error()),
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            _ = events.closed() => return Err(BackendError::Cancelled),
+            lifecycle = self.lifecycle.read() => lifecycle,
+        };
         if !self.is_open() {
             return Err(Self::closed_error());
         }
@@ -3523,6 +3529,31 @@ mod tests {
             .unwrap();
         let error = waiter.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("pool is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn thread_admission_cancellation_does_not_wait_for_the_lifecycle_writer() {
+        let pool = BridgePool::default();
+        let writer = pool.lifecycle.write().await;
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+        let admission = pool.acquire_thread_admission("blocked", &cancel, &events);
+        tokio::pin!(admission);
+        assert!(futures::poll!(admission.as_mut()).is_pending());
+
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), admission)
+                .await
+                .unwrap(),
+            Err(BackendError::Cancelled)
+        ));
+        drop(writer);
     }
 
     #[tokio::test]

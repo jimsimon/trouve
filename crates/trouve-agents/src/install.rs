@@ -247,21 +247,6 @@ fn legacy_managed_bin_path(data_dir: &Path, id: CliId) -> PathBuf {
     data_dir.join("cli").join("bin").join(id.as_str())
 }
 
-fn named_runtime_activation_lock_path(data_dir: &Path, id: &str) -> PathBuf {
-    data_dir
-        .join("cli")
-        .join(".locks")
-        .join(format!("{id}.lock"))
-}
-
-fn named_runtime_lease_directory(data_dir: &Path, id: &str, kind: RuntimeContainerKind) -> PathBuf {
-    data_dir
-        .join("cli")
-        .join(".leases")
-        .join(id)
-        .join(kind.lease_directory())
-}
-
 fn installed_unlocked(data_dir: &Path, id: CliId) -> Option<InstalledCli> {
     let raw = std::fs::read_to_string(cli_root(data_dir, id).join("installed.json")).ok()?;
     let info: InstalledCli = serde_json::from_str(&raw).ok()?;
@@ -720,7 +705,13 @@ impl PreparedInstall {
         // final pointer rename can serve as the single commit point.
         let generations = root.join(".generations");
         std::fs::create_dir_all(&generations)?;
-        enforce_runtime_generation_limit(&generations)?;
+        ensure_runtime_generation_capacity(
+            &self.data_dir,
+            self.id,
+            &root,
+            &generations,
+            &mut sync_path,
+        )?;
         let generation = unique_runtime_path(&generations, &format!("runtime-{}", self.version))?;
         let bin = generation.join(&self.bin_rel);
         let info = InstalledCli {
@@ -981,16 +972,50 @@ fn sync_runtime_tree(
     }
 }
 
-fn enforce_runtime_generation_limit(generations: &Path) -> std::io::Result<()> {
+fn runtime_generation_count(generations: &Path) -> std::io::Result<usize> {
     let mut retained = 0usize;
     for entry in std::fs::read_dir(generations)? {
         if entry?.file_type()?.is_dir() {
             retained += 1;
         }
     }
+    Ok(retained)
+}
+
+fn ensure_runtime_generation_capacity(
+    data_dir: &Path,
+    id: CliId,
+    root: &Path,
+    generations: &Path,
+    sync_path: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let retained = runtime_generation_count(generations)?;
+    if retained < MAX_RETAINED_RUNTIME_GENERATIONS {
+        return Ok(());
+    }
+
+    // Every generation published by this transaction has already had its
+    // contents and `.generations` entry flushed. If the final root sync later
+    // failed, retry durability for the currently visible pointer before
+    // reclaiming anything. Once that succeeds, no crash can select an older
+    // generation, although live backends may still retain one through leases.
+    let active = installed_unlocked(data_dir, id)
+        .and_then(|install| runtime_container(generations, Path::new(&install.bin)))
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "managed runtime retains {retained} recovery generations without a recoverable active pointer"
+            ))
+        })?;
+    sync_runtime_tree(&active, sync_path)?;
+    sync_path(generations)?;
+    sync_path(root)?;
+    prune_runtime_generations(data_dir, id, generations, &active, None);
+    sync_path(generations)?;
+
+    let retained = runtime_generation_count(generations)?;
     if retained >= MAX_RETAINED_RUNTIME_GENERATIONS {
         Err(std::io::Error::other(format!(
-            "managed runtime retains {retained} recovery generations; refusing another activation until the managed install is removed"
+            "managed runtime retains {retained} leased recovery generations; refusing another activation until their users stop"
         )))
     } else {
         Ok(())
@@ -1022,11 +1047,18 @@ fn unique_runtime_path(parent: &Path, label: &str) -> std::io::Result<PathBuf> {
 }
 
 fn runtime_activation_lock_path(data_dir: &Path, id: CliId) -> PathBuf {
-    named_runtime_activation_lock_path(data_dir, id.as_str())
+    data_dir
+        .join("cli")
+        .join(".locks")
+        .join(format!("{}.lock", id.as_str()))
 }
 
 fn runtime_lease_directory(data_dir: &Path, id: CliId, kind: RuntimeContainerKind) -> PathBuf {
-    named_runtime_lease_directory(data_dir, id.as_str(), kind)
+    data_dir
+        .join("cli")
+        .join(".leases")
+        .join(id.as_str())
+        .join(kind.lease_directory())
 }
 
 fn open_runtime_lease_file(
@@ -1067,16 +1099,9 @@ fn runtime_lease_path(
 }
 
 fn lock_runtime_activation(data_dir: &Path, id: CliId) -> std::io::Result<std::fs::File> {
-    lock_runtime_activation_path(runtime_activation_lock_path(data_dir, id))
-}
-
-fn lock_named_runtime_activation(data_dir: &Path, id: &str) -> std::io::Result<std::fs::File> {
-    lock_runtime_activation_path(named_runtime_activation_lock_path(data_dir, id))
-}
-
-fn lock_runtime_activation_path(lock_path: PathBuf) -> std::io::Result<std::fs::File> {
     use fs4::fs_std::FileExt as _;
 
+    let lock_path = runtime_activation_lock_path(data_dir, id);
     std::fs::create_dir_all(lock_path.parent().expect("runtime lock has a parent"))?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -1165,33 +1190,10 @@ pub async fn install(
 /// own copies.
 pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
     let _activation_lock = lock_runtime_activation(data_dir, id)?;
-    let legacy_cursor_root = data_dir.join("cli").join("cursor-agent");
-    // Always serialize a Cursor SDK uninstall with the old namespace before
-    // checking it. Otherwise an older process could publish cursor-agent
-    // between our existence check and cleanup.
-    let _legacy_cursor_activation = if id == CliId::CursorSdkBridge {
-        Some(lock_named_runtime_activation(data_dir, "cursor-agent")?)
-    } else {
-        None
-    };
-    let remove_legacy_cursor = _legacy_cursor_activation.is_some()
-        && std::fs::symlink_metadata(&legacy_cursor_root)
-            .is_ok_and(|metadata| metadata.file_type().is_dir());
-    // An older trouve process can still be running from the pre-SDK Cursor
-    // namespace. Honor its generation locks before changing either managed
-    // installation.
     // Lease files live outside the runtime root, so they remain lockable while
     // that root is removed (including on Windows). Refuse the whole operation
     // before changing any path when another process can still use a runtime.
     let _runtime_leases = lock_all_runtime_leases_exclusive(data_dir, id)?;
-    let legacy_cursor_leases = if remove_legacy_cursor {
-        Some(lock_all_named_runtime_leases_exclusive(
-            data_dir,
-            "cursor-agent",
-        )?)
-    } else {
-        None
-    };
     let link = legacy_managed_bin_path(data_dir, id);
     if link.symlink_metadata().is_ok() {
         std::fs::remove_file(&link)?;
@@ -1200,23 +1202,8 @@ pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
     }
-    if remove_legacy_cursor {
-        for name in ["cursor-agent", "cursor-agent.exe"] {
-            let legacy_link = data_dir.join("cli").join("bin").join(name);
-            match std::fs::remove_file(&legacy_link) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        std::fs::remove_dir_all(&legacy_cursor_root)?;
-    }
     drop(_runtime_leases);
     remove_path(&data_dir.join("cli").join(".leases").join(id.as_str()))?;
-    if remove_legacy_cursor {
-        drop(legacy_cursor_leases);
-        remove_path(&data_dir.join("cli").join(".leases").join("cursor-agent"))?;
-    }
     Ok(())
 }
 
@@ -1224,19 +1211,12 @@ fn lock_all_runtime_leases_exclusive(
     data_dir: &Path,
     id: CliId,
 ) -> std::io::Result<Vec<std::fs::File>> {
-    lock_all_named_runtime_leases_exclusive(data_dir, id.as_str())
-}
-
-fn lock_all_named_runtime_leases_exclusive(
-    data_dir: &Path,
-    id: &str,
-) -> std::io::Result<Vec<std::fs::File>> {
     let mut leases = Vec::new();
     for kind in [
         RuntimeContainerKind::Generation,
         RuntimeContainerKind::Legacy,
     ] {
-        let directory = named_runtime_lease_directory(data_dir, id, kind);
+        let directory = runtime_lease_directory(data_dir, id, kind);
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1254,7 +1234,7 @@ fn lock_all_named_runtime_leases_exclusive(
             if !fs4::fs_std::FileExt::try_lock_exclusive(&lease)? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
-                    format!("managed {id} runtime is still in use"),
+                    format!("managed {} runtime is still in use", id.as_str()),
                 ));
             }
             leases.push(lease);
@@ -2205,7 +2185,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
-    fn consecutive_pointer_sync_failures_stop_at_the_recovery_generation_bound() {
+    fn recovery_generation_bound_blocks_growth_and_recovers_after_sync_returns() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
         let generations = root.join(".generations");
@@ -2258,13 +2238,39 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         };
         let mut checkpoint = |_| Ok(());
         let error = prepared
-            .activate_with_checkpoint_and_sync(&mut checkpoint, |_| Ok(()))
+            .activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
+                if path == root {
+                    Err(std::io::Error::other("root sync is still unavailable"))
+                } else {
+                    Ok(())
+                }
+            })
             .unwrap_err();
-        assert!(error.to_string().contains("refusing another activation"));
+        assert!(error.to_string().contains("root sync is still unavailable"));
         assert!(!staged_path.exists());
         assert_eq!(
             std::fs::read_dir(&generations).unwrap().count(),
             MAX_RETAINED_RUNTIME_GENERATIONS
+        );
+
+        let stage = create_install_stage(&root, "recovered").unwrap();
+        std::fs::write(stage.join("codex"), "recovered").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "recovered".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+        };
+        let mut checkpoint = |_| Ok(());
+        let outcome = prepared
+            .activate_with_checkpoint_and_sync(&mut checkpoint, |_| Ok(()))
+            .unwrap();
+        assert!(matches!(outcome, ActivationOutcome::Durable(_)));
+        assert!(std::fs::read_dir(&generations).unwrap().count() <= 2);
+        assert_eq!(
+            installed(tmp.path(), CliId::Codex).unwrap().version,
+            "recovered"
         );
     }
 
@@ -2441,7 +2447,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
-    fn cursor_sdk_uninstall_removes_the_legacy_managed_cursor_install() {
+    fn cursor_sdk_uninstall_preserves_legacy_runtime_for_older_processes() {
         let tmp = tempfile::tempdir().unwrap();
         let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
         let sdk_bin = sdk_root
@@ -2471,13 +2477,6 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         std::fs::write(&legacy_link, "legacy").unwrap();
         let legacy_windows_link = tmp.path().join("cli").join("bin").join("cursor-agent.exe");
         std::fs::write(&legacy_windows_link, "legacy windows").unwrap();
-        let legacy_leases = named_runtime_lease_directory(
-            tmp.path(),
-            "cursor-agent",
-            RuntimeContainerKind::Generation,
-        );
-        std::fs::create_dir_all(&legacy_leases).unwrap();
-        std::fs::write(legacy_leases.join("runtime-old.lock"), "").unwrap();
         let external = tmp.path().join("system-cursor-agent");
         std::fs::write(&external, "outside trouve's managed layout").unwrap();
 
@@ -2485,41 +2484,10 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
 
         assert!(!sdk_root.exists());
         assert!(sdk_link.symlink_metadata().is_err());
-        assert!(!legacy_root.exists());
-        assert!(!legacy_link.exists());
-        assert!(!legacy_windows_link.exists());
-        assert!(!tmp.path().join("cli/.leases/cursor-agent").exists());
-        assert!(external.exists());
-    }
-
-    #[test]
-    fn cursor_sdk_uninstall_refuses_a_leased_legacy_cursor_runtime() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
-        let legacy_root = tmp.path().join("cli").join("cursor-agent");
-        std::fs::create_dir_all(&sdk_root).unwrap();
-        std::fs::create_dir_all(&legacy_root).unwrap();
-        let lease_dir = named_runtime_lease_directory(
-            tmp.path(),
-            "cursor-agent",
-            RuntimeContainerKind::Generation,
-        );
-        std::fs::create_dir_all(&lease_dir).unwrap();
-        let lease = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lease_dir.join("runtime-active.lock"))
-            .unwrap();
-        fs4::fs_std::FileExt::lock_shared(&lease).unwrap();
-
-        let error = uninstall(tmp.path(), CliId::CursorSdkBridge).unwrap_err();
-
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(sdk_root.exists());
         assert!(legacy_root.exists());
-        fs4::fs_std::FileExt::unlock(&lease).unwrap();
+        assert!(legacy_link.exists());
+        assert!(legacy_windows_link.exists());
+        assert!(external.exists());
     }
 
     #[test]
