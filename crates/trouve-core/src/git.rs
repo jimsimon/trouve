@@ -4987,8 +4987,7 @@ line three
         let head = run(tmp.path(), &["rev-parse", "HEAD"]);
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let metadata_error =
-            diff_files_between(tmp.path(), &base, &head, 8, &cancel).unwrap_err();
+        let metadata_error = diff_files_between(tmp.path(), &base, &head, 8, &cancel).unwrap_err();
         let metadata_message = metadata_error.to_string();
         assert!(
             metadata_message.contains("review diff metadata exceeds the 8-byte limit")
