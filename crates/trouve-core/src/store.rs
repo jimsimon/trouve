@@ -622,23 +622,33 @@ CREATE TABLE IF NOT EXISTS code_review_polled_comments (
 );
 "#;
 
-// Keep the one-time backfill in the same batch as the column addition. On
-// later opens the duplicate-column error stops this batch before it can
-// revisit the event log.
-const USAGE_MODEL_MIGRATION: &str = "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT '';
-WITH turn_models AS MATERIALIZED (
+const USAGE_MODEL_COLUMN_MIGRATION: &str =
+    "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT ''";
+
+// Retried independently from the column addition so an interrupted upgrade
+// can resume. Materialize the small set of blank usage keys first, then use
+// the events scope index so unrelated thread histories are never ranked.
+const USAGE_MODEL_BACKFILL: &str = "WITH missing_usage AS MATERIALIZED (
+  SELECT DISTINCT thread_id, turn
+  FROM usage
+  WHERE model = ''
+),
+turn_models AS MATERIALIZED (
   SELECT
-    scope_id AS thread_id,
-    CAST(json_extract(payload, '$.turn') AS INTEGER) AS turn,
-    json_extract(payload, '$.model') AS model,
+    events.scope_id AS thread_id,
+    CAST(json_extract(events.payload, '$.turn') AS INTEGER) AS turn,
+    json_extract(events.payload, '$.model') AS model,
     ROW_NUMBER() OVER (
-      PARTITION BY scope_id, CAST(json_extract(payload, '$.turn') AS INTEGER)
-      ORDER BY cursor DESC
+      PARTITION BY events.scope_id, CAST(json_extract(events.payload, '$.turn') AS INTEGER)
+      ORDER BY events.cursor DESC
     ) AS model_rank
-  FROM events
-  WHERE scope_kind = 'thread'
-    AND json_extract(payload, '$.type') = 'turn.started'
-    AND typeof(json_extract(payload, '$.model')) = 'text'
+  FROM missing_usage
+  CROSS JOIN events INDEXED BY events_scope
+  WHERE events.scope_kind = 'thread'
+    AND events.scope_id = missing_usage.thread_id
+    AND CAST(json_extract(events.payload, '$.turn') AS INTEGER) = missing_usage.turn
+    AND json_extract(events.payload, '$.type') = 'turn.started'
+    AND typeof(json_extract(events.payload, '$.model')) = 'text'
 )
 UPDATE usage
 SET model = turn_models.model
@@ -815,7 +825,7 @@ const MIGRATIONS: &[&str] = &[
     // (fixed default budgets). Persisted so retries re-batch identically
     // even when provider metadata is transiently unavailable.
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
-    USAGE_MODEL_MIGRATION,
+    USAGE_MODEL_COLUMN_MIGRATION,
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -881,6 +891,8 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
+    conn.execute_batch(USAGE_MODEL_BACKFILL)
+        .context("usage model backfill failed")?;
     preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
@@ -15323,11 +15335,52 @@ mod tests {
     }
 
     #[test]
-    fn usage_model_backfill_materializes_the_event_mapping_once() {
+    fn usage_model_backfill_resumes_when_column_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("usage-model-resume.db");
+        {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "partial-upgrade-thread");
+            store
+                .append_event(
+                    Scope::Thread("partial-upgrade-thread".into()),
+                    Event::TurnStarted {
+                        turn: 4,
+                        mode: "code".into(),
+                        model: "resumed/model".into(),
+                        thinking_level: None,
+                        supports_steering: false,
+                    },
+                )
+                .unwrap();
+            store
+                .record_usage(
+                    "se_q",
+                    "partial-upgrade-thread",
+                    4,
+                    "",
+                    &trouve_protocol::Usage {
+                        input_tokens: 10,
+                        ..Default::default()
+                    },
+                    10,
+                )
+                .unwrap();
+        }
+
+        let reopened = Store::open(&path).unwrap();
+        let summary = reopened
+            .usage_summary(UsageScope::Thread("partial-upgrade-thread"))
+            .unwrap();
+        assert_eq!(summary.models.len(), 1);
+        assert_eq!(summary.models[0].model, "resumed/model");
+    }
+
+    #[test]
+    fn usage_model_backfill_only_ranks_missing_usage_histories() {
         let store = Store::open_in_memory().unwrap();
         let conn = store.conn.lock().unwrap();
-        let update_sql = USAGE_MODEL_MIGRATION.split_once(';').unwrap().1;
-        let explain = format!("EXPLAIN QUERY PLAN {update_sql}");
+        let explain = format!("EXPLAIN QUERY PLAN {USAGE_MODEL_BACKFILL}");
         let mut statement = conn.prepare(&explain).unwrap();
         let plan = statement
             .query_map([], |row| row.get::<_, String>(3))
@@ -15337,14 +15390,22 @@ mod tests {
 
         assert!(
             plan.iter()
+                .any(|detail| detail.contains("MATERIALIZE missing_usage")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
                 .any(|detail| detail.contains("MATERIALIZE turn_models")),
             "{plan:?}"
         );
-        assert_eq!(
-            plan.iter()
-                .filter(|detail| detail.contains("events"))
-                .count(),
-            1,
+        let event_access = plan
+            .iter()
+            .filter(|detail| detail.contains("events"))
+            .collect::<Vec<_>>();
+        assert_eq!(event_access.len(), 1, "{plan:?}");
+        assert!(
+            event_access[0].contains("USING INDEX events_scope")
+                && event_access[0].contains("scope_kind=? AND scope_id=?"),
             "{plan:?}"
         );
         assert!(
