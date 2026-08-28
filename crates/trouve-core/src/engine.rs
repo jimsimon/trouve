@@ -102,6 +102,10 @@ const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// this outer aggregate budget leaves room for that normal path while fencing
 /// every backend implementation at the registry boundary.
 const BACKEND_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const BACKEND_RETIREMENT_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const BACKEND_RETIREMENT_RETRY_MAX: Duration = Duration::from_secs(30);
+const RUNTIME_UNINSTALL_LEASE_RETRIES: usize = 4;
+const RUNTIME_UNINSTALL_LEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
 
@@ -2114,13 +2118,15 @@ impl Drop for AutomatedReviewToolBudgetGuard {
 }
 
 /// Owns one serialized backend-registry transition while the previous active
-/// instances are retired. Dropping an unpublished transition is the
-/// cancellation and error rollback path: it rebuilds the affected ids from the
-/// current durable configuration before releasing the transition lock.
+/// instances are retired. Once an active entry is detached, dropping an
+/// unpublished transition is the cancellation and error rollback path: it
+/// rebuilds the affected ids from durable configuration before releasing the
+/// transition lock. A transition that only retries an older retained owner
+/// leaves the still-active entry untouched on failure.
 struct BackendRetirement {
     engine: Weak<Engine>,
     target_ids: HashSet<String>,
-    publish_on_drop: bool,
+    rollback_on_drop: bool,
     _transition: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -2133,7 +2139,7 @@ impl BackendRetirement {
         Self {
             engine: Arc::downgrade(engine),
             target_ids,
-            publish_on_drop: true,
+            rollback_on_drop: false,
             _transition: transition,
         }
     }
@@ -2142,16 +2148,20 @@ impl BackendRetirement {
     /// release the serialized transition. This is synchronous so no
     /// cancellation point can separate durable mutation from publication.
     fn publish(mut self) {
-        self.publish_on_drop = false;
+        self.rollback_on_drop = false;
         if let Some(engine) = self.engine.upgrade() {
             engine.replace_provider_registries_for_ids(&self.target_ids);
         }
+    }
+
+    fn arm_rollback(&mut self) {
+        self.rollback_on_drop = true;
     }
 }
 
 impl Drop for BackendRetirement {
     fn drop(&mut self) {
-        if self.publish_on_drop
+        if self.rollback_on_drop
             && let Some(engine) = self.engine.upgrade()
         {
             engine.replace_provider_registries_for_ids(&self.target_ids);
@@ -2159,12 +2169,14 @@ impl Drop for BackendRetirement {
     }
 }
 
+type RetiringBackendBatch = Vec<(String, Arc<dyn AgentBackend>)>;
+
 /// Complete one detached cleanup batch and drop every backend owner before
 /// handing the transition back to a caller that may immediately remove the
 /// managed runtime those backends leased.
 async fn shutdown_retiring_backend_batch(
     engine: &Engine,
-    retiring: Vec<(String, Arc<dyn AgentBackend>)>,
+    retiring: RetiringBackendBatch,
     deadline: tokio::time::Instant,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -2232,6 +2244,9 @@ pub struct Engine {
     /// retry. Keeping cleanup ownership separate prevents a closed instance
     /// from remaining selectable without orphaning its vendor processes.
     retiring_backends: Mutex<HashMap<String, Vec<Arc<dyn AgentBackend>>>>,
+    /// One supervised, bounded-backoff retry worker owns failed backend
+    /// shutdowns independently of later settings or runtime operations.
+    retiring_backend_retry_started: AtomicBool,
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
@@ -2622,8 +2637,20 @@ fn build_all_providers(
     secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
     catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> HashMap<String, Arc<dyn Provider>> {
+    build_providers_for_ids(config, secrets, catalog, None)
+}
+
+fn build_providers_for_ids(
+    config: &Config,
+    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
+    target_ids: Option<&HashSet<String>>,
+) -> HashMap<String, Arc<dyn Provider>> {
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     for (id, pc) in &config.providers {
+        if target_ids.is_some_and(|target_ids| !target_ids.contains(id)) {
+            continue;
+        }
         if is_backend_kind(&pc.kind) {
             continue; // handled by build_all_backends
         }
@@ -2635,12 +2662,14 @@ fn build_all_providers(
         }
     }
     // Zero-config defaults from conventional env vars.
-    if !providers.contains_key("openai")
+    if target_ids.is_none_or(|target_ids| target_ids.contains("openai"))
+        && !providers.contains_key("openai")
         && let Ok(p) = trouve_providers::openai_compat::OpenAiCompatProvider::openai_from_env()
     {
         providers.insert("openai".into(), Arc::new(p.with_catalog(catalog.clone())));
     }
-    if !providers.contains_key("anthropic")
+    if target_ids.is_none_or(|target_ids| target_ids.contains("anthropic"))
+        && !providers.contains_key("anthropic")
         && let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
     {
         providers.insert(
@@ -2791,6 +2820,7 @@ impl Engine {
             injected_providers: Mutex::new(injected_providers),
             backends: Arc::new(RwLock::new(backends)),
             retiring_backends: Mutex::new(HashMap::new()),
+            retiring_backend_retry_started: AtomicBool::new(false),
             injected_backends: Mutex::new(HashMap::new()),
             background_turn_intake: Mutex::new(Vec::new()),
             background_turn_intake_notify: Arc::new(tokio::sync::Notify::new()),
@@ -3682,6 +3712,12 @@ impl Engine {
         id: &str,
         req: &UpsertProviderRequest,
     ) -> Result<ProviderInfo, EngineError> {
+        if req.kind == "cursor-cli" {
+            return Err(EngineError::BadRequest(
+                "cursor-cli is a read-only legacy migration state; save Cursor as cursor-sdk with an API key"
+                    .into(),
+            ));
+        }
         if !matches!(
             req.kind.as_str(),
             "openai-compat"
@@ -4345,7 +4381,20 @@ impl Engine {
         // it and publishing its replacement: cancellation cannot strand a
         // missing registry entry. Delayed turn clones remain protected by the
         // install layer and surface a retryable conflict.
-        let uninstall = trouve_agents::install::uninstall(&self.data_dir, cli).map_err(|error| {
+        let mut lease_attempt = 0;
+        let uninstall = loop {
+            match trouve_agents::install::uninstall(&self.data_dir, cli) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && lease_attempt < RUNTIME_UNINSTALL_LEASE_RETRIES =>
+                {
+                    lease_attempt += 1;
+                    tokio::time::sleep(RUNTIME_UNINSTALL_LEASE_RETRY_DELAY).await;
+                }
+                result => break result,
+            }
+        }
+        .map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 EngineError::Conflict(format!(
                     "managed {} runtime is still in use; retry uninstall after active turns finish",
@@ -5540,7 +5589,8 @@ impl Engine {
     /// cannot select a closing instance. The shutdown work owns the transition
     /// lock in a detached task; request cancellation therefore cannot stop
     /// cleanup or strand registry publication. Failed instances stay in the
-    /// retiring registry and are retried by the next matching transition.
+    /// retiring registry under a supervised bounded-backoff retry; a matching
+    /// user transition also retries them before detaching another generation.
     async fn retire_config_backends_matching_ids(
         self: &Arc<Self>,
         target_ids: &HashSet<String>,
@@ -5569,61 +5619,28 @@ impl Engine {
         transition: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<BackendRetirement, EngineError> {
         let retirement = BackendRetirement::new(self, target_ids.clone(), transition);
-        let injected = self
-            .injected_backends
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let retiring = {
-            let mut backends = self.backends.write().unwrap();
-            let mut retiring_backends = self.retiring_backends.lock().unwrap();
-            let mut selected = Vec::new();
-            for id in target_ids {
-                let detach = backends.get(id).is_some_and(|backend| {
-                    !injected
-                        .iter()
-                        .any(|candidate| Arc::ptr_eq(candidate, backend))
-                });
-                if detach && let Some(backend) = backends.remove(id) {
-                    let entries = retiring_backends.entry(id.clone()).or_default();
-                    if !entries
-                        .iter()
-                        .any(|candidate| Arc::ptr_eq(candidate, &backend))
-                    {
-                        entries.push(backend);
-                    }
-                }
-                if let Some(entries) = retiring_backends.get(id) {
-                    for backend in entries {
-                        if !selected
-                            .iter()
-                            .any(|(_, candidate)| Arc::ptr_eq(candidate, backend))
-                        {
-                            selected.push((id.clone(), backend.clone()));
-                        }
-                    }
-                }
-            }
-            selected
-        };
-        if retiring.is_empty() {
-            return Ok(retirement);
-        }
-
         let engine = Arc::clone(self);
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let _retirement_task = tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + timeout;
-            let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
-            let completion = if failures.is_empty() {
-                Ok(retirement)
-            } else {
-                Err(EngineError::Internal(anyhow!(
-                    "backend retirement failed: {}",
-                    failures.join("; ")
-                )))
+            let mut retirement = retirement;
+            let completion = loop {
+                let (retiring, detached_active) =
+                    engine.select_retiring_backends(&retirement.target_ids);
+                if detached_active {
+                    retirement.arm_rollback();
+                }
+                if retiring.is_empty() {
+                    break Ok(retirement);
+                }
+                let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
+                if !failures.is_empty() {
+                    engine.ensure_retiring_backend_retry();
+                    break Err(EngineError::Internal(anyhow!(
+                        "backend retirement failed: {}",
+                        failures.join("; ")
+                    )));
+                }
             };
             let _ = completion_tx.send(completion);
         });
@@ -5632,6 +5649,106 @@ impl Engine {
                 "backend retirement task exited before reporting completion: {error}"
             ))
         })?
+    }
+
+    /// Retry previously failed owners before detaching the currently active
+    /// generation. This keeps at most one failed generation per provider even
+    /// when repeated reload/uninstall requests arrive during an outage.
+    fn select_retiring_backends(
+        &self,
+        target_ids: &HashSet<String>,
+    ) -> (RetiringBackendBatch, bool) {
+        let injected = self
+            .injected_backends
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut backends = self.backends.write().unwrap();
+        let mut retiring_backends = self.retiring_backends.lock().unwrap();
+        let mut selected = Vec::new();
+        let mut detached_active = false;
+        for id in target_ids {
+            if let Some(entries) = retiring_backends.get(id)
+                && !entries.is_empty()
+            {
+                selected.extend(entries.iter().cloned().map(|backend| (id.clone(), backend)));
+                continue;
+            }
+            let detach = backends.get(id).is_some_and(|backend| {
+                !injected
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, backend))
+            });
+            if detach && let Some(backend) = backends.remove(id) {
+                retiring_backends
+                    .entry(id.clone())
+                    .or_default()
+                    .push(backend.clone());
+                selected.push((id.clone(), backend));
+                detached_active = true;
+            }
+        }
+        (selected, detached_active)
+    }
+
+    /// Start at most one weakly owned cleanup supervisor. Permanent vendor
+    /// failures retain the process owner but neither grow generations nor keep
+    /// the Engine alive after its external owners are gone.
+    fn ensure_retiring_backend_retry(self: &Arc<Self>) {
+        if self
+            .retiring_backend_retry_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let engine = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut delay = BACKEND_RETIREMENT_RETRY_INITIAL;
+            loop {
+                tokio::time::sleep(delay).await;
+                let Some(engine) = engine.upgrade() else {
+                    return;
+                };
+                let _transition = engine.provider_reload.clone().lock_owned().await;
+                let retiring = engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(id, entries)| {
+                        entries
+                            .iter()
+                            .cloned()
+                            .map(|backend| (id.clone(), backend))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                if retiring.is_empty() {
+                    break;
+                }
+                let deadline = tokio::time::Instant::now() + BACKEND_RETIREMENT_TIMEOUT;
+                let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
+                if failures.is_empty() && engine.retiring_backends.lock().unwrap().is_empty() {
+                    break;
+                }
+                tracing::warn!(
+                    failures = %failures.join("; "),
+                    "retrying retained backend shutdown after bounded backoff"
+                );
+                delay = (delay * 2).min(BACKEND_RETIREMENT_RETRY_MAX);
+            }
+            if let Some(engine) = engine.upgrade() {
+                engine
+                    .retiring_backend_retry_started
+                    .store(false, Ordering::Release);
+                if !engine.retiring_backends.lock().unwrap().is_empty() {
+                    engine.ensure_retiring_backend_retry();
+                }
+            }
+        });
     }
 
     fn release_retiring_backend(&self, id: &str, backend: &Arc<dyn AgentBackend>) {
@@ -5652,8 +5769,12 @@ impl Engine {
     /// instances keep their vendor sessions, process pools, and receivers.
     fn replace_provider_registries_for_ids(&self, target_ids: &HashSet<String>) {
         let config = self.config.lock().unwrap().clone();
-        let mut provider_replacements =
-            build_all_providers(&config, &self.secrets, &self.model_catalog);
+        let mut provider_replacements = build_providers_for_ids(
+            &config,
+            &self.secrets,
+            &self.model_catalog,
+            Some(target_ids),
+        );
         let injected_providers = self.injected_providers.lock().unwrap().clone();
         let mut providers = self.providers.write().unwrap();
         for id in target_ids {
@@ -26311,6 +26432,75 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
+    async fn public_provider_upsert_rejects_the_legacy_cursor_cli_kind() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-cli".into(),
+                command: Some("cursor-agent".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let error = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-cli".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("legacy migration state"));
+        let config = engine.config.lock().unwrap();
+        assert_eq!(config.providers["cursor"].kind, "cursor-cli");
+        assert_eq!(
+            config.providers["cursor"].command.as_deref(),
+            Some("cursor-agent")
+        );
+    }
+
+    #[test]
+    fn targeted_provider_rebuild_constructs_only_requested_api_providers() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for id in ["target-api", "unrelated-api"] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: "openai-compat".into(),
+                    base_url: Some(format!("https://{id}.example.test/v1")),
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        let replacements = build_providers_for_ids(
+            &config,
+            &engine.secrets,
+            &engine.model_catalog,
+            Some(&HashSet::from(["target-api".to_string()])),
+        );
+
+        assert_eq!(replacements.len(), 1);
+        assert!(replacements.contains_key("target-api"));
+    }
+
+    #[tokio::test]
     async fn title_model_provider_refresh_waits_for_provider_transition() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -26371,6 +26561,47 @@ default_permission_mode = "ask"
 
     struct FailingShutdownBackend {
         shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    struct TransientShutdownBackend {
+        shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for TransientShutdownBackend {
+        fn id(&self) -> &str {
+            "transient-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            let attempt = self
+                .shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err(BackendError::Protocol("transient shutdown failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
     }
 
     #[async_trait::async_trait]
@@ -26764,6 +26995,102 @@ default_permission_mode = "ask"
             .expect("a later transition could not retry retained cleanup");
         retirement.publish();
         assert!(engine.retiring_backends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_backend_retirement_retries_without_another_user_transition() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let transient = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), transient.clone());
+
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&HashSet::from(["cursor".to_string()]))
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if engine.retiring_backends.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained backend did not receive an autonomous retry");
+        assert_eq!(
+            transient
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_retirement_does_not_detach_another_generation() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let failing: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), failing);
+        let targets = HashSet::from(["cursor".to_string()]);
+
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&targets)
+                .await
+                .is_err()
+        );
+        let active_after_first = engine.backends.read().unwrap()["cursor"].clone();
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&targets)
+                .await
+                .is_err()
+        );
+
+        assert!(Arc::ptr_eq(
+            &active_after_first,
+            &engine.backends.read().unwrap()["cursor"]
+        ));
+        assert_eq!(engine.retiring_backends.lock().unwrap()["cursor"].len(), 1);
     }
 
     #[tokio::test]

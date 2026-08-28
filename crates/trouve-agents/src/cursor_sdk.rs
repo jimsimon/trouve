@@ -479,6 +479,11 @@ impl BridgeLease {
             .as_ref()
             .expect("a live Cursor Bridge lease owns its process")
     }
+
+    fn release_thread_gate(&mut self) {
+        self.thread_guard.take();
+        notify_available(&self.available);
+    }
 }
 
 impl std::ops::Deref for BridgeLease {
@@ -714,32 +719,30 @@ impl BridgePool {
         notify_available(&self.available);
         let _lifecycle = self.lifecycle.write().await;
         let mut first_error = None;
-        loop {
-            let thread_ids = self
-                .processes
-                .lock()
-                .await
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            if thread_ids.is_empty() {
-                break;
+        let thread_ids = self
+            .processes
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for thread_id in thread_ids {
+            let gate = self.thread_gate(&thread_id).await;
+            let _guard = gate.lock_owned().await;
+            let process = self.processes.lock().await.remove(&thread_id);
+            let Some(process) = process else {
+                continue;
+            };
+            process.quarantine();
+            if let Err(error) = process.terminate().await {
+                self.restore_if_vacant(&thread_id, process).await;
+                first_error.get_or_insert(error);
             }
-            for thread_id in thread_ids {
-                let gate = self.thread_gate(&thread_id).await;
-                let _guard = gate.lock_owned().await;
-                let process = self.processes.lock().await.remove(&thread_id);
-                let Some(process) = process else {
-                    continue;
-                };
-                process.quarantine();
-                if let Err(error) = process.terminate().await {
-                    first_error.get_or_insert(error);
-                }
-                notify_available(&self.available);
-            }
+            notify_available(&self.available);
         }
-        self.thread_gates.lock().await.clear();
+        if self.processes.lock().await.is_empty() {
+            self.thread_gates.lock().await.clear();
+        }
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -773,6 +776,26 @@ impl BridgePool {
             .await
             .entry(thread_id.to_string())
             .or_insert(process);
+    }
+
+    async fn terminate_after_declined_retention(
+        &self,
+        thread_id: &str,
+        process: &BridgeLease,
+    ) -> Result<(), BackendError> {
+        let gate = self.thread_gate(thread_id).await;
+        let _guard = gate.lock_owned().await;
+        let still_owned = self
+            .processes
+            .lock()
+            .await
+            .get(thread_id)
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, process.pooled()));
+        if !still_owned {
+            // A racing pool shutdown already reaped this exact process.
+            return Ok(());
+        }
+        self.terminate_and_remove(thread_id, process).await
     }
 
     async fn acquire_capacity(
@@ -922,6 +945,14 @@ fn notify_available(available: &Notify) {
     available.notify_one();
 }
 
+async fn retain_lease_if_open<F>(pool: &BridgePool, lease: &mut BridgeLease, retain: F) -> bool
+where
+    F: FnOnce(&BridgeLease),
+{
+    lease.release_thread_gate();
+    pool.retain_if_open(|| async { retain(lease) }).await
+}
+
 struct PooledBridge {
     bridge: Mutex<BridgeProcess>,
     reusable: AtomicBool,
@@ -1021,7 +1052,7 @@ async fn run_sdk_turn(
         return Ok(TurnTerminal::ConsumerClosed);
     }
     let state_dir = thread_state_dir(state_root, provider_id, &turn.thread_id);
-    let process = match pool
+    let mut process = match pool
         .process_for(
             &turn.thread_id,
             BridgeProcessRequest {
@@ -1220,17 +1251,23 @@ async fn run_sdk_turn(
     // Drop the Bridge mutex before waiting for the lifecycle reader: a queued
     // shutdown writer may need that mutex to drain the process. Once admitted,
     // retain_if_open keeps the retention commit ordered before shutdown.
-    let keep_warm = warm_eligible
-        && pool
-            .retain_if_open(|| async {
-                process.touch();
-            })
-            .await;
+    let keep_warm = if warm_eligible {
+        // Never wait for the lifecycle reader while owning the per-thread
+        // gate: shutdown owns the writer before acquiring that same gate.
+        retain_lease_if_open(pool, &mut process, |process| process.touch()).await
+    } else {
+        false
+    };
 
     if keep_warm {
         return outcome;
     }
-    let process_cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
+    let process_cleanup = if warm_eligible {
+        pool.terminate_after_declined_retention(&turn.thread_id, &process)
+            .await
+    } else {
+        pool.terminate_and_remove(&turn.thread_id, &process).await
+    };
     finish_recycled_turn(outcome, release, process_cleanup)
 }
 
@@ -1950,11 +1987,22 @@ fn callback_fingerprint(request: &CustomToolRequest) -> CallbackKey {
     let mut digest = Sha256::new();
     digest.update((request.tool_name.len() as u64).to_le_bytes());
     digest.update(request.tool_name.as_bytes());
-    let args = serde_json::to_vec(&request.args)
+    serde_json::to_writer(DigestWriter(&mut digest), &request.args)
         .expect("a deserialized Cursor callback argument remains serializable");
-    digest.update((args.len() as u64).to_le_bytes());
-    digest.update(args);
     digest.finalize().into()
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn secure_text_eq(left: &str, right: &str) -> bool {
@@ -2089,6 +2137,7 @@ impl BridgeProcess {
             }
         };
         let process_secrets = vec![api_key.to_string(), callback.bearer.clone(), token.clone()];
+        redact_diagnostics(&mut diagnostics, &process_secrets);
         let process_secret_count = process_secrets.len();
         let secrets = Arc::new(StdMutex::new(process_secrets));
         let shared_diagnostics = Arc::new(tokio::sync::Mutex::new(diagnostics));
@@ -2336,6 +2385,13 @@ fn push_diagnostic(lines: &mut VecDeque<String>, line: String) {
     lines.push_back(bounded_text(&line));
 }
 
+fn redact_diagnostics(lines: &mut VecDeque<String>, secrets: &[String]) {
+    let secrets = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+    for line in lines {
+        *line = redact(line, &secrets);
+    }
+}
+
 fn startup_error_with_diagnostics(
     error: BackendError,
     diagnostics: &VecDeque<String>,
@@ -2435,8 +2491,9 @@ impl BridgeClient {
         timeout: Duration,
     ) -> Result<Value, BridgeRpcFailure> {
         let url = format!("{}/sdk.v1.{service}/{method}", self.base_url);
-        let response = tokio::time::timeout(
-            timeout,
+        let deadline = tokio::time::Instant::now() + timeout;
+        let response = tokio::time::timeout_at(
+            deadline,
             self.http
                 .post(url)
                 .bearer_auth(&self.token)
@@ -2447,8 +2504,8 @@ impl BridgeClient {
         .await
         .map_err(|_| BackendError::Protocol(format!("{method} timed out")))?
         .map_err(|error| BackendError::Protocol(format!("{method}: {error}")))?;
-        let (status, bytes) = tokio::time::timeout(
-            timeout,
+        let (status, bytes) = tokio::time::timeout_at(
+            deadline,
             read_bounded_response(response, method, MAX_RPC_BODY_BYTES),
         )
         .await
@@ -2486,14 +2543,18 @@ impl BridgeClient {
     }
 
     async fn diagnostic_suffix(&self) -> String {
-        let diagnostics = self.diagnostics.lock().await;
+        let diagnostics = self
+            .diagnostics
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ");
         if diagnostics.is_empty() {
             String::new()
         } else {
-            format!(
-                "; Bridge diagnostics: {}",
-                diagnostics.iter().cloned().collect::<Vec<_>>().join(" | ")
-            )
+            format!("; Bridge diagnostics: {}", self.redact(&diagnostics))
         }
     }
 }
@@ -3572,6 +3633,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_retention_releases_thread_gate_before_waiting_for_lifecycle() {
+        let pool = BridgePool::default();
+        let lifecycle_writer = pool.lifecycle.write().await;
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.clone().lock_owned().await;
+        let mut lease = BridgeLease {
+            process: None,
+            thread_guard: Some(guard),
+            available: pool.available.clone(),
+        };
+        let retention = retain_lease_if_open(&pool, &mut lease, |_| {});
+        tokio::pin!(retention);
+
+        assert!(matches!(
+            futures::poll!(retention.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            gate.clone().try_lock_owned().is_ok(),
+            "retention waited for the lifecycle reader while holding the thread gate"
+        );
+        drop(lifecycle_writer);
+        assert!(retention.await);
+    }
+
+    #[test]
+    fn buffered_startup_diagnostics_are_reredacted_after_token_discovery() {
+        let token = "bridge-secret-token".to_string();
+        let mut diagnostics = VecDeque::from([format!("startup echoed {token}")]);
+        redact_diagnostics(&mut diagnostics, std::slice::from_ref(&token));
+        assert_eq!(diagnostics[0], "startup echoed [REDACTED]");
+    }
+
+    #[test]
+    fn callback_fingerprints_are_stable_and_cover_arguments() {
+        let request = |value| CustomToolRequest {
+            tool_name: "trouve_test".into(),
+            tool_call_id: Some("call".into()),
+            agent_id: "agent".into(),
+            args: json!({ "value": value }),
+        };
+        assert_eq!(
+            callback_fingerprint(&request(1)),
+            callback_fingerprint(&request(1))
+        );
+        assert_ne!(
+            callback_fingerprint(&request(1)),
+            callback_fingerprint(&request(2))
+        );
+    }
+
+    #[tokio::test]
     async fn projection_rejects_done_false_as_completion() {
         let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
         let _stream = async_stream(move |events| async move {
@@ -3684,6 +3797,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeded 4 bytes"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unary_rpc_uses_one_aggregate_header_and_body_deadline() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/sdk.v1.FixtureService/Slow",
+                    post(|| async {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        Response::builder()
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from_stream(futures::stream::once(
+                                async {
+                                    tokio::time::sleep(Duration::from_millis(60)).await;
+                                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
+                                        b"{}",
+                                    ))
+                                },
+                            )))
+                            .unwrap()
+                    }),
+                ),
+            )
+            .await
+        });
+        let client = BridgeClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+            token: "fixture-token".into(),
+            secrets: Arc::new(StdMutex::new(vec!["fixture-token".into()])),
+            process_secret_count: 1,
+            diagnostics: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+        };
+
+        let error = client
+            .unary_with_timeout(
+                "FixtureService",
+                "Slow",
+                json!({}),
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("response timed out"));
         server.abort();
     }
 

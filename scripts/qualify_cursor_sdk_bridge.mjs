@@ -103,6 +103,10 @@ const FORBIDDEN_BUILT_INS = new Set([
   "web",
   "write",
 ]);
+const canonicalToolName = (name) => String(name).toLowerCase().replace(/[^a-z0-9]+/gu, "");
+const FORBIDDEN_NATIVE_TOOL_NAMES = new Set(
+  CURSOR_NATIVE_TOOL_DENYLIST.map(canonicalToolName),
+);
 
 class QualificationError extends Error {}
 
@@ -649,6 +653,9 @@ async function startBridge({
       throw new QualificationError("Cursor SDK Bridge returned an empty bearer token");
     }
     secrets.push(token);
+    for (let index = 0; index < diagnostics.length; index += 1) {
+      diagnostics[index] = redact(diagnostics[index], secrets);
+    }
     return {
       child,
       diagnostics,
@@ -662,7 +669,20 @@ async function startBridge({
   }
 }
 
-async function terminateProcessTree(child) {
+const PROCESS_TREE_TERMINATIONS = new WeakMap();
+
+function terminateProcessTree(child) {
+  if (child === null || (typeof child !== "object" && typeof child !== "function")) {
+    return Promise.resolve();
+  }
+  const existing = PROCESS_TREE_TERMINATIONS.get(child);
+  if (existing !== undefined) return existing;
+  const termination = terminateProcessTreeOnce(child);
+  PROCESS_TREE_TERMINATIONS.set(child, termination);
+  return termination;
+}
+
+async function terminateProcessTreeOnce(child) {
   if (!Number.isInteger(child?.pid)) return;
   if (process.platform === "win32") {
     const exited = () => child.exitCode !== null || child.signalCode !== null;
@@ -1010,11 +1030,14 @@ function exactTerminalResult(frames, label) {
   return results[0].result;
 }
 
-function toolIsForbidden(name) {
+export function toolIsForbidden(name) {
   const normalized = String(name).toLowerCase().replace(/[^a-z0-9]+/gu, "_");
   if (normalized === "mcp" || normalized === TOOL_NAME) return false;
   const segments = normalized.split("_").filter(Boolean);
-  return segments.some((segment) => FORBIDDEN_BUILT_INS.has(segment));
+  return (
+    FORBIDDEN_NATIVE_TOOL_NAMES.has(canonicalToolName(name)) ||
+    segments.some((segment) => FORBIDDEN_BUILT_INS.has(segment))
+  );
 }
 
 function sdkMessages(frames) {
@@ -1374,7 +1397,7 @@ async function main() {
       callback = undefined;
       const cleanupSteps = [];
       if (signal === undefined && activeBridge !== undefined && activeAgentId !== undefined) {
-        cleanupSteps.push(["close SDK agent", () => safeUnary(
+        cleanupSteps.push(["close SDK agent", () => unary(
           activeBridge,
           "SdkAgentService",
           "CloseAgent",
@@ -1383,7 +1406,7 @@ async function main() {
         )]);
       }
       if (signal === undefined && activeBridge !== undefined) {
-        cleanupSteps.push(["shut down SDK Bridge", () => safeUnary(
+        cleanupSteps.push(["shut down SDK Bridge", () => unary(
           activeBridge,
           "SdkBridgeControlService",
           "Shutdown",
