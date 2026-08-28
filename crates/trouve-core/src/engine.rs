@@ -7682,7 +7682,9 @@ impl Engine {
     fn resolve_workspace_list_item(workspace: Workspace, timeout: Duration) -> WorkspaceListItem {
         let repository = Path::new(&workspace.path);
         let (remote_url, common_directory) =
-            git::workspace_repository_sources(repository, "origin", timeout);
+            git::workspace_repository_sources(repository, "origin", timeout, |remote| {
+                crate::github::parse_remote(remote).is_some()
+            });
         let remote_identity = remote_url.and_then(|remote| crate::github::parse_remote(&remote));
         let (repository_key, repository_name) = if let Some((host, owner, name)) = remote_identity {
             (
@@ -8151,9 +8153,25 @@ impl Engine {
     /// while retaining existing sessions, worktrees, and automation records.
     /// Registering the same path later reopens it.
     pub fn close_workspace(&self, id: &str) -> Result<(), EngineError> {
-        if self.store.workspace(id)?.is_none() {
-            return Err(EngineError::NotFound(format!("workspace {id}")));
-        }
+        self.close_workspace_with(id, |_| {})
+    }
+
+    fn close_workspace_with(
+        &self,
+        id: &str,
+        on_lock_attempt: impl FnOnce(bool),
+    ) -> Result<(), EngineError> {
+        let workspace = self
+            .store
+            .workspace(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+        // Re-registration may spend time resolving repository identity between
+        // reading and reopening an existing row. Serialize close against that
+        // whole lifecycle so whichever operation completes last owns the
+        // durable visibility and terminal state.
+        let registration_lock = self.workspace_registration_lock(Path::new(&workspace.path));
+        let _registration =
+            Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
         if self.store.set_workspace_closed(id, true)? {
             for session in self.store.list_sessions(Some(id))? {
                 self.terminals.remove_session(&session.id);
@@ -22620,6 +22638,73 @@ default_permission_mode = "ask"
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn workspace_close_waits_for_reregistration_and_remains_final() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = engine
+            .register_workspace(repository.path().to_str().unwrap(), None)
+            .unwrap();
+        let workspace_id = workspace.id.clone();
+        let repository_path = repository.path().to_path_buf();
+        let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_workspace_with(
+                repository_path.to_str().unwrap(),
+                None,
+                |_| {},
+                || {
+                    prepared_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        prepared_rx.recv().unwrap();
+
+        let (close_lock_tx, close_lock_rx) = std::sync::mpsc::channel();
+        let close_engine = Arc::clone(&engine);
+        let close_workspace_id = workspace_id.clone();
+        let close = std::thread::spawn(move || {
+            close_engine.close_workspace_with(&close_workspace_id, |contended| {
+                close_lock_tx.send(contended).unwrap();
+            })
+        });
+        assert!(close_lock_rx.recv().unwrap());
+        release_tx.send(()).unwrap();
+        registration.join().unwrap().unwrap();
+        close.join().unwrap().unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered {
+                    workspace_id: registered_id,
+                    ..
+                } if registered_id == workspace_id => Some("registered"),
+                Event::WorkspaceClosed {
+                    workspace_id: closed_id,
+                } if closed_id == workspace_id => Some("closed"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
     }
 
     #[test]

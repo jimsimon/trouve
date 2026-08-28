@@ -2225,6 +2225,7 @@ pub fn workspace_repository_sources(
     repo: &Path,
     remote: &str,
     timeout: Duration,
+    remote_is_usable: impl FnOnce(&str) -> bool,
 ) -> (Option<String>, Option<PathBuf>) {
     let operation = GitOperation::with_timeout(None, timeout, "workspace repository identity");
     let remote_url = run_git_bounded(
@@ -2239,28 +2240,32 @@ pub fn workspace_repository_sources(
     .filter(|output| !output.truncated)
     .map(|output| String::from_utf8_lossy(&output.bytes).trim().to_string())
     .filter(|url| !url.is_empty());
-    let common_directory = run_git_bounded(
-        repo,
-        None,
-        &["rev-parse", "--git-common-dir"],
-        None,
-        64 * 1024,
-        &operation,
-    )
-    .ok()
-    .filter(|output| !output.truncated)
-    .map(|output| {
-        let common = PathBuf::from(String::from_utf8_lossy(&output.bytes).trim().to_string());
-        // Keep all filesystem traversal inside the bounded Git child. The
-        // workspace root is canonical at registration, so joining Git's
-        // relative result is stable without an unbounded canonicalize call.
-        let common = if common.is_absolute() {
-            common
-        } else {
-            repo.join(common)
-        };
-        normalize_path_lexically(&common)
-    });
+    let common_directory = if remote_url.as_deref().is_some_and(remote_is_usable) {
+        None
+    } else {
+        run_git_bounded(
+            repo,
+            None,
+            &["rev-parse", "--git-common-dir"],
+            None,
+            64 * 1024,
+            &operation,
+        )
+        .ok()
+        .filter(|output| !output.truncated)
+        .map(|output| {
+            let common = PathBuf::from(String::from_utf8_lossy(&output.bytes).trim().to_string());
+            // Keep all filesystem traversal inside the bounded Git child. The
+            // workspace root is canonical at registration, so joining Git's
+            // relative result is stable without an unbounded canonicalize call.
+            let common = if common.is_absolute() {
+                common
+            } else {
+                repo.join(common)
+            };
+            normalize_path_lexically(&common)
+        })
+    };
     (remote_url, common_directory)
 }
 
@@ -3545,10 +3550,42 @@ mod tests {
 
         let started = Instant::now();
         let sources =
-            workspace_repository_sources(tmp.path(), "origin", Duration::from_millis(300));
+            workspace_repository_sources(tmp.path(), "origin", Duration::from_millis(300), |_| {
+                true
+            });
 
         assert_eq!(sources, (None, None));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn workspace_repository_sources_skip_local_fallback_for_a_usable_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(
+            tmp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.test/acme/widgets.git",
+            ],
+        );
+
+        let (remote_url, common_directory) =
+            workspace_repository_sources(tmp.path(), "origin", Duration::from_secs(1), |url| {
+                url.starts_with("https://")
+            });
+
+        assert_eq!(
+            remote_url.as_deref(),
+            Some("https://example.test/acme/widgets.git")
+        );
+        assert_eq!(common_directory, None);
+
+        let (_, common_directory) =
+            workspace_repository_sources(tmp.path(), "origin", Duration::from_secs(1), |_| false);
+        assert!(common_directory.is_some());
     }
 
     #[test]

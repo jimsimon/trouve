@@ -198,6 +198,9 @@ describe("Trouve visual contract", () => {
     expect(pullRequests).toBeLessThan(automations);
     expect(automations).toBeLessThan(settings);
     expect(settings).toBeLessThan(workspaces);
+    expect(shell).toContain('class="repository-group-heading"');
+    expect(shell).toContain('? html`<h3 id=${`workspace-${index}`}>');
+    expect(shell).toContain(': html`<h4 id=${`workspace-${index}`}>');
     expect(shell).toContain('class="workspace-row"');
     expect(shell).toContain("data-controls-visible=${");
     expect(shell).toContain('class="workspace-toggle"');

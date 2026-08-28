@@ -3093,7 +3093,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             <button class="navigation-icon-button" type="button" aria-label="Settings" data-tooltip="Settings" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "settings" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("gear", { className: "settings-link-icon" })}</button>
           </div>
           <div class="workspace-list-heading">
-            <strong>Workspaces</strong>
+            <h2>Workspaces</h2>
             <span class="workspace-list-options-wrap">
               <button
                 class="workspace-list-options-button"
@@ -3191,7 +3191,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               ></div>`;
               return html`
                 ${repositoryGroup?.first
-                  ? html`<h2 id=${repositoryGroup.headingId} class="repository-group-heading">${repositoryGroup.label}</h2>`
+                  ? html`<h3 id=${repositoryGroup.headingId} class="repository-group-heading">${repositoryGroup.label}</h3>`
                   : nothing}
                 ${dropTarget && !this.#workspaceDropAfter ? placeholder : nothing}
                 <section
@@ -3218,8 +3218,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     >
                       ${fontAwesomeIcon(collapsed ? "caret-right" : "caret-down")}
                       ${repositoryGroup === undefined
-                        ? html`<h2 id=${`workspace-${index}`}>${workspace.name}</h2>`
-                        : html`<h3 id=${`workspace-${index}`}>${workspace.name}</h3>`}
+                        ? html`<h3 id=${`workspace-${index}`}>${workspace.name}</h3>`
+                        : html`<h4 id=${`workspace-${index}`}>${workspace.name}</h4>`}
                     </button>
                     ${workspaceReorderingEnabled
                       ? html`<span
@@ -3353,7 +3353,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       @click=${() => this.#toggleWorkspace(workspaceId)}
                     >
                       ${fontAwesomeIcon(collapsed ? "caret-right" : "caret-down")}
-                      <h2 id=${`workspace-orphan-${index}`}>Workspace</h2>
+                      <h3 id=${`workspace-orphan-${index}`}>Workspace</h3>
                     </button>
                   </header>
                   <trouve-session-list
