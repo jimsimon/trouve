@@ -399,6 +399,13 @@ pub struct CodeReviewRuntime {
     /// repository poll and one prioritized walk per repository batch,
     /// instead of one blocked task and one redundant poll per delivery.
     thread_webhook_dispatch: Mutex<ThreadWebhookDispatch>,
+    /// Per repository, the pulls whose head-of-line threadless command hit
+    /// a retryable failure on their last examined pass. Their commands sort
+    /// behind every other pull's on the next pass, so a fixed prefix of
+    /// retrying pulls can never reload identically and starve later pulls
+    /// out of the bounded pass window. Entries clear when the pull's head
+    /// command reaches an outcome or its rows are consumed.
+    threadless_retry_pulls: Mutex<HashMap<String, HashSet<u64>>>,
 }
 
 #[derive(Default)]
@@ -1208,6 +1215,19 @@ enum ThreadlessCommandDisposition {
     /// A transient failure left the row pending; the caller must halt this
     /// pull's later commands so a newer opposite command cannot overtake it.
     RetryPull,
+}
+
+/// Orders one pass's pending commands: comment-id order (the order the
+/// maintainers wrote them), except pulls whose head-of-line command failed
+/// retryably on their last examined pass sort behind every other pull. The
+/// sort is stable, so within each pull comment-id order — and therefore
+/// head-of-line FIFO — is preserved; commands on different pulls are
+/// independent, so their relative order carries no meaning.
+fn deprioritize_retrying_pulls(
+    commands: &mut [crate::store::PendingThreadlessCommand],
+    retrying: &HashSet<u64>,
+) {
+    commands.sort_by_key(|command| retrying.contains(&command.pull_number));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10313,7 +10333,7 @@ impl Engine {
     /// stampede permission lookups. Row consumption is transactional and
     /// exclusive, so the webhook and poll processors cannot double-apply.
     async fn process_pending_threadless_commands(&self, repository: &CodeReviewRepository) {
-        let commands = match self
+        let mut commands = match self
             .store
             .pending_threadless_commands(&repository.repository)
         {
@@ -10328,6 +10348,24 @@ impl Engine {
         if commands.is_empty() {
             return;
         }
+        // Pass fairness: the budget counts examined commands, so without
+        // reordering, sixteen distinct pulls whose head commands keep
+        // failing retryably would reload as the identical prefix every pass
+        // and a later pull's valid command would never be reached.
+        let mut deprioritized = self
+            .code_review
+            .threadless_retry_pulls
+            .lock()
+            .unwrap()
+            .get(&repository.repository)
+            .cloned()
+            .unwrap_or_default();
+        let pending_pulls = commands
+            .iter()
+            .map(|command| command.pull_number)
+            .collect::<HashSet<_>>();
+        deprioritized.retain(|pull| pending_pulls.contains(pull));
+        deprioritize_retrying_pulls(&mut commands, &deprioritized);
         // One authentication per pass; failure leaves every row for the
         // next pass rather than failing each command individually.
         let api = match self.installation_api(repository.installation_id).await {
@@ -10341,6 +10379,7 @@ impl Engine {
         };
         let mut permission_cache: HashMap<String, bool> = HashMap::new();
         let mut halted_pulls: HashSet<u64> = HashSet::new();
+        let mut advanced_pulls: HashSet<u64> = HashSet::new();
         let mut processed = 0usize;
         for command in commands {
             if processed >= THREADLESS_COMMAND_PASS_LIMIT {
@@ -10362,11 +10401,24 @@ impl Engine {
                 )
                 .await
             {
-                ThreadlessCommandDisposition::Done => {}
+                ThreadlessCommandDisposition::Done => {
+                    advanced_pulls.insert(command.pull_number);
+                }
                 ThreadlessCommandDisposition::RetryPull => {
                     halted_pulls.insert(command.pull_number);
                 }
             }
+        }
+        // Pulls whose head command reached an outcome rejoin the front of
+        // the next pass; pulls that failed retryably (now or on an earlier
+        // pass whose rows are still pending) stay behind everyone else.
+        deprioritized.retain(|pull| !advanced_pulls.contains(pull));
+        deprioritized.extend(halted_pulls);
+        let mut retry_pulls = self.code_review.threadless_retry_pulls.lock().unwrap();
+        if deprioritized.is_empty() {
+            retry_pulls.remove(&repository.repository);
+        } else {
+            retry_pulls.insert(repository.repository.clone(), deprioritized);
         }
     }
 
@@ -27111,6 +27163,36 @@ mod tests {
         assert_eq!(
             parse_threadless_resolve_command("resolve rvf_9b7fc0c6 x"),
             None
+        );
+    }
+
+    #[test]
+    fn retrying_pulls_sort_behind_fresh_pulls_and_keep_per_pull_order() {
+        let command = |pull: u64, comment_id: u64| crate::store::PendingThreadlessCommand {
+            trigger_key: format!("threadless:{comment_id}"),
+            repository: "acme/widgets".into(),
+            pull_number: pull,
+            comment_id,
+            author: "octocat".into(),
+            resolve: true,
+            finding_prefix: "rvf_9b7fc0c6".into(),
+            reason: "reason".into(),
+            created_at: "2026-08-27T00:00:00Z".into(),
+        };
+        let mut commands = vec![
+            command(1, 100),
+            command(2, 101),
+            command(1, 102),
+            command(3, 103),
+        ];
+        deprioritize_retrying_pulls(&mut commands, &HashSet::from([1]));
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| (command.pull_number, command.comment_id))
+                .collect::<Vec<_>>(),
+            vec![(2, 101), (3, 103), (1, 100), (1, 102)],
+            "pull 1 retried last pass: its commands go last, in comment order"
         );
     }
 
