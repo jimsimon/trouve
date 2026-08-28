@@ -216,8 +216,15 @@ pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
             let tag = github_latest_tag("openai/codex").await?;
             Ok(tag.trim_start_matches("rust-v").to_string())
         }
-        // llama.cpp versions are bare build tags ("b9957").
-        CliId::LlamaServer => github_latest_tag("ggml-org/llama.cpp").await,
+        // llama.cpp publishes binary builds as prereleases ("b9957"). Its
+        // `/releases/latest` entry is now a metadata-only nightly marker, so
+        // resolve the newest release that actually carries build artifacts.
+        CliId::LlamaServer => {
+            let body =
+                get_text("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20")
+                    .await?;
+            parse_llama_release_tag(&body)
+        }
     }
 }
 
@@ -232,6 +239,36 @@ async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| InstallError::Download("github release had no tag_name".into()))
+}
+
+fn parse_llama_release_tag(body: &str) -> Result<String, InstallError> {
+    let releases: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| InstallError::Download(format!("github release json: {e}")))?;
+    releases
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|release| {
+            let tag = release["tag_name"].as_str()?;
+            let build = tag.strip_prefix('b')?;
+            if build.is_empty()
+                || !build.bytes().all(|byte| byte.is_ascii_digit())
+                || release["draft"].as_bool().unwrap_or(false)
+            {
+                return None;
+            }
+            let artifact_prefix = format!("llama-{tag}-bin-");
+            release["assets"]
+                .as_array()?
+                .iter()
+                .any(|asset| {
+                    asset["name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with(&artifact_prefix))
+                })
+                .then(|| tag.to_string())
+        })
+        .ok_or_else(|| InstallError::Download("github releases had no llama.cpp build".into()))
 }
 
 /// Pull the pinned version out of the official cursor install script
@@ -659,6 +696,30 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
             Some("2026.07.01-41b2de7")
         );
         assert_eq!(parse_cursor_install_version("nothing here"), None);
+    }
+
+    #[test]
+    fn selects_llama_build_release_instead_of_latest_marker() {
+        let releases = serde_json::json!([
+            {
+                "tag_name": "v0.3.0",
+                "draft": false,
+                "assets": [{ "name": "nightly-tag.txt" }]
+            },
+            {
+                "tag_name": "b10665",
+                "draft": false,
+                "prerelease": true,
+                "assets": [
+                    { "name": "llama-b10665-bin-ubuntu-vulkan-x64.tar.gz" }
+                ]
+            }
+        ]);
+
+        assert_eq!(
+            parse_llama_release_tag(&releases.to_string()).unwrap(),
+            "b10665"
+        );
     }
 
     #[test]
