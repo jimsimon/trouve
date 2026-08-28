@@ -219,13 +219,7 @@ pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
         // llama.cpp publishes binary builds as prereleases ("b9957"). Its
         // `/releases/latest` entry is now a metadata-only nightly marker, so
         // resolve the newest release that actually carries build artifacts.
-        CliId::LlamaServer => latest_llama_release_tag(|page| async move {
-            get_text(&format!(
-                "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100&page={page}"
-            ))
-            .await
-        })
-        .await,
+        CliId::LlamaServer => latest_llama_release_tag(fetch_llama_release_page).await,
     }
 }
 
@@ -243,6 +237,13 @@ async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
 }
 
 const LLAMA_RELEASE_PAGE_LIMIT: usize = 5;
+
+async fn fetch_llama_release_page(page: usize) -> Result<String, InstallError> {
+    get_text(&format!(
+        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100&page={page}"
+    ))
+    .await
+}
 
 async fn latest_llama_release_tag<F, Fut>(mut fetch: F) -> Result<String, InstallError>
 where
