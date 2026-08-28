@@ -395,6 +395,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #messageRequest: "start" | "queue" | undefined;
   #optimisticPrompt: OptimisticPromptSubmission | undefined;
   #newThreadSetupOpen = false;
+  #publishedNewThreadSetupOpen: boolean | undefined;
   #newThreadBusy = false;
   #newThreadError = "";
   #newThreadRequest: NewThreadRequestToken | undefined;
@@ -726,6 +727,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   protected override updated(): void {
+    this.#publishNewThreadSetupState(this.#effectiveNewThreadSetupOpen());
     if (
       this.threadId !== ""
       && (globalThis.document?.visibilityState ?? "visible") === "visible"
@@ -928,9 +930,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     document.addEventListener("scroll", this.#dismissMarkdownContextMenu, true);
     globalThis.addEventListener("resize", this.#dismissMarkdownContextMenu);
     globalThis.addEventListener("pagehide", this.#persistComposerDraftFromPageHide);
+    this.#publishedNewThreadSetupOpen = undefined;
+    this.#publishNewThreadSetupState(this.#effectiveNewThreadSetupOpen());
   }
 
   override disconnectedCallback(): void {
+    this.#newThreadSetupOpen = false;
+    this.#publishNewThreadSetupState(false);
+    this.#publishedNewThreadSetupOpen = undefined;
     this.#persistComposerDraftNow();
     document.removeEventListener("pointerdown", this.#dismissMarkdownContextMenuFromPointer, true);
     document.removeEventListener("pointerup", this.#restoreMarkdownContextMenuSelectionFromPointer, true);
@@ -1339,8 +1346,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const threads = sessionThreads.filter((candidate) =>
       candidate.id === this.threadId
       || !closedThreadTabs.has(candidate.id));
-    const newThreadSetupOpen = this.#newThreadSetupOpen
-      || (this.threadId === "" && sessionThreads.length > 0 && threads.length === 0);
+    const newThreadSetupOpen = this.#effectiveNewThreadSetupOpen();
     const thread = this.threadId === "" ? undefined : store.thread(this.threadId);
     const subagentReadOnly = thread === undefined
       ? false
@@ -6115,7 +6121,23 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     });
   };
 
+  #effectiveNewThreadSetupOpen(): boolean {
+    if (this.#newThreadSetupOpen) return true;
+    if (this.threadId !== "") return false;
+    const store = this.#store.value;
+    const services = this.#services.value;
+    if (store === undefined || services === undefined) return false;
+    const sessionThreads = store.threadsForSession(this.sessionId);
+    if (sessionThreads.length === 0) return false;
+    const closedThreadTabs = new Set(
+      readSignal(services.resumePreferences).closedThreadTabs,
+    );
+    return sessionThreads.every((thread) => closedThreadTabs.has(thread.id));
+  }
+
   #publishNewThreadSetupState(open: boolean): void {
+    if (this.#publishedNewThreadSetupOpen === open) return;
+    this.#publishedNewThreadSetupOpen = open;
     this.dispatchEvent(new CustomEvent("trouve-new-thread-setup-state", {
       detail: { open },
       bubbles: true,

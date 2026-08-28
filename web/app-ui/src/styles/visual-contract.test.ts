@@ -211,6 +211,12 @@ describe("Trouve visual contract", () => {
     expect(app).toContain(".navigation-icon-button:focus-visible::after");
     expect(app).toContain(".navigation-panel > trouve-session-usage-panel");
     expect(app).toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*position:\s*sticky/s);
+    expect(app).toMatch(
+      /\.session-usage-heading > small \{[^}]*overflow-wrap:\s*anywhere/s,
+    );
+    expect(app).toMatch(
+      /\.session-usage-model-heading > span \{[^}]*overflow-wrap:\s*anywhere/s,
+    );
     expect(app).toMatch(/\.workspace-row \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.workspace-toggle > span \{[^}]*inset-inline-start:\s*3px/s);
     expect(app).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);

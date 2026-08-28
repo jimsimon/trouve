@@ -3130,7 +3130,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             model=${activeThread?.model ?? ""}
             .placeholder=${sessions.length === 0
               || this.#newSessionSetup.status === "open"
-              || this.#newThreadSetupOpen}
+              || (route.kind === "session" && this.#newThreadSetupOpen)}
           ></trouve-session-usage-panel>
         </nav>
 

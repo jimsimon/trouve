@@ -104,7 +104,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           <strong id="session-usage-title">Usage</strong>
           ${placeholder
             ? nothing
-            : html`<small title=${this.model}>${this.model}</small>`}
+            : html`<small>${this.model}</small>`}
         </header>
         ${placeholder
           ? html`<p class="session-usage-placeholder">
@@ -209,7 +209,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     return html`
       <div class=${`session-usage-model-row ${row.total ? "total" : ""}`}>
         <div class="session-usage-model-heading">
-          <span title=${row.label}>${row.label}</span>
+          <span>${row.label}</span>
           <small>${row.turns} ${row.turns === 1 ? "turn" : "turns"}</small>
         </div>
         <dl class="session-usage-model-stats">

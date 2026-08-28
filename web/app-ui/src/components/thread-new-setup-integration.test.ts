@@ -11,6 +11,10 @@ describe("thread screen provisional setup integration", () => {
     new URL("./new-thread-setup.ts", import.meta.url),
     "utf8",
   );
+  const app = readFileSync(
+    new URL("../app/trouve-app.ts", import.meta.url),
+    "utf8",
+  );
 
   it("opens a provisional tab without eagerly creating a thread", () => {
     expect(screen).toContain("openNewThreadSetup");
@@ -39,6 +43,23 @@ describe("thread screen provisional setup integration", () => {
     expect(screen).toContain("this.#newThreadSetupOpen = false");
     expect(screen).toContain(
       "this.querySelector<HTMLButtonElement>('[aria-label=\"New thread\"]')?.focus()",
+    );
+  });
+
+  it("publishes the effective setup state and clears it across navigation", () => {
+    expect(screen).toContain(
+      "this.#publishNewThreadSetupState(this.#effectiveNewThreadSetupOpen())",
+    );
+    const disconnectStart = screen.indexOf("override disconnectedCallback(): void");
+    const disconnectEnd = screen.indexOf("super.disconnectedCallback()", disconnectStart);
+    const disconnect = screen.slice(disconnectStart, disconnectEnd);
+    expect(disconnect).toContain("this.#newThreadSetupOpen = false");
+    expect(disconnect).toContain("this.#publishNewThreadSetupState(false)");
+    expect(screen).toContain(
+      "if (this.#publishedNewThreadSetupOpen === open) return",
+    );
+    expect(app).toContain(
+      '|| (route.kind === "session" && this.#newThreadSetupOpen)',
     );
   });
 

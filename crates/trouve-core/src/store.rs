@@ -622,6 +622,32 @@ CREATE TABLE IF NOT EXISTS code_review_polled_comments (
 );
 "#;
 
+// Keep the one-time backfill in the same batch as the column addition. On
+// later opens the duplicate-column error stops this batch before it can
+// revisit the event log.
+const USAGE_MODEL_MIGRATION: &str = "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT '';
+WITH turn_models AS MATERIALIZED (
+  SELECT
+    scope_id AS thread_id,
+    CAST(json_extract(payload, '$.turn') AS INTEGER) AS turn,
+    json_extract(payload, '$.model') AS model,
+    ROW_NUMBER() OVER (
+      PARTITION BY scope_id, CAST(json_extract(payload, '$.turn') AS INTEGER)
+      ORDER BY cursor DESC
+    ) AS model_rank
+  FROM events
+  WHERE scope_kind = 'thread'
+    AND json_extract(payload, '$.type') = 'turn.started'
+    AND typeof(json_extract(payload, '$.model')) = 'text'
+)
+UPDATE usage
+SET model = turn_models.model
+FROM turn_models
+WHERE usage.model = ''
+  AND turn_models.model_rank = 1
+  AND turn_models.thread_id = usage.thread_id
+  AND turn_models.turn = usage.turn";
+
 /// Repeat-safe migrations for databases created before a schema change.
 /// `CREATE TABLE IF NOT EXISTS` won't touch existing tables, so column
 /// additions are retried and "duplicate column" errors are ignored.
@@ -789,22 +815,7 @@ const MIGRATIONS: &[&str] = &[
     // (fixed default budgets). Persisted so retries re-batch identically
     // even when provider metadata is transiently unavailable.
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
-    "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT ''",
-    "UPDATE usage
-       SET model = COALESCE(
-         (
-           SELECT json_extract(events.payload, '$.model')
-           FROM events
-           WHERE events.scope_kind = 'thread'
-             AND events.scope_id = usage.thread_id
-             AND json_extract(events.payload, '$.type') = 'turn.started'
-             AND CAST(json_extract(events.payload, '$.turn') AS INTEGER) = usage.turn
-           ORDER BY events.cursor DESC
-           LIMIT 1
-         ),
-         ''
-       )
-       WHERE model = ''",
+    USAGE_MODEL_MIGRATION,
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -15294,12 +15305,52 @@ mod tests {
                 .unwrap();
         }
 
+        // Recreate the persisted shape from before the model column existed;
+        // opening that database must execute the migration rather than the
+        // repeat-safe duplicate-column path used by current databases.
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch("ALTER TABLE usage DROP COLUMN model")
+            .unwrap();
+        drop(legacy);
+
         let reopened = Store::open(&path).unwrap();
         let summary = reopened
             .usage_summary(UsageScope::Thread("legacy-thread"))
             .unwrap();
         assert_eq!(summary.models.len(), 1);
         assert_eq!(summary.models[0].model, "historical/model");
+    }
+
+    #[test]
+    fn usage_model_backfill_materializes_the_event_mapping_once() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let update_sql = USAGE_MODEL_MIGRATION.split_once(';').unwrap().1;
+        let explain = format!("EXPLAIN QUERY PLAN {update_sql}");
+        let mut statement = conn.prepare(&explain).unwrap();
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("MATERIALIZE turn_models")),
+            "{plan:?}"
+        );
+        assert_eq!(
+            plan.iter()
+                .filter(|detail| detail.contains("events"))
+                .count(),
+            1,
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("CORRELATED")),
+            "{plan:?}"
+        );
     }
 
     #[test]

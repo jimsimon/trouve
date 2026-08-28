@@ -40,4 +40,11 @@ describe("session usage panel asynchronous lifecycle guards", () => {
       'this.#renderUsageScope("Session", this.#sessionSummary)',
     );
   });
+
+  it("keeps complete model labels visible without hover-only truncation", () => {
+    expect(source).toContain("html`<small>${this.model}</small>`");
+    expect(source).toContain("<span>${row.label}</span>");
+    expect(source).not.toContain("title=${this.model}");
+    expect(source).not.toContain("title=${row.label}");
+  });
 });
