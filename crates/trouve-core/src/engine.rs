@@ -8535,22 +8535,31 @@ impl Engine {
         let session = self
             .create_session_with_workspace_adoption(req, false)
             .await?;
-        let recorded = {
+        let (recorded, cancelled) = {
             let mut committed = commit_fence.committed.lock().unwrap();
-            if cancel.is_cancelled() {
-                false
-            } else if let Some(committed) = committed
+            let cancelled = cancel.is_cancelled();
+            let recorded = if let Some(committed) = committed
                 .as_mut()
                 .filter(|committed| committed.workspace_id == session.workspace_id)
             {
+                // Record ownership before observing cancellation so the
+                // retryable outer cleanup retains this session even if its
+                // first deletion attempt fails.
                 committed.provisional_session_id = Some(session.id.clone());
                 true
             } else {
                 false
-            }
+            };
+            (recorded, cancelled)
         };
-        if recorded {
+        if recorded && !cancelled {
             return Ok(session);
+        }
+
+        if recorded {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
         }
 
         self.delete_session(&session.id).await?;
@@ -23236,6 +23245,75 @@ default_permission_mode = "ask"
         })
         .await
         .expect("provisional review worktree was not cleaned up");
+    }
+
+    #[tokio::test]
+    async fn cancelled_review_session_is_recorded_before_retryable_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("cancelled review session".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+
+        // Model cancellation becoming visible after durable session creation
+        // but before create_review_session records ownership in the fence.
+        cancel.cancel();
+        let error = engine
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id,
+                    idempotency_key: None,
+                    title: Some("cancelled review session".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                &cancel,
+                &commit_fence,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+
+        let session_id = commit_fence
+            .committed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|commit| commit.provisional_session_id.clone())
+            .expect("cancelled review session must remain cleanup-addressable");
+        let session = engine.store.session(&session_id).unwrap().unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(worktree.exists());
+
+        engine
+            .cancel_review_workspace_registration_and_session(&cancel, &commit_fence)
+            .await
+            .unwrap();
+
+        assert!(engine.store.session(&session_id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled review session worktree was not cleaned up");
     }
 
     #[test]
