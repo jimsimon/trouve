@@ -120,6 +120,7 @@ trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto
   .session-age { opacity: 0; }
 }
 trouve-session-list { display: block; }
+trouve-session-list[hidden] { display: none; }
 .session-list { list-style: none; margin: 0; padding: 0; }
 .context-placeholder { margin: 8px 0; color: var(--trouve-text-dim); font-size: 11px; }
 .session-list-empty { margin-inline: 26px 8px; }

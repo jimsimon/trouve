@@ -203,6 +203,8 @@ describe("Trouve visual contract", () => {
     expect(shell).toContain('class="workspace-toggle"');
     expect(shell).toContain('class="workspace-new-session"');
     expect(shell).toContain("#toggleWorkspace");
+    expect(shell).toContain("?hidden=\${collapsed}");
+    expect(app).toContain("trouve-session-list[hidden] { display: none; }");
     expect(app).toMatch(/\.primary-links button \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.workspace-row \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.workspace-toggle > span \{[^}]*inset-inline-start:\s*3px/s);
