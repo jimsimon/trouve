@@ -842,8 +842,7 @@ export async function qualifySubscriptionHealth(apiKey, timeoutMilliseconds) {
       "CURSOR_API_KEY is required for subscription-health qualification",
     );
   }
-  const origin = (process.env.CURSOR_BACKEND_URL ?? "https://api2.cursor.sh")
-    .replace(/\/+$/u, "");
+  const origin = "https://api2.cursor.sh";
   const exchange = await fetch(`${origin}/auth/exchange_user_api_key`, {
     method: "POST",
     headers: {

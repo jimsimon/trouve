@@ -711,12 +711,8 @@ impl BridgePool {
     }
 
     async fn shutdown(&self) -> Result<(), BackendError> {
-        // Publish closure before waiting for the lifecycle writer. Capacity,
-        // thread-gate, and bridge-lock waiters may own read guards; waking
-        // them first prevents provider reload from deadlocking behind queued
-        // admission that cannot otherwise make progress.
+        // Close new admission, drain admitted turns, then wake shutdown waiters.
         self.closed.store(true, Ordering::Release);
-        self.closing.cancel();
         self.capacity.close();
         self.turn_admission.close();
         notify_available(&self.available);
@@ -746,6 +742,7 @@ impl BridgePool {
         if self.processes.lock().await.is_empty() {
             self.thread_gates.lock().await.clear();
         }
+        self.closing.cancel();
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -793,6 +790,9 @@ impl BridgePool {
             _ = events.closed() => return Err(BackendError::Cancelled),
             guard = gate.lock_owned() => guard,
         };
+        if !self.is_open() {
+            return Err(Self::closed_error());
+        }
         Ok(ThreadBridgeAdmission {
             _lifecycle: lifecycle,
             thread_guard,
