@@ -1156,7 +1156,10 @@ trouve-command-palette { display: contents; }
   html, body { min-width: 280px; }
   .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
   .panel-splitter { display: none; }
-  .navigation-panel, .thread-panel, .inspection-panel { display: none; grid-column: 1; grid-row: 1; border-inline: 0; }
+  .navigation-panel, .thread-panel, .inspection-panel { display: none; border-inline: 0; }
+  .app-shell > .navigation-panel,
+  .app-shell > .thread-panel:not(.new-session-screen),
+  .app-shell > .inspection-panel { grid-column: 1; grid-row: 1; }
   .navigation-panel { padding-top: calc(10px + env(safe-area-inset-top)); padding-inline: max(10px, env(safe-area-inset-left)) max(10px, env(safe-area-inset-right)); }
   .mobile-pane-navigation .navigation-panel { display: block; }
   .mobile-pane-navigation .navigation-panel { overscroll-behavior-y: contain; }

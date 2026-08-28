@@ -1386,7 +1386,9 @@ test("subscription status renders complete quota lines in the workspace usage pa
   await replayHistory(page);
   if (testInfo.project.name.startsWith("mobile")) {
     const sessionsButton = page.getByRole("button", { name: "Sessions", exact: true });
-    await sessionsButton.evaluate((button: HTMLButtonElement) => button.click());
+    await expect(sessionsButton).toBeVisible();
+    await expect(sessionsButton).toBeEnabled();
+    await sessionsButton.click();
     await expect(sessionsButton).toHaveAttribute("aria-pressed", "true");
   }
 
