@@ -143,8 +143,6 @@ const REVIEW_PRIOR_FIX_DIFF_MAX_BYTES: usize = 64 * 1024;
 const REVIEW_EXTERNAL_COMMENTS_MAX_BYTES: usize = 64 * 1024;
 const REVIEW_EXTERNAL_COMMENT_BODY_MAX_BYTES: usize = 4 * 1024;
 const REVIEW_DIFF_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
-const REVIEW_DIFF_MAX_FILES: usize = 250;
-const REVIEW_DIFF_MAX_CHANGED_LINES: u64 = 20_000;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
 // Release reviews can span every synchronized first-party manifest. Preserve
 // a hard bound while leaving enough room to inspect those independent files.
@@ -4859,8 +4857,6 @@ impl Engine {
                         base_sha: job.review_base_sha.clone(),
                         cancel: superseded.clone(),
                         head_sha: job.head_sha.clone(),
-                        max_files: REVIEW_DIFF_MAX_FILES,
-                        max_changed_lines: REVIEW_DIFF_MAX_CHANGED_LINES,
                         max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
                     })
                     .await
@@ -4895,8 +4891,6 @@ impl Engine {
                             base_sha: previous_merge_base.clone(),
                             head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
                             cancel: superseded.clone(),
-                            max_files: REVIEW_DIFF_MAX_FILES,
-                            max_changed_lines: REVIEW_DIFF_MAX_CHANGED_LINES,
                             max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
                         })
                         .await;
@@ -6273,8 +6267,6 @@ impl Engine {
                 base_sha: job.base_ref.clone(),
                 head_sha: job.head_sha.clone(),
                 cancel: superseded.clone(),
-                max_files: REVIEW_DIFF_MAX_FILES,
-                max_changed_lines: REVIEW_DIFF_MAX_CHANGED_LINES,
                 max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
             })
             .await;
@@ -7219,8 +7211,6 @@ impl Engine {
                     base_sha: finding.observed_head.clone(),
                     head_sha: finding.resolved_head.clone(),
                     cancel: cancel.clone(),
-                    max_files: 64,
-                    max_changed_lines: 8_000,
                     max_bytes: diff_budget,
                 })
                 .await;
