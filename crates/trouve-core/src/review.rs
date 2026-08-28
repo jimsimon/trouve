@@ -29,7 +29,7 @@ use trouve_protocol::{
 };
 
 use crate::config::GithubReviewAppConfig;
-use crate::engine::{Engine, EngineError};
+use crate::engine::{Engine, EngineError, ReviewWorkspaceRegistrationFence};
 use crate::store::{
     CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewJobRetryOutcome, CodeReviewManualRequest,
     CodeReviewModelTiming, CodeReviewTaskMetrics, NewCodeReviewFinding,
@@ -4735,7 +4735,7 @@ impl Engine {
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
         self.sync_code_review_projection(&record.job).await;
         let active_threads = Arc::new(Mutex::new(HashSet::new()));
-        let workspace_registration_fence = Arc::new(Mutex::new(()));
+        let workspace_registration_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
         let review_settings = self.effective_code_review_settings();
         let review_timeout = Duration::from_secs(review_settings.total_timeout_seconds);
         let result = tokio::time::timeout(
@@ -4749,13 +4749,19 @@ impl Engine {
             ),
         )
         .await;
+        if !matches!(result, Ok(Ok(_))) {
+            // A blocking registration may outlive its dropped join future. If
+            // it crossed the cancellation check before this job stopped,
+            // wait for the commit and compensate the review-owned mutation.
+            if let Err(error) =
+                self.cancel_review_workspace_registration(&cancel, &workspace_registration_fence)
+            {
+                self.record_review_error(format!(
+                    "compensating workspace registration for stopped review job {job_id}: {error}"
+                ));
+            }
+        }
         if result.is_err() {
-            cancel.cancel();
-            // A blocking registration may outlive its dropped join future.
-            // Wait for an in-progress commit, or establish cancellation before
-            // a still-probing worker is allowed to mutate durable state.
-            let registration_commit = workspace_registration_fence.lock().unwrap();
-            drop(registration_commit);
             let active_threads = match active_threads.lock() {
                 Ok(active_threads) => active_threads.iter().cloned().collect::<Vec<_>>(),
                 Err(error) => {
@@ -5015,7 +5021,7 @@ impl Engine {
         record: &CodeReviewJobRecord,
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
-        workspace_registration_fence: &Arc<Mutex<()>>,
+        workspace_registration_fence: &Arc<ReviewWorkspaceRegistrationFence>,
         review_settings: &CodeReviewSettings,
     ) -> Result<String> {
         let preparation_started = Instant::now();
@@ -5189,6 +5195,7 @@ impl Engine {
             }
             bail!("stale: review was superseded before model dispatch");
         }
+        self.complete_review_workspace_registration(workspace_registration_fence);
         self.emit_code_review_updated(Some(job.id.clone()))?;
         ensure_review_current(superseded)?;
         let diff_cache_key = format!(

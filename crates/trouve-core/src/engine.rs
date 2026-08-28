@@ -1944,6 +1944,17 @@ struct WorkspaceListCacheEntry {
     refreshed_at: Instant,
 }
 
+#[derive(Clone)]
+struct ReviewWorkspaceRegistrationCommit {
+    workspace_id: String,
+    mutated: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct ReviewWorkspaceRegistrationFence {
+    committed: Mutex<Option<ReviewWorkspaceRegistrationCommit>>,
+}
+
 #[derive(Clone, Copy)]
 struct AutomatedReviewToolBudget {
     limit: u64,
@@ -7860,8 +7871,8 @@ impl Engine {
         workspace: Workspace,
         item: WorkspaceListItem,
         existing: bool,
-    ) -> Result<WorkspaceListItem, EngineError> {
-        if existing {
+    ) -> Result<(WorkspaceListItem, bool), EngineError> {
+        let mutated = if existing {
             if self.store.set_workspace_closed(&workspace.id, false)? {
                 for session in self.store.list_sessions(Some(&workspace.id))? {
                     if !session.archived {
@@ -7875,6 +7886,9 @@ impl Engine {
                         path: workspace.path,
                     },
                 )?;
+                true
+            } else {
+                false
             }
         } else {
             self.store.insert_workspace(&workspace)?;
@@ -7885,8 +7899,9 @@ impl Engine {
                     path: workspace.path,
                 },
             )?;
-        }
-        Ok(self.cache_workspace_list_item(item))
+            true
+        };
+        Ok((self.cache_workspace_list_item(item), mutated))
     }
 
     pub fn register_workspace(
@@ -7917,6 +7932,7 @@ impl Engine {
             WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
         );
         self.commit_workspace_registration(workspace, item, existing)
+            .map(|(item, _mutated)| item)
     }
 
     pub(crate) fn register_review_workspace(
@@ -7924,9 +7940,29 @@ impl Engine {
         path: &str,
         name: Option<String>,
         cancel: &tokio_util::sync::CancellationToken,
-        commit_fence: &Mutex<()>,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
     ) -> Result<WorkspaceListItem, EngineError> {
-        self.register_review_workspace_with(path, name, cancel, commit_fence, || {})
+        self.register_review_workspace_with(path, name, cancel, commit_fence, || {}, || {})
+    }
+
+    pub(crate) fn cancel_review_workspace_registration(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<(), EngineError> {
+        cancel.cancel();
+        let committed = commit_fence.committed.lock().unwrap().clone();
+        if let Some(committed) = committed.filter(|committed| committed.mutated) {
+            self.close_workspace(&committed.workspace_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_review_workspace_registration(
+        &self,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) {
+        commit_fence.committed.lock().unwrap().take();
     }
 
     fn register_review_workspace_with(
@@ -7934,8 +7970,9 @@ impl Engine {
         path: &str,
         name: Option<String>,
         cancel: &tokio_util::sync::CancellationToken,
-        commit_fence: &Mutex<()>,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
         before_commit: impl FnOnce(),
+        after_cancel_check: impl FnOnce(),
     ) -> Result<WorkspaceListItem, EngineError> {
         if cancel.is_cancelled() {
             return Err(EngineError::BadRequest(
@@ -7958,13 +7995,19 @@ impl Engine {
             WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
         );
         before_commit();
-        let _commit = commit_fence.lock().unwrap();
+        let mut committed = commit_fence.committed.lock().unwrap();
         if cancel.is_cancelled() {
             return Err(EngineError::BadRequest(
                 "stale: review workspace registration was cancelled".into(),
             ));
         }
-        self.commit_workspace_registration(workspace, item, existing)
+        after_cancel_check();
+        let (item, mutated) = self.commit_workspace_registration(workspace, item, existing)?;
+        *committed = Some(ReviewWorkspaceRegistrationCommit {
+            workspace_id: item.id.clone(),
+            mutated,
+        });
+        Ok(item)
     }
 
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>, EngineError> {
@@ -22830,18 +22873,167 @@ default_permission_mode = "ask"
             &Config::default(),
         );
         let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
         let error = engine
             .register_review_workspace_with(
                 repository.path().to_str().unwrap(),
                 Some("cancelled review".into()),
                 &cancel,
-                &Mutex::new(()),
+                &commit_fence,
                 || cancel.cancel(),
+                || {},
             )
             .unwrap_err();
 
         assert!(error.to_string().starts_with("stale:"));
         assert!(engine.list_workspaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_compensates_registration_admitted_before_timeout() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration_cancel = cancel.clone();
+        let registration_fence = Arc::clone(&commit_fence);
+        let repository_path = repository.path().to_path_buf();
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_review_workspace_with(
+                repository_path.to_str().unwrap(),
+                Some("timed out review".into()),
+                &registration_cancel,
+                &registration_fence,
+                || {},
+                || {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        admitted_rx.recv().unwrap();
+
+        let cancellation_engine = Arc::clone(&engine);
+        let cancellation_token = cancel.clone();
+        let cancellation_fence = Arc::clone(&commit_fence);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let cancellation = std::thread::spawn(move || {
+            let result = cancellation_engine
+                .cancel_review_workspace_registration(&cancellation_token, &cancellation_fence);
+            cancelled_tx.send(()).unwrap();
+            result
+        });
+        assert!(matches!(
+            cancelled_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+
+        let workspace = registration.join().unwrap().unwrap();
+        cancellation.join().unwrap().unwrap();
+
+        assert!(cancel.is_cancelled());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
+    }
+
+    #[test]
+    fn cancellation_recloses_workspace_reopened_before_timeout() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = engine
+            .register_workspace(repository.path().to_str().unwrap(), None)
+            .unwrap();
+        engine.close_workspace(&workspace.id).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration_cancel = cancel.clone();
+        let registration_fence = Arc::clone(&commit_fence);
+        let repository_path = repository.path().to_path_buf();
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_review_workspace_with(
+                repository_path.to_str().unwrap(),
+                None,
+                &registration_cancel,
+                &registration_fence,
+                || {},
+                || {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        admitted_rx.recv().unwrap();
+
+        let cancellation_engine = Arc::clone(&engine);
+        let cancellation_token = cancel.clone();
+        let cancellation_fence = Arc::clone(&commit_fence);
+        let cancellation = std::thread::spawn(move || {
+            cancellation_engine
+                .cancel_review_workspace_registration(&cancellation_token, &cancellation_fence)
+        });
+        release_tx.send(()).unwrap();
+
+        let reopened = registration.join().unwrap().unwrap();
+        cancellation.join().unwrap().unwrap();
+
+        assert_eq!(reopened.id, workspace.id);
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed", "registered", "closed"]);
     }
 
     #[test]
