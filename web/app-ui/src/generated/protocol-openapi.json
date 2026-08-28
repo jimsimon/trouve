@@ -4821,7 +4821,7 @@
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/Workspace"
+                    "$ref": "#/components/schemas/WorkspaceListItem"
                   }
                 }
               }
@@ -4848,7 +4848,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Workspace"
+                  "$ref": "#/components/schemas/WorkspaceListItem"
                 }
               }
             }
@@ -14113,6 +14113,38 @@
           },
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "WorkspaceListItem": {
+        "type": "object",
+        "description": "Workspace presentation returned by the list and registration endpoints.\nSeparate checkouts and linked worktrees share repository_key when they\nresolve to the same configured remote or local Git common directory.",
+        "required": [
+          "id",
+          "name",
+          "path"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "repository_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_name": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }
