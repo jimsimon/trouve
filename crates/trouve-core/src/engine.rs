@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 /// turn's prompt, so it is written to read sensibly in a transcript.
 pub const BACKGROUND_ATTACH_PROMPT: &str = "[background agent activity]";
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -1947,10 +1947,39 @@ struct WorkspaceListCacheEntry {
 #[derive(Clone)]
 struct ReviewWorkspaceRegistrationCommit {
     workspace_id: String,
-    provisional: bool,
     canonical_path: PathBuf,
-    generation: Arc<AtomicU64>,
-    observed_generation: u64,
+    lifecycle: Arc<Mutex<ReviewWorkspaceRegistrationLifecycle>>,
+    lease_id: Option<u64>,
+}
+
+#[derive(Default)]
+struct ReviewWorkspaceRegistrationLifecycle {
+    next_lease_id: u64,
+    provisional_workspace_id: Option<String>,
+    outstanding_leases: HashSet<u64>,
+}
+
+impl ReviewWorkspaceRegistrationLifecycle {
+    fn register(&mut self, workspace_id: &str, mutated: bool) -> Option<u64> {
+        if mutated {
+            self.stabilize();
+            self.provisional_workspace_id = Some(workspace_id.to_string());
+        }
+        if self.provisional_workspace_id.as_deref() != Some(workspace_id) {
+            return None;
+        }
+        self.next_lease_id = self
+            .next_lease_id
+            .checked_add(1)
+            .expect("review workspace registration lease overflow");
+        self.outstanding_leases.insert(self.next_lease_id);
+        Some(self.next_lease_id)
+    }
+
+    fn stabilize(&mut self) {
+        self.provisional_workspace_id = None;
+        self.outstanding_leases.clear();
+    }
 }
 
 #[derive(Default)]
@@ -2059,10 +2088,11 @@ pub struct Engine {
     /// Deduplicate expired repository-identity probes per workspace. Entries
     /// are weak so closed or inactive workspaces do not grow this registry.
     workspace_list_refresh_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    /// Generation of each canonical workspace registration lifecycle. A
-    /// review commit retains its generation so a later registration can adopt
-    /// the workspace and invalidate stale cancellation compensation.
-    workspace_registration_generations: Mutex<HashMap<String, Weak<AtomicU64>>>,
+    /// Provisional review leases for each canonical workspace path. A
+    /// successful review or foreground registration stabilizes the workspace;
+    /// cancellation compensates only after the final provisional lease ends.
+    workspace_registration_lifecycles:
+        Mutex<HashMap<String, Weak<Mutex<ReviewWorkspaceRegistrationLifecycle>>>>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute newly released or account-specific live models.
@@ -2527,7 +2557,7 @@ impl Engine {
             config_dir,
             workspace_list_cache: Mutex::new(HashMap::new()),
             workspace_list_refresh_locks: Mutex::new(HashMap::new()),
-            workspace_registration_generations: Mutex::new(HashMap::new()),
+            workspace_registration_lifecycles: Mutex::new(HashMap::new()),
             model_catalog,
             providers: RwLock::new(providers),
             injected_providers: Mutex::new(injected_providers),
@@ -7829,29 +7859,19 @@ impl Engine {
         self.workspace_list_refresh_lock(&format!("registration:{}", canonical.to_string_lossy()))
     }
 
-    fn workspace_registration_generation(&self, canonical: &Path) -> Arc<AtomicU64> {
+    fn workspace_registration_lifecycle(
+        &self,
+        canonical: &Path,
+    ) -> Arc<Mutex<ReviewWorkspaceRegistrationLifecycle>> {
         let key = canonical.to_string_lossy().to_string();
-        let mut generations = self.workspace_registration_generations.lock().unwrap();
-        generations.retain(|_, generation| generation.strong_count() > 0);
-        if let Some(generation) = generations.get(&key).and_then(Weak::upgrade) {
-            return generation;
+        let mut lifecycles = self.workspace_registration_lifecycles.lock().unwrap();
+        lifecycles.retain(|_, lifecycle| lifecycle.strong_count() > 0);
+        if let Some(lifecycle) = lifecycles.get(&key).and_then(Weak::upgrade) {
+            return lifecycle;
         }
-        let generation = Arc::new(AtomicU64::new(0));
-        generations.insert(key, Arc::downgrade(&generation));
-        generation
-    }
-
-    fn advance_workspace_registration_generation(generation: &AtomicU64, provisional: bool) -> u64 {
-        let next = (generation.load(Ordering::SeqCst) & !1)
-            .checked_add(2)
-            .expect("workspace registration generation overflow")
-            | u64::from(provisional);
-        generation.store(next, Ordering::SeqCst);
-        next
-    }
-
-    fn workspace_registration_is_provisional(generation: u64) -> bool {
-        generation & 1 == 1
+        let lifecycle = Arc::new(Mutex::new(ReviewWorkspaceRegistrationLifecycle::default()));
+        lifecycles.insert(key, Arc::downgrade(&lifecycle));
+        lifecycle
     }
 
     fn acquire_workspace_registration_lock<'a>(
@@ -7954,7 +7974,7 @@ impl Engine {
     ) -> Result<WorkspaceListItem, EngineError> {
         let canonical = Self::canonical_workspace_registration_path(path)?;
         let registration_lock = self.workspace_registration_lock(&canonical);
-        let generation = self.workspace_registration_generation(&canonical);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical);
         let _registration =
             Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
         let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
@@ -7966,7 +7986,7 @@ impl Engine {
             WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
         );
         let (item, _mutated) = self.commit_workspace_registration(workspace, item, existing)?;
-        Self::advance_workspace_registration_generation(&generation, false);
+        lifecycle.lock().unwrap().stabilize();
         Ok(item)
     }
 
@@ -7987,12 +8007,20 @@ impl Engine {
     ) -> Result<(), EngineError> {
         cancel.cancel();
         let committed = commit_fence.committed.lock().unwrap().clone();
-        if let Some(committed) = committed.filter(|committed| committed.provisional) {
+        if let Some(committed) = committed.filter(|committed| committed.lease_id.is_some()) {
             let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
             let _registration = registration_lock.lock().unwrap();
-            if committed.generation.load(Ordering::SeqCst) == committed.observed_generation {
+            let lease_id = committed.lease_id.unwrap();
+            let mut lifecycle = committed.lifecycle.lock().unwrap();
+            if lifecycle.outstanding_leases.contains(&lease_id)
+                && lifecycle.outstanding_leases.len() == 1
+                && lifecycle.provisional_workspace_id.as_deref()
+                    == Some(committed.workspace_id.as_str())
+            {
                 self.commit_workspace_close(&committed.workspace_id)?;
-                Self::advance_workspace_registration_generation(&committed.generation, false);
+                lifecycle.stabilize();
+            } else {
+                lifecycle.outstanding_leases.remove(&lease_id);
             }
         }
         Ok(())
@@ -8003,11 +8031,13 @@ impl Engine {
         commit_fence: &ReviewWorkspaceRegistrationFence,
     ) {
         let committed = commit_fence.committed.lock().unwrap().take();
-        if let Some(committed) = committed.filter(|committed| committed.provisional) {
+        if let Some(committed) = committed.filter(|committed| committed.lease_id.is_some()) {
             let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
             let _registration = registration_lock.lock().unwrap();
-            if committed.generation.load(Ordering::SeqCst) == committed.observed_generation {
-                Self::advance_workspace_registration_generation(&committed.generation, false);
+            let lease_id = committed.lease_id.unwrap();
+            let mut lifecycle = committed.lifecycle.lock().unwrap();
+            if lifecycle.outstanding_leases.contains(&lease_id) {
+                lifecycle.stabilize();
             }
         }
     }
@@ -8028,7 +8058,7 @@ impl Engine {
         }
         let canonical = Self::canonical_workspace_registration_path(path)?;
         let registration_lock = self.workspace_registration_lock(&canonical);
-        let generation = self.workspace_registration_generation(&canonical);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical);
         let _registration = registration_lock.lock().unwrap();
         if cancel.is_cancelled() {
             return Err(EngineError::BadRequest(
@@ -8050,18 +8080,13 @@ impl Engine {
             ));
         }
         after_cancel_check();
-        let inherited_provisional =
-            Self::workspace_registration_is_provisional(generation.load(Ordering::SeqCst));
         let (item, mutated) = self.commit_workspace_registration(workspace, item, existing)?;
-        let provisional = mutated || inherited_provisional;
-        let observed_generation =
-            Self::advance_workspace_registration_generation(&generation, provisional);
+        let lease_id = lifecycle.lock().unwrap().register(&item.id, mutated);
         *committed = Some(ReviewWorkspaceRegistrationCommit {
             workspace_id: item.id.clone(),
-            provisional,
             canonical_path: canonical,
-            generation,
-            observed_generation,
+            lifecycle,
+            lease_id,
         });
         Ok(item)
     }
@@ -8269,11 +8294,11 @@ impl Engine {
         // whole lifecycle so whichever operation completes last owns the
         // durable visibility and terminal state.
         let registration_lock = self.workspace_registration_lock(Path::new(&workspace.path));
-        let generation = self.workspace_registration_generation(Path::new(&workspace.path));
+        let lifecycle = self.workspace_registration_lifecycle(Path::new(&workspace.path));
         let _registration =
             Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
         self.commit_workspace_close(id)?;
-        Self::advance_workspace_registration_generation(&generation, false);
+        lifecycle.lock().unwrap().stabilize();
         Ok(())
     }
 
@@ -23217,6 +23242,73 @@ default_permission_mode = "ask"
             })
             .collect::<Vec<_>>();
         assert_eq!(lifecycle, ["registered", "closed"]);
+    }
+
+    #[test]
+    fn later_review_cancellation_preserves_active_or_completed_earlier_review() {
+        for complete_first_before_cancel in [false, true] {
+            let repository = tempfile::tempdir().unwrap();
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository.path());
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+            let data = tempfile::tempdir().unwrap();
+            let engine = Engine::new(
+                Store::open_in_memory().unwrap(),
+                data.path().to_path_buf(),
+                &Config::default(),
+            );
+            let first_cancel = tokio_util::sync::CancellationToken::new();
+            let first_fence = ReviewWorkspaceRegistrationFence::default();
+            let workspace = engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    None,
+                    &first_cancel,
+                    &first_fence,
+                )
+                .unwrap();
+            let second_cancel = tokio_util::sync::CancellationToken::new();
+            let second_fence = ReviewWorkspaceRegistrationFence::default();
+            engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    None,
+                    &second_cancel,
+                    &second_fence,
+                )
+                .unwrap();
+
+            if complete_first_before_cancel {
+                engine.complete_review_workspace_registration(&first_fence);
+            }
+            engine
+                .cancel_review_workspace_registration(&second_cancel, &second_fence)
+                .unwrap();
+            if !complete_first_before_cancel {
+                engine.complete_review_workspace_registration(&first_fence);
+            }
+
+            assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+            let lifecycle = engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    Event::WorkspaceRegistered { workspace_id, .. }
+                        if workspace_id == workspace.id =>
+                    {
+                        Some("registered")
+                    }
+                    Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                        Some("closed")
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lifecycle, ["registered"]);
+        }
     }
 
     #[test]
