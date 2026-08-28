@@ -33,6 +33,7 @@ import {
   assistantText,
   assertUniqueToolLifecycle,
   combineQualificationAndCleanupErrors,
+  createProcessCleanupBoundary,
   exactTerminalResult,
   installSignalCleanup,
   isUnsupportedRpcMethodError,
@@ -1092,6 +1093,7 @@ async function fullQualification(args) {
       agentId = undefined;
       callback = undefined;
       const cleanupSteps = [];
+      const processCleanup = createProcessCleanupBoundary();
       if (signal === undefined && activeBridge !== undefined && activeAgentId !== undefined) {
         cleanupSteps.push(["close SDK agent", () => unary(
           activeBridge,
@@ -1111,7 +1113,10 @@ async function fullQualification(args) {
         )]);
       }
       for (const child of bridgeChildren) {
-        cleanupSteps.push(["terminate SDK Bridge process tree", () => terminateProcessTree(child)]);
+        cleanupSteps.push([
+          "terminate SDK Bridge process tree",
+          () => processCleanup.terminate(() => terminateProcessTree(child)),
+        ]);
       }
       bridgeChildren.clear();
       if (activeCallback !== undefined) {
@@ -1123,7 +1128,10 @@ async function fullQualification(args) {
       if (signal !== undefined || !args.keepState) {
         cleanupSteps.push([
           "remove qualification state",
-          () => rm(temporaryRoot, { recursive: true, force: true }),
+          () => processCleanup.remove(
+            "qualification state",
+            () => rm(temporaryRoot, { recursive: true, force: true }),
+          ),
         ]);
       } else {
         process.stderr.write(`Kept qualification state at ${temporaryRoot}\n`);
