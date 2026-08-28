@@ -819,6 +819,10 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     assert_eq!(usage["turns"], 1);
     assert_eq!(usage["input_tokens"], 30);
     assert_eq!(usage["output_tokens"], 7);
+    assert_eq!(usage["models"].as_array().unwrap().len(), 1);
+    assert_eq!(usage["models"][0]["model"], "scripted/test-model");
+    assert_eq!(usage["models"][0]["turns"], 1);
+    assert_eq!(usage["models"][0]["input_tokens"], 30);
 
     // Cursor resumption: replay from mid-stream only returns later events.
     let mid = events[events.len() / 2]["cursor"].as_u64().unwrap();

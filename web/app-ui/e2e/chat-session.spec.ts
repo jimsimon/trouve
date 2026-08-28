@@ -1368,7 +1368,7 @@ test("model picker escapes the composer control strip", async ({ page }) => {
   await expect(popup).toHaveCount(0);
 });
 
-test("subscription status uses hover help without a click disclosure", async ({ page }) => {
+test("subscription status renders complete quota lines in the workspace usage panel", async ({ page }, testInfo) => {
   await installProtocolFixtures(page);
   await page.route("**/v1/subscriptions", async (route) => {
     await route.fulfill({
@@ -1384,20 +1384,25 @@ test("subscription status uses hover help without a click disclosure", async ({ 
   });
   await page.goto("/");
   await replayHistory(page);
+  if (testInfo.project.name.startsWith("mobile")) {
+    const sessionsButton = page.getByRole("button", { name: "Sessions", exact: true });
+    await expect(sessionsButton).toBeVisible();
+    await expect(sessionsButton).toBeEnabled();
+    await sessionsButton.click();
+    await expect(sessionsButton).toHaveAttribute("aria-pressed", "true");
+  }
 
-  const status = page.locator(".composer .model-health-pill");
-  await expect(page.locator(".composer .subscription-option > span")).toHaveText(
-    "Subscription",
-  );
-  await expect(status).toContainText("Pro · 57% used");
-  await expect(status).toHaveAttribute("title", /Weekly: 57% used · resets Monday/u);
-  await expect(status).toHaveAttribute("tabindex", "0");
-  await expect(status.locator("summary")).toHaveCount(0);
-  await expect(page.locator(".model-health-detail")).toHaveCount(0);
-
-  await status.click();
-  await expect(status).toBeFocused();
-  await expect(page.locator(".model-health-detail")).toHaveCount(0);
+  const panel = page.locator("trouve-session-usage-panel");
+  await expect(panel).toBeVisible();
+  const subscription = panel.locator('[aria-label="test subscription usage"]');
+  await expect(subscription).toContainText("pro plan");
+  await expect(subscription).toContainText("Weekly");
+  await expect(subscription).toContainText("57% used · resets Monday");
+  await expect(
+    subscription.getByRole("progressbar", { name: "Weekly" }),
+  ).toHaveAttribute("aria-valuenow", "57");
+  await expect(page.locator(".composer .subscription-option")).toHaveCount(0);
+  await expect(page.locator(".composer .model-health-pill")).toHaveCount(0);
 });
 
 test("new-thread model choices do not wait for subscription health", async ({ page }) => {
@@ -2188,7 +2193,7 @@ test("interactive subagent tabs accept follow-up prompts", async ({ page }) => {
 
 test("regular thread tabs can be closed and reopened from the session menu", async ({
   page,
-}) => {
+}, testInfo) => {
   await installProtocolFixtures(page, {
     additionalThreads: [{
       id: "th_second",
@@ -2219,6 +2224,13 @@ test("regular thread tabs can be closed and reopened from the session menu", asy
   ).click();
   await expect(page.getByRole("form", { name: "New thread setup (provisional)" }))
     .toBeVisible();
+  const setupUsagePlaceholder = page.getByText(
+    "Subscription and model usage details will show here once a session is started.",
+    { exact: true },
+  );
+  if (!testInfo.project.name.startsWith("mobile")) {
+    await expect(setupUsagePlaceholder).toBeVisible();
+  }
   await expect(page.locator('[data-thread-tab-id="th_fixture"]')).toHaveCount(0);
   await expect(page.locator('[data-thread-tab-id="th_second"]')).toHaveCount(0);
 
@@ -2235,6 +2247,7 @@ test("regular thread tabs can be closed and reopened from the session menu", asy
   await expect(page).toHaveURL(/\/threads\/th_fixture/u);
   await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
     .toHaveAttribute("data-thread-tab-id", "th_fixture");
+  await expect(setupUsagePlaceholder).toHaveCount(0);
   await page.getByRole("button", { name: "Threads (2)" }).click();
   await page.getByRole("treeitem", { name: /Review follow-up/u }).click();
   await expect(page.locator('.thread-tab-main[aria-selected="true"]'))

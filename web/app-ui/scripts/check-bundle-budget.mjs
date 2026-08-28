@@ -31,14 +31,17 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // durable turn-phase, conditional-title, route-scoped new-session lifecycle,
 // outside-diff review, version-check, per-thread transcript-search, detailed
 // agent-activity, attachment-gallery, external-video, and PR-wide
-// review-state additions, including lazy previews and mobile playback
-// notices. Preserve less than 2 kB of headroom; entry, worker, and
+// review-state additions, including lazy previews, mobile playback notices,
+// and the route-scoped subscription/API/local usage panel, including its
+// generated per-model usage schema and scope breakdowns. Preserve less than
+// 2 kB of headroom; entry, worker, and
 // largest-chunk budgets below still prevent one bundle from hiding in the
 // aggregate.
-const totalJavaScriptLimit = 3_220_000;
-// Version-check and transcript-search styling bring the clean artifact to
-// 183,291 B. Preserve less than 2 kB of headroom.
-const totalStyleLimit = 184_000;
+const totalJavaScriptLimit = 3_233_000;
+// Version-check, transcript-search, compact navigation, and the sticky
+// multi-mode usage panel with thread/session model rows bring the clean
+// artifact close to this ceiling. Preserve less than 2 kB of headroom.
+const totalStyleLimit = 189_000;
 const limits = {
   entry: entryLimit,
   worker: 350_000,

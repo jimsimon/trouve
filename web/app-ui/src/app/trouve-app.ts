@@ -184,6 +184,7 @@ import {
 import "../components/command-palette.js";
 import "../components/image-preview.js";
 import "../components/session-list.js";
+import "../components/session-usage-panel.js";
 import "../components/thread-screen.js";
 import "../components/model-picker.js";
 
@@ -413,6 +414,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #pwaInstallPending = false;
   #pwaInstallStatus = "";
   #newSessionSetup: NewSessionSetupLifecycle = createNewSessionSetupLifecycle();
+  #newThreadSetupOpen = false;
   #newSessionPending = false;
   #newSessionError = "";
   #newSessionWorkspaceId = "";
@@ -2945,15 +2947,19 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         @trouve-pull-request-chat=${this.#openPullRequestChat}
         @trouve-pull-request-fix=${this.#fixPullRequestReview}
         @trouve-close-full-screen=${this.#closeFullScreenRoute}
+        @trouve-new-thread-setup-state=${(event: CustomEvent<{ readonly open: boolean }>) => {
+          this.#newThreadSetupOpen = event.detail.open;
+          this.requestUpdate();
+        }}
       >
         <nav
           class="navigation-panel"
           aria-label="Workspaces and sessions"
         >
           <div class="primary-links" aria-label="Application sections">
-            <button type="button" aria-current=${route.kind === "reviews" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "reviews" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("code-pull-request")}<strong>Pull Requests</strong></button>
-            <button type="button" aria-current=${route.kind === "automations" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "automations" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("stopwatch")}<strong>Automations</strong></button>
-            <button type="button" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "settings" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("gear", { className: "settings-link-icon" })}<strong>Settings</strong></button>
+            <button class="navigation-icon-button" type="button" aria-label="Pull Requests" data-tooltip="Pull Requests" aria-current=${route.kind === "reviews" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "reviews" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("code-pull-request")}</button>
+            <button class="navigation-icon-button" type="button" aria-label="Automations" data-tooltip="Automations" aria-current=${route.kind === "automations" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "automations" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("stopwatch")}</button>
+            <button class="navigation-icon-button" type="button" aria-label="Settings" data-tooltip="Settings" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "settings" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("gear", { className: "settings-link-icon" })}</button>
           </div>
           <div class="workspace-list-heading">
             <strong>Workspaces</strong>
@@ -3118,6 +3124,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     : "Create a session with the + button above."}</span>
               </div>`
             : nothing}
+          <trouve-session-usage-panel
+            session-id=${route.kind === "session" ? route.sessionId : ""}
+            thread-id=${route.kind === "session" ? route.threadId ?? "" : ""}
+            model=${activeThread?.model ?? ""}
+            .placeholder=${sessions.length === 0
+              || this.#newSessionSetup.status === "open"
+              || (route.kind === "session" && this.#newThreadSetupOpen)}
+          ></trouve-session-usage-panel>
         </nav>
 
         <div

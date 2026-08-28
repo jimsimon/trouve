@@ -3199,12 +3199,24 @@ pub struct ModelInfo {
 
 /// Aggregated usage for a thread or session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ModelUsageSummary {
+    pub model: String,
+    pub turns: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct UsageSummary {
     pub turns: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub cost_usd: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelUsageSummary>,
 }
 
 // --- errors --------------------------------------------------------------

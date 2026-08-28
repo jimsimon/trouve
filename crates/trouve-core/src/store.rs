@@ -124,12 +124,17 @@ CREATE TABLE IF NOT EXISTS usage (
   thread_id TEXT NOT NULL REFERENCES threads(id),
   session_id TEXT NOT NULL REFERENCES sessions(id),
   turn INTEGER NOT NULL,
+  model TEXT NOT NULL,
   input_tokens INTEGER NOT NULL,      -- summed across the turn's requests (cost)
   output_tokens INTEGER NOT NULL,
   cached_input_tokens INTEGER NOT NULL,
   context_input_tokens INTEGER NOT NULL DEFAULT 0, -- last request's input (context size)
   cost_usd REAL,
   PRIMARY KEY (thread_id, turn)
+);
+CREATE TABLE IF NOT EXISTS data_migrations (
+  name TEXT PRIMARY KEY,
+  completed_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS backend_sessions (
   thread_id TEXT NOT NULL REFERENCES threads(id),
@@ -621,6 +626,54 @@ CREATE TABLE IF NOT EXISTS code_review_polled_comments (
 );
 "#;
 
+const USAGE_MODEL_COLUMN_MIGRATION: &str =
+    "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT ''";
+
+const USAGE_MODEL_BACKFILL_MIGRATION: &str = "usage-model-backfill-v1";
+
+// This repair runs once inside the same transaction as its completion marker.
+// It can therefore resume after an interrupted column migration without
+// imposing history-sized work on every later store open. Each affected thread
+// is scanned once, regardless of how many of its turns need attribution.
+const USAGE_MODEL_BACKFILL: &str = "WITH missing_usage AS MATERIALIZED (
+  SELECT thread_id, turn
+  FROM usage
+  WHERE model = ''
+),
+affected_threads AS MATERIALIZED (
+  SELECT DISTINCT thread_id
+  FROM missing_usage
+),
+turn_models AS MATERIALIZED (
+  SELECT
+    events.scope_id AS thread_id,
+    CAST(json_extract(events.payload, '$.turn') AS INTEGER) AS turn,
+    json_extract(events.payload, '$.model') AS model,
+    ROW_NUMBER() OVER (
+      PARTITION BY events.scope_id, CAST(json_extract(events.payload, '$.turn') AS INTEGER)
+      ORDER BY events.cursor DESC
+    ) AS model_rank
+  FROM affected_threads
+  CROSS JOIN events INDEXED BY events_scope
+  WHERE events.scope_kind = 'thread'
+    AND events.scope_id = affected_threads.thread_id
+    AND json_extract(events.payload, '$.type') = 'turn.started'
+    AND typeof(json_extract(events.payload, '$.model')) = 'text'
+    AND EXISTS (
+      SELECT 1
+      FROM missing_usage
+      WHERE missing_usage.thread_id = events.scope_id
+        AND missing_usage.turn = CAST(json_extract(events.payload, '$.turn') AS INTEGER)
+    )
+)
+UPDATE usage
+SET model = turn_models.model
+FROM turn_models
+WHERE usage.model = ''
+  AND turn_models.model_rank = 1
+  AND turn_models.thread_id = usage.thread_id
+  AND turn_models.turn = usage.turn";
+
 /// Repeat-safe migrations for databases created before a schema change.
 /// `CREATE TABLE IF NOT EXISTS` won't touch existing tables, so column
 /// additions are retried and "duplicate column" errors are ignored.
@@ -788,6 +841,7 @@ const MIGRATIONS: &[&str] = &[
     // (fixed default budgets). Persisted so retries re-batch identically
     // even when provider metadata is transiently unavailable.
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
+    USAGE_MODEL_COLUMN_MIGRATION,
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -836,6 +890,30 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn backfill_usage_models(conn: &Connection) -> Result<()> {
+    let transaction = write_transaction(conn)?;
+    let complete = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM data_migrations WHERE name = ?1)",
+        [USAGE_MODEL_BACKFILL_MIGRATION],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if complete {
+        transaction.commit()?;
+        return Ok(());
+    }
+
+    transaction
+        .execute_batch(USAGE_MODEL_BACKFILL)
+        .context("usage model backfill failed")?;
+    transaction.execute(
+        "INSERT INTO data_migrations (name, completed_at)
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [USAGE_MODEL_BACKFILL_MIGRATION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
     let had_theme_observation_publication_authority = conn.query_row(
         "SELECT EXISTS (
@@ -853,6 +931,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
             }
         }
     }
+    backfill_usage_models(conn)?;
     preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
@@ -7372,6 +7451,7 @@ impl Store {
                     output_tokens: row.get::<_, i64>(2)? as u64,
                     cached_input_tokens: row.get::<_, i64>(3)? as u64,
                     cost_usd: row.get(4)?,
+                    models: Vec::new(),
                 })
             },
         )
@@ -14350,8 +14430,9 @@ impl Store {
 
     // --- usage accounting -------------------------------------------------------
 
-    /// Record a turn's usage. `usage` totals are summed across the turn's
-    /// requests (correct for billing); `context_input_tokens` is the
+    /// Record a turn's usage under the model selected when the turn started.
+    /// `usage` totals are summed across the turn's requests (correct for
+    /// billing); `context_input_tokens` is the
     /// provider-authoritative context size for the turn's *last* request.
     /// Summing per-iteration inputs over a multi-tool turn inflates the figure
     /// many-fold and spuriously trips compaction.
@@ -14360,17 +14441,19 @@ impl Store {
         session_id: &str,
         thread_id: &str,
         turn: u64,
+        model: &str,
         usage: &trouve_protocol::Usage,
         context_input_tokens: u64,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT OR REPLACE INTO usage
-             (thread_id, session_id, turn, input_tokens, output_tokens, cached_input_tokens, context_input_tokens, cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (thread_id, session_id, turn, model, input_tokens, output_tokens, cached_input_tokens, context_input_tokens, cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 thread_id,
                 session_id,
                 turn as i64,
+                model,
                 usage.input_tokens as i64,
                 usage.output_tokens as i64,
                 usage.cached_input_tokens as i64,
@@ -14408,20 +14491,41 @@ impl Store {
             UsageScope::Session(id) => ("session_id", id),
         };
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
+        let mut totals_stmt = conn.prepare(&format!(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM(cached_input_tokens), 0), COALESCE(SUM(cost_usd), 0.0)
              FROM usage WHERE {col} = ?1"
         ))?;
-        Ok(stmt.query_row(params![id], |r| {
+        let mut summary = totals_stmt.query_row(params![id], |r| {
             Ok(trouve_protocol::UsageSummary {
                 turns: r.get::<_, i64>(0)? as u64,
                 input_tokens: r.get::<_, i64>(1)? as u64,
                 output_tokens: r.get::<_, i64>(2)? as u64,
                 cached_input_tokens: r.get::<_, i64>(3)? as u64,
                 cost_usd: r.get(4)?,
+                models: Vec::new(),
             })
-        })?)
+        })?;
+        let mut models_stmt = conn.prepare(&format!(
+            "SELECT model, COUNT(*), COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0)
+             FROM usage WHERE {col} = ?1
+             GROUP BY model ORDER BY model"
+        ))?;
+        summary.models = models_stmt
+            .query_map(params![id], |r| {
+                Ok(trouve_protocol::ModelUsageSummary {
+                    model: r.get(0)?,
+                    turns: r.get::<_, i64>(1)? as u64,
+                    input_tokens: r.get::<_, i64>(2)? as u64,
+                    output_tokens: r.get::<_, i64>(3)? as u64,
+                    cached_input_tokens: r.get::<_, i64>(4)? as u64,
+                    cost_usd: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(summary)
     }
 
     // --- checkpoints ----------------------------------------------------------
@@ -15113,6 +15217,7 @@ mod tests {
                     "se_q",
                     thread_id,
                     turn,
+                    "p/m",
                     &trouve_protocol::Usage {
                         input_tokens,
                         output_tokens: 1,
@@ -15151,6 +15256,244 @@ mod tests {
         assert_eq!(
             store.failed_spawned_descendants("root").unwrap(),
             vec!["grandchild".to_string()]
+        );
+    }
+
+    #[test]
+    fn usage_summaries_group_session_and_thread_totals_by_model() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "thread-a");
+        seed_thread(&store, "thread-b");
+        for (thread_id, turn, model, input, output, cached, cost) in [
+            ("thread-a", 1, "openai/gpt-5", 10, 2, 3, 0.01),
+            ("thread-a", 2, "anthropic/claude", 20, 4, 6, 0.02),
+            ("thread-b", 1, "openai/gpt-5", 30, 6, 9, 0.03),
+        ] {
+            store
+                .record_usage(
+                    "se_q",
+                    thread_id,
+                    turn,
+                    model,
+                    &trouve_protocol::Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        cached_input_tokens: cached,
+                        cost_usd: Some(cost),
+                        ..Default::default()
+                    },
+                    input + cached,
+                )
+                .unwrap();
+        }
+
+        let thread = store.usage_summary(UsageScope::Thread("thread-a")).unwrap();
+        assert_eq!(
+            (thread.turns, thread.input_tokens, thread.cost_usd),
+            (2, 30, 0.03)
+        );
+        assert_eq!(
+            thread
+                .models
+                .iter()
+                .map(|usage| usage.model.as_str())
+                .collect::<Vec<_>>(),
+            ["anthropic/claude", "openai/gpt-5"]
+        );
+        assert_eq!(
+            (thread.models[0].turns, thread.models[0].input_tokens),
+            (1, 20)
+        );
+
+        let session = store.usage_summary(UsageScope::Session("se_q")).unwrap();
+        assert_eq!(
+            (session.turns, session.input_tokens, session.cost_usd),
+            (3, 60, 0.06)
+        );
+        assert_eq!(session.models.len(), 2);
+        assert_eq!(
+            (
+                session.models[1].turns,
+                session.models[1].input_tokens,
+                session.models[1].output_tokens,
+                session.models[1].cached_input_tokens,
+            ),
+            (2, 40, 8, 12)
+        );
+    }
+
+    #[test]
+    fn usage_model_backfill_uses_the_durable_turn_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("usage-model.db");
+        {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "legacy-thread");
+            store
+                .append_event(
+                    Scope::Thread("legacy-thread".into()),
+                    Event::TurnStarted {
+                        turn: 1,
+                        mode: "code".into(),
+                        model: "historical/model".into(),
+                        thinking_level: None,
+                        supports_steering: false,
+                    },
+                )
+                .unwrap();
+            store
+                .record_usage(
+                    "se_q",
+                    "legacy-thread",
+                    1,
+                    "",
+                    &trouve_protocol::Usage {
+                        input_tokens: 10,
+                        ..Default::default()
+                    },
+                    10,
+                )
+                .unwrap();
+        }
+
+        // Recreate the persisted shape from before the model column existed;
+        // opening that database must execute the migration rather than the
+        // repeat-safe duplicate-column path used by current databases.
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute(
+                "DELETE FROM data_migrations WHERE name = ?1",
+                [USAGE_MODEL_BACKFILL_MIGRATION],
+            )
+            .unwrap();
+        legacy
+            .execute_batch("ALTER TABLE usage DROP COLUMN model")
+            .unwrap();
+        drop(legacy);
+
+        let reopened = Store::open(&path).unwrap();
+        let summary = reopened
+            .usage_summary(UsageScope::Thread("legacy-thread"))
+            .unwrap();
+        assert_eq!(summary.models.len(), 1);
+        assert_eq!(summary.models[0].model, "historical/model");
+    }
+
+    #[test]
+    fn usage_model_backfill_resumes_when_column_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("usage-model-resume.db");
+        {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "partial-upgrade-thread");
+            store
+                .append_event(
+                    Scope::Thread("partial-upgrade-thread".into()),
+                    Event::TurnStarted {
+                        turn: 4,
+                        mode: "code".into(),
+                        model: "resumed/model".into(),
+                        thinking_level: None,
+                        supports_steering: false,
+                    },
+                )
+                .unwrap();
+            store
+                .record_usage(
+                    "se_q",
+                    "partial-upgrade-thread",
+                    4,
+                    "",
+                    &trouve_protocol::Usage {
+                        input_tokens: 10,
+                        ..Default::default()
+                    },
+                    10,
+                )
+                .unwrap();
+        }
+
+        // Simulate an interrupted upgrade that added the column but did not
+        // atomically complete the backfill.
+        let partial = Connection::open(&path).unwrap();
+        partial
+            .execute(
+                "DELETE FROM data_migrations WHERE name = ?1",
+                [USAGE_MODEL_BACKFILL_MIGRATION],
+            )
+            .unwrap();
+        drop(partial);
+
+        {
+            let reopened = Store::open(&path).unwrap();
+            let summary = reopened
+                .usage_summary(UsageScope::Thread("partial-upgrade-thread"))
+                .unwrap();
+            assert_eq!(summary.models.len(), 1);
+            assert_eq!(summary.models[0].model, "resumed/model");
+        }
+
+        // Once the durable marker is committed, later opens must not rescan
+        // history. Current writes always provide a model; blanking this row
+        // makes an accidental repeated backfill observable.
+        let completed = Connection::open(&path).unwrap();
+        completed
+            .execute(
+                "UPDATE usage SET model = '' WHERE thread_id = ?1 AND turn = ?2",
+                params!["partial-upgrade-thread", 4],
+            )
+            .unwrap();
+        drop(completed);
+
+        let reopened = Store::open(&path).unwrap();
+        let summary = reopened
+            .usage_summary(UsageScope::Thread("partial-upgrade-thread"))
+            .unwrap();
+        assert_eq!(summary.models.len(), 1);
+        assert_eq!(summary.models[0].model, "");
+    }
+
+    #[test]
+    fn usage_model_backfill_scans_each_affected_thread_once() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let explain = format!("EXPLAIN QUERY PLAN {USAGE_MODEL_BACKFILL}");
+        let mut statement = conn.prepare(&explain).unwrap();
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("MATERIALIZE missing_usage")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("MATERIALIZE affected_threads")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("MATERIALIZE turn_models")),
+            "{plan:?}"
+        );
+        let event_access = plan
+            .iter()
+            .filter(|detail| detail.contains("events"))
+            .collect::<Vec<_>>();
+        assert_eq!(event_access.len(), 1, "{plan:?}");
+        assert!(
+            event_access[0].contains("USING INDEX events_scope")
+                && event_access[0].contains("scope_kind=? AND scope_id=?"),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SCAN affected_threads")),
+            "{plan:?}"
         );
     }
 

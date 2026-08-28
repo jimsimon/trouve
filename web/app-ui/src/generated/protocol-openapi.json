@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.20"
+    "version": "7.21"
   },
   "paths": {
     "/v1/approvals": {
@@ -9780,6 +9780,47 @@
           }
         }
       },
+      "ModelUsageSummary": {
+        "type": "object",
+        "description": "Aggregated usage for a thread or session.",
+        "required": [
+          "model",
+          "turns",
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cost_usd"
+        ],
+        "properties": {
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cost_usd": {
+            "type": "number",
+            "format": "double"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "model": {
+            "type": "string"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "turns": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "OpenTerminalRequest": {
         "type": "object",
         "description": "Initial dimensions for a newly created terminal. The singular compatibility\nendpoint ignores these values when it re-attaches to a live terminal.",
@@ -14016,7 +14057,6 @@
       },
       "UsageSummary": {
         "type": "object",
-        "description": "Aggregated usage for a thread or session.",
         "required": [
           "turns",
           "input_tokens",
@@ -14038,6 +14078,12 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelUsageSummary"
+            }
           },
           "output_tokens": {
             "type": "integer",

@@ -118,7 +118,6 @@ import {
   modelOptionLabel,
 } from "./model-option-controls.js";
 import {
-  modelHealthPresentation,
   modelHealthPresentations,
 } from "./model-health.js";
 import {
@@ -396,6 +395,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #messageRequest: "start" | "queue" | undefined;
   #optimisticPrompt: OptimisticPromptSubmission | undefined;
   #newThreadSetupOpen = false;
+  #publishedNewThreadSetupOpen: boolean | undefined;
   #newThreadBusy = false;
   #newThreadError = "";
   #newThreadRequest: NewThreadRequestToken | undefined;
@@ -556,6 +556,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   });
 
   protected override willUpdate(changed: PropertyValues<this>): void {
+    const newThreadSetupWasOpen = this.#newThreadSetupOpen;
     const composerScopeChanged = changed.has("sessionId") || changed.has("threadId");
     if (composerScopeChanged) this.#persistComposerDraftNow();
     if (changed.has("workspaceId")) {
@@ -720,9 +721,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#virtualizer.enableFollowTail();
       this.#restoredScrollThreadId = this.threadId;
     }
+    if (newThreadSetupWasOpen && !this.#newThreadSetupOpen) {
+      this.#publishNewThreadSetupState(false);
+    }
   }
 
   protected override updated(): void {
+    this.#publishNewThreadSetupState(this.#effectiveNewThreadSetupOpen());
     if (
       this.threadId !== ""
       && (globalThis.document?.visibilityState ?? "visible") === "visible"
@@ -925,9 +930,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     document.addEventListener("scroll", this.#dismissMarkdownContextMenu, true);
     globalThis.addEventListener("resize", this.#dismissMarkdownContextMenu);
     globalThis.addEventListener("pagehide", this.#persistComposerDraftFromPageHide);
+    this.#publishedNewThreadSetupOpen = undefined;
+    this.#publishNewThreadSetupState(this.#effectiveNewThreadSetupOpen());
   }
 
   override disconnectedCallback(): void {
+    this.#newThreadSetupOpen = false;
+    this.#publishNewThreadSetupState(false);
+    this.#publishedNewThreadSetupOpen = undefined;
     this.#persistComposerDraftNow();
     document.removeEventListener("pointerdown", this.#dismissMarkdownContextMenuFromPointer, true);
     document.removeEventListener("pointerup", this.#restoreMarkdownContextMenuSelectionFromPointer, true);
@@ -1336,8 +1346,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const threads = sessionThreads.filter((candidate) =>
       candidate.id === this.threadId
       || !closedThreadTabs.has(candidate.id));
-    const newThreadSetupOpen = this.#newThreadSetupOpen
-      || (this.threadId === "" && sessionThreads.length > 0 && threads.length === 0);
+    const newThreadSetupOpen = this.#effectiveNewThreadSetupOpen();
     const thread = this.threadId === "" ? undefined : store.thread(this.threadId);
     const subagentReadOnly = thread === undefined
       ? false
@@ -1461,18 +1470,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const steerPending = this.#requestPending && this.#messageRequest === undefined;
     const modelControls = modelOptionControls(selectedModel, thread?.model_options);
     const modelHealth = modelHealthPresentations(models, this.#subscriptionHealth);
-    const selectedProviderId = thread?.model.split("/", 1)[0] ?? "";
-    const selectedSubscription = this.#subscriptionHealth.find(
-      (health) => health.provider_id === selectedProviderId,
-    );
-    const selectedModelHealth = selectedSubscription === undefined
-      ? undefined
-      : modelHealthPresentation(selectedSubscription);
-    const subscriptionLoading = selectedModelHealth === undefined && (
-      this.#optionCatalogKey === ""
-      || (this.#services.value !== undefined
-        && readSignal(this.#services.value.subscriptionHealth.loading))
-    );
     const contextUsage = composerContextUsage(
       view?.lastUsage,
       selectedModel?.context_window,
@@ -2097,31 +2094,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                       "Model could not be changed.",
                     )}
                   ></trouve-model-picker>
-                </div>
-                <div class="composer-option subscription-option">
-                  <span>Subscription</span>
-                  ${selectedModelHealth === undefined
-                    ? html`<div
-                        class=${`model-health-pill ${subscriptionLoading ? "loading" : "unavailable"}`}
-                        role="status"
-                        aria-busy=${subscriptionLoading ? "true" : "false"}
-                        aria-label=${subscriptionLoading
-                          ? "Loading subscription status"
-                          : "Subscription status is unavailable"}
-                      >
-                        <span class="model-health-placeholder-dot" aria-hidden="true"></span>
-                        <span>${subscriptionLoading ? "Loading…" : "Not available"}</span>
-                      </div>`
-                    : html`
-                      <div
-                        class=${`model-health-pill tone-${selectedModelHealth.tone}`}
-                        tabindex="0"
-                        title=${selectedModelHealth.detail}
-                        aria-label=${`Subscription status: ${selectedModelHealth.summary}. ${selectedModelHealth.detail}`}
-                      >
-                        <span class=${`model-health-dot tone-${selectedModelHealth.tone}`} aria-hidden="true"></span>
-                        <span>${selectedModelHealth.summary}</span>
-                      </div>`}
                 </div>
                 <label class="composer-option thinking-option">
                   <span>Thinking</span>
@@ -5572,7 +5544,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const lastUsageCursor = this.threadId === ""
       ? 0
       : store.threadView(this.threadId).lastUsageCursor;
-    return `${this.sessionId}:${sessionUpdatedAt}:${lastUsageCursor}`;
+    const sessionUsageRevision = store.sessionUsageRevision(this.sessionId);
+    return `${this.sessionId}:${sessionUpdatedAt}:${lastUsageCursor}:${sessionUsageRevision}`;
   }
 
   async #ensureSessionUsage(): Promise<void> {
@@ -5811,6 +5784,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   openNewThreadSetup = (): void => {
     if (this.sessionId === "" || this.#newThreadBusy) return;
     this.#newThreadSetupOpen = true;
+    this.#publishNewThreadSetupState(true);
     this.#newThreadError = "";
     this.requestUpdate();
     void this.updateComplete.then(() => {
@@ -5824,6 +5798,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (this.threadId !== "") this.#store.value?.markThreadRead(this.threadId);
     this.#store.value?.markThreadRead(threadId);
     this.#newThreadSetupOpen = false;
+    this.#publishNewThreadSetupState(false);
     this.#newThreadError = "";
     services.router.navigate({
       kind: "session",
@@ -6095,6 +6070,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       token.createdThreadId = thread.id;
       store.upsertThread(thread);
       this.#newThreadSetupOpen = false;
+      this.#publishNewThreadSetupState(false);
       services.router.navigate({
         kind: "session",
         workspaceId: token.workspaceId,
@@ -6138,12 +6114,37 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     ) return;
     event.preventDefault();
     this.#newThreadSetupOpen = false;
+    this.#publishNewThreadSetupState(false);
     this.#newThreadError = "";
     this.requestUpdate();
     void this.updateComplete.then(() => {
       this.querySelector<HTMLButtonElement>('[aria-label="New thread"]')?.focus();
     });
   };
+
+  #effectiveNewThreadSetupOpen(): boolean {
+    if (this.#newThreadSetupOpen) return true;
+    if (this.threadId !== "") return false;
+    const store = this.#store.value;
+    const services = this.#services.value;
+    if (store === undefined || services === undefined) return false;
+    const sessionThreads = store.threadsForSession(this.sessionId);
+    if (sessionThreads.length === 0) return false;
+    const closedThreadTabs = new Set(
+      readSignal(services.resumePreferences).closedThreadTabs,
+    );
+    return sessionThreads.every((thread) => closedThreadTabs.has(thread.id));
+  }
+
+  #publishNewThreadSetupState(open: boolean): void {
+    if (this.#publishedNewThreadSetupOpen === open) return;
+    this.#publishedNewThreadSetupOpen = open;
+    this.dispatchEvent(new CustomEvent("trouve-new-thread-setup-state", {
+      detail: { open },
+      bubbles: true,
+      composed: true,
+    }));
+  }
 
   #startQueueEdit(prompt: QueuedPrompt): void {
     if (
