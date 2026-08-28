@@ -321,7 +321,9 @@ pub use requests::*;
 // anchor quote with a server-derived match verdict, execution-path
 // verification grade, and counterexample search — from which finding
 // confidence is now derived (additive).
-pub const PROTOCOL_VERSION: &str = "7.20";
+// 7.21: session and thread usage summaries include per-model token, turn,
+// and estimated-cost aggregates (additive).
+pub const PROTOCOL_VERSION: &str = "7.21";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

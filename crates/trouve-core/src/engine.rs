@@ -10913,6 +10913,7 @@ impl Engine {
             &session.id,
             &thread.id,
             turn,
+            &thread.model,
             &usage_total,
             context_input_tokens,
         )?;
@@ -12081,6 +12082,7 @@ impl Engine {
                     &session.id,
                     &collaborator.thread.id,
                     collaborator.turn,
+                    &collaborator.thread.model,
                     &usage,
                     context_input_tokens,
                 )?;
@@ -13668,6 +13670,7 @@ impl Engine {
             &session.id,
             &thread.id,
             turn,
+            &thread.model,
             &usage_total,
             context_input_tokens,
         )?;

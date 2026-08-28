@@ -3520,6 +3520,20 @@ export interface components {
             output_price_per_mtok?: number | null;
             supports_tools: boolean;
         };
+        /** @description Aggregated usage for a thread or session. */
+        ModelUsageSummary: {
+            /** Format: int64 */
+            cached_input_tokens: number;
+            /** Format: double */
+            cost_usd: number;
+            /** Format: int64 */
+            input_tokens: number;
+            model: string;
+            /** Format: int64 */
+            output_tokens: number;
+            /** Format: int64 */
+            turns: number;
+        };
         /**
          * @description Initial dimensions for a newly created terminal. The singular compatibility
          *     endpoint ignores these values when it re-attaches to a live terminal.
@@ -5030,7 +5044,6 @@ export interface components {
             /** Format: int64 */
             output_tokens: number;
         };
-        /** @description Aggregated usage for a thread or session. */
         UsageSummary: {
             /** Format: int64 */
             cached_input_tokens: number;
@@ -5038,6 +5051,7 @@ export interface components {
             cost_usd: number;
             /** Format: int64 */
             input_tokens: number;
+            models?: components["schemas"]["ModelUsageSummary"][];
             /** Format: int64 */
             output_tokens: number;
             /** Format: int64 */

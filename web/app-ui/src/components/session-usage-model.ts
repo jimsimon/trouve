@@ -43,6 +43,36 @@ export const latestCompletedTurnDuration = (
   return latestDuration;
 };
 
+export interface UsageTotals {
+  readonly turns: number;
+  readonly input_tokens: number;
+  readonly output_tokens: number;
+  readonly cached_input_tokens: number;
+  readonly cost_usd: number;
+}
+
+export interface ModelUsageTotals extends UsageTotals {
+  readonly model: string;
+}
+
+export interface UsageBreakdownRow extends UsageTotals {
+  readonly label: string;
+  readonly total: boolean;
+}
+
+export const usageBreakdownRows = (
+  summary: UsageTotals & { readonly models?: readonly ModelUsageTotals[] },
+): readonly UsageBreakdownRow[] => {
+  const models = summary.models ?? [];
+  const rows: UsageBreakdownRow[] = models.map((usage) => ({
+    ...usage,
+    label: usage.model || "Unknown model",
+    total: false,
+  }));
+  if (models.length > 1) rows.push({ ...summary, label: "Total", total: true });
+  return rows;
+};
+
 export const localMemoryUtilization = (
   modelBytes: number,
   capacityBytes: number,

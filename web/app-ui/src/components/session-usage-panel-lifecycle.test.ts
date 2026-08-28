@@ -13,7 +13,7 @@ describe("session usage panel asynchronous lifecycle guards", () => {
     const branch = source.slice(branchStart, branchEnd);
 
     const awaitedAt = branch.indexOf(
-      "const localStatus = await services.protocol.localStatus();",
+      "const [localStatusResult, sessionResult, threadResult] = await Promise.allSettled([",
     );
     const guardAt = branch.indexOf(
       "if (generation !== this.#generation) return;",
@@ -24,5 +24,20 @@ describe("session usage panel asynchronous lifecycle guards", () => {
     expect(guardAt).toBeGreaterThan(awaitedAt);
     expect(publishAt).toBeGreaterThan(guardAt);
     expect(branch).not.toContain("this.#localStatus = await");
+    expect(branch.indexOf("this.#sessionSummary = sessionSummary;", guardAt))
+      .toBeGreaterThan(guardAt);
+    expect(branch.indexOf("this.#threadSummary = threadSummary;", guardAt))
+      .toBeGreaterThan(guardAt);
+  });
+
+  it("loads and renders active-thread and session usage scopes", () => {
+    expect(source).toContain("services.protocol.threadUsage(this.threadId)");
+    expect(source).toContain("services.protocol.sessionUsage(this.sessionId)");
+    expect(source).toContain(
+      'this.#renderUsageScope("Active thread", this.#threadSummary)',
+    );
+    expect(source).toContain(
+      'this.#renderUsageScope("Session", this.#sessionSummary)',
+    );
   });
 });

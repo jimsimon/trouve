@@ -4,6 +4,7 @@ import {
   latestCompletedTurnDuration,
   localMemoryUtilization,
   sessionUsagePanelKind,
+  usageBreakdownRows,
   usageThroughput,
 } from "./session-usage-model.js";
 
@@ -45,5 +46,28 @@ describe("session usage panel presentation", () => {
 
     expect(latestCompletedTurnDuration(durations)).toBe(1_999_990);
     expect(latestCompletedTurnDuration(new Map())).toBeUndefined();
+  });
+
+  it("breaks usage down by model and adds a total only for multiple models", () => {
+    const one = {
+      model: "openai/gpt-5",
+      turns: 2,
+      input_tokens: 10,
+      cached_input_tokens: 3,
+      output_tokens: 4,
+      cost_usd: 0.02,
+    };
+    expect(usageBreakdownRows({ ...one, models: [one] })).toEqual([
+      { ...one, label: "openai/gpt-5", total: false },
+    ]);
+
+    const second = { ...one, model: "anthropic/claude", turns: 1 };
+    const rows = usageBreakdownRows({ ...one, turns: 3, models: [one, second] });
+    expect(rows.map((row) => row.label)).toEqual([
+      "openai/gpt-5",
+      "anthropic/claude",
+      "Total",
+    ]);
+    expect(rows.at(-1)).toMatchObject({ turns: 3, total: true });
   });
 });

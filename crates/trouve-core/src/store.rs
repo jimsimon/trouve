@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS usage (
   thread_id TEXT NOT NULL REFERENCES threads(id),
   session_id TEXT NOT NULL REFERENCES sessions(id),
   turn INTEGER NOT NULL,
+  model TEXT NOT NULL,
   input_tokens INTEGER NOT NULL,      -- summed across the turn's requests (cost)
   output_tokens INTEGER NOT NULL,
   cached_input_tokens INTEGER NOT NULL,
@@ -788,6 +789,22 @@ const MIGRATIONS: &[&str] = &[
     // (fixed default budgets). Persisted so retries re-batch identically
     // even when provider metadata is transiently unavailable.
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
+    "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+    "UPDATE usage
+       SET model = COALESCE(
+         (
+           SELECT json_extract(events.payload, '$.model')
+           FROM events
+           WHERE events.scope_kind = 'thread'
+             AND events.scope_id = usage.thread_id
+             AND json_extract(events.payload, '$.type') = 'turn.started'
+             AND CAST(json_extract(events.payload, '$.turn') AS INTEGER) = usage.turn
+           ORDER BY events.cursor DESC
+           LIMIT 1
+         ),
+         ''
+       )
+       WHERE model = ''",
 ];
 
 /// Legacy snapshots counted every open finding; recompute both tiers on the
@@ -7372,6 +7389,7 @@ impl Store {
                     output_tokens: row.get::<_, i64>(2)? as u64,
                     cached_input_tokens: row.get::<_, i64>(3)? as u64,
                     cost_usd: row.get(4)?,
+                    models: Vec::new(),
                 })
             },
         )
@@ -14350,8 +14368,9 @@ impl Store {
 
     // --- usage accounting -------------------------------------------------------
 
-    /// Record a turn's usage. `usage` totals are summed across the turn's
-    /// requests (correct for billing); `context_input_tokens` is the
+    /// Record a turn's usage under the model selected when the turn started.
+    /// `usage` totals are summed across the turn's requests (correct for
+    /// billing); `context_input_tokens` is the
     /// provider-authoritative context size for the turn's *last* request.
     /// Summing per-iteration inputs over a multi-tool turn inflates the figure
     /// many-fold and spuriously trips compaction.
@@ -14360,17 +14379,19 @@ impl Store {
         session_id: &str,
         thread_id: &str,
         turn: u64,
+        model: &str,
         usage: &trouve_protocol::Usage,
         context_input_tokens: u64,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT OR REPLACE INTO usage
-             (thread_id, session_id, turn, input_tokens, output_tokens, cached_input_tokens, context_input_tokens, cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (thread_id, session_id, turn, model, input_tokens, output_tokens, cached_input_tokens, context_input_tokens, cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 thread_id,
                 session_id,
                 turn as i64,
+                model,
                 usage.input_tokens as i64,
                 usage.output_tokens as i64,
                 usage.cached_input_tokens as i64,
@@ -14408,20 +14429,41 @@ impl Store {
             UsageScope::Session(id) => ("session_id", id),
         };
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
+        let mut totals_stmt = conn.prepare(&format!(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM(cached_input_tokens), 0), COALESCE(SUM(cost_usd), 0.0)
              FROM usage WHERE {col} = ?1"
         ))?;
-        Ok(stmt.query_row(params![id], |r| {
+        let mut summary = totals_stmt.query_row(params![id], |r| {
             Ok(trouve_protocol::UsageSummary {
                 turns: r.get::<_, i64>(0)? as u64,
                 input_tokens: r.get::<_, i64>(1)? as u64,
                 output_tokens: r.get::<_, i64>(2)? as u64,
                 cached_input_tokens: r.get::<_, i64>(3)? as u64,
                 cost_usd: r.get(4)?,
+                models: Vec::new(),
             })
-        })?)
+        })?;
+        let mut models_stmt = conn.prepare(&format!(
+            "SELECT model, COUNT(*), COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0)
+             FROM usage WHERE {col} = ?1
+             GROUP BY model ORDER BY model"
+        ))?;
+        summary.models = models_stmt
+            .query_map(params![id], |r| {
+                Ok(trouve_protocol::ModelUsageSummary {
+                    model: r.get(0)?,
+                    turns: r.get::<_, i64>(1)? as u64,
+                    input_tokens: r.get::<_, i64>(2)? as u64,
+                    output_tokens: r.get::<_, i64>(3)? as u64,
+                    cached_input_tokens: r.get::<_, i64>(4)? as u64,
+                    cost_usd: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(summary)
     }
 
     // --- checkpoints ----------------------------------------------------------
@@ -15113,6 +15155,7 @@ mod tests {
                     "se_q",
                     thread_id,
                     turn,
+                    "p/m",
                     &trouve_protocol::Usage {
                         input_tokens,
                         output_tokens: 1,
@@ -15152,6 +15195,111 @@ mod tests {
             store.failed_spawned_descendants("root").unwrap(),
             vec!["grandchild".to_string()]
         );
+    }
+
+    #[test]
+    fn usage_summaries_group_session_and_thread_totals_by_model() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "thread-a");
+        seed_thread(&store, "thread-b");
+        for (thread_id, turn, model, input, output, cached, cost) in [
+            ("thread-a", 1, "openai/gpt-5", 10, 2, 3, 0.01),
+            ("thread-a", 2, "anthropic/claude", 20, 4, 6, 0.02),
+            ("thread-b", 1, "openai/gpt-5", 30, 6, 9, 0.03),
+        ] {
+            store
+                .record_usage(
+                    "se_q",
+                    thread_id,
+                    turn,
+                    model,
+                    &trouve_protocol::Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        cached_input_tokens: cached,
+                        cost_usd: Some(cost),
+                        ..Default::default()
+                    },
+                    input + cached,
+                )
+                .unwrap();
+        }
+
+        let thread = store.usage_summary(UsageScope::Thread("thread-a")).unwrap();
+        assert_eq!(
+            (thread.turns, thread.input_tokens, thread.cost_usd),
+            (2, 30, 0.03)
+        );
+        assert_eq!(
+            thread
+                .models
+                .iter()
+                .map(|usage| usage.model.as_str())
+                .collect::<Vec<_>>(),
+            ["anthropic/claude", "openai/gpt-5"]
+        );
+        assert_eq!(
+            (thread.models[0].turns, thread.models[0].input_tokens),
+            (1, 20)
+        );
+
+        let session = store.usage_summary(UsageScope::Session("se_q")).unwrap();
+        assert_eq!(
+            (session.turns, session.input_tokens, session.cost_usd),
+            (3, 60, 0.06)
+        );
+        assert_eq!(session.models.len(), 2);
+        assert_eq!(
+            (
+                session.models[1].turns,
+                session.models[1].input_tokens,
+                session.models[1].output_tokens,
+                session.models[1].cached_input_tokens,
+            ),
+            (2, 40, 8, 12)
+        );
+    }
+
+    #[test]
+    fn usage_model_backfill_uses_the_durable_turn_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("usage-model.db");
+        {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "legacy-thread");
+            store
+                .append_event(
+                    Scope::Thread("legacy-thread".into()),
+                    Event::TurnStarted {
+                        turn: 1,
+                        mode: "code".into(),
+                        model: "historical/model".into(),
+                        thinking_level: None,
+                        supports_steering: false,
+                    },
+                )
+                .unwrap();
+            store
+                .record_usage(
+                    "se_q",
+                    "legacy-thread",
+                    1,
+                    "",
+                    &trouve_protocol::Usage {
+                        input_tokens: 10,
+                        ..Default::default()
+                    },
+                    10,
+                )
+                .unwrap();
+        }
+
+        let reopened = Store::open(&path).unwrap();
+        let summary = reopened
+            .usage_summary(UsageScope::Thread("legacy-thread"))
+            .unwrap();
+        assert_eq!(summary.models.len(), 1);
+        assert_eq!(summary.models[0].model, "historical/model");
     }
 
     #[test]

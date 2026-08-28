@@ -20,6 +20,8 @@ import {
   localMemoryUtilization,
   sessionUsagePanelKind,
   type SessionUsagePanelKind,
+  type UsageBreakdownRow,
+  usageBreakdownRows,
   usageThroughput,
 } from "./session-usage-model.js";
 
@@ -63,7 +65,8 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
   #loading = false;
   #error = "";
   #health: ProtocolSubscriptionHealth | undefined;
-  #summary: ProtocolUsageSummary | undefined;
+  #sessionSummary: ProtocolUsageSummary | undefined;
+  #threadSummary: ProtocolUsageSummary | undefined;
   #localStatus: ProtocolLocalStatus | undefined;
 
   protected override createRenderRoot(): HTMLElement {
@@ -116,11 +119,24 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     if (this.#loading) {
       return html`<p class="session-usage-placeholder" role="status">Loading usage details…</p>`;
     }
-    if (kind === "local") return this.#renderLocal();
-    if (kind === "subscription" && this.#health !== undefined) {
-      return this.#renderSubscription(this.#health);
+    if (kind === "local") {
+      if (
+        this.#localStatus === undefined
+        && this.#sessionSummary === undefined
+        && this.#threadSummary === undefined
+      ) {
+        return html`<p class="session-usage-placeholder" role="status">
+          ${this.#error || "Usage details are not available yet."}
+        </p>`;
+      }
+      return this.#renderLocal();
     }
-    if (kind === "api" && this.#summary !== undefined) return this.#renderApi(this.#summary);
+    if (kind === "subscription" && this.#health !== undefined) {
+      return html`${this.#renderSubscription(this.#health)}${this.#renderUsageScopes()}`;
+    }
+    if (kind === "api" && (this.#sessionSummary !== undefined || this.#threadSummary !== undefined)) {
+      return this.#renderUsageScopes();
+    }
     return html`<p class="session-usage-placeholder" role="status">
       ${this.#error || "Usage details are not available yet."}
     </p>`;
@@ -157,24 +173,52 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     `;
   }
 
-  #renderApi(summary: ProtocolUsageSummary) {
-    const totalTokens = summary.input_tokens
-      + summary.cached_input_tokens
-      + summary.output_tokens;
-    const outputPercent = totalTokens === 0
-      ? 0
-      : Math.round(summary.output_tokens / totalTokens * 100);
+  #renderUsageScopes() {
     return html`
-      <article class="session-usage-content" aria-label="API session usage">
-        <div class="session-usage-meta"><span>API session</span><small>${summary.turns} turns</small></div>
-        <dl class="session-usage-stats">
-          <div><dt>Input tokens</dt><dd>${formatCount(summary.input_tokens)}</dd></div>
-          <div><dt>Cached input</dt><dd>${formatCount(summary.cached_input_tokens)}</dd></div>
-          <div><dt>Output tokens</dt><dd>${formatCount(summary.output_tokens)}</dd></div>
-          <div><dt>Estimated cost</dt><dd>$${summary.cost_usd.toFixed(4)}</dd></div>
+      <div class="session-usage-scopes" aria-label="Token and cost usage">
+        ${this.#renderUsageScope("Active thread", this.#threadSummary)}
+        ${this.#renderUsageScope("Session", this.#sessionSummary)}
+      </div>
+    `;
+  }
+
+  #renderUsageScope(label: string, summary: ProtocolUsageSummary | undefined) {
+    if (summary === undefined) {
+      return html`<section class="session-usage-scope">
+        <div class="session-usage-scope-heading"><strong>${label}</strong></div>
+        <p class="session-usage-placeholder">Usage is unavailable.</p>
+      </section>`;
+    }
+    const rows = usageBreakdownRows(summary);
+    return html`
+      <section class="session-usage-scope">
+        <div class="session-usage-scope-heading">
+          <strong>${label}</strong>
+          <small>${summary.turns} ${summary.turns === 1 ? "turn" : "turns"}</small>
+        </div>
+        ${rows.length === 0
+          ? html`<p class="session-usage-placeholder">No completed usage yet.</p>`
+          : html`<div class="session-usage-breakdown">
+              ${rows.map((row) => this.#renderUsageRow(row))}
+            </div>`}
+      </section>
+    `;
+  }
+
+  #renderUsageRow(row: UsageBreakdownRow) {
+    return html`
+      <div class=${`session-usage-model-row ${row.total ? "total" : ""}`}>
+        <div class="session-usage-model-heading">
+          <span title=${row.label}>${row.label}</span>
+          <small>${row.turns} ${row.turns === 1 ? "turn" : "turns"}</small>
+        </div>
+        <dl class="session-usage-model-stats">
+          <div><dt>Input</dt><dd>${formatCount(row.input_tokens)}</dd></div>
+          <div><dt>Cached</dt><dd>${formatCount(row.cached_input_tokens)}</dd></div>
+          <div><dt>Output</dt><dd>${formatCount(row.output_tokens)}</dd></div>
+          <div><dt>Cost</dt><dd>$${row.cost_usd.toFixed(4)}</dd></div>
         </dl>
-        ${this.#renderMeter("Output share of session tokens", outputPercent, "ok")}
-      </article>
+      </div>
     `;
   }
 
@@ -197,19 +241,26 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     const throughput = usageThroughput(usage?.output_tokens ?? 0, duration);
     return html`
       <article class="session-usage-content" aria-label="Local model utilization and performance">
-        <div class="session-usage-meta">
-          <span>${running ? "Running locally" : "Local model"}</span>
-          <small>${status?.server_status || "stopped"}</small>
-        </div>
+        ${status === undefined
+          ? html`<p>Local resource status is unavailable.</p>`
+          : html`
+              <div class="session-usage-meta">
+                <span>${running ? "Running locally" : "Local model"}</span>
+                <small>${status.server_status || "stopped"}</small>
+              </div>
+              <dl class="session-usage-stats">
+                <div><dt>Model footprint</dt><dd>${formatBytes(model?.size_bytes ?? 0)}</dd></div>
+                <div><dt>Memory tier</dt><dd>${model?.fit === "gpu" ? "GPU / VRAM" : "CPU / RAM"}</dd></div>
+              </dl>
+              ${this.#renderMeter("Current model memory utilization", currentMemoryPercent, currentMemoryPercent >= 90 ? "error" : currentMemoryPercent >= 70 ? "warning" : "ok")}
+            `}
         <dl class="session-usage-stats">
-          <div><dt>Model footprint</dt><dd>${formatBytes(model?.size_bytes ?? 0)}</dd></div>
-          <div><dt>Memory tier</dt><dd>${model?.fit === "gpu" ? "GPU / VRAM" : "CPU / RAM"}</dd></div>
           <div><dt>Prompt processed</dt><dd>${formatCount((usage?.input_tokens ?? 0) + (usage?.cached_input_tokens ?? 0))} tokens</dd></div>
           <div><dt>Last output</dt><dd>${formatCount(usage?.output_tokens ?? 0)} tokens</dd></div>
           <div><dt>Overall throughput</dt><dd>${throughput === undefined ? "Not available" : `${throughput.toFixed(1)} tok/s`}</dd></div>
           <div><dt>Last turn</dt><dd>${duration === undefined ? "Not available" : `${(duration / 1_000).toFixed(1)}s`}</dd></div>
         </dl>
-        ${this.#renderMeter("Current model memory utilization", currentMemoryPercent, currentMemoryPercent >= 90 ? "error" : currentMemoryPercent >= 70 ? "warning" : "ok")}
+        ${this.#renderUsageScopes()}
       </article>
     `;
   }
@@ -235,7 +286,8 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       || this.model === "";
     const generation = ++this.#generation;
     this.#health = undefined;
-    this.#summary = undefined;
+    this.#sessionSummary = undefined;
+    this.#threadSummary = undefined;
     this.#localStatus = undefined;
     this.#error = "";
     if (placeholder || services === undefined) {
@@ -247,14 +299,35 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       if (this.model.startsWith("local/")) {
-        const localStatus = await services.protocol.localStatus();
+        const [localStatusResult, sessionResult, threadResult] = await Promise.allSettled([
+          services.protocol.localStatus(),
+          services.protocol.sessionUsage(this.sessionId),
+          services.protocol.threadUsage(this.threadId),
+        ]);
         if (generation !== this.#generation) return;
+        const localStatus = localStatusResult.status === "fulfilled"
+          ? localStatusResult.value
+          : undefined;
+        const sessionSummary = sessionResult.status === "fulfilled"
+          ? sessionResult.value
+          : undefined;
+        const threadSummary = threadResult.status === "fulfilled"
+          ? threadResult.value
+          : undefined;
         this.#localStatus = localStatus;
+        this.#sessionSummary = sessionSummary;
+        this.#threadSummary = threadSummary;
+        if (
+          localStatus === undefined
+          && sessionSummary === undefined
+          && threadSummary === undefined
+        ) throw new Error("local usage details unavailable");
       } else {
         const providerId = this.model.split("/", 1)[0] ?? "";
-        const [healthResult, summaryResult] = await Promise.allSettled([
+        const [healthResult, sessionResult, threadResult] = await Promise.allSettled([
           services.subscriptionHealth.refresh("if-stale"),
           services.protocol.sessionUsage(this.sessionId),
+          services.protocol.threadUsage(this.threadId),
         ]);
         if (generation !== this.#generation) return;
         this.#health = healthResult.status === "fulfilled"
@@ -262,9 +335,18 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           : undefined;
         if (this.#health === undefined || this.#health.status === "unsupported") {
           this.#health = undefined;
-          if (summaryResult.status === "rejected") throw summaryResult.reason;
-          this.#summary = summaryResult.value;
         }
+        this.#sessionSummary = sessionResult.status === "fulfilled"
+          ? sessionResult.value
+          : undefined;
+        this.#threadSummary = threadResult.status === "fulfilled"
+          ? threadResult.value
+          : undefined;
+        if (
+          this.#health === undefined
+          && this.#sessionSummary === undefined
+          && this.#threadSummary === undefined
+        ) throw new Error("usage details unavailable");
       }
     } catch {
       if (generation !== this.#generation) return;

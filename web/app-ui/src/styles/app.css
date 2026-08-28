@@ -150,6 +150,22 @@ trouve-session-list[hidden] { display: none; }
 .session-usage-stats > div { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 8px; }
 .session-usage-stats dt { min-width: 0; overflow: hidden; color: var(--trouve-text-dim); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .session-usage-stats dd { margin: 0; color: var(--trouve-text-mid); font-size: 10px; font-variant-numeric: tabular-nums; text-align: end; }
+.session-usage-scopes { min-width: 0; display: grid; gap: 10px; border-top: 1px solid var(--trouve-border); padding-top: 8px; }
+.session-usage-scope { min-width: 0; display: grid; gap: 6px; }
+.session-usage-scope + .session-usage-scope { border-top: 1px solid var(--trouve-border); padding-top: 8px; }
+.session-usage-scope-heading { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.session-usage-scope-heading > strong { min-width: 0; flex: 1; color: var(--trouve-text-mid); font-size: 11px; }
+.session-usage-scope-heading > small { flex: none; color: var(--trouve-text-dim); font-size: 9px; }
+.session-usage-breakdown { min-width: 0; display: grid; gap: 6px; }
+.session-usage-model-row { min-width: 0; display: grid; gap: 4px; border-radius: var(--trouve-radius); padding: 6px; background: var(--trouve-control-bg); }
+.session-usage-model-row.total { border-top: 1px solid var(--trouve-border-strong); border-radius: 0; padding: 6px 0 0; background: transparent; }
+.session-usage-model-heading { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+.session-usage-model-heading > span { min-width: 0; flex: 1; overflow: hidden; color: var(--trouve-text-mid); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.session-usage-model-heading > small { flex: none; color: var(--trouve-text-dim); font-size: 9px; }
+.session-usage-model-stats { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px 8px; margin: 0; }
+.session-usage-model-stats > div { min-width: 0; display: flex; align-items: baseline; gap: 4px; }
+.session-usage-model-stats dt { min-width: 0; flex: 1; color: var(--trouve-text-dim); font-size: 9px; }
+.session-usage-model-stats dd { margin: 0; color: var(--trouve-text-mid); font-size: 9px; font-variant-numeric: tabular-nums; text-align: end; }
 .session-list-empty { margin-inline: 26px 8px; }
 .archived-session-group { margin-top: 2px; }
 .archived-session-toggle { width: 100%; min-height: 28px; display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 11px; text-align: start; }
