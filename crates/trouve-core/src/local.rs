@@ -121,21 +121,25 @@ pub const CATALOG: &[CatalogEntry] = &[
 /// Dedicated session-title model. It is intentionally absent from the local
 /// coding-model catalog: the title sidecar has its own lifecycle and never
 /// appears in thread model pickers.
-pub const TITLE_MODEL_ID: &str = "qwen3-title-1.7b-q4-k-m";
-pub const TITLE_MODEL_CONTEXT: u64 = 2_048;
+pub const TITLE_MODEL_ID: &str = "qwen3-title-1.7b-q5-k-m";
+pub const TITLE_MODEL_CONTEXT: u64 = 4_096;
 pub const TITLE_MODEL_SHA256: &str =
-    "d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5";
+    "4287aca1b231f27dbd20012c4bf9693c89b6c849dc02b7027096da54564d4037";
 pub const TITLE_MODEL_LICENSE: &str = "Apache-2.0";
-pub(crate) const LEGACY_TITLE_MODEL_FILES: &[&str] =
-    &["qwen2.5-0.5b-instruct-q4_k_m.gguf", "Qwen3-0.6B-Q8_0.gguf"];
+pub(crate) const LEGACY_TITLE_MODEL_FILES: &[&str] = &[
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "Qwen3-0.6B-Q8_0.gguf",
+    "Qwen3-1.7B-Q4_K_M.gguf",
+    "Qwen3-1.7B-Q5_K_M.gguf",
+];
 
 pub fn title_model_entry() -> ModelEntry {
     ModelEntry {
         id: TITLE_MODEL_ID.into(),
         display_name: "Session naming model".into(),
-        repo: "ggml-org/Qwen3-1.7B-GGUF".into(),
-        file: "Qwen3-1.7B-Q4_K_M.gguf".into(),
-        size_bytes: 1_282_439_264,
+        repo: "bartowski/Qwen_Qwen3-1.7B-GGUF".into(),
+        file: "Qwen_Qwen3-1.7B-Q5_K_M.gguf".into(),
+        size_bytes: 1_471_805_856,
         params: "1.7B".into(),
         notes: format!("Balanced-quality dedicated session-title model ({TITLE_MODEL_LICENSE})"),
         custom: false,

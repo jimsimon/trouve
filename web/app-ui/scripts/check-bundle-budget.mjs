@@ -25,18 +25,19 @@ const worker = javascript.find(({ name }) => name.startsWith("content-worker-"))
 // presentation preference, and Font Awesome icon UI; the PWA remains on the
 // original entry ceiling. Font assets have their own explicit budget below.
 const entryLimit = mode === "desktop" ? 856_000 : 850_000;
-// The locked Vite/Rolldown graph emits 3,247,629 B with the
+// The locked Vite/Rolldown graph emits 3,250,461 B with the
 // two-tier finding-gate labels, background-turn labeling, evidence-backed
 // review-history, churn-metrics, implementation-analyst configuration,
 // durable turn-phase, conditional-title, route-scoped new-session lifecycle,
 // outside-diff review, version-check, per-thread transcript-search, detailed
 // agent-activity, attachment-gallery, external-video, and PR-wide
 // review-state and workspace-organization additions, including lazy previews,
-// mobile playback notices, and the route-scoped subscription/API/local usage
-// panel, including its generated per-model usage schema and scope breakdowns.
-// Preserve less than 2 kB of headroom; entry, worker, and largest-chunk budgets
-// below still prevent one bundle from hiding in the aggregate.
-const totalJavaScriptLimit = 3_249_000;
+// mobile playback notices, the route-scoped subscription/API/local usage
+// panel with its generated per-model usage schema and scope breakdowns, and
+// the scope-verdict causal-waypoint evidence schema. Preserve less than 2 kB
+// of headroom; entry, worker, and largest-chunk budgets below still prevent one
+// bundle from hiding in the aggregate.
+const totalJavaScriptLimit = 3_252_000;
 // Version-check, transcript-search, compact navigation, and the sticky
 // multi-mode usage panel with thread/session model rows plus workspace
 // organization styling bring the clean artifact to 190,958 B. Preserve less

@@ -8020,9 +8020,26 @@ impl Engine {
         cancel: &tokio_util::sync::CancellationToken,
         commit_fence: &ReviewWorkspaceRegistrationFence,
     ) -> Result<(), EngineError> {
+        self.cancel_review_workspace_registration_and_session_with(cancel, commit_fence, || {})
+            .await
+    }
+
+    async fn cancel_review_workspace_registration_and_session_with(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+        after_first_snapshot: impl FnOnce() + Send,
+    ) -> Result<(), EngineError> {
         cancel.cancel();
-        let committed = commit_fence.committed.lock().unwrap().clone();
-        if let Some(committed) = committed {
+        let mut after_first_snapshot = Some(after_first_snapshot);
+        loop {
+            let committed = commit_fence.committed.lock().unwrap().clone();
+            let Some(committed) = committed else {
+                return Ok(());
+            };
+            if let Some(after_first_snapshot) = after_first_snapshot.take() {
+                after_first_snapshot();
+            }
             let session_cleanup =
                 if let Some(session_id) = committed.provisional_session_id.as_deref() {
                     match self.store.session(session_id) {
@@ -8035,14 +8052,15 @@ impl Engine {
                 };
             let workspace_compensation =
                 self.compensate_review_workspace_registration(committed.clone());
-            Self::finish_review_workspace_cancellation(
+            if Self::finish_review_workspace_cancellation(
                 commit_fence,
                 &committed,
                 session_cleanup,
                 workspace_compensation,
-            )?;
+            )? {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     fn finish_review_workspace_cancellation(
@@ -8050,15 +8068,16 @@ impl Engine {
         committed: &ReviewWorkspaceRegistrationCommit,
         session_cleanup: Result<(), EngineError>,
         workspace_compensation: Result<(), EngineError>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
         let session_cleaned = session_cleanup.is_ok();
         let workspace_compensated = workspace_compensation.is_ok();
-        {
+        let finished = {
             let mut current = commit_fence.committed.lock().unwrap();
             if let Some(current_commit) = current.as_mut()
                 && current_commit.workspace_id == committed.workspace_id
                 && current_commit.lease_id == committed.lease_id
                 && Arc::ptr_eq(&current_commit.lifecycle, &committed.lifecycle)
+                && current_commit.provisional_session_id == committed.provisional_session_id
             {
                 if session_cleaned {
                     current_commit.provisional_session_id = None;
@@ -8067,10 +8086,11 @@ impl Engine {
                     current.take();
                 }
             }
-        }
+            current.is_none()
+        };
 
         match (session_cleanup, workspace_compensation) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => Ok(finished),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(session_error), Err(workspace_error)) => {
                 Err(EngineError::Internal(anyhow::anyhow!(
@@ -8606,9 +8626,6 @@ impl Engine {
                 return Err(EngineError::Conflict(
                     "session idempotency key was already used for a different request".into(),
                 ));
-            }
-            if adopt_workspace_registration {
-                self.workspace_for_session_creation(&req.workspace_id, true)?;
             }
             return self.get_session(&existing.id);
         }
@@ -19677,6 +19694,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_idempotency_replay_is_side_effect_free_after_workspace_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let workspace = engine
+            .register_workspace(repository.to_str().unwrap(), None)
+            .unwrap();
+        let request = CreateSessionRequest {
+            workspace_id: workspace.id.clone(),
+            idempotency_key: Some("closed-workspace-replay".into()),
+            title: Some("closed workspace replay".into()),
+            base_ref: Some("main".into()),
+            checkout_ref: None,
+            fetch_latest: false,
+        };
+        let first = engine.create_session(request.clone()).await.unwrap();
+        engine.create_terminal(&first.id, 80, 24).unwrap();
+        assert_eq!(engine.list_terminals(&first.id).unwrap().len(), 1);
+
+        engine.close_workspace(&workspace.id).unwrap();
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        assert!(engine.list_terminals(&first.id).unwrap().is_empty());
+        let registrations_before_replay = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|envelope| {
+                matches!(
+                    &envelope.event,
+                    Event::WorkspaceRegistered { workspace_id, .. }
+                        if workspace_id == &workspace.id
+                )
+            })
+            .count();
+
+        let replay = engine.create_session(request).await.unwrap();
+
+        assert_eq!(replay.id, first.id);
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        assert!(engine.list_terminals(&first.id).unwrap().is_empty());
+        assert_eq!(
+            engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        Event::WorkspaceRegistered { workspace_id, .. }
+                            if workspace_id == &workspace.id
+                    )
+                })
+                .count(),
+            registrations_before_replay
+        );
+        engine.delete_session(&first.id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn session_creation_idempotency_key_rejects_a_different_request() {
         let probe = Arc::new(SessionCreationProbeExecutor::new(
             false,
@@ -23314,6 +23398,92 @@ default_permission_mode = "ask"
         })
         .await
         .expect("cancelled review session worktree was not cleaned up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_retries_when_a_session_is_published_after_its_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("racing review cancellation".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let cancellation = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let cancel = cancel.clone();
+            let commit_fence = Arc::clone(&commit_fence);
+            async move {
+                engine
+                    .cancel_review_workspace_registration_and_session_with(
+                        &cancel,
+                        &commit_fence,
+                        move || {
+                            snapshot_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                        },
+                    )
+                    .await
+            }
+        });
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation did not snapshot the empty session handle");
+
+        let error = engine
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id,
+                    idempotency_key: None,
+                    title: Some("racing review cancellation".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                &cancel,
+                &commit_fence,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+        let session_id = commit_fence
+            .committed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|commit| commit.provisional_session_id.clone())
+            .expect("the newly published session must remain cleanup-addressable");
+        let session = engine.store.session(&session_id).unwrap().unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(worktree.exists());
+
+        release_tx.send(()).unwrap();
+        cancellation.await.unwrap().unwrap();
+
+        assert!(commit_fence.committed.lock().unwrap().is_none());
+        assert!(engine.store.session(&session_id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("racing review session worktree was not cleaned up");
     }
 
     #[test]

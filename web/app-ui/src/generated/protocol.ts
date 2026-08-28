@@ -1947,6 +1947,19 @@ export interface components {
             /** @description Concise, generated one-line summary of the candidate issue. */
             title: string;
         };
+        /**
+         * @description One step of the causal chain from changed code to a finding's anchor,
+         *     quoted by the coordinator and mechanically verified against the reviewed
+         *     revision. A finding anchored outside the diff can only block the review
+         *     when its waypoints verify and at least one lies on a changed line.
+         */
+        CodeReviewCausalWaypoint: {
+            /** Format: int64 */
+            line: number;
+            path: string;
+            /** @description Verbatim source line at `path:line`, from the head revision. */
+            quote?: string;
+        };
         /** @description Signals that measure repeated review work rather than raw issue volume. */
         CodeReviewChurnStats: {
             /** Format: double */
@@ -2067,6 +2080,25 @@ export interface components {
              *     the reviewed revision; empty when the anchor was never verified.
              */
             anchor_quote?: string;
+            /**
+             * @description The causal chain from changed code to the finding's anchor, required
+             *     to verify an `introduced` claim whose anchor is outside the diff.
+             */
+            causal_waypoints?: components["schemas"]["CodeReviewCausalWaypoint"][];
+            /**
+             * @description Coordinator's causation claim for the finding: `introduced` when this
+             *     change caused the issue, `pre_existing` when the issue predates it and
+             *     is surfaced for awareness only. Empty on legacy records.
+             */
+            change_causation?: string;
+            /**
+             * @description Server-derived scope verdict: `verified` when the causation claim is
+             *     mechanically corroborated (anchor on a changed line, or verified
+             *     waypoints reaching one), `unverified` otherwise. Only scope-verified
+             *     findings block the review. Model-provided values are overwritten;
+             *     empty legacy records block as before.
+             */
+            change_scope?: string;
             consequence?: string;
             /**
              * @description The refuting guard, caller, or test the coordinator searched for to

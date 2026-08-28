@@ -2129,6 +2129,19 @@ pub struct CodeReviewUnadjudicatedCandidate {
     pub body: String,
 }
 
+/// One step of the causal chain from changed code to a finding's anchor,
+/// quoted by the coordinator and mechanically verified against the reviewed
+/// revision. A finding anchored outside the diff can only block the review
+/// when its waypoints verify and at least one lies on a changed line.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewCausalWaypoint {
+    pub path: String,
+    pub line: u64,
+    /// Verbatim source line at `path:line`, from the head revision.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quote: String,
+}
+
 /// Concrete evidence that makes a confirmed finding independently verifiable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewFindingEvidence {
@@ -2160,6 +2173,22 @@ pub struct CodeReviewFindingEvidence {
     /// attempted.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub counterexample_search: String,
+    /// Coordinator's causation claim for the finding: `introduced` when this
+    /// change caused the issue, `pre_existing` when the issue predates it and
+    /// is surfaced for awareness only. Empty on legacy records.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub change_causation: String,
+    /// The causal chain from changed code to the finding's anchor, required
+    /// to verify an `introduced` claim whose anchor is outside the diff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causal_waypoints: Vec<CodeReviewCausalWaypoint>,
+    /// Server-derived scope verdict: `verified` when the causation claim is
+    /// mechanically corroborated (anchor on a changed line, or verified
+    /// waypoints reaching one), `unverified` otherwise. Only scope-verified
+    /// findings block the review. Model-provided values are overwritten;
+    /// empty legacy records block as before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub change_scope: String,
 }
 
 /// How a finding relates to earlier review rounds on the pull request.
