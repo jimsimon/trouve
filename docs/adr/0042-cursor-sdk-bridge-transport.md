@@ -1,6 +1,6 @@
 # ADR 0042: Cursor SDK Bridge transport
 
-Status: Accepted (2026-08)
+Status: Superseded by [ADR 0043](0043-shared-cursor-sdk-bridge-process.md) (2026-08)
 
 ## Context
 

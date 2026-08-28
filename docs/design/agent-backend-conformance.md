@@ -88,6 +88,14 @@ Run the broader promotion probe only when several paid turns are acceptable:
 CURSOR_API_KEY=... node scripts/qualify_cursor_sdk_bridge_full.mjs
 ```
 
+Qualify one Bridge shared across concurrent agents, including distinct
+workspaces and tool catalogs, agent-scoped cancellation, warm resume, and cold
+process resume, with six paid turns:
+
+```sh
+CURSOR_API_KEY=... node scripts/qualify_cursor_sdk_bridge_shared.mjs
+```
+
 Run only the direct, non-billable subscription-health qualification (no Bridge
 process) with:
 
@@ -176,20 +184,24 @@ Trouve now performs that sequence directly, keeps the exchanged access token
 only in memory for the query, and never invokes `cursor-agent` or reads its
 credential files.
 
-The same date's shipping-path qualification passed two paid Composer 2.5 turns
-through the production Rust adapter. It verified one approval-gated
-`write_file` and one `read_file` callback exactly once, worktree confinement,
-token usage, durable tool cards, and reuse of both the SDK agent and one warm
-Bridge process. The second callback reached a newly registered turn-scoped
-server and MCP ticket. The test observed the same private Bridge runtime
-directory after both turns, then verified that uninstall removed it. It also
-installed and uninstalled the managed runtime through the public HTTP API,
-returned live subscription health, and found no API-key bytes under Trouve's
-test data directory. The first attempt exposed an adapter bug: the documented
-Bridge handshake puts its bearer-token file in the OS temporary directory
-rather than the durable state root. The adapter now redirects each child
-process's temporary directory to a private, auto-cleaned directory and keeps
-fail-closed path validation there; the clean reruns passed.
+The 2026-08-28 shared-process qualification passed six paid Composer 2 turns
+through one v1.0.28 Bridge. Two agents used distinct workspaces, API-key-bearing
+options, custom-tool catalogs, and exact callback routes while their sends ran
+concurrently. Cancelling agent A left agent B's callback and turn healthy; the
+Bridge did not disconnect A's callback itself, and the probe verified the
+adapter-required route settlement instead. Both agents passed warm
+`CloseAgent`/`ResumeAgent`, cold-process resume from the shared SQLite store,
+and MCP-only native-tool confinement. The run observed exactly one Bridge
+process and about 228 MiB warm RSS.
+
+The same date's shipping-path qualification passed three paid Composer 2.5
+turns through the production Rust adapter and public HTTP API. It verified one
+approval-gated `write_file`, concurrent `read_file` callbacks in two separate
+session worktrees, distinct Cursor agent ids, exact tool lifecycles and
+worktree routing, resume of the first agent, and one unchanged private Bridge
+runtime directory throughout. Managed install/uninstall, live subscription
+health, durable thread views, token usage, and the scan proving no API-key
+bytes were persisted under Trouve's data directory also passed.
 
 **Decision: use the SDK Bridge adapter and retire the Cursor CLI transport.**
 Cursor steering remains disabled through the existing per-backend
@@ -203,7 +215,7 @@ provider-wide subscription windows.
 
 The fixture suite, permission/approval integration, and repeated live
 qualification remain required whenever the pinned Bridge release changes. See
-ADR [0042](../adr/0042-cursor-sdk-bridge-transport.md), plus the official
+ADR [0043](../adr/0043-shared-cursor-sdk-bridge-process.md), plus the official
 [Cursor SDK Bridge contract](https://cursor.com/docs/sdk/bridge).
 
 ## Rollout rule
