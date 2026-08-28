@@ -51,6 +51,7 @@ const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const INTERRUPTED_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONNECT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -475,9 +476,7 @@ struct BridgeLease {
     available: Arc<Notify>,
 }
 
-/// Admission to one thread's serial Bridge lane. The lifecycle reader stays
-/// held until process lookup/spawn is complete, so shutdown cannot finish
-/// between lane admission and registering a newly spawned process.
+/// Admission to one thread's serial Bridge lane, ordered with pool shutdown.
 struct ThreadBridgeAdmission<'a> {
     _lifecycle: RwLockReadGuard<'a, ()>,
     thread_guard: OwnedMutexGuard<()>,
@@ -506,8 +505,7 @@ impl std::ops::Deref for BridgeLease {
 
 impl Drop for BridgeLease {
     fn drop(&mut self) {
-        // A capacity waiter may only retry eviction after the lease no longer
-        // contributes a process reference and no longer owns the thread gate.
+        // Wake capacity waiters only after releasing both retained resources.
         self.thread_guard.take();
         self.process.take();
         notify_available(&self.available);
@@ -693,10 +691,7 @@ impl BridgePool {
         BackendError::Protocol("Cursor SDK Bridge pool is shutting down".into())
     }
 
-    /// Commit warm retention while holding the lifecycle reader. Shutdown may
-    /// publish `closed` before waiting for the writer, but it cannot finish
-    /// draining the pool until this callback has either committed or declined
-    /// retention.
+    /// Commit warm retention while ordered before the shutdown writer.
     async fn retain_if_open<F, Fut>(&self, retain: F) -> bool
     where
         F: FnOnce() -> Fut,
@@ -712,11 +707,19 @@ impl BridgePool {
 
     async fn shutdown(&self) -> Result<(), BackendError> {
         // Close new admission, drain admitted turns, then wake shutdown waiters.
+        let drain_deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
         self.closed.store(true, Ordering::Release);
         self.capacity.close();
         self.turn_admission.close();
         notify_available(&self.available);
-        let _lifecycle = self.lifecycle.write().await;
+        let _lifecycle = match tokio::time::timeout_at(drain_deadline, self.lifecycle.write()).await
+        {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => {
+                self.closing.cancel();
+                self.lifecycle.write().await
+            }
+        };
         let mut first_error = None;
         let thread_ids = self
             .processes
@@ -727,7 +730,14 @@ impl BridgePool {
             .collect::<Vec<_>>();
         for thread_id in thread_ids {
             let gate = self.thread_gate(&thread_id).await;
-            let _guard = gate.lock_owned().await;
+            let _guard =
+                match tokio::time::timeout_at(drain_deadline, gate.clone().lock_owned()).await {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        self.closing.cancel();
+                        gate.lock_owned().await
+                    }
+                };
             let process = self.processes.lock().await.remove(&thread_id);
             let Some(process) = process else {
                 continue;
