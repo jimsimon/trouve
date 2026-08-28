@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -5,6 +7,7 @@ import {
   loadProtocolEventParser,
   ProtocolClient,
   ProtocolClientError,
+  SUPPORTED_PROTOCOL_VERSION,
 } from "./protocol-client.js";
 
 const session = {
@@ -1056,12 +1059,21 @@ describe("ProtocolClient", () => {
 });
 
 describe("protocol compatibility", () => {
+  it("matches the canonical server protocol version", () => {
+    const source = readFileSync(
+      new URL("../../../../crates/trouve-protocol/src/lib.rs", import.meta.url),
+      "utf8",
+    );
+    const version = source.match(/pub const PROTOCOL_VERSION: &str = "([^"]+)";/)?.[1];
+    expect(version).toBe(SUPPORTED_PROTOCOL_VERSION);
+  });
+
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.19")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.20")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.21", "7.20.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );
