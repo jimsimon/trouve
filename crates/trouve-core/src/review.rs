@@ -10146,18 +10146,6 @@ impl Engine {
         Ok(ReviewThreadReconciliationOutcome::Completed)
     }
 
-    /// Applies a maintainer's checkbox edits on the lifecycle comment:
-    /// checking a threadless finding's box dismisses it, unchecking restores
-    /// it. Maintainer judgment applies directly — no model re-adjudicates —
-    /// and the counts, check run, and lifecycle comment re-project in place
-    /// exactly as for a thread resolution.
-    /// Applies a webhook-delivered checkbox edit from its payload snapshot.
-    /// The persisted edit watermark orders deliveries by the comment's
-    /// `updated_at`, so a reordered or replayed snapshot can never overwrite
-    /// a newer maintainer decision — and unlike refetching the live body,
-    /// the payload preserves a toggle made while an earlier one was still
-    /// being applied and re-rendered (the ledger render would otherwise
-    /// erase it before its own delivery arrived).
     /// Prefetch immutable-object lines for every anchor the coordinator's
     /// findings reference outside the diff, through the executor's audited
     /// git boundary. Reading before validation keeps verification itself
@@ -10234,6 +10222,8 @@ impl Engine {
             }
         }
         lines
+    }
+
     /// Authoritative effective-permission check for a commenter: only
     /// write, maintain, or admin may mutate durable review state.
     async fn commenter_has_write_permission(
@@ -10534,6 +10524,12 @@ impl Engine {
         ThreadlessCommandDisposition::Done
     }
 
+    /// Applies a webhook-delivered checkbox edit from its payload snapshot:
+    /// checking a threadless finding's box dismisses it, unchecking restores
+    /// it, and maintainer judgment applies directly — no model
+    /// re-adjudicates. The persisted edit watermark orders deliveries by the
+    /// comment's `updated_at`, so a reordered or replayed snapshot can never
+    /// overwrite a newer maintainer decision.
     async fn apply_lifecycle_dismissal_edit(
         &self,
         repository: &CodeReviewRepository,
