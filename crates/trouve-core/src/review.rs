@@ -12412,9 +12412,11 @@ fn lifecycle_prompt_for_agents(
     // must not starve carried blockers: when both exist, the fresh section
     // keeps only half the budget and carried entries fill the rest. Every
     // omission is disclosed deterministically.
-    // Reserve room for the fixed preamble and closing instructions around
-    // {evidence}, so the fence never truncates them away.
-    let prompt_budget = LIFECYCLE_PROMPT_MAX_BYTES.saturating_sub(1_024);
+    // Reserve exactly what the fixed preamble and closing instructions
+    // around {evidence} measure (plus slack for fence escaping), so the
+    // fence never truncates them away no matter how the guidance grows.
+    let frame_reserve = lifecycle_prompt_framed(job, "").len() + 64;
+    let prompt_budget = LIFECYCLE_PROMPT_MAX_BYTES.saturating_sub(frame_reserve);
     let fresh_budget = if carried_findings.is_empty() {
         prompt_budget
     } else {
@@ -12472,6 +12474,15 @@ fn lifecycle_prompt_for_agents(
             evidence.push_str(&entry);
         }
     }
+    lifecycle_prompt_framed(job, &evidence)
+}
+
+/// The lifecycle remediation prompt's fixed frame around the evidence
+/// block. Split out so the entry budget can measure the frame it actually
+/// wraps instead of trusting a hand-maintained reserve — a constant went
+/// stale the moment two changes each lengthened the closing instructions,
+/// and the public fence then truncated the tail of the prompt.
+fn lifecycle_prompt_framed(job: &trouve_protocol::CodeReviewJob, evidence: &str) -> String {
     format!(
         "Independently verify and remediate every reported issue on {repository} pull request \
          #{pull_number} at commit {head_sha}. The reviewer analysis is provided to accelerate \
