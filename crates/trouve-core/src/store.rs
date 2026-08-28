@@ -12369,10 +12369,15 @@ impl Store {
         // the command the newer writer: a checkbox snapshot captured before
         // the command but delivered after it is watermark-rejected instead
         // of silently reverting the decision. The watermark is compared as
-        // a string, so this uses GitHub's second-granularity `Z` timestamp
-        // format; same-second snapshots still apply, matching the bounded
-        // same-second window the checkbox path already documents.
-        let watermark = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        // a string in GitHub's second-granularity `Z` timestamp format, and
+        // equal timestamps apply, so the command claims its entire current
+        // second: a snapshot stamped in the same second compares older and
+        // is rejected, and only a strictly later-second checkbox edit
+        // supersedes the command. The column is NOT NULL DEFAULT '', so the
+        // strict comparison also advances initial rows.
+        let watermark = (chrono::Utc::now() + chrono::Duration::seconds(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         tx.execute(
             "UPDATE code_review_pr_state
              SET lifecycle_checkbox_edited_at = ?3
@@ -19969,7 +19974,9 @@ mod tests {
         // A command advances the shared checkbox watermark in its own
         // transaction: a checkbox snapshot captured before the command but
         // delivered after it is watermark-rejected instead of reverting the
-        // decision, while a genuinely newer edit still applies.
+        // decision — including one stamped in the command's own second —
+        // while a genuinely newer edit still applies.
+        let command_second = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let (outcome, _) = store
             .apply_threadless_resolve_command(&command(&target, true), "final — @jim", None)
             .unwrap();
@@ -19983,6 +19990,18 @@ mod tests {
             )
             .unwrap();
         assert!(!changed, "a stale checkbox snapshot must not apply");
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                &command_second,
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(
+            !changed,
+            "a snapshot from the command's own second must not supersede it"
+        );
         let (listed, _) = store
             .threadless_code_review_findings("acme/widgets", 42)
             .unwrap();
