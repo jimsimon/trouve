@@ -4293,12 +4293,9 @@ impl Engine {
                     {
                         Ok(outcome) => {
                             let (_, warning) = outcome.into_parts();
-                            engine
-                                .reload_providers_for_runtime(cli)
-                                .await
-                                .map_err(|error| {
-                                    format!("reloading providers after runtime install: {error}")
-                                })?;
+                            let warning = engine
+                                .reload_after_committed_runtime_install(cli, &version, warning)
+                                .await;
                             Ok(Some((version, warning)))
                         }
                         Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
@@ -5856,6 +5853,34 @@ impl Engine {
         let retirement = self.retire_config_backends_for_runtime(runtime).await?;
         retirement.publish();
         Ok(())
+    }
+
+    /// Refresh providers after the managed-runtime pointer has committed.
+    /// A teardown failure cannot roll that commit back, so preserve install
+    /// success and surface the registry recovery as an operational warning.
+    async fn reload_after_committed_runtime_install(
+        self: &Arc<Self>,
+        runtime: trouve_agents::install::CliId,
+        version: &str,
+        warning: Option<String>,
+    ) -> Option<String> {
+        let Err(error) = self.reload_providers_for_runtime(runtime).await else {
+            return warning;
+        };
+        tracing::warn!(
+            runtime = runtime.as_str(),
+            version,
+            %error,
+            "managed runtime committed but provider reload did not complete cleanly"
+        );
+        let reload_warning = format!(
+            "{} {version} is active, but its provider registry could not be reloaded cleanly: {error}; Trouve restored the registry from committed configuration",
+            runtime.display_name()
+        );
+        Some(match warning {
+            Some(warning) => format!("{warning}; {reload_warning}"),
+            None => reload_warning,
+        })
     }
 
     pub fn thread_usage(
@@ -27389,6 +27414,74 @@ default_permission_mode = "ask"
             Some("crash durability could not be confirmed")
         );
         assert!(status.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_runtime_reload_failure_is_an_install_warning() {
+        let data = tempfile::tempdir().unwrap();
+        let runtime_root = data.path().join("cli/codex");
+        let runtime_bin = runtime_root
+            .join(".generations/runtime-test/bin")
+            .join("codex");
+        std::fs::create_dir_all(runtime_bin.parent().unwrap()).unwrap();
+        std::fs::write(&runtime_bin, "codex fixture").unwrap();
+        std::fs::write(
+            runtime_root.join("installed.json"),
+            serde_json::to_string(&trouve_agents::install::InstalledCli {
+                version: "1.2.3".into(),
+                bin: runtime_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "codex".into(),
+            ProviderConfig {
+                kind: "codex-app-server".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        engine.backends.write().unwrap().insert(
+            "codex".into(),
+            Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+
+        let warning = engine
+            .reload_after_committed_runtime_install(
+                trouve_agents::install::CliId::Codex,
+                "1.2.3",
+                None,
+            )
+            .await;
+        engine.cli_installs.lock().unwrap().insert(
+            "codex".into(),
+            CliInstallState::Success {
+                version: "1.2.3".into(),
+                warning,
+            },
+        );
+
+        let status = engine.cli_install_status("codex");
+        assert_eq!(status.status, "success");
+        assert_eq!(status.version.as_deref(), Some("1.2.3"));
+        assert!(status.error.is_none());
+        let warning = status.warning.expect("reload warning");
+        assert!(warning.contains("is active"), "{warning}");
+        assert!(warning.contains("provider registry"), "{warning}");
+        assert_eq!(
+            trouve_agents::install::installed(data.path(), trouve_agents::install::CliId::Codex,)
+                .expect("committed runtime remains installed")
+                .version,
+            "1.2.3"
+        );
     }
 
     #[tokio::test]
