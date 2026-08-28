@@ -3359,7 +3359,12 @@ pub fn review_object_line(
     if !output.status.success() || output.stdout.truncated {
         return Ok(None);
     }
-    let text = String::from_utf8_lossy(&output.stdout.bytes);
+    // Strict decoding: lossy replacement would let a quote containing
+    // U+FFFD "match" bytes that are absent from the immutable object. A
+    // non-UTF-8 blob is simply not verifiable.
+    let Ok(text) = String::from_utf8(output.stdout.bytes) else {
+        return Ok(None);
+    };
     let Some(index) = usize::try_from(line)
         .ok()
         .and_then(|line| line.checked_sub(1))
@@ -3737,6 +3742,30 @@ line three
         );
         assert_eq!(
             review_object_line(repo.path(), &reviewed, "src/config.rs", 2, 8, &cancel).unwrap(),
+            None
+        );
+
+        // A non-UTF-8 blob is unverifiable rather than lossily decoded: a
+        // quote containing U+FFFD must never "match" bytes the immutable
+        // object does not contain.
+        std::fs::write(
+            repo.path().join("src/binary.bin"),
+            [0xff, 0xfe, b'\n', 0x80],
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "--quiet", "-m", "binary"]);
+        let with_binary = run(&["rev-parse", "HEAD"]).trim().to_owned();
+        assert_eq!(
+            review_object_line(
+                repo.path(),
+                &with_binary,
+                "src/binary.bin",
+                1,
+                64 * 1024,
+                &cancel
+            )
+            .unwrap(),
             None
         );
     }
