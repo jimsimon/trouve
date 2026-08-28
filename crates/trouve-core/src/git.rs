@@ -2899,8 +2899,6 @@ fn review_blob_headers(
 pub fn session_diff_patches_cancellable<F>(
     worktree: &Path,
     base_ref: &str,
-    max_files: usize,
-    max_changed_lines: u64,
     max_total_bytes: usize,
     cancel: &tokio_util::sync::CancellationToken,
     capture_header: F,
@@ -2912,20 +2910,6 @@ where
     let operation = GitOperation::new(Some(cancel));
     with_session_snapshot_index(worktree, &operation, |index| {
         let summary = session_diff_summary_with_index(worktree, base_ref, index, &operation)?;
-        let changed_lines = summary.iter().try_fold(0_u64, |total, file| {
-            total
-                .checked_add(file.additions)
-                .and_then(|total| total.checked_add(file.deletions))
-                .context("session review diff line count overflow")
-        })?;
-        if summary.len() > max_files || changed_lines > max_changed_lines {
-            return Err(session_diff_too_large(format!(
-                "review diff is too large ({} files, {changed_lines} changed lines; limit is \
-                 {max_files} files or {max_changed_lines} changed lines)",
-                summary.len()
-            )));
-        }
-
         let mut total_bytes = 0_usize;
         let mut patches = Vec::with_capacity(summary.len());
         for file in summary {
@@ -3156,8 +3140,6 @@ pub fn diff_files_between(
     repo: &Path,
     base_ref: &str,
     head_ref: &str,
-    max_files: usize,
-    max_changed_lines: u64,
     max_metadata_bytes: usize,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<String>> {
@@ -3186,42 +3168,22 @@ pub fn diff_files_between(
         bail!("review diff metadata exceeds the {max_metadata_bytes}-byte limit");
     }
     let mut paths = Vec::new();
-    let mut changed_lines = 0_u64;
     for entry in output
         .bytes
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
         let mut fields = entry.splitn(3, |byte| *byte == b'\t');
-        let additions = fields
+        fields
             .next()
             .context("review diff metadata omitted additions")?;
-        let deletions = fields
+        fields
             .next()
             .context("review diff metadata omitted deletions")?;
         let path = fields
             .next()
             .context("review diff metadata omitted its path")?;
-        let additions = std::str::from_utf8(additions)
-            .context("review diff additions are not UTF-8")?
-            .parse::<u64>();
-        let deletions = std::str::from_utf8(deletions)
-            .context("review diff deletions are not UTF-8")?
-            .parse::<u64>();
-        if let (Ok(additions), Ok(deletions)) = (additions, deletions) {
-            changed_lines = changed_lines
-                .checked_add(additions)
-                .and_then(|total| total.checked_add(deletions))
-                .context("review diff changed-line count overflow")?;
-        }
         paths.push(String::from_utf8(path.to_vec()).context("review diff path is not UTF-8")?);
-        if paths.len() > max_files || changed_lines > max_changed_lines {
-            bail!(
-                "review diff is too large ({} files, {changed_lines} changed lines; limit is \
-                 {max_files} files or {max_changed_lines} changed lines)",
-                paths.len()
-            );
-        }
     }
     Ok(paths)
 }
@@ -4359,8 +4321,6 @@ line three
         let files = session_diff_patches_cancellable(
             tmp.path(),
             &base,
-            10,
-            1_000,
             1024 * 1024,
             &tokio_util::sync::CancellationToken::new(),
             |_| true,
@@ -4538,8 +4498,6 @@ line three
         let files = session_diff_patches_cancellable(
             tmp.path(),
             &base,
-            10,
-            1_000,
             1024 * 1024,
             &tokio_util::sync::CancellationToken::new(),
             |_| true,
@@ -4571,8 +4529,6 @@ line three
         let files = session_diff_patches_cancellable(
             tmp.path(),
             &base,
-            10,
-            1_000,
             1024 * 1024,
             &tokio_util::sync::CancellationToken::new(),
             |_| true,
@@ -4602,8 +4558,6 @@ line three
         let files = session_diff_patches_cancellable(
             tmp.path(),
             &base,
-            10,
-            1_000,
             1024 * 1024,
             &tokio_util::sync::CancellationToken::new(),
             |_| true,
@@ -4729,8 +4683,6 @@ line three
             tmp.path(),
             &base,
             &head,
-            10,
-            100,
             64 * 1024,
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -4943,8 +4895,6 @@ line three
                 tmp.path(),
                 &common,
                 &feature,
-                10,
-                100,
                 64 * 1024,
                 &tokio_util::sync::CancellationToken::new(),
             )
@@ -5026,7 +4976,7 @@ line three
     }
 
     #[test]
-    fn immutable_review_diff_enforces_limits_and_literal_paths() {
+    fn immutable_review_diff_enforces_byte_limits_and_literal_paths() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
         let base = run(tmp.path(), &["rev-parse", "HEAD"]);
@@ -5037,12 +4987,13 @@ line three
         let head = run(tmp.path(), &["rev-parse", "HEAD"]);
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let file_error =
-            diff_files_between(tmp.path(), &base, &head, 1, 100, 64 * 1024, &cancel).unwrap_err();
-        assert!(file_error.to_string().contains("limit is 1 files"));
-        let line_error =
-            diff_files_between(tmp.path(), &base, &head, 10, 1, 64 * 1024, &cancel).unwrap_err();
-        assert!(line_error.to_string().contains("1 changed lines"));
+        let metadata_error = diff_files_between(tmp.path(), &base, &head, 8, &cancel).unwrap_err();
+        let metadata_message = metadata_error.to_string();
+        assert!(
+            metadata_message.contains("review diff metadata exceeds the 8-byte limit")
+                || metadata_message.contains("output exceeded its 8-byte bound"),
+            "{metadata_message}"
+        );
 
         let diff =
             diff_path_between(tmp.path(), &base, &head, ":(glob)**", 64 * 1024, &cancel).unwrap();

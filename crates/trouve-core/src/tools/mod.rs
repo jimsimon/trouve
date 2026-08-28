@@ -1059,8 +1059,6 @@ pub struct ReviewRepositoryDiff {
     pub base_sha: String,
     pub head_sha: String,
     pub cancel: tokio_util::sync::CancellationToken,
-    pub max_files: usize,
-    pub max_changed_lines: u64,
     pub max_bytes: usize,
 }
 
@@ -3294,23 +3292,14 @@ impl ToolExecutor for LocalToolExecutor {
         let base_sha = request.base_sha.clone();
         let head_sha = request.head_sha.clone();
         let cancel = request.cancel.clone();
-        let max_files = request.max_files;
-        let max_changed_lines = request.max_changed_lines;
         let max_bytes = request.max_bytes;
         tokio::task::spawn_blocking(move || {
             if cancel.is_cancelled() {
                 return Err("review repository diff cancelled".into());
             }
-            let paths = crate::git::diff_files_between(
-                &worktree,
-                &base_sha,
-                &head_sha,
-                max_files,
-                max_changed_lines,
-                max_bytes,
-                &cancel,
-            )
-            .map_err(|error| error.to_string())?;
+            let paths =
+                crate::git::diff_files_between(&worktree, &base_sha, &head_sha, max_bytes, &cancel)
+                    .map_err(|error| error.to_string())?;
             let path_bytes = paths.iter().try_fold(0_usize, |total, path| {
                 total
                     .checked_add(path.len())
@@ -3340,15 +3329,11 @@ impl ToolExecutor for LocalToolExecutor {
         let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
         let base_sha = request.base_sha.clone();
         let cancel = request.cancel.clone();
-        let max_files = request.max_files;
-        let max_changed_lines = request.max_changed_lines;
         let max_bytes = request.max_bytes;
         tokio::task::spawn_blocking(move || {
             crate::git::session_diff_patches_cancellable(
                 &worktree,
                 &base_sha,
-                max_files,
-                max_changed_lines,
                 max_bytes,
                 &cancel,
                 is_conventional_generated_artifact_path,
