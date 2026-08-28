@@ -864,7 +864,7 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
                AND finding_job.pull_number = code_review_jobs.pull_number
                AND finding_job.review_published != 0
                AND finding.status = 'open'
-               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low')) AND COALESCE(json_extract(finding.evidence, '$.change_scope'), '') != 'unverified'
            ),
            publication_advisory_open_issue_count = (
              SELECT COUNT(*) FROM code_review_findings finding
@@ -873,7 +873,7 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
                AND finding_job.pull_number = code_review_jobs.pull_number
                AND finding_job.review_published != 0
                AND finding.status = 'open'
-               AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+               AND NOT ((lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low')) AND COALESCE(json_extract(finding.evidence, '$.change_scope'), '') != 'unverified')
            )
          WHERE publication_open_issue_count IS NOT NULL
            AND publication_advisory_open_issue_count IS NULL
@@ -3190,7 +3190,7 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status = 'open'
-             AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+             AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low')) AND COALESCE(json_extract(finding.evidence, '$.change_scope'), '') != 'unverified'
          ),
          publication_advisory_open_issue_count = (
            SELECT COUNT(*)
@@ -3200,7 +3200,7 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status = 'open'
-             AND NOT (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))
+             AND NOT ((lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low')) AND COALESCE(json_extract(finding.evidence, '$.change_scope'), '') != 'unverified')
          )
          WHERE id = ?1",
         params![job_id],
@@ -11985,7 +11985,7 @@ impl Store {
                AND j.review_published = 1
                AND f.github_comment_id IS NULL
                AND f.status IN ('open', 'dismissed')
-               AND (lower(trim(f.severity)) = 'high' OR (lower(trim(f.severity)) != 'low' AND lower(trim(f.confidence)) != 'low'))
+               AND (lower(trim(f.severity)) = 'high' OR (lower(trim(f.severity)) != 'low' AND lower(trim(f.confidence)) != 'low')) AND COALESCE(json_extract(f.evidence, '$.change_scope'), '') != 'unverified'
              ORDER BY CASE f.status WHEN 'open' THEN 0 ELSE 1 END,
                       f.resolved_at DESC, f.path, f.line, f.id
              LIMIT 101",
@@ -13608,8 +13608,8 @@ impl Store {
     }
 
     /// Count of open blocking findings across all published rounds of a pull
-    /// request, using the same severity/confidence tier cutoff as the
-    /// publication snapshot.
+    /// request, using the same severity/confidence tier cutoff and scope
+    /// verdict as the publication snapshot.
     pub fn code_review_open_blocking_finding_count(
         &self,
         repository: &str,
@@ -13622,7 +13622,7 @@ impl Store {
              WHERE job.repository = ?1 AND job.pull_number = ?2
                AND job.review_published != 0
                AND finding.status = 'open'
-               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low'))",
+               AND (lower(trim(finding.severity)) = 'high' OR (lower(trim(finding.severity)) != 'low' AND lower(trim(finding.confidence)) != 'low')) AND COALESCE(json_extract(finding.evidence, '$.change_scope'), '') != 'unverified'",
             params![repository, pull_number as i64],
             |row| row.get::<_, i64>(0),
         )? as u64)
