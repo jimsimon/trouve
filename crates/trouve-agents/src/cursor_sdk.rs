@@ -28,7 +28,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufReader};
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use tokio::sync::{
+    Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, RwLockReadGuard, Semaphore, watch,
+};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use trouve_protocol::{ModelInfo, Usage};
@@ -473,6 +475,14 @@ struct BridgeLease {
     available: Arc<Notify>,
 }
 
+/// Admission to one thread's serial Bridge lane. The lifecycle reader stays
+/// held until process lookup/spawn is complete, so shutdown cannot finish
+/// between lane admission and registering a newly spawned process.
+struct ThreadBridgeAdmission<'a> {
+    _lifecycle: RwLockReadGuard<'a, ()>,
+    thread_guard: OwnedMutexGuard<()>,
+}
+
 impl BridgeLease {
     fn pooled(&self) -> &Arc<PooledBridge> {
         self.process
@@ -518,12 +528,13 @@ impl BridgePool {
     async fn process_for(
         &self,
         thread_id: &str,
+        admission: ThreadBridgeAdmission<'_>,
         request: BridgeProcessRequest<'_>,
     ) -> Result<BridgeLease, BackendError> {
-        // Shutdown owns the write side until every retained process is reaped.
-        // Holding this read guard through admission makes a racing spawn either
-        // visible to shutdown or fail after shutdown has closed the pool.
-        let _lifecycle = self.lifecycle.read().await;
+        let ThreadBridgeAdmission {
+            _lifecycle,
+            thread_guard,
+        } = admission;
         if !self.is_open() {
             return Err(BackendError::Protocol(
                 "Cursor SDK Bridge pool is shutting down".into(),
@@ -532,14 +543,6 @@ impl BridgePool {
         if request.cancel.is_cancelled() || request.events.is_closed() {
             return Err(BackendError::Cancelled);
         }
-        let gate = self.thread_gate(thread_id).await;
-        let thread_guard = tokio::select! {
-            biased;
-            _ = self.closing.cancelled() => return Err(Self::closed_error()),
-            _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
-            _ = request.events.closed() => return Err(BackendError::Cancelled),
-            guard = gate.lock_owned() => guard,
-        };
         let existing = self.processes.lock().await.get(thread_id).cloned();
         if let Some(process) = existing {
             let alive = if process.is_reusable()
@@ -758,6 +761,36 @@ impl BridgePool {
         let gate = Arc::new(Mutex::new(()));
         gates.insert(thread_id.to_string(), Arc::downgrade(&gate));
         gate
+    }
+
+    async fn acquire_thread_admission<'a>(
+        &'a self,
+        thread_id: &str,
+        cancel: &CancellationToken,
+        events: &BackendEventSender,
+    ) -> Result<ThreadBridgeAdmission<'a>, BackendError> {
+        // Shutdown owns the write side until every retained process is reaped.
+        // Publish closure before taking that writer wakes all of the selects
+        // below, including same-thread queues that hold lifecycle readers.
+        let lifecycle = self.lifecycle.read().await;
+        if !self.is_open() {
+            return Err(Self::closed_error());
+        }
+        if cancel.is_cancelled() || events.is_closed() {
+            return Err(BackendError::Cancelled);
+        }
+        let gate = self.thread_gate(thread_id).await;
+        let thread_guard = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => return Err(Self::closed_error()),
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            _ = events.closed() => return Err(BackendError::Cancelled),
+            guard = gate.lock_owned() => guard,
+        };
+        Ok(ThreadBridgeAdmission {
+            _lifecycle: lifecycle,
+            thread_guard,
+        })
     }
 
     async fn remove_if_same(&self, thread_id: &str, process: &Arc<PooledBridge>) {
@@ -1013,9 +1046,23 @@ async fn run_sdk_turn(
         .then(|| turn.mcp_bridge.as_ref().map(|bridge| bridge.url.clone()))
         .flatten();
 
+    // Admit the thread lane first. Same-thread queues must not consume every
+    // provider-wide permit while waiting for a serial Bridge they cannot yet
+    // use, or unrelated threads would starve behind them.
+    let thread_admission = match pool
+        .acquire_thread_admission(&turn.thread_id, &turn.cancel, events)
+        .await
+    {
+        Ok(admission) => admission,
+        Err(BackendError::Cancelled) if events.is_closed() => {
+            return Ok(TurnTerminal::ConsumerClosed);
+        }
+        Err(BackendError::Cancelled) => return Ok(TurnTerminal::Cancelled),
+        Err(error) => return Err(error),
+    };
     // Bound tool discovery along with every other turn-scoped resource. Tool
     // lists may be large, so queued turns must not fetch and retain one before
-    // they own a pool admission slot.
+    // they own both their thread lane and a pool-wide admission slot.
     let _turn_admission = match pool.acquire_turn_admission(&turn.cancel, events).await {
         Ok(permit) => permit,
         Err(BackendError::Cancelled) if events.is_closed() => {
@@ -1055,6 +1102,7 @@ async fn run_sdk_turn(
     let mut process = match pool
         .process_for(
             &turn.thread_id,
+            thread_admission,
             BridgeProcessRequest {
                 command,
                 worktree: &turn.worktree,
@@ -3502,6 +3550,49 @@ mod tests {
         pool.shutdown().await.unwrap();
         let error = waiter.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("pool is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn same_thread_queues_do_not_consume_global_turn_admission() {
+        let pool = BridgePool::default();
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+
+        let _active_thread = pool
+            .acquire_thread_admission("busy-thread", &cancel, &events)
+            .await
+            .unwrap();
+        let _active_turn = pool.acquire_turn_admission(&cancel, &events).await.unwrap();
+        let mut same_thread_queue = futures::stream::FuturesUnordered::new();
+        for _ in 0..POOL_CAP {
+            same_thread_queue.push(pool.acquire_thread_admission("busy-thread", &cancel, &events));
+        }
+        assert!(futures::poll!(same_thread_queue.next()).is_pending());
+        assert_eq!(
+            pool.turn_admission.available_permits(),
+            POOL_CAP - 1,
+            "same-thread waiters reserved provider-wide permits"
+        );
+
+        let _other_thread = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.acquire_thread_admission("other-thread", &cancel, &events),
+        )
+        .await
+        .expect("an unrelated thread could not enter its Bridge lane")
+        .unwrap();
+        let _other_turn = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.acquire_turn_admission(&cancel, &events),
+        )
+        .await
+        .expect("same-thread queues starved an unrelated turn")
+        .unwrap();
     }
 
     #[tokio::test]

@@ -2180,36 +2180,32 @@ async fn shutdown_retiring_backend_batch(
     deadline: tokio::time::Instant,
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    let mut retiring = retiring.into_iter();
-    for (id, backend) in retiring.by_ref() {
-        let timed_out = match tokio::time::timeout_at(deadline, backend.shutdown()).await {
+    // Poll every backend immediately under the same aggregate deadline. A
+    // stalled first entry must not prevent later independent owners from
+    // receiving their shutdown request and releasing their runtime leases.
+    let shutdowns = retiring.into_iter().map(|(id, backend)| async move {
+        let result = tokio::time::timeout_at(deadline, backend.shutdown()).await;
+        (id, backend, result)
+    });
+    for (id, backend, result) in futures::future::join_all(shutdowns).await {
+        match result {
             Ok(Ok(())) => {
                 engine.release_retiring_backend(&id, &backend);
-                false
             }
             Ok(Err(error)) => {
                 failures.push(format!("{id}: {error}"));
-                false
             }
             Err(_) => {
                 failures.push(format!(
                     "{id}: backend shutdown exceeded the aggregate retirement deadline"
                 ));
-                true
             }
-        };
+        }
         // Drop the wrapper's runtime lease before the caller can proceed to
         // uninstall. Timer registration and task-output cleanup are not relied
         // upon for this ownership boundary.
         drop(backend);
-        if timed_out {
-            break;
-        }
     }
-    // A deadline may leave unattempted clones in the iterator. The retiring
-    // registry remains their durable owner; this batch must release its copies
-    // before publishing replacements or returning to runtime removal.
-    drop(retiring);
     failures
 }
 
@@ -26995,6 +26991,41 @@ default_permission_mode = "ask"
             .expect("a later transition could not retry retained cleanup");
         retirement.publish();
         assert!(engine.retiring_backends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retirement_starts_every_backend_shutdown_before_the_shared_deadline() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+        let later = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let failures = shutdown_retiring_backend_batch(
+            &engine,
+            vec![
+                ("blocking".into(), blocking),
+                ("later".into(), later.clone()),
+            ],
+            tokio::time::Instant::now() + Duration::from_millis(25),
+        )
+        .await;
+
+        assert_eq!(entered.available_permits(), 1);
+        assert_eq!(
+            later.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the later backend was never asked to shut down"
+        );
+        assert_eq!(failures.len(), 2);
     }
 
     #[tokio::test]

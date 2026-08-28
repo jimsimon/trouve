@@ -493,6 +493,8 @@ import time
 import urllib.parse
 
 binary = os.path.abspath(sys.argv[0])
+with open(binary + ".pid", "w", encoding="utf-8") as destination:
+    destination.write(str(os.getpid()))
 count_path = binary + ".spawns"
 try:
     with open(count_path, "r", encoding="utf-8") as source:
@@ -1044,6 +1046,12 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
     })
     .await
     .expect("Cursor Send did not publish cancellation readiness");
+    #[cfg(target_os = "linux")]
+    let pid: u32 = std::fs::read_to_string(format!("{stub}.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     cancel.cancel();
     std::fs::write(format!("{stub}.release-run-id"), "").unwrap();
 
@@ -1074,6 +1082,11 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
             .await
             .is_err(),
         "cancelled Cursor Bridge was still accepting connections"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "cancelled Cursor stream closed before the Bridge process was reaped"
     );
 }
 

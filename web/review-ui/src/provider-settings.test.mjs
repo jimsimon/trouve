@@ -50,3 +50,10 @@ test("API key inputs expose their guidance to assistive technology", () => {
     assert.match(providerSetupSource, new RegExp(`<small id="${id}">`, "u"));
   }
 });
+
+test("Cursor migration focus requests are consumed after focusing the API key", () => {
+  assert.match(
+    providerSetupSource,
+    /input\.focus\(\);\s*setCursorMigrationFocusRequest\(0\);/u,
+  );
+});
