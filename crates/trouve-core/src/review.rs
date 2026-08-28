@@ -4032,6 +4032,21 @@ impl Engine {
                     continue;
                 }
                 Err(_) => {
+                    // The credential wait consumed the rest of the pass
+                    // budget serving this specific key, so it is a failure
+                    // for the key — not budget-deferred work. Leaving it
+                    // out of `failed` would requeue it with its webhook
+                    // retry budget intact, and a repository whose
+                    // credential refresh reliably outlasts the pass budget
+                    // could then occupy the dispatcher forever instead of
+                    // handing off to the poll rotation after its bounded
+                    // attempts.
+                    failed.insert(key.clone());
+                    self.code_review
+                        .thread_reconciled_at
+                        .lock()
+                        .unwrap()
+                        .insert(key, Instant::now());
                     first_error.get_or_insert_with(|| {
                         anyhow!(
                             "refreshing GitHub App credentials before reconciliation for {}#{} timed out",
